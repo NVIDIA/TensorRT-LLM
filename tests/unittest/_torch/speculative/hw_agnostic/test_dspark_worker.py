@@ -117,8 +117,13 @@ def test_worker_lazy_init_window_buffers():
     dm = _fake_draft_model(num_stages=3, window_size=128, head_dim=64)
     meta = _make_metadata(max_num_requests=8)
     worker._lazy_init(dm, meta)
-    assert worker._kv_windows.shape == (8, 3, 128, 64)
-    assert worker._ctx_len.shape == (8,)
+    # max_batch (8) request slots + 1 scratch row for padded / unknown IDs.
+    assert worker._kv_windows.shape == (9, 3, 128, 64)
+    assert worker._ctx_len.shape == (9,)
+    assert worker._scratch_slot == 8
+    # Dummy-id floor separates real request ids from CUDA-graph padding ids.
+    assert worker._graph_dummy_id_floor == (1 << 64) - 1 - worker.max_draft_len
+    # The scratch row is never handed out through the free pool.
     assert list(worker._free_slots) == list(range(8))
     assert worker._batch_to_slot is not None
     assert worker._batch_to_slot.shape == (8,)
@@ -255,6 +260,101 @@ def test_prepare_frees_stale_slots_on_batched_path():
     assert int(worker._ctx_len[sa]) == 0
 
 
+def test_prepare_maps_unknown_request_to_scratch_row_not_slot_zero():
+    """Padded / unknown request IDs route to the scratch row, never a live slot.
+
+    Regression for the rolling-window aliasing bug (GitHub #16767): an unknown
+    request id (CUDA-graph padding, ADP idle request, or a disagg seed forward
+    without a real id) must not overwrite the request that owns slot 0.
+    """
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    # A live request takes the first free slot (0) and populates its window.
+    s_real = worker._assign_slot(100, reset=True)
+    assert s_real == 0
+    worker._ctx_len[s_real] = 17
+    worker._kv_windows[s_real].fill_(1.0)
+
+    # Batch contains the live request plus an unknown id (e.g. graph padding).
+    meta.request_ids = [100, 999]
+    meta.prepare()
+
+    # The unknown id maps to the scratch row, not to slot 0.
+    assert worker._batch_to_slot[:2].tolist() == [s_real, worker._scratch_slot]
+    assert worker._scratch_slot != s_real
+    # It is not silently registered as a real request and did not consume a slot.
+    assert 999 not in worker._req_to_slot
+    assert list(worker._free_slots) == [1, 2, 3]
+    # The live request's rolling window and position are untouched.
+    assert int(worker._ctx_len[s_real]) == 17
+    assert torch.all(worker._kv_windows[s_real] == 1.0)
+
+
+def test_prepare_assigns_slots_to_disagg_generation_requests():
+    """Disagg gen requests (never seeded here) get distinct slots, not one shared row.
+
+    Regression for GitHub #16767: on the disaggregated generation server the
+    prompt is prefilled (and the DSpark window seeded) on the *context* server,
+    so ``_seed_context_windows`` never runs here and ``_req_to_slot`` stays empty.
+    ``prepare()`` must therefore assign each real generation request its own
+    rolling-window slot instead of collapsing them all onto the shared scratch
+    row (which corrupts drafts and collapses accept length at batch size > 1).
+    """
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    # All-generation batch (num_contexts == 0), no prior seeding.
+    meta.request_ids = [1000, 1001]
+    meta.num_generations = 2
+    meta.prepare()
+
+    s0 = worker._req_to_slot[1000]
+    s1 = worker._req_to_slot[1001]
+    assert s0 != s1
+    assert s0 != worker._scratch_slot and s1 != worker._scratch_slot
+    assert worker._batch_to_slot[:2].tolist() == [s0, s1]
+
+    # Stable across steps: the same ids keep their slots (no churn / reassignment).
+    meta.prepare()
+    assert worker._req_to_slot[1000] == s0
+    assert worker._req_to_slot[1001] == s1
+    assert worker._batch_to_slot[:2].tolist() == [s0, s1]
+
+
+def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
+    """ADP-idle (id 0) and CUDA-graph padding dummies never consume a real slot."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+    from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+
+    worker = _make_worker()
+    meta = _make_metadata(max_num_requests=4)
+    worker._lazy_init(_fake_draft_model(), meta)
+    meta._dspark_worker = worker
+
+    graph_dummy = CUDA_GRAPH_DUMMY_REQUEST_ID - worker.max_draft_len
+    meta.request_ids = [1000, ATTENTION_DP_DUMMY_REQUEST_ID, graph_dummy]
+    meta.num_generations = 3
+    meta.prepare()
+
+    s_real = worker._req_to_slot[1000]
+    assert s_real != worker._scratch_slot
+    # Dummies are neither registered nor given a real slot; they map to scratch.
+    assert ATTENTION_DP_DUMMY_REQUEST_ID not in worker._req_to_slot
+    assert graph_dummy not in worker._req_to_slot
+    assert worker._batch_to_slot[:3].tolist() == [
+        s_real,
+        worker._scratch_slot,
+        worker._scratch_slot,
+    ]
+    # Exactly one real slot consumed.
+    assert list(worker._free_slots) == [1, 2, 3]
+
+
 def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     """Mixed (context + gen) batch: ``forward`` must route acceptance and
     production through the unified ``SpecWorkerBase`` entries, one-hot-fill the
@@ -354,3 +454,142 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     # Verified tokens are surfaced unchanged.
     assert torch.equal(out["new_tokens"], accepted)
     assert torch.equal(out["new_tokens_lens"], num_accepted)
+
+
+def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
+    """Guided mixed (context + gen) batch: ``forward`` must walk the K draft
+    positions left-to-right, advancing the grammar matcher
+    (``add_draft_batch``) and masking each position's logits in place
+    (``execute_draft_batch``) BEFORE that position is sampled.
+
+    This is the guided sibling of
+    ``test_forward_mixed_batch_routes_through_base_entries``; it pins the
+    parts static reading can't settle — the step-major contiguous layout the
+    bitmask kernel requires, the zero-padded context rows, the seed token fed
+    to the matcher, and mask-before-sample ordering — with a fake guided
+    decoder (no grammar backend / draft model / MPI).
+    """
+    worker = _make_worker()
+    dm = _fake_draft_model(num_stages=3, window_size=128, head_dim=64)
+
+    K = worker.max_draft_len
+    vocab = 16
+    num_contexts, num_gens = 2, 3
+    batch_size = num_contexts + num_gens
+    BANNED = 3  # grammar forbids this draft-vocab column
+    FULL_VOCAB = 97  # post-TP-gather scatter width (wider than sharded `vocab`)
+
+    meta = _make_metadata(max_num_requests=8)
+    meta.request_ids = [10, 11, 20, 21, 22]  # 2 context + 3 gen
+    meta.prepare()
+
+    attn_metadata = types.SimpleNamespace(
+        num_seqs=batch_size,
+        num_contexts=num_contexts,
+        num_ctx_tokens=0,
+        num_tokens=batch_size,
+    )
+
+    # Acceptance: one accepted token per request (num_accepted == 1), so the
+    # matcher seed is accepted_tokens[:, 0].
+    accepted = torch.arange(batch_size * (K + 1), dtype=torch.int32, device="cuda").reshape(
+        batch_size, K + 1
+    )
+    num_accepted = torch.ones(batch_size, dtype=torch.int32, device="cuda")
+    monkeypatch.setattr(
+        worker, "sample_and_accept_draft_tokens", lambda *a, **k: (accepted, num_accepted)
+    )
+    monkeypatch.setattr(worker, "_seed_context_windows", lambda *a, **k: None)
+
+    gen_logits = torch.randn(num_gens, K, vocab, device="cuda")
+    monkeypatch.setattr(worker, "_draft_gen_block_batched", lambda *a, **k: gen_logits)
+
+    class FakeGuidedDecoder:
+        def __init__(self):
+            self.add_steps = []
+            self.add_tokens = []
+            self.exec_records = []
+
+        def execute(self, logits, d2t=None):
+            # Target-verify masking (``_execute_guided_decoder_if_present`` in
+            # ``_forward_impl``); a no-op here — this test asserts only the
+            # draft-loop behavior, not target-side masking.
+            pass
+
+        def add_draft_batch(self, new_tokens, num_accepted_tokens, draft_step=0):
+            self.add_steps.append(draft_step)
+            self.add_tokens.append(new_tokens.clone())
+
+        def execute_draft_batch(self, logits, draft_step=0):
+            # Record the exact tensor properties the bitmask kernel requires,
+            # BEFORE mutating: contiguous [batch, vocab] with zero-padded
+            # context rows.
+            self.exec_records.append(
+                dict(
+                    step=draft_step,
+                    contiguous=logits.is_contiguous(),
+                    shape=tuple(logits.shape),
+                    ctx_sum=float(logits[:num_contexts].abs().sum()),
+                )
+            )
+            # Simulate the grammar bitmask applied in place before sampling.
+            logits[:, BANNED] = float("-inf")
+
+    guided = FakeGuidedDecoder()
+    worker.guided_decoder = guided
+
+    sampled_per_step = []
+
+    def fake_sample_draft_tokens(gl, sm, bs, *, draft_step):
+        # The sampler must see the already-masked logits (mask-before-sample).
+        assert torch.all(gl[:, BANNED] == float("-inf"))
+        sm.draft_probs_last_dim = FULL_VOCAB  # simulate the full-vocab scatter
+        tokens = gl.argmax(dim=-1).to(torch.int32)
+        sampled_per_step.append(tokens.clone())
+        return tokens
+
+    monkeypatch.setattr(worker, "sample_draft_tokens", fake_sample_draft_tokens)
+
+    onehot_calls = {}
+    monkeypatch.setattr(
+        worker,
+        "write_context_onehot_draft_probs",
+        lambda sm, nc, ng, k, gv: onehot_calls.update(nc=nc, ng=ng, k=k, gv=gv),
+    )
+
+    input_ids = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+    position_ids = torch.zeros(batch_size, dtype=torch.long, device="cuda")
+    hidden = torch.zeros(batch_size, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    logits = torch.zeros(batch_size, vocab, device="cuda")
+
+    out = worker.forward(input_ids, position_ids, hidden, logits, attn_metadata, meta, dm)
+
+    # Matcher advanced once per draft position, in order 0..K-1.
+    assert guided.add_steps == list(range(K))
+    assert [r["step"] for r in guided.exec_records] == list(range(K))
+
+    # Each step's logits were the contiguous [batch, vocab] slice the bitmask
+    # kernel requires, with context rows zero-padded (they carry no draft).
+    for rec in guided.exec_records:
+        assert rec["contiguous"]
+        assert rec["shape"] == (batch_size, vocab)
+        assert rec["ctx_sum"] == 0.0
+
+    # Step 0's matcher seed is the last accepted token (accepted[:, 0], since
+    # num_accepted == 1); each later step is fed the previous step's full-batch
+    # sample.
+    assert torch.equal(guided.add_tokens[0], accepted[:, 0])
+    for k in range(1, K):
+        assert torch.equal(guided.add_tokens[k], sampled_per_step[k - 1])
+
+    # Context rows are one-hot-filled at the scatter width (draft_probs_last_dim),
+    # NOT the sharded gen_logits width.
+    assert onehot_calls == {"nc": num_contexts, "ng": num_gens, "k": K, "gv": FULL_VOCAB}
+
+    # Output excludes context rows and matches the per-step masked samples.
+    nd = out["next_draft_tokens"]
+    assert nd.shape == (batch_size, K)
+    assert torch.all(nd[:num_contexts] == 0)
+    gen_draft = nd[num_contexts:]
+    expected_gen = torch.stack([s[num_contexts:] for s in sampled_per_step], dim=1)
+    assert torch.equal(gen_draft, expected_gen)

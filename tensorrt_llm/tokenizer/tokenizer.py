@@ -40,8 +40,12 @@ except ImportError:
 
 # Aliases for built-in custom tokenizers.
 TOKENIZER_ALIASES = {
-    "deepseek_v32": "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
-    "deepseek_v4": "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
+    "deepseek_v32":
+    "tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer",
+    "deepseek_v4":
+    "tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer",
+    "mistral_common":
+    "tensorrt_llm._torch.models.checkpoints.mistral.tokenizer.MistralTokenizer",
 }
 
 TLLM_INCREMENTAL_DETOKENIZATION_BACKEND = os.environ.get(

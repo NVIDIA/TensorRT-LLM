@@ -24,7 +24,7 @@ function declaration in ``attentionOp.h`` (text/regex), and enforces:
    declared C++ type matches the source attribute's Python type at a
    coarse-category level (tensor / int / bool / float / list-of-X).
 3. Every dataclass field reachable from ``AttentionForwardArgs`` (including
-   nested dataclass sub-bags like ``SparsePrediction``) is consumed at
+   nested dataclass sub-bags like ``SparseRuntimeParams``) is consumed at
    the call site — directly, transitively via a @property of the
    containing class, or listed in ``_THOP_EXCLUDED_FIELDS``.
 4. Every kwarg passed as a literal constant matches an entry in
@@ -73,14 +73,14 @@ _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     "skip_softmax_threshold_scale_factor_decode": (
         "forward_args",
         (
-            "skip_softmax_kernel_params",
+            "sparse_runtime_params",
             "threshold_scale_factor_decode",
         ),
     ),
     "skip_softmax_threshold_scale_factor_prefill": (
         "forward_args",
         (
-            "skip_softmax_kernel_params",
+            "sparse_runtime_params",
             "threshold_scale_factor_prefill",
         ),
     ),
@@ -571,7 +571,7 @@ def _verify_consumed(cls, chains: set[tuple[str, ...]], excluded=frozenset()):
 def test_every_forward_args_field_is_consumed():
     """Recursively check that every dataclass field reachable from
     ``AttentionForwardArgs`` (including nested sub-bags such as
-    ``SparsePrediction``) is consumed at the call site, transitively
+    ``SparseRuntimeParams``) is consumed at the call site, transitively
     via @property where applicable, or listed in ``_THOP_EXCLUDED_FIELDS``.
     """
     _verify_consumed(

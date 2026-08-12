@@ -1,6 +1,7 @@
 @Library(['trtllm-jenkins-shared-lib@main']) _
 
-DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
+DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
 // LLM repository configuration
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
@@ -11,7 +12,7 @@ LLM_ROOT = "llm"
 def createKubernetesPodConfig(image, arch = "amd64")
 {
     def archSuffix = arch == "arm64" ? "arm" : "amd"
-    def jnlpImage = "urm.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
     def podConfig = [
         cloud: "kubernetes-cpu",
@@ -23,6 +24,8 @@ def createKubernetesPodConfig(image, arch = "amd64")
                 nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   - name: trt-llm
                     image: ${image}
@@ -89,7 +92,7 @@ pipeline {
                 container("trt-llm") {
                     script {
                         sh "pwd && ls -alh"
-                        trtllm_utils.checkoutSource(LLM_REPO, params.BRANCH, LLM_ROOT, false, false)
+                        trtllm_utils.checkoutSource(LLM_REPO, params.BRANCH, LLM_ROOT, true, false)
                         def commandsBase64 = params.COMMANDS.bytes.encodeBase64().toString()
                         sh """
                             cd ${LLM_ROOT}/jenkins/scripts/perf && python3 perf_sanity_triage.py \

@@ -74,8 +74,9 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
 MediaModality = Literal["image", "video", "audio"]
 
 # Output representations supported by `ImageMediaIO`:
-# `"pt"` -> `torch.Tensor`, `"pil"` -> `PIL.Image.Image`.
-_SUPPORTED_IMAGE_FORMATS = ("pt", "pil")
+# `"pt"` -> `torch.Tensor`, `"np"` -> uint8 HWC `numpy.ndarray`,
+# `"pil"` -> `PIL.Image.Image`.
+_SUPPORTED_IMAGE_FORMATS = ("pt", "np", "pil")
 
 # Output representations supported by `VideoMediaIO`. See
 # `_load_video_by_cv2` for the per-format contract.
@@ -345,6 +346,136 @@ def _get_cv2():
     return cv2
 
 
+# --- Reference-payload classification ----------------------------------------
+# The serve boundary routes a metadata-free reference payload (JSON base64
+# carries no filename or MIME type; multipart metadata is client-typed) to the
+# image or video slot by its container signature. Routing only, never
+# acceptance: for both modalities the worker's decoder is what accepts, and
+# its failure is reported as a client error. So the signature can never
+# disagree with what actually decodes, and the boundary never spends a full
+# decode — on an async request path — to answer a routing question.
+
+
+# ISO-BMFF brands that mark a still image or image sequence (HEIF/AVIF/AVC
+# image). `ftyp` identifies the ISO-BMFF *family*, not video — HEIC photos
+# (the iOS camera default) share it with MP4 — so these are split out and
+# rejected at the boundary instead of being sent to a video decoder that
+# cannot use them.
+#
+# Deliberately NOT an exhaustive image registry: an unfamiliar ISO-BMFF
+# still-image brand simply stays a video candidate and gets a 400 from the
+# worker's decoder, which is safe. Registered names per MP4RA
+# (https://mp4ra.org/registered-types/brands).
+_ISOBMFF_IMAGE_BRANDS = frozenset(
+    {
+        b"mif1",
+        b"mif2",
+        b"msf1",  # MIAF image / image sequence
+        b"heic",
+        b"heix",
+        b"heim",
+        b"heis",  # HEVC image
+        b"hevc",
+        b"hevx",
+        b"hevm",
+        b"hevs",  # HEVC image sequence
+        b"avif",
+        b"avis",  # AVIF image / sequence
+        b"avci",
+        b"avcs",  # AVC image / sequence
+    }
+)
+
+# Work bound, not a format rule. The declared box size is client-controlled,
+# so without a ceiling the scan below costs O(payload): 1.6 s of interpreter
+# time for a 64 MB buffer, on the serving event loop. This admits 1020
+# compatible brands against a registry holding a few hundred in total, so no
+# encoder output comes near it; real boxes are tens of bytes.
+_MAX_FTYP_BOX_BYTES = 4096
+
+
+def _isobmff_brands(data) -> Optional[frozenset]:
+    """Brands declared by a leading ``ftyp`` box, or ``None`` if undeterminable.
+
+    Layout per ISO/IEC 14496-12 — ``size`` [0:4], ``'ftyp'`` [4:8], then::
+
+        normal    major [8:12]   minor [12:16]  compatible from 16
+        size == 1 largesize [8:16], major [16:20], minor [20:24], compat from 24
+
+    ``None`` means "do not classify" and callers must treat the payload as
+    unrecognized rather than assuming video: the box is malformed, extends
+    past the payload, or exceeds the scan bound, and a partial scan could
+    miss an image brand late in the compatible-brand list.
+    """
+    buf = bytes(data[:_MAX_FTYP_BOX_BYTES])
+    if len(buf) < 16:
+        return None
+
+    size = int.from_bytes(buf[0:4], "big")
+    if size == 1:
+        # Extended size: the 64-bit largesize occupies 8:16, shifting the
+        # brands. Reading 8:12 as the major brand here is what makes naive
+        # parsers misclassify.
+        box_end, brands_at = int.from_bytes(buf[8:16], "big"), 16
+    elif size == 0:
+        box_end, brands_at = len(data), 8  # box runs to EOF
+    else:
+        box_end, brands_at = size, 8
+
+    if box_end > len(data) or box_end > _MAX_FTYP_BOX_BYTES:
+        return None  # truncated, or past the work bound — refuse to guess
+    # `FileTypeBox` is a major brand plus a mandatory `minor_version`,
+    # followed by whole compatible brands. A short or misaligned box is
+    # malformed; reject it rather than rounding down to what parses.
+    if box_end < brands_at + 8 or (box_end - brands_at) % 4:
+        return None
+
+    brands = {buf[brands_at : brands_at + 4]}
+    # Skip the 4-byte minor_version between the major and compatible brands.
+    for off in range(brands_at + 8, box_end - 3, 4):
+        brands.add(buf[off : off + 4])
+    return frozenset(brands)
+
+
+def is_isobmff_image_bytes(data) -> bool:
+    """True when the payload is an ISO-BMFF still image (HEIF/AVIF/AVC image).
+
+    Lets the boundary say "this format is unsupported, convert it" instead of
+    "this file is corrupt" — the payload is perfectly valid, we just do not
+    decode it.
+    """
+    if bytes(data[4:8]) != b"ftyp":
+        return False
+    brands = _isobmff_brands(data)
+    return bool(brands and brands & _ISOBMFF_IMAGE_BRANDS)
+
+
+def sniff_media_kind(data) -> Optional[str]:
+    """Classify a reference payload by container signature.
+
+    Returns ``"image"`` (PNG/JPEG, or an ISO-BMFF still-image brand such as
+    HEIF/AVIF), ``"video"`` (other ISO-BMFF/MP4 family, or AVI), or ``None``
+    for anything unrecognized.
+    """
+    header = bytes(data[:12])
+    if header.startswith(b"\x89PNG\r\n\x1a\n") or header.startswith(b"\xff\xd8\xff"):
+        return "image"
+    if header[4:8] == b"ftyp":
+        brands = _isobmff_brands(data)
+        if not brands:
+            # Box unreadable (truncated / malformed / past the work bound):
+            # classify nothing rather than defaulting to video on a partial scan.
+            return None
+        # AVIF requires `avif`/`avis` among the *compatible* brands, so the
+        # major brand alone is not sufficient to identify still images.
+        if brands & _ISOBMFF_IMAGE_BRANDS:
+            return "image"
+        return "video"
+    if header.startswith(b"RIFF") and header[8:12] == b"AVI ":
+        return "video"
+    return None
+
+
 def _select_cv2_stream_buffered_backend() -> Optional[int]:
     """Return a VideoCapture backend that can read from a Python `BytesIO`.
 
@@ -421,12 +552,13 @@ def _load_video_by_cv2(
     tempfile required. Callers that have no stream-buffered backend
     available should spill to a tempfile themselves and pass a path.
 
-    `format` controls the per-frame return type:
-      `"pt"`    - list[torch.Tensor], dtype=float32, shape=(C, H, W), range
-                  [0, 1]; rescaled and permuted to CHW here.
-      `"np"` - list[np.ndarray], dtype=uint8, shape=(H, W, 3); returned as
-                  decoded, leaving rescale/permute to the HF processor.
-      `"pil"`   - list[PIL.Image], one per sampled frame.
+    `format` controls the return type:
+      `"pt"`  - list[torch.Tensor], dtype=float32, shape=(C, H, W), range
+                [0, 1]; rescaled and permuted to CHW here.
+      `"np"`  - np.ndarray of shape (N, H, W, 3), dtype=uint8; a single
+                contiguous 4D buffer that HF video processors pass through
+                without an extra frame-by-frame copy.
+      `"pil"` - list[PIL.Image], one per sampled frame.
     """
     assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
 
@@ -477,42 +609,66 @@ def _load_video_by_cv2(
 
         indices = np.linspace(0, frame_count - 1, num_frames_to_sample, dtype=int).tolist()
 
-        # Sequential forward scan — grab() without per-frame seek
+        # Defer allocating the stacked buffer until the first frame is actually
+        # decoded: container metadata (CAP_PROP_FRAME_WIDTH/HEIGHT) can be 0
+        # or stale before the first decode for some codecs.
+        stacked_rgb: Optional[np.ndarray] = None
+        H = W = None
+
         target_set = set(indices)
         max_idx = indices[-1]
-        raw_frames: dict[int, np.ndarray] = {}
+        bgr_scratch: Optional[np.ndarray] = None
+        valid_indices: list[int] = []
+        # Log at most once per decode to avoid spamming when a whole stream is
+        # affected (e.g. every frame retrieves with a drifted shape).
+        skip_warned = False
         frame_idx = 0
-        while frame_idx <= max_idx:
-            grab_succeeded = vidcap.grab()
-            if not grab_succeeded:
-                break
+        while frame_idx <= max_idx and vidcap.grab():
             if frame_idx in target_set:
-                # cv2 decodes frames in BGR order; convert to RGB for downstream use
-                retrieve_succeeded, bgr_frame = vidcap.retrieve()
-                if retrieve_succeeded:
-                    raw_frames[frame_idx] = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+                # Reuse a single BGR buffer across retrieves; cv2 replaces its
+                # contents in place when the argument is shape-compatible.
+                ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
+                if ok:
+                    fh, fw = bgr_scratch.shape[:2]
+                    if stacked_rgb is None:
+                        H, W = fh, fw
+                        stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
+                    if (fh, fw) == (H, W):
+                        cv2.cvtColor(
+                            bgr_scratch,
+                            cv2.COLOR_BGR2RGB,
+                            dst=stacked_rgb[len(valid_indices)],
+                        )
+                        valid_indices.append(frame_idx)
+                    elif not skip_warned:
+                        logger.warning(
+                            f"Skipping frame {frame_idx} and subsequent size-drifted frames: "
+                            f"shape={(fh, fw)} differs from first decoded shape=({H}, {W})."
+                        )
+                        skip_warned = True
+                elif not skip_warned:
+                    logger.warning(
+                        f"Skipping frame {frame_idx} and subsequent retrieve failures: retrieve returned ok=False."
+                    )
+                    skip_warned = True
             frame_idx += 1
         vidcap.release()
 
-        if not raw_frames:
+        if stacked_rgb is None or not valid_indices:
             raise ValueError("Video has no readable frames.")
+        stacked_rgb = stacked_rgb[: len(valid_indices)]
 
-        valid_indices = [i for i in indices if i in raw_frames]
         if format == "pt":
-            # uint8 -> float32 + /255 rescale done once on the stacked buffer
-            # so the dtype conversion is a single memory pass and there's one
-            # Python torch call instead of one per frame.
-            stacked_uint8 = np.stack([raw_frames[i] for i in valid_indices])
-            stacked_f32 = stacked_uint8.astype(np.float32) * (1.0 / 255.0)
+            stacked_f32 = stacked_rgb.astype(np.float32)
+            stacked_f32 *= 1.0 / 255.0
             tensor_nchw = torch.from_numpy(stacked_f32).permute(0, 3, 1, 2).contiguous()
             if device != "cpu":
                 tensor_nchw = tensor_nchw.to(device)
             loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
         elif format == "np":
-            # uint8 HWC frames as-is; the HF processor rescales/permutes.
-            loaded_frames = [raw_frames[i] for i in valid_indices]
+            loaded_frames = stacked_rgb
         else:  # "pil"
-            loaded_frames = [Image.fromarray(raw_frames[i]) for i in valid_indices]
+            loaded_frames = [Image.fromarray(frame) for frame in stacked_rgb]
 
         metadata = {
             "total_num_frames": frame_count,
@@ -666,7 +822,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         return await loop.run_in_executor(BaseMediaIO._executor, fn, *args)
 
 
-class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor]]):
+class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     """I/O for the image modality."""
 
     def __init__(self, format: str = "pt", device: str = "cpu") -> None:
@@ -675,20 +831,25 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor]]):
         self._format = format
         self._device = device
 
-    def _postprocess(self, image: Image.Image) -> Union[Image.Image, torch.Tensor]:
+    def _postprocess(self, image: Image.Image) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         if self._format == "pt":
             from torchvision.transforms import ToTensor
 
             return ToTensor()(image).to(device=self._device)
+        if self._format == "np":
+            # uint8 HWC array; the downstream HF processor rescales/permutes.
+            return np.asarray(image)
         return image
 
-    def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor]:
+    def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(BytesIO(data)))
 
-    def load_base64(self, media_type: str, data: str) -> Union[Image.Image, torch.Tensor]:
+    def load_base64(
+        self, media_type: str, data: str
+    ) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(BytesIO(base64.b64decode(data))))
 
-    def load_file(self, url: str) -> Union[Image.Image, torch.Tensor]:
+    def load_file(self, url: str) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         return self._postprocess(_load_and_convert_image(Path(_normalize_file_uri(url))))
 
 

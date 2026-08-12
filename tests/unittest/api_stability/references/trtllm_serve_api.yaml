@@ -207,14 +207,14 @@ models:
         required: false
       length_penalty:
         kind: extension
-        type: float
-        default: 1.0
+        type: Optional[float]
+        default: null
         status: stable
         required: false
       early_stopping:
         kind: extension
-        type: bool
-        default: false
+        type: Optional[Union[bool, Literal['never']]]
+        default: null
         status: stable
         required: false
       stop_token_ids:
@@ -298,6 +298,12 @@ models:
       conversation_params:
         kind: extension
         type: Optional[ConversationParams]
+        default: null
+        status: prototype
+        required: false
+      priority:
+        kind: extension
+        type: Optional[float]
         default: null
         status: prototype
         required: false
@@ -672,14 +678,14 @@ models:
         required: false
       length_penalty:
         kind: extension
-        type: float
-        default: 1.0
+        type: Optional[float]
+        default: null
         status: stable
         required: false
       early_stopping:
         kind: extension
-        type: bool
-        default: false
+        type: Optional[Union[bool, Literal['never']]]
+        default: null
         status: stable
         required: false
       stop_token_ids:
@@ -801,6 +807,12 @@ models:
         type: Optional[Dict[str, Any]]
         default: null
         status: beta
+        required: false
+      priority:
+        kind: extension
+        type: Optional[float]
+        default: null
+        status: prototype
         required: false
 
   ChatCompletionResponseChoice:

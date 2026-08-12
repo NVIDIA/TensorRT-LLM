@@ -116,6 +116,22 @@ def _get_lora_task_id(req: LlmRequest):
     return (1, lora_id)
 
 
+def _get_forced_context_chunk_size(req: LlmRequest) -> int:
+    next_point = min(
+        (point for point in req.expect_snapshot_points if point > req.context_current_position),
+        default=None,
+    )
+    if next_point is None:
+        return req.context_remaining_length
+    next_position = min(next_point, req.prompt_len)
+    return max(0, next_position - req.context_current_position)
+
+
+def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
+    next_position = req.context_current_position + chunk_size
+    return next_position >= req.prompt_len or next_position in req.expect_snapshot_points
+
+
 class ScheduledRequests:
     """Scheduled requests separated into disjoint sets.
 
@@ -136,6 +152,16 @@ class ScheduledRequests:
     """Requests that are in the generation phase."""
     paused_requests: RequestList
     """Requests that are paused."""
+    added_inflight_req_ids: list[int]
+    """Request ids this batch inserted into the executor's inflight set.
+
+    Recorded by ``PyExecutor._add_inflight_ids`` so the paired
+    ``_remove_inflight_ids`` erases exactly what was added. The batch is trimmed
+    between the two calls -- ``ResourceManager.prepare_resources`` shrinks
+    over-budget context chunks at its end, which can move a request out of
+    ``context_requests_last_chunk`` -- so the ids are no longer derivable from
+    the request lists at removal time.
+    """
 
     def __init__(self):
         self.encoder_requests: RequestList = []
@@ -143,6 +169,7 @@ class ScheduledRequests:
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.added_inflight_req_ids: list[int] = []
 
     @property
     def is_generation_only(self) -> bool:
@@ -200,6 +227,25 @@ class ScheduledRequests:
 
 
 class RequestScheduler(ABC):
+    @property
+    @abstractmethod
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        """Return the half-open state range admitted to a forward batch."""
+        raise NotImplementedError
+
+    def is_request_in_schedulable_state(self, request: LlmRequest) -> bool:
+        """Return whether request state permits admission to a forward batch."""
+        if is_decoder_context_request_waiting_for_encoder_output(request):
+            return False
+        if request.state in (
+            LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+            LlmRequestState.DISAGG_GENERATION_INIT,
+            LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        ):
+            return False
+        schedule_from, schedule_to = self.scheduling_state_range
+        return schedule_from.value <= request.state_value < schedule_to.value
+
     @abstractmethod
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -376,10 +422,14 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         max_batch_size: int,
         max_num_tokens: int = None,
         ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
     ) -> None:
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
+        self.no_schedule_until_state = no_schedule_until_state
+        self.no_schedule_after_state = no_schedule_after_state
 
         ctx_chunk_config_cpp = None
         if ctx_chunk_config is not None:
@@ -387,7 +437,12 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1]
             )
 
-        self.impl = tb_internal.algorithms.MicroBatchScheduler(ctx_chunk_config_cpp, max_num_tokens)
+        self.impl = tb_internal.algorithms.MicroBatchScheduler(
+            ctx_chunk_config=ctx_chunk_config_cpp,
+            max_context_length=max_num_tokens,
+            no_schedule_until_state=no_schedule_until_state,
+            no_schedule_after_state=no_schedule_after_state,
+        )
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -410,6 +465,13 @@ class SimpleScheduler(RequestScheduler):
         super(SimpleScheduler, self).__init__()
         self.capacity_scheduler = capacity_scheduler
         self.micro_batch_scheduler = micro_batch_scheduler
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return (
+            self.micro_batch_scheduler.no_schedule_until_state,
+            self.micro_batch_scheduler.no_schedule_after_state,
+        )
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -664,6 +726,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             all_context_requests_fit = False
 
         if ctx_chunk_config and ctx_chunk_config.chunking_policy == ChunkingPolicy.FORCE_CHUNK:
+            # Run snapshot-boundary selection even when the full contexts fit.
             all_context_requests_fit = False
 
         # 3. Apply Chunking Strategy if needed
@@ -886,8 +949,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
     def _chunk_forced(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         """Mirrors the kFORCE_CHUNK specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
 
-        Every request is assigned exactly min(context_remaining_length, unit_size) tokens.
-        Requests that would exceed the capacity budget are zeroed out.
+        Requests advance to their next expected snapshot point. With no
+        remaining snapshot point, they consume the full remaining context.
+        Capacity-limited chunks are rounded down to a unit_size multiple.
 
         This policy is designed for linear attention / Mamba2 state caching, which doesn't support
         estimating reusable tokens, so we don't subtract them from the budget.
@@ -899,9 +963,14 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             )
         total_tokens = 0
         for req in requests:
-            req.context_chunk_size = min(req.context_remaining_length, unit_size)
-            if capacity is not None and total_tokens + req.context_chunk_size > capacity:
-                req.context_chunk_size = 0
+            assert isinstance(req.expect_snapshot_points, list)
+            chunk_size = _get_forced_context_chunk_size(req)
+            if self.max_context_length is not None and chunk_size > self.max_context_length:
+                chunk_size = (self.max_context_length // unit_size) * unit_size
+            if capacity is not None and total_tokens + chunk_size > capacity:
+                remaining_capacity = max(0, capacity - total_tokens)
+                chunk_size = (min(chunk_size, remaining_capacity) // unit_size) * unit_size
+            req.context_chunk_size = int(chunk_size)
             total_tokens += req.context_chunk_size
         assert capacity is None or total_tokens <= capacity
 
@@ -1842,6 +1911,13 @@ class SimpleUnifiedScheduler(RequestScheduler):
             max_num_tokens=max_num_tokens,
             ctx_chunk_config=py_chunk_config,
             no_schedule_until_state=no_schedule_until_state,
+        )
+
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return (
+            self.micro_batch_scheduler.no_schedule_until_state,
+            self.micro_batch_scheduler.no_schedule_after_state,
         )
 
     def schedule_request(

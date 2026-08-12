@@ -10,9 +10,13 @@ true-CFG path (dual cond/uncond forward plus the norm-preserving CFG
 combination) and the non-CFG path, on CPU.
 """
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
+from tensorrt_llm._torch.visual_gen.profiler import VisualGenProfiler
 
 
 class _RecordingTransformer(torch.nn.Module):
@@ -81,6 +85,11 @@ def _pipeline_with_test_doubles():
     pipe.vae_scale_factor = 8
     pipe.transformer = _RecordingTransformer()
     pipe.scheduler = _RecordingScheduler()
+    pipe.pipeline_config = SimpleNamespace(
+        cuda_graph=SimpleNamespace(enable=False), visual_gen_mapping=None
+    )
+    pipe._is_warmup = False
+    pipe._profiler = VisualGenProfiler()
     captured = {"encoded_prompts": []}
 
     def _encode_prompt(prompt, device, max_sequence_length):
@@ -121,6 +130,7 @@ def _pipeline_with_test_doubles():
     pipe._encode_prompt = _encode_prompt
     pipe._prepare_latents = _prepare_latents
     pipe._decode_latents = _decode_latents
+    pipe.cache_accelerator = None
     return pipe, captured
 
 
@@ -129,7 +139,7 @@ def _expanded_noise(values, *, batch_size, seq_len, dtype=torch.float32):
     return pattern.view(1, 1, -1).expand(batch_size, seq_len, -1)
 
 
-def test_forward_runs_without_true_cfg():
+def test_forward_runs_without_negative_prompt_cfg():
     pipe, captured = _pipeline_with_test_doubles()
 
     output = pipe.forward(
@@ -138,7 +148,7 @@ def test_forward_runs_without_true_cfg():
         height=32,
         width=48,
         num_inference_steps=3,
-        true_cfg_scale=4.0,
+        negative_prompt_cfg_scale=1.0,
         seed=123,
         max_sequence_length=16,
         sigmas=[1.0, 0.5, 0.25],
@@ -160,7 +170,37 @@ def test_forward_runs_without_true_cfg():
     )
 
 
-def test_forward_runs_true_cfg_pipeline():
+def test_forward_defaults_missing_negative_prompt_to_empty_string_for_cfg():
+    pipe, captured = _pipeline_with_test_doubles()
+
+    output = pipe.forward(
+        prompt=["a cat"],
+        negative_prompt=None,
+        height=32,
+        width=48,
+        num_inference_steps=2,
+        negative_prompt_cfg_scale=4.0,
+        seed=123,
+        max_sequence_length=16,
+        sigmas=[1.0, 0.5],
+    )
+
+    assert output.image.shape == (1, 32, 48, 3)
+    assert captured["encoded_prompts"] == [
+        (["a cat"], torch.device("cpu"), 16),
+        ([""], torch.device("cpu"), 16),
+    ]
+    assert len(pipe.transformer.calls) == 4
+    assert torch.all(pipe.transformer.calls[0]["encoder_hidden_states"] > 0)
+    assert torch.all(pipe.transformer.calls[1]["encoder_hidden_states"] > 0)
+    assert len(pipe.scheduler.step_calls) == 2
+    assert torch.allclose(
+        pipe.scheduler.step_calls[0]["noise_pred"],
+        _expanded_noise([1, 2, 3, 4], batch_size=1, seq_len=6),
+    )
+
+
+def test_forward_runs_negative_prompt_cfg_pipeline():
     pipe, captured = _pipeline_with_test_doubles()
 
     output = pipe.forward(
@@ -169,7 +209,7 @@ def test_forward_runs_true_cfg_pipeline():
         height=32,
         width=48,
         num_inference_steps=2,
-        true_cfg_scale=3.0,
+        negative_prompt_cfg_scale=3.0,
         seed=123,
         max_sequence_length=16,
         sigmas=[1.0, 0.5],
@@ -211,3 +251,39 @@ def test_forward_runs_true_cfg_pipeline():
     )
     assert torch.allclose(pipe.scheduler.step_calls[0]["noise_pred"], expected_cfg_noise)
     assert pipe.scheduler.step_calls[0]["return_dict"] is False
+
+
+def test_forward_honors_profile_step_range(tmp_path):
+    pipe, _ = _pipeline_with_test_doubles()
+    pipe._profiler.range = (frozenset({0}), frozenset({1}))
+    torch_profiler = MagicMock()
+    pipe._profiler._torch_profiler = torch_profiler
+    pipe._profiler._trace_path = str(tmp_path / "visual-gen-trace-rank-0.json")
+    cudart = MagicMock()
+
+    with (
+        patch(
+            "tensorrt_llm._torch.visual_gen.profiler.torch.cuda.cudart",
+            return_value=cudart,
+        ),
+        patch.object(torch.cuda, "synchronize"),
+    ):
+        pipe.forward(
+            prompt=["a cat"],
+            negative_prompt=None,
+            height=32,
+            width=48,
+            num_inference_steps=2,
+            negative_prompt_cfg_scale=1.0,
+            seed=123,
+            max_sequence_length=16,
+            sigmas=[1.0, 0.5],
+        )
+
+    cudart.cudaProfilerStart.assert_called_once_with()
+    torch_profiler.start.assert_called_once_with()
+    torch_profiler.stop.assert_called_once_with()
+    torch_profiler.export_chrome_trace.assert_called_once_with(
+        str(tmp_path / "visual-gen-trace-rank-0.json")
+    )
+    cudart.cudaProfilerStop.assert_called_once_with()

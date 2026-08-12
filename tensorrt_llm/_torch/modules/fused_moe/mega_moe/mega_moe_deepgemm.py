@@ -35,6 +35,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType
+from ..impl_contract import MoERunContext
 from ..interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
 from ..quantization import (
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
@@ -203,7 +204,6 @@ class MegaMoEDeepGemm(MoE):
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         init_load_balancer: bool = True,
-        without_comm: bool = False,
         # DG tunables. ``swiglu_limit_scalar`` mirrors the upstream MoE
         # kwarg; bridged to DG's ``activation_clamp`` at the call site.
         activation: str = "swiglu",
@@ -564,8 +564,9 @@ class MegaMoEDeepGemm(MoE):
                 self.routing_method.experts_per_token,
                 self.hidden_size,
                 self.intermediate_size,
-                True,
-                self.activation,
+                num_shared_experts=0,
+                mma_type="fp8xfp4",
+                activation=self.activation,
             )
             _MEGA_MOE_SYMM_BUFFER_CACHE[key] = cached
             # Log only on the first layer; deeper layers reuse the cache
@@ -651,13 +652,9 @@ class MegaMoEDeepGemm(MoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
+        ctx: MoERunContext,
         *,
-        output_dtype: Optional[torch.dtype] = None,
-        **unused_kwargs,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """Run the fused kernel with either BF16 or pre-quantized activations.
 
@@ -665,9 +662,12 @@ class MegaMoEDeepGemm(MoE):
         FP8+SF+topk SymmBuffer fields in one custom op. The fallback path
         keeps the original ``quantize_input`` + copy contract.
         """
-        assert not unused_kwargs, (
-            f"MegaMoEDeepGemm.run_moe got unexpected kwargs: {sorted(unused_kwargs)}"
-        )
+        del workspace  # The SymmBuffer is this backend's own workspace.
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
         dg = self._dg

@@ -202,8 +202,6 @@ deepseek-ai/DeepSeek-R1-0528:
   - quant_algo: FP8_BLOCK_SCALES
     kv_cache_quant_algo: FP8
     accuracy: 84.722
-deepseek-ai/DeepSeek-R1-Distill-Llama-70B:
-  - accuracy: 78.19
 deepseek-ai/DeepSeek-V3.2-Exp:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 88.2
@@ -247,6 +245,9 @@ Qwen3/Qwen3-30B-A3B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 79.53
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 79.53
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 79.78
   - quant_algo: W4A8_MXFP4_MXFP8
@@ -284,6 +285,9 @@ MiniMaxAI/MiniMax-M3-MXFP8:
 nvidia/MiniMax-M3-NVFP4:
   - quant_algo: MIXED_PRECISION
     accuracy: 83
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 81
 moonshotai/Kimi-K2-Instruct:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 87.65
@@ -331,8 +335,6 @@ nvidia/Llama-3_1-Nemotron-Ultra-253B-v1:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 83.36
-kanana-1.5-2.1b-instruct-2505:
-  - accuracy: 56.89
 mistralai/Ministral-8B-Instruct-2410:
   - accuracy: 66.35
   - quant_algo: FP8

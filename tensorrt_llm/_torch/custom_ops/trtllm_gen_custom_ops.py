@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -50,6 +65,19 @@ _MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV = (
 #   4. Otherwise clamp into the small pow2 ladder.
 _BALANCED = "balanced"
 _RANDOM = "random"
+
+
+def _select_explicit_fallback_tactic(
+        valid_tactics: List[List[int]]) -> List[int]:
+    if not valid_tactics:
+        raise RuntimeError(
+            "The FP8 block-scale MoE runner has no valid fallback tactic for "
+            "the current input shape.")
+
+    # Prefer the widest valid token tile so the fallback uses the largest
+    # routing workspace among the runner's candidates. Pick the lowest config
+    # index within that tile to keep cache-miss behavior deterministic.
+    return max(valid_tactics, key=lambda tactic: (tactic[0], -tactic[1]))
 
 
 def prepare_dummy_topk_and_hook(
@@ -128,6 +156,19 @@ def prepare_dummy_topk_and_hook(
     # experts and only ~1/ep_size of slots hit local.
     is_local = use_dp
 
+    def pad_with_remote_dummy_experts(topk_ids_local: torch.Tensor,
+                                      device: torch.device) -> torch.Tensor:
+        """Fill remaining slots with deterministic out-of-shard ids, mirroring
+        production rows when local_num_experts < top_k: a row's top_k picks
+        are distinct global experts, at most local_num_experts of them local.
+        """
+        num_tokens, k_local = topk_ids_local.shape
+        remote = (local_expert_offset + local_num_experts + torch.arange(
+            top_k - k_local, device=device, dtype=torch.int32)) % num_experts
+        return torch.cat(
+            [topk_ids_local,
+             remote.unsqueeze(0).expand(num_tokens, -1)], dim=1)
+
     def make_balanced_dummy_topk(
             num_tokens: int,
             device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -154,24 +195,26 @@ def prepare_dummy_topk_and_hook(
             n_target = local_num_experts if is_local else num_experts
             topk_ids[t, k] = (t + k * stride) % n_target  (+ local_expert_offset if is_local)
 
-        Stride is picked so each row's `top_k` entries stay distinct;
-        the assertion guards against degenerate (n_target < top_k) configs
-        that would produce in-row duplicates.
+        Stride is picked so each row's filled entries stay distinct; when
+        n_target < top_k (local regime only) the row is padded with
+        out-of-shard ids (see pad_with_remote_dummy_experts).
         """
         n_target = local_num_experts if is_local else num_experts
-        assert n_target >= top_k, (
-            f"make_balanced_dummy_topk requires n_target>={top_k}; "
-            f"got n_target={n_target}, is_local={is_local}, "
-            f"num_experts={num_experts}, local_num_experts={local_num_experts}")
-        stride = max(1, min(local_num_experts, n_target // top_k))
-        if stride * top_k > n_target:
-            stride = max(1, n_target // top_k)
-        base = torch.arange(top_k, device=device, dtype=torch.int32) * stride
+        assert is_local or n_target >= top_k, (
+            f"make_balanced_dummy_topk requires num_experts>={top_k} in "
+            f"the global regime; got num_experts={num_experts}")
+        k_fill = min(top_k, n_target)
+        stride = max(1, min(local_num_experts, n_target // k_fill))
+        if stride * k_fill > n_target:
+            stride = max(1, n_target // k_fill)
+        base = torch.arange(k_fill, device=device, dtype=torch.int32) * stride
         token_idx = torch.arange(num_tokens, device=device,
                                  dtype=torch.int32).unsqueeze(1)
         topk_ids = (base + token_idx) % n_target
         if is_local:
             topk_ids = topk_ids + local_expert_offset
+            if k_fill < top_k:
+                topk_ids = pad_with_remote_dummy_experts(topk_ids, device)
         topk_weights = torch.ones(num_tokens,
                                   top_k,
                                   dtype=torch.bfloat16,
@@ -261,9 +304,7 @@ def prepare_dummy_topk_and_hook(
             would observe.
         """
         if is_local:
-            assert local_num_experts >= top_k, (
-                f"random_local requires local_num_experts >= top_k; "
-                f"got local_num_experts={local_num_experts}, top_k={top_k}")
+            k_fill = min(top_k, local_num_experts)
             if (logits is None or logits.shape[0] != num_tokens
                     or logits.shape[-1] != local_num_experts):
                 logits = torch.randn(num_tokens,
@@ -272,9 +313,12 @@ def prepare_dummy_topk_and_hook(
                                      device=device)
             # Plain topk over local logits — bypasses the model's
             # routing_method on purpose (see docstring caveat re:
-            # grouped routings like DeepSeekV3 / Llama4).
-            topk_ids = torch.topk(logits.float(), top_k, dim=-1).indices.to(
+            # grouped routings like DeepSeekV3 / Llama4). If the shard has
+            # fewer than top_k experts, take all and pad (see helper).
+            topk_ids = torch.topk(logits.float(), k_fill, dim=-1).indices.to(
                 torch.int32) + local_expert_offset
+            if k_fill < top_k:
+                topk_ids = pad_with_remote_dummy_experts(topk_ids, device)
             topk_weights = torch.ones(num_tokens,
                                       top_k,
                                       dtype=torch.bfloat16,
@@ -814,12 +858,14 @@ class FP8BlockScaleMoEInputs:
 class FP8BlockScaleMoERunner(TunableRunner):
 
     runner_dict = dict()
+    fallback_tactic_dict = dict()
     tuning_config = None
 
     def __init__(
         self,
         num_experts: int,
         top_k: int,
+        num_fused_shared_experts: Optional[int],
         n_group: Optional[int],
         topk_group: Optional[int],
         intermediate_size: int,
@@ -835,6 +881,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
         self.num_experts = num_experts
         self.top_k = top_k
+        self.num_fused_shared_experts = num_fused_shared_experts
         self.n_group = n_group
         self.topk_group = topk_group
         self.intermediate_size = intermediate_size
@@ -856,8 +903,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
     # that influence tactic validity here. e.g. we are tuning FC1 and FC2 so the routing
     # type does not matter
     def unique_id(self):
-        return (self.top_k, self.intermediate_size, self.local_num_experts,
-                self.act_type)
+        return (self.top_k, self.num_fused_shared_experts,
+                self.intermediate_size, self.local_num_experts, self.act_type)
 
     def get_runner(self):
         instance_key = ()
@@ -865,6 +912,25 @@ class FP8BlockScaleMoERunner(TunableRunner):
             FP8BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FP8BlockScaleMoERunner()
         return FP8BlockScaleMoERunner.runner_dict[instance_key]
+
+    def get_fallback_tactic(self, hidden_size: int,
+                            num_tokens: int) -> List[int]:
+        """Deterministic tactic for the AutoTuner cache-miss path.
+
+        Enumerating the valid tactics walks every (tileN, config) pair through
+        ``isValidConfig``, and this runs on *every* forward call that misses
+        the profiling cache. The result depends only on the key below, so
+        memoize it the same way ``runner_dict`` memoizes the runner.
+        """
+        key = (self.top_k, self.num_fused_shared_experts, hidden_size,
+               self.intermediate_size, self.local_num_experts, num_tokens)
+        tactic = FP8BlockScaleMoERunner.fallback_tactic_dict.get(key)
+        if tactic is None:
+            tactic = tuple(
+                _select_explicit_fallback_tactic(
+                    self.get_runner().get_valid_configs(*key)))
+            FP8BlockScaleMoERunner.fallback_tactic_dict[key] = tactic
+        return list(tactic)
 
     def forward(
         self,
@@ -882,11 +948,11 @@ class FP8BlockScaleMoERunner(TunableRunner):
             args.hidden_states_scale, args.gemm1_weights,
             args.gemm1_weights_scale, args.gemm2_weights,
             args.gemm2_weights_scale, self.num_experts, self.top_k,
-            self.n_group, self.topk_group, self.intermediate_size,
-            self.local_expert_offset, self.local_num_experts,
-            self.routed_scaling_factor, self.routing_method_type, tactic,
-            args.topk_weights, args.topk_ids, self.gemm1_clamp_limit_value,
-            output)
+            self.num_fused_shared_experts, self.n_group, self.topk_group,
+            self.intermediate_size, self.local_expert_offset,
+            self.local_num_experts, self.routed_scaling_factor,
+            self.routing_method_type, tactic, args.topk_weights, args.topk_ids,
+            self.gemm1_clamp_limit_value, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -901,6 +967,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
         tactics = kernel_runner.get_valid_configs(
             self.top_k,
+            self.num_fused_shared_experts,
             hidden_size,
             self.intermediate_size,
             self.local_num_experts,
@@ -1007,6 +1074,7 @@ def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
                                gemm2_weights_scale: torch.Tensor,
                                num_experts: int,
                                top_k: int,
+                               num_fused_shared_experts: Optional[int],
                                n_group: Optional[int],
                                topk_group: Optional[int],
                                intermediate_size: int,
@@ -1026,6 +1094,7 @@ def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
     kernel_runner = FP8BlockScaleMoERunner(
         num_experts,
         top_k,
+        num_fused_shared_experts,
         n_group,
         topk_group,
         intermediate_size,
@@ -1079,15 +1148,16 @@ def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         input_tensors_for_tuner,
     )
 
+    if best_tactic == -1:
+        best_tactic = kernel_runner.get_fallback_tactic(hidden_states.shape[1],
+                                                        hidden_states.shape[0])
+
     input_tensors = input_tensors_for_tuner
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
-    result = kernel_runner(
-        input_tensors,
-        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
-        output=output)
+    result = kernel_runner(input_tensors, tactic=best_tactic, output=output)
     # When output is provided, the result is written in-place to output.
     # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
     # (custom op output cannot be the same tensor as input).
@@ -1108,6 +1178,7 @@ def _(routing_logits: torch.Tensor,
       gemm2_weights_scale: torch.Tensor,
       num_experts: int,
       top_k: int,
+      num_fused_shared_experts: Optional[int],
       n_group: Optional[int],
       topk_group: Optional[int],
       intermediate_size: int,

@@ -1,21 +1,11 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 2358,
-    "total_files": 271
+    "total_violations": 2096,
+    "total_files": 224
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
-  },
-  "benchmarks/utils/convert_nemo_dataset.py": {
-    "E741": 1
-  },
-  "benchmarks/utils/prepare_real_data.py": {
-    "D202": 1,
-    "D205": 1,
-    "D410": 7,
-    "D411": 8,
-    "D415": 1
   },
   "cpp/kernels/fmha_v2/setup.py": {
     "E712": 27,
@@ -80,15 +70,6 @@
     "D212": 1,
     "D300": 1
   },
-  "examples/dora/normalize_weights.py": {
-    "D200": 3,
-    "D202": 1,
-    "D205": 1,
-    "D212": 4
-  },
-  "examples/eval_long_context.py": {
-    "E711": 2
-  },
   "examples/infinitebench/compute_scores.py": {
     "D200": 1,
     "D205": 1,
@@ -136,110 +117,9 @@
     "D212": 1,
     "F821": 1
   },
-  "examples/mmlu.py": {
-    "D205": 1,
-    "D415": 1,
-    "E741": 1
-  },
-  "examples/models/contrib/chatglm-6b/tokenization_chatglm.py": {
-    "D205": 4,
-    "D210": 4,
-    "D212": 7,
-    "D301": 2,
-    "D415": 4
-  },
-  "examples/models/contrib/chatglm2-6b/tokenization_chatglm.py": {
-    "D205": 1,
-    "D210": 3,
-    "D212": 3,
-    "D415": 3
-  },
-  "examples/models/contrib/chatglm3-6b-32k/tokenization_chatglm.py": {
-    "D205": 1,
-    "D210": 3,
-    "D212": 3,
-    "D415": 3
-  },
-  "examples/models/contrib/sdxl/pipeline_stable_diffusion_xl.py": {
-    "D202": 1,
-    "D205": 6,
-    "D212": 10,
-    "D414": 1,
-    "D415": 2
-  },
-  "examples/models/core/multimodal/run.py": {
-    "E731": 1
-  },
-  "examples/models/core/qwen2audio/run.py": {
-    "D200": 1,
-    "D212": 1,
-    "D415": 1,
-    "E722": 1
-  },
-  "examples/models/core/qwen2audio/run_chat.py": {
-    "E722": 1
-  },
-  "examples/models/core/qwenvl/run.py": {
-    "E722": 1
-  },
-  "examples/models/core/qwenvl/run_chat.py": {
-    "E722": 1
-  },
-  "examples/ngram/run_dtm_ngram.py": {
-    "D200": 1,
-    "D205": 1,
-    "D212": 2,
-    "D415": 2,
-    "E741": 3
-  },
-  "examples/openai_triton/manual_plugin/build.py": {
-    "D202": 1,
-    "D205": 1,
-    "D212": 1,
-    "D300": 1
-  },
-  "examples/openai_triton/manual_plugin/fmha_triton.py": {
-    "D205": 1,
-    "D212": 1,
-    "D415": 1
-  },
-  "examples/openai_triton/manual_plugin/plugin.py": {
-    "D202": 1,
-    "D205": 1,
-    "D212": 1,
-    "D300": 1
-  },
-  "examples/openai_triton/plugin_autogen/build_engine.py": {
-    "D202": 2,
-    "D205": 2,
-    "D212": 2,
-    "D300": 2
-  },
-  "examples/openai_triton/plugin_autogen/kernel_config.py": {
-    "F403": 1,
-    "F405": 22
-  },
-  "examples/python_plugin/plugin_lib/lookup_plugin.py": {
-    "E731": 1
-  },
   "examples/quantization/quantize_mixed_precision_moe.py": {
     "E741": 1,
     "F601": 2
-  },
-  "examples/run.py": {
-    "E711": 4
-  },
-  "examples/scaffolding/contrib/mcp/e2b/e2bserver.py": {
-    "D202": 1,
-    "D205": 1,
-    "D411": 1
-  },
-  "examples/scaffolding/contrib/mcp/websearch/websearch.py": {
-    "D205": 1,
-    "D415": 1
-  },
-  "examples/summarize.py": {
-    "E741": 1
   },
   "jenkins/scripts/open_search_db.py": {
     "D205": 1,
@@ -401,18 +281,6 @@
     "D411": 1,
     "D415": 1
   },
-  "tensorrt_llm/bench/build/build.py": {
-    "D205": 1,
-    "D210": 2,
-    "D411": 1
-  },
-  "tensorrt_llm/bench/build/dataclasses.py": {
-    "D210": 3
-  },
-  "tensorrt_llm/bench/build/tuning.py": {
-    "D205": 2,
-    "D210": 2
-  },
   "tensorrt_llm/bench/dataclasses/reporting.py": {
     "D200": 1,
     "D212": 1
@@ -543,11 +411,11 @@
     "E731": 2
   },
   "tensorrt_llm/llmapi/disagg_utils.py": {
-    "D205": 2,
+    "D205": 1,
     "D210": 1,
-    "D212": 2,
-    "D403": 2,
-    "D415": 2,
+    "D212": 1,
+    "D403": 1,
+    "D415": 1,
     "F822": 2
   },
   "tensorrt_llm/llmapi/llm.py": {
@@ -555,8 +423,7 @@
     "D205": 4
   },
   "tensorrt_llm/llmapi/llm_args.py": {
-    "D205": 11,
-    "D212": 1
+    "D205": 10
   },
   "tensorrt_llm/llmapi/llm_utils.py": {
     "D200": 1
@@ -614,17 +481,6 @@
     "D415": 3,
     "E731": 1,
     "F821": 1
-  },
-  "tensorrt_llm/quantization/quantize_by_modelopt.py": {
-    "D200": 1,
-    "D205": 1,
-    "D208": 2,
-    "D212": 2,
-    "D300": 1,
-    "D415": 2,
-    "E722": 1,
-    "F601": 1,
-    "F821": 2
   },
   "tensorrt_llm/quantization/utils/fp4_utils.py": {
     "D200": 2,
@@ -684,14 +540,8 @@
   "tensorrt_llm/scaffolding/result.py": {
     "F821": 1
   },
-  "tensorrt_llm/scaffolding/scaffolding_llm.py": {
-    "PLE0302": 1
-  },
   "tensorrt_llm/scaffolding/task.py": {
     "F821": 1
-  },
-  "tensorrt_llm/scaffolding/worker.py": {
-    "PLE0302": 1
   },
   "tensorrt_llm/serve/disagg_auto_scaling.py": {
     "D205": 2,
@@ -708,15 +558,15 @@
     "D210": 1,
     "F811": 1
   },
+  "tensorrt_llm/serve/openai_server.py": {
+    "F821": 3
+  },
   "tensorrt_llm/serve/responses_utils.py": {
     "D200": 2,
-    "D205": 4,
-    "D212": 11
+    "D212": 7
   },
   "tensorrt_llm/serve/router.py": {
     "D205": 1,
-    "D212": 1,
-    "D300": 1,
     "D415": 7
   },
   "tensorrt_llm/serve/scripts/benchmark_dataset.py": {
@@ -796,9 +646,9 @@
     "D205": 3,
     "D210": 2,
     "D212": 5,
-    "D300": 7,
-    "D403": 6,
-    "D415": 12
+    "D300": 6,
+    "D403": 5,
+    "D415": 11
   },
   "tests/integration/defs/conftest.py": {
     "D200": 3,
@@ -807,9 +657,9 @@
     "D209": 1,
     "D212": 5,
     "D214": 1,
-    "D300": 92,
+    "D300": 91,
     "D403": 51,
-    "D415": 92,
+    "D415": 91,
     "E722": 2,
     "E741": 1
   },
@@ -821,8 +671,7 @@
     "E741": 2
   },
   "tests/integration/defs/disaggregated/test_disaggregated.py": {
-    "D205": 3,
-    "D209": 1,
+    "D205": 2,
     "D212": 5,
     "D415": 1
   },
@@ -842,78 +691,16 @@
     "D415": 15,
     "E722": 1
   },
-  "tests/integration/defs/examples/test_bert.py": {
-    "D300": 1,
-    "D415": 1
-  },
-  "tests/integration/defs/examples/test_bindings.py": {
-    "D300": 1,
-    "D415": 1
-  },
-  "tests/integration/defs/examples/test_chatglm.py": {
-    "D300": 1
-  },
-  "tests/integration/defs/examples/test_commandr.py": {
-    "D300": 1
-  },
   "tests/integration/defs/examples/test_gpt.py": {
     "D202": 3,
     "D300": 5,
     "D403": 1,
     "D415": 4
   },
-  "tests/integration/defs/examples/test_granite.py": {
-    "D202": 1,
-    "D300": 1
-  },
-  "tests/integration/defs/examples/test_internlm.py": {
-    "D300": 1,
-    "D415": 1
-  },
-  "tests/integration/defs/examples/test_llama.py": {
-    "D202": 2,
-    "D300": 4,
-    "D403": 2,
-    "D415": 2
-  },
-  "tests/integration/defs/examples/test_mamba.py": {
-    "D300": 2,
-    "D415": 2
-  },
-  "tests/integration/defs/examples/test_mistral.py": {
-    "D202": 1
-  },
-  "tests/integration/defs/examples/test_mixtral.py": {
-    "D300": 1,
-    "D403": 1
-  },
-  "tests/integration/defs/examples/test_multimodal.py": {
-    "D202": 1,
-    "D300": 2,
-    "D415": 2
-  },
-  "tests/integration/defs/examples/test_openai.py": {
-    "D300": 3,
-    "D403": 1,
-    "D415": 3
-  },
   "tests/integration/defs/examples/test_phi.py": {
     "D202": 1,
     "D300": 2,
     "D415": 2
-  },
-  "tests/integration/defs/examples/test_qwen.py": {
-    "D202": 1,
-    "D300": 2,
-    "D403": 1
-  },
-  "tests/integration/defs/examples/test_qwen2audio.py": {
-    "D300": 2,
-    "D415": 1
-  },
-  "tests/integration/defs/examples/test_qwenvl.py": {
-    "D300": 1,
-    "D415": 1
   },
   "tests/integration/defs/llmapi/test_llm_api_qa.py": {
     "D200": 1,

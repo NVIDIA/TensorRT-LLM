@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 import os
@@ -26,6 +29,9 @@ aux_stream_name_list = [
     'MoeOutputMemset',
     'MoeFc2Alpha',
     'EngramPrecompute',
+    'MlaIndexer',
+    'MlaIndexerAux',
+    'MlaCompressor',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -39,8 +45,8 @@ EventType = Enum(
 
 
 def is_gdn_replay_enabled() -> bool:
-    """Return whether GDN replay was explicitly enabled."""
-    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "0") == "1"
+    """Return whether GDN replay is enabled (default: enabled)."""
+    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "1") == "1"
 
 
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
@@ -66,6 +72,10 @@ class ActType_TrtllmGen(IntEnum):
     Relu2 = 1
     # act = x0 * sigmoid(x0)
     Silu = 2
+    # SiTu gated activation (Kimi K3), gate on x1:
+    #   act = (beta * tanh(x0 / beta)) * (alpha * tanh(x1 / alpha) * sigmoid(x1))
+    # alpha/beta come from the per-expert gemm1_alpha/gemm1_beta runtime buffers.
+    SiTu = 3
 
 
 # IMPORTANT: when adding a new activation type, please update this function.
@@ -110,13 +120,20 @@ def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
 
 
+def is_nvfp4_marlin_supported_sm(sm_version: int | None = None) -> bool:
+    """Return True on Ada Lovelace (SM89, e.g. L40S) and Hopper (SM90-99)."""
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return 89 <= sm_version < 100
+
+
 def is_nvfp4_marlin_enabled() -> bool:
-    is_hopper = get_sm_version() == 90
+    is_supported_sm = is_nvfp4_marlin_supported_sm()
     has_marlin_kernel = hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
     attrs = get_model_extra_attrs()
     is_marlin_specified = attrs is not None and "marlin" in attrs.get(
         'nvfp4_gemm_allowed_backends', [])
-    return is_hopper and has_marlin_kernel and is_marlin_specified
+    return is_supported_sm and has_marlin_kernel and is_marlin_specified
 
 
 @contextlib.contextmanager

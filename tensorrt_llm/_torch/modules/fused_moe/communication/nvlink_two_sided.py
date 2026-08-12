@@ -100,13 +100,26 @@ class NVLinkTwoSided(Communication):
         return True
 
     def checkpoint_prepare(self) -> None:
-        """Detach TRT-native two-sided workspaces after global quiescence."""
+        """Collectively detach two-sided workspaces after global quiescence.
+
+        Every rank must call this method symmetrically after all in-flight
+        dispatch/combine pairs using the workspaces have completed.
+        """
         if self._dispatch_state:
             raise RuntimeError("Cannot checkpoint during an active MoE All-to-All phase")
         MnnvlMoe.checkpoint_prepare()
 
     def checkpoint_restore(self, comm) -> None:
-        """Restore TRT-native two-sided workspaces and protocol state."""
+        """Collectively restore two-sided workspaces and protocol state.
+
+        Args:
+            comm: An mpi4py-like communicator exposing ``Get_rank()``,
+                ``Get_size()``, ``allgather()``, and ``barrier()``. Its local
+                rank and size must match the communicator used for the
+                original allocations. Every rank must call this method
+                symmetrically after all in-flight dispatch/combine pairs have
+                completed.
+        """
         MnnvlMoe.checkpoint_restore(comm)
         self._dispatch_state = {}
 

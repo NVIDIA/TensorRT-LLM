@@ -17,6 +17,7 @@ import asyncio
 import base64
 import os
 from io import BytesIO
+from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
 
@@ -58,6 +59,9 @@ def _assert_llm_envelope(
     assert isinstance(body["message"], str) and body["message"]
     if message_contains is not None:
         assert message_contains in body["message"], body["message"]
+
+
+_V2V_FIXTURE_MP4 = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
 
 
 def _make_dummy_image_tensor(height: int = 64, width: int = 64) -> torch.Tensor:
@@ -130,6 +134,7 @@ class MockVisualGen:
         should_fail: bool = False,
         batch_aware: bool = True,
         validation_error: Optional[ValueError] = None,
+        generate_error: Optional[BaseException] = None,
     ):
         from types import SimpleNamespace
 
@@ -139,6 +144,9 @@ class MockVisualGen:
         self._should_fail = should_fail
         self._batch_aware = batch_aware
         self._validation_error = validation_error
+        # Raised out of generate(): models an engine-side failure class,
+        # where validation_error models a coordinator preflight rejection.
+        self._generate_error = generate_error
         self._healthy = True
         self._req_counter = 0
         # Captured arguments of the most recent generate / generate_async call,
@@ -183,6 +191,8 @@ class MockVisualGen:
         self.last_params = params
         if self._validation_error is not None:
             raise self._validation_error
+        if self._generate_error is not None:
+            raise self._generate_error
         if self._should_fail:
             raise RuntimeError("Generation intentionally failed")
         n = getattr(params, "num_images_per_prompt", 1) if params else 1
@@ -300,13 +310,18 @@ class MockVisualGenResult:
 def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> TestClient:
     """Instantiate an OpenAIServer for VISUAL_GEN with a mocked generator.
 
-    We patch the ``VisualGen`` name inside the ``openai_server`` module so that
-    ``isinstance(generator, VisualGen)`` returns True for our mock.
+    The server detects VisualGen generators via ``_is_visual_gen_instance``
+    (a sys.modules probe, so plain LLM serving never imports visual_gen) and
+    caches the result in ``__init__``; patching the probe during construction
+    makes it recognize our mock.
     """
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
-    with patch("tensorrt_llm.serve.openai_server.VisualGen", MockVisualGen):
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
         server = OpenAIServer(
             generator=generator,
             model=model_name,
@@ -839,8 +854,49 @@ class TestVideoGenerationSync:
         # through as params.image (a filesystem path).
         params = video_client.mock_gen.last_params
         assert isinstance(params.image, str)
-        assert params.image.endswith("_reference.png")
+        assert params.image.endswith("_reference")
         assert os.path.exists(params.image)
+
+    def test_sync_video_generation_multipart_with_video_reference(self, video_client):
+        """A video ``input_reference`` rides through as the encoded payload on
+        the model-specific ``video`` extra param (V2V), byte-identical — the
+        serve never decodes video; the worker demuxes/NVDEC-decodes it.
+
+        Routed by container signature, so a checked-in H.264/MP4 fixture drives
+        the boundary directly.
+        """
+        payload = _V2V_FIXTURE_MP4.read_bytes()
+        with open(_V2V_FIXTURE_MP4, "rb") as f:
+            resp = video_client.post(
+                "/v1/videos/generations",
+                data={
+                    "prompt": "Continue the same scene",
+                    "size": "64x64",
+                    "seconds": "1.0",
+                    "fps": "8",
+                },
+                files={"input_reference": ("ref.mp4", f, "video/mp4")},
+            )
+        assert resp.status_code == 200
+        assert len(resp.content) > 0
+
+        # Video content must NOT land on params.image; it rides the
+        # model-specific ``video`` extra param as the untouched encoded bytes
+        # (the same intake the offline example's --video_path uses).
+        params = video_client.mock_gen.last_params
+        assert params.image is None
+        assert params.extra_params["video"] == payload
+
+    def test_sync_video_generation_undecodable_reference_400(self, video_client):
+        """Content matching no image or video container signature is rejected
+        at the boundary."""
+        resp = video_client.post(
+            "/v1/videos/generations",
+            data={"prompt": "x"},
+            files={"input_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
+        )
+        assert resp.status_code == 400
+        assert "not a recognized media container" in resp.text
 
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
@@ -867,6 +923,43 @@ class TestVideoGenerationSync:
         )
         assert resp.status_code == 500
         os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    def test_sync_video_capacity_failure_is_503(self, tmp_path, monkeypatch):
+        """A valid request the deployment cannot fit is retryable (503).
+
+        The engine signals capacity with ``MemoryError`` — a built-in, so the
+        error contract carries no VisualGen-specific exception type — and the
+        route must not fold it into the generic 500.
+        """
+        gen = MockVisualGen(
+            generate_error=MemoryError("Out of device memory while preparing generation")
+        )
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen)
+        resp = client.post(
+            "/v1/videos/generations",
+            json={"prompt": "big", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 503
+        assert "Out of device memory" in resp.text
+
+    def test_sync_video_client_failure_is_400(self, tmp_path, monkeypatch):
+        """Engine-side client errors stay 400, distinct from capacity.
+
+        The detail rides in the message — that is what a primitive exception
+        type buys instead of a taxonomy — so it must reach the client.
+        """
+        gen = MockVisualGen(generate_error=ValueError("reference has no decodable frames"))
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+        client = _create_server(gen)
+        resp = client.post(
+            "/v1/videos/generations",
+            json={"prompt": "bad ref", "size": "64x64", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 400
+        assert "no decodable frames" in resp.text
 
     def test_sync_video_unsupported_content_type(self, video_client):
         resp = video_client.post(

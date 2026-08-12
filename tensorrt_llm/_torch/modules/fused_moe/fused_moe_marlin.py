@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Marlin-based MoE backend for NVFP4 on SM90 (Hopper).
+"""Marlin-based MoE backend for NVFP4 on SM89-SM99 (Ada/Hopper).
 
 Uses a fused ``marlin_nvfp4_moe_gemm`` CUDA kernel that processes ALL experts
 in a single launch.  W4A16 approach: BF16 activations + FP4 weights,
@@ -25,12 +25,13 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, is_nvfp4_marlin_supported_sm
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, is_gated_activation, relu2
 from .fused_moe_cutlass import CutlassFusedMoE
+from .impl_contract import MoERunContext, MoEStaticCapability
 from .interface import _warn_and_return
 from .quantization import NVFP4MarlinFusedMoEMethod
 
@@ -44,7 +45,7 @@ def _has_fused_moe_kernel() -> bool:
 
 
 class MarlinFusedMoE(CutlassFusedMoE):
-    """MoE backend using Marlin W4A16 NVFP4 GEMM for SM90 (Hopper).
+    """MoE backend using Marlin W4A16 NVFP4 GEMM for SM89-SM99.
 
     Uses ``marlin_nvfp4_moe_gemm`` with BF16 activations to process all experts
     in a single kernel launch via sorted token dispatch. In-kernel topk_weights
@@ -52,9 +53,17 @@ class MarlinFusedMoE(CutlassFusedMoE):
     compatible. Requires the fused kernel to be built (no fallback path).
     """
 
+    # Restated rather than inherited from CutlassFusedMoE, whose exact-class
+    # LoRA comparison answered False for this backend.
+    capabilities = MoEStaticCapability(supports_moe_lora=False)
+
     _QUANT_SUPPORT_TABLE = {
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {90}),
+            "sm_constraint": ("in", set(range(89, 100))),
+            "dtypes": {torch.bfloat16},
+        },
+        QuantAlgo.W4A16_NVFP4: {
+            "sm_constraint": ("in", set(range(89, 100))),
             "dtypes": {torch.bfloat16},
         },
     }
@@ -68,14 +77,14 @@ class MarlinFusedMoE(CutlassFusedMoE):
     ) -> Tuple[bool, Optional[str]]:
         sm_version = get_sm_version()
 
-        if quant_algo != QuantAlgo.NVFP4:
+        if quant_algo not in cls._QUANT_SUPPORT_TABLE:
             return _warn_and_return(
-                f"MarlinFusedMoE only supports NVFP4 (got quant_algo={quant_algo})"
+                f"MarlinFusedMoE only supports NVFP4 or W4A16_NVFP4 (got quant_algo={quant_algo})"
             )
 
-        if sm_version != 90:
+        if not is_nvfp4_marlin_supported_sm(sm_version):
             return _warn_and_return(
-                f"MarlinFusedMoE only supports SM90 (Hopper), got SM{sm_version}"
+                f"MarlinFusedMoE only supports SM89-SM99 (Ada/Hopper), got SM{sm_version}"
             )
 
         if swiglu_gptoss_style:
@@ -103,31 +112,6 @@ class MarlinFusedMoE(CutlassFusedMoE):
 
     def _supports_load_balancer(self) -> bool:
         return False
-
-    def validate_configurable_moe(self, moe) -> None:
-        """Reject configs that require external-communication MoE dispatch.
-
-        Marlin is W4A16 (``quantize_input`` produces no activation scale) and
-        routes internally inside ``run_moe``. The host-side all-to-all
-        dispatch/combine path that ConfigurableMoE uses for attention-DP
-        expert parallelism needs the routing decided *before* dispatch and a
-        per-token scale payload, so it is incompatible with Marlin and fails
-        inside ``moe_a2a_dispatch``.
-
-        ConfigurableMoE only creates an external communication strategy when
-        ``enable_attention_dp and dp_size > 1`` (see CommunicationFactory);
-        ``moe.comm`` is not assigned yet when this hook runs, so check that
-        same condition via the mapping. Single-GPU, and TP/EP without
-        attention DP, are supported.
-        """
-        if moe.use_dp and moe.mapping.dp_size > 1:
-            raise ValueError(
-                "MarlinFusedMoE does not support external-communication MoE "
-                "(attention data parallelism combined with expert "
-                "parallelism): its W4A16 layout and internal routing are "
-                "incompatible with the all-to-all dispatch path. Use Marlin "
-                "single-node, or with TP/EP without attention DP."
-            )
 
     def _apply_activation(self, gemm1_out: torch.Tensor) -> torch.Tensor:
         """Apply the activation function to the gemm1 output.
@@ -168,20 +152,24 @@ class MarlinFusedMoE(CutlassFusedMoE):
     # Main entry point
     # ====================================================================
 
+    def supports_moe_output_in_alltoall_workspace(self):
+        # Overrides the CutlassFusedMoE "True": this kernel always allocates
+        # and returns its own output tensor, so a workspace-backed buffer
+        # would be filled by nobody while combine() read from it.
+        return False
+
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
-        is_sf_swizzled: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        tuner_num_tokens: Optional[int] = None,
-        tuner_top_k: Optional[int] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: Optional[bool] = None,
-        router_logits: Optional[torch.Tensor] = None,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
+        del workspace  # Marlin owns its own scratch (see _marlin_workspace).
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        router_logits = ctx.router_logits
+        output_dtype = ctx.output_dtype
         assert output_dtype is None or output_dtype == torch.bfloat16
         assert _has_fused_moe_kernel(), (
             "marlin_nvfp4_moe_gemm is not available. Rebuild TensorRT-LLM "
@@ -202,6 +190,15 @@ class MarlinFusedMoE(CutlassFusedMoE):
 
         local_n = self.expert_size_per_partition
         if local_n != self.num_experts:
+            # EP: non-local token-expert pairs are clamped to local expert 0
+            # with a zero final scale, so they still run through both GEMMs
+            # and are discarded at the combine.
+            # TODO(perf): skip them instead — e.g. mark non-local pairs with a
+            # sentinel expert id that moe_align_block_size drops. Requires
+            # bounds guards in moeAlignKernels.cu (the histogram and
+            # count_and_sort kernels index shared/cumsum buffers with the raw
+            # id) and zero-initializing unscheduled GEMM output rows before
+            # the index_add_ combine.
             slot_start = self.slot_start
             is_local = (token_selected_experts >= slot_start) & (
                 token_selected_experts < slot_start + local_n

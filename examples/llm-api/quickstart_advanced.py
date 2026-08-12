@@ -87,8 +87,8 @@ def add_llm_args(parser):
         type=str,
         default='AUTO',
         choices=[
-            'AUTO', 'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP', 'DEEPGEMM',
-            'CUTEDSL', 'TRITON'
+            'AUTO', 'CUTLASS', 'TRTLLM', 'VANILLA', 'DEEPGEMM', 'CUTEDSL',
+            'TRITON'
         ],
         help=
         'MoE backend to use. AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases.'
@@ -194,6 +194,11 @@ def add_llm_args(parser):
     parser.add_argument('--apply_chat_template',
                         default=False,
                         action='store_true')
+    parser.add_argument('--custom_tokenizer',
+                        type=str,
+                        default=None,
+                        help='Override the tokenizer. Accepts a built-in alias '
+                        " or a fully-qualified class import path.")
 
     # Sampling
     parser.add_argument("--max_tokens", type=int, default=64)
@@ -303,6 +308,8 @@ def setup_llm(args, **kwargs):
     if spec_decode_algo == 'MTP':
         if not args.use_one_model:
             print("Running MTP eagle with two model style.")
+        speculative_model = (args.draft_model_dir if args.draft_model_dir
+                             is not None else args.model_dir)
         spec_config = MTPDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
@@ -310,7 +317,10 @@ def setup_llm(args, **kwargs):
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
             mtp_eagle_one_model=args.use_one_model,
-            speculative_model=args.model_dir)
+            use_dynamic_tree=args.use_dynamic_tree,
+            dynamic_tree_max_topK=args.dynamic_tree_max_topK,
+            max_total_draft_tokens=args.max_total_draft_tokens,
+            speculative_model=speculative_model)
     elif spec_decode_algo == "EAGLE3":
         spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -387,6 +397,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        custom_tokenizer=args.custom_tokenizer,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1

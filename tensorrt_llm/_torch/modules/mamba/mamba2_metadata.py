@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
 from typing import Tuple
 
@@ -214,6 +215,23 @@ def cu_seqlens_to_chunk_indices_offsets(
 
 class Mamba2Metadata:
 
+    # Warmup-only knob: when set via ``force_initial_states_for_warmup``,
+    # ``prepare()`` forces ``has_initial_states_cpu[:num_contexts]`` to True so
+    # the ``HAS_INITSTATES=True`` variants of the SSD Triton kernels compile
+    # during warmup. Class-scoped (not env-var) so it cannot leak into real
+    # inference from a stray shell export or a forked worker.
+    _warmup_force_initial_states: bool = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def force_initial_states_for_warmup(cls):
+        prev = cls._warmup_force_initial_states
+        cls._warmup_force_initial_states = True
+        try:
+            yield
+        finally:
+            cls._warmup_force_initial_states = prev
+
     def __init__(self, max_batch_size: int, chunk_size: int):
         self.max_batch_size = max_batch_size
         self.chunk_size = chunk_size
@@ -243,6 +261,14 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
+        # int64 mirror of state_indices, refreshed once per prepare() so
+        # per-layer consumers that need long indices (index_select /
+        # index_copy_) do not each launch an int32->int64 cast kernel
+        # inside the decode CUDA graph (69 KDA layers x ~1.7us for Kimi K3).
+        self._state_indices_long = torch.zeros(max_batch_size,
+                                               dtype=torch.long,
+                                               device="cuda")
+        self.state_indices_long = self._state_indices_long[:0]
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
@@ -271,9 +297,20 @@ class Mamba2Metadata:
             return
         num_decodes = batch_size - num_contexts
         self.replay_num_decodes = num_decodes
-        self.replay_n_writes.zero_()
         if num_decodes == 0:
             return
+        if getattr(kv_cache_manager, 'use_gdn_cached_replay_all_layer_commit',
+                   False):
+            from tensorrt_llm._torch.modules.fla.cached_replay import \
+                CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+
+            # The fused small-batch GDN kernel commits its checkpoint in-layer
+            # and indexes cache metadata directly. Work items are only consumed
+            # by the partitioned replay + all-layer commit path.
+            if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
+                return
+
+        self.replay_n_writes.zero_()
         if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
             raise RuntimeError(
                 "Replay state update is enabled, but the KV cache manager "
@@ -380,6 +417,12 @@ class Mamba2Metadata:
                 self.state_indices[:batch_size].copy_(
                     self.state_indices_cpu[:batch_size], non_blocking=True)
 
+        # Refresh the int64 mirror once per step (outside the decode graph)
+        # so layers can index pools without a per-layer cast kernel.
+        self._state_indices_long[:batch_size].copy_(
+            self.state_indices[:batch_size])
+        self.state_indices_long = self._state_indices_long[:batch_size]
+
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)
 
@@ -419,6 +462,15 @@ class Mamba2Metadata:
                                                   device='cpu')
 
             self.has_initial_states_cpu[:num_contexts].copy_(initial_states_cpu)
+            # Warmup-only override: force HAS_INITSTATES=True path so the
+            # HAS_INITSTATES=True variants of _state_passing_fwd_kernel,
+            # _chunk_scan_fwd_kernel, and _chunk_state_varlen_kernel compile
+            # during warmup instead of the first real-request iter that hits
+            # chunked prefill with cached tokens. Gate is a class-scoped
+            # context manager (see ``force_initial_states_for_warmup``) so it
+            # cannot silently affect real inference.
+            if Mamba2Metadata._warmup_force_initial_states:
+                self.has_initial_states_cpu[:num_contexts].fill_(True)
             # Mirror CPU staging flags to the CUDA-side buffer asynchronously.
             self.has_initial_states[:num_contexts].copy_(
                 self.has_initial_states_cpu[:num_contexts], non_blocking=True)

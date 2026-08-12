@@ -28,10 +28,14 @@ control flow without constructing a real HF processor.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     _decide_do_sample_frames,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _fake_video(metadata, *, n_frames=8):

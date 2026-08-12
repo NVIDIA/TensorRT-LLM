@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import weakref
 from collections import namedtuple
@@ -27,7 +30,8 @@ from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
-from .sparse.params import SkipSoftmaxKernelParams, SparseMetadataParams
+from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
+                            SparseRuntimeParams)
 
 try:
     # Transformers v5
@@ -674,6 +678,7 @@ class RopeParams:
         rope_params = RopeParams()
 
         hf_rope_parameters = getattr(config, 'rope_parameters', None)
+        normalized_rope_parameters = hf_rope_parameters
         if hf_rope_parameters is not None:
             if set(hf_rope_parameters.keys()).issubset(
                     ALLOWED_ATTENTION_LAYER_TYPES):
@@ -681,17 +686,17 @@ class RopeParams:
                 # Pick "full_attention" as the default; callers override theta
                 # for sliding-window layers independently.
                 if "full_attention" in hf_rope_parameters:
-                    flat = hf_rope_parameters["full_attention"]
+                    normalized_rope_parameters = hf_rope_parameters[
+                        "full_attention"]
                 else:
                     fallback_key = next(iter(hf_rope_parameters))
                     logger.warning(
                         f"Per-layer-type rope_parameters has no 'full_attention' entry; "
                         f"falling back to '{fallback_key}'. Available layer types: "
                         f"{list(hf_rope_parameters.keys())}.")
-                    flat = hf_rope_parameters[fallback_key]
-                config.update(flat)
-            else:
-                config.update(hf_rope_parameters)
+                    normalized_rope_parameters = hf_rope_parameters[
+                        fallback_key]
+            config.update(normalized_rope_parameters)
 
         # get rotary parameters.
         hidden_size = config.hidden_size
@@ -700,6 +705,8 @@ class RopeParams:
         if not isinstance(head_dim, int):
             head_dim = hidden_size // num_attention_heads
         rope_scaling = getattr(config, 'rope_scaling', None)
+        if rope_scaling is None and normalized_rope_parameters is not None:
+            rope_scaling = normalized_rope_parameters
         rope_params.max_positions = config.max_position_embeddings
         rope_params.theta = get_hf_rope_theta(config, 10000.0)
         rope_percentage = (getattr(config, 'rotary_pct', None)
@@ -887,27 +894,6 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
-class SparsePrediction:
-    """Sparse KV / attention indices predicted by the framework backends.
-
-    RocketKV and DSA produce these from ``sparse_kv_predict`` /
-    ``sparse_attn_predict``, telling the attention op which KV tokens to keep
-    and which blocks to attend to. Backends that don't predict leave
-    ``AttentionForwardArgs.sparse_prediction`` at its default-constructed value
-    (all-``None`` / ``0`` fields).
-    """
-    sparse_kv_indices: Optional[torch.Tensor] = None
-    sparse_kv_offsets: Optional[torch.Tensor] = None
-    sparse_attn_indices: Optional[torch.Tensor] = None
-    sparse_attn_offsets: Optional[torch.Tensor] = None
-    sparse_attn_indices_block_size: int = 0
-    # DeepSeek-V4 sparse-MLA only: per-token compressed top-k lengths and the
-    # base pointer of the compressed KV cache pool (compress_ratio > 1).
-    sparse_mla_topk_lens: Optional[torch.Tensor] = None
-    compressed_kv_cache_pool_ptr: Optional[int] = None
-
-
-@dataclass(kw_only=True, slots=True)
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
@@ -960,17 +946,14 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
 
-    topk_indices: Optional[torch.Tensor] = None
-
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = None
 
-    sparse_prediction: SparsePrediction = field(
-        default_factory=SparsePrediction)
-    skip_softmax_kernel_params: SkipSoftmaxKernelParams = field(
-        default_factory=SkipSoftmaxKernelParams)
+    sparse_backend_args: Optional[SparseBackendForwardArgs] = None
+    sparse_runtime_params: SparseRuntimeParams = field(
+        default_factory=SparseRuntimeParams)
 
     @property
     def mask_type(self) -> int:

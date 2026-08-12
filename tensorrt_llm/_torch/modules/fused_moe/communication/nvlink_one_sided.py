@@ -418,6 +418,8 @@ class NVLinkOneSided(Communication):
 
         The local phase and watchdog checks are defense-in-depth only; they do
         not prove that every wrapper sharing this workspace is quiescent.
+        Every rank must call this method symmetrically after all in-flight
+        dispatch/combine pairs using the allocation have completed.
         """
         if self._dispatch_state.get("phase") != "idle":
             raise RuntimeError("Cannot checkpoint during an active MoE All-to-All phase")
@@ -432,6 +434,14 @@ class NVLinkOneSided(Communication):
 
         The low-level remap is idempotent, so every shared owner may call this
         method to reset its own protocol state.
+
+        Args:
+            comm: An mpi4py-like communicator exposing ``Get_rank()``,
+                ``Get_size()``, ``allgather()``, and ``barrier()``. Its local
+                rank and size must match the communicator used for the
+                original allocation. Every rank must call this method
+                symmetrically after all in-flight dispatch/combine pairs have
+                completed.
         """
         self.mnnvl_mem.checkpoint_restore(comm)
         refreshed_metainfo = torch.ops.trtllm.moe_a2a_initialize(

@@ -19,6 +19,7 @@ import fcntl
 import glob
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -28,7 +29,8 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import pytest
 import yaml
 from test_common.error_utils import report_error
-from test_common.http_utils import wait_for_endpoint_ready
+from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
+from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 
 from defs.trt_test_alternative import print_info
 from tensorrt_llm._utils import get_free_port
@@ -96,6 +98,54 @@ def ensure_bench_serving_repo() -> str:
 
 
 DEFAULT_TIMEOUT = 10800
+# Defaults for the server *ready* wait, separate from the whole-test timeout:
+# a server that is not healthy after this long is not going to be, and failing
+# here (with server-log tails, see wait_for_endpoint_ready) instead of at the
+# per-test pytest kill both saves GPU-hours and leaves a classifiable failure
+# in the CI log. The disagg bound is larger because its /health only answers
+# once EVERY ctx/gen worker has finished model load + autotune + warmup.
+# 1800 proved too tight for the largest agg cases: gb300 DeepSeek-V4-Pro
+# ctx_only (con4301) needs ~2000s of model load + autotune before /health
+# answers, so it failed readiness while the server was still coming up
+# (nvbugs/6517846). Raised to match the disagg bound.
+AGG_SERVER_READY_TIMEOUT = 3600
+DISAGG_SERVER_READY_TIMEOUT = 3600
+# GEN workers normally reap within seconds after benchmark_status is written.
+# Keep this well below the whole-test timeout so a stuck multi-node srun cannot
+# turn the optional log-flush synchronization into a pytest/Slurm cancellation.
+GEN_LOG_SENTINEL_TIMEOUT = 120
+
+
+def server_ready_timeout(default: int, mode: str) -> int:
+    """Ready-wait bound for one serving mode ("AGG" or "DISAGG").
+
+    Agg and disagg servers have very different init times (disagg's /health
+    answers only after every ctx/gen worker is up), so each mode has its own
+    override var, with the generic one as a shared fallback:
+    TRTLLM_TEST_<mode>_SERVER_READY_TIMEOUT > TRTLLM_TEST_SERVER_READY_TIMEOUT
+    > the built-in per-mode default.
+
+    Read at call time (not import time) so the env vars can be adjusted per
+    invocation, and parsed defensively so a malformed value cannot break
+    pytest collection of this module.
+    """
+    for var in (
+        f"TRTLLM_TEST_{mode.upper()}_SERVER_READY_TIMEOUT",
+        "TRTLLM_TEST_SERVER_READY_TIMEOUT",
+    ):
+        raw = os.environ.get(var)
+        if not raw:
+            continue
+        try:
+            timeout = int(raw)
+        except ValueError:
+            timeout = 0
+        if timeout > 0:
+            return timeout
+        print_info(f"Invalid {var}={raw!r}; ignoring it")
+    return default
+
+
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
 DISAGG_CONFIG_FOLDER = os.environ.get(
     "DISAGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/disaggregated"
@@ -173,20 +223,26 @@ def _scan_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
-) -> Tuple[List[Dict[int, Tuple[int, float]]], int]:
+) -> Tuple[List[Tuple[Dict[int, Tuple[int, float]], int, float]], int]:
     """Single-pass scan of the gen logs.
 
-    Returns (per_file_by_ngen, total_count):
-      - per_file_by_ngen: one dict per file that produced >=1 usable line,
-        mapping num_generation_tokens -> (count, Welford mean of
-        prev_device_step_time) over rows with iter >= 5 and a numeric
-        prev_device_step_time. Rows lacking num_generation_tokens on the same
-        line are skipped for the mean but still counted for settle detection.
+    Returns (per_file_scans, total_count):
+      - per_file_scans: one entry per file that produced >=1 usable row, each
+        a tuple (by_ngen, all_count, all_mean):
+          * by_ngen maps num_generation_tokens -> (count, Welford mean of
+            prev_device_step_time) over rows with iter >= 5, a numeric
+            prev_device_step_time, and a parseable num_generation_tokens on
+            the same line.
+          * all_count / all_mean are the count and Welford mean of
+            prev_device_step_time over ALL iter >= 5 numeric rows in the file,
+            including those whose num_generation_tokens did not parse. This is
+            the fallback aggregate used when a worker never emits a parseable
+            num_generation_tokens (nvbugs 6487036 / 6487040): PR #16298 began
+            requiring num_generation_tokens on every line, so a worker whose
+            states dict renders it as e.g. tensor(256) would drop to no
+            buckets and the metric would wrongly parse to None.
       - total_count: the number of iter >= 5 rows with a numeric
-        prev_device_step_time across all files. This is monotonic as new
-        lines flush across NFS (rows only get appended) so the caller can use
-        it as the settle signal without worrying that changes to a per-ngen
-        filter can make it drop.
+        prev_device_step_time across all files.
 
     Memory is O(distinct num_generation_tokens per file), a small constant
     in practice (steady-state plus a shrinking tail).
@@ -195,7 +251,7 @@ def _scan_gen_worker_device_step_time(
     (model load) write partial multibyte sequences that would otherwise raise
     UnicodeDecodeError mid-scan.
     """
-    per_file_by_ngen: List[Dict[int, Tuple[int, float]]] = []
+    per_file_scans: List[Tuple[Dict[int, Tuple[int, float]], int, float]] = []
     total_count = 0
     for i in range(num_gen_servers):
         log_path = os.path.join(output_dir, f"gen_server_{i}.log")
@@ -209,6 +265,8 @@ def _scan_gen_worker_device_step_time(
         )
 
         by_ngen: Dict[int, Tuple[int, float]] = {}
+        all_count = 0
+        all_mean = 0.0
         with open(log_path, errors="replace") as f:
             if seek_to:
                 f.seek(seek_to)
@@ -219,39 +277,48 @@ def _scan_gen_worker_device_step_time(
                 if int(m.group(1)) < 5:
                     continue
                 total_count += 1
+                dt = float(m.group(2))
+                # All-iter fallback aggregate (every usable row).
+                all_count += 1
+                all_mean += (dt - all_mean) / all_count
+                # Per-ngen bucket (only rows with a parseable ngen).
                 ngen_m = _NUM_GEN_TOKENS_RE.search(line)
                 if ngen_m is None:
                     continue
                 ngen = int(ngen_m.group(1))
-                dt = float(m.group(2))
                 count, mean = by_ngen.get(ngen, (0, 0.0))
                 count += 1
                 mean += (dt - mean) / count
                 by_ngen[ngen] = (count, mean)
-        if by_ngen:
-            per_file_by_ngen.append(by_ngen)
-    return per_file_by_ngen, total_count
+        if all_count:
+            per_file_scans.append((by_ngen, all_count, all_mean))
+    return per_file_scans, total_count
 
 
 def _mean_at_mode_ngen(
-    per_file_by_ngen: List[Dict[int, Tuple[int, float]]],
+    per_file_scans: List[Tuple[Dict[int, Tuple[int, float]], int, float]],
 ) -> Optional[float]:
-    """Aggregate per-file per-ngen buckets into a single mean.
+    """Aggregate per-file scans into a single mean.
 
     Within each file pick the num_generation_tokens value with the most
     iterations (the mode) and take its Welford mean; ties break to the
     largest ngen because the steady-state plateau is the upper of any tied
     clusters. Mode is more robust than strict == max — a one-off spike where
     a single iter's ngen briefly exceeds the sustained batch would otherwise
-    collapse the mean to 1-2 samples. Then average the per-file means across
-    workers. Returns None if no file had a usable row.
+    collapse the mean to 1-2 samples. When a file produced usable rows but no
+    parseable num_generation_tokens on any of them, fall back to the file's
+    all-iter mean so a present metric is never lost (nvbugs 6487036 /
+    6487040). Then average the per-file means across workers. Returns None if
+    no file had a usable row.
     """
     means: List[float] = []
-    for by_ngen in per_file_by_ngen:
-        if not by_ngen:
-            continue
-        _mode_ngen, (_count, mean) = max(by_ngen.items(), key=lambda kv: (kv[1][0], kv[0]))
-        means.append(mean)
+    for by_ngen, _all_count, all_mean in per_file_scans:
+        if by_ngen:
+            _mode_ngen, (_count, mean) = max(by_ngen.items(), key=lambda kv: (kv[1][0], kv[0]))
+            means.append(mean)
+        else:
+            # No parseable ngen anywhere in this worker; use the all-iter mean.
+            means.append(all_mean)
     if not means:
         return None
     return sum(means) / len(means)
@@ -261,8 +328,6 @@ def parse_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
-    settle_timeout: float = 90.0,
-    poll_interval: float = 3.0,
 ) -> Optional[float]:
     """Mean per-iter prev_device_step_time (ms) across all gen workers.
 
@@ -275,44 +340,27 @@ def parse_gen_worker_device_step_time(
     below the steady-state cost. Using the mode (rather than strict == max)
     is robust against a single iter whose ngen briefly spikes above the
     sustained batch, which would otherwise collapse the mean to 1-2 samples.
-    Returns None if no usable line is found in any file.
+    A worker whose num_generation_tokens never parses falls back to its
+    all-iter mean rather than being dropped to None. Returns None only if no
+    usable line is found in any file.
 
     When start_offsets is provided, only the bytes from start_offsets[i] to
     end-of-file are considered for gen_server_{i}.log — used to slice out a
     single client's iteration segment.
 
-    The gen worker writes gen_server_{i}.log on a different node than the
-    benchmark/pytest process, and the worker is kept alive (waiting on the
-    benchmark_status file) when this runs — so when the client returns, the
-    decode iterations are done but their log lines may still be flushing across
-    NFS. Reading once immediately can see zero iter>=5 lines and wrongly return
-    None. So poll the slice until the iter>=5 row count is non-zero AND
-    stable across two consecutive reads (flush drained), bounded by
-    settle_timeout. The settle signal is the raw iter>=5 row count (not the
-    mode-bucket count) because raw rows are monotonic across polls, whereas
-    the mode ngen — and therefore its bucket size — can shift while the tail
-    is still flushing.
+    The log is read exactly once. The caller (DisaggTestCmds.run_cmd) normally
+    waits for the gen_server_{i}.done sentinels first, so every gen srun has
+    exited and its &> aggregate log is fully flushed. If the dedicated
+    sentinel wait expires, the caller parses the current contents instead of
+    consuming the whole-test timeout; a missing metric then hard-fails before
+    upload. This replaces the earlier settle-poll heuristic, which could
+    accept a truncated prefix while the log was still flushing across NFS
+    (nvbugs 6487036 / 6487040 / 6487038).
     """
-    deadline = time.time() + settle_timeout
-    prev_count = -1
-    while True:
-        per_file_by_ngen, total_count = _scan_gen_worker_device_step_time(
-            output_dir, num_gen_servers, start_offsets
-        )
-        # Non-empty and unchanged since the last poll → the flush has settled.
-        if total_count > 0 and total_count == prev_count:
-            return _mean_at_mode_ngen(per_file_by_ngen)
-        if time.time() >= deadline:
-            if per_file_by_ngen:
-                print_info(
-                    f"parse_gen_worker_device_step_time: settle_timeout "
-                    f"({settle_timeout}s) reached with {total_count} line(s); "
-                    "returning current mean."
-                )
-                return _mean_at_mode_ngen(per_file_by_ngen)
-            return None
-        prev_count = total_count
-        time.sleep(poll_interval)
+    per_file_scans, _total_count = _scan_gen_worker_device_step_time(
+        output_dir, num_gen_servers, start_offsets
+    )
+    return _mean_at_mode_ngen(per_file_scans)
 
 
 def add_perf_metric_value(
@@ -549,7 +597,6 @@ class ServerConfig:
             "gpus_per_node",
             "match_mode",
             "client_configs",
-            "match_mode",
             "backend",
             "extra_llm_api_config_path",
             "server_env_var",
@@ -585,30 +632,7 @@ class ServerConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        return [
-            "s_model_name",
-            "l_tp",
-            "l_ep",
-            "l_pp",
-            "l_cp",
-            "l_gpus_per_node",
-            "l_max_batch_size",
-            "b_enable_attention_dp",
-            "s_serving_backend",
-            # kv_cache_config
-            "s_kv_cache_dtype",
-            # cache_transceiver_config
-            "s_cache_transceiver_backend",
-            # speculative_config
-            # Keep baseline matching on the legacy key during DB migration.
-            # l_max_draft_len is written to DB but not used for matching until
-            # backfill completes.
-            "s_spec_decoding_type",
-            "l_num_nextn_predict_layers",
-            "l_force_num_accepted_tokens",
-            # moe_config
-            "l_load_balancer_num_slots",
-        ]
+        return get_server_match_keys(self.match_mode)
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to database data."""
@@ -857,6 +881,11 @@ class ClientConfig:
         self.model_path = ""
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
+        # Derived from lane identity only (gen_only + concurrency == 1); do not
+        # set this from lane YAML. warmup is intentionally not a baseline match
+        # key, which is only sound while its value stays fully determined by
+        # benchmark_mode and concurrency.
+        self.warmup = client_config_data.get("warmup", False)
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
         # is now always passed; output-length stability with spec decoding comes from
@@ -935,11 +964,15 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
             "--ignore-eos",
         ]
+        # benchmark_serving's initial single-prompt test run (excluded from
+        # metrics) doubles as a warmup request; keep it disabled unless the
+        # lane requests one.
+        if not self.warmup:
+            benchmark_cmd.append("--no-test-input")
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
@@ -976,18 +1009,7 @@ class ClientConfig:
         return to_env_dict(self.env_vars)
 
     def to_match_keys(self) -> List[str]:
-        return [
-            "l_concurrency",
-            "l_iterations",
-            "l_isl",
-            "l_osl",
-            "d_random_range_ratio",
-            "s_backend",
-            "b_use_chat_template",
-            "b_streaming",
-            "b_use_nv_sa_benchmark",
-            "b_eos",
-        ]
+        return get_client_match_keys()
 
     def to_db_data(self) -> dict:
         """Convert ClientConfig to database data."""
@@ -1008,6 +1030,7 @@ class ClientConfig:
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
             "b_eos": self.spec_decoding,
+            "b_warmup": self.warmup,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -1032,6 +1055,7 @@ class DisaggConfig:
         model_name: str,
         hardware: dict,
         server_env_var: str,
+        internal_request_auth_key: str | None = None,
     ):
         self.name = name
         self.disagg_serving_type = disagg_serving_type
@@ -1042,6 +1066,7 @@ class DisaggConfig:
         self.model_name = model_name
         self.hardware = hardware
         self.server_env_var = server_env_var
+        self.internal_request_auth_key = internal_request_auth_key
         self.num_ctx_servers = hardware.get("num_ctx_servers", 0)
         self.num_gen_servers = hardware.get("num_gen_servers", 0)
 
@@ -1095,7 +1120,9 @@ class AggrTestCmds(NamedTuple):
 
                 wait_for_endpoint_ready(
                     f"http://{server_hostname}:{server_port}/health",
-                    timeout=self.timeout,
+                    timeout=min(
+                        self.timeout, server_ready_timeout(AGG_SERVER_READY_TIMEOUT, "AGG")
+                    ),
                     check_files=[server_file_path],
                     server_proc=server_proc,
                 )
@@ -1171,6 +1198,7 @@ class DisaggTestCmds(NamedTuple):
     output_dir: str
     test_output_dir: str
     model_name: str = ""
+    internal_request_auth_key: str = ""
     client_configs: Dict[int, List["ClientConfig"]] = {}
     # Per-server-index ServerConfig triples (ctx_config, gen_config, disagg_config).
     # Used by run_cmd() to merge per-config env vars into the appropriate
@@ -1235,6 +1263,7 @@ class DisaggTestCmds(NamedTuple):
             "hostname": self.hostname,
             "port": disagg_server_port,
             "backend": "pytorch",
+            "internal_request_auth_key": self.internal_request_auth_key,
             "context_servers": {
                 "num_instances": self.num_ctx_servers,
                 "urls": ctx_hostnames,
@@ -1270,8 +1299,25 @@ class DisaggTestCmds(NamedTuple):
             server_config = yaml.safe_load(f)
         return server_config["hostname"], server_config["port"]
 
-    def wait_for_benchmark_ready(self, benchmark_status_file: str):
-        """Wait for benchmark to complete."""
+    def wait_for_benchmark_ready(
+        self,
+        benchmark_status_file: str,
+        server_proc: subprocess.Popen | None = None,
+        server_log: str | None = None,
+    ):
+        """Wait for benchmark to complete, failing fast if our server dies.
+
+        The liveness check is event-driven (process exit), not a timeout: a
+        ctx/gen/disagg server that dies here raises within one loop iteration
+        with its log tail in the CI log, and the rank exits nonzero. Teardown
+        of the rest of the stage then follows from the launcher
+        (``srun --kill-on-bad-exit=1`` kills this rank's step) plus the
+        benchmark rank's bounded ready-wait failing fast on the dead endpoint
+        -- instead of every rank sitting in this loop for the full timeout.
+
+        The benchmark-done check runs FIRST so a server exiting just after a
+        completed benchmark cannot fail an otherwise-passing test.
+        """
         start_time = time.time()
         while True:
             if os.path.exists(benchmark_status_file):
@@ -1279,6 +1325,11 @@ class DisaggTestCmds(NamedTuple):
                     f"Benchmark status file found, terminating server {self.disagg_serving_type}"
                 )
                 break
+            fail_if_proc_died(
+                server_proc,
+                f"{self.disagg_serving_type} server",
+                [server_log] if server_log else None,
+            )
             elapsed_time = time.time() - start_time
             print_info(f"Waiting for benchmark status file, elapsed time: {elapsed_time}s")
             if elapsed_time > self.timeout:
@@ -1286,6 +1337,77 @@ class DisaggTestCmds(NamedTuple):
                     f"Timeout waiting for benchmark status file after {self.timeout}s"
                 )
             time.sleep(10)
+
+    def wait_for_gen_log_sentinels(
+        self,
+        timeout: float = GEN_LOG_SENTINEL_TIMEOUT,
+        poll_interval: float = 2.0,
+    ) -> bool:
+        """Block until every gen worker signals that its log is fully written.
+
+        Each gen worker's srun in slurm_launch_draft.sh redirects all of its
+        ranks' stdout to gen_server_{i}.log via `&>` and touches
+        gen_server_{i}.done only after that srun is reaped (fd closed, log
+        flushed). The benchmark writes benchmark_status *before* calling this,
+        which is what lets the gen srun exit — so this is not circular.
+
+        Returns True once all sentinels exist, or False if the dedicated
+        sentinel timeout is reached first. On False the caller falls back to
+        parsing the current log contents. The bounded wait prevents a stuck
+        multi-node srun from consuming the whole-test timeout and triggering
+        Slurm's kill-on-bad-exit cascade (nvbugs 6487036 / 6487040 / 6487038).
+        """
+        sentinels = [
+            os.path.join(self.test_output_dir, f"gen_server_{i}.done")
+            for i in range(self.num_gen_servers)
+        ]
+        start_time = time.monotonic()
+        while True:
+            missing = [p for p in sentinels if not os.path.exists(p)]
+            if not missing:
+                print_info("All gen worker log sentinels present; log flush complete.")
+                return True
+            elapsed_time = time.monotonic() - start_time
+            if elapsed_time > timeout:
+                print_info(
+                    f"Timeout ({timeout}s) waiting for gen worker log "
+                    f"sentinels {missing}; parsing current log contents."
+                )
+                return False
+            print_info(
+                f"Waiting for gen worker log sentinels {missing}, elapsed time: {elapsed_time:.0f}s"
+            )
+            time.sleep(poll_interval)
+
+    def _append_gen_worker_device_step_time(
+        self,
+        pending_device_step_time: List[dict],
+        outputs: List[str],
+    ) -> None:
+        """Wait for GEN log flush, then append each pending client metric.
+
+        A sentinel timeout is a bounded teardown fallback, not a reason to
+        discard metrics that are already present in the GEN logs. If the
+        fallback parse finds no usable metric, check_test_failure still fails
+        the gen_only run before results are uploaded.
+        """
+        if not pending_device_step_time:
+            return
+
+        self.wait_for_gen_log_sentinels()
+        for record in pending_device_step_time:
+            device_step_time_mean = parse_gen_worker_device_step_time(
+                self.test_output_dir,
+                self.num_gen_servers,
+                start_offsets=record["start_offsets"],
+            )
+            if device_step_time_mean is None:
+                continue
+            summary_line = f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
+            with open(record["benchmark_file_path"], "a") as benchmark_ctx:
+                benchmark_ctx.write(f"\n{summary_line}\n")
+            idx = record["output_index"]
+            outputs[idx] = f"{outputs[idx]}\n{summary_line}\n"
 
     def get_server_logs(self, server_idx: int) -> List[str]:
         server_logs = []
@@ -1359,7 +1481,11 @@ class DisaggTestCmds(NamedTuple):
                         stdout=server_ctx,
                         stderr=subprocess.STDOUT,
                     )
-                    self.wait_for_benchmark_ready(benchmark_status_file)
+                    self.wait_for_benchmark_ready(
+                        benchmark_status_file,
+                        server_proc=server_proc,
+                        server_log=server_file_path,
+                    )
             finally:
                 print_info(f"Server {self.disagg_serving_type} stopped")
                 server_proc.terminate()
@@ -1384,13 +1510,28 @@ class DisaggTestCmds(NamedTuple):
                         stdout=disagg_server_ctx,
                         stderr=subprocess.STDOUT,
                     )
-                    self.wait_for_benchmark_ready(benchmark_status_file)
+                    self.wait_for_benchmark_ready(
+                        benchmark_status_file,
+                        server_proc=disagg_server_proc,
+                        server_log=disagg_server_file_path,
+                    )
             finally:
                 print_info(f"Disagg server {self.disagg_serving_type} stopped")
                 disagg_server_proc.terminate()
                 disagg_server_proc.wait()
 
         elif self.disagg_serving_type == "BENCHMARK":
+            # Perf-benchmark clients whose gen-worker device step time must be
+            # parsed after the gen-log flush wait. The parse is deferred out of
+            # the client loop because gen_server_*.log keeps being written until
+            # the gen srun exits, and the gen srun only exits after
+            # benchmark_status is written in the finally below. Parsing inside
+            # the loop (as before) could read a truncated / not-yet-flushed log
+            # and report a wrong mean (nvbugs 6487036 / 6487040).
+            pending_device_step_time: List[dict] = []
+            collect_device_step_time = (
+                configs_for_idx is not None and configs_for_idx[2].benchmark_mode == "gen_only"
+            )
             try:
                 disagg_server_hostname, disagg_server_port = (
                     self._get_disagg_server_hostname_and_port(server_idx)
@@ -1398,7 +1539,9 @@ class DisaggTestCmds(NamedTuple):
 
                 wait_for_endpoint_ready(
                     f"http://{disagg_server_hostname}:{disagg_server_port}/health",
-                    timeout=self.timeout,
+                    timeout=min(
+                        self.timeout, server_ready_timeout(DISAGG_SERVER_READY_TIMEOUT, "DISAGG")
+                    ),
                     check_files=self.get_server_logs(server_idx),
                 )
 
@@ -1420,11 +1563,15 @@ class DisaggTestCmds(NamedTuple):
                         )
                         print_info(f"Starting benchmark. cmd is {client_cmd_with_port}")
 
-                        # Snapshot gen_server log sizes so the per-client
-                        # average covers only iterations driven by this client.
-                        gen_log_start_offsets = gen_worker_log_sizes(
-                            self.test_output_dir, self.num_gen_servers
-                        )
+                        # Snapshot gen_server log sizes so the gen_only
+                        # per-client average covers only iterations driven by
+                        # this client. Other modes do not emit this metric and
+                        # must not wait for the GEN teardown sentinel.
+                        gen_log_start_offsets = None
+                        if collect_device_step_time:
+                            gen_log_start_offsets = gen_worker_log_sizes(
+                                self.test_output_dir, self.num_gen_servers
+                            )
 
                         bench_env = copy.deepcopy(os.environ)
                         if client_config:
@@ -1438,20 +1585,18 @@ class DisaggTestCmds(NamedTuple):
                         with open(benchmark_file_path, "w") as benchmark_ctx:
                             benchmark_ctx.write(output)
 
-                        # Only gen_only emits prev_device_step_time; other
-                        # modes yield None and we skip writing the line.
-                        device_step_time_mean = parse_gen_worker_device_step_time(
-                            self.test_output_dir,
-                            self.num_gen_servers,
-                            start_offsets=gen_log_start_offsets,
-                        )
-                        if device_step_time_mean is not None:
-                            summary_line = f"Average Per Iter Device Step Time (ms): {device_step_time_mean:.2f}"
-                            with open(benchmark_file_path, "a") as benchmark_ctx:
-                                benchmark_ctx.write(f"\n{summary_line}\n")
-                            output = f"{output}\n{summary_line}\n"
-
                         outputs.append(output)
+                        if collect_device_step_time:
+                            # Defer the gen-worker device-step-time parse until
+                            # the gen logs are flushed (see below); remember
+                            # where to write the summary back.
+                            pending_device_step_time.append(
+                                {
+                                    "output_index": len(outputs) - 1,
+                                    "benchmark_file_path": benchmark_file_path,
+                                    "start_offsets": gen_log_start_offsets,
+                                }
+                            )
                     else:
                         print_info(
                             f"Skipping perf benchmark for client {client_idx}: "
@@ -1484,6 +1629,15 @@ class DisaggTestCmds(NamedTuple):
             finally:
                 with open(benchmark_status_file, "w") as status_file:
                     status_file.write("Done")
+
+            # benchmark_status is written, so the gen workers can now stop and
+            # their srun will exit and drop gen_server_{i}.done. Wait once for
+            # those sentinels (bounded independently of the whole-test timeout),
+            # then parse each benchmark client's gen-worker device step time a
+            # single time. A timeout falls back to the current log contents.
+            # Only gen_only runs populate this queue; other modes skip both the
+            # sentinel wait and device-step-time parsing.
+            self._append_gen_worker_device_step_time(pending_device_step_time, outputs)
 
         return outputs
 
@@ -1756,6 +1910,7 @@ class PerfSanityTestConfig:
         )
         server_env_var = environment.get("server_env_var", "")
         client_env_var = environment.get("client_env_var", "")
+        internal_request_auth_key = self._resolve_internal_request_auth_key(config)
 
         # Parse concurrency_list - can be string or list
         concurrency_str = benchmark.get("concurrency_list", "1")
@@ -1797,6 +1952,7 @@ class PerfSanityTestConfig:
         else:
             # For e2e and gen_only modes - create ctx and gen server configs
             ctx_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1806,6 +1962,7 @@ class PerfSanityTestConfig:
             }
 
             gen_server_config_data = {
+                "internal_request_auth_key": internal_request_auth_key,
                 "concurrency": concurrency_values[0],
                 "name": f"{benchmark_mode}-{config_file_base_name}",
                 "model_name": model_name,
@@ -1827,6 +1984,7 @@ class PerfSanityTestConfig:
                 model_name=model_name,
                 hardware=hardware,
                 server_env_var=server_env_var,
+                internal_request_auth_key=internal_request_auth_key,
             )
 
             # server_configs is a list with one element (tuple of ctx, gen, disagg config)
@@ -1867,6 +2025,15 @@ class PerfSanityTestConfig:
                 "use_nv_sa_benchmark": use_nv_sa_benchmark,
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
+                # gen_only measures a single round (iterations forced to 1
+                # above), so one-time costs like the cache transceiver's lazy
+                # connection setup would otherwise land entirely on the
+                # measured TTFT. Scoped to concurrency == 1: the gen executor's
+                # fill gate (TLLM_BENCHMARK_REQ_QUEUES_SIZE) only opens once
+                # `concurrency` requests are queued, so a lone warmup request
+                # would deadlock higher-concurrency lanes — which amortize the
+                # cold start anyway.
+                "warmup": benchmark_mode == "gen_only" and concurrency == 1,
             }
             client_config = ClientConfig(
                 client_config_data,
@@ -1877,6 +2044,32 @@ class PerfSanityTestConfig:
             client_configs.append(client_config)
 
         self.server_client_configs = {0: client_configs}
+
+    def _resolve_internal_request_auth_key(self, config: dict) -> str:
+        explicit_key = config.get("internal_request_auth_key")
+        if explicit_key:
+            return explicit_key
+
+        test_output_dir = os.path.join(self._output_dir, self._test_param_labels)
+        os.makedirs(test_output_dir, exist_ok=True)
+        key_path = os.path.join(test_output_dir, "internal_request_auth_key.txt")
+        lock_path = f"{key_path}.lock"
+
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                if os.path.exists(key_path):
+                    with open(key_path, "r") as key_file:
+                        internal_request_auth_key = key_file.read().strip()
+                    if internal_request_auth_key:
+                        return internal_request_auth_key
+
+                internal_request_auth_key = secrets.token_hex(32)
+                with open(key_path, "w") as key_file:
+                    key_file.write(f"{internal_request_auth_key}\n")
+                return internal_request_auth_key
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     def get_commands(self):
         """Get commands based on runtime and benchmark_mode."""
@@ -1990,6 +2183,7 @@ class PerfSanityTestConfig:
             output_dir=output_dir,
             test_output_dir=test_output_dir,
             model_name=disagg_config.model_name,
+            internal_request_auth_key=disagg_config.internal_request_auth_key,
             client_configs=self.server_client_configs,
             server_configs=list(self.server_configs),
         )

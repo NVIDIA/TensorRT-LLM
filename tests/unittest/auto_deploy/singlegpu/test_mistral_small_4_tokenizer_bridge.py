@@ -17,6 +17,9 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
+
 _SOURCE_MODEL = "mistralai/Mistral-Small-4-119B-2603"
 
 
