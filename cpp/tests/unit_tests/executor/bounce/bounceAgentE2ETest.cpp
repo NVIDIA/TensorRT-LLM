@@ -155,6 +155,7 @@ void clearBounceEnv()
     unsetenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES");
     unsetenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES");
     unsetenv("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST");
+    unsetenv("TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES");
     unsetenv("TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS");
 }
 } // namespace
@@ -262,6 +263,67 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     b->shutdown();
     cudaFree(dSrc);
     cudaFree(dDst);
+    clearBounceEnv();
+}
+
+// A non-power-of-two arena can clamp the effective chunk cap below the configured cap. A descriptor
+// between those limits must use ordinary NIXL instead of entering bounce and failing plan creation.
+TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "1", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT", "1", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES", "98304", 1); // configured 96 KiB
+    setenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", "98304", 1);     // buddy capacity is 64 KiB
+    setenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", "256", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES", "1048576", 1);
+
+    std::unique_ptr<kvc::NixlTransferAgent> a;
+    std::unique_ptr<kvc::NixlTransferAgent> b;
+    try
+    {
+        a = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{"capAgentA", true, false, true});
+        b = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{"capAgentB", true, false, true});
+    }
+    catch (std::exception const& e)
+    {
+        clearBounceEnv();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+    }
+
+    auto bufs = makeAgentBufs(/*nDescs=*/1, /*descBytes=*/80 * 1024, /*seed=*/8);
+    auto req = makeReq(bufs, "capAgentB");
+    a->registerMemory(req.getSrcDescs());
+    b->registerMemory(req.getDstDescs());
+    a->loadRemoteAgent("capAgentB", b->getLocalAgentDesc());
+
+    auto status = a->submitTransferRequests(req);
+    ASSERT_NE(status, nullptr);
+    kvc::TransferState state = kvc::TransferState::kIN_PROGRESS;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        state = status->wait(100);
+        if (state != kvc::TransferState::kIN_PROGRESS)
+        {
+            break;
+        }
+    }
+    EXPECT_EQ(state, kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(a->getBounceSubmitCount(), 0);
+    EXPECT_TRUE(verifyAgentBufs(bufs));
+    EXPECT_TRUE(status->release());
+    status.reset();
+
+    a->deregisterMemory(req.getSrcDescs());
+    b->deregisterMemory(req.getDstDescs());
+    a->shutdown();
+    b->shutdown();
+    cudaFree(bufs.src);
+    cudaFree(bufs.dst);
     clearBounceEnv();
 }
 
