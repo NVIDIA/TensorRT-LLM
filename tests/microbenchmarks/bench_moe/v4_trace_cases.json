@@ -1,0 +1,81 @@
+{
+  "_comment": "Auto-derived from a layer-wise nsys trace by tools/gen_module_cases.py. Regenerate rather than hand-edit. share_of_iteration is that shape's fraction of one decode iteration's GPU time on the traced run.",
+  "source": {
+    "artifact": "artifacts\\b40\\lwb",
+    "rank": 0
+  },
+  "workload": {
+    "model": "DeepSeek-V4-Flash-Base",
+    "moe_backend": "DEEPGEMM",
+    "run_type": "GEN",
+    "batch_size": 128,
+    "seq_len_q": 1,
+    "num_tokens": 128,
+    "ep_size": 4,
+    "layer_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "use_cuda_graph": true,
+    "enable_attention_dp": true
+  },
+  "experts_per_rank": 64,
+  "gemm_shapes": [
+    {
+      "N": 4096,
+      "K": 4096,
+      "num_groups": 64,
+      "gemm_type": "MGroupedMasked",
+      "dtype_in": "fp8_e4m3",
+      "dtype_out": "bf16",
+      "share_of_iteration": 0.3225,
+      "modules": [
+        "DeepseekV4MoE/MoE"
+      ]
+    },
+    {
+      "N": 4096,
+      "K": 2048,
+      "num_groups": 64,
+      "gemm_type": "MGroupedMasked",
+      "dtype_in": "fp8_e4m3",
+      "dtype_out": "bf16",
+      "share_of_iteration": 0.1741,
+      "modules": [
+        "DeepseekV4MoE/MoE"
+      ]
+    },
+    {
+      "N": 4096,
+      "K": 2048,
+      "num_groups": 1,
+      "gemm_type": "Normal",
+      "dtype_in": "fp8_e4m3",
+      "dtype_out": "bf16",
+      "share_of_iteration": 0.0183,
+      "modules": [
+        "DeepseekV4MoE/GatedMLP"
+      ]
+    },
+    {
+      "N": 4096,
+      "K": 4096,
+      "num_groups": 1,
+      "gemm_type": "Normal",
+      "dtype_in": "fp8_e4m3",
+      "dtype_out": "bf16",
+      "share_of_iteration": 0.0162,
+      "modules": [
+        "DeepseekV4MoE/GatedMLP"
+      ]
+    }
+  ],
+  "derived_dims": {
+    "hidden_size": 4096,
+    "intermediate_size": 2048,
+    "consistent": true,
+    "check": "up.N(4096) == 2*intermediate(4096) and down.N(4096) == hidden(4096)"
+  }
+}
