@@ -35,6 +35,9 @@ LLM_DOCKER_IMAGE = env.dockerImage
 // Always use x86_64 image for agent
 AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64").replace("sbsa", "x86_64")
 
+// K8s secret in namespace sw-tensorrt for pulling from artifactory.nvidia.com
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
+
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
 // Literals for easier access.
@@ -105,10 +108,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (TRTLLM_VERSION_OVERRIDE): null,
 ]
 
 // TODO: Move common variables to an unified location
@@ -224,6 +230,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 - "qa_only"
 ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   ${containerConfig}
                     env:
@@ -361,7 +369,7 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
     })
 }
 
-def prepareLLMBuild(pipeline, config)
+def prepareLLMBuild(pipeline, config, versionOverride)
 {
     def buildFlags = BUILD_CONFIGS[config]
     def tarName = buildFlags[TARNAME]
@@ -369,14 +377,16 @@ def prepareLLMBuild(pipeline, config)
     def is_linux_x86_64 = config.contains("linux_x86_64")
     def artifacts = ["${tarName}": tarName]
     def runner = {
-        runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
+        runLLMBuild(
+            pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride)
     }
 
     return [artifacts, runner]
 
 }
 
-def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
+def runLLMBuild(
+    pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride)
 {
     // Step 1: cloning tekit source code
     sh "pwd && ls -alh"
@@ -420,9 +430,15 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
 
     def buildJobs = buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS
 
-    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+    withEnv([
+        "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
+        "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
+    ]) {
+        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
+            sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        }
     }
+    sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
 
@@ -554,17 +570,24 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         wheelDockerImage = env.dockerImage
     }
 
+    def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     buildConfigs = [
         "Build TRT-LLM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
+            pipeline,
+            cpu_arch == AARCH64_TRIPLE ?
+                CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA,
+            versionOverride),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
+            pipeline,
+            cpu_arch == AARCH64_TRIPLE ?
+                CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM,
+            versionOverride),
     ]
 
     if (cpu_arch == X86_64_TRIPLE) {
         buildConfigs += [
         "Build TRT-LLM SingleDevice": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
-            pipeline, CONFIG_LINUX_X86_64_SINGLE_DEVICE),
+            pipeline, CONFIG_LINUX_X86_64_SINGLE_DEVICE, versionOverride),
         ]
     }
 

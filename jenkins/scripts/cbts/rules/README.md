@@ -12,8 +12,9 @@ for the overall CBTS architecture.
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (each excl. `.md`) |
-| `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/visual_gen/**` (each excl. `.md`) |
+| `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. `.md`) |
 | `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. `.md`) |
+| `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
 
 ## WaivesRule
@@ -151,9 +152,12 @@ discipline statically.
 ## VisualGenRule
 
 Path-only rule. Claims source files under `examples/visual_gen/`,
-`tensorrt_llm/_torch/visual_gen/`, and `tensorrt_llm/visual_gen/`
-(excluding `.md`, which `OutOfScopeRule` claims as noop). Image
-suffixes are intentionally NOT excluded: VG ships reference images
+`scripts/visualgen_eval/`, `tensorrt_llm/_torch/visual_gen/`,
+`tensorrt_llm/media/`, and `tensorrt_llm/visual_gen/` (excluding `.md`,
+which `OutOfScopeRule` claims as noop). fused-DiT paths stay unclaimed:
+those diffs also touch `inplace_info()` in
+`tensorrt_llm/_torch/compilation/utils.py`, which no VG rule claims.
+Image suffixes are intentionally NOT excluded: VG ships reference images
 used as test fixtures (e.g. `examples/visual_gen/cat_piano.png` and
 `examples/visual_gen/serve/media/woman_skyline_original_720p.jpeg` are
 loaded by `tests/unittest/_torch/visual_gen/`), so edits to them must
@@ -169,11 +173,12 @@ live in `backend: pytorch` and `backend: tensorrt` blocks. A block
 For each matched block, `block_filters` keeps only the VG entries.
 Non-VG siblings in the same block stay governed by other rules.
 
-Outward-facing fallback: unlike AutoDeploy, VG public symbols are
-imported eagerly by non-VG startup paths such as `commands/serve.py`,
-`commands/utils.py`, and `serve/openai_server.py`. The public API
-package prefix (`tensorrt_llm/visual_gen/`) is listed in
-`_VG_OUTWARD_PREFIXES`; touching any non-doc file under it claims the
+Outward-facing fallback: unlike AutoDeploy, VG public symbols and
+`tensorrt_llm.media.*` are imported eagerly by non-VG startup paths such
+as `commands/serve.py`, `commands/utils.py`, and
+`serve/openai_server.py`. Both package prefixes
+(`tensorrt_llm/visual_gen/`, `tensorrt_llm/media/`) are listed in
+`_VG_OUTWARD_PREFIXES`; touching any non-doc file under them claims the
 changed files but emits `scope=None` so Selector falls back to baseline.
 This protects trtllm-serve / trtllm-bench startup paths from VG
 signature drift slipping through pre-merge.
@@ -181,12 +186,13 @@ signature drift slipping through pre-merge.
 Outcomes:
 
 - No VG source files in the diff → rule returns `None`.
-- VG source touched, all internal (`examples/visual_gen/**` or
-  `tensorrt_llm/_torch/visual_gen/**`) → `scope=visualgenonly`;
+- VG source touched, all internal (`examples/visual_gen/**`,
+  `scripts/visualgen_eval/**`, or `tensorrt_llm/_torch/visual_gen/**`)
+  → `scope=visualgenonly`;
   sanity off (VG changes don't affect wheel sanity); perfsanity on iff
   a matched block lives in `l0_perf` or `*perf_sanity*`.
 - VG source touched, any outward-facing path under
-  `tensorrt_llm/visual_gen/` → `scope=None`
+  `tensorrt_llm/visual_gen/` or `tensorrt_llm/media/` → `scope=None`
   (fallback).
 - VG source touched but no VG block found anywhere (defensive) →
   `scope=None` (fallback).

@@ -105,6 +105,7 @@ def _build_single_output_add_mul_module(hidden: int = 128):
     return ModuleOp(Region([block]))
 
 
+@pytest.mark.cpu_only
 def test_decompose_discover_codegen_pipeline():
     """Full pipeline: decompose add+rmsnorm -> discover subgraph -> generate kernel."""
     hidden = 128
@@ -127,6 +128,7 @@ def test_decompose_discover_codegen_pipeline():
     assert callable(kernel_fn), "Expected generate_kernel_from_subgraph to return a callable"
 
 
+@pytest.mark.cpu_only
 def test_single_output_fused_metadata_uses_tuple_contract():
     """Generated fused kernels return tuples, including the one-output case."""
     hidden = 128
@@ -192,6 +194,7 @@ def test_decompose_discover_codegen_numerical_correctness():
     torch.testing.assert_close(result[1], normed_ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.cpu_only
 def test_no_subgraphs_for_single_op():
     """A module with only one fusible op should produce no subgraphs."""
     hidden = 64
@@ -218,6 +221,7 @@ def test_no_subgraphs_for_single_op():
     assert len(subgraphs) == 0
 
 
+@pytest.mark.cpu_only
 def test_pipeline_reports_subgraph_metadata():
     """Verify subgraph metadata (inputs, outputs, op count) is correct."""
     hidden = 128
@@ -280,6 +284,7 @@ def _build_add_rmsnorm_silu_gate_module(hidden: int = 128):
     return ModuleOp(Region([block]))
 
 
+@pytest.mark.cpu_only
 def test_novel_add_rmsnorm_silu_gate():
     """Fusion that has NO pre-existing kernel — auto-discovered and generated.
 
@@ -488,6 +493,7 @@ def _build_moe_ep_mask_module(top_k: int = 8, experts_per_rank: int = 32, ep_ran
     return ModuleOp(Region([block]))
 
 
+@pytest.mark.cpu_only
 def test_moe_ep_mask_fusion_discovery():
     """Floordiv + eq + mul should be discovered as a single fusible subgraph."""
     mlir_mod = _build_moe_ep_mask_module()
@@ -497,6 +503,7 @@ def test_moe_ep_mask_fusion_discovery():
     assert len(subgraphs[0].ops) == 3, f"Expected 3 ops, got {len(subgraphs[0].ops)}"
 
 
+@pytest.mark.cpu_only
 def test_moe_ep_mask_kernel_generation():
     """Triton kernel can be generated for the mixed-type floordiv+eq+mul pattern."""
     mlir_mod = _build_moe_ep_mask_module()

@@ -496,6 +496,7 @@ def test_glm4_moe_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_glm4_moe_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
@@ -507,6 +508,7 @@ def test_glm4_moe_config_registration():
     assert hasattr(config, "use_qk_norm")
 
 
+@pytest.mark.cpu_only
 def test_glm4_moe_gqa_structure():
     """Test that attention uses GQA (fewer KV heads than Q heads)."""
     config = _create_small_config()
@@ -525,6 +527,7 @@ def test_glm4_moe_gqa_structure():
     assert hasattr(attn, "k_norm"), "Attention should have k_norm"
 
 
+@pytest.mark.cpu_only
 def test_glm4_moe_dense_and_moe_layers():
     """Test that first_k_dense_replace layers are dense, rest are MoE."""
     config = _create_small_config()
@@ -537,6 +540,7 @@ def test_glm4_moe_dense_and_moe_layers():
     assert isinstance(model.model.layers[2].mlp, Glm4MoeMoE), "Layer 2 should use MoE"
 
 
+@pytest.mark.cpu_only
 def test_glm4_moe_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()

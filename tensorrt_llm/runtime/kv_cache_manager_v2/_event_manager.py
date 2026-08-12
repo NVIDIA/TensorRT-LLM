@@ -335,7 +335,7 @@ class KVCacheEventManager:
 
     def _add_event(
         self,
-        data: KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData,
+        data: (KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData),
         layer_group_id: LayerGroupId = None,
     ) -> None:
         if self._max_kv_event_entries <= 0:
@@ -416,7 +416,7 @@ class KVCacheEventManager:
 
     def _add_event_unlocked(
         self,
-        data: KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData,
+        data: (KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData),
         layer_group_id: LayerGroupId = None,
     ) -> KVCacheEvent:
         if not isinstance(data, KVCacheRemovedData):
@@ -525,12 +525,6 @@ class KVCacheEventManager:
         self._v1_root_attrs_by_block_key.pop(block_hash, None)
 
     @staticmethod
-    def _resolve_page_ref(page_ref: Any) -> Any:
-        if page_ref is None:
-            return None
-        return page_ref() if callable(page_ref) else page_ref
-
-    @staticmethod
     def _normalize_token(token: TokenIdExt) -> UniqueToken:
         if isinstance(token, bytes):
             return UniqueToken(token.hex())
@@ -542,13 +536,11 @@ class KVCacheEventManager:
         cache_level: CacheLevel = GPU_LEVEL
         priority: Priority = PRIORITY_DEFAULT
         found_page = False
-        for life_cycle_id, page_ref in enumerate(block.storage):
+        for life_cycle_id in range(len(block.storage)):
             if life_cycle_ids is not None and life_cycle_id not in life_cycle_ids:
                 continue
-            if page_ref is None:
-                continue
-            page = self._resolve_page_ref(page_ref)
-            if page is None:
+            page = block.get_page(life_cycle_id)
+            if page is None or page.num_tokens_in_block < len(block.tokens):
                 continue
             cache_level = page.cache_level
             priority = page.priority
@@ -570,8 +562,9 @@ class KVCacheEventManager:
     def _life_cycle_ids_from_radix_block(block: Any) -> set[int]:
         return {
             life_cycle_id
-            for life_cycle_id, page_ref in enumerate(block.storage)
-            if page_ref is not None and KVCacheEventManager._resolve_page_ref(page_ref) is not None
+            for life_cycle_id in range(len(block.storage))
+            if (page := block.get_page(life_cycle_id)) is not None
+            and page.num_tokens_in_block >= len(block.tokens)
         }
 
     def _parent_hash_from_radix_block(self, block: Any) -> EventBlockHash | None:

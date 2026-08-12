@@ -49,6 +49,7 @@ from blocks import (  # noqa: E402
     write_filtered_test_db,
 )
 from rules._helpers import strip_noop_diff_lines  # noqa: E402
+from rules.agent_flow_rule import AgentFlowRule  # noqa: E402
 from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
 from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
@@ -68,6 +69,7 @@ RULE_CLASSES: list[type[Rule]] = [
     AutoDeployRule,
     VisualGenRule,
     SpecDecRule,
+    AgentFlowRule,
     OutOfScopeRule,
 ]
 
@@ -84,6 +86,7 @@ def build_rules(
         AutoDeployRule(yaml_index, stages),
         VisualGenRule(yaml_index, stages),
         SpecDecRule(yaml_index, stages),
+        AgentFlowRule(yaml_index, stages),
         OutOfScopeRule(yaml_index, stages),
     ]
 
@@ -139,6 +142,7 @@ _TESTSONLY_FAMILY: frozenset[str] = frozenset(
         "autodeployonly",
         "visualgenonly",
         "specdeconly",
+        "agentflowonly",
     }
 )
 
