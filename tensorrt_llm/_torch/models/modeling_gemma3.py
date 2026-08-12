@@ -303,14 +303,6 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         """
         return "V2"
 
-    @classmethod
-    def get_preferred_transceiver_runtime(
-        cls,
-        pretrained_config: Any = None,
-    ) -> Optional[Literal["CPP", "PYTHON"]]:
-        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
-        return "PYTHON"
-
     def _get_token_type_mask(self, image_token_mask: torch.BoolTensor):
         device = image_token_mask.device
         sequence_length = len(image_token_mask)
