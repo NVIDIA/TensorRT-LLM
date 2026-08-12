@@ -266,7 +266,7 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.parametrize("_repeat", range(260, 360), ids=lambda i: f"rep{i:02d}")
+    @pytest.mark.parametrize("_repeat", range(360, 460), ids=lambda i: f"rep{i:02d}")
     @pytest.mark.parametrize(
         "variant",
         [
@@ -285,21 +285,40 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     )
     # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
     @pytest.mark.threadleak(enabled=False)
-    def test_disaggregated_videomme(self, variant: EPDVariant, _repeat: int) -> None:
+    def test_disaggregated_videomme(
+        self, variant: EPDVariant, _repeat: int, request: pytest.FixtureRequest
+    ) -> None:
         """Run VideoMME shard through a model-specific llmapi E/PD config."""
         import faulthandler
         import sys
+        import tempfile
+        from pathlib import Path
 
-        # Install SIGSEGV / SIGABRT / SIGFPE handler so a native crash dumps
-        # ALL thread stacks to stderr BEFORE the process dies. Without this,
-        # `--capture=fd` swallows the crash and only "Test terminated
-        # unexpectedly" reaches the artifacts.
-        faulthandler.enable(file=sys.stderr, all_threads=True)
-        # Periodic dumps every 60s catch hangs where enable() alone would not
-        # produce output (no signal is delivered).
-        faulthandler.dump_traceback_later(60, repeat=True, file=sys.stderr)
+        # Pass an OS-level file (not sys.stderr) to faulthandler so the
+        # SIGSEGV / SIGABRT thread dump survives pytest's --capture=fd
+        # buffering. Writing to sys.stderr goes into the capture pipe;
+        # if pytest is killed by the signal before flushing, the dump is
+        # lost. Writing to a real file gets a direct write() from the
+        # signal handler before the process dies.
+        output_dir_opt = request.config.getoption("--output-dir", default=None)
+        crash_dir = Path(output_dir_opt) if output_dir_opt else Path(tempfile.gettempdir())
+        crash_dir.mkdir(parents=True, exist_ok=True)
+        variant_slug = variant.model_name.rsplit("/", 1)[-1]
+        crash_log_path = crash_dir / f"faulthandler_{variant_slug}_rep{_repeat:03d}.log"
+        crash_log_file = open(crash_log_path, "w", buffering=1)
+        # Route the path to sys.__stderr__ (pre-capture) so the CI console
+        # can locate the file even if pytest capture ate the write above.
+        print(
+            f"[NVBUG-6327718] faulthandler log: {crash_log_path}",
+            file=sys.__stderr__,
+            flush=True,
+        )
+        faulthandler.enable(file=crash_log_file, all_threads=True)
+        faulthandler.dump_traceback_later(60, repeat=True, file=crash_log_file)
         try:
             with self._launch_epd(variant) as llm:
                 self._run_videomme(llm, variant)
         finally:
             faulthandler.cancel_dump_traceback_later()
+            crash_log_file.flush()
+            crash_log_file.close()
