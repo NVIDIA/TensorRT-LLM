@@ -871,6 +871,7 @@ W8A16_NON_ALIGNED_MOE_MODEL_CONFIGS = [
 def generate_int8_woq_non_aligned_test_params() -> List:
     """W8A16 CUTLASS coverage for a non-64-aligned intermediate size."""
     params: List = []
+    generated_activations = set()
     # Cover both the non-gated (single up-projection) and gated (gate+up
     # concatenated) layouts: the gated path pads w3 as well as w1 before the
     # concatenation, so it exercises a branch the non-gated case does not.
@@ -918,9 +919,12 @@ def generate_int8_woq_non_aligned_test_params() -> List:
                 float("inf") if gated else None,
             )
             params.append(create_test_param(param_values, test_id))
+            generated_activations.add(activation_type)
     # Guard against the 128-alignment skip message being reworded upstream,
-    # which would otherwise silently generate zero cases.
-    assert params, "non-aligned W8A16 coverage generated no test cases"
+    # which would otherwise silently drop one or both activation families.
+    expected_activations = {ActivationType.Relu2, ActivationType.Swiglu}
+    if not expected_activations.issubset(generated_activations):
+        raise ValueError("non-aligned W8A16 coverage must include both Relu2 and Swiglu cases")
     return params
 
 
