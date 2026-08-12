@@ -3,7 +3,9 @@
 from scaffolding.test_worker import (create_trtllm_worker, default_prompt,
                                      trtllm_model_path)
 
-from tensorrt_llm.scaffolding import NativeGenerationController, ScaffoldingLlm
+from tensorrt_llm.scaffolding import (MajorityVoteController,
+                                      NativeGenerationController,
+                                      ScaffoldingLlm)
 
 
 def create_scaffolding_llm_with_native_generation_controller(trtllm_model_path):
@@ -19,6 +21,28 @@ def create_scaffolding_llm_with_native_generation_controller(trtllm_model_path):
         prototype_generation_controller,
         {NativeGenerationController.WorkerTag.GENERATION: trtllm_worker},
     )
+
+
+def create_scaffolding_llm_with_majority_vote_controller(
+        trtllm_model_path, samples_num):
+    trtllm_worker = create_trtllm_worker(trtllm_model_path)
+
+    workers = {}
+    prototype_generation_controller = NativeGenerationController(
+        sampling_params={"max_tokens": 256})
+    workers[NativeGenerationController.WorkerTag.GENERATION] = trtllm_worker
+
+    prototype_majority_vote_controller = MajorityVoteController(
+        prototype_generation_controller,
+        default_sample_num=samples_num,
+    )
+
+    llm = ScaffoldingLlm(
+        prototype_majority_vote_controller,
+        workers=workers,
+    )
+
+    return llm
 
 
 def test_unbatched_scaffolding_sync(default_prompt, trtllm_model_path):
@@ -64,3 +88,20 @@ def test_async_scaffolding_generation(default_prompt, trtllm_model_path):
 
     import asyncio
     asyncio.run(run_async_test())
+
+
+def test_majority_vote(default_prompt, trtllm_model_path):
+    # MajorityVoteController extracts integer answers from \\boxed{...}.
+    # Ask for that format so Qwen3-0.6B satisfies the controller assert.
+    prompt = (
+        default_prompt +
+        "Please reason step by step, and put your final answer within \\boxed{}."
+    )
+    scaffolding_llm = create_scaffolding_llm_with_majority_vote_controller(
+        trtllm_model_path, samples_num=3)
+    try:
+        result = scaffolding_llm.generate(prompt)
+        assert isinstance(result.outputs[0].text, str) and len(
+            result.outputs[0].text) > 0, "Output should be a non-empty string"
+    finally:
+        scaffolding_llm.shutdown(shutdown_workers=True)
