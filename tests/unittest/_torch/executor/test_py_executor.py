@@ -2534,7 +2534,7 @@ class TestPendingTransferResponseFlush:
         """A queued client receives a rank-0 ADP error before cleanup."""
         executor = object.__new__(PyExecutor)
         request_id = 7
-        response = LlmResponse()
+        response = LlmResponse(request_id=request_id)
         response.request_id = request_id
         response.client_id = 42
         response.error_msg = "transfer failed"
@@ -2545,6 +2545,7 @@ class TestPendingTransferResponseFlush:
         executor.enable_attention_dp = False
         executor.gather_all_responses = False
         executor.dist = Mock(rank=0)
+        executor.dist.mapping.tp_group = [0]
         executor.responses = {}
         executor.response_cv = threading.Condition()
         executor.result_wait_queues = {request_id: result_queue}
@@ -2565,7 +2566,7 @@ class TestPendingTransferResponseFlush:
         profiler = MagicMock()
         profiler.__enter__.return_value = Mock()
         executor._profiler = Mock(return_value=profiler)
-        executor.hang_detector = Mock()
+        executor.hang_detector = MagicMock()
         executor.enable_iter_perf_stats = False
         executor._resource_governor_enabled = False
         executor._is_kv_manager_v2 = False

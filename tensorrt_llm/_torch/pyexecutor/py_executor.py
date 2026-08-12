@@ -4098,7 +4098,8 @@ class PyExecutor:
                 self.is_shutdown = True
                 self._handle_errors(error_msg,
                                     requests=None,
-                                    charge_budget=False)
+                                    charge_budget=False,
+                                    fatal_is_collective_aligned=True)
                 return
 
         if not (self.enable_attention_dp and self.dist.world_size != 1):
@@ -7183,7 +7184,8 @@ class PyExecutor:
                        error_msg: Optional[str] = None,
                        *,
                        requests: Optional[List[LlmRequest]] = None,
-                       charge_budget: bool = True) -> None:
+                       charge_budget: bool = True,
+                       fatal_is_collective_aligned: bool = False) -> None:
         """Fail requests and optionally initiate shutdown on fatal errors.
 
         When ``charge_budget`` is True (the default), classifies the error
@@ -7221,6 +7223,12 @@ class PyExecutor:
         error_msg = error_msg or "error"
         multi_rank_adp = (self.enable_attention_dp
                           and self.dist.world_size != 1)
+        # ``fatal_is_collective_aligned`` is set only by the synchronized caller
+        # (_handle_disagg_cache_errors_synced, after its world allreduce), which
+        # guarantees every ADP rank enters the fatal path in the same collective
+        # order. Do NOT infer it from ``self._fatal_error is not None``: a
+        # rank-local setter would then route into a tp_gather while peers are
+        # elsewhere, recreating the desync this path exists to prevent.
 
         budget_fatal = (self._error_budget.consume(error_msg)
                         if charge_budget else False)
@@ -7275,12 +7283,17 @@ class PyExecutor:
                                      client_id=getattr(item.request,
                                                        'client_id', None))))
 
-            if waiting_responses and not multi_rank_adp:
-                self._enqueue_responses(waiting_responses)
+            if not multi_rank_adp:
                 if waiting_responses:
+                    self._enqueue_responses(waiting_responses)
                     logger.info(
                         f"Drained {len(waiting_responses)} queued requests "
                         "on fatal error")
+            elif fatal_is_collective_aligned:
+                # Synchronized fatal: every ADP rank enters this drain gather
+                # together, so issue it even when this rank has no queued
+                # responses, to stay peer-aligned.
+                self._enqueue_responses(waiting_responses)
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
@@ -7302,14 +7315,19 @@ class PyExecutor:
         publish_immediately = False
         if is_fatal:
             if multi_rank_adp:
-                # A fatal exception can be observed by one ADP rank before its
-                # peers reach their next collective. Do not issue tp_gather
-                # here: it would desynchronize the group exactly like a
-                # rank-local non-fatal response. Escalate through the event
-                # loop wrapper, which wakes local response waiters without a
-                # collective; the distributed supervisor tears down peers.
-                logger.error(
-                    "Skipping rank-local fatal response gather under ADP")
+                if fatal_is_collective_aligned:
+                    # Synchronized fatal: all ranks agree and march through the
+                    # aligned publish/terminate collectives together, so publish
+                    # here instead of diverging.
+                    publish_immediately = True
+                else:
+                    # A novel rank-local fatal can be observed by one ADP rank
+                    # before its peers reach their next collective. Do not issue
+                    # tp_gather here: it would desynchronize the group exactly
+                    # like a rank-local non-fatal response. Skip the gather and
+                    # raise below; the distributed supervisor tears down peers.
+                    logger.error(
+                        "Skipping rank-local fatal response gather under ADP")
             else:
                 publish_immediately = True
         elif multi_rank_adp:
@@ -7347,7 +7365,10 @@ class PyExecutor:
 
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
-            if multi_rank_adp:
+            if multi_rank_adp and not fatal_is_collective_aligned:
+                # Only a novel rank-local fatal raises to force local teardown;
+                # a synchronized fatal has already published in lockstep and
+                # tears down every rank together via is_shutdown.
                 raise self._fatal_error
 
     def _terminate_request(self, request: LlmRequest):
