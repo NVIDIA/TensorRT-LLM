@@ -234,7 +234,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         moe = self.moe
         return (
             isinstance(moe.comm, DeepEPLowLatency)
-            and moe.backend.__class__ == CuteDslFusedMoE
+            and moe.backend.capabilities.supports_deep_ep_direct_metadata
             and not moe.backend.disable_deep_ep_direct_metadata
             and moe.backend.has_nvfp4
             and supports_post_quant
@@ -530,7 +530,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # through **kwargs, so the request does not need a comm-side test.
             if moe.backend.input_requirement.requires_sanitized_expert_ids:
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
-            if isinstance(moe.comm, DeepEPLowLatency) and moe.backend.__class__ == CuteDslFusedMoE:
+            if (
+                isinstance(moe.comm, DeepEPLowLatency)
+                and moe.backend.capabilities.supports_deep_ep_direct_metadata
+            ):
                 use_deep_ep_direct_metadata = self._use_cutedsl_deep_ep_direct_metadata(
                     supports_post_quant
                 )
@@ -878,7 +881,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
             moe.comm.payload_in_workspace = payload_in_workspace
         recv_expert_count = None
         deep_ep_expert_capacity = None
-        if isinstance(moe.comm, DeepEPLowLatency) and moe.backend.__class__ == CuteDslFusedMoE:
+        if (
+            isinstance(moe.comm, DeepEPLowLatency)
+            and moe.backend.capabilities.supports_deep_ep_direct_metadata
+        ):
             recv_expert_count, deep_ep_expert_capacity = (
                 moe.comm.get_expert_major_dispatch_metadata()
             )

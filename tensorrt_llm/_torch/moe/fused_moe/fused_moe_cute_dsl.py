@@ -661,7 +661,8 @@ class CuteDslFusedMoE(MoEImplBase):
     capabilities = MoEStaticCapability(
         supports_dwdp=True,
         supports_eplb=True,
-        supports_apply_router_weight_on_input=True)
+        supports_apply_router_weight_on_input=True,
+        supports_deep_ep_direct_metadata=True)
 
     input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
 

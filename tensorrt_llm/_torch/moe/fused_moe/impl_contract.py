@@ -58,6 +58,9 @@ class MoEStaticCapability:
     # flag in their own constructor keep doing so; that check guards direct
     # construction, which never reaches the factory.
     supports_apply_router_weight_on_input: bool = False
+    # Whether the backend can consume DeepEP's expert-major receive counts
+    # directly, without materializing token-major adapter metadata.
+    supports_deep_ep_direct_metadata: bool = False
 
 
 @dataclass(frozen=True)
