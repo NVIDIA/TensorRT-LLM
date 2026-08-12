@@ -37,7 +37,8 @@ from tensorrt_llm.llmapi.llm_args import (
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
-from tensorrt_llm._torch.peft.lora.manager import load_torch_lora
+from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
+                                                   supports_native_fp8_lora)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 
@@ -87,6 +88,16 @@ GB = 1 << 30
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _get_initial_lora_data_type(
+    configured_lora_data_type: Optional[torch.dtype],
+) -> Optional[torch.dtype]:
+    if configured_lora_data_type != torch.float8_e4m3fn:
+        return None
+    if supports_native_fp8_lora(torch.cuda.get_device_capability()):
+        return configured_lora_data_type
+    return None
 
 
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
@@ -2819,10 +2830,8 @@ def create_py_executor_instance(
         initial_lora_data_type = None
         if len(lora_config.lora_dir) == 1:
             # Route to appropriate loader based on checkpoint source
-            configured_lora_data_type = load_torch_lora(lora_config)
-            if (configured_lora_data_type == torch.float8_e4m3fn
-                    and torch.cuda.get_device_capability() == (9, 0)):
-                initial_lora_data_type = configured_lora_data_type
+            initial_lora_data_type = _get_initial_lora_data_type(
+                load_torch_lora(lora_config))
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
