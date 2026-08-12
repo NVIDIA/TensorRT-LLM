@@ -176,3 +176,33 @@ def test_nvfp4_wan_conv_product_path_bias_residual_and_spatial_padding() -> None
 
     assert relative_l2_error.item() < 0.25
     assert cosine_similarity.item() > 0.96
+
+
+def test_nvfp4_wan_conv_reuses_cubin_across_runtime_shapes() -> None:
+    """The provider's runtime-shape kernel serves compatible C and H/W values."""
+    _require_blackwell()
+    pytest.importorskip("cutlass")
+    from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import (
+        NVFP4WanCausalConv3d,
+        WanCausalConv3d,
+        _fp4_compile_cache,
+    )
+
+    _fp4_compile_cache.clear()
+    for input_channels, height, width in ((256, 4, 6), (512, 5, 7)):
+        base = WanCausalConv3d(input_channels, 256, 3, padding=1).cuda().to(torch.bfloat16).eval()
+        with torch.no_grad():
+            base.weight.zero_()
+            base.bias.normal_()
+        conv = NVFP4WanCausalConv3d(base).cuda().to(torch.bfloat16).eval()
+        activation = torch.randn(
+            (1, input_channels, 1, height, width),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+        actual = conv(activation)
+        expected = base.bias.view(1, -1, 1, 1, 1).expand_as(actual)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    assert len(_fp4_compile_cache) == 1
