@@ -474,6 +474,37 @@ class TestCreateKvSliceTokenRange:
         assert kv_slice.token_range is not None
         assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
 
+    def test_swa_caps_oversized_non_speculative_v1_list_before_window_trim(self):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=0,
+            prompt_len=32,
+            block_ids=[100, 101, 102, 103, 104],
+            sliding_window_size=16,
+        )
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        np.testing.assert_array_equal(
+            kv_slice.block_ids_per_layer_groups[0],
+            np.array([102, 103], dtype=np.int64),
+        )
+
+    def test_swa_allocation_cap_preserves_packed_beam_tails(self):
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=0,
+            prompt_len=32,
+            block_ids=[100, 101, 102, 103, 104, 200, 201, 202],
+            sliding_window_size=16,
+            beam_width=4,
+        )
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        np.testing.assert_array_equal(
+            kv_slice.block_ids_per_layer_groups[0],
+            np.array([102, 103, 200, 201, 202], dtype=np.int64),
+        )
+
     @pytest.mark.parametrize(
         "block_ids",
         (

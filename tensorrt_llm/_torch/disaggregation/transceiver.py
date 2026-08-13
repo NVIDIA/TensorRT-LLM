@@ -296,14 +296,26 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             window_size = lg.sliding_window_size
 
             if window_size is not None:
+                allocated_blocks = (
+                    req.prompt_len + self._kv_cache_manager.num_extra_kv_tokens + tpb - 1
+                ) // tpb
+                beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
+                    block_ids,
+                    req.py_beam_width,
+                    allocated_blocks,
+                )
+                if beam0_block_ids.size > allocated_blocks:
+                    beam0_block_ids = beam0_block_ids[:allocated_blocks]
+                    block_ids = (
+                        np.concatenate([beam0_block_ids, tail_block_ids])
+                        if tail_block_ids.size > 0
+                        else beam0_block_ids
+                    )
                 # SWA block lists are ordered from the oldest valid prompt
                 # block to the speculative scratch tail. Remove the
                 # uninitialized scratch blocks before trimming stale prompt
                 # blocks; otherwise a boundary-crossing draft allocation can
                 # make us retain scratch and discard initialized prompt KV.
-                allocated_blocks = (
-                    req.prompt_len + self._kv_cache_manager.num_extra_kv_tokens + tpb - 1
-                ) // tpb
                 scratch_blocks = max(0, allocated_blocks - total_blocks)
                 if scratch_blocks > 0:
                     assert req.py_beam_width == 1, (
