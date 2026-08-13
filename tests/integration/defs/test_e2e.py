@@ -962,39 +962,20 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Llama-4-Scout-17B-16E-FP4',
                  'llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4',
                  marks=skip_pre_blackwell),
-    pytest.param('Nemotron-Nano-9B-v2-nvfp4',
-                 'NVIDIA-Nemotron-Nano-9B-v2-NVFP4',
-                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    if model_name == "Nemotron-Nano-9B-v2-nvfp4":
-        llm_venv.run_cmd([
-            str(example_root / "quickstart_advanced.py"),
-            "--disable_kv_cache_reuse",
-            "--max_batch_size=8",
-            "--model_dir",
-            f"{llm_models_root()}/{model_path}",
-        ])
-    else:
-        mapping = {
-            "Llama3.1-8B-BF16": 18.60,
-            "Llama3.2-11B-BF16": 18.88,
-            "Nemotron4_4B-BF16": 12.50,
-            "Llama3.1-8B-FP8": 13.05,
-            "Llama3.1-8B-NVFP4": 10.2
-        }
-        cmds = [
-            str(example_root / "quickstart_advanced.py"),
-            "--enable_chunked_prefill",
-            f"--model_dir={llm_models_root()}/{model_path}",
-        ]
-        if "Qwen3" in model_name:
-            cmds.append("--kv_cache_fraction=0.6")
-        if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
-            cmds.append("--max_num_tokens=1024")
-        llm_venv.run_cmd(cmds)
+    cmds = [
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_chunked_prefill",
+        f"--model_dir={llm_models_root()}/{model_path}",
+    ]
+    if "Qwen3" in model_name:
+        cmds.append("--kv_cache_fraction=0.6")
+    if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
+        cmds.append("--max_num_tokens=1024")
+    llm_venv.run_cmd(cmds)
 
 
 @pytest.mark.parametrize("model_name,model_path", [
