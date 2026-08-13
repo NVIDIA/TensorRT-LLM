@@ -70,6 +70,11 @@ class IntactMapper(RegionMapperBase):
             )
         self._runs = self._merge_contiguous(src, dst, self_bytes_per_layer)
 
+    @property
+    def frags_per_block(self) -> int:
+        """One fragment per contiguous run of layers; a dedicated K/V pool merges to 1."""
+        return len(self._runs)
+
     @staticmethod
     def _merge_contiguous(
         src: np.ndarray, dst: np.ndarray, bytes_per_layer: int
@@ -256,6 +261,11 @@ class HNDHeadMismatchMapper(RegionMapperBase):
             buffer_bytes=dst_buffer_bytes,
             head_offset=self._dst_head_off,
         )
+
+    @property
+    def frags_per_block(self) -> int:
+        """One fragment per (layer, buffer): the head-mismatch descriptor explosion."""
+        return int(self._src_flat_offsets.size)
 
     @staticmethod
     def _build_flat_offsets(

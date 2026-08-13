@@ -224,10 +224,10 @@ def test_fanin_bounce_safe_gate():
     assert safe(ov(1, 4), ri([20])) is False
     # duplicate heads blocks even an otherwise-even PP split
     assert safe(ov(2, 4), ri([20, 20, 20, 20])) is False
-    # replicated views (one elected sender per destination) make multi-writer
-    # contributions unequal -> fall back; single-writer overlap stays safe,
-    # and sharded-only view schemes are unaffected
-    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED))) is False
+    # Replicated views make multi-writer contributions unequal. reserve() sizes the sub-regions
+    # per writer for a pure-TP fan-in; combined with a PP fan-in it still falls back.
+    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED))) is True
+    assert safe(ov(1, 4, ranks=(0, 1)), ri([20, 20, 20, 20], pt(MapperKind.REPLICATED))) is False
     assert safe(ov(1, 1, ranks=(0,)), ri([24], pt(MapperKind.REPLICATED))) is True
     assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.NHD))) is True
 
@@ -242,7 +242,7 @@ class TestNoBounce:
         assert nb.enabled is False
         assert nb.reserve(SimpleNamespace()) is False
         assert nb.build_request(SimpleNamespace()) is None
-        assert nb.writer_base(("r", 0), 1) is None
+        assert nb.writer_region(("r", 0), 1) == (None, None)
         assert nb.is_bounced(("r", 0)) is False
         nb.record_result(("r", 0), 1)  # no-op, must not raise
         nb.record_failure(("r", 0), 1)  # no-op, must not raise
@@ -264,7 +264,7 @@ class TestNoBounce:
 
 
 # --------------------------------------------------------------------------- #
-# Transport TP fan-in logic — reserve gate / writer_base / accumulate ordering
+# Transport TP fan-in logic — reserve gate / writer_region / accumulate ordering
 # (GPU allocators, streams and the scatter worker are mocked out)
 # --------------------------------------------------------------------------- #
 class _FakeAlloc:
@@ -301,7 +301,13 @@ class _FakeAlloc:
         return []
 
 
-def _make_transport(monkeypatch, block_bytes_per_group, capacity=1 << 30, min_blocks=1):
+def _make_transport(
+    monkeypatch,
+    block_bytes_per_group,
+    capacity=1 << 30,
+    min_blocks=1,
+    replicated_block_bytes_per_group=None,
+):
     monkeypatch.setattr(btr, "SlotAllocator", _FakeAlloc)
     monkeypatch.setattr(btr.VmmBounceTransport, "_new_stream", lambda self: 0)
     monkeypatch.setattr(
@@ -315,7 +321,10 @@ def _make_transport(monkeypatch, block_bytes_per_group, capacity=1 << 30, min_bl
         device_id=0,
         capacity_bytes=capacity,
         phys_chunk_size=32 * _MIB,
-        block_bytes_per_group=block_bytes_per_group,
+        block_bytes_per_group=(
+            block_bytes_per_group,
+            replicated_block_bytes_per_group or [0] * len(block_bytes_per_group),
+        ),
         min_blocks=min_blocks,
     )
 
@@ -326,6 +335,7 @@ def _recv_req(block_counts, rid=1, slice_id=0):
         unique_rid=rid,
         slice_id=slice_id,
         bounce_dst_base=None,
+        bounce_dst_bytes=None,
     )
 
 
@@ -337,8 +347,9 @@ class TestFanInReserve:
         assert t.reserve(req, num_writers=2) is True
         assert req.bounce_dst_base == 0x100000
         # writer i lands at base + i * (total // num_writers); per_writer = 100.
-        assert t.writer_base((req.unique_rid, req.slice_id), 0) == 0x100000
-        assert t.writer_base((req.unique_rid, req.slice_id), 1) == 0x100000 + 100
+        key = (req.unique_rid, req.slice_id)
+        assert t.writer_region(key, 0) == (0x100000, 100)
+        assert t.writer_region(key, 1) == (0x100000 + 100, 100)
 
     def test_reserve_uneven_fanin_falls_back(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[3])
@@ -372,6 +383,23 @@ class TestFanInReserve:
     def test_reserve_too_small_falls_back(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_blocks=96)
         assert t.reserve(_recv_req([4]), num_writers=1) is False  # 4 < 96 blocks
+
+    def test_size_gate_counts_fragments_not_blocks(self, monkeypatch):
+        """Fragments, not blocks, decide the gate.
+
+        64 blocks at 120 fragments each clears the gate; 64 whole-slot blocks do not.
+        """
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_blocks=96)
+        assert t.reserve(_recv_req([64], rid=1), num_writers=1) is False
+        assert (
+            t.reserve(_recv_req([64], rid=2), num_writers=1, frags_per_block={0: 120}) is True
+        )  # 64 * 120 = 7680 fragments
+
+    def test_size_gate_unchanged_for_whole_slot_copies(self, monkeypatch):
+        """One fragment per block makes the fragment gate identical to the old block gate."""
+        t = _make_transport(monkeypatch, block_bytes_per_group=[100], min_blocks=96)
+        assert t.reserve(_recv_req([95], rid=1), num_writers=1, frags_per_block={0: 1}) is False
+        assert t.reserve(_recv_req([96], rid=2), num_writers=1, frags_per_block={0: 1}) is True
 
     def test_reserve_unknown_slot_size_falls_back(self, monkeypatch):
         t = _make_transport(monkeypatch, block_bytes_per_group=[100])  # only 1 group known
@@ -726,3 +754,257 @@ class TestQuarantine:
         a.quarantine(s, grace_s=float("inf"))  # close-only reclaim
         assert a.reclaim_expired() == 0
         assert a.quarantined_bytes == 512
+
+
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+class TestReplicatedFanInSplit:
+    """The replicated pool's elected owner must get the larger sub-region.
+
+    A replicated pool is sent once by one elected owner while the
+    sharded pools split across all writers, so an even split would leave the owner short and
+    its write would run into the next writer's region.
+    """
+
+    # One layer group, 100B/block total, of which 40B live in a replicated pool.
+    GROUP = [100]
+    REPLICATED = [40]
+
+    def test_owner_gets_the_replicated_bytes(self, monkeypatch):
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=self.GROUP,
+            replicated_block_bytes_per_group=self.REPLICATED,
+        )
+        req = _recv_req([2])  # total 200B: 120B sharded (60B each) + 80B replicated
+        assert t.reserve(req, num_writers=2, writer_owns_replicated=[False, True]) is True
+        key = (req.unique_rid, req.slice_id)
+        assert t.writer_region(key, 0)[1] == 60
+        assert t.writer_region(key, 1)[1] == 60 + 80
+        # Sub-regions tile the reservation without overlap or gap.
+        assert t.writer_region(key, 0)[0] == req.bounce_dst_base
+        assert t.writer_region(key, 1)[0] == req.bounce_dst_base + 60
+
+    def test_owner_first_also_tiles(self, monkeypatch):
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=self.GROUP,
+            replicated_block_bytes_per_group=self.REPLICATED,
+        )
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=2, writer_owns_replicated=[True, False]) is True
+        key = (req.unique_rid, req.slice_id)
+        assert t.writer_region(key, 0)[1] == 140
+        assert t.writer_region(key, 1)[0] == req.bounce_dst_base + 140
+
+    def test_sub_regions_never_overlap(self, monkeypatch):
+        for owner in range(4):
+            t = _make_transport(
+                monkeypatch,
+                block_bytes_per_group=self.GROUP,
+                replicated_block_bytes_per_group=self.REPLICATED,
+            )
+            req = _recv_req([4])  # 400B: 240B sharded (60B each) + 160B replicated
+            owns = [i == owner for i in range(4)]
+            assert t.reserve(req, num_writers=4, writer_owns_replicated=owns) is True
+            key = (req.unique_rid, req.slice_id)
+            base = req.bounce_dst_base
+            cursor = base
+            for i in range(4):
+                assert t.writer_region(key, i)[0] == cursor, f"owner={owner} writer={i}"
+                cursor += t.writer_region(key, i)[1]
+            assert cursor == base + 400, f"owner={owner}: sub-regions must cover exactly the total"
+
+    def test_unknown_owner_falls_back(self, monkeypatch):
+        """No prediction means no bounce, rather than a guess.
+
+        Without it the receiver cannot say where the extra bytes land, and an even split
+        would overrun.
+        """
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=self.GROUP,
+            replicated_block_bytes_per_group=self.REPLICATED,
+        )
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=2) is False
+        assert req.bounce_dst_base is None
+
+    def test_ambiguous_owner_falls_back(self, monkeypatch):
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=self.GROUP,
+            replicated_block_bytes_per_group=self.REPLICATED,
+        )
+        assert (
+            t.reserve(_recv_req([2], rid=1), num_writers=2, writer_owns_replicated=[True, True])
+            is False
+        )
+        assert (
+            t.reserve(_recv_req([2], rid=2), num_writers=2, writer_owns_replicated=[False, False])
+            is False
+        )
+        assert (
+            t.reserve(_recv_req([2], rid=3), num_writers=2, writer_owns_replicated=[True]) is False
+        )
+
+    def test_uneven_sharded_remainder_falls_back(self, monkeypatch):
+        # 1 block: 60B sharded across 3 writers is 20B each (fine); make it indivisible instead.
+        t = _make_transport(
+            monkeypatch, block_bytes_per_group=[100], replicated_block_bytes_per_group=[41]
+        )
+        req = _recv_req([1])  # 59B sharded, not divisible by 2
+        assert t.reserve(req, num_writers=2, writer_owns_replicated=[False, True]) is False
+
+    def test_no_replicated_keeps_even_split(self, monkeypatch):
+        """Models without replicated pools are unaffected: the owner list is ignored."""
+        t = _make_transport(
+            monkeypatch, block_bytes_per_group=[100], replicated_block_bytes_per_group=[0]
+        )
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=2, writer_owns_replicated=[False, True]) is True
+        key = (req.unique_rid, req.slice_id)
+        assert t.writer_region(key, 0)[1] == t.writer_region(key, 1)[1] == 100
+
+    def test_single_writer_ignores_replicated(self, monkeypatch):
+        t = _make_transport(
+            monkeypatch,
+            block_bytes_per_group=self.GROUP,
+            replicated_block_bytes_per_group=self.REPLICATED,
+        )
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=1) is True
+        assert req.bounce_dst_bytes == 200
+
+    def test_shared_pool_replicated_share_falls_back(self, monkeypatch):
+        """Nothing left to share after the replicated bytes means fall back, not empty regions.
+
+        One pool can hold views of both classes, and charging the whole slot to the replicated one
+        leaves every non-owner writer an empty sub-region -- which all alias the same address.
+        """
+        t = _make_transport(
+            monkeypatch, block_bytes_per_group=[100], replicated_block_bytes_per_group=[100]
+        )
+        req = _recv_req([2])
+        assert t.reserve(req, num_writers=2, writer_owns_replicated=[False, True]) is False
+        assert req.bounce_dst_base is None
+
+
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+class TestReplicatedBytesAreMeasuredPerView:
+    """The replicated share is a property of the view, not of the pool it lives in.
+
+    It must come from the replicated view's own buffer entries: views of both classes can share
+    one physical pool.
+    """
+
+    @staticmethod
+    def _page_table(shared_pool: bool):
+        from tensorrt_llm._torch.disaggregation.resource.page import (
+            BUFFER_ENTRY_DTYPE,
+            AttentionLayerGroup,
+            MapperKind,
+            PoolView,
+        )
+
+        def view(pool_idx, kind, sizes):
+            entries = np.array(
+                [(i, sum(sizes[:i]), s) for i, s in enumerate(sizes)], dtype=BUFFER_ENTRY_DTYPE
+            )
+            return PoolView(pool_idx=pool_idx, buffer_entries=entries, mapper_kind=kind)
+
+        kv = view(0, MapperKind.NHD, [40, 40])  # 80B of sharded key/value
+        idx = view(0 if shared_pool else 1, MapperKind.REPLICATED, [20])  # 20B of replicated
+        # Shared: one 100B slot holding both. Separate: an 80B slot and a 20B one.
+        pools = (
+            [SimpleNamespace(slot_bytes=100)]
+            if shared_pool
+            else [
+                SimpleNamespace(slot_bytes=80),
+                SimpleNamespace(slot_bytes=20),
+            ]
+        )
+        return SimpleNamespace(
+            layer_groups=[AttentionLayerGroup(pool_group_idx=0, pool_views=[kv, idx])],
+            pool_groups=[SimpleNamespace(pools=pools)],
+        )
+
+    @pytest.mark.parametrize("shared_pool", [True, False])
+    def test_replicated_share_is_the_view_not_the_pool(self, shared_pool):
+        total, replicated = btr.block_bytes_per_group(self._page_table(shared_pool))
+        # The total counts each physical pool once; the replicated share counts only its view, so
+        # sharing a pool with the sharded view must not inflate it.
+        assert total == [100]
+        assert replicated == [20]
+
+
+@pytest.mark.skipif(not _HAVE_TRANSPORT, reason="bounce.transport import needs CUDA bindings")
+class TestMultiWriterScatterIsOneBatch:
+    """A fan-in scatter must issue ONE batched copy, not one per writer.
+
+    The batched-copy metadata buffers are cached per stream and may only be refilled after a
+    sync; the scatter worker syncs once, after all writers. A copy per writer let the second
+    refill them while the first kernel was still reading, which faulted in production.
+    """
+
+    def test_all_writers_go_in_a_single_launch(self, monkeypatch):
+        from tensorrt_llm._torch.disaggregation.native.bounce import gather_scatter as gs
+
+        calls = []
+        monkeypatch.setattr(
+            gs,
+            "_launch_batched_copy",
+            lambda dst, src, sizes, stream: calls.append((dst.copy(), src.copy(), sizes.copy()))
+            or True,
+        )
+        regions = [
+            (1000, np.array([10, 20], dtype=np.int64), np.array([4, 4], dtype=np.int64)),
+            (2000, np.array([30], dtype=np.int64), np.array([8], dtype=np.int64)),
+        ]
+        gs.scatter_contiguous_multi(regions, stream=0)
+
+        assert len(calls) == 1, "one launch for the whole fan-in, else the buffers are reused"
+        dst, src, sizes = calls[0]
+        assert list(dst) == [10, 20, 30]
+        # Each region keeps its own base and its own running offsets.
+        assert list(src) == [1000, 1004, 2000]
+        assert list(sizes) == [4, 4, 8]
+
+    def test_empty_regions_are_skipped(self, monkeypatch):
+        from tensorrt_llm._torch.disaggregation.native.bounce import gather_scatter as gs
+
+        calls = []
+        monkeypatch.setattr(gs, "_launch_batched_copy", lambda *a, **k: calls.append(a) or True)
+        gs.scatter_contiguous_multi(
+            [(1000, np.array([], dtype=np.int64), np.array([], dtype=np.int64))], stream=0
+        )
+        assert calls == []
+
+
+def test_recv_req_info_tolerates_unknown_wire_keys():
+    """An unknown field from a newer peer must be dropped, not raise.
+
+    RecvReqInfo travels from the generation side to the context side; a TypeError here would
+    swallow REQUEST_DATA and hang the transfer instead of degrading.
+    """
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    import msgpack
+
+    payload = msgpack.packb(
+        {
+            "sender_req_id": 1,
+            "instance_name": "gen",
+            "instance_rank": 0,
+            "block_ids_per_layer_groups": [np.array([1, 2], dtype=np.int64).tobytes()],
+            "unique_rid": 7,
+            "dst_start_token": None,
+            "aux_slot": None,
+            "mamba_state_index": None,
+            "slice_id": 0,
+            "bounce_dst_base": None,
+            "bounce_dst_bytes": None,
+            "a_field_from_the_future": 123,
+        }
+    )
+    info = tfr.RecvReqInfo.from_bytes(payload)
+    assert info.unique_rid == 7
+    assert not hasattr(info, "a_field_from_the_future")

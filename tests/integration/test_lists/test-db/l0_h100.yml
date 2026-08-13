@@ -107,6 +107,8 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v2"
   # DSA indexer-K side cache (V1, REPLICATED).
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_dsa_indexer
+  # Python transceiver with the C++ NIXL agent's bounce v2 enabled.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_nixl_cache_transceiver_uses_cpp_bounce
   - unittest/disaggregated/test_cache_transceiver_harness_report.py
   - unittest/disaggregated/test_cache_transceiver_harness.py
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mha-ctx_fp16_gen_fp16]
@@ -277,6 +279,7 @@ l0_h100:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_unit_tests[common-90]
+  - cpp/test_unit_tests.py::test_unit_tests[executor_bounce-90]
   - cpp/test_unit_tests.py::test_unit_tests[kernels-90]
   - cpp/test_unit_tests.py::test_unit_tests[layers-90]
   - cpp/test_unit_tests.py::test_unit_tests[thop-90]

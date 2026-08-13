@@ -31,6 +31,11 @@ add_gtest(ucxCommTest ucxCommTest.cpp)
 target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
 target_link_libraries(serializeUtilsTest PRIVATE ${Python3_LIBRARIES})
 
+# NIXL bounce-buffer v2 KV-cache transfer tests live in their own subdirectory
+# (mirrors the source layout under nixl_utils/bounce/). It self-gates on zmq and
+# NIXL_ROOT, so it is safe to descend unconditionally.
+add_subdirectory(bounce)
+
 # Skip MOONCAKE related tests on Rocky8
 set(IS_ROCKY8 FALSE)
 if(EXISTS "/etc/redhat-release")
@@ -47,6 +52,9 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
                                                 ${Python3_LIBRARIES})
     target_compile_definitions(transferAgentTest PRIVATE TEST_NIXL_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_NIXL_BACKEND=1)
+
+    # NIXL bounce v2 tests (nixlTransferEngineTest / bounceNixlE2ETest /
+    # bounceAgentE2ETest) live in bounce/CMakeLists.txt.
   endif()
 
   if(MOONCAKE_ROOT)
