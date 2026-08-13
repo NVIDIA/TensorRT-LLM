@@ -311,16 +311,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         if tail_block_ids.size > 0
                         else beam0_block_ids
                     )
-                # SWA block lists are ordered from the oldest valid prompt
-                # block to the speculative scratch tail. Remove the
-                # uninitialized scratch blocks before trimming stale prompt
-                # blocks; otherwise a boundary-crossing draft allocation can
-                # make us retain scratch and discard initialized prompt KV.
+                # Current PyExecutor cache managers disable KV-cache token sinks,
+                # so SWA block lists contain an evictable prompt prefix followed
+                # by the speculative scratch tail. If token sinks are enabled,
+                # this must use block-ordinal metadata to preserve the sink prefix.
+                # Remove scratch before trimming stale prompt blocks; otherwise a
+                # boundary-crossing allocation can displace initialized prompt KV.
                 scratch_blocks = max(0, allocated_blocks - total_blocks)
                 if scratch_blocks > 0:
-                    assert req.py_beam_width == 1, (
-                        "speculative scratch blocks require beam_width == 1"
-                    )
+                    if req.py_beam_width != 1:
+                        raise ValueError("speculative scratch blocks require beam_width == 1")
                     block_ids = (
                         block_ids[:-scratch_blocks]
                         if scratch_blocks < block_ids.size

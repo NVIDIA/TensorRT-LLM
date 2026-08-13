@@ -538,9 +538,7 @@ class TestCreateKvSliceTokenRange:
             beam_width=4,
         )
 
-        with pytest.raises(
-            AssertionError, match="speculative scratch blocks require beam_width == 1"
-        ):
+        with pytest.raises(ValueError, match="speculative scratch blocks require beam_width == 1"):
             transceiver._create_kv_slice(req)
 
     @pytest.mark.parametrize("prompt_len", (1150, 1151))
