@@ -3404,7 +3404,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             moe_config = MoeConfig()
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
             # Cap max_seq_len based on the evaluation task (NVBug 6476233).
-            extra_llm_args["max_seq_len"] = 8192
+            extra_llm_args["max_seq_len"] = 40960 if fp8kv else 8192
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
