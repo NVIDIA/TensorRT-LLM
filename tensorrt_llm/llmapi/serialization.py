@@ -121,12 +121,8 @@ BASE_EXAMPLE_CLASSES = {
     ],
     "torch._utils": ["_rebuild_tensor_v2"],
     "torch.storage": ["_load_from_bytes"],
-    # Legacy module keys, kept for the layout-migration compatibility window
-    # (Epic TRTLLM-14558).  A pickle written before the move carries the old
-    # module string, and find_class() matches the key exactly and rejects
-    # before the compatibility shim is ever imported -- so dropping these
-    # would silently disable the shims on the deserialization path.  They are
-    # removed together with the shims by the removal ticket T25 delivers.
+    # Pre-move module paths, so older artifacts still load.  Removed together
+    # with the forwarding modules.
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
     "tensorrt_llm.sampling_params":
     ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],

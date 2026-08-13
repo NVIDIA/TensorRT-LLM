@@ -331,8 +331,8 @@ llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar"
 Create a `GuidedDecodingParams` with the `json` field specified with a JSON schema, use it to create `SamplingParams`, and then pass to `llm.generate` or `llm.generate_async`. Alternatively, the JSON schema can be created using [pydantic](https://docs.pydantic.dev/latest/).
 
 ```python
-from tensorrt_llm import LLM
-from tensorrt_llm.executor.params.sampling import SamplingParams, GuidedDecodingParams
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams
 
 if __name__ == "__main__":
     llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar")
@@ -383,8 +383,8 @@ The output would look like:
 Create a `GuidedDecodingParams` with the `regex` field specified with a regular expression, use it to create `SamplingParams`, and then pass to `llm.generate` or `llm.generate_async`.
 
 ```python
-from tensorrt_llm import LLM
-from tensorrt_llm.executor.params.sampling import SamplingParams, GuidedDecodingParams
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams
 
 if __name__ == "__main__":
     llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar")
@@ -418,8 +418,8 @@ Paris
 Create a `GuidedDecodingParams` with the `grammar` field specified with an EBNF grammar, use it to create `SamplingParams`, and then pass to `llm.generate` or `llm.generate_async`.
 
 ```python
-from tensorrt_llm import LLM
-from tensorrt_llm.executor.params.sampling import SamplingParams, GuidedDecodingParams
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams
 
 if __name__ == "__main__":
     llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar")
@@ -462,8 +462,8 @@ Structural tag is supported by `xgrammar` backend only. It is a powerful and fle
 
 ```python
 import json
-from tensorrt_llm import LLM
-from tensorrt_llm.executor.params.sampling import SamplingParams, GuidedDecodingParams
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import GuidedDecodingParams
 
 if __name__ == "__main__":
     llm = LLM("nvidia/Llama-3.1-8B-Instruct-FP8", guided_decoding_backend="xgrammar")

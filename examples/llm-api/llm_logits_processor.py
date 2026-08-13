@@ -6,9 +6,8 @@ from typing import List, Optional
 import torch
 from transformers import PreTrainedTokenizer
 
-from tensorrt_llm import LLM
-from tensorrt_llm.executor.params.sampling import (LogitsProcessor,
-                                                   SamplingParams)
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.executor.params.sampling import LogitsProcessor
 
 
 def text_to_token(tokenizer: PreTrainedTokenizer, text: str, last: bool):

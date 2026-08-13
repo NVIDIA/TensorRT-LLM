@@ -16,6 +16,7 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
+from tensorrt_llm import SamplingParams
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._config import (
@@ -23,7 +24,6 @@ from tensorrt_llm._torch.auto_deploy.utils._config import (
     deep_merge_dicts,
 )
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
-from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 
 # Registry paths

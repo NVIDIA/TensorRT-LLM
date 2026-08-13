@@ -461,6 +461,14 @@
 /tensorrt_llm/_torch/pyexecutor/py_executor.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/model_engine.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 
+# ===== COMPATIBILITY FORWARDING MODULES =====
+# Modules kept at their pre-move import paths so external callers keep working.
+# Each forwards to the relocated implementation and is owned by the same team.
+# This whole section is deleted together with the modules it lists.
+/tensorrt_llm/sampling_params.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/scheduling_params.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
+
 # ===== GOVERNANCE / LEGAL GATES =====
 /.github/CODEOWNERS @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /.github/tava_architecture_diagram.md @NVIDIA/trt-llm-TAVA-design-change

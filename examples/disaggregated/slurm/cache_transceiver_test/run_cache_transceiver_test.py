@@ -51,14 +51,13 @@ from report import build_cases  # shared case enumeration (same dir on sys.path)
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm import DisaggregatedParams
+from tensorrt_llm import DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.executor.params.sampling import SamplingParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
