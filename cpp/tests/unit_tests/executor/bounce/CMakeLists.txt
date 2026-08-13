@@ -25,6 +25,9 @@ set(BOUNCE_DIR
 )
 
 # ---- Pure-logic + GPU unit tests (no NIXL / zmq / network) ----
+add_gtest(creditSchedulerTest creditSchedulerTest.cpp)
+target_sources(creditSchedulerTest PRIVATE ${BOUNCE_DIR}/CreditScheduler.cpp
+                                           ${BOUNCE_DIR}/BuddyAllocator.cpp)
 add_gtest(bounceTransferPlanTest bounceTransferPlanTest.cpp)
 target_sources(bounceTransferPlanTest
                PRIVATE ${BOUNCE_DIR}/BounceTransferPlan.cpp)
