@@ -58,12 +58,12 @@
 //
 // INFRA-TODO (fill in with the team before enabling non-dry-run):
 //   * Jenkins job config: schedule (cron) on each instance; "Pipeline script from
-//     SCM" so `checkout scm` works in the bootstrap stage below.
+//     SCM" so readTrusted() can read jenkins/current_image_tags.properties.
 //   * Work-pod must have an ssh client + the svc_tensorrt creds that
 //     CloudManager.withSlurmFrontendFailover expects (same as L0_Test SLURM
 //     dispatchers).
 //   * Confirm squeue field format (%k comment, %M elapsed) on the target Slurm
-//     version, and the bootstrap git image availability.
+//     version.
 // =============================================================================
 
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
@@ -71,6 +71,7 @@
 import com.nvidia.bloom.CloudManager
 import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.Utils
+import jenkins.model.Jenkins
 
 // Structured owner tag carried in each CI SLURM job's --comment. L0_Test writes
 // "trtllm-ci-owner=<BUILD_URL>" (co-existing with any other comment payload,
@@ -82,12 +83,6 @@ SLURM_CI_USER = "svc_tensorrt"
 
 // K8s secret for pulling the work-pod image from artifactory.nvidia.com.
 ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
-
-// Small git-capable image used only by the bootstrap stage to check out the repo
-// and read the CI image tag from jenkins/current_image_tags.properties, so the
-// work-pod image is not hardcoded here (single source of truth is the properties
-// file). INFRA-TODO: confirm this image is available via the mirror.
-BOOTSTRAP_IMAGE = "urm.nvidia.com/docker/alpine/git:latest"
 
 // True if the owner Jenkins build is still running, via the in-process Jenkins
 // API (no HTTP, no credentials, no shell). Only same-instance builds are checked:
@@ -126,42 +121,20 @@ boolean isOwnerBuildRunning(String buildUrl) {
     }
 }
 
-// Minimal pod for the bootstrap stage (checkout + read image tag).
-def createBootstrapPodConfig()
-{
-    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_amd_linux:jdk17"
-    return [
-        cloud: "kubernetes-cpu",
-        namespace: "sw-tensorrt",
-        yaml: """
-            apiVersion: v1
-            kind: Pod
-            spec:
-                qosClass: Guaranteed
-                nodeSelector:
-                  nvidia.com/node_type: builder
-                  kubernetes.io/os: linux
-                containers:
-                  - name: trt-llm
-                    image: ${BOOTSTRAP_IMAGE}
-                    command: ['cat']
-                    tty: true
-                    resources:
-                      requests: { cpu: '1', memory: 1Gi, ephemeral-storage: 5Gi }
-                      limits:   { cpu: '1', memory: 1Gi, ephemeral-storage: 5Gi }
-                    imagePullPolicy: Always
-                  - name: jnlp
-                    image: ${jnlpImage}
-                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
-                    resources:
-                      requests: { cpu: '1', memory: 1Gi, ephemeral-storage: 5Gi }
-                      limits:   { cpu: '1', memory: 1Gi, ephemeral-storage: 5Gi }
-        """.stripIndent(),
-    ]
+// Extract a "KEY=value" image tag from current_image_tags.properties text. Pure /
+// node-free so it can run on the controller alongside readTrusted.
+@NonCPS
+String parseImageTag(String propsText, String key) {
+    if (!propsText || !key) {
+        return null
+    }
+    def pattern = ~("(?m)^\\s*" + java.util.regex.Pattern.quote(key) + "\\s*=\\s*(\\S+)\\s*\$")
+    def m = pattern.matcher(propsText)
+    return m.find() ? m.group(1) : null
 }
 
 // Work pod: reaches the SLURM login nodes over ssh (CloudManager). Image is read
-// from current_image_tags.properties by the bootstrap stage rather than hardcoded.
+// from current_image_tags.properties at runtime rather than hardcoded.
 // INFRA-TODO: confirm image/creds/network match the SLURM dispatcher pool.
 def createKubernetesPodConfig(image)
 {
@@ -347,12 +320,17 @@ pipeline {
 
                     // Read the work-pod image from the repo (single source of truth:
                     // jenkins/current_image_tags.properties) instead of hardcoding it.
-                    def podImage
-                    trtllm_utils.launchKubernetesPod(this, createBootstrapPodConfig(), "trt-llm") {
-                        checkout scm
-                        podImage = readProperties(file: 'jenkins/current_image_tags.properties',
-                                                  interpolate: true)['LLM_DOCKER_IMAGE']
+                    // readTrusted fetches the file from the same SCM revision as this
+                    // Jenkinsfile on the controller -- no node / checkout / bootstrap
+                    // pod. Requires the job to be "Pipeline script from SCM".
+                    def propsText
+                    try {
+                        propsText = readTrusted('jenkins/current_image_tags.properties')
+                    } catch (Exception e) {
+                        error "[JANITOR] could not read current_image_tags.properties via readTrusted (${e}); " +
+                              "configure this job as 'Pipeline script from SCM'."
                     }
+                    def podImage = parseImageTag(propsText, 'LLM_DOCKER_IMAGE')
                     if (!podImage) {
                         error "[JANITOR] could not resolve LLM_DOCKER_IMAGE from current_image_tags.properties."
                     }
