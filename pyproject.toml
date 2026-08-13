@@ -885,6 +885,26 @@ explicit_package_bases = true
 namespace_packages = true
 strict = true
 show_error_codes = true
+# Files checked when mypy runs with no explicit paths. This is the single source
+# of truth for the type-check file set. Both the CI build stage (which invokes
+# scripts/run_mypy.sh directly) and the local pre-commit hook run mypy without
+# explicit paths (the hook sets `pass_filenames: false`), so both read this list.
+files = [
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_common.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/sampler_strategy.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/logprobs.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/finish_reasons.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/top_p_decay.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/penalties.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py",
+    "tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py",
+    "tests/unittest/_torch/sampler/test_torch_sampler.py",
+    "tests/unittest/_torch/sampler/test_token_ban.py",
+    "tests/unittest/_torch/sampler/test_beam_search.py",
+    "tests/unittest/_torch/sampler/test_beam_search_util.py",
+]
 # NB:
 #   .   -> 'tensorrt_llm'
 #   tests/unittest   -> 'utils'
