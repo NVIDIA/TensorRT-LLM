@@ -15,7 +15,7 @@
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -29,16 +29,47 @@ from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    CACHE_LEVEL1,
     DEFAULT_BEAM_INDEX,
     BatchDesc,
     GpuCacheTierConfig,
     KVCacheDesc,
     KVCacheManagerConfig,
+    OutOfMemoryError,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
 
 TOKENS_PER_BLOCK = 4
 MAX_SEQ_LEN = 16
+
+
+def test_generation_oom_is_reported_as_allocation_failure() -> None:
+    class ConcreteOOMError(OutOfMemoryError):
+        pass
+
+    manager = object.__new__(KVCacheManagerV2)
+    kv_cache = Mock(is_active=True, capacity=7)
+    kv_cache.resize.side_effect = ConcreteOOMError("CUDA out of memory")
+    manager.kv_cache_map = {11: kv_cache}
+    manager._allocated_draft_lens = {}
+    manager._effective_draft_len = lambda _req: 0
+    request = SimpleNamespace(py_request_id=11)
+
+    assert not manager.try_allocate_generation(request)
+
+
+def test_scheduler_suspend_offloads_to_secondary_tier() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    kv_cache = Mock(is_active=True)
+    kv_cache.offload.return_value = True
+    manager.kv_cache_map = {12: kv_cache}
+    manager.kv_cache_manager_py_config = SimpleNamespace(cache_tiers=[object(), object()])
+    request = SimpleNamespace(py_request_id=12)
+
+    manager.suspend_request(request, offload=True)
+
+    kv_cache.suspend.assert_called_once_with()
+    kv_cache.offload.assert_called_once_with(CACHE_LEVEL1)
 
 
 class _FakeKVCache:

@@ -164,8 +164,9 @@ public:
         std::vector<BatchedLockTarget> const& targets, KvCache& kvCache, MigrationRecorder const& migrationRecorder);
 
     // Best-effort migration of grouped pages to a destination cache level.
-    void prefetch(
-        CacheLevel dstLevel, TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
+    void prefetch(CacheLevel dstLevel,
+        TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     // ---- Query helpers -----------------------------------------------------
 

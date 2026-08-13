@@ -731,8 +731,9 @@ void StorageManager::batchedMigrateToGpu(
         _batchedMigrate(key.second, kGpuLevel, key.first, pages, /*updateSrc=*/true, migrationRecorder);
 }
 
-void StorageManager::prefetch(
-    CacheLevel dstLevel, TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages)
+void StorageManager::prefetch(CacheLevel dstLevel,
+    TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
     TypedVec<PoolGroupIndex, SlotCount> numSlotsToMigrate(numPoolGroups(), 0);
     std::vector<SharedPtr<Page>> scheduled;
@@ -758,9 +759,9 @@ void StorageManager::prefetch(
         for (CacheLevel level{0}; level < poolGroupPages.size(); ++level)
         {
             auto const& levelPages = poolGroupPages.at(level);
-            TLLM_CHECK_DEBUG(level >= dstLevel || levelPages.empty());
             for (auto const& page : levelPages)
             {
+                TLLM_CHECK_DEBUG(page->cacheLevel == level);
                 if (page->scheduledForEviction())
                 {
                     excludeFromEviction(*page);
@@ -770,7 +771,6 @@ void StorageManager::prefetch(
                 {
                     scheduled.push_back(page);
                 }
-                TLLM_CHECK_DEBUG(level >= dstLevel);
                 if (level == dstLevel)
                 {
                     continue;
@@ -780,13 +780,17 @@ void StorageManager::prefetch(
         }
     }
 
-    prepareFreeSlots(dstLevel, numSlotsToMigrate);
+    prepareFreeSlots(dstLevel, numSlotsToMigrate, migrationRecorder, dropRecorder);
     for (PoolGroupIndex pgIndex{0}; pgIndex < pages.size(); ++pgIndex)
     {
         auto const& poolGroupPages = pages.at(pgIndex);
-        for (CacheLevel lvl = dstLevel + 1; lvl < numCacheLevels(); ++lvl)
+        for (CacheLevel lvl{0}; lvl < numCacheLevels(); ++lvl)
         {
-            _batchedMigrate(pgIndex, dstLevel, lvl, poolGroupPages.at(lvl), /*updateSrc=*/true);
+            if (lvl == dstLevel)
+            {
+                continue;
+            }
+            _batchedMigrate(pgIndex, dstLevel, lvl, poolGroupPages.at(lvl), /*updateSrc=*/true, migrationRecorder);
         }
     }
 }

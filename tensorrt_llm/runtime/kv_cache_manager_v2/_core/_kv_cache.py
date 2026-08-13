@@ -42,7 +42,7 @@ from .._common import (
     TokenIdExt,
 )
 from .._copy_engine import CopyTask, batched_copy
-from .._exceptions import LogicError, OutOfPagesError
+from .._exceptions import LogicError, OutOfMemoryError, OutOfPagesError
 from .._life_cycle_registry import (
     AttnLifeCycle,
     LayerGroupId,
@@ -845,7 +845,7 @@ class _KVCache:
                         self._record_migrated_slots,
                         self._record_dropped_pages,
                     )
-                except OutOfPagesError:
+                except (OutOfMemoryError, OutOfPagesError):
                     self._recover_excess_scratch_slots(excess_scratch_slots)
                     self._lock_held_blocks(backup_holders)
                     return False
@@ -1178,9 +1178,6 @@ class _KVCache:
         assert self.status == self.Status.SUSPENDED
         if cuda_stream is not None:
             self.cuda_stream = cuda_stream
-        utilization = max(self._storage.get_utilization(GPU_LEVEL))
-        if utilization > self.manager._init_config.max_util_for_resume:
-            return False
         assert self._cuda_stream is not None, "cuda_stream is never set"
         assert self._finish_event is None
         storage = self._storage
@@ -1211,12 +1208,45 @@ class _KVCache:
         for lc_idx in typed_range(num_life_cycles):
             num_slots[lc_idx] += delta_scratch_slots[lc_idx]
 
+        # Admission is based on the pages this cache will make unavailable,
+        # rather than the current utilization of an unrelated pool group.
+        # A suspended GPU page is evictable today but becomes unavailable once
+        # locked; an offloaded page has the same final cost after migration.
+        additional_unavailable = filled_list(0, storage.num_pool_groups)
+        for lc_idx, count in typed_enumerate(num_slots):
+            additional_unavailable[storage.get_pool_group_index(lc_idx)] += count
+
+        counted_pages: set[int] = set()
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            holder = self._page(ordinal, beam_idx, lc_idx)
+            if holder is None:
+                continue
+            page = expect_type(_PageHolder, holder).page
+            page_id = id(page)
+            if page_id in counted_pages or page.status == PageStatus.LOCKED:
+                continue
+            counted_pages.add(page_id)
+            # A held GPU page that is not on the eviction queue is already
+            # included in stat.unavailable. Only migration from a colder tier
+            # or locking an evictable GPU page increases that count.
+            if page.cache_level != GPU_LEVEL or page.scheduled_for_eviction:
+                additional_unavailable[storage.get_pool_group_index(lc_idx)] += 1
+
+        max_utilization = self.manager._init_config.max_util_for_resume
+        gpu_stats = storage.get_statistics(GPU_LEVEL)
+        if any(
+            additional_unavailable[pg_idx] > 0
+            and stat.unavailable + additional_unavailable[pg_idx] > stat.total * max_utilization
+            for pg_idx, stat in typed_enumerate(gpu_stats)
+        ):
+            return False
+
         if any(c > 0 for c in num_slots):
             try:
                 tmp_slots = storage.new_gpu_slots(
                     num_slots, self._record_migrated_slots, self._record_dropped_pages
                 )
-            except OutOfPagesError:
+            except (OutOfMemoryError, OutOfPagesError):
                 return False
 
             # Wait for scratch slots to be ready
@@ -1251,7 +1281,7 @@ class _KVCache:
             locks = batched_lock_to_gpu(
                 self, tasks, self._record_migrated_slots, self._record_dropped_pages
             )
-        except OutOfPagesError:
+        except (OutOfMemoryError, OutOfPagesError):
             for lc_idx, slot in typed_enumerate(deferred_slots):
                 if slot is not None:
                     storage.release_slot(lc_idx, GPU_LEVEL, slot)
@@ -1359,6 +1389,52 @@ class _KVCache:
         self._status = self.Status.ACTIVE
         return True
 
+    def offload(self, target: CacheLevel) -> bool:
+        """Best-effort offload of active pages to ``target``.
+
+        The cache must be suspended. All active pages in faster tiers are
+        migrated, including attention pages and recurrent SSM/conv state.
+        Pages already at ``target`` or in a slower tier are left in place.
+        """
+        assert self.status == self.Status.SUSPENDED
+        storage = self.manager._storage
+        num_tiers = storage.num_cache_levels
+        assert GPU_LEVEL < target < num_tiers
+
+        all_pages = make_typed(
+            lambda _: make_typed(lambda _: list[Page](), num_tiers), storage.num_pool_groups
+        )
+        counted_pages: set[int] = set()
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            holder = self._page(ordinal, beam_idx, lc_idx)
+            if holder is None:
+                continue
+            page = expect_type(_PageHolder, holder).page
+            page_id = id(page)
+            # A page can be shared by multiple beams or requests. After this
+            # cache is suspended, a still-locked page belongs to another active
+            # request and must remain resident on GPU.
+            if (
+                page_id in counted_pages
+                or page.status == PageStatus.LOCKED
+                or page.cache_level >= target
+            ):
+                continue
+            counted_pages.add(page_id)
+            pg_idx = storage.get_pool_group_index(lc_idx)
+            all_pages[pg_idx][page.cache_level].append(page)
+
+        try:
+            storage.prefetch(
+                target,
+                all_pages,
+                self._record_migrated_slots,
+                self._record_dropped_pages,
+            )
+        except (OutOfMemoryError, OutOfPagesError):
+            return False
+        return True
+
     def prefetch(self, target: CacheLevel) -> bool:
         """Best-effort prefetch active pages to the target cache level.
 
@@ -1397,8 +1473,13 @@ class _KVCache:
             all_pages[pg_idx][lvl].append(page)
 
         try:
-            storage.prefetch(target, all_pages)
-        except OutOfPagesError:
+            storage.prefetch(
+                target,
+                all_pages,
+                self._record_migrated_slots,
+                self._record_dropped_pages,
+            )
+        except (OutOfMemoryError, OutOfPagesError):
             return False
         return True
 

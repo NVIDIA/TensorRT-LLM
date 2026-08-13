@@ -1478,7 +1478,8 @@ def test_hybrid_mtp_layout_honors_explicit_base_partition():
                 kv_cache_config=KvCacheConfig(enable_block_reuse=False),
                 spec_config=spec_config,
             )
-            assert cache_cost == (64 * (rank + 1), 2400)
+            expected_intercept = 2400 if manager_cls is CppMambaHybridCacheManager else 1600
+            assert cache_cost == (64 * (rank + 1), expected_intercept)
 
 
 def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
@@ -1503,7 +1504,7 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
             spec_config=spec_config,
             use_separate_draft_kv_cache=True,
         )
-        assert target_cost == (64, 2400)
+        assert target_cost == (64, 1600)
 
         _, local_mamba_layers, local_attention_layers = _get_local_mamba_cache_layout(
             model_config,
@@ -1529,15 +1530,15 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
 @pytest.mark.parametrize(
     ("spec_config", "enable_attention_dp", "expected_intercept"),
     [
-        (None, False, 320),
-        (MTPDecodingConfig(max_draft_len=4), True, 384),
+        (None, False, 128),
+        (MTPDecodingConfig(max_draft_len=4), True, 192),
         (
             MTPDecodingConfig(
                 max_draft_len=4,
                 draft_len_schedule={1: 4, 2: 2, 3: 1},
             ),
             True,
-            576,
+            384,
         ),
     ],
 )
@@ -1615,7 +1616,7 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     mgr.ssm_bytes = 64
     mgr.conv_bytes = 32
     mgr.max_attention_window_vec = [128, 128]
-    mgr.max_batch_size = 2
+    mgr.max_batch_size = 512
     mgr.mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     mgr.max_seq_len = 128
     mgr.max_num_tokens = 128
@@ -1639,7 +1640,14 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
         ),
     )
     mgr.kv_cache_config = kv_cache_config
-    constraints = [BatchDesc([KVCacheDesc(capacity=64, history_length=0)])]
+    constraints = [
+        BatchDesc(
+            [
+                KVCacheDesc(capacity=64, history_length=0),
+                KVCacheDesc(capacity=1, history_length=0),
+            ]
+        )
+    ]
     base_layers = _base_attention_layer_configs(2)
     base_config = KVCacheManagerConfig(
         tokens_per_block=32,
@@ -1654,10 +1662,11 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     assert isinstance(config.layers[1], AttentionLayerConfig)
     assert int(config.layers[1].layer_id) == int(base_layers[1].layer_id)
     assert config.typical_step == BatchDesc(
-        [KVCacheDesc(capacity=32, history_length=31)] * 6
+        [KVCacheDesc(capacity=32, history_length=31)] * (3 * 512)
         + [KVCacheDesc(capacity=0, history_length=0)]
     )
-    # The caller-provided constraint keeps its dummy-slot padding.
+    # The caller-provided max-batch constraint is reduced to the one request
+    # that must always make progress, while keeping dummy-slot padding.
     assert (
         BatchDesc(
             [
@@ -1667,17 +1676,16 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
         )
         in config.constraints
     )
-    # An explicit SSM floor constraint is always emitted so the recurrent pool
-    # can hold every live + reserved-dummy state slot even when the caller
-    # supplies no constraints (e.g. avg_seq_len unset). It is built from
-    # zero-capacity requests, so it costs no attention pages.
-    required_ssm_slots = mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots
+    # The explicit SSM floor is independent of max_batch_size: suspended live
+    # states can reside in host memory. Zero capacity avoids charging attention
+    # pages for this one-runnable-request + dummy constraint.
+    required_ssm_slots = mgr._minimum_gpu_resident_sequences() + mgr._num_reserved_dummy_slots
     assert any(
         all(kv.capacity == 0 for kv in batch.kv_caches)
         and len(batch.kv_caches) >= required_ssm_slots
         for batch in config.constraints
     )
-    assert sum(kv.capacity for kv in config.typical_step.kv_caches) == 2 * 96
+    assert sum(kv.capacity for kv in config.typical_step.kv_caches) == 512 * 96
     assert not hasattr(config.typical_step.kv_caches[0], "num_ssm_slots")
 
 
@@ -1744,9 +1752,12 @@ def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr.enable_swa_scratch_reuse = False
     mgr.get_layer_bytes_per_token = lambda **kwargs: 0
     mgr._attention_cache_bytes_per_token = lambda: 0
-    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        max_util_for_resume=1.0,
+    )
 
-    assert mgr._minimum_live_gpu_quota() == 3 * (64 + 32)
+    assert mgr._minimum_live_gpu_quota() == 2 * (64 + 32)
 
 
 def test_cpp_hybrid_prepare_expect_snapshot_points():

@@ -486,7 +486,7 @@ class TestKVCacheFailuresGen:
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0, 1]
         assert ids(out.paused_requests) == [99]
-        mgr.suspend_request.assert_called_once_with(victim)
+        mgr.suspend_request.assert_called_once_with(victim, offload=True)
 
     def test_gen_alloc_fails_evict_insufficient(self):
         """gen fails, evict victim, retry still fails → self-evict."""
@@ -556,6 +556,58 @@ class TestKVCacheFailuresGen:
         # → gen1 self-evicts, victim is not in paused list from eviction
         assert ids(out.generation_requests) == [0]
         assert 99 not in ids(out.paused_requests)
+
+    def test_inflight_request_prevents_false_deadlock(self):
+        """An inflight batch can release pages after an empty schedule."""
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        inflight = make_gen_request(0)
+        waiting = make_gen_request(1)
+        mgr.kv_cache_map[waiting.py_request_id].is_active = False
+
+        out = sched.schedule_request([inflight, waiting], {inflight.request_id})
+
+        assert ids(out.generation_requests) == []
+        assert ids(out.paused_requests) == []
+
+    def test_pending_completion_prevents_false_deadlock(self):
+        """A completing request releases its cache after scheduling."""
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        completing = make_gen_request(0)
+        completing.state_value = GEN_TO_COMPLETE
+        waiting = make_gen_request(1)
+        mgr.kv_cache_map[waiting.py_request_id].is_active = False
+
+        out = sched.schedule_request([completing, waiting], set())
+
+        assert ids(out.generation_requests) == []
+        assert ids(out.paused_requests) == []
+
+    def test_suspended_request_without_progress_raises_deadlock(self):
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        waiting = make_gen_request(1)
+        mgr.kv_cache_map[waiting.py_request_id].is_active = False
+
+        with pytest.raises(RuntimeError, match="No KV cache pool can admit"):
+            sched.schedule_request([waiting], set())
+
+    def test_suspended_request_blocked_by_token_budget_is_not_deadlocked(self):
+        mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=0)
+        waiting = make_gen_request(1)
+        mgr.kv_cache_map[waiting.py_request_id].is_active = False
+
+        out = sched.schedule_request([waiting], set())
+
+        assert ids(out.generation_requests) == []
 
 
 class TestKVCacheFailuresCtx:
@@ -734,7 +786,7 @@ class TestEviction:
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), victim]
         sched.schedule_request(reqs, set())
-        mgr.suspend_request.assert_called_once_with(victim)
+        mgr.suspend_request.assert_called_once_with(victim, offload=True)
 
     def test_eviction_clears_request_runtime_state(self):
         mgr = make_kv_cache_manager(

@@ -2215,14 +2215,24 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
 
-        if not kv_cache.is_active:
-            if not kv_cache.resume(self._stream.cuda_stream):
-                return False
-            self._restore_page_index_bufs(req.py_request_id, kv_cache)
+        try:
+            if not kv_cache.is_active:
+                if not kv_cache.resume(self._stream.cuda_stream):
+                    return False
+                self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
-        draft_len = self._effective_draft_len(req)
-        self._allocated_draft_lens[req.py_request_id] = draft_len
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+            draft_len = self._effective_draft_len(req)
+            self._allocated_draft_lens[req.py_request_id] = draft_len
+            return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        except KVCacheOutOfMemoryError:
+            # Allocation pressure is part of the scheduler's normal control
+            # flow. Let it suspend/offload victims and retry instead of
+            # terminating the executor event loop.
+            logger.debug(
+                "KV cache allocation ran out of memory for request %s",
+                req.py_request_id,
+            )
+            return False
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
@@ -2275,7 +2285,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"to {pre_cap}"
             )
         if pre_cap > 0:
-            kv_cache.suspend()
+            self._suspend_kv_cache(req.py_request_id, kv_cache, offload=True)
 
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
@@ -2390,7 +2400,7 @@ class KVCacheManagerV2(BaseResourceManager):
         success = kv_cache.resize(capacity)
         if not success:
             if req.is_first_context_chunk:
-                kv_cache.suspend()
+                self._suspend_kv_cache(req.py_request_id, kv_cache, offload=True)
             return False
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
@@ -2419,7 +2429,7 @@ class KVCacheManagerV2(BaseResourceManager):
         success = kv_cache.resize(capacity, req.prompt_len)
         if not success:
             if req.is_first_context_chunk:
-                kv_cache.suspend()
+                self._suspend_kv_cache(req.py_request_id, kv_cache, offload=True)
             return False
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         return True
@@ -2464,11 +2474,27 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"(target capacity {new_capacity})"
             )
 
-    def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache (move to host tier)."""
+    def _suspend_kv_cache(self, request_id: int, kv_cache, *, offload: bool) -> None:
+        if not kv_cache.is_active:
+            return
+        kv_cache.suspend()
+        if (
+            offload
+            and len(self.kv_cache_manager_py_config.cache_tiers) > 1
+            and not kv_cache.offload(CACHE_LEVEL1)
+        ):
+            # The cache remains valid and suspended. Demand-driven eviction
+            # can still migrate its pages during a later allocation retry.
+            logger.debug(
+                "Failed to offload suspended KV cache for request %s",
+                request_id,
+            )
+
+    def suspend_request(self, req: LlmRequest, *, offload: bool = False) -> None:
+        """Suspend a request and optionally move its working set off GPU."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
-        if kv_cache is not None and kv_cache.is_active:
-            kv_cache.suspend()
+        if kv_cache is not None:
+            self._suspend_kv_cache(req.py_request_id, kv_cache, offload=offload)
 
     def resume_request(self, req: LlmRequest) -> bool:
         """Resume a previously-suspended KV cache for *req*.

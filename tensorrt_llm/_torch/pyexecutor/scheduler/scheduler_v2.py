@@ -265,6 +265,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
+        blocked_suspended_gen = 0
 
         budget = BudgetTracker(
             self.max_num_tokens,
@@ -387,7 +388,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 peft_pages = budget.peft_pages_needed(req)
                 if peft_pages is None:
                     break
-                action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
+                (
+                    action,
+                    tokens,
+                    scheduled_beam_width,
+                    req_it_end,
+                    resume_blocked,
+                ) = self._try_schedule_generation(
                     req,
                     budget,
                     requests_list,
@@ -396,6 +403,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     evicted,
                     scheduled_beam_width,
                 )
+                blocked_suspended_gen += int(resume_blocked)
                 if action is ScheduleAction.STOP:
                     break
                 if action is ScheduleAction.SKIP:
@@ -431,26 +439,29 @@ class KVCacheV2Scheduler(RequestScheduler):
                 budget.commit(req, tokens, peft_pages)
 
         # Deadlock detection: if generation requests exist but none were
-        # scheduled and none were evicted, no forward pass will run and no
-        # KV cache pages will ever be freed — the scheduler will spin
-        # forever.  This typically happens when the KV cache pool is
-        # exhausted and no host cache tier is available for suspend/resume.
+        # scheduled or evicted, the scheduler will spin forever unless an
+        # inflight batch or a request pending teardown can still release
+        # pages after this scheduling call.
         if not scheduled_gen and not scheduled_ctx:
-            num_gen_candidates = sum(
-                1
-                for r in active_requests
-                if r.is_generation_in_progress_state
-                and not r.is_generation_to_complete_state
-                and r.request_id not in inflight_request_ids
+            has_inflight_requests = any(
+                r.request_id in inflight_request_ids for r in active_requests
             )
-            if num_gen_candidates > 0 and not evicted:
+            has_pending_completions = any(
+                r.state_value == self._gen_to_complete_state_value for r in active_requests
+            )
+            if (
+                blocked_suspended_gen > 0
+                and not evicted
+                and not has_inflight_requests
+                and not has_pending_completions
+            ):
                 raise RuntimeError(
-                    f"V2 scheduler deadlock: {num_gen_candidates} generation "
-                    f"request(s) active but none could be scheduled or "
-                    f"evicted. KV cache pool is likely exhausted with no "
-                    f"host cache tier for suspend/resume offload. "
-                    f"Configure kv_cache_config.host_cache_size or increase "
-                    f"kv_cache_config.max_tokens."
+                    "V2 scheduler deadlock: a suspended generation request "
+                    "was eligible for scheduling but could not resume, and "
+                    "no request can release KV cache pages. No KV cache pool "
+                    "can admit the suspended request. Ensure every pool can "
+                    "fit one request below max_util_for_resume, configure "
+                    "host_cache_size, or increase max_tokens."
                 )
 
         return (
@@ -927,7 +938,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         target_capacity = req_tokens + cross_kv_cache_manager.num_extra_kv_tokens
         if not kv_cache.resize(max(kv_cache.capacity, target_capacity)):
             if req.is_first_context_chunk:
-                kv_cache.suspend()
+                cross_kv_cache_manager.suspend_request(req, offload=True)
             return False
 
         return True
@@ -941,23 +952,26 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it_end: int,
         evicted: RequestList,
         scheduled_beam_width: int,
-    ) -> tuple[ScheduleAction, int, int, int]:
+    ) -> tuple[ScheduleAction, int, int, int, bool]:
         """Try to schedule a generation request.
 
-        Returns ``(action, tokens, scheduled_beam_width, req_it_end)``.
+        Returns ``(action, tokens, scheduled_beam_width, req_it_end,
+        resume_blocked)``. ``resume_blocked`` is true only when an eligible,
+        already-suspended request attempted and failed KV-cache admission.
         *tokens* is meaningful only when *action* is ``SCHEDULED``.
         """
         beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
         req_tokens = beam_width + get_draft_token_length(req)
 
         if not budget.can_fit_tokens(req_tokens):
-            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end, False
 
         if scheduled_beam_width == 0:
             scheduled_beam_width = beam_width
         elif scheduled_beam_width != beam_width:
-            return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
+            return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end, False
 
+        was_suspended = not self.kv_cache_manager.is_request_active(req.py_request_id)
         success = self.kv_cache_manager.try_allocate_generation(req)
 
         if not success:
@@ -966,7 +980,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
 
         if success:
-            return ScheduleAction.SCHEDULED, req_tokens, scheduled_beam_width, req_it_end
+            return (
+                ScheduleAction.SCHEDULED,
+                req_tokens,
+                scheduled_beam_width,
+                req_it_end,
+                False,
+            )
 
         # Self-eviction: suspend this gen request to free its
         # GPU pages so other requests can resume().
@@ -980,7 +1000,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._suspend_request(req)
             evicted.append(req)
 
-        return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
+        return (
+            ScheduleAction.STOP,
+            0,
+            scheduled_beam_width,
+            req_it_end,
+            was_suspended,
+        )
 
     # ---- Eviction ----
 
@@ -1003,9 +1029,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         fail if it needs to load a different adapter into a full cache.
         """
         self._clear_request_runtime_state(req)
-        self.kv_cache_manager.suspend_request(req)
+        self.kv_cache_manager.suspend_request(req, offload=True)
         if self.draft_kv_cache_manager is not None:
-            self.draft_kv_cache_manager.suspend_request(req)
+            self.draft_kv_cache_manager.suspend_request(req, offload=True)
 
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None

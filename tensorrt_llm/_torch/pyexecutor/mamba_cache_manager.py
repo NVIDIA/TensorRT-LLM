@@ -2003,6 +2003,7 @@ def _estimate_mamba_hybrid_cache_cost(
     tokens_per_block: int,
     max_seq_len: Optional[int],
     num_reserved_dummy_slots: int,
+    num_guaranteed_resident_sequences: Optional[int],
     include_explicit_snapshots: bool,
     cap_partial_attention_snapshots: bool,
     is_draft: bool = False,
@@ -2026,7 +2027,11 @@ def _estimate_mamba_hybrid_cache_cost(
     ) if local_attention_layers > 0 else 0)
     state_bytes_per_rank = (local_mamba_layers *
                             params.get_states_bytes_per_layer(mapping))
-    max_resident_sequences = max_batch_size * mapping.pp_size
+    resident_sequences = (max_batch_size *
+                          mapping.pp_size if num_guaranteed_resident_sequences
+                          is None else num_guaranteed_resident_sequences)
+    if local_mamba_layers == 0:
+        resident_sequences = 0
 
     if include_explicit_snapshots:
         fixed_rules, unaligned_fixed_rules = _mamba_snapshot_rule_counts(
@@ -2034,8 +2039,8 @@ def _estimate_mamba_hybrid_cache_cost(
     else:
         fixed_rules = 0
         unaligned_fixed_rules = 0
-    fixed_state_slots = (max_resident_sequences + num_reserved_dummy_slots +
-                         max_resident_sequences * fixed_rules)
+    fixed_state_slots = (resident_sequences + num_reserved_dummy_slots +
+                         resident_sequences * fixed_rules)
     attention_block_bytes = attention_slope * tokens_per_block
 
     interval = _mamba_regular_snapshot_interval(kv_cache_config, max_seq_len)
@@ -2046,11 +2051,10 @@ def _estimate_mamba_hybrid_cache_cost(
         # snapshot is possible, reserve one retained partial attention page
         # per resident lineage. Dummy requests carry no attention capacity.
         has_non_live_ssm_capacity = fixed_rules > 0 or interval is not None
-        partial_attention_slots = (max_resident_sequences
+        partial_attention_slots = (resident_sequences
                                    if has_non_live_ssm_capacity else 0)
     else:
-        partial_attention_slots = (max_resident_sequences *
-                                   unaligned_fixed_rules)
+        partial_attention_slots = (resident_sequences * unaligned_fixed_rules)
     intercept = (fixed_state_slots * state_bytes_per_rank +
                  partial_attention_slots * attention_block_bytes)
 
@@ -2404,6 +2408,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             num_reserved_dummy_slots=1,
+            num_guaranteed_resident_sequences=None,
             include_explicit_snapshots=False,
             cap_partial_attention_snapshots=False,
             **kwargs,
@@ -3058,8 +3063,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 LayerId(first_mamba_local_layer), MambaRole.SSM_STATE)
             num_ssm_slots = ((num_ssm_pages + self._ssm_page_index_scale - 1) //
                              self._ssm_page_index_scale)
-            required_live_slots = (self._max_resident_sequences() +
-                                   self._num_reserved_dummy_slots)
+            required_live_slots = self._minimum_resumable_state_slots()
             if num_ssm_slots < required_live_slots:
                 KVCacheManagerV2.shutdown(self)
                 raise ValueError(
@@ -3157,6 +3161,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             num_reserved_dummy_slots=num_reserved_dummy_slots,
+            # Suspended V2 requests can migrate recurrent state to a colder
+            # tier. Only one runnable request and persistent padding dummies
+            # are an unavoidable GPU fixed cost; max_batch_size remains a
+            # pool-ratio hint below, not a residency requirement.
+            num_guaranteed_resident_sequences=1,
             include_explicit_snapshots=True,
             cap_partial_attention_snapshots=True,
             **kwargs,
@@ -3175,6 +3184,25 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _max_resident_sequences(self) -> int:
         return self.max_batch_size * self.mapping.pp_size
 
+    def _minimum_gpu_resident_sequences(self) -> int:
+        """Return the number of real requests that must fit on GPU.
+
+        V2 can preserve suspended recurrent state in a colder cache tier, so
+        ``max_batch_size`` is not a hard residency requirement. One request is
+        sufficient for forward progress; the scheduler admits more whenever
+        both the recurrent and attention pools have pages for them.
+        """
+        return int(self.local_num_mamba_layers > 0)
+
+    def _minimum_resumable_state_slots(self) -> int:
+        """Return physical SSM slots needed for one resumable request."""
+        logical_slots = (self._minimum_gpu_resident_sequences() +
+                         self._num_reserved_dummy_slots)
+        if logical_slots == 0:
+            return 0
+        return math.ceil(logical_slots /
+                         self.kv_cache_config.max_util_for_resume)
+
     def _mamba_state_bytes_per_slot(self) -> int:
         return self.local_num_mamba_layers * (self.ssm_bytes + self.conv_bytes)
 
@@ -3182,6 +3210,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self,
         capacity: int,
         kv_cache_config: KvCacheConfig,
+        num_request_lineages: Optional[int] = None,
     ) -> int:
         if capacity <= 0 or not kv_cache_config.enable_block_reuse:
             return 0
@@ -3192,8 +3221,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         interval = _mamba_regular_snapshot_interval(kv_cache_config,
                                                     self.max_seq_len)
         regular_snapshots = capacity // interval if interval is not None else 0
-        return (self._max_resident_sequences() * fixed_rules +
-                regular_snapshots)
+        if num_request_lineages is None:
+            num_request_lineages = self._max_resident_sequences()
+        return (num_request_lineages * fixed_rules + regular_snapshots)
 
     def _num_ssm_states_per_typical_request(
         self,
@@ -3249,9 +3279,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         attention_quota = super()._get_quota_from_max_tokens(max_tokens)
-        num_request_lineages = self._max_resident_sequences()
+        num_request_lineages = self._minimum_gpu_resident_sequences()
         snapshot_slots = self._num_ssm_snapshots_for_capacity(
-            max_tokens, self.kv_cache_config)
+            max_tokens,
+            self.kv_cache_config,
+            num_request_lineages=num_request_lineages)
         state_slots = (num_request_lineages + self._num_reserved_dummy_slots +
                        snapshot_slots)
         state_quota = state_slots * self._mamba_state_bytes_per_slot()
@@ -3285,10 +3317,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return low
 
     def _minimum_live_gpu_quota(self) -> int:
-        """Return the minimum quota for live states and one attention page."""
+        """Return the logical quota needed by one runnable request."""
         attention_block_quota = (self._attention_cache_bytes_per_token() *
                                  self.tokens_per_block)
-        num_state_slots = (self._max_resident_sequences() +
+        num_state_slots = (self._minimum_gpu_resident_sequences() +
                            self._num_reserved_dummy_slots)
         state_quota = num_state_slots * self._mamba_state_bytes_per_slot()
         return max(
@@ -3328,10 +3360,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             KVCacheDesc(capacity=0, history_length=0)
             for _ in range(self._num_reserved_dummy_slots)
         ]
+        # Base warmup constraints describe max_batch_size concurrent requests.
+        # For hybrid V2 that would turn max_batch_size into a non-offloadable
+        # SSM floor. Keep the largest request from each constraint so one
+        # request can always make progress; larger batches are admitted from
+        # actual free pages.
         constraints = [
             replace(
                 batch,
-                kv_caches=[*batch.kv_caches, *dummy_requests],
+                kv_caches=[*batch.kv_caches[:1], *dummy_requests],
             ) for batch in config.constraints
         ]
 
@@ -3344,17 +3381,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             typical_step = BatchDesc(request_descs *
                                      self._max_resident_sequences() +
                                      dummy_requests)
-        # The recurrent (SSM) state pool must hold one slot per resident
-        # sequence plus every reserved dummy slot. Unlike attention pages, a
-        # Mamba state is fixed-size per sequence, so this floor is independent
-        # of sequence length. The base config only emits constraints when
-        # ``avg_seq_len`` is set, and speculative decoding inflates the reserved
-        # dummy slots (CUDA-graph padding), so without an explicit floor the SSM
-        # pool can be undersized (see the live/dummy-slot check in _setup_states
-        # / __init__). Add a min-slots constraint of zero-capacity requests:
-        # these cost no attention pages but reserve one SSM slot each.
+        # Reserve only state slots that cannot be offloaded: one runnable
+        # request plus persistent padding dummies. StorageManager adds the
+        # max_util_for_resume headroom to this logical constraint. Additional
+        # requests consume the ratio-sized pool and are suspended to a colder
+        # tier when their GPU state is not resident.
         if any(isinstance(layer, SsmLayerConfig) for layer in layers):
-            ssm_floor_slots = (self._max_resident_sequences() +
+            ssm_floor_slots = (self._minimum_gpu_resident_sequences() +
                                self._num_reserved_dummy_slots)
             constraints = [
                 *constraints,

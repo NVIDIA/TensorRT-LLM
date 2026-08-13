@@ -163,6 +163,22 @@ requires_python_backend = unittest.skipIf(
 )
 
 
+class TestExceptionHierarchy(unittest.TestCase):
+    @unittest.skipUnless(
+        KV_CACHE_MANAGER_V2_BACKEND == "cpp",
+        "C++ binding exception hierarchy",
+    )
+    def test_oom_subtypes_derive_from_out_of_memory(self) -> None:
+        try:
+            from bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
+        except ImportError:
+            from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
+
+        self.assertTrue(issubclass(cpp.HostOOMError, cpp.OutOfMemoryError))
+        self.assertTrue(issubclass(cpp.DiskOOMError, cpp.OutOfMemoryError))
+        self.assertTrue(issubclass(cpp.CuOOMError, cpp.OutOfMemoryError))
+
+
 def get_cached_cuda_event_type():
     backend = KV_CACHE_MANAGER_V2_BACKEND
     if backend == "cpp":
@@ -555,10 +571,13 @@ class TestNoBatching(TestKVCacheManagerV2):
         # This also tests eviction to disk.
         self.assertRaises(OutOfPagesError, lambda: self.run_naive(seq_len + 1, 1, False))
 
-    def test_resume_rejects_if_any_pool_group_exceeds_threshold(self) -> None:
+    def test_resume_uses_projected_pool_group_utilization(self) -> None:
         cfg = KVCacheManagerConfig(
             tokens_per_block=32,
-            cache_tiers=[GpuCacheTierConfig(quota=4 << 20)],
+            cache_tiers=[
+                GpuCacheTierConfig(quota=4 << 20),
+                HostCacheTierConfig(quota=4 << 20),
+            ],
             max_util_for_resume=0.9,
             layers=[
                 AttentionLayerConfig(
@@ -615,9 +634,17 @@ class TestNoBatching(TestKVCacheManagerV2):
             self.assertGreater(max(utilizations), cfg.max_util_for_resume)
             self.assertLess(overall_utilization(), cfg.max_util_for_resume)
 
-            # One pool group is now over the limit, so a further resume is rejected.
-            rejected_cache = self.manager.create_kv_cache()
-            prior_caches.append(rejected_cache)
+            # A cache with no pages has no GPU residency cost, so pressure in
+            # another pool group must not prevent it from becoming active.
+            empty_cache = self.manager.create_kv_cache()
+            prior_caches.append(empty_cache)
+            self.assertTrue(empty_cache.resume(stream))
+            empty_cache.suspend()
+
+            # Suspending a resident cache makes its pages evictable. Resuming
+            # it would restore the over-threshold working set and is rejected.
+            rejected_cache = prior_caches[-2]
+            rejected_cache.suspend()
             self.assertFalse(rejected_cache.resume(stream))
             self.assertEqual(rejected_cache.status, _KVCache.Status.SUSPENDED)
         finally:
@@ -2135,6 +2162,7 @@ class TestSSMSupport(unittest.TestCase):
         self,
         tokens_per_block: int = 32,
         gpu_quota: int = 32 << 20,
+        host_quota: int | None = None,
         num_attn_layers: int = 2,
         num_ssm_layers: int = 2,
         window_size: SlidingWindowSize = None,
@@ -2165,9 +2193,12 @@ class TestSSMSupport(unittest.TestCase):
                 )
             )
             lid += 1
+        cache_tiers = [GpuCacheTierConfig(quota=gpu_quota)]
+        if host_quota is not None:
+            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
         return KVCacheManagerConfig(
             tokens_per_block=tokens_per_block,
-            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            cache_tiers=cache_tiers,
             layers=layers,
             enable_partial_reuse=enable_partial_reuse,
             commit_min_snapshot=commit_min_snapshot,
@@ -2203,6 +2234,36 @@ class TestSSMSupport(unittest.TestCase):
         # SSM slot should be the same
         resumed_slot = kv_cache.get_ssm_block_base_index(ssm_lg)
         self.assertEqual(initial_slot, resumed_slot, "SSM slot unchanged after suspend/resume")
+        kv_cache.close()
+
+    def test_offload_and_resume_preserves_hybrid_state(self) -> None:
+        """Suspending can offload attention and recurrent state together."""
+        host_level = CacheLevel(1)
+        cfg = self._make_ssm_config(host_quota=32 << 20)
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        kv_cache = self.manager.create_kv_cache()
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        history = [self.next_token() for _ in range(64)]
+
+        self.assertTrue(kv_cache.resume(stream))
+        kv_cache.stop_committing()
+        self.assertTrue(kv_cache.resize(len(history), len(history)))
+        engine.execute([Step(kv_cache, history, [])], stream)
+
+        kv_cache.suspend()
+        counts_before, _ = _introspection.active_page_stats(kv_cache)
+        self.assertGreater(counts_before[GPU_LEVEL], 0)
+        self.assertEqual(counts_before[host_level], 0)
+
+        self.assertTrue(kv_cache.offload(host_level))
+        counts_offloaded, _ = _introspection.active_page_stats(kv_cache)
+        self.assertEqual(counts_offloaded[GPU_LEVEL], 0)
+        self.assertEqual(counts_offloaded[host_level], sum(counts_before))
+
+        self.assertTrue(kv_cache.resume(stream))
+        engine.execute([Step(kv_cache, [], history)], stream)
         kv_cache.close()
 
     def test_no_reuse_with_ssm(self) -> None:

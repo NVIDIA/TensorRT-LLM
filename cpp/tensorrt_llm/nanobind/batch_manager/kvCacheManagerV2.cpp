@@ -627,9 +627,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- Exceptions --------------------------------------------------------
     static nb::object sOutOfMemoryError = nb::exception<kv::OutOfMemoryError>(m, "OutOfMemoryError");
-    static nb::object sHostOOMError = nb::exception<kv::HostOOMError>(m, "HostOOMError");
-    static nb::object sDiskOOMError = nb::exception<kv::DiskOOMError>(m, "DiskOOMError");
-    static nb::object sCuOOMError = nb::exception<kv::CuOOMError>(m, "CuOOMError");
+    static nb::object sHostOOMError = nb::exception<kv::HostOOMError>(m, "HostOOMError", sOutOfMemoryError);
+    static nb::object sDiskOOMError = nb::exception<kv::DiskOOMError>(m, "DiskOOMError", sOutOfMemoryError);
+    static nb::object sCuOOMError = nb::exception<kv::CuOOMError>(m, "CuOOMError", sOutOfMemoryError);
     static nb::object sLogicError = nb::exception<kv::LogicError>(m, "LogicError");
     static nb::object sResourceBusyError = nb::exception<kv::ResourceBusyError>(m, "ResourceBusyError");
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
@@ -1525,6 +1525,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("cuda_stream") = nb::none())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "offload", [](kv::KvCache& self, int target) { return self.offload(kv::CacheLevel{target}); },
+            nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())

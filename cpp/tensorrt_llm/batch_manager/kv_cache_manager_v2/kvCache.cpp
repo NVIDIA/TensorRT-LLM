@@ -262,14 +262,6 @@ bool KvCache::resume(std::optional<CUstream> stream)
     TLLM_CHECK_DEBUG_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
-    // Check utilization against threshold.
-    auto const utilizations = mManager->storage().getUtilization(kGpuLevel);
-    float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
-    if (utilization > mManager->config().maxUtilForResume)
-    {
-        return false;
-    }
-
     auto& storageMgr = mManager->storage();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
     LifeCycleId numLc = storageMgr.numLifeCycles();
@@ -302,6 +294,42 @@ bool KvCache::resume(std::optional<CUstream> stream)
     for (LifeCycleId lc{0}; lc < numLc; ++lc)
         numSlotsNeeded[lc] += std::max(0, scratchDeltaCounts[lc]);
 
+    // Admission is based on the pages this cache will make unavailable,
+    // rather than the current utilization of an unrelated pool group.
+    TypedVec<PoolGroupIndex, SlotCount> additionalUnavailable(storageMgr.numPoolGroups(), 0);
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
+    {
+        additionalUnavailable[storageMgr.getPoolGroupIndex(lc)] += numSlotsNeeded[lc];
+    }
+
+    std::unordered_set<Page*> countedPages;
+    for (auto const& activePage : _activePages())
+    {
+        auto const page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
+        if (!page || page->status() == PageStatus::LOCKED || !countedPages.insert(page.get()).second)
+        {
+            continue;
+        }
+        // A held GPU page that is not on the eviction queue is already
+        // included in stats.unavailable(). Only migration from a colder tier
+        // or locking a currently evictable GPU page increases that count.
+        if (page->cacheLevel != kGpuLevel || page->scheduledForEviction())
+        {
+            additionalUnavailable[storageMgr.getPoolGroupIndex(activePage.lcId)] += 1;
+        }
+    }
+
+    for (PoolGroupIndex pgIdx{0}; pgIdx < storageMgr.numPoolGroups(); ++pgIdx)
+    {
+        auto const stats = storageMgr.getStatistics(kGpuLevel, pgIdx);
+        auto const projectedUnavailable = stats.unavailable() + additionalUnavailable[pgIdx];
+        auto const limit = static_cast<double>(stats.total) * mManager->config().maxUtilForResume;
+        if (additionalUnavailable[pgIdx] > 0 && static_cast<double>(projectedUnavailable) > limit)
+        {
+            return false;
+        }
+    }
+
     // Only allocate if any slots are needed.
     bool anyNeeded = std::any_of(numSlotsNeeded.begin(), numSlotsNeeded.end(), [](SlotCount n) { return n > 0; });
     if (anyNeeded)
@@ -317,6 +345,10 @@ bool KvCache::resume(std::optional<CUstream> stream)
             tmpSlots = storageMgr.newGpuSlots(numSlotsNeeded, migrationRecorder, dropRecorder);
         }
         catch (OutOfPagesError const&)
+        {
+            return false;
+        }
+        catch (OutOfMemoryError const&)
         {
             return false;
         }
@@ -351,6 +383,15 @@ bool KvCache::resume(std::optional<CUstream> stream)
             streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), scratchReadyEvents);
     }
 
+    auto releaseDeferredSlots = [&]()
+    {
+        for (LifeCycleId lc{0}; lc < numLc; ++lc)
+        {
+            if (deferredSlots[lc].has_value())
+                storageMgr.releaseSlot(lc, kGpuLevel, std::move(*deferredSlots[lc]));
+        }
+    };
+
     try
     {
         activate();
@@ -358,13 +399,14 @@ bool KvCache::resume(std::optional<CUstream> stream)
     catch (OutOfPagesError const&)
     {
         // Release pre-allocated deferred slots on failure.
-        for (LifeCycleId lc{0}; lc < numLc; ++lc)
-        {
-            if (deferredSlots[lc].has_value())
-                storageMgr.releaseSlot(lc, kGpuLevel, std::move(*deferredSlots[lc]));
-        }
+        releaseDeferredSlots();
         // Scratch slots stay in mScratchSlots — they'll be freed by close() inside
         // a recordEventScope, matching Python behavior.
+        return false;
+    }
+    catch (OutOfMemoryError const&)
+    {
+        releaseDeferredSlots();
         return false;
     }
 
@@ -505,9 +547,65 @@ bool KvCache::prefetch(CacheLevel target)
 
     try
     {
-        storageMgr.prefetch(target, allPages);
+        MigrationRecorder const migrationRecorder
+            = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
+                  CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
+        DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
+        { _recordDroppedPages(pages, cacheLevel); };
+        storageMgr.prefetch(target, allPages, migrationRecorder, dropRecorder);
     }
     catch (OutOfPagesError const&)
+    {
+        return false;
+    }
+    catch (OutOfMemoryError const&)
+    {
+        return false;
+    }
+    return true;
+}
+
+bool KvCache::offload(CacheLevel target)
+{
+    TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
+    auto& storageMgr = mManager->storage();
+    CacheLevel const numTiers = storageMgr.numCacheLevels();
+    TLLM_CHECK_DEBUG(kGpuLevel < target && target < numTiers);
+
+    PoolGroupIndex const numPoolGroups = storageMgr.numPoolGroups();
+    TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
+        numPoolGroups, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(numTiers));
+
+    std::unordered_set<Page*> countedPages;
+    for (auto const& activePage : _activePages())
+    {
+        auto page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
+        // A page can be shared by multiple beams or requests. After this cache
+        // is suspended, a still-locked page belongs to another active request
+        // and must remain resident on GPU.
+        if (!page || page->status() == PageStatus::LOCKED || page->cacheLevel >= target
+            || !countedPages.insert(page.get()).second)
+        {
+            continue;
+        }
+        auto const pgIdx = storageMgr.getPoolGroupIndex(activePage.lcId);
+        allPages.at(pgIdx).at(page->cacheLevel).push_back(std::move(page));
+    }
+
+    try
+    {
+        MigrationRecorder const migrationRecorder
+            = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
+                  CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
+        DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
+        { _recordDroppedPages(pages, cacheLevel); };
+        storageMgr.prefetch(target, allPages, migrationRecorder, dropRecorder);
+    }
+    catch (OutOfPagesError const&)
+    {
+        return false;
+    }
+    catch (OutOfMemoryError const&)
     {
         return false;
     }
@@ -1069,6 +1167,12 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 newSlots = mManager->storage().newGpuSlots(allocCounts, migrationRecorder, dropRecorder);
             }
             catch (OutOfPagesError const&)
+            {
+                _recoverExcessScratchSlots(excessScratchSlots);
+                _lockHeldBlocks(backupHolders);
+                return false;
+            }
+            catch (OutOfMemoryError const&)
             {
                 _recoverExcessScratchSlots(excessScratchSlots);
                 _lockHeldBlocks(backupHolders);

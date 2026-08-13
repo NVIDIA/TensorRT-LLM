@@ -198,6 +198,9 @@ public:
     // Best-effort prefetch active pages to the target cache level.
     bool prefetch(CacheLevel target);
 
+    // Best-effort offload of active pages in faster tiers to the target level.
+    bool offload(CacheLevel target);
+
     // ---- Capacity / history ------------------------------------------------
 
     // Resize capacity and/or history_length.
