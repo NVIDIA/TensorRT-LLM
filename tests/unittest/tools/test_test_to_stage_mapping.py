@@ -1,10 +1,13 @@
 import os
 import random
+import re
 import subprocess
 import sys
 from collections import defaultdict
 
 import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 # Add scripts directory to path
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
@@ -79,23 +82,80 @@ def test_data_availability(stage_query):
     print(f"Max samples configured: {MAX_SAMPLES}")
 
 
-def test_s3_stdout_echo_requires_explicit_opt_in():
-    """Keep Jenkins pytest progress readable unless live log echo is requested."""
-    with open(GROOVY, 'r') as f:
-        lines = f.readlines()
-
-    assert any(
-        'ENABLE_S3_ECHO_STDOUT = params.enableS3EchoStdout != null ? params.enableS3EchoStdout : false'
-        in line for line in lines)
-
-    echo_lines = [
-        idx for idx, line in enumerate(lines) if '"--s3-echo-stdout"' in line
+def test_documented_stage_examples_are_live(stage_query):
+    """Documented --stages examples must name stages that still exist in CI."""
+    sources = [
+        os.path.join(REPO_ROOT, 'docs', 'source', 'developer-guide',
+                     'ci-overview.md'),
+        os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py'),
     ]
-    assert echo_lines, 'Expected at least one opt-in --s3-echo-stdout path'
 
-    for idx in echo_lines:
-        context = lines[max(0, idx - 3):idx]
-        assert any('if (ENABLE_S3_ECHO_STDOUT)' in line for line in context)
+    checked = 0
+    for path in sources:
+        with open(path, 'r') as f:
+            text = f.read()
+
+        # Unwrap backslash continuations so wrapped commands read as one line,
+        # then take the stage names each documented invocation passes.
+        unwrapped = re.sub(r'\\+\s*\n\s*', ' ', text)
+        for example in re.findall(r'test_to_stage_mapping\.py.*?--stages(.*)',
+                                  unwrapped):
+            # Brackets are matched, not skipped, so a stale ``[Post-Merge]``
+            # spelling fails here instead of slipping through as two tokens.
+            for name in re.findall(r'[\w\[\].-]+', example):
+                if name.startswith('-'):
+                    break  # start of the next option, not a stage name
+                why = (f'{os.path.basename(path)} documents --stages {name}, '
+                       'which ')
+                assert name in stage_query.stage_to_yaml, \
+                    why + f'is not a stage in {os.path.basename(GROOVY)}'
+                assert stage_query.stages_to_tests([name]), \
+                    why + 'maps to no tests'
+                checked += 1
+
+    assert checked, 'Found no documented --stages examples to validate'
+
+
+def test_unknown_stage_reports_a_diagnostic(stage_query):
+    """An unresolvable stage name must not be silently swallowed."""
+    bogus = 'A100X-Triton-Post-Merge-1'
+    assert bogus not in stage_query.stage_to_yaml
+    assert 'A100X-PyTorch-Post-Merge-1' in stage_query.suggest_stages(bogus), \
+        f"Expected the live A100X stage to be suggested for '{bogus}'"
+
+    script = os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py')
+    proc = subprocess.run([sys.executable, script, '--stages', bogus],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    assert not proc.stdout.strip(), 'Unknown stage should map to no tests'
+    assert f'unknown stage: {bogus}' in proc.stderr.decode()
+
+
+def test_known_stage_without_tests_is_reported(tmp_path):
+    """A known stage that runs no tests stays visible alongside other stages."""
+    # No live stage is currently empty, so build a minimal repo whose
+    # ``empty`` stage maps to a YAML holding only post_merge tests.
+    (tmp_path / 'jenkins').mkdir()
+    (tmp_path / 'jenkins' / 'L0_Test.groovy').write_text(
+        '"Filled-PyTorch-1": ["x", "l0_filled", 1, 1],\n'
+        '"Empty-PyTorch-1": ["x", "l0_empty", 1, 1],\n')
+    db_dir = tmp_path / 'tests' / 'integration' / 'test_lists' / 'test-db'
+    db_dir.mkdir(parents=True)
+    for name, stage in (('l0_filled', 'pre_merge'), ('l0_empty', 'post_merge')):
+        (db_dir / f'{name}.yml').write_text(
+            f'version: 0.0.1\n{name}:\n- condition:\n    terms:\n'
+            f'      stage: {stage}\n      backend: pytorch\n'
+            f'  tests:\n  - unittest/{name}.py\n')
+
+    script = os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py')
+    proc = subprocess.run([
+        sys.executable, script, '--repo-root',
+        str(tmp_path), '--stages', 'Empty-PyTorch-1', 'Filled-PyTorch-1'
+    ],
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    assert proc.stdout.decode().split() == ['unittest/l0_filled.py']
+    assert 'no tests mapped to: Empty-PyTorch-1' in proc.stderr.decode()
 
 
 @pytest.mark.skip(reason="https://nvbugs/5547275")
@@ -251,8 +311,15 @@ def test_backend_filtering_consistency(stage_query):
                 f"at least one stage containing '{backend.upper()}', " \
                 f"but got stages: {stages}"
 
-            # Check that test does NOT map to stages of other backends
-            other_backends = all_backends - {backend}
+            # Check that test does NOT map to stages of backends it is not
+            # declared under (tests may legitimately be listed under several
+            # backends across test-db files).
+            declared_backends = {
+                b.strip()
+                for _, _, b in stage_query.test_map[test_name]
+                if b and b.strip()
+            }
+            other_backends = all_backends - declared_backends
             for stage in stages:
                 stage_upper = stage.upper()
                 for other_backend in other_backends:

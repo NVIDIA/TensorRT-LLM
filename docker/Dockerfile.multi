@@ -31,7 +31,6 @@ FROM base AS devel
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
-ARG TRT_VER
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
@@ -45,18 +44,16 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     echo "Using Python version: ${PYTHON_VERSION}" && \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
-    TRT_VER=${TRT_VER} CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
+    CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
-         --tensorrt --polygraphy --mpi4py --pytorch
+         --cuda_libs --polygraphy --mpi4py --pytorch
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    # WAR: uninstall dependencies that has vulnerability or need upgrading.
-    apt remove python3-wheel \
-    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy || true && \
+    pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy wandb || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
     rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
     pip3 install -r /tmp/constraints.txt && \
@@ -107,7 +104,6 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
-COPY benchmarks benchmarks
 COPY cpp cpp
 COPY docker docker
 COPY scripts scripts
@@ -122,12 +118,19 @@ ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
     GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 
 WORKDIR /app/tensorrt_llm
+ARG GITHUB_MIRROR=""
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
     TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
     test -n "${TRTLLM_WHEEL}" && \
     pip install "${TRTLLM_WHEEL}[mx]"
@@ -137,7 +140,6 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=cpp/include,target=/mnt/ctx/include \
     --mount=type=bind,source=examples,target=/mnt/ctx/examples \
     --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/mnt/wheel \
-    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/benchmarks,target=/mnt/benchmarks \
     # Copy build context files
     cp /mnt/ctx/README.md ./ && \
     cp -r /mnt/ctx/docs ./docs && \
@@ -146,7 +148,6 @@ RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     chmod -R a+w examples && \
     # Copy wheel stage outputs
     cp /mnt/wheel/tensorrt_llm*.whl ./ && \
-    cp -r /mnt/benchmarks ./benchmarks && \
     # Create a symlink to installed package libraries
     ln -sv $(python3 -c 'import site; print(f"{site.getsitepackages()[0]}/tensorrt_llm/libs")') lib && \
     test -f lib/libtensorrt_llm.so && \

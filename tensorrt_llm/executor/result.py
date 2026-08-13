@@ -188,6 +188,10 @@ class GenerationResultBase:
         self.cached_tokens = 0
         self.per_pos_drafted = None
         self.per_pos_accepted = None
+        # Cumulative (accepted, drafted) draft-token totals attached by the
+        # PyTorch executor (LlmResult.spec_dec_totals); backfills
+        # RequestPerfMetrics.speculative_decoding in _handle_sequence.
+        self.spec_dec_totals = None
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
@@ -281,6 +285,33 @@ class GenerationResultBase:
         """Return the error message if this result completed with an error."""
         return self._error_msg
 
+    def _maybe_fill_spec_dec_perf_metrics(
+            self, perf_metrics: "tllm.RequestPerfMetrics") -> None:
+        """Backfill RequestPerfMetrics.speculative_decoding in the PyTorch flow.
+
+        The C++ runtime accumulates that section in
+        LlmRequest::updateNumTokensPerIteration, which the PyTorch flow
+        (TorchSampler) never calls, so the section arrives zeroed even when
+        drafting ran. The PyTorch executor instead attaches cumulative
+        (accepted, drafted) totals to the response (LlmResult.spec_dec_totals,
+        stashed on self in _handle_response); fill the section from them.
+        No-op when the section is already populated (TRT engine / TRTLLMSampler
+        paths) or when no drafting occurred.
+        """
+        if not self.spec_dec_totals:
+            return
+        spec_dec = perf_metrics.speculative_decoding
+        if spec_dec is not None and spec_dec.total_draft_tokens > 0:
+            return
+        accepted, drafted = self.spec_dec_totals
+        if drafted <= 0:
+            return
+        spec_dec = tllm.SpeculativeDecodingMetrics()
+        spec_dec.total_accepted_draft_tokens = accepted
+        spec_dec.total_draft_tokens = drafted
+        spec_dec.acceptance_rate = accepted / drafted
+        perf_metrics.speculative_decoding = spec_dec
+
     def _handle_sequence(self,
                          finish_reasons,
                          response_tensors,
@@ -295,10 +326,21 @@ class GenerationResultBase:
         output = self._outputs[seq_idx]
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
+        output._last_logprobs_len = len(output.logprobs)
+        decoder_output_prefix = ()
+        if (self.sampling_params.exclude_input_from_output
+                or getattr(self, "_streaming", False)):
+            decoder_output_prefix = \
+                self.sampling_params._decoder_output_token_prefix
         if self.sampling_params.use_beam_search:
             # Beam search enforces returning all generated tokens
-            output.token_ids = response_tensors.output_token_ids[src_idx]
+            output.token_ids = [
+                *decoder_output_prefix,
+                *response_tensors.output_token_ids[src_idx],
+            ]
         else:
+            if decoder_output_prefix and not output.token_ids:
+                output.token_ids.extend(decoder_output_prefix)
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
         if response_tensors.cum_log_probs is not None:
@@ -310,16 +352,15 @@ class GenerationResultBase:
         # generation logprobs handling (provenance varies by backend)
         if logprobs_result and logprobs_result.generation is not None:  # TRT backend
             # update logprobs from ResponseWrapper (TRT top logprobs WAR)
-            output._last_logprobs_len = len(output.logprobs)
             output.logprobs += logprobs_result.generation
         elif response_tensors.log_probs is not None:  # PyTorch backend
             # handle logprobs directly from response tensors given by sampler
-            output._last_logprobs_len = len(output.logprobs)
-            # In streaming mode, since out-of-order responses are not possible,
-            # each streamed response_tensors.log_probs[src_idx]
-            # contains a streamwise monotonically growing list of logprobs.
-            # so we need to accumulate only the new ones unique to that particular streamed response
-            if self.use_trtllm_sampler:
+            if decoder_output_prefix and self.sampling_params.use_beam_search:
+                output.logprobs = [
+                    *self._get_decoder_output_prefix_logprobs(),
+                    *response_tensors.log_probs[src_idx],
+                ]
+            elif self.use_trtllm_sampler:
                 assert output._last_logprobs_len <= len(
                     response_tensors.log_probs[src_idx]
                 ), (f"_last_logprobs_len ({output._last_logprobs_len}) > log_probs length ("
@@ -327,6 +368,9 @@ class GenerationResultBase:
                 output.logprobs += response_tensors.log_probs[src_idx][
                     output._last_logprobs_len:]
             else:
+                if decoder_output_prefix and not output.logprobs:
+                    output.logprobs.extend(
+                        self._get_decoder_output_prefix_logprobs())
                 output.logprobs += response_tensors.log_probs[src_idx]
 
             # overcome some WAR in the cpp executor
@@ -378,6 +422,7 @@ class GenerationResultBase:
 
         if response_tensors.request_perf_metrics is not None:
             output.request_perf_metrics = response_tensors.request_perf_metrics
+            self._maybe_fill_spec_dec_perf_metrics(output.request_perf_metrics)
 
         # Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.
         if hasattr(response_tensors, 'time_breakdown_metrics'
@@ -426,6 +471,13 @@ class GenerationResultBase:
         # Tracing is recorded once when the entire request is done.
         if self._done:
             self.do_tracing(output, req_perf_metrics_dict)
+
+    def _get_decoder_output_prefix_logprobs(
+            self) -> TokenLogprobs | SimpleTokenLogprobs:
+        prefix = self.sampling_params._decoder_output_token_prefix
+        if self.sampling_params.logprobs_simple_format:
+            return [0.0] * len(prefix)
+        return [{token_id: Logprob(logprob=0.0, rank=1)} for token_id in prefix]
 
     @print_traceback_on_error
     @nvtx_range_debug("handle_response",
@@ -503,6 +555,8 @@ class GenerationResultBase:
                                            None)
             self.per_pos_accepted = getattr(response_result, 'per_pos_accepted',
                                             None)
+            self.spec_dec_totals = getattr(response_result, 'spec_dec_totals',
+                                           None)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             # Expose gen-first ctx usage so the postprocessor
             # (_ctx_usage_from_outputs) can adopt the context-side accounting.

@@ -29,6 +29,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
@@ -112,9 +113,31 @@ class DSparkSpecMetadata(SpecMetadata):
                     worker._ctx_len[slot] = 0
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
-            # Unknown request IDs (e.g. synthetic warmup requests) default to slot 0.
+            # Assign a persistent rolling-window slot to every real generation
+            # request that never ran a context/seed forward on this worker. In
+            # disaggregated serving the prompt is prefilled (and the window
+            # seeded) on the *context* server, so ``_seed_context_windows`` never
+            # runs on the generation server and ``_req_to_slot`` stays empty;
+            # without this, all concurrent gen requests fall through to the shared
+            # scratch row below and corrupt each other's draft window at batch
+            # size > 1 (GitHub #16767). Context-prefix entries are left to
+            # ``_seed_context_windows``; the ADP-idle (id 0) and CUDA-graph
+            # padding dummies are kept on the scratch row.
+            num_contexts = max(0, len(self.request_ids) - self.num_generations)
+            for rid in self.request_ids[num_contexts:]:
+                if (
+                    rid != ATTENTION_DP_DUMMY_REQUEST_ID
+                    and rid < worker._graph_dummy_id_floor
+                    and rid not in worker._req_to_slot
+                ):
+                    worker._assign_slot(rid, reset=False)
+            # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
+            # requests, or disagg seed forwards without a real id) map to the
+            # dedicated throwaway scratch row so they cannot overwrite a live
+            # request's rolling window (they previously aliased to slot 0).
+            scratch = worker._scratch_slot
             mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, 0) for rid in self.request_ids],
+                [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
                 dtype=torch.long,
                 device="cpu",
                 pin_memory=prefer_pinned(),
@@ -212,6 +235,10 @@ class DSparkWorker(SpecWorkerBase):
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
+        # Index of the throwaway "scratch" window row that absorbs padded /
+        # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
+        # never handed out through ``_free_slots``.
+        self._scratch_slot = 0
 
         # The generation draft path is the batched, host-sync-free
         # ``_draft_gen_block_batched`` + ``DSparkDraftModel.forward_batched`` +
@@ -244,19 +271,41 @@ class DSparkWorker(SpecWorkerBase):
         self._win = int(draft_model._attn_params["window_size"])
         head_dim = int(draft_model._attn_params["head_dim"])
 
+        # Real requests occupy slots ``[0, max_batch)``; one extra "scratch" row
+        # at index ``max_batch`` absorbs padded / unknown request IDs (CUDA-graph
+        # padding, ADP idle requests, or disagg seed forwards that arrive without
+        # a real request id) so they can never overwrite a live request's rolling
+        # window. Previously such IDs aliased to slot 0 and corrupted whichever
+        # real request occupied it. The scratch row is never handed out through
+        # ``_free_slots`` and its contents are throwaway.
+        self._scratch_slot = max_batch
+        num_rows = max_batch + 1
+
+        # CUDA-graph padding requests carry ids in
+        # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
+        # while real request ids start at ``max_batch_size`` and grow, so a simple
+        # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
+        # (0) these dummies must route to the scratch row (see ``prepare()``) and
+        # never consume a real slot. Imported lazily to break the
+        # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
+        from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+
+        self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+
         self._kv_windows = torch.zeros(
-            (max_batch, num_stages, self._win, head_dim),
+            (num_rows, num_stages, self._win, head_dim),
             dtype=torch.bfloat16,
             device="cuda",
         )
-        self._ctx_len = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
         self._win_inited = True
         logger.info(
             f"DSpark: allocated rolling KV windows "
-            f"[{max_batch}, {num_stages}, {self._win}, {head_dim}]"
+            f"[{num_rows}, {num_stages}, {self._win}, {head_dim}] "
+            f"({max_batch} request slots + 1 scratch row)"
         )
 
     def _assign_slot(self, req_id: int, reset: bool) -> int:
@@ -404,6 +453,44 @@ class DSparkWorker(SpecWorkerBase):
         )
         return block_logits
 
+    def _sample_draft_tokens_guided(
+        self,
+        gen_logits: torch.Tensor,
+        spec_metadata: "DSparkSpecMetadata",
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        K: int,
+    ):
+        """
+        Grammar-constrained draft sampling for the guided-decoding path.
+        """
+        vocab = gen_logits.shape[-1]
+        # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
+        # a contiguous [batch, vocab] tensor.
+        if num_contexts > 0:
+            full_logits = gen_logits.new_zeros((K, batch_size, vocab))
+            full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
+        else:
+            full_logits = gen_logits.transpose(0, 1).contiguous()
+
+        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1).long()
+        new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
+
+        gen_draft_tokens = []
+        for k in range(K):
+            self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
+            step_logits = full_logits[k]
+            self.guided_decoder.execute_draft_batch(step_logits, draft_step=k)
+            step_tokens = self.sample_draft_tokens(
+                step_logits, spec_metadata, batch_size, draft_step=k
+            )
+            gen_draft_tokens.append(step_tokens[num_contexts:])
+            new_tokens = step_tokens
+        gen_draft_tokens = torch.stack(gen_draft_tokens, dim=1)
+        return gen_draft_tokens
+
     def _forward_impl(
         self,
         input_ids,
@@ -508,12 +595,21 @@ class DSparkWorker(SpecWorkerBase):
                 all_rank_num_tokens=all_rank_draft_tokens,
             )
             if gen_logits is not None:
-                # SpecWorkerBase samples the draft tokens (greedy argmax, or
-                # rejection sampling for a non-greedy batch), performs the TP
-                # gather, and scatters the proposal distribution into draft_probs.
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
-                )
+                if self.guided_decoder is not None:
+                    gen_draft_tokens = self._sample_draft_tokens_guided(
+                        gen_logits,
+                        spec_metadata,
+                        accepted_tokens,
+                        num_accepted_tokens,
+                        num_contexts,
+                        batch_size,
+                        K,
+                    )
+                else:
+                    # SpecWorkerBase samples the draft tokens.
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+                    )
                 # The context one-hot must match the width the gen scatter just
                 # published to draft_probs, NOT gen_logits.shape[-1]: under TP the
                 # draft logits are vocab-sharded and sample_draft_tokens gathers

@@ -464,11 +464,23 @@ class NVLinkOneSided(Communication):
             raise RuntimeError("Native MoE All-to-All workspace handles are unmapped")
 
     def checkpoint_prepare(self) -> None:
-        """Collectively detach handles after every shared owner is idle."""
+        """Collectively detach handles after every shared owner is idle.
+
+        Every rank must call this method symmetrically after all in-flight
+        dispatch/combine pairs using the shared allocation have completed.
+        """
         self._require_workspace_lifecycle().checkpoint_prepare()
 
     def checkpoint_restore(self, comm) -> None:
-        """Collectively restore handles and all shared frontend state."""
+        """Collectively restore handles and all shared frontend state.
+
+        Args:
+            comm: An mpi4py-like communicator exposing ``Get_rank()``,
+                ``Get_size()``, ``allgather()``, and ``barrier()``. Its local
+                rank and size must match the communicator used for the
+                original allocation. Every rank must call this method
+                symmetrically.
+        """
         self._require_workspace_lifecycle().checkpoint_restore(
             comm,
             lambda: torch.ops.trtllm.moe_a2a_initialize(

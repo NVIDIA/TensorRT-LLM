@@ -217,6 +217,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
+    xqaParams.force_prepare_spec_dec_tree_mask = mForcePrepareSpecDecTreeMask;
     xqaParams.layer_idx = generationsParams.layer_idx;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
@@ -692,6 +693,14 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     }
 
     params.multi_block_mode = input_params.multi_block_mode;
+    // Cascade-attention partials must be wired regardless of multi_block_mode.
+    // Cascade decode runs with multi_block disabled (short-decode workloads have
+    // max_num_seq_len_tiles == 1, so enable_multi_block is structurally false).
+    // Gating these behind multi_block_mode leaves cascade_partial_* null and makes
+    // launch_cascade_attention fall back with "cascade workspace not provisioned".
+    params.cascade_partial_out = input_params.cascade_partial_out;
+    params.cascade_partial_max = input_params.cascade_partial_max;
+    params.cascade_partial_sum = input_params.cascade_partial_sum;
     if (input_params.multi_block_mode)
     {
         params.min_seq_len_tile = input_params.min_seq_len_tile;
@@ -700,10 +709,6 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
         params.partial_out = reinterpret_cast<DataType*>(input_params.partial_out);
         params.partial_sum = input_params.partial_sum;
         params.partial_max = input_params.partial_max;
-
-        params.cascade_partial_out = input_params.cascade_partial_out;
-        params.cascade_partial_max = input_params.cascade_partial_max;
-        params.cascade_partial_sum = input_params.cascade_partial_sum;
 
         params.block_counter = input_params.block_counter;
     }
@@ -757,6 +762,24 @@ size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
     size_t const partialOSize = kMultiCtasKvPartialOElementSize * maxRows * headDimV;
 
     return partialStatsSize + partialOSize;
+}
+
+size_t AttentionOp::contextMlaWorkspaceBytesPerToken(int32_t numAttnHeads, int32_t qkRopeHeadDim, int32_t qkNopeHeadDim,
+    int32_t vHeadDim, bool fp8ContextMla, bool separateQAndKvInput, bool sparseMla) noexcept
+{
+    // Only the fp8 context-MLA separate-Q/KV path stages total_kv_len-scaled K/V dequant buffers.
+    // Sparse MLA reads K/V directly from the paged KV cache (no staging), so its per-token cost is 0.
+    if (!fp8ContextMla || !separateQAndKvInput || sparseMla)
+    {
+        return 0;
+    }
+    // Mirror getWorkspaceSizeForContext's dim layout for the non-sparse fp8 branch:
+    //   total_k_dim_all_heads = numAttnHeads * (qk_rope_head_dim + qk_nope_head_dim)
+    //   total_v_dim_all_heads = numAttnHeads * v_head_dim
+    // The buffers are fp8 (1 byte/element), so bytes/token == element count.
+    int const dimKPerHead = qkRopeHeadDim + qkNopeHeadDim;
+    int const dimVPerHead = vHeadDim;
+    return static_cast<size_t>(numAttnHeads) * static_cast<size_t>(dimKPerHead + dimVPerHead);
 }
 
 size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int32_t max_num_seq,
@@ -842,10 +865,17 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
         {
             // Use total_kv_len when available (KV cache reuse causes total_kv_len >> max_num_tokens).
             // enqueueContext sizes these buffers by total_kv_len, so workspace must match.
+            // NOTE: the per-token cost of these two buffers (total_k_dim_all_heads + total_v_dim_all_heads) is
+            // the single source of truth exposed via contextMlaWorkspaceBytesPerToken() for the KV-cache
+            // estimator's workspace reserve. Keep the two in sync if this dim layout changes.
             size_t const kv_buf_tokens = std::max(
                 static_cast<size_t>(total_kv_len), static_cast<size_t>(mChunkPrefillBufferBatchSize) * max_num_tokens);
             fp8_k_buf_size = kv_buf_tokens * static_cast<size_t>(total_k_dim_all_heads);
             fp8_v_buf_size = kv_buf_tokens * static_cast<size_t>(total_v_dim_all_heads);
+            TLLM_CHECK(static_cast<size_t>(total_k_dim_all_heads + total_v_dim_all_heads)
+                == contextMlaWorkspaceBytesPerToken(mNumAttnHeads, mMLAParams.qk_rope_head_dim,
+                    mMLAParams.qk_nope_head_dim, mMLAParams.v_head_dim, mFP8ContextMLA,
+                    /*separateQAndKvInput=*/true, useSparseMLA()));
         }
     }
     else if (useSageAttnSeparateQkv)
@@ -1194,11 +1224,11 @@ int AttentionOp::mlaGeneration(
         // Set the following parameters if sparseAttention is used.
         if (useSparseMLA())
         {
-            bool const useDynamicSparseMLA = mRuntimeSparseAttentionParams.sparse_mla_topk_lens != nullptr;
+            bool const useDynamicSparseMLA = mRuntimeSparseAttentionParams.sparse_attn_kv_lens != nullptr;
             tllmRunnerParams.mSparseAttention
                 = useDynamicSparseMLA ? SparseType::DynamicTokenSparse : SparseType::StaticTokenSparse;
             tllmRunnerParams.mSparseTopK = mRuntimeSparseAttentionParams.num_sparse_topk;
-            tllmRunnerParams.ptrSparseMlaTopKLens = mRuntimeSparseAttentionParams.sparse_mla_topk_lens;
+            tllmRunnerParams.ptrSparseMlaTopKLens = mRuntimeSparseAttentionParams.sparse_attn_kv_lens;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(
                 mRuntimeSparseAttentionParams.sparse_attn_indices);
             if (useDynamicSparseMLA)

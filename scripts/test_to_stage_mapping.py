@@ -13,7 +13,11 @@ Example usage::
        "unittest/_torch/sampler/test_beam_search.py"
    python scripts/test_to_stage_mapping.py --tests test_beam_search
    python scripts/test_to_stage_mapping.py --stages \\
-       A100X-Triton-Post-Merge-1
+       A100X-PyTorch-Post-Merge-1
+
+Stage names passed to ``--stages`` must exactly match a key of the stage map in
+``jenkins/L0_Test.groovy``. Unrecognized names, and known names that map to no
+tests, are reported on stderr.
 
 Tests can also be provided via ``--test-list`` pointing to either a plain text
 file or a YAML list file. Quote individual test names on the command line so
@@ -21,8 +25,10 @@ the shell does not interpret ``[`` and ``]`` characters.
 """
 
 import argparse
+import difflib
 import os
 import re
+import sys
 from collections import defaultdict
 from glob import glob
 from typing import List
@@ -47,7 +53,7 @@ def _load_tests_file(path: str) -> List[str]:
 
 
 # Regex to parse Jenkins stage configurations from Groovy files
-# Matches patterns like: "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count]
+# Matches patterns like: "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count, node_count, runWithSbatch]
 #
 # Pattern breakdown:
 #   "(?P<stage>[^"]+)"     - Captures stage name in quotes (group 'stage')
@@ -56,10 +62,12 @@ def _load_tests_file(path: str) -> List[str]:
 #   "[^"]+"              - Matches platform string in quotes (ignored)
 #   ,\s*                 - Matches comma with optional whitespace
 #   "(?P<yml>[^"]+)"     - Captures yaml filename in quotes (group 'yml')
-#   (?:,\s*\d+)*         - Matches zero or more comma-separated numbers (split_id, split_count, gpu_count)
+#   (?:,\s*(?:\d+|true|false))* - Matches zero or more comma-separated numbers or
+#                          booleans (split_id, split_count, gpu_count, node_count, runWithSbatch)
 #   \s*\]                - Matches closing bracket with optional whitespace
 _STAGE_RE = re.compile(
-    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*\d+)*\s*\]')
+    r'"(?P<stage>[^"]+)"\s*:\s*\["[^"]+",\s*"(?P<yml>[^"]+)"(?:,\s*(?:\d+|true|false))*\s*\]'
+)
 
 
 def _extract_terms(entry):
@@ -85,6 +93,8 @@ class StageQuery:
         yaml_to_stages = defaultdict(list)
         with open(path, 'r') as f:
             for line in f:
+                if line.lstrip().startswith('//'):
+                    continue
                 m = _STAGE_RE.search(line)
                 if m:
                     stage = m.group('stage')
@@ -185,6 +195,10 @@ class StageQuery:
                     result.add(s)
         return sorted(result)
 
+    def suggest_stages(self, stage):
+        """Return live stage names spelled similarly to an unknown one."""
+        return difflib.get_close_matches(stage, self.stage_to_yaml)
+
     def stages_to_tests(self, stages):
         result = set()
         for s in stages:
@@ -257,9 +271,23 @@ def main():
         for s in stages:
             print(s)
     else:
+        unknown = [s for s in args.stages if s not in query.stage_to_yaml]
+        for s in unknown:
+            sys.stderr.write(f'unknown stage: {s}\n')
+            for hint in query.suggest_stages(s):
+                sys.stderr.write(f'  did you mean: {hint}\n')
+        # Report each known-but-empty stage on its own, so it stays visible when
+        # another requested stage does contribute tests, instead of printing
+        # nothing at all for it.
+        empty = [
+            s for s in args.stages
+            if s not in unknown and not query.stages_to_tests([s])
+        ]
         tests = query.stages_to_tests(args.stages)
         for t in tests:
             print(t)
+        if empty:
+            sys.stderr.write(f'no tests mapped to: {", ".join(empty)}\n')
 
 
 if __name__ == '__main__':

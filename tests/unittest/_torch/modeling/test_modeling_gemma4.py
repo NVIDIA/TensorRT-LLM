@@ -19,19 +19,24 @@ transformers>=5.5.0 Gemma4 support.
 """
 
 import math
+import tempfile
 import unittest
 import unittest.mock
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
-from transformers import Gemma4Config, Gemma4TextConfig
+from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig
 
 from tensorrt_llm._torch.attention_backend import FlashInferAttention, FlashInferAttentionMetadata
+from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma4 import (
+    Gemma4AssistantForCausalLM,
+    Gemma4AssistantMaskedEmbedder,
     Gemma4Attention,
     Gemma4DecoderLayer,
     Gemma4ForCausalLM,
@@ -104,10 +109,38 @@ GEMMA4_PLE_CONFIG = {
     "use_double_wide_mlp": True,
 }
 
+GEMMA4_ASSISTANT_CONFIG = {
+    "text_config": {
+        **GEMMA4_SMALL_CONFIG,
+        "num_hidden_layers": 4,
+        "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        "num_kv_shared_layers": 4,
+        "vocab_size_per_layer_input": 0,
+    },
+    "backbone_hidden_size": 256,
+    "use_ordered_embeddings": True,
+    "num_centroids": 16,
+    "centroid_intermediate_top_k": 2,
+    "tie_word_embeddings": True,
+    "dtype": "bfloat16",
+}
+
 
 def _make_model_config(config_dict):
     """Build a ModelConfig from a raw config dict."""
     cfg = Gemma4TextConfig(**config_dict)
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    return ModelConfig(pretrained_config=cfg, mapping=mapping)
+
+
+def _make_assistant_model_config(config_dict=GEMMA4_ASSISTANT_CONFIG):
+    """Build a ModelConfig for a standalone Gemma4 assistant."""
+    cfg = Gemma4AssistantConfig(**deepcopy(config_dict))
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     return ModelConfig(pretrained_config=cfg, mapping=mapping)
 
@@ -370,6 +403,91 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
 class TestGemma4HfWeightMapper(unittest.TestCase):
     """Tests for Gemma4-specific checkpoint key transformations."""
 
+    def test_duplicate_full_attention_kv_projection_tensors(self):
+        """Full K=V layers should duplicate all missing k_proj tensors to v_proj."""
+        fields = ("weight", "weight_scale", "input_scale", "weight_scale_2", "pre_quant_scale")
+        for is_vlm in (False, True):
+            with self.subTest(is_vlm=is_vlm):
+                mapper = Gemma4HfWeightMapper()
+                config = SimpleNamespace(
+                    attention_k_eq_v=True,
+                    layer_types=["sliding_attention", "full_attention"],
+                )
+                layer_scalar_buffers = [unittest.mock.Mock(), unittest.mock.Mock()]
+                layers = [
+                    SimpleNamespace(layer_scalar=layer_scalar_buffer)
+                    for layer_scalar_buffer in layer_scalar_buffers
+                ]
+                if is_vlm:
+                    mapper._model = SimpleNamespace(
+                        config=config,
+                        vision_tower=object(),
+                        llm=SimpleNamespace(model=SimpleNamespace(layers=layers)),
+                    )
+                    model_prefix = "language_model.model"
+                else:
+                    mapper._model = SimpleNamespace(
+                        config=config,
+                        model=SimpleNamespace(layers=layers),
+                    )
+                    model_prefix = "model"
+
+                weights = {}
+                if is_vlm:
+                    weights["model.vision_tower.marker"] = object()
+                raw_prefix = "model.language_model"
+                full_k_prefix = f"{model_prefix}.layers.1.self_attn.k_proj."
+                full_v_prefix = f"{model_prefix}.layers.1.self_attn.v_proj."
+                sliding_v_prefix = f"{model_prefix}.layers.0.self_attn.v_proj."
+                for field in fields:
+                    weights[f"{raw_prefix}.layers.1.self_attn.k_proj.{field}"] = object()
+                    weights[f"{raw_prefix}.layers.0.self_attn.k_proj.{field}"] = object()
+
+                explicit_v_input_scale = object()
+                weights[f"{raw_prefix}.layers.1.self_attn.v_proj.input_scale"] = (
+                    explicit_v_input_scale
+                )
+                explicit_v_scale = object()
+                weights[f"{raw_prefix}.layers.1.self_attn.k_proj.k_scale"] = object()
+                weights[f"{raw_prefix}.layers.1.self_attn.k_proj.k_bias"] = object()
+                weights[f"{raw_prefix}.layers.1.self_attn.v_proj.v_scale"] = explicit_v_scale
+                weights[f"{raw_prefix}.layers.1.self_attn.k_norm.weight"] = object()
+                layer_scalar_value = object()
+                weights[f"{raw_prefix}.layers.1.layer_scalar"] = layer_scalar_value
+
+                result = mapper.preprocess_weights(weights)
+
+                self.assertIs(
+                    result[f"{full_v_prefix}input_scale"],
+                    explicit_v_input_scale,
+                )
+                for field in fields:
+                    if field == "input_scale":
+                        continue
+                    self.assertIs(
+                        result[f"{full_v_prefix}{field}"],
+                        result[f"{full_k_prefix}{field}"],
+                    )
+                self.assertIs(result[f"{full_v_prefix}v_scale"], explicit_v_scale)
+                self.assertIs(
+                    result[f"{full_v_prefix}v_bias"],
+                    result[f"{full_k_prefix}k_bias"],
+                )
+                self.assertNotIn(f"{full_v_prefix}k_scale", result)
+                self.assertNotIn(f"{full_v_prefix}k_bias", result)
+                for field in fields:
+                    self.assertNotIn(f"{sliding_v_prefix}{field}", result)
+                self.assertNotIn(
+                    f"{model_prefix}.layers.1.self_attn.v_norm.weight",
+                    result,
+                )
+                layer_scalar_buffers[1].copy_.assert_called_once_with(layer_scalar_value)
+                self.assertNotIn(f"{model_prefix}.layers.1.layer_scalar", result)
+
+                second_result = mapper.preprocess_weights(result)
+                for key, value in result.items():
+                    self.assertIs(second_result[key], value)
+
     def test_remap_modelopt_nvfp4_per_expert_weights(self):
         """ModelOpt's split expert tensors should map to the VANILLA MoE layout."""
         mapper = Gemma4HfWeightMapper()
@@ -443,6 +561,86 @@ class TestGemma4HfWeightMapper(unittest.TestCase):
             r"model\.layers\.0\.experts\.0\.unknown_proj\.weight",
         ):
             Gemma4HfWeightMapper()._remap_moe_keys(weights)
+
+
+class TestGemma4Assistant(unittest.TestCase):
+    """Structural tests for standalone Gemma4 MTP assistants."""
+
+    def test_assistant_config(self):
+        config_dict = deepcopy(GEMMA4_ASSISTANT_CONFIG)
+        config_dict["text_config"].pop("num_kv_shared_layers")
+        config = Gemma4AssistantConfig(**config_dict)
+
+        self.assertEqual(config.model_type, "gemma4_assistant")
+        self.assertIsInstance(config.text_config, Gemma4TextConfig)
+        self.assertEqual(config.hidden_size, 256)
+        self.assertEqual(config.vocab_size, 1024)
+        self.assertEqual(config.num_hidden_layers, 4)
+        self.assertEqual(config.text_config.num_kv_shared_layers, 4)
+
+        with tempfile.TemporaryDirectory() as directory:
+            config.save_pretrained(directory)
+            restored = AutoConfig.from_pretrained(directory)
+
+        self.assertEqual(restored.model_type, "gemma4_assistant")
+        self.assertEqual(restored.backbone_hidden_size, 256)
+        self.assertEqual(restored.text_config.num_kv_shared_layers, 4)
+
+    def test_assistant_rejects_partial_kv_sharing(self):
+        config_dict = deepcopy(GEMMA4_ASSISTANT_CONFIG)
+        config_dict["text_config"]["num_kv_shared_layers"] = 2
+
+        with self.assertRaisesRegex(ValueError, "must share the target KV cache"):
+            Gemma4AssistantConfig(**config_dict)
+
+    def test_ordered_embedding_combines_vocab_parallel_shards(self):
+        hidden_states = torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]])
+        lm_head_weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        canonical_positions = torch.tensor([[0, 5, 7], [3, 4, 6]])
+
+        shard_logits = []
+        for vocab_start_index, shard in ((0, lm_head_weight[:4]), (4, lm_head_weight[4:])):
+            shard_logits.append(
+                Gemma4AssistantMaskedEmbedder._selected_logits_for_vocab_shard(
+                    hidden_states,
+                    shard,
+                    canonical_positions,
+                    vocab_start_index,
+                )
+            )
+        actual = sum(shard_logits)
+        selected_weights = lm_head_weight[canonical_positions]
+        expected = torch.bmm(hidden_states.unsqueeze(1), selected_weights.transpose(1, 2)).squeeze(
+            1
+        )
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_assistant_uses_target_kv_sources(self):
+        assistant = Gemma4AssistantForCausalLM(_make_assistant_model_config())
+        self.assertEqual(len(assistant.model.layers), 4)
+        self.assertTrue(all(layer.is_kv_shared_layer for layer in assistant.model.layers))
+
+        target_config = {
+            **GEMMA4_SMALL_CONFIG,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "num_kv_shared_layers": 2,
+        }
+        target = Gemma4ForCausalLM(_make_model_config(target_config))
+        assistant.load_weights_from_target_model(target)
+
+        expected_source_layers = [2, 2, 2, 3]
+        actual_source_layers = [layer.self_attn.attn.layer_idx for layer in assistant.model.layers]
+        self.assertEqual(actual_source_layers, expected_source_layers)
+        self.assertIs(assistant.target_input_embeddings, target.model.embed_tokens)
+        self.assertIsNot(assistant.model.embed_tokens, target.model.embed_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +870,12 @@ GEMMA4_26B_REAL_DIMS_CONFIG = {
 }
 
 
-def _build_gemma4_kv_cache_manager(config, num_blocks=4, tokens_per_block=32, batch_size=1):
+def _build_gemma4_kv_cache_manager(
+    config,
+    num_blocks=4,
+    tokens_per_block=32,
+    batch_size=1,
+):
     """Create KVCacheManagerV2 supporting Gemma4 per-layer head_dim / kv_heads.
 
     Mirrors ``Gemma4Attention``'s layout (global kv heads only for K=V layers)
@@ -2380,14 +2583,13 @@ class TestGemma4CUDAGraph(unittest.TestCase):
     def _expected_decode_block_table(
         self,
         metadata: "FlashInferAttentionMetadata",
-        head_dim: int,
+        pool_id: int,
         page_counts: list[int],
         *,
         rows: int,
         width: int,
     ) -> torch.Tensor:
         """Build the expected compact table from one VSWA pool's host indices."""
-        pool_id = metadata._vswa_head_dim_to_pool[head_dim]
         pool_indices = metadata._host_pool_indices[pool_id].numpy()
         expected = torch.zeros((rows, width), dtype=torch.int32)
         source_offset = metadata.num_context_blocks
@@ -2398,6 +2600,47 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             )
             source_offset += page_count
         return expected
+
+    @torch.no_grad()
+    @unittest.mock.patch(
+        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
+    )
+    def test_shared_kv_draft_view(self) -> None:
+        """The draft view advances lengths without modifying target KV."""
+        kv_cache_manager, layers, metadata, queries, _, _ = self._make_trtllm_gen_decode_case(
+            [3, 2]
+        )
+        target_kv = {
+            layer.layer_idx: kv_cache_manager.get_buffers(layer.layer_idx).clone()
+            for layer in layers
+        }
+
+        accepted_tokens = torch.tensor([1, 3], dtype=torch.int, device="cuda")
+        draft_metadata = metadata.get_draft_metadata()
+        draft_metadata.update_shared_kv_draft_lengths(
+            metadata,
+            accepted_tokens,
+            num_contexts=0,
+        )
+        expected_kv_lens = metadata._cached_token_lens[:2] + accepted_tokens
+
+        for layer, query in zip(layers, queries, strict=True):
+            layer.forward(query, None, None, draft_metadata)
+
+        self.assertIs(draft_metadata.kv_cache_manager, metadata.kv_cache_manager)
+        torch.testing.assert_close(
+            draft_metadata._draft_kv_runtime_lens[:2],
+            expected_kv_lens,
+            atol=0,
+            rtol=0,
+        )
+        for layer in layers:
+            torch.testing.assert_close(
+                kv_cache_manager.get_buffers(layer.layer_idx),
+                target_kv[layer.layer_idx],
+                atol=0,
+                rtol=0,
+            )
 
     @torch.no_grad()
     @unittest.mock.patch(
@@ -2422,7 +2665,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
                 block_tables = wrappers.decode_wrapper._block_tables
                 expected = self._expected_decode_block_table(
                     metadata,
-                    plan_params.head_dim,
+                    plan_params.kv_pool_id,
                     new_page_counts,
                     rows=len(initial_page_counts),
                     width=max(initial_page_counts),
@@ -2451,11 +2694,12 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
         initial_state = {}
         for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
+            self.assertIsNotNone(plan_params.kv_pool_id)
             block_tables = wrappers.decode_wrapper._block_tables
             self.assertGreaterEqual(block_tables.size(1), 65)
             self.assertEqual(block_tables.size(1), metadata.kv_cache_manager.max_blocks_per_seq)
             self.assertEqual(wrappers.host_decode_block_tables.size(1), 64)
-            initial_state[plan_params.head_dim] = (
+            initial_state[plan_params.kv_pool_id] = (
                 block_tables.data_ptr(),
                 wrappers.host_decode_block_tables.data_ptr(),
             )
@@ -2467,13 +2711,13 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         for plan_params, wrappers in metadata._plan_params_to_wrappers.items():
             with self.subTest(head_dim=plan_params.head_dim):
                 block_tables = wrappers.decode_wrapper._block_tables
-                old_device_ptr, old_host_ptr = initial_state[plan_params.head_dim]
+                old_device_ptr, old_host_ptr = initial_state[plan_params.kv_pool_id]
                 self.assertEqual(block_tables.data_ptr(), old_device_ptr)
                 self.assertNotEqual(wrappers.host_decode_block_tables.data_ptr(), old_host_ptr)
                 self.assertGreaterEqual(wrappers.host_decode_block_tables.size(1), 65)
                 expected = self._expected_decode_block_table(
                     metadata,
-                    plan_params.head_dim,
+                    plan_params.kv_pool_id,
                     new_page_counts,
                     rows=len(new_page_counts),
                     width=max(new_page_counts),

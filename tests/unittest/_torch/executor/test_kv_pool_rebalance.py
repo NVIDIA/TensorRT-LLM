@@ -32,7 +32,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -51,9 +51,14 @@ def _make_executor(
     need_adjustment: bool = True,
     active_requests=None,
     previous_batch=None,
+    padding_dummies=None,
+    has_cuda_graph_runner: bool = True,
 ) -> MagicMock:
     """Construct a MagicMock shaped like PyExecutor with exactly the
     attributes the rebalance code path reads.
+
+    ``padding_dummies`` is the runner's ``{draft_len: dummy}`` map; its
+    dummies count as active on GPU, like real pre-allocated ones.
     """
     exe = MagicMock(spec=PyExecutor)
 
@@ -71,12 +76,41 @@ def _make_executor(
     exe.kv_cache_manager.impl = MagicMock()
     exe.kv_cache_manager.impl.need_adjustment = need_adjustment
 
+    # CUDA-graph runner holding the pre-allocated padding dummies.  A bare
+    # MagicMock would be truthy and non-iterable in the suspend helper.
+    padding_dummies = dict(padding_dummies or {})
+    exe.model_engine = MagicMock()
+    exe.resource_manager = MagicMock()
+    if has_cuda_graph_runner:
+        exe.model_engine.cuda_graph_runner = MagicMock()
+        exe.model_engine.cuda_graph_runner.padding_dummy_requests = padding_dummies
+        # Mirror the real helper: pop the dummy from the runner's map.
+        exe.model_engine.cuda_graph_runner.release_padding_dummy.side_effect = (
+            lambda _rm, draft_len: padding_dummies.pop(draft_len, None) is not None
+        )
+    else:
+        exe.model_engine.cuda_graph_runner = None
+
     # is_request_active returns True for every id we tracked, False for
     # everything else.  Tests set active_requests to a list of mocks with
     # py_request_id attributes.
     exe.active_requests = active_requests or []
     active_ids = {r.py_request_id for r in exe.active_requests}
+    active_ids |= {d.py_request_id for d in padding_dummies.values()}
     exe.kv_cache_manager.is_request_active.side_effect = lambda rid: rid in active_ids
+    exe.kv_cache_manager.resume_request.return_value = True
+
+    # Bind the padding-dummy helpers to their real implementations so that
+    # _maybe_rebalance_kv_pools tests exercise the actual path rather than
+    # MagicMock stand-ins supplied by spec=PyExecutor.
+    exe._suspend_padding_dummies_for_rebalance = (
+        lambda mgr: PyExecutor._suspend_padding_dummies_for_rebalance(exe, mgr)
+    )
+    exe._resume_padding_dummies_after_rebalance = (
+        lambda mgr, suspended: PyExecutor._resume_padding_dummies_after_rebalance(
+            exe, mgr, suspended
+        )
+    )
 
     # Previous batch (overlap loop).
     exe.previous_batch = previous_batch
@@ -209,6 +243,104 @@ class TestMaybeRebalanceKvPools:
 
         with pytest.raises(RuntimeError, match="boom"):
             PyExecutor._maybe_rebalance_kv_pools(exe)
+
+
+# --------------------------------------------------------------------------- #
+# CUDA-graph padding dummies
+# --------------------------------------------------------------------------- #
+
+
+class TestPaddingDummies:
+    """``adjust()`` requires every living KV cache to be suspended, but the
+    CUDA-graph padding dummies stay ACTIVE across iterations and never appear
+    in ``active_requests``.  The hook must suspend them too -- and must not
+    free them, since they are pre-allocated at warmup precisely so that a
+    loaded KV cache cannot deny them later (PR #16072).
+    """
+
+    @staticmethod
+    def _fire(exe, monkeypatch):
+        exe._consume_previous_batch_for_rebalance = MagicMock()
+        monkeypatch.setattr("torch.cuda.current_stream", MagicMock())
+        PyExecutor._maybe_rebalance_kv_pools(exe)
+
+    def test_padding_dummy_is_suspended_before_adjust(self, monkeypatch):
+        dummy = _make_request(999)
+        exe = _make_executor(active_requests=[_make_request(1)], padding_dummies={0: dummy})
+
+        call_order = []
+        exe.kv_cache_manager.suspend_request.side_effect = lambda req: call_order.append(
+            ("suspend", req.py_request_id)
+        )
+        exe.kv_cache_manager.impl.adjust.side_effect = lambda: call_order.append(("adjust", None))
+
+        self._fire(exe, monkeypatch)
+
+        assert call_order.index(("suspend", 999)) < call_order.index(("adjust", None))
+
+    def test_padding_dummy_is_resumed_and_never_freed(self, monkeypatch):
+        """The dummy must survive the rebalance: freeing it would return to
+        the lazy re-allocation that #16072 removed, which can fail against a
+        loaded cache and drop padded batches to eager mode permanently.
+        """
+        dummy = _make_request(999)
+        runner_map = {0: dummy}
+        exe = _make_executor(padding_dummies=runner_map)
+
+        self._fire(exe, monkeypatch)
+
+        exe.kv_cache_manager.resume_request.assert_called_once_with(dummy)
+        exe.kv_cache_manager.free_resources.assert_not_called()
+        assert exe.model_engine.cuda_graph_runner.padding_dummy_requests == {0: dummy}
+
+    def test_every_captured_draft_length_is_covered(self, monkeypatch):
+        """#16072 retains one dummy per captured draft length, not just one."""
+        dummies = {0: _make_request(999), 3: _make_request(996)}
+        exe = _make_executor(padding_dummies=dummies)
+
+        self._fire(exe, monkeypatch)
+
+        suspended = {
+            c.args[0].py_request_id for c in exe.kv_cache_manager.suspend_request.call_args_list
+        }
+        assert suspended == {999, 996}
+
+    def test_unresumable_padding_dummy_is_released_and_dropped(self, monkeypatch):
+        """Nothing reschedules a padding dummy, and the runner hands back a
+        cached dummy without checking that its cache is live -- so one that
+        cannot be resumed must not be left suspended in the runner's map.
+
+        The release goes through the runner rather than the KV cache manager
+        directly: a dummy is registered with up to four managers, and the
+        runner owns that list.
+        """
+        dummy = _make_request(999)
+        exe = _make_executor(padding_dummies={0: dummy})
+        exe.kv_cache_manager.resume_request.return_value = False
+        runner = exe.model_engine.cuda_graph_runner
+
+        self._fire(exe, monkeypatch)
+
+        runner.release_padding_dummy.assert_called_once_with(exe.resource_manager, 0)
+        exe.kv_cache_manager.free_resources.assert_not_called()
+
+    def test_already_suspended_padding_dummy_is_left_alone(self, monkeypatch):
+        dummy = _make_request(999)
+        exe = _make_executor(padding_dummies={0: dummy})
+        exe.kv_cache_manager.is_request_active.side_effect = lambda rid: False
+
+        self._fire(exe, monkeypatch)
+
+        exe.kv_cache_manager.suspend_request.assert_not_called()
+        exe.kv_cache_manager.resume_request.assert_not_called()
+
+    def test_missing_cuda_graph_runner_is_tolerated(self, monkeypatch):
+        """Engines without a CUDA-graph runner must still rebalance."""
+        exe = _make_executor(active_requests=[_make_request(1)], has_cuda_graph_runner=False)
+
+        self._fire(exe, monkeypatch)
+
+        exe.kv_cache_manager.impl.adjust.assert_called_once()
 
 
 # --------------------------------------------------------------------------- #

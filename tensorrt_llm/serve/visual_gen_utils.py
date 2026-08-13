@@ -1,12 +1,18 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import os
-import shutil
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from tensorrt_llm.inputs.media_io import is_isobmff_image_bytes, sniff_media_kind
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
-from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
+
+if TYPE_CHECKING:
+    # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
+    # whole visual_gen tree into every LLM serving process.
+    from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 # Per-field warnings for OpenAI-shaped knobs that the engine has no
 # semantic for. Each entry maps the request attribute to the message
@@ -84,6 +90,23 @@ def _merge_extra_params(
         params.extra_params = None
 
 
+def _read_reference_payload(reference) -> bytes:
+    """Read the ``input_reference`` payload (base64 JSON or multipart file).
+
+    Payload size is deliberately not checked here: encoded size is not part
+    of the request-validity contract, and body limits belong to the
+    proxy/ASGI deployment layer (HTTP 413). Base64 decodes strictly so
+    malformed encodings — not sizes — are rejected.
+    """
+    if isinstance(reference, str):
+        try:
+            return base64.b64decode(reference, validate=True)
+        except ValueError as exc:
+            # binascii.Error subclasses ValueError.
+            raise ValueError("input_reference is not valid base64 data.") from exc
+    return reference.file.read()
+
+
 def parse_visual_gen_params(
     request: ImageGenerationRequest | VideoGenerationRequest,
     id: str,
@@ -154,16 +177,41 @@ def parse_visual_gen_params(
                 )
             params.num_frames = derived
         if request.input_reference is not None:
-            if media_storage_path is None:
-                raise ValueError("media_storage_path is required when input_reference is provided")
-            ref_path = os.path.join(media_storage_path, f"{id}_reference.png")
-            if isinstance(request.input_reference, str):
+            payload = _read_reference_payload(request.input_reference)
+            kind = sniff_media_kind(payload)
+            if kind == "image":
+                # Rejected on signature alone, not on a failed decode:
+                # whether Pillow reads HEIF/AVIF depends on optional plugins,
+                # and the worker process need not have the same ones.
+                if is_isobmff_image_bytes(payload):
+                    raise ValueError(
+                        "input_reference is a HEIF/AVIF image, which is not "
+                        "a supported reference format; convert it to PNG or "
+                        "JPEG."
+                    )
+                # I2V: the stored image file is the cross-model contract.
+                # every I2V pipeline reads ``params.image`` as a path.
+                if media_storage_path is None:
+                    raise ValueError(
+                        "media_storage_path is required when input_reference is an image"
+                    )
+                ref_path = os.path.join(media_storage_path, f"{id}_reference")
                 with open(ref_path, "wb") as f:
-                    f.write(base64.b64decode(request.input_reference))
+                    f.write(payload)
+                params.image = ref_path
+            elif kind == "video":
+                # V2V: encoded bytes pass through untouched; the worker
+                # demuxes and NVDEC-decodes them (acceptance happens there,
+                # so corrupt content behind a valid signature still fails as
+                # a client error).
+                if params.extra_params is None:
+                    params.extra_params = {}
+                params.extra_params["video"] = payload
             else:
-                with open(ref_path, "wb") as f:
-                    shutil.copyfileobj(request.input_reference.file, f)
-            params.image = ref_path
+                raise ValueError(
+                    "input_reference is not a recognized media container; "
+                    "supported inputs are PNG/JPEG images and MP4/AVI video."
+                )
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)

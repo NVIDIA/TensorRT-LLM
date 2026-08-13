@@ -6,9 +6,9 @@ from pydantic import AliasChoices, BaseModel, Field
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
-from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
+from tensorrt_llm.bench.tuning.settings import get_model_config
 from tensorrt_llm.commands.utils import \
     collect_explicit_cli_keys as _collect_explicit_cli_keys
 from tensorrt_llm.logger import logger
@@ -55,6 +55,8 @@ class GeneralExecSettings(BaseModel):
                                          validation_alias=AliasChoices(
                                              "dataset_path", "dataset"),
                                          description="Path to dataset file")
+    duration: Optional[int] = Field(default=None,
+                                    description="Maximum run time in seconds")
     engine_dir: Optional[Path] = Field(
         default=None, description="Path to a serialized TRT-LLM engine")
     eos_id: int = Field(

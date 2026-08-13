@@ -38,6 +38,8 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     v2_sha256_block_hasher)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
+COORDINATOR_SELECT_MAX_ATTEMPTS = 2
+COORDINATOR_SELECT_RETRY_DELAY_S = 0.05
 COORDINATOR_FINISH_MAX_ATTEMPTS = 3
 COORDINATOR_FINISH_RETRY_DELAY_S = 0.1
 COORDINATOR_FINISH_TIMEOUT_S = 5.0
@@ -798,14 +800,19 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  tokens_per_block: Optional[int] = None,
                  custom_tokenizer: Optional[str] = None,
                  tokenizer_dir: Optional[str] = None,
+                 use_harmony: Optional[bool] = None,
+                 model_path: Optional[str] = None,
                  track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
-                 **kwargs):
+                 **kwargs) -> None:
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block, custom_tokenizer,
-                                 tokenizer_dir)
+        self._init_block_hashing(tokens_per_block,
+                                 custom_tokenizer,
+                                 tokenizer_dir,
+                                 use_harmony=use_harmony,
+                                 model_path=model_path)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
@@ -1252,11 +1259,12 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  use_token_ids: bool = False,
                  hash_skip_count: int = 0,
                  max_sessions: int = 100000,
+                 use_harmony: Optional[bool] = None,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_load_balancing(servers)
-        self._init_block_hashing(tokens_per_block)
+        self._init_block_hashing(tokens_per_block, use_harmony=use_harmony)
 
         self._match_threshold = match_threshold
         self._use_token_ids = use_token_ids
@@ -1744,18 +1752,45 @@ class CoordinatorDelegatingRouter(Router):
             "exclude_server": exclude_server
         }
         _t0 = time.monotonic()
-        async with self.session.post(f"{self._coordinator_url}/select",
-                                     data=msgpack.packb(payload,
-                                                        use_bin_type=True),
-                                     headers=_MSGPACK_HEADERS,
-                                     timeout=self._request_timeout_s) as resp:
-            body = msgpack.unpackb(await resp.read(), raw=False)
-            if resp.status != 200:
-                raise ValueError(f"coordinator /select returned {resp.status}: "
-                                 f"{body.get('error', body)}")
+        body = await self._post_select(payload)
         self._select_lat.record(time.monotonic() - _t0)
         info = body.get("info") or {}
         return body["server"], info
+
+    async def _post_select(self, payload: dict) -> dict:
+        """POST /select, retrying connection-level failures.
+
+        A pooled connection the coordinator closed first fails instantly with
+        BrokenPipeError/ConnectionResetError; without a retry that transport
+        blip becomes a 500 on a live request. The coordinator's ``select`` is
+        idempotent for a repeated req_id -- it cancels the prior reservation and
+        re-places -- so replaying is safe even when the first attempt did reach
+        it. Only connection errors retry: an error status from the coordinator
+        is a real placement failure and must propagate, and a timeout means it
+        is already overloaded, so retrying would only add load.
+        """
+        data = msgpack.packb(payload, use_bin_type=True)
+        for attempt in range(1, COORDINATOR_SELECT_MAX_ATTEMPTS + 1):
+            try:
+                async with self.session.post(
+                        f"{self._coordinator_url}/select",
+                        data=data,
+                        headers=_MSGPACK_HEADERS,
+                        timeout=self._request_timeout_s) as resp:
+                    body = msgpack.unpackb(await resp.read(), raw=False)
+                    if resp.status != 200:
+                        raise ValueError(
+                            f"coordinator /select returned {resp.status}: "
+                            f"{body.get('error', body)}")
+                return body
+            except aiohttp.ClientConnectionError as e:
+                if attempt == COORDINATOR_SELECT_MAX_ATTEMPTS:
+                    raise
+                logger.warning(
+                    f"CoordinatorDelegatingRouter select attempt {attempt} "
+                    f"failed: {e}; retrying")
+                await asyncio.sleep(COORDINATOR_SELECT_RETRY_DELAY_S *
+                                    (2**(attempt - 1)))
 
     async def finish_request(self,
                              request: OpenAIRequest,

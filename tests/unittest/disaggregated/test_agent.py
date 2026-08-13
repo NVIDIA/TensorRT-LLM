@@ -6,8 +6,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-# Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
-os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
+# Force a deterministic UCX/NIXL config regardless of what the cluster/CI
+# injects; see test_kv_transfer.py for the full rationale.
+os.environ["UCX_TLS"] = "^ib,gdr_copy"
+os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
@@ -32,8 +34,10 @@ except Exception:  # pragma: no cover - binding unavailable in some envs
     _HAS_CPP_NIXL_BINDING = False
 
 _AGENT_CPP_MODULE = "tensorrt_llm._torch.disaggregation.nixl._agent_cpp"
+_AGENT_PY_MODULE = "tensorrt_llm._torch.disaggregation.nixl._agent_py"
 
 
+@pytest.mark.cpu_only
 class TestTransferStatus(TestCase):
     def test_mock_transfer_status(self):
         mock_transfer_status = Mock(spec=TransferStatus)
@@ -47,6 +51,21 @@ class TestTransferStatus(TestCase):
                 result = mock_transfer_status.wait(timeout_ms=timeout)
                 self.assertTrue(result)
                 mock_transfer_status.wait.assert_called_with(timeout_ms=timeout)
+
+
+@pytest.mark.cpu_only
+def test_python_agent_accepts_topology_without_forwarding_it_to_nixl():
+    agent_py = pytest.importorskip(_AGENT_PY_MODULE, exc_type=ImportError)
+    with (
+        patch.object(agent_py, "nixl_agent_config") as agent_config,
+        patch.object(agent_py, "nixl_agent") as nixl_agent,
+    ):
+        agent_py.NixlTransferAgent(
+            "testAgent", use_prog_thread=False, num_threads=3, rank=2, world_size=4
+        )
+
+    agent_config.assert_called_once_with(enable_prog_thread=False, backends=["UCX"], num_threads=3)
+    nixl_agent.assert_called_once_with("testAgent", agent_config.return_value)
 
 
 def _convert_to_memory_descs(reg_descs: RegMemoryDescs) -> MemoryDescs:
@@ -279,6 +298,23 @@ class TestBindingsNixlTransferAgentShutdown(TestCase):
         agent.shutdown()
         with self.assertRaises(Exception):
             agent.submit_transfer_requests(Mock())
+
+    @patch(f"{_AGENT_CPP_MODULE}.CppNixlTransferAgent")
+    @patch(f"{_AGENT_CPP_MODULE}.BaseAgentConfig")
+    def test_topology_is_forwarded_to_config(self, base_config, cpp_agent):
+        BindingsNixlTransferAgent("testAgent", rank=2, world_size=4)
+
+        base_config.assert_called_once_with(
+            "testAgent",
+            True,
+            multi_thread=False,
+            use_listen_thread=False,
+            enable_telemetry=False,
+            backend_params={"num_threads": "1"},
+            rank=2,
+            world_size=4,
+        )
+        cpp_agent.assert_called_once_with(base_config.return_value)
 
 
 if __name__ == "__main__":

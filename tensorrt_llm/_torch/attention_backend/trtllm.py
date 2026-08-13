@@ -17,7 +17,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -41,6 +41,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
+from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 
@@ -117,6 +118,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     is_spec_dec_tree: bool = False
     # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
     is_spec_dec_dynamic_tree: bool = False
+    force_prepare_spec_dec_tree_mask: bool = False
 
     # parameters required for spec-dec mode
     max_total_draft_tokens: Optional[int] = None
@@ -156,11 +158,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
-    # Block IDs per sequence; populated in __post_init__ when a KV cache
-    # manager is present. Declared here so encoder-only metadata (no KV cache)
-    # still exposes the attribute.
+    # Active block-ID buffers, defaulting to the target cache. Separate draft
+    # storage lets CUDA graphs bind stable target and draft addresses.
     block_ids_per_seq: Optional[torch.Tensor] = None
     kv_block_ids_per_seq: Optional[torch.Tensor] = None
+    draft_block_ids_per_seq: Optional[torch.Tensor] = None
+    draft_kv_block_ids_per_seq: Optional[torch.Tensor] = None
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -333,6 +336,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.host_kv_cache_block_offsets = self.kv_cache_manager.host_kv_cache_block_offsets
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
+            self.draft_block_ids_per_seq = None
+            self.draft_kv_block_ids_per_seq = None
 
             # Allocate separate block offset tensors for draft KV cache manager
             # Used in one-model speculative decoding with different KV cache layouts
@@ -372,6 +377,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
+                if self.draft_kv_cache_manager is not None:
+                    self.draft_block_ids_per_seq = self.get_empty(
+                        buffers,
+                        [
+                            self.draft_kv_cache_manager.max_batch_size,
+                            self.draft_kv_cache_manager.max_blocks_per_seq
+                        ],
+                        cache_name="draft_block_ids_per_seq",
+                        dtype=torch.int32,
+                        capture_graph=capture_graph,
+                    )
+                    self.draft_kv_block_ids_per_seq = self.get_empty(
+                        buffers,
+                        [
+                            self.draft_kv_cache_manager.max_batch_size,
+                            self.draft_kv_cache_manager.max_blocks_per_seq
+                        ],
+                        cache_name="draft_kv_block_ids_per_seq",
+                        dtype=torch.int32,
+                        capture_graph=capture_graph,
+                    )
                 # Allocate fixed-size buffers for pre-computed FlashMLA metadata.
                 # These are pre-allocated so their GPU addresses are stable across CUDA graph captures.
                 sm_count = torch.cuda.get_device_properties(
@@ -641,6 +667,56 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:self.num_seqs],
         )
 
+    def prepare_encoder_decoder_from_precomputed_lengths(
+            self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
+            context_kv_tokens: int, generation_kv_tokens: int,
+            max_kv_len: int) -> None:
+        """Prepare encoder-decoder attention from precomputed lengths."""
+        super().prepare()
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
+
+        assert self.kv_cache_manager is not None
+        assert self.draft_kv_cache_manager is None
+        assert not self.is_spec_decoding_enabled
+        assert self.kv_cache_params.num_extra_kv_tokens == 0
+        assert not self.enable_flash_mla
+        assert not self.enable_helix
+        assert not self.enable_context_mla_with_cached_kv
+        assert self.request_ids is not None
+        assert max_kv_len <= self.kv_cache_manager.max_seq_len, (
+            f"The max KV cache length of input sequences ({max_kv_len}) "
+            "exceeds the KV cache manager's maximum supported length "
+            f"({self.kv_cache_manager.max_seq_len}).")
+
+        num_seqs = self.num_seqs
+        self.prompt_lens_cuda[:num_seqs].copy_(prompt_lens, non_blocking=True)
+        self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
+        self.host_total_kv_lens[0] = context_kv_tokens
+        self.host_total_kv_lens[1] = generation_kv_tokens
+        self.host_request_types[:self.num_contexts].fill_(0)
+        self.host_request_types[self.num_contexts:num_seqs].fill_(1)
+
+        max_blocks = None
+        if self.kv_cache_manager.tokens_per_block:
+            max_blocks = ceil_div(max_kv_len,
+                                  self.kv_cache_manager.tokens_per_block)
+        self.kv_cache_manager.copy_batch_block_offsets(
+            self.kv_cache_block_offsets,
+            self.request_ids,
+            self.beam_width,
+            self.num_contexts,
+            num_seqs,
+            max_blocks=max_blocks)
+        self._bind_runtime_views(
+            kv_lens_cuda=self.kv_lens_cuda[:num_seqs],
+            kv_lens=kv_lens,
+            prompt_lens_cuda=self.prompt_lens_cuda[:num_seqs],
+            prompt_lens_cpu=prompt_lens,
+            host_request_types=self.host_request_types[:num_seqs],
+        )
+
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
         extra_attrs = get_model_extra_attrs()
@@ -701,9 +777,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_total_kv_lens[0] = padded_num_tokens
 
     def prepare_flash_mla(self) -> None:
-        # Invalidate the pre-computed metadata so that forward() recomputes it
-        # for this forward pass before the first attention layer runs.
         self._flash_mla_metadata_valid = False
+        # Request-specific fills and H2D copies must happen before replay, not
+        # become fixed operations in the captured graph.
+        if torch.cuda.is_current_stream_capturing():
+            return
+
         block_ids_per_seq = maybe_pin_memory(
             self.kv_cache_manager.get_block_ids_per_seq(self.request_ids))
         num_blocks = block_ids_per_seq.shape[1]
@@ -1003,6 +1082,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.use_spec_decoding = self.is_spec_decoding_enabled
         self.is_spec_dec_tree = is_spec_dec_tree
         self.is_spec_dec_dynamic_tree = is_spec_dec_dynamic_tree
+        # A hybrid model's first executed attention layer can have a nonzero
+        # cache-local index because recurrent layers precede it.  Do not rely
+        # on the C++ ``layer_idx == 0`` fallback to rebuild the target mask:
+        # the dynamic draft loop clears that mask before the next target step.
+        self.force_prepare_spec_dec_tree_mask = is_spec_dec_dynamic_tree
         # Forward static tree length to FMHA kernel selection.
         self.max_total_draft_tokens = max_total_draft_tokens
 
@@ -1110,8 +1194,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Case 2/3: static tree
             elif self.is_spec_dec_tree and not self.is_spec_dec_dynamic_tree and spec_metadata is not None:
-                assert spec_metadata.spec_dec_mode.is_eagle3(
-                ), "Tree decoding is only supported for Eagle3 now"
+                assert (spec_metadata.spec_dec_mode.is_eagle3()
+                        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
+                        ), "Tree decoding is only supported for Eagle3 now"
 
                 is_target_model = not getattr(spec_metadata, 'is_draft_model',
                                               False)
@@ -1589,40 +1674,59 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             else:
                 forward_args.fmha_scheduler_counter.zero_()
             assert forward_args.latent_cache is not None
-            from .utils import append_mla_latent_cache
-            append_mla_latent_cache(
-                metadata.kv_cache_manager,
-                self.get_local_layer_idx(metadata),
-                metadata.request_ids,
-                metadata.seq_lens.tolist(),
-                metadata.kv_cache_params.num_cached_tokens_per_seq,
-                forward_args.latent_cache,
-                kv_layout=metadata.kv_layout,
-                seq_start=num_ctx,
-            )
+            from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 
-        # RocketKV and DSA predict which blocks to keep, so build their sparse
-        # index tensors here. Skip-softmax needs no prediction.
-        sparse_params = self.sparse_params
-        if (sparse_params is not None
-                and not isinstance(sparse_params, SkipSoftmaxParams)):
-            kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
-                                                    forward_args)
-            at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
-                                                      forward_args)
-            forward_args.sparse_prediction = replace(
-                forward_args.sparse_prediction,
-                sparse_kv_indices=kv_idx,
-                sparse_kv_offsets=kv_off,
-                sparse_attn_indices=at_idx,
-                sparse_attn_offsets=at_off,
-                sparse_attn_indices_block_size=sparse_params.indices_block_size,
-            )
+            # Hybrid (mamba/masked-layer) KV managers take the graph-safe
+            # append; the same predicate interface.py uses to detect hybrid
+            # managers for mamba metadata. Dense MLA models keep the
+            # host-side path unchanged.
+            if isinstance(metadata.kv_cache_manager, BaseMambaCacheManager):
+                from .utils import \
+                    append_mla_latent_cache_generation_cuda_graph_safe
+
+                # The write positions must come from device tensors: the host
+                # lists (request ids, seq lens, cached-token counts) are
+                # frozen into the graph at capture time and corrupt the cache
+                # on replay. The helper falls back to the host-side loop for
+                # eager forwards only; under CUDA graphs it scatters
+                # device-side for any uniform q_len (1 for plain decode,
+                # 1 + draft_len for padded spec-dec verification batches).
+                append_mla_latent_cache_generation_cuda_graph_safe(
+                    metadata,
+                    # NOTE: get_buffers / layer_offsets take the GLOBAL layer
+                    # index (they map through layer_offsets internally).
+                    # Passing the local offset double-maps and breaks hybrid
+                    # models whose KV manager covers a masked layer subset
+                    # (e.g. Kimi K3).
+                    self.layer_idx,
+                    forward_args.latent_cache,
+                )
+            else:
+                # TODO(TRTLLM-15193): this host-side path freezes write
+                # positions at CUDA graph capture time and may corrupt the
+                # cache on replay IF a non-hybrid MLA model reaches this path
+                # under graph capture. Investigate whether that is reachable;
+                # if so, the graph-safe branch above is a correctness fix to
+                # generalize, not an optimization.
+                from .utils import append_mla_latent_cache
+                append_mla_latent_cache(
+                    metadata.kv_cache_manager,
+                    self.get_local_layer_idx(metadata),
+                    metadata.request_ids,
+                    metadata.seq_lens.tolist(),
+                    metadata.kv_cache_params.num_cached_tokens_per_seq,
+                    forward_args.latent_cache,
+                    kv_layout=metadata.kv_layout,
+                    seq_start=num_ctx,
+                )
+
+        forward_args.sparse_runtime_params = prepare_sparse_runtime_params(
+            self, q, k, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
-        # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
-        # recomputation when cache_seq_lens change. The metadata must always match the
-        # compacted generation sub-batch, which is also the layout used by block_ids_per_seq.
+        # The flag is invalidated whenever FlashMLA inputs change. The metadata
+        # must always match the compacted generation sub-batch, which is also
+        # the layout used by block_ids_per_seq.
         if (metadata.enable_flash_mla and forward_args.attention_input_type
                 != AttentionInputType.context_only
                 and metadata.num_generations > 0
@@ -1674,7 +1778,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 assert k.shape[0] == num_tokens
                 assert v.shape[0] == num_tokens
         else:
-            is_sparse_attn = forward_args.sparse_prediction.sparse_attn_indices is not None and forward_args.sparse_prediction.sparse_attn_indices.numel(
+            sparse_attn_indices = forward_args.sparse_runtime_params.sparse_attn_indices
+            is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
             ) > 0
             if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
                 assert forward_args.is_fused_qkv
@@ -1750,9 +1855,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         sparse_params = self.sparse_params
         if isinstance(sparse_params, SkipSoftmaxParams):
-            forward_args.skip_softmax_kernel_params = (
-                sparse_params.scheduler.get_kernel_params(
-                    timestep=forward_args.timestep))
+            forward_args.sparse_runtime_params = (
+                sparse_params.scheduler.get_runtime_params(
+                    runtime_params=forward_args.sparse_runtime_params,
+                    timestep=forward_args.timestep,
+                ))
 
         # max_context_q_len_override is only set when encoder CUDA graphs are enabled.
         if metadata.max_context_q_len_override is not None:
@@ -1973,10 +2080,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-            Predict sparse kv indices. It's implemented in the derived class.
-        """
-        raise NotImplementedError
+        """Predict sparse KV indices when required by an algorithm."""
+        return None, None
 
     def sparse_attn_predict(
         self,
@@ -1985,10 +2090,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-            Predict sparse attn indices. It's implemented in the derived class.
-        """
-        raise NotImplementedError
+        """Predict sparse attention indices when required by an algorithm."""
+        return None, None
 
     def mla_rope_generation(
         self,

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,6 +39,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
@@ -135,6 +136,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     auto mInternalBatchManagerKvCacheV2Utils
         = mInternalBatchManager.def_submodule("kv_cache_manager_v2_utils", "KV Cache Manager V2 Utils bindings");
+    auto mInternalBatchManagerKvCacheV2
+        = mInternalBatchManager.def_submodule("kv_cache_manager_v2", "KV Cache Manager V2 bindings");
+    tensorrt_llm::nanobind::batch_manager::KvCacheManagerV2Bindings::initBindings(mInternalBatchManagerKvCacheV2);
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
@@ -544,4 +548,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 
     m.def("steady_clock_now", []() { return std::chrono::steady_clock::now(); });
+    // Global (offset-normalized) steady clock, matching what
+    // LlmRequest::setKvCacheTransferStart/End expect. Reads the process-global
+    // steady clock offset, set by PyExecutor at startup.
+    m.def("global_steady_clock_now", []() { return tb::LlmRequest::getSteadyClockNow(); });
 }
