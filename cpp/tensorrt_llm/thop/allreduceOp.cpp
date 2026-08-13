@@ -563,12 +563,11 @@ private:
             inputPtr = windowBuffer0.ptr;
         }
 
-        // Use a window-backed output buffer under the same threshold gate as the input above.
-        // minRegistrationThreshold is SIZE_MAX without NVLink/MNNVL, where the collective
-        // ncclAllReduce plus cudaStreamSynchronize inside allocateAndRegisterBuffer cannot
-        // complete, so allocating here unconditionally hangs every rank.
+        // Request an output window only when the message meets the same
+        // registration threshold used by the input path. Smaller messages use a
+        // regular output tensor and skip the window allocation path.
         torch::Tensor outputTensor;
-        if (windowBuffer0.isValid() || bufferSizeBytes >= minRegistrationThreshold)
+        if (bufferSizeBytes >= minRegistrationThreshold)
         {
             auto [windowOutput, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
             if (windowBuffer1.isValid())
