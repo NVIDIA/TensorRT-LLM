@@ -42,9 +42,6 @@ for how to build TensorRT LLM from source and start a TRT-LLM Docker container.
 ## Hardware Requirements
 
 DeepSeek-V4 is supported on Hopper (`SM90`) and Blackwell (`SM100+`) GPUs in the PyTorch backend.
-The Hopper sparse-attention path uses FlashMLA; use the `CUTLASS` MoE backend on Hopper. Examples
-below that explicitly select the `TRTLLM` MoE backend target Blackwell and should be changed to
-`CUTLASS` when running on Hopper.
 
 DeepSeek-V4 has two model scales, and each scale provides Base and Instruct checkpoints. The table
 below follows the model list published on the
@@ -343,8 +340,6 @@ attention_dp_config:
   timeout_iters: 60
 cuda_graph_config:
   enable_padding: true
-moe_config:
-  backend: TRTLLM
 max_batch_size: 16
 max_num_tokens: 8192
 stream_interval: 10
@@ -482,7 +477,6 @@ configuration.
 - `DeepseekV4CacheManager requires tokens_per_block in [128, 256]`: pass
   `--tokens_per_block 128` in `quickstart_advanced.py` or set
   `kv_cache_config.tokens_per_block: 128` in YAML.
-- On Hopper, select the `CUTLASS` MoE backend; the `TRTLLM` MoE backend examples target Blackwell.
 - Out-of-memory during initialization or prefill: reduce `max_batch_size`, `max_num_tokens`, or
   `kv_cache_config.free_gpu_memory_fraction`. For bring-up on 8xB200, set `max_seq_len` explicitly
   instead of using the checkpoint's 1M-token context length.

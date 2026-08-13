@@ -566,7 +566,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         # Hopper uses the fused MLA RoPE/cache-append helpers for context and
         # generation. Blackwell's FMHA plan/run path prepares this state
         # internally.
-        if get_sm_version() < 100:
+        if get_sm_version() == 90:
             self.prepare_for_mla_rope_append(cached_token_lens[:num_requests], kv_lens)
 
         # For indices conversion

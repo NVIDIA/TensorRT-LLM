@@ -122,7 +122,10 @@ def initialize_sparse_attn(self) -> None:
         inverse=True,
     )
     self._dsv4_flash_mla = None
-    if get_sm_version() < 100:
+    sm_version = get_sm_version()
+    if sm_version < 90:
+        raise RuntimeError(f"DeepSeek-V4 requires Hopper or newer GPUs, got SM{sm_version}")
+    if sm_version == 90:
         if not isinstance(self.mqa, DeepseekV4TrtllmAttention):
             raise TypeError("DeepSeek-V4 Hopper requires DeepseekV4TrtllmAttention")
         self._dsv4_flash_mla = DeepSeekV4FlashMLA(self.mqa, self.mqa.compress_ratio)
@@ -637,7 +640,7 @@ def forward_generation_sparse_attn(
     enable_dsv4_epilogue_fusion: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 generation absorption path."""
-    if get_sm_version() < 100:
+    if get_sm_version() == 90:
         if self._dsv4_flash_mla is None:
             raise RuntimeError("DeepSeek-V4 Hopper FlashMLA helper is not initialized")
         return self._dsv4_flash_mla.forward_generation(
@@ -818,7 +821,7 @@ def forward_context_sparse_attn(
     enable_dsv4_epilogue_fusion: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the DeepSeek-V4 context absorption path."""
-    if get_sm_version() < 100:
+    if get_sm_version() == 90:
         if self._dsv4_flash_mla is None:
             raise RuntimeError("DeepSeek-V4 Hopper FlashMLA helper is not initialized")
         return self._dsv4_flash_mla.forward_context(
