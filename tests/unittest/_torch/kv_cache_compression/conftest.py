@@ -251,6 +251,7 @@ def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
         index_mapper=SimpleNamespace(gather_k_block_offsets=gather),
         index_scales=torch.full((num_slots,), 2, dtype=torch.int32, pin_memory=True),
         kv_offset=torch.ones(num_slots, dtype=torch.int32, pin_memory=True),
+        _page_table_materializer=SimpleNamespace(uses_device_expansion=False),
         _stream=manager_stream,
     )
 
