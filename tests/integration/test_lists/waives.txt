@@ -246,6 +246,8 @@ full:H20/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp
 full:H20/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True-enable_chunked_prefill=True-v2_kv_cache=True] SKIP (https://nvbugs/6422343)
 full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-one_model-overlap_scheduler] SKIP (https://nvbugs/6373530)
 full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[triton-auto] SKIP (https://nvbugs/6026676)
+full:H20/accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=TRTLLM-torch_compile=True] SKIP (https://nvbugs/6546909)
+full:H20/accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=True] SKIP (https://nvbugs/6580087)
 full:H20/accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=FLASHINFER-torch_compile=True] SKIP (https://nvbugs/6546909)
 full:H20/llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] SKIP (https://nvbugs/6475623)
 full:L40S/accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton-False-1] SKIP (https://nvbugs/6322045)
