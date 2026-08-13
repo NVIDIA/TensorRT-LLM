@@ -28,8 +28,7 @@ MIN_PATTERN_LENGTH = 3  # Minimum length for search patterns
 def _stage_backed_tests(stage_query):
     """Return tests from YAML files that are wired to a Jenkins stage."""
     return [
-        test
-        for test, mappings in stage_query.test_map.items()
+        test for test, mappings in stage_query.test_map.items()
         if any(yml in stage_query.yaml_to_stages
                for yml, _stage, _backend in mappings)
     ]
@@ -49,8 +48,7 @@ def sample_test_cases(stage_query):
     if not all_tests:
         raise RuntimeError(
             "No tests are backed by a live Jenkins stage. Check that the "
-            "Groovy stage map and test database reference the same YAML files."
-        )
+            "Groovy stage map and test database reference the same YAML files.")
 
     # Return up to MAX_SAMPLES tests randomly selected
     if len(all_tests) <= MAX_SAMPLES:
