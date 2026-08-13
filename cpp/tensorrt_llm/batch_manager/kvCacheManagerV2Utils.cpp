@@ -218,38 +218,69 @@ at::Tensor IndexMapper::getCopyIndex(
     return copyIndex_.slice(0, 0, numSeqs);
 }
 
-void IndexMapper::gatherKBlockOffsets(at::Tensor const& source, at::Tensor destination,
-    std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numBlocks)
+namespace
 {
-    std::vector<int64_t> sourceRowsByRequest;
-    sourceRowsByRequest.reserve(requestIds.size());
-    for (auto const requestId : requestIds)
-    {
-        sourceRowsByRequest.push_back(static_cast<int64_t>(getIndex(requestId)) * maxBeamWidth_);
-    }
+void gatherBasePageRowsImpl(at::Tensor const& source, at::Tensor destination, SizeType32 const* copyIndexData,
+    int64_t copyIndexSize, SizeType32 numBlocks)
+{
+    TLLM_CHECK_WITH_INFO(source.device().is_cpu(), "source must be a CPU tensor");
+    TLLM_CHECK_WITH_INFO(destination.device().is_cpu(), "destination must be a CPU tensor");
+    TLLM_CHECK_WITH_INFO(source.scalar_type() == at::kInt, "source must contain int32 values");
+    TLLM_CHECK_WITH_INFO(destination.scalar_type() == at::kInt, "destination must contain int32 values");
+    TLLM_CHECK_WITH_INFO(source.is_contiguous(), "source must be contiguous");
+    TLLM_CHECK_WITH_INFO(destination.is_contiguous(), "destination must be contiguous");
+    TLLM_CHECK_WITH_INFO(
+        source.dim() == 4 && source.size(2) == 2, "source must be [numPools, rowCapacity, 2, maxBlocksPerSeq]");
+    TLLM_CHECK_WITH_INFO(destination.dim() == 4 && destination.size(2) == 2,
+        "destination must be [numPools, numSequences, 2, numBlocksPerSeq]");
+    TLLM_CHECK_WITH_INFO(destination.size(0) == source.size(0), "source and destination pool counts must match");
+    TLLM_CHECK_WITH_INFO(destination.size(1) >= copyIndexSize, "destination must have one row per copyIndex entry");
+    TLLM_CHECK_WITH_INFO(numBlocks > 0 && numBlocks <= source.size(3) && numBlocks <= destination.size(3),
+        "numBlocks must fit both source and destination");
 
     auto const* sourceData = source.data_ptr<int32_t>();
     auto* destinationData = destination.data_ptr<int32_t>();
+    auto const numPools = source.size(0);
     auto const sourceRows = source.size(1);
-    auto const sourcePlanes = source.size(2);
     auto const sourceBlocks = source.size(3);
     auto const destinationRows = destination.size(1);
-    auto const destinationPlanes = destination.size(2);
     auto const destinationBlocks = destination.size(3);
     auto const copyBytes = static_cast<size_t>(numBlocks) * sizeof(int32_t);
 
-    for (int64_t pool = 0; pool < source.size(0); ++pool)
+    for (int64_t pool = 0; pool < numPools; ++pool)
     {
-        for (size_t destinationRow = 0; destinationRow < sourceRowsByRequest.size(); ++destinationRow)
+        for (int64_t destinationRow = 0; destinationRow < copyIndexSize; ++destinationRow)
         {
-            auto const sourceRow = sourceRowsByRequest[destinationRow];
-            auto const sourceOffset = ((pool * sourceRows + sourceRow) * sourcePlanes) * sourceBlocks;
-            auto const destinationOffset
-                = ((pool * destinationRows + static_cast<int64_t>(destinationRow)) * destinationPlanes)
-                * destinationBlocks;
+            auto const sourceRow = static_cast<int64_t>(copyIndexData[destinationRow]);
+            TLLM_CHECK_WITH_INFO(sourceRow >= 0 && sourceRow < sourceRows, "copyIndex row is out of bounds");
+            auto const sourceOffset = ((pool * sourceRows + sourceRow) * 2) * sourceBlocks;
+            auto const destinationOffset = ((pool * destinationRows + destinationRow) * 2) * destinationBlocks;
             std::memcpy(destinationData + destinationOffset, sourceData + sourceOffset, copyBytes);
         }
     }
+}
+} // namespace
+
+void gatherBasePageRows(
+    at::Tensor const& source, at::Tensor destination, at::Tensor const& copyIndex, SizeType32 numBlocks)
+{
+    TLLM_CHECK_WITH_INFO(copyIndex.device().is_cpu(), "copyIndex must be a CPU tensor");
+    TLLM_CHECK_WITH_INFO(copyIndex.scalar_type() == at::kInt, "copyIndex must contain int32 values");
+    TLLM_CHECK_WITH_INFO(copyIndex.is_contiguous(), "copyIndex must be contiguous");
+    TLLM_CHECK_WITH_INFO(copyIndex.dim() == 1, "copyIndex must be one-dimensional");
+    gatherBasePageRowsImpl(source, destination, copyIndex.data_ptr<SizeType32>(), copyIndex.size(0), numBlocks);
+}
+
+void IndexMapper::gatherKBlockOffsets(at::Tensor const& source, at::Tensor destination,
+    std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numBlocks)
+{
+    std::vector<SizeType32> sourceRows;
+    sourceRows.reserve(requestIds.size());
+    for (auto const requestId : requestIds)
+    {
+        sourceRows.push_back(getIndex(requestId) * maxBeamWidth_);
+    }
+    gatherBasePageRowsImpl(source, destination, sourceRows.data(), static_cast<int64_t>(sourceRows.size()), numBlocks);
 }
 
 IndexMapper::IndexMapper(SizeType32 maxBatchSize, SizeType32 maxBeamWidth)

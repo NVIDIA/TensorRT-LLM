@@ -184,6 +184,39 @@ CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, 
     return launchBatchedCopy(false, tasks, numBytes, stream);
 }
 
+void copyBasePageRowsToDevice(ITensor const& input, ITensor& output, SizeType32 numRows, CUstream stream)
+{
+    using namespace tensorrt_llm::runtime;
+
+    auto const& srcShape = input.getShape();
+    auto const& dstShape = output.getShape();
+    constexpr SizeType32 kKvFactor = 2;
+    TLLM_CHECK(srcShape.nbDims == 4 && dstShape.nbDims == 4);
+    TLLM_CHECK(srcShape.d[0] == dstShape.d[0]);
+    TLLM_CHECK(srcShape.d[2] == kKvFactor && dstShape.d[2] == kKvFactor);
+    TLLM_CHECK(srcShape.d[3] == dstShape.d[3]);
+    TLLM_CHECK(numRows >= 0 && numRows <= srcShape.d[1] && numRows <= dstShape.d[1]);
+    if (numRows == 0)
+    {
+        return;
+    }
+
+    auto const* srcPtr = bufferCast<SizeType32 const>(input);
+    auto* dstPtr = bufferCast<SizeType32>(output);
+    auto const numPools = srcShape.d[0];
+    auto const numBlocks = srcShape.d[3];
+    auto const rowStride = static_cast<size_t>(kKvFactor) * static_cast<size_t>(numBlocks);
+    auto const srcPoolStride = static_cast<size_t>(srcShape.d[1]) * rowStride;
+    auto const dstPoolStride = static_cast<size_t>(dstShape.d[1]) * rowStride;
+    auto const rowBytes = static_cast<size_t>(numBlocks) * sizeof(SizeType32);
+    auto const pitchBytes = static_cast<size_t>(rowStride) * sizeof(SizeType32);
+    for (SizeType32 pool = 0; pool < numPools; ++pool)
+    {
+        TLLM_CUDA_CHECK(cudaMemcpy2DAsync(dstPtr + pool * dstPoolStride, pitchBytes, srcPtr + pool * srcPoolStride,
+            pitchBytes, rowBytes, numRows, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream)));
+    }
+}
+
 // dst_tensor[:, :num_seqs, 0] = src_tensor[:, copy_idx]
 // dst_tensor[:, :num_seqs, 1] = dst_tensor[:, :num_seqs, 0] + 1
 __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict__ srcPtr,
