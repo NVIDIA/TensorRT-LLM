@@ -115,6 +115,14 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertTrue(any(arg.startswith("--s3-upload-path=") for arg in upload_args))
         self.assertEqual(_pytest_capture_mode(upload_args, initial_mode="no"), "fd")
 
+    def test_agent_flow_uses_prepared_standard_pytest_workspace_only_for_dry_run(self):
+        body = _function_body(L0_TEST, "runLLMAgentFlowTest", "launchTestListCheck")
+        self.assertIn("if (isInfraDryRun())", body)
+        self.assertIn(
+            "runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)", body
+        )
+        self.assertLess(body.index("if (isInfraDryRun())"), body.index("pip3 install -e"))
+
     def test_slurm_keeps_only_dry_gates_needed_by_the_standard_runner(self):
         body = _function_body(L0_TEST, "runLLMTestlistWithSbatch", "runLLMTestlistOnSlurm")
         self.assertIn(
