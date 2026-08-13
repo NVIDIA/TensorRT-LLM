@@ -190,6 +190,7 @@ def test_create_moe_keeps_all_reduce_for_external_tp_reduction():
     """``reduce_results=False`` keeps the wrapper's direct-TP collective."""
     from transformers.configuration_utils import PretrainedConfig
 
+    from tensorrt_llm._torch.distributed import AllReduceStrategy
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate
     from tensorrt_llm._torch.modules.fused_moe import ConfigurableMoE, create_moe
@@ -213,6 +214,7 @@ def test_create_moe_keeps_all_reduce_for_external_tp_reduction():
             moe_ep_size=1,
         ),
         moe_backend="TRTLLM",
+        allreduce_strategy=AllReduceStrategy.NCCL,
     )
     gate = KimiK3MoEGate(config)
     moe = create_moe(
