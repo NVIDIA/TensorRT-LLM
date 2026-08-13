@@ -83,18 +83,19 @@ def test_sync_video_generation(
                 "format": format,
             }
 
-            # Add the file
+            # Add the file. Keep the request inside the file's context so the
+            # handle closes once the upload completes.
             ## Note: The content-type must be multipart/form-data.
-            files = {
-                "image_reference": (
-                    Path(image_reference).name,
-                    open(image_reference, "rb"),
-                    "multipart/form-data",
-                )
-            }
-
-            print("\n   Uploading reference image and generating video...")
-            response_video = requests.post(endpoint, data=form_data, files=files)
+            with open(image_reference, "rb") as ref_file:
+                files = {
+                    "image_reference": (
+                        Path(image_reference).name,
+                        ref_file,
+                        "multipart/form-data",
+                    )
+                }
+                print("\n   Uploading reference image and generating video...")
+                response_video = requests.post(endpoint, data=form_data, files=files)
         else:
             # T2V mode - Use JSON
             response_video = requests.post(
