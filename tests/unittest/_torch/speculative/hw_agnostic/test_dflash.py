@@ -23,7 +23,8 @@ import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.utils import get_spec_metadata
 from tensorrt_llm.llmapi import CudaGraphConfig, DFlashDecodingConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -37,6 +38,21 @@ PROMPTS = [
 ]
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+
+def test_dflash_metadata_preserves_default_seq_slot_pool_in_graph_copy():
+    metadata = DFlashSpecMetadata(
+        max_draft_len=4,
+        max_total_draft_tokens=4,
+        spec_dec_mode=SpeculativeDecodingMode.DFLASH,
+        max_num_requests=5,
+    )
+
+    graph_metadata = metadata.create_cuda_graph_metadata(max_batch_size=2)
+
+    assert metadata.num_seq_slots == 5
+    assert graph_metadata.max_num_requests == 2
+    assert graph_metadata.num_seq_slots == 5
 
 
 def test_dflash_graph_bucket_uses_full_seq_slot_pool():

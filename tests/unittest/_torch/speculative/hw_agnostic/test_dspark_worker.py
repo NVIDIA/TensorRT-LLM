@@ -94,6 +94,16 @@ def test_metadata_prepare_batch_indices():
     assert meta.batch_indices_cuda[:3].tolist() == [0, 1, 2]
 
 
+def test_metadata_preserves_default_seq_slot_pool_in_graph_copy():
+    metadata = _make_metadata(max_num_requests=5)
+
+    graph_metadata = metadata.create_cuda_graph_metadata(max_batch_size=2)
+
+    assert metadata.num_seq_slots == 5
+    assert graph_metadata.max_num_requests == 2
+    assert graph_metadata.num_seq_slots == 5
+
+
 def _make_worker():
     cfg = types.SimpleNamespace(
         max_draft_len=5,
