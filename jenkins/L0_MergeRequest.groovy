@@ -2291,7 +2291,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     }]}
 
-    parallelJobs.failFast = enableFailFast
+    // A dry acceptance run must finish both architecture tracks so one failure
+    // does not erase the remaining coverage. Preserve the existing fail-fast
+    // behavior for every normal pipeline.
+    def effectiveFailFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast
+    parallelJobs.failFast = effectiveFailFast
     pipeline.parallel parallelJobs
 }
 
