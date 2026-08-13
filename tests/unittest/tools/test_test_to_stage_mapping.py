@@ -25,6 +25,16 @@ MAX_SAMPLES = 10  # Small number for efficient testing
 MIN_PATTERN_LENGTH = 3  # Minimum length for search patterns
 
 
+def _stage_backed_tests(stage_query):
+    """Return tests from YAML files that are wired to a Jenkins stage."""
+    return [
+        test
+        for test, mappings in stage_query.test_map.items()
+        if any(yml in stage_query.yaml_to_stages
+               for yml, _stage, _backend in mappings)
+    ]
+
+
 @pytest.fixture(scope="module")
 def stage_query():
     """Fixture that provides a StageQuery instance."""
@@ -33,16 +43,14 @@ def stage_query():
 
 @pytest.fixture(scope="module")
 def sample_test_cases(stage_query):
-    """Fixture that provides sample test cases from actual data."""
+    """Fixture that samples tests backed by a live Jenkins stage."""
     random.seed(0)  # Ensure deterministic test results
-    all_tests = list(stage_query.test_map.keys())
+    all_tests = _stage_backed_tests(stage_query)
     if not all_tests:
         raise RuntimeError(
-            "No tests found in test mapping. This indicates a configuration "
-            "issue - either the test database YAML files are missing/empty "
-            "or the StageQuery is not parsing them correctly. Please check "
-            "that the test database directory exists and contains valid YAML "
-            "files with test definitions.")
+            "No tests are backed by a live Jenkins stage. Check that the "
+            "Groovy stage map and test database reference the same YAML files."
+        )
 
     # Return up to MAX_SAMPLES tests randomly selected
     if len(all_tests) <= MAX_SAMPLES:
@@ -80,6 +88,19 @@ def test_data_availability(stage_query):
     print(f"\nTotal tests available: {len(stage_query.test_map)}")
     print(f"Total stages available: {len(stage_query.stage_to_yaml)}")
     print(f"Max samples configured: {MAX_SAMPLES}")
+
+
+def test_all_stage_backed_tests_map(stage_query):
+    """Every test in a Jenkins-wired YAML must resolve to a live stage."""
+    stage_backed_tests = _stage_backed_tests(stage_query)
+    assert stage_backed_tests, "No tests are backed by a live Jenkins stage"
+
+    unmapped = [
+        test for test in stage_backed_tests
+        if not stage_query.tests_to_stages([test])
+    ]
+    assert not unmapped, \
+        f"Stage-backed tests should map to at least one stage: {unmapped}"
 
 
 def test_documented_stage_examples_are_live(stage_query):
@@ -163,7 +184,6 @@ def test_known_stage_without_tests_is_reported(tmp_path):
 def test_bidirectional_mapping_consistency(stage_query, sample_test_cases,
                                            sample_stages, direction):
     """Test mapping consistency in both directions with roundtrip validation."""
-
     if direction == "test_to_stage":
         if not sample_test_cases:
             pytest.skip("No test cases available")
