@@ -9,6 +9,7 @@
 #   FAT_SQSH_DIR            - scratch path where fat .sqsh files are stored
 #   FAT_LLM_TARFILE         - HTTPS URL of the TRT-LLM wheel tarball (for cache-key hashing)
 #   FAT_LLM_DOCKER_IMAGE    - full docker image tag (for cache-key hashing)
+#   FAT_BUILD_SCRIPT_PATH   - path to fat_build_inline.sh on the login node (for cache-key hashing)
 #   FAT_BUILD_SBATCH_PATH   - path to the fat_build_sbatch.sh wrapper on the login node
 #   FAT_BUILD_LOG_TEMPLATE  - SLURM log path template (may contain %j for job ID)
 
@@ -21,12 +22,16 @@ if ! mkdir -p "${FAT_SQSH_DIR}" 2>&1; then
     exit 0
 fi
 
-# Include fat_build_inline.sh content hash so this script polls for the same sqsh path
-# that fat_build_sbatch_body.sh actually builds (same cache key formula).
-fatBuildScriptHash=""
-if [ -n "${FAT_BUILD_SCRIPT_PATH:-}" ] && [ -f "${FAT_BUILD_SCRIPT_PATH}" ]; then
-    fatBuildScriptHash=$(sha256sum "${FAT_BUILD_SCRIPT_PATH}" | cut -d' ' -f1 | head -c 8)
+# Cache key formula is mirrored in fat_build_sbatch_body.sh (the only writer) and
+# computeFatSqshPath() in L0_Test.groovy; a divergent key misses the cache silently.
+# The builder hashes FAT_BUILD_SCRIPT_PATH unconditionally, so bail out rather than
+# fall back to an empty hash, which yields a path no builder ever writes.
+if [ -z "${FAT_BUILD_SCRIPT_PATH:-}" ] || [ ! -f "${FAT_BUILD_SCRIPT_PATH}" ]; then
+    echo "Warning: FAT_BUILD_SCRIPT_PATH (${FAT_BUILD_SCRIPT_PATH:-unset}) is missing; cannot compute the fat sqsh cache key."
+    echo "=== [Prepare Container] STAGE END (no build script): $(date '+%Y-%m-%d %H:%M:%S') ==="
+    exit 0
 fi
+fatBuildScriptHash=$(sha256sum "${FAT_BUILD_SCRIPT_PATH}" | cut -d' ' -f1 | head -c 8)
 fatHash=$(printf '%s' "${FAT_LLM_TARFILE}|${FAT_LLM_DOCKER_IMAGE}|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
 fatSqshPath="${FAT_SQSH_DIR}/fat-${fatHash}.sqsh"
 
