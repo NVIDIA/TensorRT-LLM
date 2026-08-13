@@ -66,6 +66,25 @@ class CUDAGraphTestScenario:
 
 class TestFlashInferAttention(unittest.TestCase):
 
+    def test_attention_layer_indices_ignore_zero_kv_layers(self):
+
+        class FakeHybridManager:
+            layer_offsets = {0: 0, 1: 1, 2: 2}
+            num_kv_heads_per_layer = [0, 8, 8]
+
+        self.assertEqual(
+            flashinfer_backend._get_attention_layer_indices(
+                FakeHybridManager()), [1, 2])
+
+    def test_attention_layer_indices_support_v1_manager(self):
+
+        class FakeV1Manager:
+            layer_offsets = {0: 0, 1: 1}
+
+        self.assertEqual(
+            flashinfer_backend._get_attention_layer_indices(FakeV1Manager()),
+            [0, 1])
+
     def test_separate_kv_draft_metadata_uses_draft_manager(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
