@@ -3232,6 +3232,7 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
+
         return self.attn_metadata
 
     @property

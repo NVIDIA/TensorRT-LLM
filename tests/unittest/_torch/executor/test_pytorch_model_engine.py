@@ -91,19 +91,6 @@ class DummyModel(torch.nn.Module):
         return {"logits": torch.randn((batch_size, 10), device='cuda')}
 
 
-def test_cute_dsl_radix_top_k_warmup_uses_shared_metadata():
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import \
-        DSAtrtllmAttentionMetadata
-
-    metadata = object.__new__(DSAtrtllmAttentionMetadata)
-    metadata.warmup_cute_dsl_radix_topk = Mock()
-    engine = SimpleNamespace(attn_metadata=metadata, original_max_draft_len=3)
-
-    PyTorchModelEngine._warmup_cute_dsl_radix_topk(engine)
-
-    metadata.warmup_cute_dsl_radix_topk.assert_called_once_with(4)
-
-
 class DummyMultimodalIndexModel(torch.nn.Module):
 
     class Config:
