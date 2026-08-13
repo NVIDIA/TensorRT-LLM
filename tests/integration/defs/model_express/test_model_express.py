@@ -59,6 +59,7 @@ _DONOR_PROCESS_FAILURE_MARKERS = (
     b"Primary job terminated normally, but",
     b"process returned a non-zero exit code",
 )
+_DONOR_PROCESS_FAILURE_OVERLAP = max(len(marker) for marker in _DONOR_PROCESS_FAILURE_MARKERS) - 1
 _MX_PREFLIGHT_SCRIPT = """
 import importlib.metadata as metadata
 import importlib.util
@@ -289,9 +290,12 @@ def _worker_environment(gpu_ids: tuple[str, ...], transfer_log_dir: Path) -> dic
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "MX_TRANSFER_LOG_DIR": str(transfer_log_dir),
-            # ModelExpress initializes its own NIXL UCX context. Keep OpenMPI
-            # on ob1 so two independently packaged UCX stacks do not coexist.
+            # NIXL's wheel bundles UCX. Keep OpenMPI's UCX-capable components
+            # from loading the container UCX stack into the same process.
             "OMPI_MCA_pml": "ob1",
+            "OMPI_MCA_osc": "pt2pt",
+            "OMPI_MCA_btl": "self,vader,tcp",
+            "OMPI_MCA_coll": "^hcoll,ucc",
             "PYTHONUNBUFFERED": "1",
             "TLLM_LOG_LEVEL": "INFO",
         }
@@ -344,10 +348,11 @@ def _wait_for_donor(
         if log_path.exists():
             with log_path.open("rb") as log_file:
                 log_file.seek(log_offset)
-                failure_window = (failure_window + log_file.read())[-4096:]
+                failure_window += log_file.read()
                 log_offset = log_file.tell()
         if any(marker in failure_window for marker in _DONOR_PROCESS_FAILURE_MARKERS):
             pytest.fail(f"MX donor worker failed before publication\n{_log_tail(log_path)}")
+        failure_window = failure_window[-_DONOR_PROCESS_FAILURE_OVERLAP:]
         if time.monotonic() >= deadline:
             pytest.fail(f"MX donor did not become ready within {timeout_s}s\n{_log_tail(log_path)}")
         time.sleep(0.5)
