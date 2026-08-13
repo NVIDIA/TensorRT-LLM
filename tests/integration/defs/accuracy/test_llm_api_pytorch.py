@@ -7850,24 +7850,35 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 task = GSM8K(model_name)
                 task.evaluate(llm)
 
-    def _run_nvfp4_eagle3_disagg(self, model_name, model_path, max_draft_len,
-                                 inferencemax, attention_dp, overlap_scheduler,
-                                 use_msa, cuda_graph):
+    def _run_nvfp4_eagle3_disagg(self,
+                                 model_name,
+                                 model_path,
+                                 max_draft_len,
+                                 inferencemax,
+                                 attention_dp,
+                                 overlap_scheduler,
+                                 use_msa,
+                                 cuda_graph,
+                                 gen_tp_size=2,
+                                 ctx_ep_size=2,
+                                 gen_ep_size=2,
+                                 enable_cpp_nixl_bounce=False):
         """Disaggregated arm of test_nvfp4_eagle3.
 
         CI coverage for Eagle3 + the unified (shared) draft KV cache
-        crossing the disaggregated transceiver on one 4-GPU node: context
-        TEP2 -> generation TEP2 over NIXL, block reuse on the context
-        server. ``attention_dp`` selects the generation flavor: True is
-        the AgentX-submission shape (attention-DP generation), False the
-        TEP production-candidate shape. Every path-gating knob mirrors
-        the production disaggregated configs (fix15a production-candidate
-        sweep, GB300); values that are workload-tuned (1M-context sizes)
-        or GPU-generation-tuned (memory fractions) are CI-adjusted and
-        called out inline. Accuracy is asserted through the router; the
-        drafter's KV rides the shared logical blocks, so a corrupted or
-        dropped drafter cache collapses accuracy. Acceptance stats stay
-        with the aggregated arm, which exercises the same view code.
+        crossing the disaggregated transceiver. The existing arm is context
+        TP2 -> generation TP2 on one 4-GPU node. The dedicated bounce test
+        calls this helper with context TEP2 -> generation TP4 and C++ NIXL
+        bounce to exercise head remapping. Both use NIXL, context piecewise
+        CUDA graphs, and block reuse on the context server. ``attention_dp``
+        selects the generation flavor: True is the AgentX-submission shape
+        (attention-DP generation), False the TEP production-candidate shape.
+        Values that are workload-tuned (1M-context sizes) or GPU-generation-
+        tuned (memory fractions) are CI-adjusted and called out inline.
+        Accuracy is asserted through the router; the drafter's KV rides the
+        shared logical blocks, so a corrupted or dropped drafter cache
+        collapses accuracy. Acceptance stats stay with the aggregated arm,
+        which exercises the same view code.
         """
         if not (overlap_scheduler and cuda_graph and use_msa):
             pytest.skip("the disagg arm pins the production serving shape "
@@ -7880,8 +7891,6 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "eagle3_one_model": True,
         }
         common_config = {
-            "tensor_parallel_size": 2,
-            "moe_expert_parallel_size": 2,
             "speculative_config": speculative_config,
             "sparse_attention_config": {
                 "algorithm": "minimax_m3",
@@ -7892,6 +7901,9 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
+                # Keep the separate Python-native bounce layer off. The
+                # head-mismatched test enables PR #17518's C++ NIXL-agent
+                # bounce with environment variables below.
                 "kv_cache_bounce_size_mb": 0,
                 "kv_transfer_timeout_ms": 600000,
             },
@@ -7920,6 +7932,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         }
         ctx_server_config = {
             **common_config,
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": ctx_ep_size,
             "disable_overlap_scheduler": not overlap_scheduler,
             "enable_attention_dp": False,
             "enable_chunked_prefill": True,
@@ -7934,9 +7948,19 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "max_batch_size": 4,
             "max_num_tokens": 32768,
             "cuda_graph_config": None,
+            "torch_compile_config": {
+                "enable_fullgraph": True,
+                "enable_inductor": False,
+                "enable_piecewise_cuda_graph": True,
+                "capture_num_tokens": [1, 2048],
+                "enable_userbuffers": True,
+                "max_num_streams": 3,
+            },
         }
         gen_server_config = {
             **common_config,
+            "tensor_parallel_size": gen_tp_size,
+            "moe_expert_parallel_size": gen_ep_size,
             "disable_overlap_scheduler": not overlap_scheduler,
             "enable_attention_dp": attention_dp,
             "enable_lm_head_tp_in_adp": False,
@@ -7966,11 +7990,32 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      model_path,
-                                      server_waiting_timeout=1800) as llm:
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                model_path,
+                extra_env=
+            {
+                # PR #17518's bounce lives in the
+                # C++ NIXL agent.
+                "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
+                "TRTLLM_NIXL_BOUNCE_ENABLE": "1",
+                # The CI workload is much smaller
+                # than production; lower both
+                # heuristic gates so engagement is
+                # deterministic.
+                "TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT": "1",
+                # BounceConfig::fromEnv accepts binary size suffixes.
+                "TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES": "1MB",
+                # Capture the C++ sender-side marker
+                # used below to reject silent direct-
+                # NIXL fallback.
+                "TLLM_LOG_LEVEL_BY_MODULE": "debug:executor",
+            } if enable_cpp_nixl_bounce else None,
+                assert_worker_log_contains="bounce path engaged"
+                if enable_cpp_nixl_bounce else None,
+                server_waiting_timeout=1800) as llm:
             # The launcher stamps quant_algo=NVFP4 from the model name; the
             # checkpoint's hf_quant_config is MIXED_PRECISION (which is what
             # the in-process arm asserts and the accuracy references key on).
@@ -8034,6 +8079,34 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 f"Eagle3 chat-GSM8K acceptance length too low: " \
                 f"{chat_length:.3f} (threshold 3.3, reference 3.518 from " \
                 f"the drafter card)"
+
+    @pytest.mark.skip_less_device(6)
+    @pytest.mark.skip_less_device_memory(140000)
+    def test_nvfp4_eagle3_disagg_head_mismatched_bounce(self):
+        """Exercise M3's head-remapped Eagle3 KV transfer through NIXL bounce."""
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import \
+            msa_package_available
+        if not msa_package_available():
+            pytest.skip("MSA kernels (fmha_sm100) not available")
+
+        model_name = "nvidia/MiniMax-M3-NVFP4"
+        model_path = f"{llm_models_root()}/MiniMax-M3-NVFP4"
+        self._run_nvfp4_eagle3_disagg(
+            model_name,
+            model_path,
+            max_draft_len=3,
+            inferencemax=True,
+            # Match the TEP head-mismatch topology validated for #17518:
+            # context TP2 has two KV heads/rank; generation TP4 has one.
+            attention_dp=False,
+            overlap_scheduler=True,
+            use_msa=True,
+            cuda_graph=True,
+            gen_tp_size=4,
+            ctx_ep_size=2,
+            gen_ep_size=1,
+            enable_cpp_nixl_bounce=True,
+        )
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
