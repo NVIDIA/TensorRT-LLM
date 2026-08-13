@@ -448,7 +448,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             acceptance_length = _compute_acceptance_length(llm)
-            print(f"[AL] test_eagle acceptance_length = {acceptance_length:.3f}")
+            print(
+                f"[AL] test_eagle acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
                 "TestLlama3_1_8BInstruct::test_eagle3",
                 acceptance_length,
