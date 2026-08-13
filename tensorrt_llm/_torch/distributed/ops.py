@@ -86,7 +86,14 @@ def _get_mnnvl_workspace_comm(mapping: Mapping):
 def _mnnvl_workspace_barrier(comm) -> None:
     """Barrier over the communicator returned by _get_mnnvl_workspace_comm."""
     if mpi_disabled():
-        torch.distributed.barrier(group=comm)
+        # MNNVL workspaces are created while models may be under MetaInitMode.
+        # The public ProcessGroup barrier is a c10d operator, so MetaInitMode
+        # intercepts and rejects it before the collective reaches Gloo.  Ray
+        # initializes the TP ProcessGroup with ``cuda:nccl,cpu:gloo``; call its
+        # CPU backend directly to keep this host-only setup barrier outside the
+        # tensor dispatcher.
+        work = comm._get_backend(torch.device("cpu")).barrier()
+        work.wait()
     else:
         comm.Barrier()
 
