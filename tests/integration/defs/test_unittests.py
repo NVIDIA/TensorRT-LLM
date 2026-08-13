@@ -90,6 +90,31 @@ def _junit_culprits(xml_path: str) -> list[str]:
     return culprits
 
 
+def _nodeid_matches_case(nodeid: str, case_selector: str) -> bool:
+    """Whether a possibly stage-prefixed node ID belongs to a case selector."""
+    node_path, node_separator, node_selection = nodeid.partition("::")
+    case_path, case_separator, case_selection = case_selector.partition("::")
+
+    if case_separator:
+        path_matches = (node_path == case_path
+                        or node_path.endswith("/" + case_path))
+    else:
+        path_matches = f"/{case_path}/" in f"/{node_path}/"
+    if not path_matches:
+        return False
+
+    if not case_separator:
+        return True
+    if not node_separator:
+        return False
+    if node_selection == case_selection:
+        return True
+    if "[" in case_selection:
+        return False
+    return (node_selection.startswith(case_selection + "::")
+            or node_selection.startswith(case_selection + "["))
+
+
 def _fail_unittests(reason: str, output_xml: str, output_dir: str,
                     case: str) -> NoReturn:
     """Raise a unittest failure naming the specific culprit test(s).
@@ -103,32 +128,31 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
     test path(s). Reading it is best-effort and never masks the original
     failure.
     """
-    culprits = _junit_culprits(output_xml)
+    junit_culprits = _junit_culprits(output_xml)
+    in_flight_culprits = []
     unfinished = os.path.join(output_dir, "unfinished_test.txt")
-    # Normalize each case selector to its file/path portion (drop a "::test"
-    # suffix) so an exact "file.py::test" case still matches, then compare on
-    # path boundaries so "unittest/foo" does not match "unittest/foo_bar/...".
-    case_paths = []
+    case_selectors = []
     for arg in shlex.split(case):
-        path = arg.split("::", 1)[0].rstrip("/")
+        selector = arg.rstrip("/")
+        path = selector.split("::", 1)[0]
         if "/" in path or path.endswith(".py"):
-            case_paths.append(path)
+            case_selectors.append(selector)
     try:
         with open(unfinished, encoding="utf-8") as f:
             for line in f:
                 nodeid = line.strip()
                 if not nodeid:
                     continue
-                node_path = nodeid.split("::", 1)[0]
-                # Real CI prefixes inner nodeids with the outer stage name.
-                # Compare complete path segments so both bare and prefixed
-                # nodeids match without confusing sibling paths.
-                bounded_node_path = f"/{node_path}/"
-                if not case_paths or any(f"/{p}/" in bounded_node_path
-                                         for p in case_paths):
-                    culprits.append("IN-FLIGHT " + nodeid)
+                if not case_selectors or any(
+                        _nodeid_matches_case(nodeid, selector)
+                        for selector in case_selectors):
+                    in_flight_culprits.append("IN-FLIGHT " + nodeid)
     except (OSError, UnicodeDecodeError):
         pass
+    # A fatal retry's in-flight node is the strongest signal. Put it ahead of
+    # the earlier JUnit failures so the display cap cannot hide it, and remove
+    # duplicate unfinished records left by an interrupted cleanup.
+    culprits = list(dict.fromkeys(in_flight_culprits + junit_culprits))
     if culprits:
         displayed_culprits = ", ".join(culprits[:_MAX_CULPRITS])
         omitted_culprits = len(culprits) - _MAX_CULPRITS

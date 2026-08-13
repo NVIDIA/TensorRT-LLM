@@ -94,12 +94,17 @@ def test_junit_culprits_ignores_unreadable_or_malformed_xml(
     assert _junit_culprits(str(report)) == []
 
 
-def _unfinished_failure(tmp_path: Path, case: str, nodeids: list[str]) -> str:
+def _unfinished_failure(
+    tmp_path: Path, case: str, nodeids: list[str], junit_contents: str | None = None
+) -> str:
     (tmp_path / "unfinished_test.txt").write_text("\n".join(nodeids) + "\n", encoding="utf-8")
+    report = tmp_path / "results.xml"
+    if junit_contents is not None:
+        report.write_text(junit_contents, encoding="utf-8")
     with pytest.raises(AssertionError) as error:
         _fail_unittests(
             "failure reported in unittests",
-            str(tmp_path / "missing-results.xml"),
+            str(report),
             str(tmp_path),
             case,
         )
@@ -147,17 +152,35 @@ def test_fail_unittests_normalizes_test_selector_to_its_case_path(tmp_path: Path
         tmp_path,
         "-m gpu unittest/foo/test_target.py::test_selected",
         [
-            "unittest/foo/test_target.py::test_selected",
-            "unittest/foo/test_target.py::test_other",
-            "unittest/foo/test_target.pyx::test_stale",
-            "unittest/other/test_stale.py::test_stale",
+            "DGX_H100-PyTorch-1/unittest/foo/test_target.py::test_selected",
+            "DGX_H100-PyTorch-1/unittest/foo/test_target.py::test_selected[param]",
+            "DGX_H100-PyTorch-1/unittest/foo/test_target.py::test_other",
+            "DGX_H100-PyTorch-1/unittest/foo/test_target.pyx::test_stale",
+            "DGX_H100-PyTorch-1/unittest/other/test_stale.py::test_stale",
         ],
     )
 
-    assert "IN-FLIGHT unittest/foo/test_target.py::test_selected" in message
-    assert "IN-FLIGHT unittest/foo/test_target.py::test_other" in message
+    assert "unittest/foo/test_target.py::test_selected" in message
+    assert "unittest/foo/test_target.py::test_selected[param]" in message
+    assert "test_target.py::test_other" not in message
     assert "test_target.pyx" not in message
     assert "unittest/other" not in message
+
+
+def test_fail_unittests_preserves_parameter_selector(tmp_path: Path) -> None:
+    message = _unfinished_failure(
+        tmp_path,
+        "unittest/foo/test_target.py::test_selected[param-a]",
+        [
+            "DGX_H100-PyTorch-1/unittest/foo/test_target.py::test_selected[param-a]",
+            "DGX_H100-PyTorch-1/unittest/foo/test_target.py::test_selected[param-b]",
+            "DGX_H100-PyTorch-1/unittest/foo/test_target.py::test_other[param-a]",
+        ],
+    )
+
+    assert "test_selected[param-a]" in message
+    assert "test_selected[param-b]" not in message
+    assert "test_other[param-a]" not in message
 
 
 def test_fail_unittests_caps_culprit_list(tmp_path: Path) -> None:
@@ -168,3 +191,26 @@ def test_fail_unittests_caps_culprit_list(tmp_path: Path) -> None:
     assert "IN-FLIGHT unittest/foo/test_19.py::test_case" in message
     assert "IN-FLIGHT unittest/foo/test_20.py::test_case" not in message
     assert message.endswith("(+2 more)")
+
+
+def test_fail_unittests_prioritizes_and_deduplicates_in_flight_culprits(
+    tmp_path: Path,
+) -> None:
+    testcases = "".join(
+        f'<testcase classname="pkg" name="test_{index}"><failure /></testcase>'
+        for index in range(22)
+    )
+    in_flight = "unittest/foo/test_fatal.py::test_fatal"
+
+    message = _unfinished_failure(
+        tmp_path,
+        "unittest/foo",
+        [in_flight, in_flight],
+        f"<testsuites><testsuite>{testcases}</testsuite></testsuites>",
+    )
+
+    assert message.count(f"IN-FLIGHT {in_flight}") == 1
+    assert message.index("IN-FLIGHT") < message.index("FAILED")
+    assert "FAILED pkg::test_18" in message
+    assert "FAILED pkg::test_19" not in message
+    assert message.endswith("(+3 more)")
