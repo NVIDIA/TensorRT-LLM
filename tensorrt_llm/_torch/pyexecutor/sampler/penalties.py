@@ -551,7 +551,11 @@ class PenaltyHandler:
             request_offsets, request_num_steps, num_beams_host
         )
 
-        if num_beams_cuda is not None:
+        if self._max_beam_width > 1:
+            # Both were established by the branch above -- a beam engine always stages a
+            # beam width -- but the narrowing does not survive stage_request_metadata, so
+            # restate it for the type checker.
+            assert predecessor_beams is not None and num_beams_cuda is not None
             # Re-parent and fold up front. On a single-beam engine the fold stays fused
             # into the packed graph below; here it cannot, because re-parenting has to
             # happen first and it is not expressible inside that graph.
