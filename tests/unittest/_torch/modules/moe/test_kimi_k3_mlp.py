@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 fused gate_up MLP tests.
 
-The runtime dense / shared-expert MLP (``KimiK3MLP``) runs a single fused
-``gate_up_proj`` GEMM whose weight is the row-concat of the HF checkpoint's
-separate ``gate_proj`` / ``up_proj`` tensors (the same concat
-``KimiLinearForCausalLM.load_weights`` performs). These tests check the
-fused module against an unfused reference built from the split weights:
+The runtime dense / shared-expert ``GatedMLP`` runs a single fused
+``gate_up_proj`` GEMM with K3's SiTU activation. ``KimiK3MLP`` remains the
+compact reference for the same fused weight layout. These tests check that
+layout against an unfused reference built from the HF checkpoint's split
+``gate_proj`` / ``up_proj`` weights:
 
 * fused ``gate_up_proj`` output matches ``two GEMMs + torch.cat`` +
   eager ``SituAndMul`` + ``down_proj`` for a decode-shaped (1 token) and
@@ -14,13 +14,18 @@ fused module against an unfused reference built from the split weights:
   ``None`` (the two activation code paths);
 * the row-concat convention is required: swapping the halves breaks
   the numerics (mutation control).
+* direct MoE-TP selects combined reduction for the shared and routed partials.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
+from _torch.modules.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP
 from torch import nn
 
-from tensorrt_llm._torch.modules.kimi_k3_moe._mlp import KimiK3MLP, SituAndMul
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.situ import SituAndMul
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
@@ -66,6 +71,26 @@ def _make_pair(hidden_size, intermediate_size, situ_beta, situ_linear_beta, devi
         fused.gate_up_proj.weight[inter:].copy_(ref.up_proj.weight)
         fused.down_proj.weight.copy_(ref.down_proj.weight)
     return fused, ref
+
+
+def _runtime_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        hidden_size=512,
+        num_experts=8,
+        num_experts_per_token=2,
+        moe_intermediate_size=256,
+        num_shared_experts=2,
+        routed_expert_hidden_size=256,
+        latent_moe_use_norm=True,
+        rms_norm_eps=1e-5,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+        moe_renormalize=True,
+        moe_router_activation_func="sigmoid",
+        routed_scaling_factor=1.0,
+        num_expert_group=1,
+        topk_group=1,
+    )
 
 
 @requires_cuda
@@ -115,3 +140,196 @@ def test_gate_up_half_swap_mutation_breaks_accuracy():
     x = torch.randn(64, hidden_size, dtype=torch.bfloat16, device=device) * 0.5
     with pytest.raises(AssertionError):
         torch.testing.assert_close(fused(x), ref(x), rtol=1.6e-2, atol=1e-3)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "situ_beta,situ_linear_beta",
+    [(4.0, 25.0), (1.0, None)],
+    ids=["default", "no_linear_beta"],
+)
+def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
+    """The shared-expert replacement preserves K3 MLP numerics."""
+    device = torch.device("cuda")
+    hidden_size, intermediate_size = 512, 384
+    torch.manual_seed(17)
+    reference = KimiK3MLP(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        use_fused_activation=True,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    gated = GatedMLP(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        bias=False,
+        activation=SituAndMul(
+            beta=situ_beta,
+            linear_beta=situ_linear_beta,
+            use_fused_activation=True,
+        ),
+        dtype=torch.bfloat16,
+        reduce_output=True,
+    ).to(device)
+
+    with torch.no_grad():
+        for projection in (reference.gate_up_proj, reference.down_proj):
+            projection.weight.copy_(torch.randn_like(projection.weight, dtype=torch.float32) * 0.05)
+        gated.gate_up_proj.weight.copy_(reference.gate_up_proj.weight)
+        gated.down_proj.weight.copy_(reference.down_proj.weight)
+
+    x = torch.randn(64, hidden_size, dtype=torch.bfloat16, device=device) * 0.5
+    torch.testing.assert_close(gated(x), reference(x), rtol=1.6e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "attention_dp,tp_size,has_routed_comm,expected_shared_tp,expected_shared_reduce,expected_combined_ar",
+    [
+        (True, 2, True, 1, False, False),
+        (False, 1, False, 1, False, False),
+        (False, 2, False, 2, False, True),
+        (False, 2, True, 2, True, False),
+    ],
+    ids=["attention_dp", "single_rank", "combined_tp", "routed_comm"],
+)
+def test_kimi_k3_shared_expert_reduction_mode(
+    monkeypatch,
+    attention_dp,
+    tp_size,
+    has_routed_comm,
+    expected_shared_tp,
+    expected_shared_reduce,
+    expected_combined_ar,
+):
+    """Each parallel mode selects exactly the required shared reduction."""
+    from tensorrt_llm._torch import distributed
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules.fused_moe import ConfigurableMoE
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    class _FakeAllReduce(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    fake_moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(fake_moe)
+    fake_moe.backend = SimpleNamespace(initial_local_expert_ids=[0, 1, 2, 3])
+    fake_moe.comm = object() if has_routed_comm else None
+    fake_moe.layer_load_balancer = None
+    fake_moe.all_reduce = _FakeAllReduce() if not attention_dp and tp_size > 1 else None
+
+    monkeypatch.setattr(modeling_kimi_linear, "create_moe", lambda **_: fake_moe)
+    monkeypatch.setattr(modeling_kimi_linear, "AllReduce", _FakeAllReduce)
+    monkeypatch.setattr(distributed, "AllReduce", _FakeAllReduce)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+
+    mapping = Mapping(
+        world_size=tp_size,
+        rank=0,
+        tp_size=tp_size,
+        enable_attention_dp=attention_dp,
+    )
+    model_config = ModelConfig(mapping=mapping, quant_config=QuantConfig())
+    config = _runtime_config()
+    runtime = modeling_kimi_linear.KimiK3MoERuntime(model_config, config, layer_idx=1)
+
+    shared = runtime.shared_experts
+    assert isinstance(shared, GatedMLP)
+    assert shared.gate_up_proj.tp_size == expected_shared_tp
+    assert shared.down_proj.tp_size == expected_shared_tp
+    assert shared.down_proj.reduce_output is expected_shared_reduce
+    assert runtime._use_combined_all_reduce is expected_combined_ar
+    local_intermediate = 512 // expected_shared_tp
+    assert shared.gate_up_proj.weight.shape == (2 * local_intermediate, config.hidden_size)
+    assert shared.down_proj.weight.shape == (config.hidden_size, local_intermediate)
+
+
+@pytest.mark.parametrize(
+    "attention_dp,tp_size,rank,gpus_per_node,intermediate_size,expected_tp_size,expected_tp_rank",
+    [
+        (True, 8, 7, 8, 516, 1, 0),
+        (False, 8, 7, 8, 512, 8, 7),
+        (False, 8, 7, 8, 516, 4, 3),
+        (False, 8, 7, 8, 515, 1, 0),
+        (False, 16, 15, 8, 512, 8, 7),
+    ],
+    ids=["attention_dp", "full_tp", "gcd_subgroup", "replicated", "single_node_cap"],
+)
+def test_kimi_k3_dense_layer_uses_gated_mlp(
+    monkeypatch,
+    attention_dp,
+    tp_size,
+    rank,
+    gpus_per_node,
+    intermediate_size,
+    expected_tp_size,
+    expected_tp_rank,
+):
+    """The first dense layer selects a block-aligned, node-local MLP TP group."""
+    from tensorrt_llm._torch import distributed
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    class _IdentityAttention(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def forward(self, hidden_states, attn_metadata):
+            return hidden_states
+
+    class _IdentityAllReduce(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def forward(self, hidden_states, *args, **kwargs):
+            return hidden_states
+
+    monkeypatch.setattr(modeling_kimi_linear, "KimiKDARuntime", _IdentityAttention)
+    monkeypatch.setattr(distributed, "AllReduce", _IdentityAllReduce)
+
+    mapping = Mapping(
+        world_size=tp_size,
+        rank=rank,
+        gpus_per_node=gpus_per_node,
+        tp_size=tp_size,
+        enable_attention_dp=attention_dp,
+    )
+    model_config = ModelConfig(mapping=mapping, quant_config=QuantConfig())
+    config = SimpleNamespace(
+        hidden_size=512,
+        intermediate_size=intermediate_size,
+        num_experts=8,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        linear_attn_config={"kda_layers": [1], "full_attn_layers": []},
+        rms_norm_eps=1e-5,
+        attn_res_block_size=1,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+    )
+    layer = modeling_kimi_linear.KimiLinearDecoderLayer(model_config, config, layer_idx=0)
+
+    assert not layer.is_moe
+    assert isinstance(layer.mlp, GatedMLP)
+    assert layer.mlp_tp_size == expected_tp_size
+    assert layer.mlp.gate_up_proj.tp_size == expected_tp_size
+    assert layer.mlp.gate_up_proj.tp_rank == expected_tp_rank
+    assert layer.mlp.down_proj.tp_size == expected_tp_size
+    assert layer.mlp.down_proj.tp_rank == expected_tp_rank
+    assert layer.mlp.down_proj.reduce_output is (expected_tp_size > 1)
+    local_intermediate = config.intermediate_size // expected_tp_size
+    assert layer.mlp.gate_up_proj.weight.shape == (
+        2 * local_intermediate,
+        config.hidden_size,
+    )
+    assert layer.mlp.down_proj.weight.shape == (
+        config.hidden_size,
+        local_intermediate,
+    )

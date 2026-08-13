@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 native TRTLLM-Gen SiTU MoE tests.
 
-Covers the acceptance criteria of the SiTU cubin integration plan
-(`tensorrt_llm/_torch/modules/kimi_k3_moe/SITU_CUBIN_INTEGRATION_PLAN.md`):
+Covers the SiTU cubin integration behavior:
 
 * runner-local ActType numeric stability (SwiGlu/Relu2/Silu unchanged,
   SiTu appended);
@@ -41,13 +40,13 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
     _K3_MOE_EP_ENV,
     _K3_MOE_TP_ENV,
+    KimiK3MoEGate,
     KimiK3MoERuntime,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
 from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
     _MEGA_MOE_SYMM_BUFFER_CACHE,
 )
-from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping
@@ -180,12 +179,19 @@ def test_kimi_gate_reuses_deepseek_v3_routing():
         gate.e_score_correction_bias.normal_(std=0.05)
     hidden_states = torch.randn(2, 7, config.hidden_size)
 
-    expected_ids, expected_weights = gate(hidden_states)
+    logits = gate.compute_logits(hidden_states)
+    scores = logits.sigmoid()
+    scores_for_choice = scores + gate.e_score_correction_bias.unsqueeze(0)
+    expected_ids = scores_for_choice.topk(gate.top_k, dim=-1, sorted=False).indices
+    expected_weights = scores.gather(1, expected_ids)
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+    expected_weights *= gate.routed_scaling_factor
+
     routing_method = gate.routing_method
     # Exercise the portable PyTorch short path; the production path keeps
     # is_fused=True and uses the same routing contract.
     routing_method.routing_impl.is_fused = False
-    actual_ids, actual_weights = routing_method.apply(gate.compute_logits(hidden_states))
+    actual_ids, actual_weights = routing_method.apply(logits)
 
     expected_order = expected_ids.argsort(dim=-1)
     actual_order = actual_ids.argsort(dim=-1)
