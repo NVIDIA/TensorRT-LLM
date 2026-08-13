@@ -3864,7 +3864,15 @@ def runLLMAgentFlowTest(pipeline, stageName)
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
 
-    def agentFlowRoot = "${LLM_ROOT}/agent-flow"
+    def llmSrc = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
+    // Dry acceptance validates the shared benchmark/JUnit/upload path for every
+    // selected stage; it must not install or execute this product test suite.
+    if (isInfraDryRun()) {
+        runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)
+        return
+    }
+
+    def agentFlowRoot = "${llmSrc}/agent-flow"
 
     // Install agent-flow with its test extras (pytest, pytest-asyncio) and the
     // runtime deps from pyproject.toml (claude-agent-sdk, openai-codex, ...).
