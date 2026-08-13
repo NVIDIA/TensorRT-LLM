@@ -13,6 +13,7 @@ import subprocess  # nosec B404
 import sys
 import time
 import uuid
+from importlib.util import find_spec
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Sequence, Set
 
@@ -59,9 +60,6 @@ if TYPE_CHECKING:
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
-
-# Bound gRPC messages while leaving room for multimodal image payloads.
-_GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
 
 
 def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
@@ -637,129 +635,6 @@ def launch_server(
                 _terminate_attached_frontends(frontend_children)
 
 
-def launch_grpc_server(host: str,
-                       port: int,
-                       llm_args: dict,
-                       served_model_name: Optional[str] = None):
-    """
-    Launch a gRPC server for TensorRT-LLM.
-
-    This provides a high-performance gRPC interface designed for external routers
-    (e.g., sgl-router) using pre-tokenized input and raw token ID output.
-
-    Args:
-        host: Host to bind to
-        port: Port to bind to
-        llm_args: Arguments for LLM initialization (from get_llm_args)
-        served_model_name: Custom model name for API responses (defaults to model path)
-    """
-    import grpc
-
-    try:
-        from grpc_reflection.v1alpha import reflection
-        REFLECTION_AVAILABLE = True
-    except ImportError:
-        REFLECTION_AVAILABLE = False
-
-    from tensorrt_llm.grpc import trtllm_service_pb2, trtllm_service_pb2_grpc
-    from tensorrt_llm.grpc.grpc_request_manager import GrpcRequestManager
-    from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
-
-    async def serve_grpc_async():
-        logger.info("Initializing TensorRT-LLM gRPC server...")
-
-        backend = llm_args.get("backend")
-        model_path = served_model_name or llm_args.get("model", "")
-
-        if backend == "pytorch":
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == "_autodeploy":
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
-
-        logger.info("Model loaded successfully")
-
-        # Create request manager
-        request_manager = GrpcRequestManager(llm)
-
-        # Create servicer
-        servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
-
-        # Create gRPC server
-        server = grpc.aio.server(
-            options=[
-                ("grpc.max_send_message_length",
-                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
-                ("grpc.max_receive_message_length",
-                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
-                ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
-                ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
-                ("grpc.keepalive_permit_without_calls", True),
-                ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
-            ], )
-
-        # Add servicer to server
-        trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(
-            servicer, server)
-
-        # Enable reflection for grpcurl and other tools
-        if REFLECTION_AVAILABLE:
-            service_names = (
-                trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
-                full_name,
-                reflection.SERVICE_NAME,
-            )
-            reflection.enable_server_reflection(service_names, server)
-            logger.info("gRPC reflection enabled")
-
-        # Bind to address
-        address = f"{host}:{port}"
-        server.add_insecure_port(address)
-
-        # Start server
-        await server.start()
-        logger.info(f"TensorRT-LLM gRPC server started on {address}")
-        logger.info("Server is ready to accept requests")
-
-        # Handle shutdown signals
-        loop = asyncio.get_running_loop()
-        stop_event = asyncio.Event()
-
-        def signal_handler():
-            logger.info("Received shutdown signal")
-            stop_event.set()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, signal_handler)
-
-        # Serve until shutdown signal
-        try:
-            await stop_event.wait()
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-        finally:
-            logger.info("Shutting down TensorRT-LLM gRPC server...")
-
-            # Stop gRPC server
-            await server.stop(grace=5.0)
-            logger.info("gRPC server stopped")
-
-            # Shutdown LLM
-            if hasattr(llm, "shutdown"):
-                llm.shutdown()
-            logger.info("LLM engine stopped")
-
-            logger.info("Shutdown complete")
-
-    uvloop.run(serve_grpc_async())
-
-
 def launch_mm_encoder_server(
     host: str,
     port: int,
@@ -1254,7 +1129,8 @@ def launch_visual_gen_server(
     is_flag=True,
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
-    "gRPC server accepts pre-tokenized requests and returns raw token IDs.",
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs. "
+    "Requires the tensorrt_llm[grpc-smg] extra.",
     status="prototype")
 @stability_option(
     "--served_model_name",
@@ -1503,10 +1379,18 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            launch_grpc_server(host,
-                               port,
-                               llm_args,
-                               served_model_name=served_model_name)
+            if find_spec("smg_grpc_proto") is None:
+                raise ValueError(
+                    "gRPC serving with the SMG protocol requires the optional "
+                    "'smg-grpc-proto' package. Install it with: "
+                    'pip install "tensorrt_llm[grpc-smg]"')
+
+            from tensorrt_llm.grpc.smg.server import launch_smg_server
+
+            launch_smg_server(host,
+                              port,
+                              llm_args,
+                              served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

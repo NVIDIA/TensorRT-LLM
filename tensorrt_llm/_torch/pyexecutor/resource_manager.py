@@ -352,6 +352,11 @@ class KVCacheManager(BaseResourceManager):
             self.indexer_k_cache_local_layer_mask = None
 
         self.kv_connector_manager = kv_connector_manager
+        # Dummy requests can reserve their V1 sequence before they enter the
+        # normal context prepare path. Track that ownership per manager so the
+        # same sequence is not registered twice, while a separate draft or
+        # cross-cache manager can still prepare its own copy.
+        self._preprepared_dummy_request_ids: set[int] = set()
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -980,6 +985,8 @@ class KVCacheManager(BaseResourceManager):
     def _context_seq_len(self, req: LlmRequest, is_cross: bool,
                          is_star_cp: bool) -> Optional[int]:
         """Return the sequence length to pass to add_sequence_batch, or None to skip this request."""
+        if req.py_request_id in self._preprepared_dummy_request_ids:
+            return None
         if is_cross:
             if (getattr(req, "py_skip_cross_kv_projection", False)
                     or not req.is_first_context_chunk
@@ -1288,6 +1295,14 @@ class KVCacheManager(BaseResourceManager):
                 raise cleanup_error
             raise
 
+        if batch_request_infos:
+            self._preprepared_dummy_request_ids.update(
+                req_id for req_id, _, _ in batch_request_infos)
+        if (draft_batch_request_infos
+                and isinstance(draft_kv_cache_manager, KVCacheManager)):
+            draft_kv_cache_manager._preprepared_dummy_request_ids.update(
+                req_id for req_id, _, _ in draft_batch_request_infos)
+
         return requests
 
     def update_resources(self,
@@ -1338,8 +1353,10 @@ class KVCacheManager(BaseResourceManager):
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        return self.impl.remove_sequence(request.py_request_id, request,
-                                         pin_on_release)
+        result = self.impl.remove_sequence(request.py_request_id, request,
+                                           pin_on_release)
+        self._preprepared_dummy_request_ids.discard(request.py_request_id)
+        return result
 
     def store_blocks_for_reuse(self,
                                request: LlmRequest,
