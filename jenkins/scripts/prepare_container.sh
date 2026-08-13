@@ -80,10 +80,19 @@ else
     echo "Warning: could not determine fat build log path; builder output will not be shown here"
 fi
 trap '[ -n "$FAT_TAIL_PID" ] && kill "$FAT_TAIL_PID" 2>/dev/null || true' EXIT
+MAX_WAIT_ITERS="${FAT_BUILD_MAX_WAIT_ITERS:-30}"   # 30 * 60s = 30min
+iters=0
 while true; do
     STATUS=$(sacct -j "$BUILDER_ID" --format=State -Pn --allocations 2>/dev/null | head -1 || true)
+    # sacct prints "CANCELLED by <uid>" for cancelled jobs; strip the trailing words.
+    STATUS="${STATUS%% *}"
     if [ -z "$STATUS" ]; then
         echo "Warning: sacct returned empty for job $BUILDER_ID, retrying in 60s..."
+        iters=$((iters + 1))
+        if [ "$iters" -ge "$MAX_WAIT_ITERS" ]; then
+            echo "Giving up on fat sqsh builder $BUILDER_ID after ${iters} polls; GPU job will fall back to base sqsh + full install"
+            break
+        fi
         sleep 60
         continue
     fi
@@ -94,6 +103,11 @@ while true; do
             ;;
         *)
             echo "Fat sqsh builder job $BUILDER_ID state: ${STATUS}, waiting..."
+            iters=$((iters + 1))
+            if [ "$iters" -ge "$MAX_WAIT_ITERS" ]; then
+                echo "Giving up on fat sqsh builder $BUILDER_ID (state=$STATUS) after ${iters} polls; GPU job will fall back to base sqsh + full install"
+                break
+            fi
             sleep 60
             ;;
     esac
