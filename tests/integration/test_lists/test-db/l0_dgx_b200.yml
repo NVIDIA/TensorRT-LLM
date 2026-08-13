@@ -221,7 +221,6 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
-  - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_async_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_pipeline_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py

@@ -36,7 +36,6 @@ l0_h100:
   # ------------- MoE components tests ---------------
   - unittest/_torch/modules/test_moe_load_balancer.py
   - unittest/_torch/modules/test_moe_routing.py
-  - unittest/_torch/modules/test_moe_host_sharer.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
@@ -105,11 +104,6 @@ l0_h100:
   - unittest/others/test_kv_cache_transceiver.py::test_kv_cache_transceiver_single_process[PYTHON-mla-ctx_fp16_gen_fp16]
   - unittest/llmapi/test_llm_telemetry.py
   - unittest/scaffolding
-  - unittest/usage/test_collectors.py
-  - unittest/usage/test_config.py
-  - unittest/usage/test_opt_out.py
-  - unittest/usage/test_reporter.py
-  - unittest/usage/test_schema.py
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
