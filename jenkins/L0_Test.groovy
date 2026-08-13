@@ -5574,10 +5574,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 5, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 5, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 5, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 5, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 5, 5, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4, 1, true, false],
@@ -5633,12 +5634,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         2
     )
     // 2 Nodes: ctx1 (1 node, 4 GPUs) + gen1 (1 node, 4 GPUs) = 8 GPUs
-    // Nemotron-3-Ultra-550B-A55B disagg-E2E latency point (conc 1, TEP4 mtp5).
+    // Nemotron-3-Ultra-550B-A55B disagg latency point (conc 1, TEP4 mtp5): e2e + gen_only (one stage each).
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
-        1,
+        2,
         8,
         2
     )
@@ -5651,11 +5652,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         12,
         3
     )
+    // 5 tests: 3 deepseek gen_only + Nemotron e2e + Nemotron gen_only (conc 64, TEP8 mtp3); one stage each.
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        4,
+        5,
         12,
         3
     )
@@ -5695,18 +5697,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         36,
         9
     )
-    // 17 Nodes: ctx1 (1 node, 4 GPUs) + gen8 (8 servers x 2 nodes, 8 GPUs each = 64 GPUs) = 68 GPUs
-    // Nemotron-3-Ultra-550B-A55B disagg-E2E throughput point (conc 9832, DEP8 mtp3).
-    // NOTE: largest perf-sanity disagg stage to date (prior max 56 GPUs / 14 nodes on GB300);
-    //       confirm gb200-flex can allocate 17 nodes before enabling in CI.
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-68_GPUs-17_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN8-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen8_node2_gpu8",
-        1,
-        68,
-        17
-    )
+    // Nemotron-3-Ultra-550B-A55B conc-9832 throughput point runs ctx_only ONLY (4 GPU, in
+    // l0_gb200_multi_gpus_perf_sanity). Its disagg-E2E / gen_only stage (68 GPU / 17 nodes)
+    // is intentionally NOT enrolled: e2e and gen_only need too many GPUs at this concurrency.
     // GB300 PerfSanity post-merge aggregated
     // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
