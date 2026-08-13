@@ -25,43 +25,28 @@ A serving process must be remotely distinguishable in exactly three states:
 dead                    Nothing is listening, so a TCP connect is refused.
 ======================  =====================================================
 
-Only the first two are :class:`ServerState` members, and deliberately so.
-``STARTING`` and ``READY`` are things the process *reports*; dead is the
-absence of a reporter. A ``DEAD`` enum value could only ever be served by
-a process still running enough to serve it, which is precisely the
-contradiction this contract removes -- a live socket answering "I am
-dead" is a fourth ambiguous state, not a clearer third one. Dead is
-therefore observed one layer down, as connection-refused, and never
-appears in ``ServerState`` or in the ``X-TensorRT-LLM-Server-State``
-header.
+Only the first two are :class:`ServerState` members: they are what the
+process *reports*, while dead is the absence of a reporter. A ``DEAD``
+value could only be served by a process alive enough to serve it -- a
+fourth ambiguous state, not a clearer third one.
 
-Historically the listening socket only appeared *after* engine
-initialization finished (weight load, KV-cache allocation, warmup, CUDA
-graph capture -- minutes for a large model). The port was bound but never
-`listen()`-ed, so a connect during startup got an RST: byte-identical to
-connecting to a process that had crashed. A remote poller therefore could
-not tell "still starting" from "already dead" and had to fall back on a
-wall-clock timeout, which is the single largest source of stuck CI jobs.
+Previously the socket was bound but never ``listen()``-ed until engine
+init finished, so a connect during startup got an RST -- byte-identical to
+a crashed process. Pollers could not tell "starting" from "dead".
 
-The contract is implemented by :class:`ServerLifecycle`, an ASGI
-application that fronts the real application for the whole process
-lifetime. One application, one socket, one uvicorn instance: the
-``STARTING`` -> ``READY`` transition is a single in-process attribute
-store, never a rebind or a socket handoff, so no client ever observes a
-reset across the transition.
+:class:`ServerLifecycle` fronts the real application for the whole process
+lifetime. One app, one socket, one uvicorn instance, so ``STARTING`` ->
+``READY`` is a single attribute store rather than a rebind or handoff, and
+no client sees a reset across it.
 
 Two properties are load-bearing and easy to lose in a refactor:
 
-* The engine must be built **off the event loop** (see
-  :func:`serve_with_lifecycle`). Building it on the loop would let
-  ``/health`` accept the connection and then never answer it. A hung
-  request is a *third* ambiguous state, and one that is strictly worse
-  than the connection refused it replaces, because the client can only
-  resolve it with the same wall-clock timeout this contract exists to
-  remove.
-* ``STARTING`` must answer *every* route, not just ``/health``. A 404 (no
-  route yet) or a partially initialized handler would be read by clients
-  as a real answer.
+* The engine is built **off the event loop** (:func:`serve_with_lifecycle`).
+  On the loop, ``/health`` would be accepted and never answered -- a third
+  ambiguous state, worse than the connection-refused it replaces, since
+  only a wall-clock timeout resolves it.
+* ``STARTING`` answers *every* route, not just ``/health``. A 404 from an
+  unregistered route reads to a client as a real answer.
 """
 
 import asyncio
@@ -74,55 +59,29 @@ from strenum import StrEnum
 
 from tensorrt_llm.logger import logger
 
-# Response header carrying the lifecycle state, so a poller can log *why* it
-# got a 503 without parsing the body.
+# Wire contract: lets a poller log *why* it got a 503 without parsing the body.
 SERVER_STATE_HEADER = "x-trtllm-server-state"
 
-# Advertised on the STARTING 503 so well-behaved clients back off instead of
-# hot-looping while the engine loads.
-_RETRY_AFTER_SECONDS = 1
-
-# How often serve_with_lifecycle re-checks that uvicorn has started listening.
-_LISTEN_POLL_INTERVAL_SECONDS = 0.02
-
-# Bound on the delegate's own lifespan shutdown, for a delegate that yields
-# but never finishes. It cannot bound one that blocks the loop thread -- no
-# asyncio timer can -- and OpenAIServer's engine teardown is deliberately of
-# that kind; see its lifespan for why.
+# Bounds a delegate lifespan that yields but never finishes. Cannot bound one
+# that blocks the loop thread -- no asyncio timer can -- and OpenAIServer's
+# engine teardown is deliberately of that kind; see its lifespan.
 _DELEGATE_SHUTDOWN_TIMEOUT_SECONDS = 60.0
 
-# Grace period for uvicorn to wind down after a failed startup before the
-# original exception is re-raised.
-#
-# What it buys: uvicorn is configured without timeout_graceful_shutdown, so
-# Server.shutdown() drains in-flight requests for as long as they take,
-# before it even begins the lifespan shutdown. This bound is the only thing
-# keeping the abort path finite.
-#
-# Set above _DELEGATE_SHUTDOWN_TIMEOUT_SECONDS so that, in the common case
-# where uvicorn reaches the lifespan shutdown promptly, the delegate gets its
-# full bound to finish tearing down cleanly rather than being cancelled. That
-# is a preference, not a guarantee: the drain above is unbounded, so a slow
-# enough drain expires this bound first regardless. Correctness does not
-# depend on the ordering -- finish_delegate_lifespan() reports what actually
-# happened either way.
-#
-# Cost: worst-case exit latency on the abort path is this plus
-# _TEARDOWN_TIMEOUT_SECONDS, so ~150s rather than the ~90s it would be with
-# the previous 30s value.
+# Bounds the abort path: uvicorn runs without timeout_graceful_shutdown, so
+# its request drain is unbounded and this is the only thing keeping the path
+# finite. Above _DELEGATE_SHUTDOWN_TIMEOUT_SECONDS so the delegate normally
+# gets its full bound -- a preference, not a guarantee; correctness does not
+# depend on the order, since finish_delegate_lifespan() reports what happened.
 _ABORT_SHUTDOWN_TIMEOUT_SECONDS = 90.0
 
-# Bound on getting a cancelled lifespan task to actually stop. Cancellation
-# normally takes effect at the next await, so this only expires against a
-# task that swallows CancelledError and keeps going.
+# Bounds getting a *cancelled* lifespan task to stop. Only expires against one
+# that swallows CancelledError and keeps going.
 _ABANDON_TIMEOUT_SECONDS = 15.0
 
-# Bound on the out-of-band engine teardown after a failed startup.
 _TEARDOWN_TIMEOUT_SECONDS = 60.0
 
-# Sentinel queued when the delegate's lifespan coroutine returns, so a waiter
-# on the next lifespan message cannot block forever if the delegate exits
-# without completing the handshake.
+# Queued when the delegate's lifespan returns, so a waiter on the next message
+# cannot block forever if it exits without completing the handshake.
 _DELEGATE_EXITED = object()
 
 ASGIApp = Callable[
@@ -140,6 +99,27 @@ class ServerState(StrEnum):
 
     STARTING = "starting"
     READY = "ready"
+
+
+# Built once: the body is constant, so rebuilding it per request would
+# re-serialize the same JSON for every poll of a multi-minute startup.
+_STARTING_BODY = json.dumps(
+    {
+        "error": {
+            "message": "The server is still initializing the engine and cannot serve "
+            "requests yet. It is listening, so this is not a crash; retry "
+            "until /health returns 200.",
+            "type": "ServiceUnavailableError",
+            "code": ServerState.STARTING.value,
+        }
+    }
+).encode()
+_STARTING_HEADERS = [
+    (b"content-type", b"application/json"),
+    (b"content-length", str(len(_STARTING_BODY)).encode()),
+    (b"retry-after", b"1"),  # so clients back off instead of hot-looping
+    (SERVER_STATE_HEADER.encode(), ServerState.STARTING.value.encode()),
+]
 
 
 class _DelegateLifespan:
@@ -209,15 +189,13 @@ class _DelegateLifespan:
     async def _abandon(self) -> bool:
         """Cancel the lifespan task; False if it did not finish in time.
 
-        ``Task.cancel()`` delivers ``CancelledError`` exactly once, and a
-        task that catches it goes on running -- a shape the delegate's own
-        teardown contains, where it cancels and awaits its background
-        collectors. Awaiting such a task unbounded would make this the one
-        unbounded wait on a path whose whole purpose is boundedness.
+        The delegate's teardown cancels and awaits its own collectors, so it
+        can catch ``CancelledError`` and keep running. Awaiting it unbounded
+        would be the one unbounded wait on a path built for boundedness.
 
-        ``asyncio.wait`` rather than ``await self._task``: it bounds the
-        wait, and it lets a cancellation of *this* coroutine propagate
-        instead of being mistaken for the cancellation we just requested.
+        ``asyncio.wait`` rather than ``await self._task``: it bounds the wait,
+        and lets a cancellation of *this* coroutine propagate instead of being
+        mistaken for the one we just requested.
         """
         if self._task is None or self._task.done():
             return True
@@ -228,37 +206,30 @@ class _DelegateLifespan:
     async def finish(self) -> bool:
         """Settle the lifespan; True only if its teardown ran to completion.
 
-        Answers what a caller actually needs to know -- *did* the delegate
-        release its resources -- rather than whether it started out
-        intending to. Those differ whenever the shutdown is abandoned or
-        cancelled partway.
-
-        Cancels a task that is still running, so the answer is stable: a
-        lifespan left suspended inside its teardown could otherwise resume
-        later and run the engine shutdown alongside an out-of-band one the
-        caller is about to start.
+        Answers whether the delegate *did* release its resources, not whether
+        it intended to -- those differ when the shutdown is abandoned partway.
+        Cancels a still-running task so the answer stays true: one left
+        suspended mid-teardown could resume later and run the engine shutdown
+        alongside an out-of-band one the caller is about to start.
         """
         if self._task is None:
             return False
         if not await self._abandon():
-            # Cancelled and still alive. Report "torn down" so the caller
-            # does not start a second teardown. A pending task means the
-            # loop is running and it is suspended at an await -- so it has
-            # not reached the engine shutdown yet, but nothing stops it
-            # reaching it a moment from now, and a second shutdown racing
-            # that one is the not-ZMQ-safe case. Deliberately preferring a
-            # possibly-skipped teardown over a possibly-concurrent one.
+            # Cancelled but still alive. Report "torn down" so the caller does
+            # not start a second one: it is suspended at an await and could
+            # reach the engine shutdown at any moment, and two concurrent
+            # shutdowns are the not-ZMQ-safe case. Prefer a possibly-skipped
+            # teardown over a possibly-concurrent one.
             logger.error(
                 "The serving application's lifespan ignored cancellation for "
                 f"{_ABANDON_TIMEOUT_SECONDS:.0f}s; leaving the engine teardown "
                 "to it rather than risking a second, concurrent one."
             )
             return True
-        # Both halves are needed. A lifespan whose startup failed returns
-        # without ever running its post-yield teardown, yet returns cleanly;
-        # and _run() funnels every exception, cancellation included, into
-        # _error, so a clean None is what distinguishes "ran to the end"
-        # from "was abandoned part-way".
+        # Both halves needed: a lifespan whose startup failed returns cleanly
+        # without running its post-yield teardown, and _run() funnels every
+        # exception (cancellation included) into _error, so a clean None is
+        # what separates "ran to the end" from "abandoned part-way".
         return not self._startup_failed and self._error is None
 
     async def shutdown(self) -> None:
@@ -272,9 +243,7 @@ class _DelegateLifespan:
             return
         if not self._task.done():
             self._to_app.put_nowait({"type": "lifespan.shutdown"})
-        # Bounds a delegate that yields but never finishes. It deliberately
-        # cannot bound a delegate that blocks the loop thread -- no asyncio
-        # timer can -- and that limitation is load-bearing: an engine
+        # The inability to bound a loop-blocking delegate is load-bearing: a
         # teardown that blocks the loop cannot be left half-done, whereas one
         # on a worker thread would keep running, uncancellable, after this
         # bound gave up on it. See OpenAIServer's lifespan.
@@ -287,11 +256,10 @@ class _DelegateLifespan:
                 "The serving application's lifespan shutdown did not finish "
                 f"within {_DELEGATE_SHUTDOWN_TIMEOUT_SECONDS:.0f}s; abandoning it."
             )
-            # Cancel rather than leave it suspended mid-teardown: a task that
-            # resumed later would run the engine shutdown alongside the
-            # out-of-band one that abandoning it makes necessary. Matters
-            # most on the normal shutdown path, where nothing else settles
-            # the lifespan afterwards.
+            # Cancel rather than leave it suspended mid-teardown: resuming
+            # later would run the engine shutdown alongside the out-of-band
+            # one that abandoning it makes necessary. Matters most on the
+            # normal path, where nothing else settles the lifespan after.
             if not await self._abandon():
                 logger.error(
                     "The serving application's lifespan also ignored "
@@ -366,12 +334,11 @@ class ServerLifecycle:
             return
 
         if scope_type == "websocket":
-            # Reachable regardless of which routes the app registers:
-            # uvicorn picks the websocket scope from the client's Upgrade
-            # header, not from the routing table. Answering such a scope with
-            # an HTTP response raises inside the protocol implementation and
-            # surfaces as a 500 plus a traceback, which would make STARTING
-            # noisier than either READY or dead.
+            # Reachable whatever routes the app registers: uvicorn picks this
+            # scope from the client's Upgrade header, not the routing table.
+            # Answering it with an HTTP response raises inside the protocol
+            # and surfaces as a 500 + traceback, making STARTING noisier than
+            # either READY or dead.
             await self._reject_websocket(receive, send)
         else:
             await self._reject_http(send)
@@ -382,9 +349,8 @@ class ServerLifecycle:
             message = await receive()
             message_type = message["type"]
             if message_type == "lifespan.startup":
-                # Complete immediately and unconditionally. uvicorn only
-                # calls listen() once startup completes, and listening while
-                # the engine loads is the entire point of this contract.
+                # Unconditionally: uvicorn calls listen() only once startup
+                # completes, and listening during engine load is the point.
                 logger.info(
                     "Server state: STARTING (listening, /health -> 503 until "
                     "the engine is initialized)"
@@ -407,45 +373,22 @@ class ServerLifecycle:
 
     async def _reject_http(self, send: Callable) -> None:
         """Answer any request with 503 while the engine is initializing."""
-        body = json.dumps(
-            {
-                "error": {
-                    "message": "The server is still initializing the engine and cannot serve "
-                    "requests yet. It is listening, so this is not a crash; retry "
-                    "until /health returns 200.",
-                    "type": "ServiceUnavailableError",
-                    "code": ServerState.STARTING.value,
-                }
-            }
-        ).encode()
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 503,
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode()),
-                    (b"retry-after", str(_RETRY_AFTER_SECONDS).encode()),
-                    (SERVER_STATE_HEADER.encode(), ServerState.STARTING.value.encode()),
-                ],
-            }
-        )
-        await send({"type": "http.response.body", "body": body})
+        await send({"type": "http.response.start", "status": 503, "headers": _STARTING_HEADERS})
+        await send({"type": "http.response.body", "body": _STARTING_BODY})
 
     async def _reject_websocket(self, receive: Callable, send: Callable) -> None:
         """Refuse a websocket handshake while the engine is initializing.
 
-        Closing before accepting makes uvicorn reject the handshake with an
-        HTTP 403, which is what the fully initialized app also does for an
-        unrouted path -- so STARTING is never worse than READY here.
+        Closing before accepting makes uvicorn reject with HTTP 403 -- what
+        the initialized app also does for an unrouted path, so STARTING is
+        never worse than READY here.
         """
         message = await receive()
         if message["type"] != "websocket.connect":
             # A client that aborted mid-handshake sends websocket.disconnect;
-            # sending a close after that raises inside the protocol.
+            # closing after that raises inside the protocol.
             return
-        # 1013 "Try Again Later" is the websocket analogue of HTTP 503.
-        await send({"type": "websocket.close", "code": 1013})
+        await send({"type": "websocket.close", "code": 1013})  # "Try Again Later"
 
 
 async def _wait_until_listening(uvicorn_server: Any, serve_task: asyncio.Task) -> None:
@@ -458,7 +401,7 @@ async def _wait_until_listening(uvicorn_server: Any, serve_task: asyncio.Task) -
                 "uvicorn exited before it started listening; the server never "
                 "reached the STARTING state."
             )
-        await asyncio.sleep(_LISTEN_POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(0.02)
 
 
 async def serve_with_lifecycle(
@@ -482,21 +425,20 @@ async def serve_with_lifecycle(
         sockets: Pre-bound sockets handed to uvicorn, which calls listen()
             on them. ``None`` lets uvicorn bind its own.
         build: Blocking callable returning the initialized server object.
-            It runs on a dedicated worker thread, never on the event loop.
+            Runs on a dedicated worker thread, never on the event loop.
         timeout_keep_alive: uvicorn keep-alive timeout, in seconds.
-        on_ready: Awaited with the built server right after it starts
-            serving. Returning ``False`` fails startup.
+        on_ready: Awaited with the built server once it starts serving.
+            Returning ``False`` fails startup.
         on_startup_failure: Called with the built server if anything after
-            the build fails. The engine already exists at that point, so
-            without this its worker processes would outlive the frontend.
+            the build fails. The engine already exists by then, so without
+            this its worker processes would outlive the frontend.
 
     Raises:
         BaseException: Whatever ``build`` raised. uvicorn is stopped first,
-            so the socket closes and remote pollers see connection refused,
-            i.e. the dead state, exactly as they would for any other crash.
+            so the socket closes and pollers see connection refused -- the
+            dead state, as for any other crash.
     """
-    # Imported lazily: this module is imported by CLI paths that must not pay
-    # for uvicorn/FastAPI unless a server is actually started.
+    # Lazy: CLI paths import this module without starting a server.
     import uvicorn
 
     lifecycle = ServerLifecycle()
@@ -529,12 +471,10 @@ async def serve_with_lifecycle(
             # Best effort: a messy shutdown must never mask the startup error
             # that is about to be re-raised, which is what the operator needs.
             logger.error(f"Server shutdown after a startup failure did not complete cleanly: {e!r}")
-        # Settle the delegate's lifespan before deciding anything: the wait
-        # above cancels uvicorn on expiry, which can leave the delegate
-        # suspended part-way through its teardown. finish_delegate_lifespan
-        # cancels such a task and reports whether the teardown actually
-        # completed, so the answer below is about what happened, not about
-        # what the delegate set out to do.
+        # Settle the delegate's lifespan first: the wait above cancels uvicorn
+        # on expiry, which can leave the delegate suspended mid-teardown.
+        # finish_delegate_lifespan cancels it and reports what actually
+        # completed, so the decision below is about fact, not intent.
         try:
             delegate_tore_down = await lifecycle.finish_delegate_lifespan()
         except asyncio.CancelledError:
@@ -543,15 +483,14 @@ async def serve_with_lifecycle(
             logger.error(f"Could not settle the serving application's lifespan: {e!r}")
             delegate_tore_down = False
 
-        # Run our own teardown only when the delegate's did not. Running both
-        # would be two concurrent engine shutdowns: BaseLLM.shutdown() takes
-        # no lock, so both callers see a non-None executor and run the whole
-        # thing, driving ZeroMqQueue.close() from two threads, which the
-        # executor proxy documents as not ZMQ-safe. Skipping *nothing* is
-        # equally wrong: the only remaining path would be LLM's atexit hook,
-        # an unbounded shutdown during interpreter teardown.
+        # Only when the delegate's did not. Running both means two concurrent
+        # engine shutdowns: BaseLLM.shutdown() takes no lock, so both callers
+        # see a non-None executor and drive ZeroMqQueue.close() from two
+        # threads, which the executor proxy documents as not ZMQ-safe.
+        # Skipping both is equally wrong -- the only path left is LLM's atexit
+        # hook, an unbounded shutdown during interpreter teardown.
         if server is not None and on_startup_failure is not None and not delegate_tore_down:
-            # Safe to run off the loop precisely because it is the only
+            # Off the loop is safe here precisely because this is the only
             # teardown on this path, so the bound cannot fire into another.
             try:
                 await asyncio.wait_for(
@@ -577,12 +516,11 @@ async def serve_with_lifecycle(
 def run_in_daemon_thread(fn: Callable[[], Any]) -> asyncio.Future:
     """Run ``fn`` on a daemon thread, reporting into an asyncio future.
 
-    Deliberately not a ``ThreadPoolExecutor``: its workers are non-daemon
-    and are joined by an ``atexit`` hook, so a SIGTERM arriving mid-build
-    would leave the process alive until initialization finished -- exactly
-    the multi-minute hang this feature exists to remove. A daemon thread
-    cannot hold the interpreter open, which matches the pre-existing
-    behavior of SIGTERM during engine initialization (immediate death).
+    Deliberately not ``asyncio.to_thread``/``ThreadPoolExecutor``: their
+    workers are non-daemon and joined at exit, so a SIGTERM mid-build would
+    keep the process alive until init finished -- the multi-minute hang this
+    feature exists to remove. A daemon thread cannot hold the interpreter
+    open, matching the pre-existing behavior of SIGTERM during engine init.
     """
     import threading
 
@@ -594,10 +532,10 @@ def run_in_daemon_thread(fn: Callable[[], Any]) -> asyncio.Future:
             setter(value)
 
     def post(setter: Callable[[Any], None], value: Any) -> None:
-        # The build is abandoned when the server stops first, so by the time
-        # it finishes the loop is usually gone. Without this guard the thread
-        # dies with "RuntimeError: Event loop is closed" printed right next to
-        # the real startup error an operator is trying to read.
+        # When the server stops first the build is abandoned and the loop is
+        # usually gone by the time it finishes. Without this guard the thread
+        # dies with "Event loop is closed" printed next to the real startup
+        # error the operator is trying to read.
         try:
             if not loop.is_closed():
                 loop.call_soon_threadsafe(report, setter, value)
@@ -619,12 +557,10 @@ def run_in_daemon_thread(fn: Callable[[], Any]) -> asyncio.Future:
 async def _build_off_event_loop(build: Callable[[], Any], serve_task: asyncio.Task) -> Any:
     """Build the server on a worker thread while the loop keeps serving.
 
-    Races the build against uvicorn stopping. If uvicorn goes away first --
-    a SIGTERM during a long startup is the common case -- the remaining
+    Races the build against uvicorn stopping. If uvicorn goes first -- a
+    SIGTERM during a long startup being the common case -- the remaining
     minutes of the build are abandoned rather than waited out.
     """
-    # The built object is handed back through the future, which is a full
-    # memory barrier, so it is safe to use from the event loop thread.
     build_future = run_in_daemon_thread(build)
     await asyncio.wait({build_future, serve_task}, return_when=asyncio.FIRST_COMPLETED)
     if not build_future.done():
