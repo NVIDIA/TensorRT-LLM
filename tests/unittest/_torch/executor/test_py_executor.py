@@ -1866,6 +1866,44 @@ def test_pad_dummy_added_when_only_to_complete_requests_disagg():
     assert len(stub.active_requests) == 2
 
 
+def test_pad_dummy_tolerates_active_request_overshoot():
+    # A transient overshoot (len(active_requests) > expected_num_active_requests,
+    # when disagg transfer-error requests linger a tick before cleanup) used to
+    # trip a hard assert that crashed the gen loop on every ADP rank. It must now
+    # warn and continue instead of raising.
+    stub = _StubADPExecutor()
+    stub.active_requests = [
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS),
+    ]
+    stub.expected_num_active_requests = 1  # < len(active_requests) == 2
+
+    # Must not raise AssertionError (the pre-fix behavior on overshoot).
+    _run_pad(stub)
+
+    # Both requests are schedulable, so no dummy is added; pin it so the test
+    # cannot pass on an early return or a stray pad.
+    assert stub.add_dummy_calls == []
+    assert len(stub.active_requests) == 2
+
+
+def test_pad_dummy_added_when_overshoot_has_no_schedulable_requests():
+    # The branch that matters: overshoot AND nothing schedulable (all at
+    # GENERATION_TO_COMPLETE) must still pad, or can_queue goes False
+    # fleet-wide.
+    stub = _StubADPExecutor()
+    stub.active_requests = [
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=1),
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=2),
+    ]
+    stub.expected_num_active_requests = 1  # < len(active_requests) == 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 3
+
+
 def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
     # Gen-first mode on the context server: DISAGG_CONTEXT_WAIT_SCHEDULER
     # sits BELOW the scheduler's window [CONTEXT_INIT, GENERATION_TO_COMPLETE)
