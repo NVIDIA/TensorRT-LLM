@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -60,6 +61,9 @@ def _llm_kwargs(args: argparse.Namespace) -> dict[str, object]:
     if args.role != "baseline":
         if not args.mx_url:
             raise ValueError("MX donor and receiver roles require --mx-url")
+        transfer_log_dir = os.environ.get("MX_TRANSFER_LOG_DIR")
+        if transfer_log_dir:
+            kwargs["env_overrides"] = {"MX_TRANSFER_LOG_DIR": transfer_log_dir}
         kwargs["mx_config"] = {
             "server_url": args.mx_url,
             # ModelExpress 0.4.1 skips polling at zero but still sleeps once
