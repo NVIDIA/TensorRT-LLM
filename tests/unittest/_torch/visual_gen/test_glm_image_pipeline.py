@@ -75,13 +75,16 @@ GLM_IMAGE_PATH = _resolve_glm_checkpoint()
 
 # GlmImage takes a plain text prompt and derives the latent grid from the
 # explicit height/width (each must be divisible by 32). 256 == 8 * 32.
-PROMPT = "A dinosaur walking through the jungle"
+PROMPT = "a tiny astronaut hatching from an egg on the moon"
+BATCH_PROMPTS = ["a sunset over mountains", "a cat on a roof"]
+# Quoted text routes through the glyph encoder, which produces the text attention mask.
+GLYPH_PROMPT = "A sign that says 'OPEN'"
 HEIGHT = 256
 WIDTH = 256
 NUM_STEPS = 30
 SEED = 42
 GUIDANCE_SCALE = 1.5
-COS_SIM_THRESHOLD = 0.99
+COS_SIM_THRESHOLD = 0.999
 
 
 # ============================================================================
@@ -290,7 +293,7 @@ class TestGlmImageGeneration:
     def test_batch_prompts(self):
         """A list of prompts returns one image per prompt in a single batched forward."""
 
-        prompts = [PROMPT, "A neon city skyline reflected in a river at night"]
+        prompts = BATCH_PROMPTS
         pipe = None
         try:
             pipe = _load_trtllm_pipeline(GLM_IMAGE_PATH)
@@ -306,6 +309,57 @@ class TestGlmImageGeneration:
             image = result.image
             assert image.shape[0] == len(prompts), (
                 f"Expected batch dim {len(prompts)}, got {image.shape[0]}"
+            )
+            assert tuple(image.shape[1:]) == (HEIGHT, WIDTH, 3), (
+                f"Expected (H,W,C)=({HEIGHT},{WIDTH},3), got {tuple(image.shape[1:])}"
+            )
+        finally:
+            _teardown_pipeline(pipe)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_quoted_prompt(self):
+        """A quoted prompt exercises the glyph path and its text attention mask."""
+
+        pipe = None
+        try:
+            pipe = _load_trtllm_pipeline(GLM_IMAGE_PATH)
+            result = _capture_trtllm_image(
+                pipe,
+                prompt=GLYPH_PROMPT,
+                height=HEIGHT,
+                width=WIDTH,
+                num_inference_steps=NUM_STEPS,
+                guidance_scale=GUIDANCE_SCALE,
+                seed=SEED,
+            )
+            images = _to_image_tensor(result.image)
+            assert images.shape == (HEIGHT, WIDTH, 3), (
+                f"Expected (H,W,C)=({HEIGHT},{WIDTH},3), got {tuple(images.shape)}"
+            )
+        finally:
+            _teardown_pipeline(pipe)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_num_images_per_prompt(self):
+        """num_images_per_prompt returns that many images for a single prompt."""
+
+        num_images_per_prompt = 2
+        pipe = None
+        try:
+            pipe = _load_trtllm_pipeline(GLM_IMAGE_PATH)
+            with torch.no_grad():
+                result = pipe.forward(
+                    prompt=PROMPT,
+                    height=HEIGHT,
+                    width=WIDTH,
+                    num_inference_steps=NUM_STEPS,
+                    guidance_scale=GUIDANCE_SCALE,
+                    num_images_per_prompt=num_images_per_prompt,
+                    generator=torch.Generator(device="cuda").manual_seed(SEED),
+                )
+            image = result.image
+            assert image.shape[0] == num_images_per_prompt, (
+                f"Expected batch dim {num_images_per_prompt}, got {image.shape[0]}"
             )
             assert tuple(image.shape[1:]) == (HEIGHT, WIDTH, 3), (
                 f"Expected (H,W,C)=({HEIGHT},{WIDTH},3), got {tuple(image.shape[1:])}"

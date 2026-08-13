@@ -352,7 +352,6 @@ class GlmImageAttention(Attention):
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
-        eps: float = 1e-6,
         dtype: Optional[torch.dtype] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
@@ -365,50 +364,16 @@ class GlmImageAttention(Attention):
             config=config,
             qk_norm_mode="per_head",
             qkv_mode=QKVMode.FUSE_QKV,
-            qk_norm=True,
+            qk_norm=False,
         )
 
         self.heads = num_attention_heads
         self.head_dim = attention_head_dim
 
-        self.add_q_proj = Linear(
-            dim,
-            dim,
-            bias=True,
-            dtype=dtype,
-            mapping=self.mapping,
-            quant_config=self.quant_config,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-        )
-        self.add_k_proj = Linear(
-            dim,
-            dim,
-            bias=True,
-            dtype=dtype,
-            mapping=self.mapping,
-            quant_config=self.quant_config,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-        )
-        self.add_v_proj = Linear(
-            dim,
-            dim,
-            bias=True,
-            dtype=dtype,
-            mapping=self.mapping,
-            quant_config=self.quant_config,
-            skip_create_weights_in_init=self.skip_create_weights_in_init,
-            force_dynamic_quantization=self.force_dynamic_quantization,
-        )
-
-        # QK-norms, applied per-head on the head_dim.
-        self.norm_added_q = RMSNorm(
-            hidden_size=attention_head_dim, eps=eps, dtype=dtype, has_weights=True
-        )
-        self.norm_added_k = RMSNorm(
-            hidden_size=attention_head_dim, eps=eps, dtype=dtype, has_weights=True
-        )
+        # GLM-Image uses parameter-free per-head LayerNorm for Q/K, not the base
+        # class's learned RMSNorm (which has no checkpoint counterpart).
+        self.norm_q = torch.nn.LayerNorm(attention_head_dim, eps=1e-5, elementwise_affine=False)
+        self.norm_k = torch.nn.LayerNorm(attention_head_dim, eps=1e-5, elementwise_affine=False)
 
         self.to_out = torch.nn.ModuleList(
             [
@@ -425,6 +390,10 @@ class GlmImageAttention(Attention):
                 torch.nn.Dropout(0.0),
             ]
         )
+
+    def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Parameter-free per-head LayerNorm on 4D tensors [B, S, H, D]."""
+        return self.norm_q(q), self.norm_k(k)
 
     def forward(
         self,
@@ -444,8 +413,7 @@ class GlmImageAttention(Attention):
         value = value.unflatten(2, (self.heads, -1))
 
         # 2. QK normalization
-        if self.qk_norm:
-            query, key = self.apply_qk_norm(query, key)
+        query, key = self.apply_qk_norm(query, key)
 
         # 3. Rotational positional embeddings applied to latent stream
         if image_rotary_emb is not None:
@@ -470,14 +438,15 @@ class GlmImageAttention(Attention):
             assert text_attn_mask.dim() == 2, (
                 "the shape of text_attn_mask should be (batch_size, text_seq_length)"
             )
-            text_attn_mask = text_attn_mask.float().to(query.device)
+            # Backends take a [B, S_kv] bool key-padding mask (True = valid); masking
+            # the padded key columns matches the reference [B, 1, S, S] score mask.
             mix_attn_mask = torch.ones(
-                (batch_size, text_seq_length + image_seq_length), device=query.device
+                (batch_size, text_seq_length + image_seq_length),
+                dtype=torch.bool,
+                device=query.device,
             )
-            mix_attn_mask[:, :text_seq_length] = text_attn_mask
-            mix_attn_mask = mix_attn_mask.unsqueeze(2)
-            attn_mask_matrix = mix_attn_mask @ mix_attn_mask.transpose(1, 2)
-            attention_mask = (attn_mask_matrix > 0).unsqueeze(1).to(query.dtype)
+            mix_attn_mask[:, :text_seq_length] = text_attn_mask.bool().to(query.device)
+            attention_mask = mix_attn_mask
 
         hidden_states = self._attn_impl(query, key, value, key_padding_mask=attention_mask)
 
@@ -511,7 +480,7 @@ class GlmImageTransformerBlock(torch.nn.Module):
         # 1. Attention
         self.norm1 = GlmImageAdaLayerNormZero(time_embed_dim, dim, model_config=config)
         self.attn1 = GlmImageAttention(
-            dim, num_attention_heads, attention_head_dim, eps, dtype, config, layer_idx
+            dim, num_attention_heads, attention_head_dim, dtype, config, layer_idx
         )
 
         # 2. Feedforward
@@ -639,6 +608,15 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
         self.rope = GlmImageRotaryPosEmbed(attention_head_dim, patch_size, theta=10000.0)
 
         # 2. Patch & Text-timestep embedding
+        # NOTE: image_projector quantization is excluded when in_channels * patch_size**2 < 128.
+        # GLM-Image has 64, which is below the 128-block size required by
+        # fp8_block_scaling_gemm (causes NVRTC compilation failure). This layer runs
+        # once per forward pass (not in the block loop), so the perf impact is negligible.
+        if in_channels * patch_size**2 < 128 and quant_config is not None:
+            if quant_config.exclude_modules is None:
+                quant_config.exclude_modules = []
+            if "*image_projector*" not in quant_config.exclude_modules:
+                quant_config.exclude_modules.append("*image_projector*")
         self.image_projector = GlmImageImageProjector(
             in_channels, inner_dim, patch_size, model_config=model_config
         )
@@ -807,26 +785,15 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
             weights: Dictionary of parameter name -> tensor
         """
 
-        # Map fused QKV layer names to original HF checkpoint names
-        # HF checkpoint has separate to_q, to_k, to_v / add_q_proj, add_k_proj, add_v_proj
-        # We fuse them into qkv_proj / add_qkv_proj for better performance
+        # Map fused QKV layer name to original HF checkpoint names
+        # We fuse to_q, to_k, to_v into qkv_proj for better performance
         params_map = {
-            "add_qkv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
             "qkv_proj": ["to_q", "to_k", "to_v"],
         }
 
         loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
-        # Track prefixes of wrapper projectors whose sub-Linears are loaded
-        # by the parent's load_weights — the generic Linear loader must skip
-        # them (their FUSED weight modes would look for nonexistent checkpoint
-        # keys via params_map and error).
-        managed_prefixes = set()
-
         for name, module in tqdm(self.named_modules(), desc="Loading weights"):
-            if any(name.startswith(p) for p in managed_prefixes):
-                continue
-
             # Create weights for modules with skip_create_weights_in_init=True
             # This must be done before loading weights (following Wan pattern)
             if callable(getattr(module, "create_weights", None)):

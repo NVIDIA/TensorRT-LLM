@@ -257,7 +257,7 @@ class TestGlmImageHuggingFaceComparison(unittest.TestCase):
         print(f"  Cosine similarity: {cos_sim:.6f}")
         print(f"  Max diff: {max_diff:.6f}")
 
-        self.assertGreater(cos_sim, 0.99, f"Cosine similarity too low: {cos_sim}")
+        self.assertGreater(cos_sim, 0.999, f"Cosine similarity too low: {cos_sim}")
 
 
 if __name__ == "__main__":

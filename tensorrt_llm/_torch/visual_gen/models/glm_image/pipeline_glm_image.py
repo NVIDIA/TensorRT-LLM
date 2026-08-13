@@ -22,14 +22,15 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import PIL
 import torch
+from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.pipelines.glm_image.pipeline_glm_image import (
-    AutoencoderKL,
-    FlowMatchEulerDiscreteScheduler,
+from diffusers.utils.torch_utils import randn_tensor
+from transformers import (
+    ByT5Tokenizer,
+    GlmImageForConditionalGeneration,
+    GlmImageProcessor,
     T5EncoderModel,
 )
-from diffusers.utils.torch_utils import randn_tensor
-from transformers import ByT5Tokenizer, GlmImageForConditionalGeneration, GlmImageProcessor
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
@@ -323,16 +324,19 @@ class GlmImagePipeline(BasePipeline):
         # Generate with AR model
         # Set torch random seed from generator for reproducibility
         # (transformers generate() doesn't accept generator parameter)
-        if generator is not None:
-            seed = generator.initial_seed()
-            torch.manual_seed(seed)
-            if device is not None and device.type == "cuda":
-                torch.cuda.manual_seed(seed)
-        outputs = self.vision_language_encoder.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-        )
+        # fork_rng keeps the reseed out of the process-global RNG
+        fork_devices = [device] if device is not None and device.type == "cuda" else []
+        with torch.random.fork_rng(devices=fork_devices, enabled=generator is not None):
+            if generator is not None:
+                seed = generator.initial_seed()
+                torch.manual_seed(seed)
+                if device is not None and device.type == "cuda":
+                    torch.cuda.manual_seed(seed)
+            outputs = self.vision_language_encoder.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+            )
 
         # Extract and upsample prior tokens for each sample
         # For left-padded inputs, generated tokens start after the padded input sequence
@@ -796,6 +800,12 @@ class GlmImagePipeline(BasePipeline):
         self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
+
+        # forward() can be called directly, bypassing infer()'s VisualGenParams defaults
+        if height is None:
+            height = self.default_generation_params["height"]
+        if width is None:
+            width = self.default_generation_params["width"]
 
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
