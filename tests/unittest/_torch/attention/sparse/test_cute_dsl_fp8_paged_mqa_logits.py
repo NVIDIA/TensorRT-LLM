@@ -452,6 +452,421 @@ def test_cute_dsl_fp8_paged_mqa_logits_multi_block(
     )
 
 
+# ---------------------------------------------------------------------------
+# Emission tests (emit_block_meta / emit_seed_counts / emit_cand_bucketed —
+# fused-GVR support). Ports of the FP4 emission tests; hit-stats and the
+# plain (non-bucketed) candidate list are FP4-only and not ported. The FP8
+# epilogue multiplies by the per-token dequant scale before the store and
+# emission is computed on the post-conversion stored logit, so references
+# recomputed from the KERNEL'S OWN logits output remain the right oracle.
+# ---------------------------------------------------------------------------
+
+_FLT_MAX_F32 = torch.finfo(torch.float32).max
+
+_EMISSION_COMMON = dict(
+    num_epi_subtiles=1,
+    epi_dtype=torch.float32,
+    acc_dtype=torch.float32,
+    output_dtype=torch.float32,
+)
+
+
+def _emission_test_data(batch_size, next_n, avg_ctx, phys_block_kv, fix_length, seed):
+    """FP8 inputs for the emission tests: ctx == avg_ctx (or randomized
+    around it) with the logits buffer spanning max_model_len == 2 * avg_ctx,
+    mirroring the FP4 emission tests (ctx < buffer proves no writes land
+    past each row's valid region). Q/KV/weights use the same recipes as
+    ``_generate_test_data``; the block table is a random permutation."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    num_heads, head_dim = 64, 128
+    max_model_len = max(avg_ctx * 2, 2048)
+    device = "cuda"
+
+    if fix_length:
+        context_lens = torch.full((batch_size,), avg_ctx, dtype=torch.int32, device=device)
+    else:
+        lo = max(phys_block_kv, int(0.7 * avg_ctx))
+        context_lens = torch.randint(
+            lo, int(1.3 * avg_ctx) + 1, (batch_size,), dtype=torch.int32, device=device
+        ).clamp(max=max_model_len)
+
+    num_blocks_per_seq = (context_lens + phys_block_kv - 1) // phys_block_kv
+    num_total_blocks = int(num_blocks_per_seq.sum().item()) + batch_size * 2
+    max_blocks_per_seq = int(num_blocks_per_seq.max().item())
+    block_table = torch.zeros((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device)
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    off = 0
+    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
+        block_table[i, :n_blks] = pool[off : off + n_blks]
+        off += n_blks
+
+    q_fp8 = torch.randn(batch_size, next_n, num_heads, head_dim, device=device).to(
+        torch.float8_e4m3fn
+    )
+    kv_bf16 = torch.randn(num_total_blocks, phys_block_kv, head_dim, device=device)
+    kv_amax = kv_bf16.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4)
+    kv_scale = _ceil_to_ue8m0(kv_amax / 448.0).squeeze(-1)
+    kv_fp8 = (kv_bf16 / kv_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    weights = torch.randn(batch_size * next_n, num_heads, device=device, dtype=torch.float32)
+    kv_fused = _make_fused_kv(kv_fp8, kv_scale, phys_block_kv, head_dim)
+
+    from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    # `block_kv = 64` — see test_cute_dsl_fp8_paged_mqa_logits for reasoning.
+    DG_METADATA_BLOCK_KV = 64
+    schedule_meta = get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
+    )
+    return q_fp8, kv_fused, weights, context_lens, block_table, schedule_meta, max_model_len
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 2, 3, 4])
+# 4224 = 33 blocks of 128 -> odd num_kv exercises WG1's OOB padding tile.
+@pytest.mark.parametrize("avg_ctx", [4096, 4224])
+@pytest.mark.parametrize("phys_block_kv", [64, 128])
+@pytest.mark.parametrize("fix_length", [True, False])
+def test_cute_dsl_fp8_paged_mqa_logits_block_meta(
+    batch_size,
+    next_n,
+    avg_ctx,
+    phys_block_kv,
+    fix_length,
+):
+    """emit_block_meta correctness: block_max recomputed from the KERNEL'S
+    OWN logits output (the meta contract is defined on what the kernel
+    stores — the per-token dequant scale is already folded in).
+    NaN-prefilled buffers prove no writes land outside
+    [0, num_kv (+1 when odd)) per row."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLPagedMQALogitsRunner
+
+    device = "cuda"
+    (
+        q_fp8,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+    ) = _emission_test_data(batch_size, next_n, avg_ctx, phys_block_kv, fix_length, seed=7)
+
+    aligned_max_ctx = ((max_model_len + 255) // 256) * 256
+    nb_pad = aligned_max_ctx // 128
+    num_rows = batch_size * next_n
+
+    # block_max: 4 warp-partial records per block; consumers fold. NaN
+    # prefill proves write coverage is exactly [0, written_hi*4) per row.
+    nan = float("nan")
+    block_max = torch.full((num_rows, nb_pad * 4), nan, dtype=torch.float32, device=device)
+    logits, bm = CuteDSLPagedMQALogitsRunner.forward(
+        q_fp8,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        emit_block_meta=True,
+        block_max_out=block_max,
+        **_EMISSION_COMMON,
+    )
+    torch.cuda.synchronize()
+
+    lf = logits.float()
+    for row in range(num_rows):
+        req = row // next_n
+        ctx = int(context_lens[req].item())
+        num_kv = (ctx + 127) // 128
+        tag = f"row={row} req={req} ctx={ctx} next_n={next_n} pbk={phys_block_kv}"
+
+        # Fold the kernel's 4 warp-partials per block (the consumer-side
+        # contract); per-warp partials themselves depend on the TMEM
+        # lane->row mapping and are not checked individually.
+        bm_fold = bm[row].view(nb_pad, 4).amax(-1)
+
+        # block_max reference from the kernel's own stored logits.
+        padded = torch.full((nb_pad * 128,), -_FLT_MAX_F32, device=device)
+        padded[:ctx] = lf[row, :ctx]
+        ref_bmax = padded.view(nb_pad, 128).amax(-1)
+        torch.testing.assert_close(
+            bm_fold[:num_kv],
+            ref_bmax[:num_kv],
+            atol=0.0,
+            rtol=0.0,
+            msg=lambda m, tag=tag: f"block_max mismatch: {tag}\n{m}",
+        )
+
+        # Odd num_kv: WG1's OOB tile writes pure identities into block
+        # slot num_kv (every lane invalid).
+        written_hi = num_kv + (num_kv % 2)
+        if written_hi > num_kv:
+            assert bm_fold[num_kv].item() == -_FLT_MAX_F32, tag
+        # No stray writes past the padding tile: NaN prefill intact.
+        assert bm[row, written_hi * 4 :].isnan().all(), f"stray block_max write: {tag}"
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 2, 3, 4])
+# 4224 = 33 blocks of 128 -> odd num_kv exercises WG1's OOB padding tile.
+@pytest.mark.parametrize("avg_ctx", [4096, 4224])
+@pytest.mark.parametrize("phys_block_kv", [64, 128])
+@pytest.mark.parametrize("fix_length", [True, False])
+@pytest.mark.parametrize("packed", [False, True])
+def test_cute_dsl_fp8_paged_mqa_logits_seed_counts(
+    batch_size,
+    next_n,
+    avg_ctx,
+    phys_block_kv,
+    fix_length,
+    packed,
+):
+    """emit_seed_counts exactness: per-row counts of logits >= threshold
+    recomputed from the KERNEL'S OWN logits output (the count contract is
+    defined on post-conversion values, same as block_max). Thresholds are
+    per-row quantiles of the row's own logits so each of the 3 counters
+    lands in a different regime (loose/mid/tight)."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLPagedMQALogitsRunner
+
+    device = "cuda"
+    (
+        q_fp8,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+    ) = _emission_test_data(batch_size, next_n, avg_ctx, phys_block_kv, fix_length, seed=11)
+
+    aligned_max_ctx = ((max_model_len + 255) // 256) * 256
+    nb_pad = aligned_max_ctx // 128
+    num_rows = batch_size * next_n
+    base_args = (
+        q_fp8,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+    )
+
+    # First pass without seed counts to harvest per-row logits for
+    # threshold picking (post-conversion value domain).
+    nan = float("nan")
+    block_max = torch.full((num_rows, nb_pad * 4), nan, dtype=torch.float32, device=device)
+    logits0, _ = CuteDSLPagedMQALogitsRunner.forward(
+        *base_args,
+        emit_block_meta=True,
+        block_max_out=block_max,
+        **_EMISSION_COMMON,
+    )
+    torch.cuda.synchronize()
+    # clone: the runner returns a persistent arena buffer that the second
+    # forward overwrites in place (fp32 output makes .float() a no-copy).
+    lf0 = logits0.float().clone()
+
+    seed_thr = torch.empty((num_rows, 3), dtype=torch.float32, device=device)
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        vals = lf0[row, :ctx]
+        # Loose / mid / tight rungs; ties on exact stored values are the
+        # point (>= must count them all).
+        seed_thr[row, 0] = torch.quantile(vals, 0.10)
+        seed_thr[row, 1] = torch.quantile(vals, 0.90)
+        seed_thr[row, 2] = torch.quantile(vals, 0.998)
+
+    if packed:
+        # Packed contract: one [rows, 8] fp32 seed row, lines at cols
+        # 0..2, counts accumulate as fp32 at cols 3..5 (caller zeroes).
+        seed_row = torch.zeros((num_rows, 8), dtype=torch.float32, device=device)
+        seed_row[:, 0:3] = seed_thr
+        thr_arg, counts_arg = seed_row, None
+    else:
+        seed_counts = torch.zeros((num_rows, 3), dtype=torch.int32, device=device)
+        thr_arg, counts_arg = seed_thr, seed_counts
+    block_max.fill_(nan)
+    logits, _ = CuteDSLPagedMQALogitsRunner.forward(
+        *base_args,
+        emit_block_meta=True,
+        block_max_out=block_max,
+        emit_seed_counts=True,
+        seed_thr=thr_arg,
+        seed_counts_out=counts_arg,
+        **_EMISSION_COMMON,
+    )
+    torch.cuda.synchronize()
+
+    lf = logits.float()
+    # compare valid prefixes only: past ctx the buffer is unwritten
+    # allocator garbage and differs run-to-run
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        torch.testing.assert_close(lf[row, :ctx], lf0[row, :ctx], atol=0.0, rtol=0.0)
+    if packed:
+        assert torch.equal(seed_row[:, 0:3], seed_thr), "lines clobbered"
+        # col 6 carries the adaptive-skip pass count (lane0-accumulated
+        # diagnostic; the top-k consumer reads it when block_max rides
+        # along), so it is a legitimate output here - bounded by the
+        # block-max record count. Only col 7 must stay untouched.
+        assert (seed_row[:, 7] == 0).all(), "stray write past counts"
+        nrec = block_max.shape[1]
+        assert ((seed_row[:, 6] >= 0) & (seed_row[:, 6] <= nrec)).all(), (
+            "adaptive-skip pass count out of range"
+        )
+        seed_counts = seed_row[:, 3:6].to(torch.int32)
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        tag = f"row={row} ctx={ctx} next_n={next_n} pbk={phys_block_kv}"
+        ref = (lf[row, :ctx].unsqueeze(0) >= seed_thr[row].unsqueeze(1)).sum(-1)
+        got = seed_counts[row].to(torch.int64)
+        assert torch.equal(got.cpu(), ref.cpu().to(torch.int64)), (
+            f"seed_counts mismatch: {tag} got={got.tolist()} ref={ref.tolist()}"
+        )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("avg_ctx", [4096, 4224])
+@pytest.mark.parametrize("phys_block_kv", [64, 128])
+@pytest.mark.parametrize("cap_mode", ["roomy", "tight"])
+def test_cute_dsl_fp8_paged_mqa_logits_cand_bucketed(
+    batch_size,
+    next_n,
+    avg_ctx,
+    phys_block_kv,
+    cap_mode,
+):
+    """emit_cand_bucketed (v5 SoA contract): three fixed segments with
+    pad-free A/B prefixes and spill-to-looser, ctl {n0, void, n1, n2}
+    with n1/n2 mirrored from the seed counters, C-window pads carrying
+    score -inf / idx -1. All invariants recomputed from the kernel's
+    own logits."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLPagedMQALogitsRunner
+
+    device = "cuda"
+    (
+        q_fp8,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+    ) = _emission_test_data(batch_size, next_n, avg_ctx, phys_block_kv, True, seed=23)
+
+    aligned_max_ctx = ((max_model_len + 255) // 256) * 256
+    nb_pad = aligned_max_ctx // 128
+    num_rows = batch_size * next_n
+    nan = float("nan")
+    block_max = torch.full((num_rows, nb_pad * 4), nan, dtype=torch.float32, device=device)
+    base_args = (
+        q_fp8,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+    )
+    logits0, _ = CuteDSLPagedMQALogitsRunner.forward(
+        *base_args,
+        emit_block_meta=True,
+        block_max_out=block_max,
+        **_EMISSION_COMMON,
+    )
+    torch.cuda.synchronize()
+    # clone: arena buffer, see test_cute_dsl_fp8_paged_mqa_logits_seed_counts.
+    lf0 = logits0.float().clone()
+    seed_row = torch.zeros((num_rows, 8), dtype=torch.float32, device=device)
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        vals = lf0[row, :ctx]
+        seed_row[row, 0] = torch.quantile(vals, 0.60)
+        seed_row[row, 1] = torch.quantile(vals, 0.90)
+        seed_row[row, 2] = torch.quantile(vals, 0.99)
+    # segment caps: roomy fits everything; tight forces A/B spill and a
+    # C-window void
+    if cap_mode == "roomy":
+        segA, capC = 2048, 4096
+    else:
+        segA, capC = 32, 128
+    W = 2 * segA + capC
+    cand_vals = torch.full((num_rows, W), nan, dtype=torch.float32, device=device)
+    cand_idx = torch.full((num_rows, W), -7, dtype=torch.int32, device=device)
+    cand_ctl = torch.zeros((num_rows, 4), dtype=torch.int32, device=device)
+    cand_cur = torch.zeros((num_rows, 4), dtype=torch.int32, device=device)
+    block_max.fill_(nan)
+    logits, _ = CuteDSLPagedMQALogitsRunner.forward(
+        *base_args,
+        emit_block_meta=True,
+        block_max_out=block_max,
+        emit_seed_counts=True,
+        seed_thr=seed_row,
+        emit_cand_bucketed=True,
+        accept_cap=segA,
+        cand_out=cand_vals,
+        cand_idx_out=cand_idx,
+        cand_ctl_out=cand_ctl,
+        cand_cur_out=cand_cur,
+        **_EMISSION_COMMON,
+    )
+    torch.cuda.synchronize()
+    lf = logits.float()
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        torch.testing.assert_close(lf[row, :ctx], lf0[row, :ctx], atol=0.0, rtol=0.0)
+        t0, t1, t2 = (float(seed_row[row, j]) for j in range(3))
+        v = lf[row, :ctx]
+        n0_ref = int((v >= t0).sum())
+        n1_ref = int((v >= t1).sum())
+        n2_ref = int((v >= t2).sum())
+        n0c, voidc, n1c, n2c = (int(cand_ctl[row, j]) for j in range(4))
+        tag = f"row={row} caps=({segA},{capC}) refs=({n0_ref},{n1_ref},{n2_ref})"
+        assert n1c == n1_ref and n2c == n2_ref, f"n1/n2 mismatch {tag} got {n1c},{n2c}"
+        curA, curB, curC = (int(cand_cur[row, j]) for j in range(3))
+        lenA = min(n2_ref, segA)
+        lenB = min(n1_ref - n2_ref + max(n2_ref - segA, 0), segA)
+        assert min(curA, segA) >= lenA or curA == n2_ref, f"curA {curA} {tag}"
+        # A prefix: pad-free, every entry >= t2, positions valid + unique
+        pa = cand_idx[row, :lenA]
+        va = cand_vals[row, :lenA]
+        assert (pa >= 0).all() and (pa < ctx).all(), f"A idx {tag}"
+        assert (va >= t2).all(), f"A vals {tag}"
+        got_a = lf[row, pa.long()]
+        torch.testing.assert_close(got_a, va, atol=0.0, rtol=0.0)
+        # B prefix: pad-free, [t1, t2) or A-spill (>= t2)
+        pb = cand_idx[row, segA : segA + lenB]
+        vb = cand_vals[row, segA : segA + lenB]
+        assert (pb >= 0).all() and (pb < ctx).all(), f"B idx {tag}"
+        assert (vb >= t1).all(), f"B vals {tag}"
+        torch.testing.assert_close(lf[row, pb.long()], vb, atol=0.0, rtol=0.0)
+        if voidc == 0:
+            # full coverage: union of live entries == the >= t0 set
+            lenC = n0c - lenA - lenB
+            pc = cand_idx[row, 2 * segA : 2 * segA + lenC]
+            vc = cand_vals[row, 2 * segA : 2 * segA + lenC]
+            live = pc >= 0
+            assert (vc[live] >= t0).all(), f"C vals {tag}"
+            # pads carry -FLT_MAX (never ranks; the emu uses -inf, the
+            # kernel the finite sentinel - both satisfy the contract)
+            assert (vc[~live] <= -3e38).all(), f"C pads {tag}"
+            allp = torch.cat([pa, pb, pc[live]])
+            assert allp.unique().numel() == allp.numel() == n0_ref, (
+                f"coverage {tag}: {allp.unique().numel()} vs {n0_ref}"
+            )
+        else:
+            assert cap_mode == "tight", f"unexpected void {tag}"
+    if cap_mode == "tight":
+        assert int(cand_ctl[:, 1].sum()) > 0, "tight caps never voided"
+
+
 def _profile_kernel_us(fn, num_warmup=10, num_iterations=30):
     """Profile CUDA kernel time in microseconds using torch.profiler."""
     from torch.profiler import ProfilerActivity, profile

@@ -69,6 +69,17 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+# Emission shares the FP4 kernel's gmem-reduction helpers and the GVR
+# sentinel constants (single definition; the two producers must stay
+# byte-identical to the consumer's identities).
+from .fp4_paged_mqa_logits import (  # noqa: E501  isort: skip
+    _META_FLT_MAX,
+    _META_NEG_FLT_MAX,
+    _atom_global_add_s32,
+    _red_global_add_f32,
+    _red_global_add_s32,
+)
+
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
@@ -202,6 +213,12 @@ class FP8MQALogitsKernel:
         epi_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
+        emit_block_meta: bool = False,
+        emit_seed_counts: bool = False,
+        seed_packed: bool = False,
+        emit_cand_bucketed: bool = False,
+        accept_cap: int = 8192,
+        cand_cap: int = 5120,
     ):
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
@@ -291,6 +308,34 @@ class FP8MQALogitsKernel:
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler_mn = (block_kv, self.N)
 
+        # GVR emission (same contract as the FP4 kernel; hit-stats and the
+        # plain-list variants are FP4-only — production wiring never passes
+        # them). Metadata is computed on the POST-conversion stored logit
+        # (f32(output_dtype(result * scale))) so it bounds what the GVR
+        # consumer reads back bit-exactly.
+        #   block_max [num_rows, nb_pad*4] fp32 — warp-partial max per
+        #     (128-token tile, warp); valid positions only (kv_pos < ctx).
+        #   seed row  [num_rows, 8] fp32 (seed_packed) — lines at cols
+        #     0..2, counts accumulated at cols 3..5, skip-pass count col 6.
+        #   candidate list — bucketed SoA segments A/B/C (see the FP4
+        #     kernel's emit_cand_bucketed contract).
+        assert block_kv == 128 or not emit_block_meta, (
+            "emission's tile*4+warp record layout assumes block_kv == 128"
+        )
+        self.emit_block_meta = emit_block_meta
+        if emit_seed_counts and not emit_block_meta:
+            raise ValueError("emit_seed_counts requires emit_block_meta")
+        self.emit_seed_counts = emit_seed_counts
+        if seed_packed and not emit_seed_counts:
+            raise ValueError("seed_packed requires emit_seed_counts")
+        self.seed_packed = seed_packed
+        if emit_cand_bucketed and not emit_seed_counts:
+            raise ValueError("emit_cand_bucketed requires emit_seed_counts")
+        self.emit_cand_bucketed = emit_cand_bucketed
+        self.accept_cap = accept_cap
+        self.cand_cap = cand_cap
+        self.CAND_WIN = 8
+
     def _setup_mma(self, a_dtype, b_dtype, a_major, b_major):
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
@@ -353,6 +398,92 @@ class FP8MQALogitsKernel:
         return tiled_mma
 
     @cute.jit
+    def _flush_seed_counts(self, mSeedCounts, q_idx, scnt, meta_lane, spass=None, cand_ctl=None):
+        """Warp-redux the lane-local seed counters and fire one lane-0
+        red.global.add per (t, threshold). Caller zero-initializes the
+        count slots each step; cross-CTA totals accumulate atomically.
+
+        seed_packed: mSeedCounts IS the [num_rows, 8] packed seed row -
+        counts land as fp32 at cols 3..5 (exact to 2^24)."""
+        next_n = cutlass.const_expr(self.next_n)
+        base_addr = mSeedCounts.iterator.toint()
+        for t in cutlass.range_constexpr(next_n):
+            for j in cutlass.range_constexpr(3):
+                w_cnt = cute.arch.warp_redux_sync(scnt[t * 3 + j], "add")
+                if meta_lane == cutlass.Int32(0):
+                    row = q_idx * cutlass.Int32(next_n) + cutlass.Int32(t)
+                    if cutlass.const_expr(self.seed_packed):
+                        addr = base_addr + (
+                            cutlass.Int64(row) * cutlass.Int64(8) + cutlass.Int64(3 + j)
+                        ) * cutlass.Int64(4)
+                        _red_global_add_f32(addr, cutlass.Float32(w_cnt))
+                    else:
+                        addr = base_addr + (
+                            cutlass.Int64(row) * cutlass.Int64(3) + cutlass.Int64(j)
+                        ) * cutlass.Int64(4)
+                        _red_global_add_s32(addr, w_cnt)
+                if cutlass.const_expr(self.emit_cand_bucketed):
+                    if j >= 1:
+                        # consumer contract: ctl = {n0, void, n1, n2}
+                        if meta_lane == cutlass.Int32(0):
+                            row_b = q_idx * cutlass.Int32(next_n) + cutlass.Int32(t)
+                            ctl_a = cand_ctl.iterator.toint() + (
+                                cutlass.Int64(row_b) * cutlass.Int64(4) + cutlass.Int64(j + 1)
+                            ) * cutlass.Int64(4)
+                            _red_global_add_s32(ctl_a, w_cnt)
+                scnt[t * 3 + j] = cutlass.Int32(0)
+        if cutlass.const_expr(self.seed_packed and spass is not None):
+            # packed col 6: adaptive-skip pass count (lane0-accumulated)
+            for t in cutlass.range_constexpr(next_n):
+                w_bp = cute.arch.warp_redux_sync(spass[t], "add")
+                if meta_lane == cutlass.Int32(0):
+                    row = q_idx * cutlass.Int32(next_n) + cutlass.Int32(t)
+                    addr = base_addr + (
+                        cutlass.Int64(row) * cutlass.Int64(8) + cutlass.Int64(6)
+                    ) * cutlass.Int64(4)
+                    _red_global_add_f32(addr, cutlass.Float32(w_bp))
+                spass[t] = cutlass.Int32(0)
+
+    @cute.jit
+    def _flush_cand_window_bucketed(self, mCand, mCandIdx, q_idx, cwbase, cwleft, meta_lane):
+        """Sentinel-fill the unconsumed C-window tail in BOTH SoA columns
+        (score -inf, idx -1: the consumer pads by score) and invalidate
+        the window. Segment C sits at base 2*segA in each row."""
+        next_n = cutlass.const_expr(self.next_n)
+        segA_f = cutlass.const_expr(self.accept_cap)
+        capC_f = cutlass.const_expr(self.cand_cap)
+        wtot_f = cutlass.const_expr(2 * self.accept_cap + self.cand_cap)
+        vbase_f = mCand.iterator.toint()
+        ibase_f = mCandIdx.iterator.toint()
+        for t in cutlass.range_constexpr(next_n):
+            if cwleft[t] > cutlass.Int32(0):
+                row_f = q_idx * cutlass.Int32(next_n) + cutlass.Int32(t)
+                sl_f = cwbase[t] + meta_lane
+                if meta_lane < cwleft[t] and sl_f < cutlass.Int32(capC_f):
+                    off_f = (
+                        cutlass.Int64(row_f) * cutlass.Int64(wtot_f)
+                        + cutlass.Int64(2 * segA_f + sl_f)
+                    ) * cutlass.Int64(4)
+                    vp_f = cute.make_ptr(
+                        cutlass.Float32,
+                        vbase_f + off_f,
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    cute.make_tensor(vp_f, cute.make_layout((1,)))[0] = cutlass.Float32(
+                        _META_NEG_FLT_MAX
+                    )
+                    ip_f = cute.make_ptr(
+                        cutlass.Int32,
+                        ibase_f + off_f,
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    cute.make_tensor(ip_f, cute.make_layout((1,)))[0] = cutlass.Int32(-1)
+                cwbase[t] = cutlass.Int32(0)
+                cwleft[t] = cutlass.Int32(0)
+
+    @cute.jit
     def __call__(
         self,
         kv_fused: cute.Tensor,  # Fused KV: [num_phys_blocks, block_bytes] FP8
@@ -365,6 +496,15 @@ class FP8MQALogitsKernel:
         num_phys_blocks: cutlass.Int32,
         batch_size: cutlass.Int32,
         stream: cuda.CUstream,
+        # emission-only tensors; defaulted so the positional signature
+        # stays the one callers already use
+        block_max: cute.Tensor = None,  # [num_rows, nb_pad*4] fp32 warp-partials
+        seed_thr: cute.Tensor = None,  # [num_rows, 3] fp32 (emit_seed_counts)
+        seed_counts: cute.Tensor = None,  # [num_rows, 3] int32 / [num_rows, 8] fp32 packed
+        cand: cute.Tensor = None,  # bucketed: [num_rows, 2*segA+capC] fp32 SoA values
+        cand_ctl: cute.Tensor = None,  # [num_rows, 4] int32 {n0, void, n1, n2}, zeroed
+        cand_idx_t: cute.Tensor = None,  # bucketed: [num_rows, 2*segA+capC] int32 SoA
+        cand_cur: cute.Tensor = None,  # bucketed: [num_rows, 4] int32 cursors, zeroed
     ):
         # Derive KV and Scale views from fused buffer using CuTE ops.
         # Fused layout per physical block: [KV data (phys_block_kv*head_dim)] [Scales (phys_block_kv*4)]
@@ -511,6 +651,13 @@ class FP8MQALogitsKernel:
             context_lens,
             schedule_meta,
             batch_size,
+            block_max,
+            seed_thr,
+            seed_counts,
+            cand,
+            cand_ctl,
+            cand_idx_t,
+            cand_cur,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -543,6 +690,13 @@ class FP8MQALogitsKernel:
         mContextLens: cute.Tensor,  # [batch_size]
         mScheduleMeta: cute.Tensor,  # [num_sms+1, 2] int32
         batch_size: cutlass.Int32,
+        mBlockMax: cute.Tensor,  # [num_rows, nb_pad*4] fp32 (emit_block_meta)
+        mSeedThr: cute.Tensor,  # [num_rows, 3] fp32 (emit_seed_counts)
+        mSeedCounts: cute.Tensor,  # [num_rows, 3] int32 / [num_rows, 8] fp32 packed
+        mCand: cute.Tensor,  # bucketed SoA values (emit_cand_bucketed)
+        mCandCtl: cute.Tensor,  # [num_rows, 4] int32 {n0, void, n1, n2}
+        mCandIdx: cute.Tensor,  # bucketed SoA indices
+        mCandCur: cute.Tensor,  # [num_rows, 4] int32 cursors
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -1282,9 +1436,33 @@ class FP8MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
+                if cutlass.const_expr(self.emit_block_meta):
+                    # Free ~8 registers for the meta accumulators/fragments;
+                    # the weight cache sits at the spill edge (same policy
+                    # as the FP4 kernel; emit_seed_counts needs no extra cut).
+                    MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
+                if cutlass.const_expr(self.emit_block_meta):
+                    ctx_cur = cutlass.Int32(0)
+                    meta_warp = local_tidx // 32
+                    meta_lane = local_tidx % 32
+                    if cutlass.const_expr(self.emit_seed_counts):
+                        sthr = cute.make_fragment(next_n * 3, cutlass.Float32)
+                        scnt = cute.make_fragment(next_n * 3, cutlass.Int32)
+                        spass = cute.make_fragment(next_n, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            spass[_i] = cutlass.Int32(0)
+                        for _i in cutlass.range_constexpr(next_n * 3):
+                            sthr[_i] = cutlass.Float32(_META_FLT_MAX)
+                            scnt[_i] = cutlass.Int32(0)
+                    if cutlass.const_expr(self.emit_cand_bucketed):
+                        cwbase = cute.make_fragment(next_n, cutlass.Int32)
+                        cwleft = cute.make_fragment(next_n, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            cwbase[_i] = cutlass.Int32(0)
+                            cwleft[_i] = cutlass.Int32(0)
 
                 while has_work:
                     # fetch_next_task: commit next → current
@@ -1306,11 +1484,43 @@ class FP8MQALogitsKernel:
                                 w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
                                     (t_i * num_heads + w_j, q_stage_local)
                                 ]
+                        if cutlass.const_expr(self.emit_block_meta):
+                            if cutlass.const_expr(self.emit_seed_counts):
+                                # Flush the PREVIOUS request's counters
+                                # before switching context.
+                                if q_idx_old < batch_size:
+                                    self._flush_seed_counts(
+                                        mSeedCounts,
+                                        q_idx_old,
+                                        scnt,
+                                        meta_lane,
+                                        spass=spass,
+                                        cand_ctl=mCandCtl,
+                                    )
+                                # (re)load this q's thresholds (a stale
+                                # FLT_MAX default zeroes every counter)
+                                for _t in cutlass.range_constexpr(next_n):
+                                    for _j in cutlass.range_constexpr(3):
+                                        sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
+                            if cutlass.const_expr(self.emit_cand_bucketed):
+                                if q_idx_old < batch_size:
+                                    self._flush_cand_window_bucketed(
+                                        mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
+                                    )
+                            # Context len for the meta valid mask
+                            # (kv_pos < ctx_cur): the FP8 epilogue runs
+                            # unconditionally over the last partial KV
+                            # block, so aligned-padding GEMM garbage must
+                            # be kept out of every emitted statistic.
+                            ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 0 (kv_idx + 0)
                     # Unconditional Math (like DeepGEMM): OOB results
                     # written to aligned padding region in logits buffer.
                     kv_pos = kv_idx * block_kv_val + m_coord
+                    if cutlass.const_expr(self.emit_block_meta):
+                        meta_kv_tile = kv_idx
+                        meta_valid = kv_pos < ctx_cur
 
                     if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
                         # Skip KV wait, rely on UMMA barrier's
@@ -1473,11 +1683,256 @@ class FP8MQALogitsKernel:
                             result_t = s0x + s0y + s1x + s1y
                         out_row = q_idx * next_n + t
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
+                            stored_t = self.output_dtype(result_t * Float16(scale_val))
                         else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_val)
+                            stored_t = self.output_dtype(result_t * scale_val)
+                        mLogits[(out_row, kv_pos)] = stored_t
+                        if cutlass.const_expr(self.emit_block_meta):
+                            # Meta reduction on the POST-conversion value so
+                            # block_max bounds what GVR reads back bit-exactly.
+                            f32_t = cutlass.Float32(stored_t)
+                            bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
+                            if meta_valid:
+                                bmax_v = f32_t
+                            r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
+                            # Warp-autonomous store: record index =
+                            # tile*4 + warp; the GVR consumer folds the
+                            # 4 warp-partials per block.
+                            if meta_lane == cutlass.Int32(0):
+                                out_row_m = q_idx * next_n + t
+                                rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
+                                mBlockMax[(out_row_m, rec_m)] = r_bmax
+                            if cutlass.const_expr(self.emit_seed_counts):
+                                # Seed-count accumulation: branchless 0/1
+                                # adds on the post-conversion value; the
+                                # valid mask keeps aligned-padding garbage
+                                # out (same contract as block_max).
+                                valid_i1 = cutlass.Int32(meta_valid)
+                                for _j in cutlass.range_constexpr(3):
+                                    ge_j = cutlass.Int32(f32_t >= sthr[t * 3 + _j])
+                                    scnt[t * 3 + _j] = scnt[t * 3 + _j] + (ge_j & valid_i1)
+                                if cutlass.const_expr(self.seed_packed):
+                                    # adaptive-skip pass count: one record
+                                    # per (tile, warp); r_bmax is warp-
+                                    # uniform so lane0 alone accumulates
+                                    if meta_lane == cutlass.Int32(0):
+                                        spass[t] = spass[t] + cutlass.Int32(
+                                            r_bmax >= sthr[t * 3 + 0]
+                                        )
+                            if cutlass.const_expr(self.emit_cand_bucketed):
+                                # Bucketed SoA: A/B EXACT ballot claims
+                                # (their prefixes must stay pad-free for
+                                # the consumer's prefix math), C keeps the
+                                # claim-window; a full segment spills to
+                                # the next looser one. Every warp
+                                # collective sits at the TOP level of this
+                                # warp-uniform bound gate - no collectives
+                                # inside nested dynamic branches (DSL).
+                                if r_bmax >= sthr[t * 3 + 0]:
+                                    segA_k = cutlass.const_expr(self.accept_cap)
+                                    capC_k = cutlass.const_expr(self.cand_cap)
+                                    wtot_k = cutlass.const_expr(2 * self.accept_cap + self.cand_cap)
+                                    row_k = q_idx * next_n + t
+                                    vb_k = mCand.iterator.toint() + cutlass.Int64(
+                                        row_k
+                                    ) * cutlass.Int64(wtot_k) * cutlass.Int64(4)
+                                    ib_k = mCandIdx.iterator.toint() + cutlass.Int64(
+                                        row_k
+                                    ) * cutlass.Int64(wtot_k) * cutlass.Int64(4)
+                                    cur_k = mCandCur.iterator.toint() + cutlass.Int64(
+                                        row_k
+                                    ) * cutlass.Int64(16)
+                                    ctl_k = mCandCtl.iterator.toint() + cutlass.Int64(
+                                        row_k
+                                    ) * cutlass.Int64(16)
+                                    lmk_k = (
+                                        cutlass.Uint32(1) << cutlass.Uint32(meta_lane)
+                                    ) - cutlass.Uint32(1)
+                                    # exclusive class predicates
+                                    pA_k = cutlass.Int32(0)
+                                    pB_k = cutlass.Int32(0)
+                                    pC_k = cutlass.Int32(0)
+                                    if meta_valid:
+                                        if f32_t >= sthr[t * 3 + 2]:
+                                            pA_k = cutlass.Int32(1)
+                                        if f32_t >= sthr[t * 3 + 1] and pA_k == cutlass.Int32(0):
+                                            pB_k = cutlass.Int32(1)
+                                        if (
+                                            f32_t >= sthr[t * 3 + 0]
+                                            and pA_k == cutlass.Int32(0)
+                                            and pB_k == cutlass.Int32(0)
+                                        ):
+                                            pC_k = cutlass.Int32(1)
+                                    # ---- A: exact claim ----
+                                    mA_k = cute.arch.vote_ballot_sync(pA_k != cutlass.Int32(0))
+                                    cntA_k = cutlass.Int32(cute.arch.popc(mA_k))
+                                    offA_k = cutlass.Int32(cute.arch.popc(mA_k & lmk_k))
+                                    baseA_k = cutlass.Int32(0)
+                                    if meta_lane == cutlass.Int32(0) and cntA_k > cutlass.Int32(0):
+                                        baseA_k = _atom_global_add_s32(cur_k, cntA_k)
+                                    baseA_k = cute.arch.shuffle_sync(baseA_k, cutlass.Int32(0))
+                                    slotA_k = baseA_k + offA_k
+                                    spA_k = cutlass.Int32(0)
+                                    if pA_k != cutlass.Int32(0) and slotA_k >= cutlass.Int32(
+                                        segA_k
+                                    ):
+                                        spA_k = cutlass.Int32(1)
+                                    if pA_k != cutlass.Int32(0) and slotA_k < cutlass.Int32(segA_k):
+                                        vp_k = cute.make_ptr(
+                                            cutlass.Float32,
+                                            vb_k + cutlass.Int64(slotA_k) * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(vp_k, cute.make_layout((1,)))[0] = f32_t
+                                        ip_k = cute.make_ptr(
+                                            cutlass.Int32,
+                                            ib_k + cutlass.Int64(slotA_k) * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(ip_k, cute.make_layout((1,)))[0] = kv_pos
+                                    # ---- B: exact claim (native + A spill) ----
+                                    pBe_k = cutlass.Int32(0)
+                                    if pB_k != cutlass.Int32(0) or spA_k != cutlass.Int32(0):
+                                        pBe_k = cutlass.Int32(1)
+                                    mB_k = cute.arch.vote_ballot_sync(pBe_k != cutlass.Int32(0))
+                                    cntB_k = cutlass.Int32(cute.arch.popc(mB_k))
+                                    offB_k = cutlass.Int32(cute.arch.popc(mB_k & lmk_k))
+                                    baseB_k = cutlass.Int32(0)
+                                    if meta_lane == cutlass.Int32(0) and cntB_k > cutlass.Int32(0):
+                                        baseB_k = _atom_global_add_s32(
+                                            cur_k + cutlass.Int64(4), cntB_k
+                                        )
+                                    baseB_k = cute.arch.shuffle_sync(baseB_k, cutlass.Int32(0))
+                                    slotB_k = baseB_k + offB_k
+                                    spB_k = cutlass.Int32(0)
+                                    if pBe_k != cutlass.Int32(0) and slotB_k >= cutlass.Int32(
+                                        segA_k
+                                    ):
+                                        spB_k = cutlass.Int32(1)
+                                    if pBe_k != cutlass.Int32(0) and slotB_k < cutlass.Int32(
+                                        segA_k
+                                    ):
+                                        vp2_k = cute.make_ptr(
+                                            cutlass.Float32,
+                                            vb_k
+                                            + cutlass.Int64(segA_k + slotB_k) * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(vp2_k, cute.make_layout((1,)))[0] = f32_t
+                                        ip2_k = cute.make_ptr(
+                                            cutlass.Int32,
+                                            ib_k
+                                            + cutlass.Int64(segA_k + slotB_k) * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(ip2_k, cute.make_layout((1,)))[0] = kv_pos
+                                    # n0 += exact placements in A and B
+                                    plc_k = (
+                                        cntA_k
+                                        - cutlass.Int32(
+                                            cute.arch.popc(
+                                                cute.arch.vote_ballot_sync(
+                                                    spA_k != cutlass.Int32(0)
+                                                )
+                                            )
+                                        )
+                                    ) + (
+                                        cntB_k
+                                        - cutlass.Int32(
+                                            cute.arch.popc(
+                                                cute.arch.vote_ballot_sync(
+                                                    spB_k != cutlass.Int32(0)
+                                                )
+                                            )
+                                        )
+                                    )
+                                    if meta_lane == cutlass.Int32(0) and plc_k > cutlass.Int32(0):
+                                        _atom_global_add_s32(ctl_k, plc_k)
+                                    # ---- C: claim window (native + B spill) ----
+                                    pCe_k = cutlass.Int32(0)
+                                    if pC_k != cutlass.Int32(0) or spB_k != cutlass.Int32(0):
+                                        pCe_k = cutlass.Int32(1)
+                                    mC_k = cute.arch.vote_ballot_sync(pCe_k != cutlass.Int32(0))
+                                    cntC_k = cutlass.Int32(cute.arch.popc(mC_k))
+                                    offC_k = cutlass.Int32(cute.arch.popc(mC_k & lmk_k))
+                                    if cntC_k > cwleft[t]:
+                                        # sentinel-fill the old window tail
+                                        # (BOTH columns: the consumer pads
+                                        # by score -inf, idx -1)
+                                        slo_k = cwbase[t] + meta_lane
+                                        if meta_lane < cwleft[t] and slo_k < cutlass.Int32(capC_k):
+                                            vpo_k = cute.make_ptr(
+                                                cutlass.Float32,
+                                                vb_k
+                                                + cutlass.Int64(2 * segA_k + slo_k)
+                                                * cutlass.Int64(4),
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=4,
+                                            )
+                                            cute.make_tensor(vpo_k, cute.make_layout((1,)))[0] = (
+                                                cutlass.Float32(_META_NEG_FLT_MAX)
+                                            )
+                                            ipo_k = cute.make_ptr(
+                                                cutlass.Int32,
+                                                ib_k
+                                                + cutlass.Int64(2 * segA_k + slo_k)
+                                                * cutlass.Int64(4),
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=4,
+                                            )
+                                            cute.make_tensor(ipo_k, cute.make_layout((1,)))[0] = (
+                                                cutlass.Int32(-1)
+                                            )
+                                        mC2_k = cntC_k + cutlass.Int32(self.CAND_WIN)
+                                        nbC_k = cutlass.Int32(0)
+                                        if meta_lane == cutlass.Int32(0):
+                                            nbC_k = _atom_global_add_s32(
+                                                cur_k + cutlass.Int64(8), mC2_k
+                                            )
+                                            _atom_global_add_s32(ctl_k, mC2_k)
+                                            if nbC_k + mC2_k > cutlass.Int32(
+                                                capC_k
+                                            ) and nbC_k <= cutlass.Int32(capC_k):
+                                                vdp_k = cute.make_ptr(
+                                                    cutlass.Int32,
+                                                    ctl_k + cutlass.Int64(4),
+                                                    cute.AddressSpace.gmem,
+                                                    assumed_align=4,
+                                                )
+                                                cute.make_tensor(vdp_k, cute.make_layout((1,)))[
+                                                    0
+                                                ] = cutlass.Int32(1)
+                                        nbC_k = cute.arch.shuffle_sync(nbC_k, cutlass.Int32(0))
+                                        cwbase[t] = nbC_k
+                                        cwleft[t] = mC2_k
+                                    slotC_k = cwbase[t] + offC_k
+                                    if pCe_k != cutlass.Int32(0) and slotC_k < cutlass.Int32(
+                                        capC_k
+                                    ):
+                                        vpc_k = cute.make_ptr(
+                                            cutlass.Float32,
+                                            vb_k
+                                            + cutlass.Int64(2 * segA_k + slotC_k)
+                                            * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(vpc_k, cute.make_layout((1,)))[0] = f32_t
+                                        ipc_k = cute.make_ptr(
+                                            cutlass.Int32,
+                                            ib_k
+                                            + cutlass.Int64(2 * segA_k + slotC_k)
+                                            * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(ipc_k, cute.make_layout((1,)))[0] = kv_pos
+                                    cwbase[t] = cwbase[t] + cntC_k
+                                    cwleft[t] = cwleft[t] - cntC_k
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
@@ -1490,6 +1945,18 @@ class FP8MQALogitsKernel:
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                # Flush the final request's emission state (WG 0).
+                if cutlass.const_expr(self.emit_seed_counts):
+                    if q_idx < batch_size:
+                        self._flush_seed_counts(
+                            mSeedCounts, q_idx, scnt, meta_lane, spass=spass, cand_ctl=mCandCtl
+                        )
+                if cutlass.const_expr(self.emit_cand_bucketed):
+                    if q_idx < batch_size:
+                        self._flush_cand_window_bucketed(
+                            mCand, mCandIdx, q_idx, cwbase, cwleft, meta_lane
+                        )
 
                 # Release last Q stage (WG 0)
                 if q_idx < batch_size:
@@ -1517,9 +1984,33 @@ class FP8MQALogitsKernel:
                     MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
                 else:
                     MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
+                if cutlass.const_expr(self.emit_block_meta):
+                    # Free ~8 registers for the meta accumulators/fragments;
+                    # the weight cache sits at the spill edge (same policy
+                    # as the FP4 kernel; emit_seed_counts needs no extra cut).
+                    MAX_NUM_W_IN_REG = MAX_NUM_W_IN_REG - 8
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
+                if cutlass.const_expr(self.emit_block_meta):
+                    ctx_cur = cutlass.Int32(0)
+                    meta_warp = local_tidx // 32
+                    meta_lane = local_tidx % 32
+                    if cutlass.const_expr(self.emit_seed_counts):
+                        sthr = cute.make_fragment(next_n * 3, cutlass.Float32)
+                        scnt = cute.make_fragment(next_n * 3, cutlass.Int32)
+                        spass = cute.make_fragment(next_n, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            spass[_i] = cutlass.Int32(0)
+                        for _i in cutlass.range_constexpr(next_n * 3):
+                            sthr[_i] = cutlass.Float32(_META_FLT_MAX)
+                            scnt[_i] = cutlass.Int32(0)
+                    if cutlass.const_expr(self.emit_cand_bucketed):
+                        cwbase = cute.make_fragment(next_n, cutlass.Int32)
+                        cwleft = cute.make_fragment(next_n, cutlass.Int32)
+                        for _i in cutlass.range_constexpr(next_n):
+                            cwbase[_i] = cutlass.Int32(0)
+                            cwleft[_i] = cutlass.Int32(0)
 
                 while has_work:
                     # fetch_next_task: commit next → current
@@ -1541,12 +2032,44 @@ class FP8MQALogitsKernel:
                                 w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
                                     (t_i * num_heads + w_j, q_stage_local)
                                 ]
+                        if cutlass.const_expr(self.emit_block_meta):
+                            if cutlass.const_expr(self.emit_seed_counts):
+                                # Flush the PREVIOUS request's counters
+                                # before switching context.
+                                if q_idx_old < batch_size:
+                                    self._flush_seed_counts(
+                                        mSeedCounts,
+                                        q_idx_old,
+                                        scnt,
+                                        meta_lane,
+                                        spass=spass,
+                                        cand_ctl=mCandCtl,
+                                    )
+                                # (re)load this q's thresholds (a stale
+                                # FLT_MAX default zeroes every counter)
+                                for _t in cutlass.range_constexpr(next_n):
+                                    for _j in cutlass.range_constexpr(3):
+                                        sthr[_t * 3 + _j] = mSeedThr[(q_idx * next_n + _t, _j)]
+                            if cutlass.const_expr(self.emit_cand_bucketed):
+                                if q_idx_old < batch_size:
+                                    self._flush_cand_window_bucketed(
+                                        mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
+                                    )
+                            # Context len for the meta valid mask
+                            # (kv_pos < ctx_cur): the FP8 epilogue runs
+                            # unconditionally over the last partial KV
+                            # block, so aligned-padding GEMM garbage must
+                            # be kept out of every emitted statistic.
+                            ctx_cur = mContextLens[q_idx]
 
                     # Process KV block for group 1 (kv_idx + 1)
                     # Unconditional Math (like DeepGEMM)
                     kv_idx_1 = kv_idx + 1
 
                     kv_pos = kv_idx_1 * block_kv_val + m_coord
+                    if cutlass.const_expr(self.emit_block_meta):
+                        meta_kv_tile = kv_idx_1
+                        meta_valid = kv_pos < ctx_cur
 
                     if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
                         umma_pipeline_1.consumer_wait(umma_cons_state_1)
@@ -1689,11 +2212,256 @@ class FP8MQALogitsKernel:
                             result_t = s0x + s0y + s1x + s1y
                         out_row = q_idx * next_n + t
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
+                            stored_t = self.output_dtype(result_t * Float16(scale_val))
                         else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_val)
+                            stored_t = self.output_dtype(result_t * scale_val)
+                        mLogits[(out_row, kv_pos)] = stored_t
+                        if cutlass.const_expr(self.emit_block_meta):
+                            # Meta reduction on the POST-conversion value so
+                            # block_max bounds what GVR reads back bit-exactly.
+                            f32_t = cutlass.Float32(stored_t)
+                            bmax_v = cutlass.Float32(_META_NEG_FLT_MAX)
+                            if meta_valid:
+                                bmax_v = f32_t
+                            r_bmax = cute.arch.warp_redux_sync(bmax_v, "fmax")
+                            # Warp-autonomous store: record index =
+                            # tile*4 + warp; the GVR consumer folds the
+                            # 4 warp-partials per block.
+                            if meta_lane == cutlass.Int32(0):
+                                out_row_m = q_idx * next_n + t
+                                rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
+                                mBlockMax[(out_row_m, rec_m)] = r_bmax
+                            if cutlass.const_expr(self.emit_seed_counts):
+                                # Seed-count accumulation: branchless 0/1
+                                # adds on the post-conversion value; the
+                                # valid mask keeps aligned-padding garbage
+                                # out (same contract as block_max).
+                                valid_i1 = cutlass.Int32(meta_valid)
+                                for _j in cutlass.range_constexpr(3):
+                                    ge_j = cutlass.Int32(f32_t >= sthr[t * 3 + _j])
+                                    scnt[t * 3 + _j] = scnt[t * 3 + _j] + (ge_j & valid_i1)
+                                if cutlass.const_expr(self.seed_packed):
+                                    # adaptive-skip pass count: one record
+                                    # per (tile, warp); r_bmax is warp-
+                                    # uniform so lane0 alone accumulates
+                                    if meta_lane == cutlass.Int32(0):
+                                        spass[t] = spass[t] + cutlass.Int32(
+                                            r_bmax >= sthr[t * 3 + 0]
+                                        )
+                            if cutlass.const_expr(self.emit_cand_bucketed):
+                                # Bucketed SoA: A/B EXACT ballot claims
+                                # (their prefixes must stay pad-free for
+                                # the consumer's prefix math), C keeps the
+                                # claim-window; a full segment spills to
+                                # the next looser one. Every warp
+                                # collective sits at the TOP level of this
+                                # warp-uniform bound gate - no collectives
+                                # inside nested dynamic branches (DSL).
+                                if r_bmax >= sthr[t * 3 + 0]:
+                                    segA_k = cutlass.const_expr(self.accept_cap)
+                                    capC_k = cutlass.const_expr(self.cand_cap)
+                                    wtot_k = cutlass.const_expr(2 * self.accept_cap + self.cand_cap)
+                                    row_k = q_idx * next_n + t
+                                    vb_k = mCand.iterator.toint() + cutlass.Int64(
+                                        row_k
+                                    ) * cutlass.Int64(wtot_k) * cutlass.Int64(4)
+                                    ib_k = mCandIdx.iterator.toint() + cutlass.Int64(
+                                        row_k
+                                    ) * cutlass.Int64(wtot_k) * cutlass.Int64(4)
+                                    cur_k = mCandCur.iterator.toint() + cutlass.Int64(
+                                        row_k
+                                    ) * cutlass.Int64(16)
+                                    ctl_k = mCandCtl.iterator.toint() + cutlass.Int64(
+                                        row_k
+                                    ) * cutlass.Int64(16)
+                                    lmk_k = (
+                                        cutlass.Uint32(1) << cutlass.Uint32(meta_lane)
+                                    ) - cutlass.Uint32(1)
+                                    # exclusive class predicates
+                                    pA_k = cutlass.Int32(0)
+                                    pB_k = cutlass.Int32(0)
+                                    pC_k = cutlass.Int32(0)
+                                    if meta_valid:
+                                        if f32_t >= sthr[t * 3 + 2]:
+                                            pA_k = cutlass.Int32(1)
+                                        if f32_t >= sthr[t * 3 + 1] and pA_k == cutlass.Int32(0):
+                                            pB_k = cutlass.Int32(1)
+                                        if (
+                                            f32_t >= sthr[t * 3 + 0]
+                                            and pA_k == cutlass.Int32(0)
+                                            and pB_k == cutlass.Int32(0)
+                                        ):
+                                            pC_k = cutlass.Int32(1)
+                                    # ---- A: exact claim ----
+                                    mA_k = cute.arch.vote_ballot_sync(pA_k != cutlass.Int32(0))
+                                    cntA_k = cutlass.Int32(cute.arch.popc(mA_k))
+                                    offA_k = cutlass.Int32(cute.arch.popc(mA_k & lmk_k))
+                                    baseA_k = cutlass.Int32(0)
+                                    if meta_lane == cutlass.Int32(0) and cntA_k > cutlass.Int32(0):
+                                        baseA_k = _atom_global_add_s32(cur_k, cntA_k)
+                                    baseA_k = cute.arch.shuffle_sync(baseA_k, cutlass.Int32(0))
+                                    slotA_k = baseA_k + offA_k
+                                    spA_k = cutlass.Int32(0)
+                                    if pA_k != cutlass.Int32(0) and slotA_k >= cutlass.Int32(
+                                        segA_k
+                                    ):
+                                        spA_k = cutlass.Int32(1)
+                                    if pA_k != cutlass.Int32(0) and slotA_k < cutlass.Int32(segA_k):
+                                        vp_k = cute.make_ptr(
+                                            cutlass.Float32,
+                                            vb_k + cutlass.Int64(slotA_k) * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(vp_k, cute.make_layout((1,)))[0] = f32_t
+                                        ip_k = cute.make_ptr(
+                                            cutlass.Int32,
+                                            ib_k + cutlass.Int64(slotA_k) * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(ip_k, cute.make_layout((1,)))[0] = kv_pos
+                                    # ---- B: exact claim (native + A spill) ----
+                                    pBe_k = cutlass.Int32(0)
+                                    if pB_k != cutlass.Int32(0) or spA_k != cutlass.Int32(0):
+                                        pBe_k = cutlass.Int32(1)
+                                    mB_k = cute.arch.vote_ballot_sync(pBe_k != cutlass.Int32(0))
+                                    cntB_k = cutlass.Int32(cute.arch.popc(mB_k))
+                                    offB_k = cutlass.Int32(cute.arch.popc(mB_k & lmk_k))
+                                    baseB_k = cutlass.Int32(0)
+                                    if meta_lane == cutlass.Int32(0) and cntB_k > cutlass.Int32(0):
+                                        baseB_k = _atom_global_add_s32(
+                                            cur_k + cutlass.Int64(4), cntB_k
+                                        )
+                                    baseB_k = cute.arch.shuffle_sync(baseB_k, cutlass.Int32(0))
+                                    slotB_k = baseB_k + offB_k
+                                    spB_k = cutlass.Int32(0)
+                                    if pBe_k != cutlass.Int32(0) and slotB_k >= cutlass.Int32(
+                                        segA_k
+                                    ):
+                                        spB_k = cutlass.Int32(1)
+                                    if pBe_k != cutlass.Int32(0) and slotB_k < cutlass.Int32(
+                                        segA_k
+                                    ):
+                                        vp2_k = cute.make_ptr(
+                                            cutlass.Float32,
+                                            vb_k
+                                            + cutlass.Int64(segA_k + slotB_k) * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(vp2_k, cute.make_layout((1,)))[0] = f32_t
+                                        ip2_k = cute.make_ptr(
+                                            cutlass.Int32,
+                                            ib_k
+                                            + cutlass.Int64(segA_k + slotB_k) * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(ip2_k, cute.make_layout((1,)))[0] = kv_pos
+                                    # n0 += exact placements in A and B
+                                    plc_k = (
+                                        cntA_k
+                                        - cutlass.Int32(
+                                            cute.arch.popc(
+                                                cute.arch.vote_ballot_sync(
+                                                    spA_k != cutlass.Int32(0)
+                                                )
+                                            )
+                                        )
+                                    ) + (
+                                        cntB_k
+                                        - cutlass.Int32(
+                                            cute.arch.popc(
+                                                cute.arch.vote_ballot_sync(
+                                                    spB_k != cutlass.Int32(0)
+                                                )
+                                            )
+                                        )
+                                    )
+                                    if meta_lane == cutlass.Int32(0) and plc_k > cutlass.Int32(0):
+                                        _atom_global_add_s32(ctl_k, plc_k)
+                                    # ---- C: claim window (native + B spill) ----
+                                    pCe_k = cutlass.Int32(0)
+                                    if pC_k != cutlass.Int32(0) or spB_k != cutlass.Int32(0):
+                                        pCe_k = cutlass.Int32(1)
+                                    mC_k = cute.arch.vote_ballot_sync(pCe_k != cutlass.Int32(0))
+                                    cntC_k = cutlass.Int32(cute.arch.popc(mC_k))
+                                    offC_k = cutlass.Int32(cute.arch.popc(mC_k & lmk_k))
+                                    if cntC_k > cwleft[t]:
+                                        # sentinel-fill the old window tail
+                                        # (BOTH columns: the consumer pads
+                                        # by score -inf, idx -1)
+                                        slo_k = cwbase[t] + meta_lane
+                                        if meta_lane < cwleft[t] and slo_k < cutlass.Int32(capC_k):
+                                            vpo_k = cute.make_ptr(
+                                                cutlass.Float32,
+                                                vb_k
+                                                + cutlass.Int64(2 * segA_k + slo_k)
+                                                * cutlass.Int64(4),
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=4,
+                                            )
+                                            cute.make_tensor(vpo_k, cute.make_layout((1,)))[0] = (
+                                                cutlass.Float32(_META_NEG_FLT_MAX)
+                                            )
+                                            ipo_k = cute.make_ptr(
+                                                cutlass.Int32,
+                                                ib_k
+                                                + cutlass.Int64(2 * segA_k + slo_k)
+                                                * cutlass.Int64(4),
+                                                cute.AddressSpace.gmem,
+                                                assumed_align=4,
+                                            )
+                                            cute.make_tensor(ipo_k, cute.make_layout((1,)))[0] = (
+                                                cutlass.Int32(-1)
+                                            )
+                                        mC2_k = cntC_k + cutlass.Int32(self.CAND_WIN)
+                                        nbC_k = cutlass.Int32(0)
+                                        if meta_lane == cutlass.Int32(0):
+                                            nbC_k = _atom_global_add_s32(
+                                                cur_k + cutlass.Int64(8), mC2_k
+                                            )
+                                            _atom_global_add_s32(ctl_k, mC2_k)
+                                            if nbC_k + mC2_k > cutlass.Int32(
+                                                capC_k
+                                            ) and nbC_k <= cutlass.Int32(capC_k):
+                                                vdp_k = cute.make_ptr(
+                                                    cutlass.Int32,
+                                                    ctl_k + cutlass.Int64(4),
+                                                    cute.AddressSpace.gmem,
+                                                    assumed_align=4,
+                                                )
+                                                cute.make_tensor(vdp_k, cute.make_layout((1,)))[
+                                                    0
+                                                ] = cutlass.Int32(1)
+                                        nbC_k = cute.arch.shuffle_sync(nbC_k, cutlass.Int32(0))
+                                        cwbase[t] = nbC_k
+                                        cwleft[t] = mC2_k
+                                    slotC_k = cwbase[t] + offC_k
+                                    if pCe_k != cutlass.Int32(0) and slotC_k < cutlass.Int32(
+                                        capC_k
+                                    ):
+                                        vpc_k = cute.make_ptr(
+                                            cutlass.Float32,
+                                            vb_k
+                                            + cutlass.Int64(2 * segA_k + slotC_k)
+                                            * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(vpc_k, cute.make_layout((1,)))[0] = f32_t
+                                        ipc_k = cute.make_ptr(
+                                            cutlass.Int32,
+                                            ib_k
+                                            + cutlass.Int64(2 * segA_k + slotC_k)
+                                            * cutlass.Int64(4),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=4,
+                                        )
+                                        cute.make_tensor(ipc_k, cute.make_layout((1,)))[0] = kv_pos
+                                    cwbase[t] = cwbase[t] + cntC_k
+                                    cwleft[t] = cwleft[t] - cntC_k
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
@@ -1706,6 +2474,18 @@ class FP8MQALogitsKernel:
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                # Flush the final request's emission state (WG 1).
+                if cutlass.const_expr(self.emit_seed_counts):
+                    if q_idx < batch_size:
+                        self._flush_seed_counts(
+                            mSeedCounts, q_idx, scnt, meta_lane, spass=spass, cand_ctl=mCandCtl
+                        )
+                if cutlass.const_expr(self.emit_cand_bucketed):
+                    if q_idx < batch_size:
+                        self._flush_cand_window_bucketed(
+                            mCand, mCandIdx, q_idx, cwbase, cwleft, meta_lane
+                        )
 
                 # Release last Q stage (WG 1)
                 if q_idx < batch_size:

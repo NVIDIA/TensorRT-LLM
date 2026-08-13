@@ -723,12 +723,10 @@ class Indexer(nn.Module):
         # GVR emission-assisted decode (opt-in, experimental): the FP4/FP8
         # indexer epilogue emits candidates the GVR Top-K consumes (see
         # gvr_emission / gvr_routing; state lives on the TopK module)
-        # only the FP4 scoring op accepts emission kwargs
         self.use_gvr_emission = (
             os.environ.get("TRTLLM_GVR_EMISSION", "0") == "1"
             and decode_top_k_implementation == TopKImplementation.CUTE_DSL_GVR
             and self.use_cute_dsl_paged_mqa_logits
-            and self.use_fp4
         )
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
