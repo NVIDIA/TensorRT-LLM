@@ -266,7 +266,7 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.parametrize("_repeat", range(360, 460), ids=lambda i: f"rep{i:02d}")
+    @pytest.mark.parametrize("_repeat", range(460, 560), ids=lambda i: f"rep{i:02d}")
     @pytest.mark.parametrize(
         "variant",
         [
