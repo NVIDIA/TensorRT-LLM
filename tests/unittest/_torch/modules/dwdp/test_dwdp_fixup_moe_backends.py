@@ -31,6 +31,7 @@ real MPI environment.
 import unittest
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -39,6 +40,8 @@ from tensorrt_llm._torch.modules.dwdp.setup import (
     _allgather_expert_scales,
     _scatter_shards_to_full,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _make_mock_comm(all_shards):
