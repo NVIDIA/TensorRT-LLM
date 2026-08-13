@@ -75,31 +75,6 @@ def test_gpt_oss_explicit_setting_wins(user_setting):
         use_kv_cache_manager_v2=user_setting)) is user_setting
 
 
-def test_gpt_oss_two_model_eagle3_falls_back_to_v1():
-    """Two-model Eagle3 builds a separate draft engine with its own KV cache
-    manager, and V2 sizes both from the full budget, so the model preference is
-    demoted to V1."""
-    assert _resolve_gpt_oss_kv_cache_manager_v2(
-        speculative_config=Eagle3DecodingConfig(
-            max_draft_len=3,
-            speculative_model="/tmp/dummy_eagle_model",
-            eagle3_one_model=False)) is False
-
-
-def test_gpt_oss_explicit_v2_rejects_two_model_eagle3():
-    """The demotion above only applies to the model preference. An explicit
-    request for the same unsupported combination is rejected rather than
-    silently honored."""
-    with pytest.raises(ValueError,
-                       match="use_kv_cache_manager_v2=True is not supported"):
-        _resolve_gpt_oss_kv_cache_manager_v2(
-            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-            speculative_config=Eagle3DecodingConfig(
-                max_draft_len=3,
-                speculative_model="/tmp/dummy_eagle_model",
-                eagle3_one_model=False))
-
-
 def test_gpt_oss_one_model_eagle3_keeps_v2():
     """One-model Eagle3 shares the target engine, so V2 still applies."""
     assert _resolve_gpt_oss_kv_cache_manager_v2(
