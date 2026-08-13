@@ -141,6 +141,13 @@ devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
 mx_deps = ["modelexpress==0.4.1"]
+# Gateway protocol adapters are opt-in extras: the default installation must
+# not carry any gateway protobuf package. Each gateway owns a dedicated
+# requirements-<gateway>.txt as the single source of truth for its pins; CI
+# stages that exercise a gateway install that file explicitly, and the file
+# may carry gateway-specific options (such as an --extra-index-url) without
+# affecting the default dependency graph.
+grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -435,6 +442,31 @@ packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 msa_package_dir = {"fmha_sm100": "3rdparty/MSA/python/fmha_sm100"}
 packages += ["fmha_sm100"]
 
+
+def get_build_state_options():
+    """Optionally redirect setuptools build state out of the source tree.
+
+    When TRTLLM_WHEEL_STAGING_DIR is set (e.g. by scripts/build_wheel.py
+    --build_root), the setuptools staging tree (build/) and *.egg-info are
+    written there instead of into the checkout. This keeps metadata-heavy
+    churn off slow network filesystems; behavior is unchanged when unset.
+    """
+    staging_dir = os.environ.get("TRTLLM_WHEEL_STAGING_DIR")
+    if not staging_dir:
+        return {}
+    staging = Path(staging_dir)
+    egg_base = staging / "egg-info"
+    egg_base.mkdir(parents=True, exist_ok=True)
+    return {
+        "build": {
+            "build_base": str(staging / "build")
+        },
+        "egg_info": {
+            "egg_base": str(egg_base)
+        },
+    }
+
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
@@ -459,6 +491,7 @@ setup(
         "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
+    options=get_build_state_options(),
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
@@ -484,8 +517,9 @@ setup(
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
-        "devel": devel_deps,
+        "devel": devel_deps + grpc_smg_deps,
         "mx": mx_deps,
+        "grpc-smg": grpc_smg_deps,
     },
     zip_safe=True,
     install_requires=required_deps,
