@@ -2425,7 +2425,9 @@ class RankInfoServer:
         self.shutdown()
 
 
-def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAgent:
+def _create_nixl_agent(
+    name: str, rank: int, world_size: int, agent_buffer_enable: Optional[bool] = None
+) -> NixlTransferAgent:
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
@@ -2436,6 +2438,7 @@ def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAge
         num_threads=num_threads,
         rank=rank,
         world_size=world_size,
+        agent_buffer_enable=agent_buffer_enable,
         **kwargs,
     )
 
@@ -2466,6 +2469,9 @@ class TransferWorkerConfig:
     rx_timeout_s: Optional[float] = None
     bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
+    # Transfer-agent staging-buffer (bounce v2) switch; None falls back to
+    # TRTLLM_NIXL_BOUNCE_ENABLE. Mutually exclusive with `bounce` above.
+    agent_buffer_enable: Optional[bool] = None
 
 
 class TransferWorker:
@@ -2536,6 +2542,7 @@ class TransferWorker:
             self._rank_info.instance_name + str(self._rank_info.instance_rank),
             rank=mapping.rank,
             world_size=mapping.world_size,
+            agent_buffer_enable=self._config.agent_buffer_enable,
         )
         self._registered_mem: list = []
         try:

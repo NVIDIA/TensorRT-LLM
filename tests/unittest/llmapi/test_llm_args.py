@@ -2609,6 +2609,20 @@ class TestStrictBaseModelArbitraryArgs:
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
 
+        # agent_buffer_enable defaults to unset (env-var fallback), accepts an explicit value, and
+        # is mutually exclusive with the Python-transceiver bounce (kv_cache_bounce_size_mb).
+        assert config.agent_buffer_enable is None
+        assert CacheTransceiverConfig(
+            agent_buffer_enable=True).agent_buffer_enable is True
+        # An explicit False is a valid combination with the Python bounce.
+        assert CacheTransceiverConfig(
+            agent_buffer_enable=False,
+            kv_cache_bounce_size_mb=384).kv_cache_bounce_size_mb == 384
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+                           match="mutually exclusive"):
+            CacheTransceiverConfig(agent_buffer_enable=True,
+                                   kv_cache_bounce_size_mb=384)
+
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:

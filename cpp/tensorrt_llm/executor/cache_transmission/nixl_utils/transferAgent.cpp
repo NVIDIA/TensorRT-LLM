@@ -122,9 +122,15 @@ private:
 };
 } // namespace
 
-void NixlTransferAgent::maybeInitBounce()
+void NixlTransferAgent::maybeInitBounce(std::optional<bool> agentBufferEnable)
 {
     auto cfg = bounce::BounceConfig::fromEnv();
+    // An explicit agent_buffer_enable from CacheTransceiverConfig / BaseAgentConfig overrides the
+    // TRTLLM_NIXL_BOUNCE_ENABLE environment variable; unset keeps the env-var behavior.
+    if (agentBufferEnable.has_value())
+    {
+        cfg.enabled = agentBufferEnable.value();
+    }
     if (!cfg.enabled)
     {
         return;
@@ -290,7 +296,13 @@ struct NixlBounceState
 };
 } // namespace bounce
 
-void NixlTransferAgent::maybeInitBounce() {}
+void NixlTransferAgent::maybeInitBounce(std::optional<bool> agentBufferEnable)
+{
+    if (agentBufferEnable.value_or(false))
+    {
+        TLLM_LOG_WARNING("agent_buffer_enable requested but bounce support is not built; ignoring");
+    }
+}
 
 bool NixlTransferAgent::shouldUseBounce(TransferRequest const&) const
 {
@@ -741,7 +753,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
 
     // Bring up bounce v2 now, if enabled, so its shared arena is registered before any peer fetches
     // our metadata. This is a no-op when bounce is disabled or not built.
-    maybeInitBounce();
+    maybeInitBounce(config.agentBufferEnable);
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
