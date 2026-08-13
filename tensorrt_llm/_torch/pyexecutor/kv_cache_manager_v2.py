@@ -74,6 +74,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     gen_multimodal_cache_key_tokens,
     typed_range,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND as KV_CACHE_MANAGER_V2_BACKEND
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
@@ -84,7 +85,7 @@ from ...logger import logger
 from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
 from .connectors.kv_cache_connector import KvCacheConnectorManager
-from .kv_cache_events import StreamingKVCacheEventManager
+from .kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -891,11 +892,17 @@ class KVCacheManagerV2(BaseResourceManager):
                     "precedence and the buffered get_kv_cache_events() poll path "
                     "will return no events."
                 )
-            if mapping.pp_size > 1:
-                raise ValueError("Streaming KV events do not support pipeline parallelism")
-            if mapping.cp_size > 1:
-                raise ValueError("Streaming KV events do not support context parallelism")
             assert kv_events_config is not None
+            # Rejects unsupported parallelism, a non-Python V2 backend and colliding
+            # publish/replay port ranges, all before any socket is bound.
+            validate_streaming_support(
+                kv_events_config,
+                pp_size=mapping.pp_size,
+                cp_size=mapping.cp_size,
+                # Only ranks sharing a host can collide on a port.
+                ranks_per_host=min(mapping.dp_size, mapping.gpus_per_node),
+                backend=KV_CACHE_MANAGER_V2_BACKEND,
+            )
             if mapping.enable_attention_dp or mpi_rank() == 0:
                 event_rank = mapping.rank if mapping.enable_attention_dp else 0
                 self.event_manager = StreamingKVCacheEventManager(
@@ -1109,7 +1116,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise
             if self.event_manager is not None:
                 self.event_manager.set_layer_group_window_sizes(
-                    self._get_event_window_sizes_by_layer_group()
+                    self._get_event_window_sizes_by_layer_group(
+                        attention_only=isinstance(self.event_manager, StreamingKVCacheEventManager)
+                    )
                 )
                 self.event_manager.add_created_event(
                     self._get_event_num_blocks_per_cache_level(cache_tiers, tokens_per_block),
@@ -1535,11 +1544,19 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_event_layer_group_ids(self) -> List[int]:
         return [int(layer_group_id) for layer_group_id in range(len(self.impl.layer_grouping))]
 
-    def _get_event_window_sizes_by_layer_group(self) -> Dict[int, int]:
+    def _get_event_window_sizes_by_layer_group(
+        self, attention_only: bool = False
+    ) -> Dict[int, int]:
         # Assumes every layer in a group shares the same sliding_window_size,
         # which is how `impl.layer_grouping` partitions layers today. Only the
         # first layer's window is read; if the grouping policy ever permits
         # mixed windows in one group, this needs to fan out per-layer.
+        #
+        # `attention_only` is set for the streaming event manager, which tracks
+        # attention prefix reuse only: excluding SSM and other non-attention life cycles
+        # prevents a state life cycle (which reports max_seq_len as its window) from
+        # tying with the attention life cycle and being selected as the event target.
+        # The buffered manager keeps every layer group, so its windows are unchanged.
 
         def get_event_window_size(layer_id: int) -> int:
             layer_config = self.kv_cache_manager_py_config.layers[layer_id]
@@ -1548,13 +1565,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
         window_sizes: Dict[int, int] = {}
         for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping):
-            life_cycle = self.impl._life_cycles.get_life_cycle(LifeCycleId(layer_group_id))
-            # Streaming KV events track attention prefix reuse only. Excluding SSM
-            # and other non-attention life cycles prevents a state life cycle
-            # (which reports max_seq_len as its window) from tying with the
-            # attention life cycle and being selected as the event target.
-            if not isinstance(life_cycle, AttnLifeCycle):
-                continue
+            if attention_only:
+                life_cycle = self.impl._life_cycles.get_life_cycle(LifeCycleId(layer_group_id))
+                if not isinstance(life_cycle, AttnLifeCycle):
+                    continue
             window_sizes[int(layer_group_id)] = get_event_window_size(int(layer_ids[0]))
         return window_sizes
 

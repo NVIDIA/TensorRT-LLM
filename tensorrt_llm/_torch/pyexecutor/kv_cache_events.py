@@ -13,10 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# This module defines TensorRT-LLM's KV cache event wire format: msgpack event
-# batches published over ZeroMQ. The on-wire schema and three-frame framing are
-# adapted from vLLM's vllm/distributed/kv_events.py so that external
-# KV-cache-aware routers can consume TensorRT-LLM events without translation.
+# This module defines TensorRT-LLM's KV cache event wire format: msgpack event batches
+# published over ZeroMQ in the three-frame (topic, seq, payload) framing that external
+# KV-cache-aware routers expect. Each event encodes as a map tagged with a "type" key,
+# the form documented for custom router backends, so routers consume these batches
+# without translation. This differs from vLLM's vllm/distributed/kv_events.py, whose
+# structs set array_like=True and encode as tagged positional arrays; keeping the map
+# form leaves field order out of the wire contract. The batch envelope is positional
+# in both.
 
 from __future__ import annotations
 
@@ -38,7 +42,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_hash import truncate_sha256_hash_to_int64
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEvent, KVCacheEventDiff
 
-ExternalBlockHash = bytes | int
+# Subscribers decode block hashes as 64-bit ints, so a bytes value would fail the
+# decode for the entire batch.
+ExternalBlockHash = int
 
 
 class EventBatch(
@@ -125,7 +131,13 @@ class NullEventPublisher(EventPublisher):
 
 
 class ZmqEventPublisher(EventPublisher):
-    """Publishes event batches over the three-frame ZeroMQ wire protocol."""
+    """Publishes event batches over the three-frame ZeroMQ wire protocol.
+
+    Delivery is best effort, but loss is observable: :meth:`publish` reserves a sequence
+    number per accepted batch, so a dropped batch leaves a gap. Subscribers must treat a
+    gap -- including a replay that starts above the requested ``start_seq`` because
+    ``buffer_steps`` evicted older batches -- as lost KV-cache state and resynchronize.
+    """
 
     SHUTDOWN_TIMEOUT = 1.0
     END_SEQ = (-1).to_bytes(8, "big", signed=True)
@@ -141,7 +153,7 @@ class ZmqEventPublisher(EventPublisher):
         topic: str = "",
     ) -> None:
         super().__init__(data_parallel_rank)
-        self._event_queue = Queue[EventBatch | None](maxsize=max_queue_size)
+        self._event_queue = Queue[Optional[tuple[int, EventBatch]]](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
         self._ctx = zmq.Context.instance()
         self._pub: Optional[zmq.Socket] = None
@@ -191,8 +203,12 @@ class ZmqEventPublisher(EventPublisher):
             return False
         if events.data_parallel_rank is None:
             events.data_parallel_rank = self._data_parallel_rank
+        # Reserve the sequence number here rather than in the publisher thread, so a
+        # batch lost to a full queue or a failed send leaves a detectable gap instead of
+        # a contiguous stream that hides the loss. publish() is the only allocator.
+        seq = next(self._seq_gen)
         try:
-            self._event_queue.put_nowait(events)
+            self._event_queue.put_nowait((seq, events))
             self.enqueued_batches += 1
             return True
         except queue.Full:
@@ -201,8 +217,8 @@ class ZmqEventPublisher(EventPublisher):
             if drops == 1 or (drops & (drops - 1) == 0):
                 logger.warning(
                     f"Dropping streaming KV event batch on rank={self._rank} because "
-                    "the publisher queue is full; "
-                    f"dropped_batches={self.dropped_batches}"
+                    f"the publisher queue is full; seq={seq} will be missing from the "
+                    f"stream; dropped_batches={self.dropped_batches}"
                 )
             return False
 
@@ -260,13 +276,13 @@ class ZmqEventPublisher(EventPublisher):
                             f"{traceback.format_exc()}"
                         )
                 try:
-                    event = self._event_queue.get(timeout=0.1)
+                    item = self._event_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                if event is None:
+                if item is None:
                     self._event_queue.task_done()
                     break
-                seq = next(self._seq_gen)
+                seq, event = item
                 try:
                     payload = encoder.encode(event)
                     self._pub.send_multipart(
@@ -281,8 +297,9 @@ class ZmqEventPublisher(EventPublisher):
                 except Exception:
                     self._send_error_drops += 1
                     logger.error(
-                        f"Failed to publish streaming KV event batch rank={self._rank} "
-                        f"seq={seq}\n{traceback.format_exc()}"
+                        f"Failed to publish streaming KV event batch rank={self._rank}; "
+                        f"seq={seq} will be missing from the stream\n"
+                        f"{traceback.format_exc()}"
                     )
                     time.sleep(0.1)
                 finally:
@@ -344,6 +361,71 @@ class ZmqEventPublisher(EventPublisher):
                 )
             return f"{base_addr}:{new_port}"
         raise ValueError("Invalid endpoint: must start with 'inproc://', 'ipc://', or 'tcp://'")
+
+
+def _tcp_base_port(endpoint: str | None) -> int | None:
+    """Return the base port of a TCP endpoint, or None if it is not TCP."""
+    if not endpoint or not endpoint.startswith("tcp://"):
+        return None
+    last_colon_idx = endpoint.rfind(":")
+    port_text = endpoint[last_colon_idx + 1 :]
+    if not port_text.isdigit():
+        return None
+    return int(port_text)
+
+
+def validate_streaming_support(
+    config: KVEventsConfig,
+    *,
+    pp_size: int,
+    cp_size: int,
+    ranks_per_host: int,
+    backend: str,
+) -> None:
+    """Reject streaming-KV-event configurations the engine cannot honour.
+
+    Split out of ``KVCacheManagerV2.__init__`` so the preconditions are testable
+    without building a manager, which needs a GPU.
+    """
+    if pp_size > 1:
+        raise ValueError("Streaming KV events do not support pipeline parallelism")
+    if cp_size > 1:
+        raise ValueError("Streaming KV events do not support context parallelism")
+    if backend != "python":
+        # StreamingKVCacheEventManager is a duck-typed Python event sink, which cannot
+        # satisfy the nanobind constructor's nb::cast<std::shared_ptr<kv::EventManager>>
+        # (and the C++ radix tree calls the sink natively, not through Python). Fail
+        # with an actionable message instead of an opaque TypeError from the cast.
+        raise ValueError(
+            "Streaming KV events (kv_cache_config.kv_events_config) are only supported "
+            f"by the Python KV cache manager V2 backend, but '{backend}' is active. Set "
+            "TLLM_KV_CACHE_MANAGER_V2_BACKEND=python to enable streaming KV events, or "
+            "use the buffered path via kv_cache_config.event_buffer_max_size."
+        )
+    validate_endpoint_ranges(config, ranks_per_host)
+
+
+def validate_endpoint_ranges(config: KVEventsConfig, ranks_per_host: int) -> None:
+    """Reject configurations whose publish and replay port ranges overlap.
+
+    Every rank binds ``base_port + rank`` on both endpoints, so intersecting spans make
+    one rank's publish bind collide with another's replay bind. Only ranks sharing a
+    host can collide, so the span is the number of ranks per host, not the total: a
+    multi-node deployment legitimately reuses the same port numbers on each node.
+    Catch it before any socket is created rather than as an opaque ``EADDRINUSE``.
+    """
+    pub_base = _tcp_base_port(config.endpoint)
+    replay_base = _tcp_base_port(config.replay_endpoint)
+    if pub_base is None or replay_base is None:
+        return
+    span = max(1, ranks_per_host)
+    if abs(pub_base - replay_base) < span:
+        raise ValueError(
+            f"KV event endpoint {config.endpoint!r} and replay_endpoint "
+            f"{config.replay_endpoint!r} overlap: with {span} rank(s) per host the "
+            f"publish range is [{pub_base}, {pub_base + span - 1}] and the replay range "
+            f"is [{replay_base}, {replay_base + span - 1}]. Use base ports {span} apart."
+        )
 
 
 def create_event_publisher(config: KVEventsConfig, data_parallel_rank: int) -> EventPublisher:
