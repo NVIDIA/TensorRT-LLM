@@ -538,34 +538,32 @@ def create_py_executor(
 
     # Initialize DWDP Manager.
     #
-    # DWDP requires every global MPI rank to be a complete, unsharded model
-    # replica owning one expert slice: `dwdp_rank = global_mpi_rank() %
-    # dwdp_size` is only a meaningful identity under that bijection, and the
-    # layout installed by `_init_dwdp_expert_layout` assumes expert weights are
-    # not additionally tensor-sharded. Two deployments satisfy this:
-    #   * disaggregated serving -- each context worker is its own TP=1 instance;
-    #     DWDP peers are separate instances joined by the global MPI world.
-    #   * aggregated serving with attention DP -- one instance in which
-    #     `mapping.dp_size == tp_size` (see Mapping.dp_size), so attention is
-    #     replicated and data-parallel rather than tensor-sharded and each rank
-    #     is still a full replica. Mapping already forces `moe_tp = moe_ep = 1`
-    #     whenever `dwdp_size > 1`, so expert weights stay unsharded and
-    #     ConfigurableMoE selects no MoE communication strategy.
-    # Real tensor parallelism (tp_size > 1 without attention DP) is rejected: a
-    # rank would be a shard of a replica, breaking both the rank-to-worker
-    # bijection and the unsharded-expert assumption.
+    # DWDP needs every global MPI rank to be a complete, unsharded model replica
+    # owning one expert slice -- `dwdp_rank = global_mpi_rank() % dwdp_size` is
+    # only meaningful under that bijection. Disaggregated context workers satisfy
+    # this with TP=1, aggregated serving with full attention DP; everything that
+    # shards a replica across ranks is rejected. Pipeline and context parallelism
+    # are rejected even under attention DP, since pairing ranks that hold
+    # different layers as DWDP peers gives wrong expert weights rather than an
+    # error. The TP check tests `dp_size == tp_size` rather than
+    # `enable_attention_dp` so a future partial attention DP cannot slip through.
     dwdp_manager: Optional[DwdpManager] = None
     if llm_args.dwdp_config is not None:
         if llm_args.dwdp_config.dwdp_size <= 1:
             raise ValueError(
                 f"DWDP requires dwdp_size > 1, got {llm_args.dwdp_config.dwdp_size}."
             )
-        if mapping.tp_size > 1 and not mapping.enable_attention_dp:
+        if mapping.pp_size > 1 or mapping.cp_size > 1:
+            raise ValueError(
+                "DWDP requires each rank to be a complete model replica, so "
+                "pipeline and context parallelism are not supported, but got "
+                f"pp_size={mapping.pp_size}, cp_size={mapping.cp_size}.")
+        if mapping.tp_size > 1 and mapping.dp_size != mapping.tp_size:
             raise ValueError(
                 "DWDP requires each rank to be a complete model replica: use "
                 "tp_size=1 (disaggregated context worker) or "
                 "enable_attention_dp=True (aggregated serving), but got "
-                f"tp_size={mapping.tp_size} with enable_attention_dp=False.")
+                f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
                                    dist=dist,
                                    mapping=mapping)

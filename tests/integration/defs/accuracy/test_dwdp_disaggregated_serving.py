@@ -3,12 +3,15 @@
 Separated from test_disaggregated_serving.py to isolate MPI-dependent test
 infrastructure for easier maintenance.
 
-NOTE: these tests are intentionally not registered in any CI test list. DWDP
-accuracy is gated in CI by test_dwdp_aggregated.py, which exercises the same
-expert-sharing paths without the disaggregated KV cache transceiver and is
-therefore not exposed to per-cluster transport configuration. This file is kept
-as a manual reproduction of the disaggregated DWDP path; run it directly with
-pytest.
+NOTE: these tests no longer gate pre-merge CI. DWDP accuracy is gated by
+test_dwdp_aggregated.py, which exercises the same expert-sharing paths without
+the disaggregated KV cache transceiver and is therefore not exposed to
+per-cluster transport configuration. The tests here stay registered in the QA
+list, waived under nvbugs/6276923, so that the file keeps being collected --
+it imports helpers from test_disaggregated_serving.py and would otherwise rot
+unnoticed -- and so that dropping the waive is the natural signal once the
+disaggregated path is healthy again. They also remain useful as a manual
+reproduction of the disaggregated DWDP path.
 
 When running it manually, check the launcher's UCX settings first: SLURM
 enroot/pyxis injects ``UCX_TLS=tcp`` from the host MPI stack on some clusters,

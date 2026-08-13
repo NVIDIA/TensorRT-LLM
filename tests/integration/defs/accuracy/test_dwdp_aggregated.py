@@ -45,6 +45,11 @@ from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 # Three remote peers per rank instead of one is also what makes
 # ``contention_opt`` meaningful, since it interleaves prefetch slices across
 # peers to spread them over several NVLink links.
+#
+# The MPI world must be exactly ``num_groups * dwdp_size`` ranks -- a rank
+# computes ``group_id = rank // dwdp_size`` and DwdpManager rejects
+# ``group_id >= num_groups``. ``tensor_parallel_size`` below is that world size,
+# so it has to track DWDP_SIZE and the ``num_groups=1`` passed to DwdpConfig.
 DWDP_SIZE = 4
 
 
@@ -63,7 +68,12 @@ class TestDwdpAggDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ],
         ids=["mode_a_uniform", "mode_b_overlap", "mode_a_uniform_contention_opt"],
     )
-    def test_dwdp_agg_accuracy(self, num_experts_per_worker, num_prefetch_experts, contention_opt):
+    def test_dwdp_agg_accuracy(
+        self,
+        num_experts_per_worker: int,
+        num_prefetch_experts: int,
+        contention_opt: bool,
+    ) -> None:
         dwdp_config = DwdpConfig(
             dwdp_size=DWDP_SIZE,
             num_groups=1,
@@ -94,5 +104,14 @@ class TestDwdpAggDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 tokens_per_block=32,
             ),
         ) as llm:
+            # Guard against DWDP silently not running at all. If the config were
+            # dropped before create_py_executor, MoE would fall back to the normal
+            # parallel path, which is also correct and scores the same, so the
+            # accuracy check below could not tell the two apart. create_py_executor
+            # either honours dwdp_config or raises -- it has no branch that ignores
+            # it -- so an LLM that constructed successfully while still carrying the
+            # config had a DwdpManager built for it.
+            assert llm.args.dwdp_config == dwdp_config
+
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
