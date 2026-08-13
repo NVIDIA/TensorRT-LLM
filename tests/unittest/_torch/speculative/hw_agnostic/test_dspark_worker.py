@@ -120,6 +120,8 @@ def test_worker_lazy_init_window_buffers():
     # max_batch (8) request slots + 1 scratch row for padded / unknown IDs.
     assert worker._kv_windows.shape == (9, 3, 128, 64)
     assert worker._ctx_len.shape == (9,)
+    assert worker._valid_len.shape == (9,)
+    assert worker._position_initialized.shape == (9,)
     assert worker._scratch_slot == 8
     # Dummy-id floor separates real request ids from CUDA-graph padding ids.
     assert worker._graph_dummy_id_floor == (1 << 64) - 1 - worker.max_draft_len
@@ -155,9 +157,13 @@ def test_worker_slot_assignment_and_reset():
 
     # mark a position, then reset -> slot freed + window/pos cleared
     worker._ctx_len[s0] = 42
+    worker._valid_len[s0] = 8
+    worker._position_initialized[s0] = True
     worker._kv_windows[s0].fill_(1.0)
     s0b = worker._assign_slot(100, reset=True)
     assert int(worker._ctx_len[s0b]) == 0
+    assert int(worker._valid_len[s0b]) == 0
+    assert not bool(worker._position_initialized[s0b])
     assert float(worker._kv_windows[s0b].abs().sum()) == 0.0
 
 
@@ -207,6 +213,8 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     )
     slot = worker._req_to_slot[100]
     assert int(worker._ctx_len[slot]) == 3
+    assert int(worker._valid_len[slot]) == 3
+    assert bool(worker._position_initialized[slot])
 
     metadata.get_hidden_states = lambda _num_tokens: torch.zeros(
         2, HIDDEN * NCAP, device="cuda", dtype=torch.bfloat16
@@ -217,6 +225,7 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     )
 
     assert int(worker._ctx_len[slot]) == 5
+    assert int(worker._valid_len[slot]) == 5
     assert [positions.tolist() for positions in draft_model.written_positions] == [
         [1, 2, 3],
         [4, 5],
@@ -251,6 +260,8 @@ def test_prepare_frees_stale_slots_on_batched_path():
     sa = worker._assign_slot(100, reset=True)
     worker._assign_slot(101, reset=True)
     worker._ctx_len[sa] = 17
+    worker._valid_len[sa] = 8
+    worker._position_initialized[sa] = True
 
     # Only request 101 survives; 100's slot must be freed + cleared.
     meta.request_ids = [101]
@@ -258,6 +269,8 @@ def test_prepare_frees_stale_slots_on_batched_path():
     assert 100 not in worker._req_to_slot
     assert sa in worker._free_slots
     assert int(worker._ctx_len[sa]) == 0
+    assert int(worker._valid_len[sa]) == 0
+    assert not bool(worker._position_initialized[sa])
 
 
 def test_prepare_maps_unknown_request_to_scratch_row_not_slot_zero():
@@ -353,6 +366,135 @@ def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
     ]
     # Exactly one real slot consumed.
     assert list(worker._free_slots) == [1, 2, 3]
+
+
+class _RecordingDraftModel:
+    num_stages = 1
+    block_size = 5
+    _attn_params = {"window_size": 8, "head_dim": 4}
+
+    def __init__(self):
+        self.forward_calls = []
+
+    def write_context_windows_batched(self, *args):
+        pass
+
+    def forward_batched(self, main_hidden, bonus, start_pos, **kwargs):
+        self.forward_calls.append(
+            {
+                "main_hidden": main_hidden.clone(),
+                "bonus": bonus.clone(),
+                "start_pos": start_pos.clone(),
+                "valid_len": kwargs["valid_len"].clone(),
+            }
+        )
+        logits = torch.zeros(main_hidden.shape[0], self.block_size, 8, device=main_hidden.device)
+        return None, None, logits
+
+
+def test_generation_state_cuda_graph_bootstrap_and_replay():
+    """Position bootstrap and valid-length advancement remain graph replay safe."""
+    worker = _make_worker()
+    worker._lazy_init(_fake_draft_model(window_size=8), _make_metadata(max_num_requests=2))
+    slots = torch.tensor([0, 1], device="cuda", dtype=torch.long)
+    num_accepted = torch.tensor([1, 2], device="cuda", dtype=torch.long)
+    input_positions = torch.tensor([4016, 87], device="cuda", dtype=torch.long)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        worker._advance_generation_state(slots, num_accepted, input_positions)
+
+    worker._ctx_len[slots] = 0
+    worker._valid_len[slots] = 0
+    worker._position_initialized[slots] = False
+    graph.replay()
+    assert worker._ctx_len[slots].tolist() == [4017, 89]
+    assert worker._valid_len[slots].tolist() == [1, 2]
+    assert worker._position_initialized[slots].tolist() == [True, True]
+
+    num_accepted.copy_(torch.tensor([2, 3], device="cuda"))
+    graph.replay()
+    assert worker._ctx_len[slots].tolist() == [4019, 92]
+    assert worker._valid_len[slots].tolist() == [3, 5]
+
+
+def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
+    """A gen-only worker bootstraps absolute positions once and indexes packed
+    target rows by their runtime width rather than the configured K+1 width."""
+    worker = _make_worker()
+    draft_model = _RecordingDraftModel()
+    metadata = types.SimpleNamespace(max_num_requests=2)
+    worker._lazy_init(draft_model, metadata)
+
+    slots = [worker._assign_slot(1000, reset=False), worker._assign_slot(1001, reset=False)]
+    worker._batch_to_slot[:2] = torch.tensor(slots, device="cuda")
+
+    captured = torch.stack(
+        [
+            torch.full((HIDDEN * NCAP,), 1.0, device="cuda", dtype=torch.bfloat16),
+            torch.full((HIDDEN * NCAP,), 2.0, device="cuda", dtype=torch.bfloat16),
+        ]
+    )
+    metadata.get_hidden_states = lambda num_tokens: captured[:num_tokens]
+    attn_metadata = types.SimpleNamespace(num_ctx_tokens=0)
+    accepted = torch.tensor([[11], [22]], device="cuda", dtype=torch.int32)
+    num_accepted = torch.ones(2, device="cuda", dtype=torch.int32)
+    position_ids = torch.tensor([[4016, 87]], device="cuda")
+
+    worker._draft_gen_block_batched(
+        draft_model,
+        metadata,
+        attn_metadata,
+        accepted,
+        num_accepted,
+        num_contexts=0,
+        batch_size=2,
+        total_target_tokens=2,
+        position_ids=position_ids,
+    )
+
+    first_call = draft_model.forward_calls[-1]
+    torch.testing.assert_close(first_call["main_hidden"], captured)
+    assert first_call["start_pos"].tolist() == [4017, 88]
+    assert worker._ctx_len[slots].tolist() == [4017, 88]
+    assert first_call["valid_len"].tolist() == [1, 1]
+    assert worker._valid_len[slots].tolist() == [1, 1]
+    assert worker._position_initialized[slots].tolist() == [True, True]
+
+    # Existing slots retain their state. The normal K+1 target layout must still
+    # select each accepted bonus hidden from its own packed request row.
+    target_width = worker.max_draft_len + 1
+    captured = torch.stack(
+        [
+            torch.full((HIDDEN * NCAP,), float(i), device="cuda", dtype=torch.bfloat16)
+            for i in range(2 * target_width)
+        ]
+    )
+    metadata.get_hidden_states = lambda num_tokens: captured[:num_tokens]
+    accepted = torch.arange(2 * target_width, device="cuda", dtype=torch.int32).reshape(
+        2, target_width
+    )
+    num_accepted = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
+    unrelated_positions = torch.zeros((1, 2 * target_width), device="cuda", dtype=torch.long)
+
+    worker._draft_gen_block_batched(
+        draft_model,
+        metadata,
+        attn_metadata,
+        accepted,
+        num_accepted,
+        num_contexts=0,
+        batch_size=2,
+        total_target_tokens=2 * target_width,
+        position_ids=unrelated_positions,
+    )
+
+    second_call = draft_model.forward_calls[-1]
+    torch.testing.assert_close(second_call["main_hidden"][0], captured[1])
+    torch.testing.assert_close(second_call["main_hidden"][1], captured[target_width + 2])
+    assert second_call["start_pos"].tolist() == [4019, 91]
+    assert second_call["valid_len"].tolist() == [3, 4]
+    assert worker._valid_len[slots].tolist() == [3, 4]
 
 
 def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
