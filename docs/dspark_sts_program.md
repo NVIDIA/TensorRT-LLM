@@ -942,6 +942,21 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - 流水线坑五连修入册:helpers 全量拷贝、OUT_DIR 自挂载、ctx 模板 MTP spec 块换 DSpark(KeyError 'weight';TRTLLM moe 装 nvfp4 无罪)、表路径需显式挂载(AA 无整卷 /lustre)、STS 采集配置不得带 enable_ragged_verify(验证器要求 ragged 必须有表)。
 - 在飞:STS v2 采集;下一棒 = 拟温度 → 三臂冷启动矩阵(notrim vs scheduled@新表裸sigmoid vs scheduled@新表+STS)。
 
+## 【08-12 23:50】AA slo20 终局判决(laliao 侧):scheduled 在生产负载 disagg 上 +6.7%/+7.4%(中位,n=3 冷启动)
+
+**协议**:slo20 生产形态(2ctx:2gen,maxbs256/mnt1024/131k窗/reuse on/autotuner off)× nvfp4 DSpark5 × AA coding-agent 真实轨迹(32 users,settle+暖稳态计量,seed 42)× PR HEAD sqsh;S 臂 = aa_slo20_table_v1(本形态 pin 阶梯重采)+ tiers[2,3,4,5] + 裸 sigmoid(STS 按用户指令跳过;AA 位置接受率 [0.982→0.892] 极高,裸分数够用);**每臂每 rep 独立冷启动 job**(reuse 纪律:臂间缓存温度对称)。
+
+| arm | 生成 p50 (tok/s/user) ×3 | e2e p50 ×3 |
+|---|---|---|
+| notrim | 130.4 / 130.1 /(r2 NODE_FAIL)| 116.8 / 116.5 |
+| sched | **141.7 / 139.0 / 127.2** | **129.8 / 125.3 / 115.5** |
+
+- **中位 +6.7%(gen)/ +7.4%(e2e)**;trim 0.50、accept 2.21-2.23 三 rep 一致;无腐蚀、轨迹完成流健康。
+- sched r3 与基线打平——rep 间波动 ±5%,n=3 中位口径成立,收窄区间需加 rep;notrim 双 rep 130.4/130.1 极稳。
+- **战役闭环**:ragged path 在 AA 生产形态功能有效(97% ragged 步、trim 50%)且**性能兑现 +7%**——统一律第五格(纯 gen disagg × 高接受产品负载)为正。
+- 过程沉淀(全部入册):AA 流水线十坑(helpers/OUT_DIR 挂载/ctx-MTP-spec/表挂载/STS 五护栏/GEN-only env/…);static×disagg 置信度 NaN(bug 数据点);短 ISL 冻结(已结案);SPS 几何(pin5=连接器);accept 先兆:正式表让 accept 从冒烟 2.17 → 2.22(planner 用真 θ 裁得更聪明)。
+- 余留:sched rep 加密(收窄 ±5%)、c80 档、STS 消融(如果之后想验标定增益)、短 ISL 与 static-NaN 两个上游修复。
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
