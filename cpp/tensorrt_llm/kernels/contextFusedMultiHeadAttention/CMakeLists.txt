@@ -17,8 +17,8 @@
 
 # Directory holding the generated FMHA sources (fmha_v2_cu/*.cu and
 # cubin/fmha_cubin.{h,cpp}). scripts/build_wheel.py points this at an
-# out-of-tree location for hermetic builds; by default the generated files live
-# in this directory as before.
+# out-of-tree location when --out-of-tree is set; by default the generated files
+# live in this directory as before.
 set(TRTLLM_FMHA_GEN_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}"
     CACHE PATH "Directory containing generated FMHA sources")

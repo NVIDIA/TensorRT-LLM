@@ -158,8 +158,8 @@ else()
   message(FATAL_ERROR "Failed to determine TensorRT LLM version")
 endif()
 
-# Where the configured executor/version.h is written. Hermetic builds point this
-# at the build tree so the source tree is never written (it may be mounted
+# Where the configured executor/version.h is written. Out-of-tree builds point
+# this at the build tree so the source tree is never written (it may be mounted
 # read-only); the default keeps the in-source location.
 set(TRTLLM_VERSION_H_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

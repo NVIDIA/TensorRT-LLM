@@ -573,7 +573,7 @@ def build_kv_cache_manager_v2(project_dir,
 def stage_python_package(project_dir: Path, staging_dir: Path) -> None:
     """Copy the sources setup.py packages into an out-of-tree staging project.
 
-    Hermetic builds install compiled artifacts into this staging tree and
+    Out-of-tree builds install compiled artifacts into this staging tree and
     build the wheel from it, so nothing is ever written into the checkout.
     """
     print(f"-- Staging python package sources into {staging_dir} ...")
@@ -619,7 +619,7 @@ def main(*,
          configure_cmake: bool = False,
          configure_only: bool = False,
          use_ccache: bool = False,
-         hermetic: bool = False,
+         out_of_tree: bool = False,
          use_3rdparty_cache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
@@ -659,23 +659,23 @@ def main(*,
         os.environ.setdefault("TRTLLM_WHEEL_STAGING_DIR",
                               str(build_root / "wheel-staging"))
 
-    if hermetic:
-        # Hermetic: never write into the checkout; the wheel is assembled in
+    if out_of_tree:
+        # Out-of-tree: never write into the checkout; the wheel is assembled in
         # an out-of-tree staging project. Validated by building with the
         # checkout mounted read-only.
         if build_root is None:
-            raise RuntimeError("--hermetic requires --build_root")
+            raise RuntimeError("--out-of-tree requires --build_root")
         if platform.system() == "Windows":
-            raise RuntimeError("--hermetic is not supported on Windows")
+            raise RuntimeError("--out-of-tree is not supported on Windows")
         if skip_building_wheel or linking_install_binary or install:
             raise RuntimeError(
-                "--hermetic is incompatible with --skip_building_wheel, "
+                "--out-of-tree is incompatible with --skip_building_wheel, "
                 "--linking_install_binary and --install: editable installs "
                 "import compiled artifacts from the checkout, which a "
-                "hermetic build never writes.")
+                "out-of-tree build never writes.")
         if version_override:
             raise RuntimeError(
-                "--hermetic does not support --version-override (it would "
+                "--out-of-tree does not support --version-override (it would "
                 "modify tensorrt_llm/version.py in the checkout)")
 
     apply_version_override(project_dir, version_override)
@@ -692,11 +692,11 @@ def main(*,
         s for s in submodules if not (project_dir / s / ".git").exists()
     ]
     if missing_submodules:
-        if hermetic:
+        if out_of_tree:
             raise RuntimeError(
                 "Missing submodules: " + ", ".join(missing_submodules) +
                 ". Run 'git submodule update --init --recursive' before a "
-                "hermetic build; the checkout is not modified during the "
+                "out-of-tree build; the checkout is not modified during the "
                 "build.")
         build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
@@ -854,13 +854,13 @@ def main(*,
 
     source_dir = get_source_dir()
 
-    fmha_gen_root = build_root / "fmha-gen" if hermetic else None
+    fmha_gen_root = build_root / "fmha-gen" if out_of_tree else None
     fmha_v2_cu_dir, _ = get_fmha_gen_dirs(project_dir, fmha_gen_root)
     if (clean or generate_fmha
             or not _fmha_generation_stamp(fmha_v2_cu_dir).exists()):
         generate_fmha_cu(project_dir, venv_python, fmha_gen_root)
 
-    if hermetic:
+    if out_of_tree:
         cmake_def_args.append(f"-DTRTLLM_FMHA_GEN_DIR={fmha_gen_root}")
         # Write the configured executor/version.h into the build tree
         # instead of cpp/include (the checkout may be read-only).
@@ -914,7 +914,7 @@ def main(*,
         assert not install, "Installing is not supported for cpp_only builds"
         return
 
-    if hermetic:
+    if out_of_tree:
         # Assemble the wheel in an out-of-tree staging project; the checkout
         # is only read from this point on.
         wheel_project_dir = build_root / "package"
@@ -1288,7 +1288,7 @@ def main(*,
 
     if not skip_building_wheel:
         if dist_dir is None:
-            dist_dir = build_root / "dist" if hermetic else project_dir / "build"
+            dist_dir = build_root / "dist" if out_of_tree else project_dir / "build"
         else:
             dist_dir = Path(dist_dir)
 
@@ -1477,7 +1477,7 @@ def add_arguments(parser: ArgumentParser):
         "/tmp) when the checkout lives on a network filesystem. Individual "
         "options like --build_dir and CCACHE_DIR still override their piece.")
     parser.add_argument(
-        "--hermetic",
+        "--out-of-tree",
         action="store_true",
         help=
         "Never write into the checkout: generated FMHA sources and version.h "
