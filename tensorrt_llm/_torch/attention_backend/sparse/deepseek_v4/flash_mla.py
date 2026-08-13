@@ -9,13 +9,96 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
+from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from .cache_manager import get_token_bytes
 from .kernels import deepseek_v4_local_to_global_indices
 from .metadata import DeepseekV4TrtllmAttentionMetadata
-from .params import DEEPSEEK_V4_SPARSE_RATIO, DeepseekV4AttentionType
+from .params import (
+    DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN,
+    DEEPSEEK_V4_SPARSE_RATIO,
+    DeepseekV4AttentionType,
+)
+
+_FP8_E4M3_MAX = 448.0
+_BF16_CONTEXT_CHUNK_SIZE = 512
+
+
+@maybe_compile(dynamic=True, options={"max-autotune": True})
+def _write_fp8_shadow_torch(
+    pool: torch.Tensor,
+    shadow: torch.Tensor,
+    source_block: torch.Tensor,
+    shadow_block: torch.Tensor,
+    token_offset: torch.Tensor,
+    valid: torch.Tensor,
+    is_fp8_pool: bool,
+    kv_scale: torch.Tensor,
+    tokens_per_block: int,
+) -> None:
+    """Convert cache entries to MODEL1 layout and update their shadow slots."""
+    nope_dim = 448
+    rope_dim = 64
+    quant_block = 64
+    num_scales = nope_dim // quant_block
+    data_bytes = nope_dim + rope_dim * 2
+    bytes_per_token = DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
+
+    token_data = pool[source_block, token_offset]
+    if is_fp8_pool:
+        token_bf16 = (token_data.view(torch.float8_e4m3fn).to(torch.bfloat16) * kv_scale).to(
+            torch.bfloat16
+        )
+    else:
+        token_bf16 = token_data
+
+    num_slots = token_bf16.shape[0]
+    nope = token_bf16[:, :nope_dim].float()
+    rope = token_bf16[:, nope_dim:]
+    nope_blocked = nope.reshape(num_slots, num_scales, quant_block)
+    block_max = nope_blocked.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    scale_log2 = torch.log2((block_max / _FP8_E4M3_MAX).clamp(min=1e-4)).ceil()
+    scale = torch.exp2(scale_log2)
+    nope_fp8 = (nope_blocked / scale).reshape(num_slots, nope_dim).to(torch.float8_e4m3fn)
+
+    scale_e8m0 = (scale_log2.squeeze(-1) + 127).clamp(0, 255).byte()
+    scale_padding = torch.nn.functional.pad(scale_e8m0, (0, 1))
+    encoded_data = torch.cat(
+        (
+            nope_fp8.view(torch.uint8).reshape(num_slots, nope_dim),
+            rope.contiguous().view(torch.uint8).reshape(num_slots, rope_dim * 2),
+        ),
+        dim=1,
+    )
+
+    row_stride = shadow.shape[1]
+    row_base = shadow_block * row_stride
+    padding_start = row_base + tokens_per_block * bytes_per_token
+    data_start = torch.where(
+        valid,
+        row_base + token_offset * data_bytes,
+        padding_start,
+    )
+    data_indices = (
+        data_start.unsqueeze(1)
+        + torch.arange(data_bytes, device=pool.device, dtype=torch.long).unsqueeze(0)
+    ).reshape(-1)
+    shadow_flat = shadow.view(-1)
+    shadow_flat[data_indices] = encoded_data.reshape(-1)
+
+    scale_start = torch.where(
+        valid,
+        row_base + tokens_per_block * data_bytes + token_offset * 8,
+        padding_start + data_bytes,
+    )
+    scale_indices = (
+        scale_start.unsqueeze(1)
+        + torch.arange(8, device=pool.device, dtype=torch.long).unsqueeze(0)
+    ).reshape(-1)
+    shadow_flat[scale_indices] = scale_padding.reshape(-1)
+
 
 try:
     import tensorrt_llm.flash_mla_cpp_tllm as flash_mla_cuda
@@ -39,10 +122,6 @@ class DeepSeekV4FlashMLA:
         self._qk_rope_head_dim = attention.mla_params.qk_rope_head_dim
         self._kv_lora_rank = attention.mla_params.kv_lora_rank
         self._v_head_dim = attention.mla_params.v_head_dim
-        self._fp8_shadows: dict[DeepseekV4AttentionType, torch.Tensor] = {}
-        self._fp8_token_update_grids: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
-        self._fp8_offsets_cache: dict[int, torch.Tensor] = {}
-        self._fp8_scale_pad_buf = torch.empty(0, 8, dtype=torch.uint8)
 
     def _prepare_q_and_cache(
         self,
@@ -264,8 +343,11 @@ class DeepSeekV4FlashMLA:
             torch.where(torch.isfinite(pool_lse), pool_lse, -torch.inf) for pool_lse in pool_lses
         ]
         max_lse = torch.stack(finite_pool_lses).amax(dim=0)
-        pool_weights = [torch.exp(pool_lse - max_lse) for pool_lse in finite_pool_lses]
+        has_valid_pool = torch.isfinite(max_lse)
+        safe_max_lse = torch.where(has_valid_pool, max_lse, torch.zeros_like(max_lse))
+        pool_weights = [torch.exp(pool_lse - safe_max_lse) for pool_lse in finite_pool_lses]
         denominator = torch.stack(pool_weights).sum(dim=0)
+        safe_denominator = torch.where(has_valid_pool, denominator, torch.ones_like(denominator))
         output = sum(
             torch.where(
                 torch.isfinite(pool_lse).unsqueeze(-1),
@@ -273,11 +355,17 @@ class DeepSeekV4FlashMLA:
                 torch.zeros_like(pool_output),
             )
             * pool_weight.unsqueeze(-1)
-            for pool_output, pool_lse, pool_weight in zip(pool_outputs, pool_lses, pool_weights)
-        ) / denominator.unsqueeze(-1)
+            for pool_output, pool_lse, pool_weight in zip(
+                pool_outputs, pool_lses, pool_weights, strict=True
+            )
+        ) / safe_denominator.unsqueeze(-1)
 
         if attention_sink is not None:
-            merged_lse = max_lse + torch.log(denominator)
+            merged_lse = torch.where(
+                has_valid_pool,
+                safe_max_lse + torch.log(safe_denominator),
+                -torch.inf,
+            )
             output *= torch.sigmoid(merged_lse - attention_sink.unsqueeze(0)).unsqueeze(-1)
         return output
 
@@ -359,61 +447,65 @@ class DeepSeekV4FlashMLA:
         kv_cache_manager = metadata.kv_cache_manager
         head_dim = kv_cache_manager.head_dim
         kv_scale = self._attention.kv_scale_quant_orig
-
         swa_pool = kv_cache_manager.get_buffers(self._layer_idx, DeepseekV4AttentionType.SWA)
-        swa_pool_flat, swa_indices = self._prepare_bf16_pool(
-            swa_pool, global_indices[:, :window_size], head_dim, kv_scale
-        )
-        swa_indices = self._pad_sparse_indices(swa_indices, alignment=128).view(num_tokens, 1, -1)
-
-        if flash_mla_sparse_fwd is None:
-            raise RuntimeError(
-                "flash_mla_sparse_fwd is unavailable; build TensorRT-LLM with FlashMLA"
-            )
-        swa_out, _, swa_lse = flash_mla_sparse_fwd(
-            q_concat,
-            swa_pool_flat,
-            swa_indices,
-            softmax_scale,
-            d_v=self._v_head_dim,
-        )
-
-        pool_outputs = [swa_out]
-        pool_lses = [swa_lse]
+        compressed_pool = None
         if compress_ratio > 1:
             compressed_pool = kv_cache_manager.get_buffers(
                 self._layer_idx, DeepseekV4AttentionType.COMPRESS
             )
-            compressed_pool_flat, compressed_indices = self._prepare_bf16_pool(
-                compressed_pool,
-                global_indices[:, window_size:],
-                head_dim,
-                kv_scale,
+        if flash_mla_sparse_fwd is None:
+            raise RuntimeError(
+                "flash_mla_sparse_fwd is unavailable; build TensorRT-LLM with FlashMLA"
             )
-            compressed_indices = self._pad_sparse_indices(compressed_indices, alignment=128).view(
-                num_tokens, 1, -1
+        attention_sink = self._attention_sink(padded_heads)
+        for chunk_start in range(0, num_tokens, _BF16_CONTEXT_CHUNK_SIZE):
+            chunk_end = min(chunk_start + _BF16_CONTEXT_CHUNK_SIZE, num_tokens)
+            chunk_tokens = chunk_end - chunk_start
+            chunk_indices = global_indices[chunk_start:chunk_end]
+            chunk_q = q_concat[chunk_start:chunk_end]
+
+            swa_pool_flat, swa_indices = self._prepare_bf16_pool(
+                swa_pool, chunk_indices[:, :window_size], head_dim, kv_scale
             )
-            compressed_out, _, compressed_lse = flash_mla_sparse_fwd(
-                q_concat,
-                compressed_pool_flat,
-                compressed_indices,
+            swa_indices = self._pad_sparse_indices(swa_indices, alignment=128).view(
+                chunk_tokens, 1, -1
+            )
+            swa_out, _, swa_lse = flash_mla_sparse_fwd(
+                chunk_q,
+                swa_pool_flat,
+                swa_indices,
                 softmax_scale,
                 d_v=self._v_head_dim,
             )
-            pool_outputs.append(compressed_out)
-            pool_lses.append(compressed_lse)
+            pool_outputs = [swa_out]
+            pool_lses = [swa_lse]
+            if compressed_pool is not None:
+                compressed_pool_flat, compressed_indices = self._prepare_bf16_pool(
+                    compressed_pool,
+                    chunk_indices[:, window_size:],
+                    head_dim,
+                    kv_scale,
+                )
+                compressed_indices = self._pad_sparse_indices(
+                    compressed_indices, alignment=128
+                ).view(chunk_tokens, 1, -1)
+                compressed_out, _, compressed_lse = flash_mla_sparse_fwd(
+                    chunk_q,
+                    compressed_pool_flat,
+                    compressed_indices,
+                    softmax_scale,
+                    d_v=self._v_head_dim,
+                )
+                pool_outputs.append(compressed_out)
+                pool_lses.append(compressed_lse)
 
-        with nvtx_range_debug("merge_deepseek_v4_hopper_attention_pools"):
-            attn_out = self._merge_pools(
-                pool_outputs,
-                pool_lses,
-                self._attention_sink(padded_heads),
-            )
+            with nvtx_range_debug("merge_deepseek_v4_hopper_attention_pools"):
+                attn_out = self._merge_pools(pool_outputs, pool_lses, attention_sink)
 
-        attn_out = attn_out[:, : self._num_heads, : self._v_head_dim]
-        if self._num_heads != padded_heads:
-            attn_out = attn_out.contiguous()
-        output.copy_(attn_out.reshape(num_tokens, -1))
+            attn_out = attn_out[:, : self._num_heads, : self._v_head_dim]
+            if self._num_heads != padded_heads:
+                attn_out = attn_out.contiguous()
+            output[chunk_start:chunk_end].copy_(attn_out.reshape(chunk_tokens, -1))
         return output
 
     @nvtx_range("forward_sparse_decode_deepseek_v4_hopper_fp8")
@@ -455,6 +547,12 @@ class DeepSeekV4FlashMLA:
         global_indices, compress_ratio, window_size = self._prepare_pool_indices(
             metadata, topk_indices, is_generation=True
         )
+        kv_cache_manager = metadata.kv_cache_manager
+        global_indices[:, :window_size] = kv_cache_manager.map_flash_mla_shadow_token_indices(
+            self._layer_idx,
+            DeepseekV4AttentionType.SWA,
+            global_indices[:, :window_size],
+        )
         swa_indices = self._pad_sparse_indices(
             global_indices[:, :window_size].unsqueeze(1), alignment=64
         )
@@ -463,6 +561,11 @@ class DeepSeekV4FlashMLA:
         if compress_ratio > 1:
             if compressed_fp8 is None:
                 raise RuntimeError("DeepSeek-V4 compressed FlashMLA cache is not initialized")
+            global_indices[:, window_size:] = kv_cache_manager.map_flash_mla_shadow_token_indices(
+                self._layer_idx,
+                DeepseekV4AttentionType.COMPRESS,
+                global_indices[:, window_size:],
+            )
             compressed_indices = self._pad_sparse_indices(
                 global_indices[:, window_size:].unsqueeze(1), alignment=64
             )
@@ -599,18 +702,16 @@ class DeepSeekV4FlashMLA:
         is_generation: bool,
     ) -> torch.Tensor:
         """Update a persistent MODEL1 view for the entries written this pass."""
+        # TODO: Move the shadow update into the canonical cache
+        # append kernels so MODEL1 does not need a separate write-through pass.
         pool = pool_raw
         is_fp8_pool = pool.dtype != torch.bfloat16
         kv_scale = self._attention.kv_scale_quant_orig
 
-        num_blocks, tokens_per_block, head_dim = pool.shape
+        _, tokens_per_block, head_dim = pool.shape
         nope_dim = 448
         rope_dim = 64
-        quant_block = 64
-        num_scales = nope_dim // quant_block
-        data_bytes = nope_dim + rope_dim * 2
-        bytes_per_token = data_bytes + 8
-        device = pool.device
+        bytes_per_token = DEEPSEEK_V4_FLASH_MLA_BYTES_PER_TOKEN
         if head_dim != nope_dim + rope_dim:
             raise ValueError(
                 f"DeepSeek-V4 MODEL1 expects head_dim={nope_dim + rope_dim}, got {head_dim}"
@@ -626,100 +727,38 @@ class DeepSeekV4FlashMLA:
         else:
             raise ValueError(f"Unsupported DeepSeek-V4 FP8 shadow type: {attn_type}")
 
-        shadow, initialized = self._ensure_shadow_state(
-            attn_type,
-            num_blocks,
-            tokens_per_block,
-            bytes_per_token,
-            device,
+        shadow = metadata.kv_cache_manager.get_flash_mla_shadow_buffer(self._layer_idx, attn_type)
+        shadow_num_blocks = shadow.shape[0]
+        shadow_view = torch.as_strided(
+            shadow,
+            size=(shadow_num_blocks, tokens_per_block, 1, bytes_per_token),
+            stride=(shadow.stride(0), bytes_per_token, bytes_per_token, 1),
         )
         if block_table.shape[1] == 0:
-            return shadow[:num_blocks].reshape(num_blocks, tokens_per_block, 1, bytes_per_token)
+            return shadow_view
 
         with nvtx_range_debug("deepseek_v4_fp8_shadow_update"):
-            if initialized:
-                physical_block, token_offset, valid = self._get_shadow_initial_sync_slots(
-                    metadata,
-                    block_table,
-                    attn_type,
-                    compress_ratio,
-                    num_blocks,
-                    tokens_per_block,
-                )
-            else:
-                physical_block, token_offset, valid = self._get_shadow_write_slots(
-                    metadata,
-                    block_table,
-                    attn_type,
-                    compress_ratio,
-                    num_blocks,
-                    tokens_per_block,
-                    position_ids,
-                    is_generation=is_generation,
-                )
+            source_block, shadow_block, token_offset, valid = self._get_shadow_write_slots(
+                metadata,
+                block_table,
+                attn_type,
+                compress_ratio,
+                position_ids,
+                is_generation=is_generation,
+            )
             self._write_fp8_shadow(
                 pool,
                 shadow,
-                physical_block,
+                source_block,
+                shadow_block,
                 token_offset,
                 valid,
                 is_fp8_pool,
                 kv_scale,
                 tokens_per_block,
-                nope_dim,
-                rope_dim,
-                quant_block,
-                num_scales,
-                data_bytes,
-                bytes_per_token,
-                num_blocks,
             )
 
-        return shadow[:num_blocks].reshape(num_blocks, tokens_per_block, 1, bytes_per_token)
-
-    def _get_shadow_initial_sync_slots(
-        self,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
-        block_table: torch.Tensor,
-        attn_type: DeepseekV4AttentionType,
-        compress_ratio: int,
-        num_blocks: int,
-        tokens_per_block: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Map active cache entries when a MODEL1 shadow is first created."""
-        kv_lens = metadata.kv_lens_cuda_runtime
-        host_kv_lens = metadata.kv_lens_runtime
-        num_requests = kv_lens.shape[0]
-        device = block_table.device
-        empty = torch.empty(0, dtype=torch.long, device=device)
-        if num_requests == 0:
-            return empty, empty, empty.bool()
-
-        if attn_type == DeepseekV4AttentionType.COMPRESS:
-            kv_lens = kv_lens // compress_ratio
-            host_kv_lens = host_kv_lens // compress_ratio
-        max_kv_len = int(host_kv_lens.max().item())
-        max_blocks = min(
-            (max_kv_len + tokens_per_block - 1) // tokens_per_block,
-            block_table.shape[1],
-        )
-        if max_blocks == 0:
-            return empty, empty, empty.bool()
-
-        request_grid, token_position = self._get_fp8_shadow_token_update_grid(
-            num_requests,
-            max_blocks * tokens_per_block,
-            device,
-        )
-        valid = token_position < kv_lens.to(torch.long)[request_grid]
-        return self._map_shadow_slots(
-            block_table,
-            request_grid,
-            token_position,
-            valid,
-            num_blocks,
-            tokens_per_block,
-        )
+        return shadow_view
 
     def _get_shadow_write_slots(
         self,
@@ -727,12 +766,10 @@ class DeepSeekV4FlashMLA:
         block_table: torch.Tensor,
         attn_type: DeepseekV4AttentionType,
         compress_ratio: int,
-        num_blocks: int,
-        tokens_per_block: int,
         position_ids: Optional[torch.Tensor],
         *,
         is_generation: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Map cache entries written in this phase to their physical slots."""
         device = block_table.device
         empty = torch.empty(0, dtype=torch.long, device=device)
@@ -740,7 +777,7 @@ class DeepSeekV4FlashMLA:
         num_requests = metadata.num_generations if is_generation else metadata.num_contexts
         request_end = request_start + num_requests
         if num_requests == 0:
-            return empty, empty, empty.bool()
+            return empty, empty, empty, empty.bool()
 
         if attn_type == DeepseekV4AttentionType.SWA:
             token_start = metadata.num_ctx_tokens if is_generation else 0
@@ -759,6 +796,14 @@ class DeepSeekV4FlashMLA:
                 & (token_position >= 0)
             )
             request_grid = request_grid.clamp(min=request_start, max=request_end - 1)
+            if not is_generation:
+                # Context tokens outside the final SWA window may use scratch
+                # slots, which are not persistent cache pages.
+                min_live_position = (
+                    metadata.kv_lens_cuda_runtime[request_grid].to(torch.long)
+                    - metadata.window_size
+                )
+                valid &= token_position >= min_live_position
         elif attn_type == DeepseekV4AttentionType.COMPRESS:
             max_new_tokens = (
                 (metadata.num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
@@ -766,10 +811,10 @@ class DeepSeekV4FlashMLA:
                 else metadata.max_ctx_compressed_tokens[compress_ratio]
             )
             if max_new_tokens == 0:
-                return empty, empty, empty.bool()
-            request_grid, token_grid = self._get_fp8_shadow_token_update_grid(
-                num_requests, max_new_tokens, device
-            )
+                return empty, empty, empty, empty.bool()
+            all_slots = torch.arange(num_requests * max_new_tokens, device=device, dtype=torch.long)
+            request_grid = all_slots // max_new_tokens
+            token_grid = all_slots % max_new_tokens
             request_grid = request_grid + request_start
             token_position = (
                 metadata.past_kv_lens_cuda[compress_ratio][request_grid].to(torch.long) + token_grid
@@ -780,155 +825,40 @@ class DeepSeekV4FlashMLA:
         else:
             raise ValueError(f"Unsupported DeepSeek-V4 FlashMLA cache type: {attn_type}")
 
-        return self._map_shadow_slots(
+        return metadata.kv_cache_manager.map_flash_mla_shadow_write_slots(
+            self._layer_idx,
+            attn_type,
             block_table,
             request_grid,
             token_position,
             valid,
-            num_blocks,
-            tokens_per_block,
         )
-
-    def _map_shadow_slots(
-        self,
-        block_table: torch.Tensor,
-        request_grid: torch.Tensor,
-        token_position: torch.Tensor,
-        valid: torch.Tensor,
-        num_blocks: int,
-        tokens_per_block: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Map request-relative token positions to physical cache slots."""
-        block_grid = token_position // tokens_per_block
-        token_offset = token_position % tokens_per_block
-        block_valid = (block_grid >= 0) & (block_grid < block_table.shape[1])
-        block_grid_safe = block_grid.clamp(min=0, max=block_table.shape[1] - 1)
-        physical_block = block_table[request_grid, block_grid_safe].to(torch.long)
-        valid = valid & block_valid & (physical_block >= 0) & (physical_block < num_blocks)
-        physical_block = physical_block.clamp(min=0, max=max(num_blocks - 1, 0))
-        return physical_block, token_offset, valid
 
     def _write_fp8_shadow(
         self,
         pool: torch.Tensor,
         shadow: torch.Tensor,
-        physical_block: torch.Tensor,
+        source_block: torch.Tensor,
+        shadow_block: torch.Tensor,
         token_offset: torch.Tensor,
         valid: torch.Tensor,
         is_fp8_pool: bool,
         kv_scale: torch.Tensor,
         tokens_per_block: int,
-        nope_dim: int,
-        rope_dim: int,
-        quant_block: int,
-        num_scales: int,
-        data_bytes: int,
-        bytes_per_token: int,
-        num_blocks: int,
     ) -> None:
-        if physical_block.numel() == 0:
+        if source_block.numel() == 0:
             return
 
-        scatter_block = torch.where(
+        # TODO: Fuse MODEL1 quantization and layout conversion
+        # into the compressor and MLA cache-append kernels.
+        _write_fp8_shadow_torch(
+            pool,
+            shadow,
+            source_block,
+            shadow_block,
+            token_offset,
             valid,
-            physical_block,
-            torch.full_like(physical_block, num_blocks),
+            is_fp8_pool,
+            kv_scale,
+            tokens_per_block,
         )
-        token_data = pool[physical_block, token_offset]
-        if is_fp8_pool:
-            token_bf16 = (token_data.view(torch.float8_e4m3fn).to(torch.bfloat16) * kv_scale).to(
-                torch.bfloat16
-            )
-        else:
-            token_bf16 = token_data
-
-        num_slots = token_bf16.shape[0]
-        nope = token_bf16[:, :nope_dim].float()
-        rope = token_bf16[:, nope_dim:]
-        nope_blocked = nope.reshape(num_slots, num_scales, quant_block)
-        block_max = nope_blocked.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-        scale_log2 = torch.log2((block_max / 448.0).clamp(min=1e-4)).ceil()
-        scale = torch.exp2(scale_log2)
-        nope_fp8 = (nope_blocked / scale).reshape(num_slots, nope_dim).to(torch.float8_e4m3fn)
-
-        scale_e8m0 = (scale_log2.squeeze(-1) + 127).clamp(0, 255).byte()
-        scale_padding = self._get_fp8_scale_padding(num_slots, pool.device)
-        scale_padding.zero_()
-        scale_padding[:, :num_scales] = scale_e8m0
-
-        nope_bytes = nope_fp8.view(torch.uint8).reshape(num_slots, nope_dim)
-        rope_bytes = rope.contiguous().view(torch.uint8).reshape(num_slots, rope_dim * 2)
-        row_stride = tokens_per_block * bytes_per_token
-        row_base = scatter_block * row_stride
-        shadow_flat = shadow.view(-1)
-
-        data_start = row_base + token_offset * data_bytes
-        nope_indices = (
-            data_start.unsqueeze(1)
-            + self._get_fp8_shadow_offsets(nope_dim, pool.device).unsqueeze(0)
-        ).reshape(-1)
-        shadow_flat[nope_indices] = nope_bytes.reshape(-1)
-
-        rope_start = data_start + nope_dim
-        rope_indices = (
-            rope_start.unsqueeze(1)
-            + self._get_fp8_shadow_offsets(rope_dim * 2, pool.device).unsqueeze(0)
-        ).reshape(-1)
-        shadow_flat[rope_indices] = rope_bytes.reshape(-1)
-
-        scale_start = row_base + tokens_per_block * data_bytes + token_offset * 8
-        scale_indices = (
-            scale_start.unsqueeze(1) + self._get_fp8_shadow_offsets(8, pool.device).unsqueeze(0)
-        ).reshape(-1)
-        shadow_flat[scale_indices] = scale_padding.reshape(-1)
-
-    def _ensure_shadow_state(
-        self,
-        shadow_key: DeepseekV4AttentionType,
-        num_blocks: int,
-        tokens_per_block: int,
-        bytes_per_token: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, bool]:
-        required_rows = num_blocks + 1
-        shadow = self._fp8_shadows.get(shadow_key)
-        initialized = shadow is None or shadow.shape != (
-            required_rows,
-            tokens_per_block * bytes_per_token,
-        )
-        if initialized:
-            shadow = torch.zeros(
-                required_rows,
-                tokens_per_block * bytes_per_token,
-                dtype=torch.uint8,
-                device=device,
-            )
-            self._fp8_shadows[shadow_key] = shadow
-        return shadow, initialized
-
-    def _get_fp8_shadow_token_update_grid(
-        self,
-        num_requests: int,
-        max_tokens: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (num_requests, max_tokens)
-        cached = self._fp8_token_update_grids.get(key)
-        if cached is not None:
-            return cached
-        all_slots = torch.arange(num_requests * max_tokens, device=device, dtype=torch.long)
-        grids = (all_slots // max_tokens, all_slots % max_tokens)
-        self._fp8_token_update_grids[key] = grids
-        return grids
-
-    def _get_fp8_shadow_offsets(self, size: int, device: torch.device) -> torch.Tensor:
-        cached = self._fp8_offsets_cache.get(size)
-        if cached is None:
-            cached = torch.arange(size, device=device, dtype=torch.long)
-            self._fp8_offsets_cache[size] = cached
-        return cached
-
-    def _get_fp8_scale_padding(self, num_slots: int, device: torch.device) -> torch.Tensor:
-        if self._fp8_scale_pad_buf.shape[0] < num_slots:
-            self._fp8_scale_pad_buf = torch.zeros(num_slots, 8, dtype=torch.uint8, device=device)
-        return self._fp8_scale_pad_buf[:num_slots]
