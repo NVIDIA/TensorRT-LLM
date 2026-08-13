@@ -2227,15 +2227,16 @@ CUBIN_EXPORT __global__
                   wait_parity<grpLoadV>(pWarpGrpBar, getAndFlip<grpLoadV>(warpGrpBarParityNext));
 #endif
 #if USE_PAGED_KV_CACHE
-                  constexpr uint32_t xIterSeqStride = cacheVTileSeqStride * nbVItersPerXIter;
-                  if constexpr (xIterSeqStride <= tokensPerPage)
+                  // Consecutive V tiles of a warp group are cacheVTileSeqStride tokens apart,
+                  // so the page cursor must step per V tile.
+                  uint32_t const idxVTileInCtaTile = xIter * nbVItersPerXIter + vIter;
+                  bool const isLastBeam = (idxBeam == beamWidth - 1 || isConvergedTile(seqIter));
+                  if constexpr (cacheVTileSeqStride <= tokensPerPage)
                   {
-                      uint32_t const nbXItersPerPage = exactDiv(tokensPerPage, xIterSeqStride);
-                      assert(nbXItersPerPage <= nbXItersPerCtaTile);
-                      if (xIter % nbXItersPerPage == nbXItersPerPage - 1 && vIter == nbVItersPerXIter - 1
-                          && (idxBeam == beamWidth - 1 || isConvergedTile(seqIter)))
+                      constexpr uint32_t nbVTilesPerPage = exactDiv(tokensPerPage, cacheVTileSeqStride);
+                      if (idxVTileInCtaTile % nbVTilesPerPage == nbVTilesPerPage - 1 && isLastBeam)
                       {
-                          auto const step = 1; // cacheVTileSeqLen * gemm1NbWarpGrps / tokensPerPage;
+                          constexpr uint32_t step = 1;
                           idxPageBeg += (idxPageBeg % nbPagesPerCtaTile == nbPagesPerCtaTile - 1
                                   ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
                                   : step);
@@ -2247,10 +2248,9 @@ CUBIN_EXPORT __global__
                   }
                   else
                   {
-                      assert(nbVItersPerXIter == 1);
-                      if ((idxBeam == beamWidth - 1 || isConvergedTile(seqIter)) && vIter == nbVItersPerXIter - 1)
+                      if (isLastBeam)
                       {
-                          auto const step = exactDiv(xIterSeqStride, tokensPerPage);
+                          constexpr uint32_t step = exactDiv(cacheVTileSeqStride, tokensPerPage);
                           idxPageBeg += (idxPageBeg % nbPagesPerCtaTile + step >= nbPagesPerCtaTile
                                   ? nbPagesPerCtaTile * (nbSubSeqPerSeq - 1) + step
                                   : step);
