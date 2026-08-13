@@ -4648,8 +4648,56 @@ class PyExecutor:
         DP dimension (``mapping.py``: ``dp_size = tp_size if
         enable_attention_dp else 1``), so those ranks own independent request
         streams and independent KV caches and legitimately need different pool
-        ratios at different times; forcing rank 0's decision on them would
-        starve a rank that needs to rebalance when rank 0 does not.
+        ratios at different times.
+
+        That independence covers the *ratios*, but not the *timing*: the ranks
+        must still enter the rebalance together, so under ADP the TP hop
+        becomes an OR-reduction instead of being skipped.  The reason is that
+        the rebalance path is itself collective under ADP.
+        ``_consume_previous_batch_for_rebalance`` calls
+        ``_flush_pending_transfer_responses``, which -- as its own docstring
+        requires -- enters ``_enqueue_responses`` on every DP rank even with an
+        empty response list, and that performs a ``tp_gather``.  A rank
+        rebalancing alone therefore joins a collective its peers are not in, and
+        pairs up against whatever they happen to be running (in a live 4-rank
+        Qwen3-Next run: the ``tp_allgather`` of batch sizes in ``_can_queue``,
+        which returned ints where responses were expected and crashed the
+        executor loop).
+
+        ``any()`` rather than rank 0's reading is what keeps the starvation
+        argument intact: a rank that needs to rebalance still gets one instead
+        of waiting for rank 0 to want the same thing.
+
+        The cost to a rank that did *not* need one is not zero.  It runs the
+        whole hook: the stream sync, ``_consume_previous_batch_for_rebalance``
+        (which in the overlap loop collapses that iteration's overlap), then
+        suspend-all / ``adjust()`` / resume-all.  Measured end to end on
+        Qwen3-Next-80B (tp4 = ep4, ADP, 2 pool groups, 17 active requests) with
+        one rank needing the rebalance and three pulled in by it:
+
+            rank that needed it   21.1 ms  = 0.4 drain + 7.3 sync/agree + 13.5 rebalance
+            ranks pulled in        8.1 ms  = 0.3 drain + 7.3 sync/agree +  0.5 rebalance
+
+        So an uninvolved rank pays ~8 ms, not the 0.04 ms its no-op ``adjust()``
+        suggests, and the dominant term is the pre-existing
+        ``torch.cuda.current_stream().synchronize()`` below rather than anything
+        this agreement adds -- a check that decides *not* to rebalance, which
+        skips that sync, costs 0.1-1.5 ms.
+
+        Note the cooldown couples too: ``adjust()`` stamps
+        ``_last_adjustment_time`` unconditionally, so a rank dragged into a peer's
+        rebalance has its own 120s clock reset by it.  That keeps the group's
+        cadence aligned rather than letting N ranks each rebalance on their own
+        schedule, at the price of deferring a need that arises immediately
+        afterwards by up to one cooldown.
+
+        The extra collective costs one allgather per check, and the check is
+        already throttled to one iteration in
+        ``KV_POOL_REBALANCE_CHECK_INTERVAL``, against the ``tp_allgather`` that
+        ``_can_queue`` runs every iteration under ADP anyway.  It does add a
+        lockstep requirement that ADP did not have before: every TP rank must
+        reach this on the same iteration, so the ``_can_pause_for_rebalance``
+        gates above must stay rank-uniform under ADP as well as under plain TP.
 
         CP is orthogonal to that and must **not** be skipped.  Within a single
         DP replica the CP ranks still split the same request along the sequence
@@ -4687,8 +4735,11 @@ class PyExecutor:
         need = self.kv_cache_manager.impl.need_adjustment
         if self.dist.cp_size > 1:
             need = self.dist.cp_broadcast(need, root=0)
-        if self.dist.tp_size > 1 and not self.enable_attention_dp:
-            need = self.dist.tp_broadcast(need, root=0)
+        if self.dist.tp_size > 1:
+            if self.enable_attention_dp:
+                need = any(self.dist.tp_allgather(need))
+            else:
+                need = self.dist.tp_broadcast(need, root=0)
         if self.dist.pp_size > 1:
             need = self.dist.pp_broadcast(need, root=0)
         return need

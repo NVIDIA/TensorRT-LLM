@@ -619,19 +619,23 @@ class TestAgreedNeedAdjustment:
         exe.dist.pp_broadcast.assert_called_once_with(True, root=0)
 
     def test_pp_hop_survives_attention_dp(self):
-        """ADP suppresses the TP hop but must never suppress the PP hop.
+        """ADP must never suppress the PP hop, and the TP hop now OR-reduces.
 
-        ADP replicates along the TP dimension, so a replica's pipeline stages
-        all serve that replica's own request stream and have to drain together.
-        ``pp_group`` for a given tp_rank holds exactly those stages, so the
-        broadcast propagates the replica's first-stage decision and nothing
-        wider.
+        A replica's pipeline stages all serve that replica's own request stream
+        and have to drain together, so the PP broadcast is unchanged.  The TP
+        hop is no longer skipped under ADP -- it becomes an allgather+OR,
+        because the rebalance path itself is collective across TP (see
+        ``test_attention_dp_or_couples_across_ranks``).  The chain is therefore
+        OR over TP, then broadcast over PP.
         """
         exe = _make_executor(tp_size=2, pp_size=2, enable_attention_dp=True, need_adjustment=True)
+        exe.dist.tp_allgather.return_value = [True, False]
         exe.dist.pp_broadcast.return_value = False
 
         assert PyExecutor._agreed_need_adjustment(exe) is False
         exe.dist.tp_broadcast.assert_not_called()
+        exe.dist.tp_allgather.assert_called_once_with(True)
+        # The OR of [True, False] is what the PP hop must be handed.
         exe.dist.pp_broadcast.assert_called_once_with(True, root=0)
 
     def test_attention_dp_still_broadcasts_over_cp(self):
@@ -655,19 +659,48 @@ class TestAgreedNeedAdjustment:
         # ...but the TP hop stays suppressed, so replicas remain independent.
         exe.dist.tp_broadcast.assert_not_called()
 
-    def test_attention_dp_without_cp_touches_no_collective(self):
+    def test_attention_dp_without_cp_uses_the_tp_allgather_only(self):
+        """No CP hop when cp_size == 1, but the TP hop still runs under ADP.
+
+        This case used to assert that ADP touched *no* collective at all.  That
+        was the bug: the rebalance path it gates reaches
+        ``_flush_pending_transfer_responses`` -> ``_enqueue_responses``, which
+        under ADP runs a ``tp_gather`` on every DP rank.  Deciding locally meant
+        entering that gather alone.
+        """
         exe = _make_executor(tp_size=2, cp_size=1, enable_attention_dp=True, need_adjustment=True)
+        exe.dist.tp_allgather.return_value = [True, True]
+
         assert PyExecutor._agreed_need_adjustment(exe) is True
         exe.dist.cp_broadcast.assert_not_called()
         exe.dist.tp_broadcast.assert_not_called()
+        exe.dist.tp_allgather.assert_called_once_with(True)
 
-    def test_attention_dp_decides_independently(self):
-        # ADP ranks own independent request streams and independent KV caches,
-        # so forcing rank 0's decision on them would starve a rank that needs
-        # to rebalance when rank 0 does not.
-        exe = _make_executor(tp_size=4, enable_attention_dp=True, need_adjustment=True)
+    def test_attention_dp_or_couples_across_ranks(self):
+        """ADP agrees on *when* to rebalance while keeping per-rank ratios.
+
+        ``any()`` rather than a rank-0 broadcast is deliberate: it preserves the
+        anti-starvation property that motivated suppressing the hop in the first
+        place -- a rank that needs a rebalance gets one without waiting for rank
+        0 to want the same thing -- while still bringing every rank into the
+        collective path together.  A rank that did not need one still runs the
+        whole hook; only its ``adjust()`` is a no-op (0.04 ms on
+        Qwen3-Next-80B), not the surrounding drain and suspend/resume.
+        """
+        exe = _make_executor(tp_size=4, enable_attention_dp=True, need_adjustment=False)
+        exe.dist.tp_allgather.return_value = [False, False, True, False]
+
+        # This rank read False; a peer read True, so it joins the rebalance.
         assert PyExecutor._agreed_need_adjustment(exe) is True
         exe.dist.tp_broadcast.assert_not_called()
+        exe.dist.tp_allgather.assert_called_once_with(False)
+
+    def test_attention_dp_stays_put_when_no_rank_needs_it(self):
+        """The OR must not manufacture a rebalance nobody asked for."""
+        exe = _make_executor(tp_size=4, enable_attention_dp=True, need_adjustment=False)
+        exe.dist.tp_allgather.return_value = [False, False, False, False]
+
+        assert PyExecutor._agreed_need_adjustment(exe) is False
 
     def test_no_rebalance_when_agreement_says_no(self, monkeypatch):
         exe = _make_executor(tp_size=2, need_adjustment=True, active_requests=[_make_request(1)])

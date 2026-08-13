@@ -318,12 +318,28 @@ def run_cp_tp_agreement(
     assert len(set(all_decisions)) == 1, f"CPxTP ranks disagreed: {all_decisions}"
 
 
-def run_attention_dp_independence(world_size: int, rank: int, local_flags: list[bool]) -> None:
-    """Under attention DP each rank keeps its own decision.
+def run_attention_dp_or_coupling(world_size: int, rank: int, local_flags: list[bool]) -> None:
+    """Under attention DP the ranks OR their readings rather than decide alone.
 
-    ADP ranks own independent request streams and independent KV caches, so
-    forcing rank 0's decision on them would starve a rank that needs to
-    rebalance when rank 0 does not.
+    ADP ranks own independent request streams and independent KV caches, so the
+    resulting *ratios* are legitimately per-rank -- but the *timing* cannot be.
+    The rebalance path is collective under ADP:
+    ``_consume_previous_batch_for_rebalance`` calls
+    ``_flush_pending_transfer_responses``, which enters ``_enqueue_responses``
+    on every DP rank even with an empty response list (its own docstring
+    requires that), and that runs a ``tp_gather``.  A rank that rebalanced alone
+    would join a collective its peers are not in.  Observed on a live 4-rank
+    Qwen3-Next run before this was fixed: the gather paired against the
+    ``tp_allgather`` of batch sizes in ``_can_queue`` and the executor loop died
+    with ``cannot unpack non-iterable int object``.
+
+    ``any()`` rather than rank 0's broadcast is what preserves the
+    anti-starvation property the old suppression was reaching for: a rank that
+    needs a rebalance still gets one instead of waiting for rank 0 to want the
+    same thing.  A rank that does not need one is not free, though -- it runs
+    the whole hook, and only the ``adjust()`` within it is a no-op (0.04 ms
+    measured, inside ~0.5 ms of suspend/resume; the preceding drain is
+    unmeasured).
 
     Args:
         world_size: Number of TP ranks.
@@ -335,28 +351,37 @@ def run_attention_dp_independence(world_size: int, rank: int, local_flags: list[
 
     got = PyExecutor._agreed_need_adjustment(exe)
 
-    assert got == local_flags[rank], (
-        f"rank {rank}: attention DP must decide locally; expected {local_flags[rank]}, got {got}"
+    expected = any(local_flags)
+    assert got == expected, (
+        f"rank {rank}: attention DP must OR the readings so every rank enters the "
+        f"collective rebalance path together; local reading was {local_flags[rank]}, "
+        f"the group read {local_flags}, expected {expected}, got {got}"
     )
 
 
 def run_adp_cp_agreement(
     world_size: int, rank: int, cp_size: int, local_flags: list[bool], expected: list[bool]
 ) -> None:
-    """Under ADP the TP hop is suppressed but the CP hop must still run.
+    """Under ADP the CP hop broadcasts and the TP hop then OR-reduces.
 
-    ADP makes the TP dimension the DP dimension, so those ranks decide
-    independently.  CP is orthogonal: inside one DP replica the CP ranks split
-    the *same* request along the sequence dimension and must admit it together.
-    Skipping the CP broadcast here would reintroduce this mechanism's own
-    divergence once per replica.
+    Two different mechanisms, chained, and this case pins down both.  CP first:
+    inside one DP replica the CP ranks split the *same* request along the
+    sequence dimension and must admit it together, so they take their CP root's
+    reading.  Then TP: under ADP the replicas must still enter the rebalance
+    together, because the path is collective (see
+    ``run_attention_dp_or_coupling``), so the post-CP values are OR-ed across
+    the TP dimension.
+
+    The observable difference from the old suppressed-TP behaviour is that the
+    replicas no longer end on different answers.  That was never safe -- the
+    ``tp_gather`` in ``_enqueue_responses`` spans the replicas.
 
     Args:
         world_size: Total ranks, equal to ``cp_size * tp_size``.
         rank: This process's global rank.
         cp_size: Context-parallel width; TP width is derived from it.
         local_flags: Per-rank local ``need_adjustment`` readings.
-        expected: Per-rank agreed decision after the CP-only broadcast.
+        expected: Per-rank agreed decision after the CP broadcast and TP OR.
     """
     tp_size = world_size // cp_size
     dist = _cp_tp_dist(cp_size, tp_size, rank)
@@ -375,6 +400,7 @@ def run_adp_cp_agreement(
     )
     assert all_decisions == expected, (
         f"ADP+CP decisions were {all_decisions}, expected {expected}: CP ranks "
+        "must follow their CP root and the replicas must then OR together; "
         "must follow their replica's root while replicas stay independent"
     )
 
@@ -466,18 +492,20 @@ def run_tp_pp_agreement(
 def run_adp_pp_agreement(
     world_size: int, rank: int, tp_size: int, local_flags: list[bool], expected: list[bool]
 ) -> None:
-    """Under ADP the TP hop is suppressed but the PP hop must still run.
+    """Under ADP both hops run: TP OR-reduces, then PP broadcasts.
 
-    ADP replicates along the TP dimension, so each ``tp_rank`` owns an
-    independent request stream -- but a replica's *pipeline stages* all serve
-    that one stream and must drain together or the replica's pipeline hangs.
-    ``pp_group`` for a given ``tp_rank`` holds exactly those stages.
+    A replica's *pipeline stages* all serve that replica's one request stream
+    and must drain together or the replica's pipeline hangs -- that is the PP
+    hop, and it is unchanged.  What changed is the TP hop: it no longer skips
+    under ADP, because the rebalance path is collective across the TP dimension
+    (see ``run_attention_dp_or_coupling``), so the replicas must enter together
+    too.
 
-    On a 2x2 with only global rank 0 reading ``True``, the expected outcome is
-    ``[True, False, True, False]``: ranks 0 and 2 form one replica and follow
-    rank 0, ranks 1 and 3 form the other and follow rank 1.  That single vector
-    pins down both halves at once -- rank 2 being ``True`` shows the PP hop ran,
-    and rank 1 staying ``False`` shows the TP hop did not.
+    On a 2x2 with only global rank 0 reading ``True`` the outcome is therefore
+    all ``True``: the TP OR carries rank 0's need to rank 1 within stage 0, and
+    the PP broadcast then carries stage 0's decision to stage 1.  The previous
+    expectation here was ``[True, False, True, False]``, which encoded the
+    replica independence a live 4-rank Qwen3-Next run disproved.
 
     Args:
         world_size: Total ranks, equal to ``tp_size * pp_size``.
@@ -498,13 +526,13 @@ def run_adp_pp_agreement(
     assert got == expected[rank], (
         f"rank {rank} (tp_rank={dist.mapping.tp_rank}, "
         f"pp_rank={dist.mapping.pp_rank}): local reading was {local_flags[rank]}, "
-        f"its replica's first stage read {expected[rank]}, so the agreed decision "
-        f"should be {expected[rank]}, got {got}"
+        f"its first stage agreed on {expected[rank]} after the TP OR, so the "
+        f"agreed decision should be {expected[rank]}, got {got}"
     )
     assert all_decisions == expected, (
-        f"ADP+PP decisions were {all_decisions}, expected {expected}: pipeline "
-        "stages must follow their replica's first stage while replicas stay "
-        "independent"
+        f"ADP+PP decisions were {all_decisions}, expected {expected}: the TP OR "
+        "must couple the replicas within a stage and the PP broadcast must then "
+        "carry the first stage's decision to the rest"
     )
 
 
@@ -745,11 +773,12 @@ def test_tp_and_pp_ranks_agree_on_rebalance_trigger(world_size: int, tp_size: in
 @pytest.mark.parametrize("tp_size", [2], ids=lambda x: f"tp:{x}")
 @pytest.mark.parametrize("world_size", [4], ids=lambda x: f"world:{x}")
 def test_attention_dp_still_agrees_across_pp_stages(world_size: int, tp_size: int) -> None:
-    """ADP suppresses the TP hop but must never suppress the PP hop.
+    """ADP must never suppress the PP hop, and no longer suppresses the TP hop.
 
     Each DP replica is itself a pipeline whose stages have to drain together;
     suppressing the PP hop would hang the replica rather than merely let it
-    drift.
+    drift.  The TP hop now OR-reduces instead of being skipped, so a need
+    anywhere in a stage reaches every rank in it.
 
     Args:
         world_size: Total ranks; must equal ``tp_size * pp_size``.
@@ -757,9 +786,9 @@ def test_attention_dp_still_agrees_across_pp_stages(world_size: int, tp_size: in
     """
     _skip_if_not_enough_gpus(world_size)
     flags = _flags_for("only_rank0_true", world_size)
-    # rank = pp_rank * tp_size + tp_rank, so the replicas are {0, 2} and {1, 3}
-    # and each follows its own first stage: rank 0 reads True, rank 1 False.
-    expected = [True, False, True, False]
+    # rank = pp_rank * tp_size + tp_rank.  Stage 0 is {0, 1} and ORs rank 0's
+    # True across itself; the PP hop then carries that to stage 1 = {2, 3}.
+    expected = [True] * world_size
 
     with MPIPoolExecutor(max_workers=world_size) as ex:
         results = ex.map(
@@ -771,8 +800,13 @@ def test_attention_dp_still_agrees_across_pp_stages(world_size: int, tp_size: in
 
 
 @pytest.mark.parametrize("world_size", [2, 4], ids=lambda x: f"tp:{x}")
-def test_attention_dp_ranks_decide_independently(world_size: int) -> None:
-    """Attention DP opts out of the agreement: each rank keeps its own answer.
+def test_attention_dp_ranks_or_couple(world_size: int) -> None:
+    """Attention DP agrees on *when*, not on *what*: the readings are OR-ed.
+
+    ``only_rank0_false`` is the discriminating vector: rank 0 reads False while
+    its peers read True.  A broadcast from rank 0 would give everyone False and
+    starve the peers that need the rebalance; the old suppression would leave
+    rank 0 out of a collective its peers enter.  Only the OR gives all True.
 
     Args:
         world_size: Number of TP ranks to run on.
@@ -780,42 +814,74 @@ def test_attention_dp_ranks_decide_independently(world_size: int) -> None:
     _skip_if_not_enough_gpus(world_size)
     flags = _flags_for("only_rank0_false", world_size)
 
+    # Non-vacuity: the vector must distinguish OR from broadcast-from-rank-0.
+    assert any(flags) != flags[0], (
+        "flags must differ between rank 0 and the OR, or the test cannot tell "
+        "an OR-reduction from a rank-0 broadcast"
+    )
+
     with MPIPoolExecutor(max_workers=world_size) as ex:
         results = ex.map(
             run_single_rank,
-            *zip(*[(world_size, run_attention_dp_independence, flags)] * world_size),
+            *zip(*[(world_size, run_attention_dp_or_coupling, flags)] * world_size),
         )
         for r in results:
             assert r is True
 
 
+@pytest.mark.parametrize(
+    "flags",
+    [[False, True, False, False], [True, False, False, False]],
+    ids=["cp_root_wins", "or_across_replicas"],
+)
 @pytest.mark.parametrize("cp_size", [2], ids=lambda x: f"cp:{x}")
 @pytest.mark.parametrize("world_size", [4], ids=lambda x: f"world:{x}")
-def test_attention_dp_agrees_over_cp_but_not_tp(world_size: int, cp_size: int) -> None:
-    """ADP + CP: CP ranks follow their replica's root, replicas stay independent.
+def test_attention_dp_agrees_over_cp_then_ors_across_tp(
+    world_size: int, cp_size: int, flags: list[bool]
+) -> None:
+    """ADP + CP: CP ranks follow their root, then the replicas OR together.
 
-    ADP suppresses only the TP hop.  Nothing in ``Mapping`` or ``LlmArgs``
-    rejects ``enable_attention_dp`` with ``cp_size > 1``, so this topology is
-    reachable, and skipping the CP hop in it would leave each replica's CP ranks
-    deciding independently -- the divergence class this mechanism removes.
+    Nothing in ``Mapping`` or ``LlmArgs`` rejects ``enable_attention_dp`` with
+    ``cp_size > 1``, so this topology is reachable and both hops have to be
+    pinned down in it.
 
-    The flags are chosen so the case fails in both directions: two ranks are
-    overridden by their CP root (proving the CP hop ran) while the two replicas
-    end on *different* answers (proving the TP hop did not).
+    Two flag vectors, because one cannot pin both properties:
+
+    * ``cp_root_wins`` puts the only True on a *non-root* CP rank.  The CP
+      broadcast discards it, so the OR that follows finds nothing and every rank
+      ends False.  A plain global OR of the local readings would give True
+      everywhere, so this is what proves the CP hop runs *before* the TP hop and
+      is not merely folded into it.
+    * ``or_across_replicas`` puts the only True on a CP root in one replica.  It
+      survives the broadcast and the OR then carries it to the other replica, so
+      every rank ends True -- the coupling the collective rebalance path needs.
 
     Args:
         world_size: Total ranks; must equal ``cp_size * tp_size``.
         cp_size: Context-parallel width; TP width is ``world_size // cp_size``.
+        flags: Per-rank local ``need_adjustment`` readings for this case.
     """
     _skip_if_not_enough_gpus(world_size)
 
-    # cp_groups are consecutive ranks within a TP slice: [[0, 1], [2, 3]].
-    flags = [True, False, False, True]
-    expected = [flags[(r // cp_size) * cp_size] for r in range(world_size)]
+    # rank = tp_rank * cp_size + cp_rank, so cp_groups are consecutive ranks
+    # ([[0, 1], [2, 3]]) and tp_groups stride by cp_size ([[0, 2], [1, 3]]).
+    after_cp = [flags[(r // cp_size) * cp_size] for r in range(world_size)]
+    expected = [
+        any(after_cp[x] for x in range(world_size) if x % cp_size == r % cp_size)
+        for r in range(world_size)
+    ]
 
-    # Non-vacuity, both directions.
-    assert expected != flags, "flags must force the CP broadcast to change some rank"
-    assert len(set(expected)) > 1, "replicas must end up disagreeing, or the TP hop is untested"
+    # Non-vacuity: the chain must not collapse to a plain global OR of `flags`,
+    # which is exactly the mistake this pair of vectors exists to catch.
+    assert expected != flags, "flags must force some hop to change some rank"
+    if not any(after_cp):
+        assert any(flags), (
+            "the cp_root_wins vector must start with a True somewhere, or it "
+            "proves nothing about ordering"
+        )
+        assert expected == [False] * world_size, (
+            "a True on a non-root CP rank must be discarded by the CP broadcast"
+        )
 
     with MPIPoolExecutor(max_workers=world_size) as ex:
         results = ex.map(
