@@ -342,7 +342,7 @@ random.seed(0)
 min_context_sequence_length = 1
 max_context_sequence_length = 1000
 min_num_contexts = 1
-max_num_contexts = 10
+max_num_contexts = 64
 random_context_sequence_lengths = [
     random.randint(min_context_sequence_length, max_context_sequence_length)
     for _ in range(random.randint(min_num_contexts, max_num_contexts))
@@ -354,6 +354,7 @@ context_sequence_lengths = [
     [100, 300, 20, 10],
     [253, 253, 253, 253],
     [100, 1110, 1000, 1000],
+    [10] * 64,
     random_context_sequence_lengths,
 ]
 # Use MTP by default if seqlen_q > 1.
@@ -361,10 +362,12 @@ generation_seq_len_q = [1, 4]
 num_generation_steps = [10]
 
 # tokens_per_block = 32 for blackwell
-tokens_per_block = 32 if torch.cuda.get_device_capability() >= (10, 0) else 64
+cuda_capability = torch.cuda.get_device_capability() if torch.cuda.device_count(
+) > 0 else (0, 0)
+tokens_per_block = 32 if cuda_capability >= (10, 0) else 64
 
 kv_cache_dtype_list = [torch.bfloat16]
-if torch.cuda.get_device_capability() in [(8, 9), (9, 0), (10, 0), (12, 0)]:
+if cuda_capability in [(8, 9), (9, 0), (10, 0), (12, 0)]:
     kv_cache_dtype_list.append(torch.float8_e4m3fn)
 scenarios = [
     Scenario(kv_cache_dtype=kv_cache_dtype,
@@ -387,6 +390,7 @@ accuracy_dict = {
         (100, "chunked_prefill"),
     ],
 )
+@pytest.mark.cpu_only
 def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
                                             monkeypatch):
     import tensorrt_llm._torch.modules.mla as mla_module
@@ -543,8 +547,7 @@ def test_attention_mla_flashinfer(scenario: Scenario,
                                   v2_kv_cache: bool):
     """Test FlashInfer MLA computation for both context and generation phases"""
     pytest.importorskip("flashinfer")
-    if (not torch.cuda.is_available()
-            or torch.cuda.get_device_capability() != (10, 0)):
+    if (not torch.cuda.is_available() or cuda_capability != (10, 0)):
         pytest.skip("FlashInfer MLA test only runs on SM100 (Blackwell)")
 
     num_heads = scenario.num_heads
@@ -867,8 +870,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 mapping=mapping,
             )
             if backend_name == "TRTLLM":
-                gen_metadata_kwargs["enable_flash_mla"] = (
-                    torch.cuda.get_device_capability() == (9, 0))
+                gen_metadata_kwargs["enable_flash_mla"] = (cuda_capability == (
+                    9, 0))
             attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
             attn_metadata.prepare()
         for layer_idx in range(num_layers):

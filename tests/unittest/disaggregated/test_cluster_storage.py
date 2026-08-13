@@ -15,6 +15,8 @@ from tensorrt_llm.serve.cluster_storage import (
     create_cluster_storage, create_cluster_storage_client, is_loopback_host,
     validate_http_cluster_storage_scope)
 
+pytestmark = pytest.mark.cpu_only
+
 _counter = 0
 
 

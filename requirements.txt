@@ -58,7 +58,7 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-flashinfer-python==0.6.15
+flashinfer-python==0.6.16
 xgrammar==0.1.32
 llguidance==0.7.29
 jsonschema
@@ -92,8 +92,9 @@ llist
 cuda-tile>=1.0.1
 nvidia-cuda-tileiras>=13.1,<13.2
 etcd-sdk-python==0.0.7
+# etcd-sdk-python imports google.protobuf but omits it from its package metadata.
+protobuf>=5.27.2
 python-multipart
-smg-grpc-proto>=0.4.2
 cache-dit>=1.3.5
 librosa
 msgpack

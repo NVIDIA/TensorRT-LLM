@@ -28,6 +28,8 @@ from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
     InsertCachedAttentionConfig,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _TwoWindowModule(torch.nn.Module):
     """A tiny two-layer model with one SWA layer and one full-attention layer.

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -419,6 +419,9 @@ private:
     PermuteGemm1::Runner mPermuteGemm1;
     Gemm2::Runner mGemm2;
     ActType mActType;
+    // Kept so setOpsData can tell the activation launcher how much per-expert
+    // tile padding the permuted row space carries.
+    int32_t mTileTokensDim;
 
     // This will be the cartesian product of the passing configs for gemm1 and gemm2
     // This allows us to autotune the MoE as one operation instead of tuning gemm1 and gemm2 separately
