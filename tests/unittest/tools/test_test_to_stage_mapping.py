@@ -158,7 +158,6 @@ def test_known_stage_without_tests_is_reported(tmp_path):
     assert 'no tests mapped to: Empty-PyTorch-1' in proc.stderr.decode()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5547275")
 @pytest.mark.parametrize("direction",
                          ["test_to_stage", "stage_to_test", "roundtrip"])
 def test_bidirectional_mapping_consistency(stage_query, sample_test_cases,
