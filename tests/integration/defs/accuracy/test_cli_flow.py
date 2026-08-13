@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -216,72 +216,6 @@ class TestPhi2(CliFlowAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     def test_tp2(self):
         self.run(tp_size=2)
-
-
-@skip_post_blackwell
-class TestPhi3Mini4kInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-@skip_post_blackwell
-class TestPhi3Mini128kInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3-mini-128k-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-mini-128k-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-@skip_post_blackwell
-class TestPhi3Small8kInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3-small-8k-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-small-8k-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-@skip_post_blackwell
-class TestPhi3Small128kInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3-small-128k-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3/Phi-3-small-128k-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-@skip_post_blackwell
-class TestPhi3_5MiniInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-3.5-mini-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-3.5/Phi-3.5-mini-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-
-class TestPhi4MiniInstruct(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-4-mini-instruct"
-    MODEL_PATH = f"{llm_models_root()}/Phi-4-mini-instruct"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    def test_auto_dtype(self):
-        self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
-
-    @pytest.mark.skip_less_device(2)
-    def test_tp2(self):
-        # Created a dummy accuracy to track tp_size=2 for phi4-mini model.
-        # TODO: update once https://nvbugs/5393849 is fixed.
-        MODEL_NAME = "microsoft/Phi-4-mini-instruct-tp2"
-        self.run(tasks=[MMLU(MODEL_NAME)], tp_size=2)
 
 
 # Long sequence length test:

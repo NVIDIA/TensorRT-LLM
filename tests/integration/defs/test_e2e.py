@@ -950,13 +950,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
                  'Qwen3/nvidia-Qwen3-32B-NVFP4',
                  marks=skip_pre_blackwell),
     ("Qwen3-32B-bf16", "Qwen3/Qwen3-32B"),
-    pytest.param('Phi4-Reasoning-Plus-fp8',
-                 'nvidia-Phi-4-reasoning-plus-FP8',
-                 marks=skip_pre_hopper),
-    pytest.param('Phi4-Reasoning-Plus-nvfp4',
-                 'nvidia-Phi-4-reasoning-plus-NVFP4',
-                 marks=skip_pre_blackwell),
-    ("Phi-4-reasoning-plus-bf16", "Phi-4-reasoning-plus"),
     pytest.param('Nemotron-Super-49B-v1.5-FP8',
                  'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1_5-FP8',
                  marks=skip_pre_hopper),
@@ -1651,78 +1644,6 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
     print("All answers are correct!")
 
 
-@pytest.mark.parametrize("modality", ["image", "audio", "image_audio"])
-@pytest.mark.parametrize("model_name,model_path", [
-    ("phi4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
-    pytest.param("phi4-multimodal-instruct-fp4",
-                 "multimodals/Phi-4-multimodal-instruct-FP4",
-                 marks=skip_pre_blackwell),
-    pytest.param("phi4-multimodal-instruct-fp8",
-                 "multimodals/Phi-4-multimodal-instruct-FP8",
-                 marks=skip_pre_hopper),
-])
-def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, model_name,
-                                          model_path, modality):
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    test_data_root = Path(
-        os.path.join(llm_models_root(), "multimodals", "test_data"))
-    audio_data_root = Path(
-        os.path.join(llm_models_root(), "multimodals",
-                     "Phi-4-multimodal-instruct", "examples"))
-    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
-    accuracy_inputs = {
-        "image": {
-            "prompt": [
-                "Describe the object and the weather condition in the image.",
-                "Describe the traffic condition on the road in the image.",
-            ],
-            "media": [
-                str(test_data_root / "inpaint.png"),
-                str(test_data_root / "61.jpg"),
-            ],
-        },
-        "audio": {
-            "prompt": [
-                "Transcribe the audio clip into text, please don't add other text.",
-                "Transcribe the audio clip into text, please don't add other text.",
-            ],
-            "media": [
-                str(audio_data_root /
-                    "what_is_the_traffic_sign_in_the_image.wav"),
-                str(audio_data_root / "what_is_shown_in_this_image.wav"),
-            ],
-        },
-        "image_audio": {
-            "prompt": [
-                "",
-            ],
-            "media": [
-                str(test_data_root / "inpaint.png"),
-                str(audio_data_root / "what_is_shown_in_this_image.wav"),
-            ],
-        }
-    }
-    cmd = [
-        str(example_root / "quickstart_multimodal.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--modality",
-        modality,
-        "--prompt",
-        *accuracy_inputs[modality]["prompt"],
-        "--media",
-        *accuracy_inputs[modality]["media"],
-        # Set max_seq_len to 4096 to use short rope factor.
-        "--max_seq_len=4096",
-        "--load_lora",
-        "--auto_model_name",
-        "Phi4MMForCausalLM",
-    ]
-    output = llm_venv.run_cmd(cmd, caller=check_output)
-
-    print("Sanity check passed!")
-
-
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
@@ -1782,10 +1703,7 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
     output = llm_venv.run_cmd(cmd, caller=check_output)
     print("output:", output)
 
-    # Set match ratio based on model
     match_ratio = 4.0 / 5
-    if model_name.startswith("Phi-4-multimodal-instruct"):
-        match_ratio = 0.6
 
     # Check output accuracy
     parsed_outputs = parse_output(output)
