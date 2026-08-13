@@ -33,8 +33,7 @@ def _meta(max_num_requests=8):
 
 
 def _request(slot, decoding_iter=0):
-    return types.SimpleNamespace(py_seq_slot=slot,
-                                 py_decoding_iter=decoding_iter)
+    return types.SimpleNamespace(py_seq_slot=slot, py_decoding_iter=decoding_iter)
 
 
 def _offsets(meta, requests):
