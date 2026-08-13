@@ -712,7 +712,6 @@ def test_default_profile_qualifies_real_tiny_llama_lifecycle(
     )
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("rank", [0, 1])
 def test_default_profile_qualifies_real_tiny_llama_tp2_rank_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
@@ -753,7 +752,6 @@ def test_default_profile_qualifies_real_tiny_llama_tp2_rank_lifecycle(
     )
 
 
-@pytest.mark.cpu_only
 def test_qwen2_dense_profile_qualifies_full_staged_lifecycle() -> None:
     case = PostTransformQualificationCase(
         profile_id="qwen2-for-causal-lm-bf16-target-v1",
@@ -793,7 +791,6 @@ def test_qwen2_dense_profile_qualifies_full_staged_lifecycle() -> None:
     }
 
 
-@pytest.mark.cpu_only
 def test_qwen2_dense_profile_rejects_effective_unfused_rope() -> None:
     model = _tiny_qwen2_model(
         kv_cache_compression_config=SimpleNamespace(changes_physical_kv_length=True)
@@ -811,7 +808,6 @@ def test_qwen2_dense_profile_rejects_effective_unfused_rope() -> None:
     assert decision.unsupported_runtime_dimensions == frozenset({"rope_fusion"})
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("rank", [0, 1])
 def test_qwen2_dense_profile_qualifies_tp2_rank_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
