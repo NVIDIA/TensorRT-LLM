@@ -7,7 +7,7 @@
 # TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS env (set by the test) so the ordinary short test prompts still
 # take the coalesced-bounce WRITE path (the production default of 96 would need a ~2k-token prompt).
 # GB200/GB300 only, since the bounce arena is fabric (MNNVL) VMM memory.
-model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+model: Qwen3/Qwen3-0.6B
 hostname: localhost
 port: 8000
 backend: "pytorch"

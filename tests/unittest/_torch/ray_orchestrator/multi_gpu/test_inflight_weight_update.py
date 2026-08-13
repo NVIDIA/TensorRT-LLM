@@ -98,7 +98,7 @@ async def _run_generate_async(
 @pytest.mark.asyncio
 @skip_pre_hopper
 async def test_inflight_weight_update():
-    model_dir = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_dir = str(llm_models_root() / "llama-3.1-model/Llama-3.1-8B-Instruct")
     num_hidden_layers = 1
 
     # Reference HF model providing the "new" weights via CUDA IPC handles.

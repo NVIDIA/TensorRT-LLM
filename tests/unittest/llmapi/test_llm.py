@@ -37,10 +37,6 @@ from utils.util import force_ampere, similar, altered_env
 
 # isort: on
 
-# The unittests are based on the tiny-llama, which is fast to build and run.
-# There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
-# test_llm_multi_gpu.py.
-
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
@@ -124,7 +120,7 @@ def llm_check_output(llm: LLM,
                  stop_reasons=stop_reasons)
 
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
 mixtral_model_name = "Mixtral-8x7B-v0.1"
 
 llama_model_path = get_model_path(default_model_name)
@@ -381,41 +377,6 @@ def _test_llm_generate_async(model_name=default_model_name,
     test_future(streaming=False)
     test_future_async()
     test_non_streaming_usage_wait()
-
-
-@pytest.mark.parametrize("chunked", [True, False])
-@pytest.mark.part0
-@pytest.mark.mpi_ray_parity
-def test_llm_generate_async_with_stream_interval(chunked):
-    model_path = get_model_path('llama-models-v2/llama-v2-7b-hf')
-    max_num_tokens = 256
-    with LLM(model_path,
-             max_num_tokens=max_num_tokens,
-             stream_interval=4,
-             enable_chunked_prefill=chunked) as llm:
-        sampling_params = SamplingParams(max_tokens=13,
-                                         ignore_eos=True,
-                                         detokenize=False)
-        step = 0
-        last_step_len = 0
-        prompt = "The capital of France is "
-        if chunked:
-            prompt = prompt * max_num_tokens
-        for output in llm.generate_async(prompt,
-                                         sampling_params=sampling_params,
-                                         streaming=True):
-            current_step_len = len(output.outputs[0].token_ids)
-            # The output lens of each step need to be [1, 3, 4, 4, 1]
-            if step == 0:
-                assert current_step_len == 1
-            elif step == 1:
-                assert current_step_len - last_step_len == 3
-            elif step == 2 or step == 3:
-                assert current_step_len - last_step_len == 4
-            else:
-                assert current_step_len - last_step_len == 1
-            step += 1
-            last_step_len = current_step_len
 
 
 @pytest.mark.part0

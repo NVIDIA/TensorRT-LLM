@@ -18,6 +18,8 @@ from defs.common import venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
 from defs.trt_test_alternative import popen
 
+_QWEN3_MODEL = "Qwen3/Qwen3-0.6B"
+
 
 @pytest.fixture(scope="module")
 def ray_example_root(llm_root):
@@ -27,7 +29,7 @@ def ray_example_root(llm_root):
 
 def test_llm_inference_async_ray(ray_example_root, llm_venv):
     script_path = os.path.join(ray_example_root, "llm_inference_async_ray.py")
-    model_path = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_path = f"{llm_models_root()}/{_QWEN3_MODEL}"
     venv_check_call(llm_venv, [script_path, "--model", model_path])
 
 
@@ -58,10 +60,9 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
 
     if ep_size != -1:
         model_dir = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
-        cmd.extend(["--model_dir", model_dir])
     else:
-        model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-        cmd.extend(["--model_dir", model_dir])
+        model_dir = f"{llm_models_root()}/{_QWEN3_MODEL}"
+    cmd.extend(["--model_dir", model_dir])
 
     venv_check_call(llm_venv, cmd)
 
@@ -86,7 +87,7 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size,
 
     disagg_dir = os.path.join(ray_example_root, "disaggregated")
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
-    model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_dir = f"{llm_models_root()}/{_QWEN3_MODEL}"
 
     try:
         runtime_env = {

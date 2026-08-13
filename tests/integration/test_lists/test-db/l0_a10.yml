@@ -54,28 +54,6 @@ l0_a10:
   - unittest/tools
   - unittest/usage/test_transport.py
   - unittest/usage/test_e2e_capture.py
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-TinyLlama-1.1B-Chat-v1.0]
   - test_e2e.py::test_get_ci_container_port
   - test_e2e.py::test_openai_chat_multimodal_example ISOLATION
   - test_e2e.py::test_openai_mmencoder_example
@@ -93,7 +71,25 @@ l0_a10:
   - test_e2e.py::test_openai_completions_example[pytorch]
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
-  - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
+  # ------------- Disaggregated serving tests ---------------
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph
+  - disaggregated/test_disaggregated.py::test_disaggregated_mixed
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens
+  - disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output
+  - disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics
+  - disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_conditional[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv
+  - disaggregated/test_disaggregated.py::test_disaggregated_ngram
+  - disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[Qwen3-0.6B]
+  - disaggregated/test_workers.py::test_workers_conditional_disaggregation[Qwen3-0.6B]
+  - disaggregated/test_workers.py::test_workers_kv_cache_events[Qwen3-0.6B]
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router[Qwen3-0.6B]
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[Qwen3-0.6B]
+  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-Qwen3-0.6B]
+  - disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-Qwen3-0.6B]
   # visual_gen
   - unittest/_torch/visual_gen/test_profiler.py
   - unittest/visual_gen/test_iteration_stats.py
@@ -155,8 +151,6 @@ l0_a10:
       stage: post_merge
       backend: pytorch
   tests:
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - llmapi/test_llm_examples.py::test_llmapi_chat_example
   - llmapi/test_llm_examples.py::test_llmapi_server_example
   - llmapi/test_llm_examples.py::test_llmapi_kv_cache_connector[Qwen2-0.5B]

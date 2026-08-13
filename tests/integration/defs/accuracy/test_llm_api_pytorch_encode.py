@@ -357,12 +357,6 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 #   Qwen2ForCausalLM   — Qwen2-7B (distinct GQA head config, SwiGLU variant)
 #   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm, architecturally distinct from Qwen2)
 DECODER_MODELS = [
-    # -- LlamaForCausalLM (covers Llama + Mistral family) --
-    pytest.param(
-        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-        id="tinyllama-1.1b",
-    ),
     # -- Gemma3ForCausalLM --
     pytest.param(
         "google/gemma-3-1b-it",

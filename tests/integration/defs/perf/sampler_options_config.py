@@ -30,10 +30,4 @@ def get_sampler_options_config(model_label: str) -> dict:
     # PerfTestConfig.to_string() emits them: maxbs:/maxnt: are always injected
     # and tp: is dropped when tp_size == num_gpus.
     base_config = {}
-    if model_label in [
-            'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:128,128-gpus:8',
-    ]:
-        base_config['top_k'] = 4
-        base_config['top_p'] = 0.5
-        base_config['temperature'] = 0.5
     return base_config

@@ -95,7 +95,6 @@ l0_dgx_h100:
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_hopper_w4a16
   - test_e2e.py::test_ptp_quickstart_advanced_bs1
   - test_e2e.py::test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance[DeepSeek-V3-Lite-FP8-DeepSeek-V3-Lite/fp8]
-  - test_e2e.py::test_trtllm_bench_llmapi_launch[pytorch_backend-llama-v3-llama3-8b]
   # ------------- Disaggregated serving tests ---------------
   # Split test_py_cache_transceiver_mp.py by workflow (4 × 12 = 48 combos).
   # A single wrapper case ran ~3581 s on B200 and brushed the outer pytest
@@ -105,17 +104,6 @@ l0_dgx_h100:
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first_sync"
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first1"
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first2"
-  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp1pp2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp1pp2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp2pp1]
@@ -218,7 +206,18 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ctxpp2_gentp2_one_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_workers.py::test_workers_conditional_disaggregation_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
   - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
-  - disaggregated/test_workers.py::test_workers_conversation_router[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4
+  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[Qwen3-0.6B]
+  - disaggregated/test_workers.py::test_workers_conversation_router[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4
+  - disaggregated/test_disaggregated.py::test_disaggregated_genbs1
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap[Qwen3-0.6B]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python
+  - disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4]
 - condition:
     ranges:
       system_gpu_count:
@@ -291,11 +290,11 @@ l0_dgx_h100:
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
     - unittest/llmapi/test_async_llm.py -m "gpu2"
     - accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
-    - examples/test_ray.py::test_llm_inference_distributed_ray[tp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[pp2]
+    - examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[tep2]
-    - examples/test_ray.py::test_ray_disaggregated_serving[tp1]
-    - examples/test_ray.py::test_ray_disaggregated_serving_python[tp1]
+    - examples/test_ray.py::test_ray_disaggregated_serving[tp2]
+    - examples/test_ray.py::test_ray_disaggregated_serving_python[tp2]
 - condition:
     ranges:
       system_gpu_count:
@@ -365,13 +364,11 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
-  - disaggregated/test_ad_disagg_trtllm_serve.py::test_openai_completion
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[google_gemma-3-1b-it-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.1-8B-Instruct-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Ministral-8B-Instruct-2410-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[mistralai_Codestral-22B-v0.1-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[Qwen_QwQ-32B-False]
-  - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[meta-llama_Llama-3.3-70B-Instruct-False]
   - accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::test_autodeploy_from_registry[nvidia_Llama-3.1-8B-Instruct-FP8-True]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[flashinfer]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-attn_dp_off-trtllm]

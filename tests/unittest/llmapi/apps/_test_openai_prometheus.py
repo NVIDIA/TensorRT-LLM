@@ -25,18 +25,11 @@ from urllib.request import Request, urlopen
 import pytest
 import yaml
 
-from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-@pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
-def model_name():
-    """Return the HuggingFace model path used for all tests in this module."""
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
 @pytest.fixture(scope="module")
@@ -61,19 +54,6 @@ def temp_extra_llm_api_options_file(request):
     finally:
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
-
-
-@pytest.fixture(scope="module")
-def server(model_name: str,
-           temp_extra_llm_api_options_file: str) -> RemoteOpenAIServer:
-    """Start a RemoteOpenAIServer with the PyTorch backend and metrics enabled."""
-    model_path = get_model_path(model_name)
-    args = ["--backend", "pytorch", "--tp_size", "1"]
-    args.extend(["--extra_llm_api_options", temp_extra_llm_api_options_file])
-    logger.info(f"Starting server, model: {model_name}, args: {args}")
-    with RemoteOpenAIServer(model_path, args) as remote_server:
-        yield remote_server
-        logger.info("Tests completed, shutting down server")
 
 
 def _parse_prometheus_sample(data: str, metric_name: str) -> float | None:

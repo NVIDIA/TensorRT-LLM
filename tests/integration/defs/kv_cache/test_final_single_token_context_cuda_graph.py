@@ -31,7 +31,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.executor.executor import GenerationExecutor
+from tensorrt_llm.executor import GenerationExecutor
 from tensorrt_llm.executor.postproc_worker import PostprocWorkerConfig
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.worker import GenerationExecutorWorker
@@ -41,7 +41,7 @@ from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from ..conftest import llm_models_root
 
-MODEL = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
 SPEC_MODEL = f"{llm_models_root()}/Qwen3/Qwen3-8B"
 EAGLE3_MODEL = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
 PROMPT_TOKEN_IDS = [1] + [42] * 63 + [43]
@@ -361,25 +361,6 @@ def test_final_token_reuse_cuda_graph(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
-def test_changed_final_token_reuse_cuda_graph(
-    use_kv_cache_manager_v2: bool,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verify the promoted row reads a changed final prompt token."""
-    cold, reused, graph_executions = _generate_changed_final_token_cold_and_reused(
-        use_kv_cache_manager_v2,
-        SamplingParams(max_tokens=4, end_id=-1, temperature=0),
-        monkeypatch,
-    )
-
-    assert PROMPT_TOKEN_IDS[:-1] == CHANGED_FINAL_PROMPT_TOKEN_IDS[:-1]
-    assert PROMPT_TOKEN_IDS[-1] != CHANGED_FINAL_PROMPT_TOKEN_IDS[-1]
-    assert cold.outputs[0].token_ids == reused.outputs[0].token_ids
-    _assert_reused_context_used_cuda_graph(graph_executions)
-
-
-@pytest.mark.threadleak(enabled=False)
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
 def test_final_token_reuse_cuda_graph_tp2(
@@ -420,6 +401,25 @@ def test_final_token_reuse_cuda_graph_tp2(
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+def test_changed_final_token_reuse_cuda_graph(
+    use_kv_cache_manager_v2: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify the promoted row reads a changed final prompt token."""
+    cold, reused, graph_executions = _generate_changed_final_token_cold_and_reused(
+        use_kv_cache_manager_v2,
+        SamplingParams(max_tokens=4, end_id=-1, temperature=0),
+        monkeypatch,
+    )
+
+    assert PROMPT_TOKEN_IDS[:-1] == CHANGED_FINAL_PROMPT_TOKEN_IDS[:-1]
+    assert PROMPT_TOKEN_IDS[-1] != CHANGED_FINAL_PROMPT_TOKEN_IDS[-1]
+    assert cold.outputs[0].token_ids == reused.outputs[0].token_ids
+    _assert_reused_context_used_cuda_graph(graph_executions)
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
 def test_context_logits_after_final_token_reuse(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -455,8 +455,6 @@ def test_guided_decoding_after_final_token_reuse(
         SamplingParams(
             max_tokens=4,
             end_id=-1,
-            # Keep the grammar permissive so output equality tests execution-
-            # path parity rather than narrow-format generation behavior.
             guided_decoding=GuidedDecodingParams(regex=r".*"),
         ),
         monkeypatch,

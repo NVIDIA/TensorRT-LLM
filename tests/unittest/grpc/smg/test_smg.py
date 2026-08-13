@@ -325,13 +325,13 @@ class TestProtoMessages:
     def test_model_info_response(self):
         """Test GetModelInfoResponse message."""
         response = pb2.GetModelInfoResponse(
-            model_id="meta-llama/Meta-Llama-3-8B",
+            model_id="meta-llama/Llama-3.1-8B-Instruct",
             max_input_len=4096,
             max_seq_len=8192,
             vocab_size=32000,
         )
 
-        assert response.model_id == "meta-llama/Meta-Llama-3-8B"
+        assert response.model_id == "meta-llama/Llama-3.1-8B-Instruct"
         assert response.max_input_len == 4096
         assert response.max_seq_len == 8192
         assert response.vocab_size == 32000
@@ -642,7 +642,7 @@ class TestGenerateValidation:
 # End-to-end gRPC service tests (with real model)
 # ============================================================================
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
 
 
 def get_model_path(model_name):
@@ -656,11 +656,8 @@ def get_model_path(model_name):
 def grpc_service():
     """Create a real LLM, request manager, and servicer for e2e testing.
 
-    Uses TinyLlama-1.1B for minimal GPU resource usage.
-    Shared across all tests in the class; class scope (not module) so the
-    LLM is shut down and its GPU memory released before the multimodal
-    class below creates its own LLM — with module scope both models are
-    alive at once and the second one OOMs on A10.
+    Uses Llama-3.1-8B-Instruct for GPU resource usage.
+    Shared across all tests in this module.
     """
     model_path = get_model_path(default_model_name)
     llm = LLM(
@@ -707,7 +704,7 @@ class TestGrpcServiceEndToEnd:
     """End-to-end tests for the gRPC service flow.
 
     Tests the full pipeline: gRPC request -> servicer -> request manager -> LLM -> response.
-    Uses TinyLlama-1.1B for minimal GPU resource usage.
+    Uses Llama-3.1-8B-Instruct for GPU resource usage.
     """
 
     def test_generate_non_streaming(self, grpc_service):

@@ -1,5 +1,4 @@
 metadata:
-  model_name: llama_v3.3_70b_instruct_fp4
   supported_gpus:
   - B200
 hardware:
@@ -7,7 +6,6 @@ hardware:
 server_configs:
   # TP4, ISL/OSL: 512/32
   - name: "llama70b_fp4_tp4_512_32"
-    model_name: "llama_v3.3_70b_instruct_fp4"
     tensor_parallel_size: 4
     pipeline_parallel_size: 1
     max_batch_size: 512
@@ -28,7 +26,6 @@ server_configs:
 
   # TP4, ISL/OSL: 1000/1000
   - name: "llama70b_fp4_tp4_1000_1000"
-    model_name: "llama_v3.3_70b_instruct_fp4"
     tensor_parallel_size: 4
     pipeline_parallel_size: 1
     max_batch_size: 1024

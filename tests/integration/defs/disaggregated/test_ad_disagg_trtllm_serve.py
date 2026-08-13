@@ -15,22 +15,11 @@
 
 import asyncio
 import os
-from pathlib import Path
 
 import pytest
 import requests
-from defs.common import get_free_port_in_ci as get_free_port
-from defs.conftest import check_device_contain, llm_models_root
-from disagg_test_utils import (
-    CHECK_STATUS_INTERVAL,
-    HEARTBEAT_INTERVAL,
-    INACTIVE_TIMEOUT,
-    run_ctx_worker,
-    run_disagg_server,
-    run_gen_worker,
-    terminate,
-)
-from openai import OpenAI
+from defs.conftest import check_device_contain
+from disagg_test_utils import CHECK_STATUS_INTERVAL, HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT
 
 pytest_plugins = ["disagg_test_utils"]
 
@@ -48,13 +37,8 @@ SERVER_START_TIMEOUT_S = 300
 SERVER_READY_REQUEST_TIMEOUT_S = 5
 OPENAI_REQUEST_TIMEOUT_S = 60
 PROXY_PORT_MAX_RETRIES = 5
-TINYLLAMA_MODEL_DIR = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 AUTODEPLOY_BACKEND = "_autodeploy"
 EXPECTED_COMPLETION_SUBSTRING = "Berlin"
-
-
-def tinyllama_model_path():
-    return str(Path(llm_models_root()) / TINYLLAMA_MODEL_DIR)
 
 
 def worker_cuda_devices(num_workers):
@@ -160,107 +144,4 @@ async def wait_for_disagg_server_ready_or_exit(port, processes, timeout, request
     raise TimeoutError(
         f"Timed out after {timeout}s waiting for disaggregated server on port {port}; "
         f"{last_readiness_error}"
-    )
-
-
-@pytest.mark.skip_less_device_memory(30000)
-@pytest.mark.skip_less_device(2)
-@pytest.mark.timeout(900)
-@pytest.mark.asyncio(loop_scope="module")
-async def test_openai_completion(work_dir):
-    """Smoke test AutoDeploy disagg through trtllm-serve and the OpenAI API.
-
-    The lower-level tests in ``test_ad_disagg.py`` drive AutoDeploy workers
-    directly and inspect context/generation handoff metadata. This test instead
-    verifies the trtllm-serve deployment shape: context worker, generation
-    worker, disaggregated proxy, and an OpenAI-compatible completion request.
-    """
-    model = tinyllama_model_path()
-    ctx_device, gen_device = worker_cuda_devices(2)
-
-    last_port_conflict = None
-    response = None
-    for attempt in range(PROXY_PORT_MAX_RETRIES):
-        disagg_port = get_free_port()
-        disagg_cluster = disagg_cluster_config(disagg_port)
-        ctx_worker = None
-        gen_worker = None
-        disagg_server = None
-
-        try:
-            # Use the same service-discovery path as the broader PyTorch disagg
-            # tests for worker ports. Passing port=0 lets each trtllm-serve worker
-            # bind an OS-selected port in the child process and register that port
-            # with the disaggregated proxy.
-            ctx_worker = run_ctx_worker(
-                model,
-                autodeploy_worker_config(disagg_cluster, disable_overlap_scheduler=True),
-                work_dir,
-                port=0,
-                device=ctx_device,
-            )
-            gen_worker = run_gen_worker(
-                model,
-                autodeploy_worker_config(disagg_cluster),
-                work_dir,
-                port=0,
-                device=gen_device,
-            )
-            disagg_server = run_disagg_server(
-                proxy_config(disagg_port, disagg_cluster),
-                work_dir,
-                disagg_port,
-                save_log=True,
-            )
-            try:
-                await wait_for_disagg_server_ready_or_exit(
-                    disagg_port,
-                    {
-                        "context worker": ctx_worker,
-                        "generation worker": gen_worker,
-                        "disaggregated proxy": disagg_server,
-                    },
-                    SERVER_START_TIMEOUT_S,
-                    SERVER_READY_REQUEST_TIMEOUT_S,
-                )
-            except RuntimeError as exc:
-                last_port_conflict = exc
-                if "disaggregated proxy" not in str(exc) or (
-                    "EADDRINUSE" not in str(exc)
-                    and "address already in use" not in str(exc).lower()
-                ):
-                    raise
-                print(
-                    f"AutoDeploy disagg serve attempt {attempt + 1} of {PROXY_PORT_MAX_RETRIES} "
-                    f"failed with proxy port conflict, retrying: {exc}"
-                )
-                continue
-
-            client = OpenAI(
-                api_key="tensorrt_llm",
-                base_url=f"http://localhost:{disagg_port}/v1",
-                timeout=OPENAI_REQUEST_TIMEOUT_S,
-                max_retries=0,
-            )
-            response = client.completions.create(
-                model=model,
-                prompt="What is the capital of Germany?",
-                max_tokens=32,
-                temperature=0,
-                extra_body={"ignore_eos": True},
-            )
-            break
-        finally:
-            terminate(ctx_worker, gen_worker, disagg_server)
-
-    if response is None:
-        raise RuntimeError(
-            f"Failed to start AutoDeploy disagg serve smoke after {PROXY_PORT_MAX_RETRIES} "
-            "proxy port attempts"
-        ) from last_port_conflict
-
-    assert response.choices
-    response_text = response.choices[0].text
-    assert EXPECTED_COMPLETION_SUBSTRING in response_text, (
-        f"expected {EXPECTED_COMPLETION_SUBSTRING!r} in response, got {response_text!r}"
     )

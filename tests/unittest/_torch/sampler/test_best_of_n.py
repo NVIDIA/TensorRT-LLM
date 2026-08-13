@@ -34,8 +34,8 @@ def expected_outputs():
 
 @pytest.fixture(scope="module")
 def llm():
-    return LLM(model=os.path.join(llm_models_root(), "llama-models-v2",
-                                  "TinyLlama-1.1B-Chat-v1.0"),
+    return LLM(model=os.path.join(llm_models_root(), "llama-3.1-model",
+                                  "Llama-3.1-8B-Instruct"),
                kv_cache_config=KvCacheConfig(max_tokens=1000),
                max_batch_size=8,
                max_seq_len=64,

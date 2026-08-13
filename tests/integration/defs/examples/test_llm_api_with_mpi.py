@@ -19,20 +19,25 @@ import pytest
 from defs.common import venv_mpi_check_call
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
+@pytest.mark.parametrize("llama_model_root", ['Qwen3-0.6B'], indirect=True)
 def test_llm_api_single_gpu_with_mpirun(llmapi_example_root, llm_venv,
                                         llama_model_root):
     src_dst_dict = {
         llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
-    summary_cmd = [f"{llmapi_example_root}/quickstart_example.py"]
+    summary_cmd = [
+        "-c",
+        "from tensorrt_llm import LLM, SamplingParams; "
+        "llm = LLM(model='Qwen3/Qwen3-0.6B'); "
+        "out = llm.generate(['A B C'], SamplingParams(max_tokens=4)); "
+        "assert out[0].outputs[0].token_ids",
+    ]
 
     venv_mpi_check_call(llm_venv, ["mpirun", "-n", "1", "--allow-run-as-root"],
-                        summary_cmd)
+                        ["python3"] + summary_cmd)

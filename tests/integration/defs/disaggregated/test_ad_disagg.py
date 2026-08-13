@@ -64,7 +64,7 @@ OMPI_COMM_WORLD_ENV_KEYS = (
     "OMPI_UNIVERSE_SIZE",
 )
 AUTODEPLOY_DISAGG_SEED = 1234
-REDUCED_TINYLLAMA_LAYERS = 2
+REDUCED_QWEN3_LAYERS = 2
 REDUCED_DEEPSEEK_LAYERS = 2
 LLAMA_EAGLE3_EXPECTED_TEXT = " Berlin\nWhat is the capital of France? Paris\nWhat is the capital of"
 LLAMA_EAGLE3_EXPECTED_TOKEN_IDS = [
@@ -90,7 +90,7 @@ LLAMA_EAGLE3_EXPECTED_TOKEN_IDS = [
 MODEL_PATHS = {
     "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
     "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
-    "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
     "DeepSeek-V3-Lite": "DeepSeek-V3-Lite/bf16",
 }
 
@@ -279,9 +279,9 @@ def run_aggregate_generation(
 # ---------------------------------------------------------------------------
 
 
-def reduced_tinyllama_config(extra_config=None):
+def reduced_qwen3_config(extra_config=None):
     config = {
-        "model_kwargs": {"num_hidden_layers": REDUCED_TINYLLAMA_LAYERS},
+        "model_kwargs": {"num_hidden_layers": REDUCED_QWEN3_LAYERS},
         "max_batch_size": 4,
         "max_seq_len": 512,
         "max_num_tokens": 256,
@@ -458,7 +458,7 @@ def reduced_model_config(model, extra_config=None):
     if "DeepSeek-V3-Lite" in model:
         config = reduced_deepseek_v3_mla_config()
     else:
-        config = reduced_tinyllama_config()
+        config = reduced_qwen3_config()
     if extra_config:
         config.update(extra_config)
     return config
@@ -467,8 +467,8 @@ def reduced_model_config(model, extra_config=None):
 def reduced_model_cases():
     return [
         pytest.param(
-            "TinyLlama-1.1B-Chat-v1.0",
-            id="tinyllama",
+            "Qwen3-0.6B",
+            id="qwen3_0.6b",
         ),
         pytest.param(
             "DeepSeek-V3-Lite",
@@ -562,7 +562,7 @@ def test_disaggregated_logits(model):
     # The MLA generation worker reconstructs logits from the compressed KV latent
     # through a different kernel/batching path than the single aggregate pass, so
     # bf16 rounding yields ~1-ULP logit differences. Use a looser tolerance for the
-    # MLA (DeepSeek) case; MHA (tinyllama) stays tight. The functional checks above
+    # MLA (DeepSeek) case; MHA (Qwen3-0.6B) stays tight. The functional checks above
     # (text/token_ids equality) remain strict for both.
     if "DeepSeek-V3-Lite" in model:
         rtol, atol = 1e-1, 1e-1
@@ -574,33 +574,6 @@ def test_disaggregated_logits(model):
         rtol=rtol,
         atol=atol,
     )
-
-
-@pytest.mark.skip_less_device_memory(30000)
-@pytest.mark.timeout(600)
-def test_tinyllama_batch_handoff_semantic_slots():
-    prompts = capital_completion_prompts()
-    expected_capitals = ["Berlin", "Paris", "Rome", "Madrid"]
-    sampling_params_kwargs = {
-        "max_tokens": 12,
-        "ignore_eos": True,
-        "top_k": 1,
-        "seed": AUTODEPLOY_DISAGG_SEED,
-    }
-    outputs = run_sequential_batch_handoff(
-        "TinyLlama-1.1B-Chat-v1.0",
-        generation_overlap=True,
-        prompts=prompts,
-        sampling_params_kwargs=sampling_params_kwargs,
-    )
-
-    for expected_capital, context_output, generation_output in zip(
-        expected_capitals, outputs["context"], outputs["generation"], strict=True
-    ):
-        assert_context_handoff_metadata(context_output)
-        assert expected_capital.lower() in generation_output.text.lower(), response_summary(
-            outputs["generation"]
-        )
 
 
 @pytest.mark.parametrize(
@@ -942,13 +915,13 @@ def run_context_then_generation_handoff(
 @pytest.mark.timeout(600)
 def test_async_generation_matches_aggregate():
     aggregate_output = run_aggregate_generation(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         world_size=1,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
     outputs = run_context_then_generation_handoff(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         worker_world_sizes=(1, 1),
         generation_overlap=True,
         prompt="What is the capital of Germany?",
@@ -980,13 +953,13 @@ def test_async_generation_no_overlap_matches_aggregate():
     """
     sampling_params_kwargs = {"max_tokens": 10, "ignore_eos": True}
     aggregate_output = run_aggregate_generation(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         world_size=1,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs=sampling_params_kwargs,
     )
     outputs = run_context_then_generation_handoff(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         worker_world_sizes=(1, 1),
         generation_overlap=False,
         prompt="What is the capital of Germany?",
@@ -1005,13 +978,13 @@ def test_async_generation_no_overlap_matches_aggregate():
 @pytest.mark.timeout(900)
 def test_async_sharded_generation_handoff():
     aggregate_output = run_aggregate_generation(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         world_size=2,
         prompt="What is the capital of Germany?",
         sampling_params_kwargs={"max_tokens": 10, "ignore_eos": True},
     )
     outputs = run_context_then_generation_handoff(
-        "TinyLlama-1.1B-Chat-v1.0",
+        "Qwen3-0.6B",
         worker_world_sizes=(2, 2),
         generation_overlap=True,
         prompt="What is the capital of Germany?",

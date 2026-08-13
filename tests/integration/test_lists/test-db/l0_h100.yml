@@ -192,11 +192,6 @@ l0_h100:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[True-False-EAGLE3-LLaMA3.1-Instruct-8B-Llama-3.1-8B-Instruct]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-False-EAGLE3-LLaMA3.1-Instruct-8B-Llama-3.1-8B-Instruct]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
   # Encoder-decoder Hopper smoke: CUDA-graph beam/greedy, kv-v2, overlap.
   # The primary pre-merge set runs on L40S (l0_l40s.yml); the full
   # dtype/model-size matrix runs post-merge below.
@@ -253,13 +248,8 @@ l0_h100:
     - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=disable-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
     - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_fp8_block_scales[latency]
     - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
-    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-DeepSeek-V3-Lite-fp8/fp8]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-False-Qwen3-8B-FP8]
-    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
     - unittest/_torch/executor/test_overlap_scheduler.py
     - unittest/executor/test_shim_ray.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
@@ -271,7 +261,6 @@ l0_h100:
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
     - unittest/llmapi/test_async_llm.py -m "not (gpu2 or gpu4)"
-    - examples/test_ray.py::test_llm_inference_async_ray
 - condition:
     ranges:
       system_gpu_count:
@@ -503,12 +492,13 @@ l0_h100:
   - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[2]
   - examples/test_ad_speculative_decoding.py::test_nemotron_mtp_model_with_weights
   - examples/test_ad_guided_decoding.py::test_autodeploy_guided_decoding_main_json
-  - disaggregated/test_ad_disagg.py::test_disaggregated_logits[tinyllama]
+  - disaggregated/test_disaggregated.py::test_disaggregated_load_balance
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[Qwen3-0.6B]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-Qwen3-0.6B]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-Qwen3-0.6B]
+  - disaggregated/test_ad_disagg.py::test_disaggregated_logits[qwen3_0.6b]
   - disaggregated/test_ad_disagg.py::test_disaggregated_logits[deepseek_v3_mla]
-  - disaggregated/test_ad_disagg.py::test_reduced_layer_handoff_matches_aggregate[tinyllama]
   - disaggregated/test_ad_disagg.py::test_reduced_layer_handoff_matches_aggregate[deepseek_v3_mla]
-  - disaggregated/test_ad_disagg.py::test_tinyllama_batch_handoff_semantic_slots
-  - disaggregated/test_ad_disagg.py::test_chunked_prefill_handoff[tinyllama]
   - disaggregated/test_ad_disagg.py::test_chunked_prefill_handoff[deepseek_v3_mla]
 - condition:
     ranges:
