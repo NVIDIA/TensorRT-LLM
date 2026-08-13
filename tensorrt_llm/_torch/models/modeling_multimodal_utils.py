@@ -383,6 +383,10 @@ def find_input_mm_embeds(
         - Handles chunked prefill by considering chunk boundaries and current chunk tokens
         - Example: if a request has 8 MM embed rows, 2 cached rows, and 3 rows
           in the current chunk, this keeps rows [2:5].
+        - A request in full prefill carries no ``multimodal_runtime`` and keeps
+          all of its rows. Its row count comes from its own ``mm_embeds`` entry
+          when batching individually, and from
+          ``multimodal_data["multimodal_embedding"]`` when pre-concatenated.
         - This function reads only CPU-resident counts from
           ``MultimodalParams.multimodal_runtime`` and never touches GPU
           tensors, so it does not introduce host-device synchronization.
@@ -408,21 +412,37 @@ def find_input_mm_embeds(
         return mm_embeds
 
     # A batch can mix full-prefill requests (no runtime data) with chunked or
-    # KV-reusing ones. A runtime-less request contributes all of its rows, but
-    # its row count is only recoverable when it owns an mm_embeds entry, i.e.
-    # in individual batching mode.
-    individual_batching = len(mm_embeds) == len(multimodal_params)
-    if not individual_batching and any(param.multimodal_runtime is None
-                                       for param in multimodal_params):
-        raise ValueError(
-            "Pre-concatenated mm_embeds require multimodal_runtime for every "
-            "multimodal param; cannot locate the rows of a request without it.")
+    # KV-reusing ones. A runtime-less request contributes all of its rows.
+    pre_concatenated = len(mm_embeds) == 1
+
+    def full_prefill_rows(index: int, param: MultimodalParams) -> int:
+        """Row count of a runtime-less request inside the current batch."""
+        if not mm_embeds:
+            # Nothing to slice. Let the checks below report the real problem.
+            return 0
+        if not pre_concatenated:
+            return mm_embeds[index].shape[0]
+        # get_multimodal_embeddings built the single tensor by concatenating
+        # each param's cached embedding in prompt order, so the per-request
+        # row count is still recoverable from multimodal_data.
+        embeds = param.multimodal_data.get("multimodal_embedding")
+        if embeds is None:
+            raise ValueError(
+                "Pre-concatenated mm_embeds require either multimodal_runtime "
+                "or a cached multimodal_data['multimodal_embedding'] on every "
+                "multimodal param; cannot locate the rows of a request that "
+                "has neither.")
+        # Both producers normalize a stashed list of chunks into one tensor
+        # before concatenating, but tolerate the un-normalized shape as well.
+        if isinstance(embeds, list):
+            return sum(chunk.shape[0] for chunk in embeds)
+        return embeds.shape[0]
 
     total_mm_tokens = 0
     for i, param in enumerate(multimodal_params):
         runtime = param.multimodal_runtime
         if runtime is None:
-            total_mm_tokens += mm_embeds[i].shape[0]
+            total_mm_tokens += full_prefill_rows(i, param)
         else:
             total_mm_tokens += runtime.num_mm_tokens_in_chunk
 
@@ -446,16 +466,19 @@ def find_input_mm_embeds(
         runtime = param.multimodal_runtime
         if runtime is None:
             # Full prefill: every row of this request is in the current chunk.
-            slices.append((i, 0, mm_embeds[i].shape[0]))
+            rows = full_prefill_rows(i, param)
+            slices.append((i, current_pos, current_pos + rows))
+            if pre_concatenated:  # advance the global cursor past those rows
+                current_pos += rows
             continue
         local_start_pos = runtime.num_cached_mm_tokens
         local_end_pos = local_start_pos + runtime.num_mm_tokens_in_chunk
         slices.append(
             (i, current_pos + local_start_pos, current_pos + local_end_pos))
-        if len(mm_embeds) == 1:  # pre-concatenated; advance global cursor
+        if pre_concatenated:  # advance the global cursor
             current_pos += runtime.total_embeds_in_request
 
-    if len(mm_embeds) == 1:
+    if pre_concatenated:
         sliced = [mm_embeds[0][start:end] for _, start, end in slices]
         return [torch.cat(sliced, dim=0)]
     return [mm_embeds[i][start:end] for i, start, end in slices]
