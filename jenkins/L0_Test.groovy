@@ -1333,19 +1333,20 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         boolean slurmFailureClassified = false
         def classifySlurmFailure = { Throwable err ->
             slurmFailureClassified = true
-            // A completed-pytest deterministic failure (tests ran, were re-run, and
-            // still failed) is a real test failure, not lost-contact infra. On the
-            // agent path the SLURM allocation outlives pytest, so the job is still
-            // RUNNING here even though pytest already finished -- do NOT let the job
-            // state below relabel it as slurm-job-still-running and retry it (which
-            // masks the failure whenever the retry happens to pass). Defer so the
-            // base classifier treats it as a UserFailure (no retry). A monitor-lost-
-            // contact cut leaves results-timeout.xml / "terminated unexpectedly"
-            // instead, so it does not match here and still retries as before.
-            String failureText = err?.toString() ?: ""
-            if (fileExists("${stageName}/failed_results.xml")
-                    || failureText.contains("still failed after rerun attempts")
-                    || failureText.contains("Regular tests failed after rerun attempt")) {
+            // A completed-pytest deterministic failure (tests ran, were re-run via
+            // --reruns, and still failed) is a real test failure, not lost-contact
+            // infra. On the agent path the SLURM allocation outlives pytest, so the
+            // job is still RUNNING here even though pytest already finished -- do NOT
+            // let the job state below relabel it as slurm-job-still-running and retry
+            // it (which masks the failure whenever the retry happens to pass). Key
+            // off the propagated rerun-failure error: it is raised only when reruns
+            // genuinely failed and takes precedence over the timeout path. Do not key
+            // off failed_results.xml -- generateRerunReport writes it from the first
+            // run whenever any rerun occurred, even when the rerun passed or the job
+            // timed out, so it would wrongly suppress a legitimate infra retry. Defer
+            // so the base classifier treats it as a UserFailure (no retry); a monitor-
+            // lost-contact cut raises "terminated unexpectedly" instead and retries.
+            if ((err?.toString() ?: "").contains("still failed after rerun attempts")) {
                 echo "[INFRA-RETRY] ${stageName}: pytest reported deterministic test failure(s); not an infra retry."
                 return err
             }
