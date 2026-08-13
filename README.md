@@ -325,15 +325,6 @@ deployment, and not linked to users. The data we collect includes:
 
 Telemetry is automatically disabled in CI and test environments.
 
-CLI terminal reporting begins before complete argument and YAML configuration
-validation so that invalid-configuration failures can be counted. Consequently,
-an invalid CLI configuration, unreadable YAML file, or malformed YAML file may
-produce a terminal report. The report does not contain CLI arguments, file
-paths, YAML contents, or exception text. To disable telemetry before any CLI or
-YAML validation, pass `--no-telemetry` in the CLI invocation or use one of the
-process-wide opt-out methods below. A `telemetry_config.disabled` setting inside
-YAML is honored after that YAML can be read successfully.
-
 ### Opting Out of Telemetry Data Collection
 
 To disable telemetry data collection, use any of the following methods:
@@ -342,6 +333,10 @@ To disable telemetry data collection, use any of the following methods:
 - **File-based**: Create the file `~/.config/trtllm/do_not_track`
 - **Python API**: Pass `TelemetryConfig(disabled=True)` to `LLM()`
 - **CLI flag**: Use `--no-telemetry` on `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`
+
+CLI terminal telemetry may report an invalid argument or YAML configuration.
+The environment-variable, file-based, and CLI-flag opt-outs are all applied
+before CLI and YAML validation.
 
 The telemetry collection code is fully open source and auditable at
 [`tensorrt_llm/usage/`](./tensorrt_llm/usage/). For a detailed field-by-field
