@@ -120,7 +120,7 @@ Meanwhile, please add the "release blocker" label to any PRs that could potentia
 
 ### Inactive pull requests
 
-TensorRT-LLM automatically reviews inactive pull requests each day. This policy applies to both draft and
+TensorRT LLM automatically reviews inactive pull requests each day. This policy applies to both draft and
 ready-for-review pull requests:
 
 * After more than 120 days without activity, the workflow reminds the author. Pull requests without merge conflicts
