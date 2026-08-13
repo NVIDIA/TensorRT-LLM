@@ -242,6 +242,7 @@ def test_kimi_k3_moe_output_matches_reference_across_parallel_modes(
 
     fake_moe = _FakeMoE()
 
+    monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
     monkeypatch.setattr(modeling_kimi_linear, "create_moe", lambda **_: fake_moe)
     monkeypatch.setattr(modeling_kimi_linear, "GatedMLP", _FakeSharedExperts)
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
