@@ -168,7 +168,11 @@ K8S_INFRA_RETRY_MAX = 1
 // be disabled pipeline-wide without turning fail-fast itself off. Only K8s-scoped
 // aborts are deferred today; SLURM-scoped aborts fall back to today's fail-fast
 // (see runBranchesWithInfraDefer).
-ENABLE_INFRA_SCOPED_FAILFAST = true
+//
+// Overridable without a code change by setting the ENABLE_INFRA_SCOPED_FAILFAST
+// env var on the job. Env values are strings ("false" is truthy in Groovy), so
+// the override goes through toBoolean() rather than the bare elvis.
+ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INFRA_SCOPED_FAILFAST.toBoolean() : true
 
 // Per-stage override of the above: set `infraRetryMax` in a stage's opts map (the
 // 3rd element of its parallel-jobs config tuple, alongside singleAttempt) to cap
