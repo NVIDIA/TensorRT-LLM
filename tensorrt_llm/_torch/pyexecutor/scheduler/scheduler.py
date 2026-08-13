@@ -291,6 +291,9 @@ class RequestScheduler(ABC):
         if is_decoder_context_request_waiting_for_encoder_output(request):
             return False
         if request.state in (
+            LlmRequestState.CONTEXT_PREFETCH_INIT,
+            LlmRequestState.CONTEXT_PREFETCH_IN_PROGRESS,
+            LlmRequestState.CONTEXT_PREFETCH_COMPLETE,
             LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
             LlmRequestState.DISAGG_GENERATION_INIT,
             LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,

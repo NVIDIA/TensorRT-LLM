@@ -51,6 +51,9 @@ enum class LlmRequestState : int32_t
     kUNKNOWN = 0,                             ///< Unknown state
     kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
 
+    kCONTEXT_PREFETCH_INIT = 4,               ///< Context request should try to fetch reusable KV before scheduling
+    kCONTEXT_PREFETCH_IN_PROGRESS = 5,        ///< Context request is fetching reusable KV before scheduling
+    kCONTEXT_PREFETCH_COMPLETE = 6,           ///< Context prefetch finished and must be committed before scheduling
     kDISAGG_CONTEXT_WAIT_SCHEDULER = 7,       ///< Waiting for scheduler to schedule the context-only request
                                               /// e.g. in gen-first mode when generation request is not scheduled yet
     kDISAGG_GENERATION_INIT = 8,              ///< New Generation request arrived at generation model
@@ -1631,6 +1634,21 @@ public:
         return mState == LlmRequestState::kCONTEXT_INIT || mState == LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS;
     }
 
+    [[nodiscard]] bool isContextPrefetchInitState() const noexcept
+    {
+        return mState == LlmRequestState::kCONTEXT_PREFETCH_INIT;
+    }
+
+    [[nodiscard]] bool isContextPrefetchInProgressState() const noexcept
+    {
+        return mState == LlmRequestState::kCONTEXT_PREFETCH_IN_PROGRESS;
+    }
+
+    [[nodiscard]] bool isContextPrefetchCompleteState() const noexcept
+    {
+        return mState == LlmRequestState::kCONTEXT_PREFETCH_COMPLETE;
+    }
+
     [[nodiscard]] bool isContextFinished() const noexcept
     {
         return isGenerationInProgressState() || mState == LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS;
@@ -1683,6 +1701,9 @@ public:
         switch (mState)
         {
         case batch_manager::LlmRequestState::kENCODER_INIT: return executor::RequestStage::kENCODER_IN_PROGRESS;
+        case batch_manager::LlmRequestState::kCONTEXT_PREFETCH_INIT:
+        case batch_manager::LlmRequestState::kCONTEXT_PREFETCH_IN_PROGRESS:
+        case batch_manager::LlmRequestState::kCONTEXT_PREFETCH_COMPLETE:
         case batch_manager::LlmRequestState::kCONTEXT_INIT:
         case batch_manager::LlmRequestState::kDISAGG_CONTEXT_WAIT_SCHEDULER:
             return executor::RequestStage::kCONTEXT_IN_PROGRESS;

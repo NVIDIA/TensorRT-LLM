@@ -2590,7 +2590,9 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver:
                     self._check_disagg_ctx_schedulable_status(new_requests)
+                    self._check_requester_cache_transfer_status()
                     self._check_disagg_gen_transfer_status()
+                    self._prepare_context_prefetch_init()
 
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
@@ -3714,8 +3716,10 @@ class PyExecutor:
 
         if self.kv_cache_transceiver:
             self._check_disagg_ctx_schedulable_status(new_requests)
+            self._check_requester_cache_transfer_status()
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
+            self._prepare_context_prefetch_init()
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -6571,11 +6575,6 @@ class PyExecutor:
         if not self._uses_async_disagg_gen_transfer():
             return
 
-        # Gen-transfer status performs cross-rank consensus internally.
-        # Enter it symmetrically; ranks with no ready local future contribute
-        # an empty ready set.
-        self._check_disagg_gen_cache_transfer_status(0)
-
         if self._is_disagg_inflight_cancel_active():
             self._cancel_timed_out_gen_transfers()
             self._check_gen_cache_transfer_errors_consensus()
@@ -7131,6 +7130,92 @@ class PyExecutor:
         # `_handle_responses` is not reached this iteration.
         self._pending_adp_dummy_request = dummy_request
 
+    @nvtx_range("_prepare_context_prefetch_init")
+    def _prepare_context_prefetch_init(self):
+        context_prefetch_requests = [
+            req for req in self.active_requests
+            if req.state == LlmRequestState.CONTEXT_PREFETCH_INIT
+        ]
+        if not context_prefetch_requests:
+            return
+
+        context_prefetch_to_prepare = ScheduledRequests()
+        context_prefetch_to_prepare.context_requests_last_chunk = (
+            context_prefetch_requests)
+
+        try:
+            for resource_mgr_type in (
+                    ResourceManagerType.KV_CACHE_MANAGER,
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER,
+                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
+                resource_manager = self.resource_manager.resource_managers.get(
+                    resource_mgr_type)
+                if resource_manager is not None:
+                    resource_manager.prepare_resources(
+                        context_prefetch_to_prepare)
+
+            kv_cache_manager = self.resource_manager.resource_managers.get(
+                ResourceManagerType.KV_CACHE_MANAGER)
+            if hasattr(kv_cache_manager, "publish_connector_scheduler_output"):
+                kv_cache_manager.publish_connector_scheduler_output(
+                    context_prefetch_to_prepare)
+        except Exception as err:
+            logger.warning(
+                "Context KV cache prefetch resource preparation failed; "
+                f"falling back to local context computation: {err}")
+            for req in context_prefetch_requests:
+                self._release_context_prefetch_resources(req)
+            return
+
+        for req in context_prefetch_requests:
+            try:
+                self.kv_cache_transceiver.request_context_prefetch_async(req)
+            except NotImplementedError:
+                logger.warning_once(
+                    "Context KV cache prefetch is not supported by this "
+                    "cache transceiver runtime; falling back to local "
+                    "context computation",
+                    key="context_kv_prefetch_unsupported")
+                self._release_context_prefetch_resources(req)
+            except Exception as err:
+                logger.warning(
+                    "Context KV cache prefetch failed to start for "
+                    f"request {req.py_request_id}; falling back to local "
+                    f"context computation: {err}")
+                self._release_context_prefetch_resources(req)
+
+    def _release_context_prefetch_resources(self, req: LlmRequest):
+        try:
+            self.resource_manager.free_resources(req)
+        except Exception as cleanup_err:
+            logger.warning(
+                "Context KV cache prefetch cleanup failed for "
+                f"request {req.py_request_id}: {cleanup_err}")
+        req.state = LlmRequestState.CONTEXT_INIT
+
+    def _finalize_context_prefetch_complete(self):
+        context_prefetch_complete_requests = [
+            req for req in self.active_requests
+            if req.state == LlmRequestState.CONTEXT_PREFETCH_COMPLETE
+        ]
+        if not context_prefetch_complete_requests:
+            return
+
+        for req in context_prefetch_complete_requests:
+            try:
+                self.kv_cache_manager.store_blocks_for_reuse(req, False)
+                self.resource_manager.free_resources(req)
+            except Exception as err:
+                logger.warning(
+                    "Context KV cache prefetch finalization failed for "
+                    f"request {req.py_request_id}; falling back to local "
+                    f"context computation: {err}")
+                self._release_context_prefetch_resources(req)
+                continue
+            req.py_kv_transfer_start_time = None
+            req.py_kv_transfer_timed_out = False
+            req.state = LlmRequestState.CONTEXT_INIT
+
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
@@ -7551,18 +7636,67 @@ class PyExecutor:
 
         self._check_cache_transfer_errors("context requests")
 
+    def _requester_transfer_request_by_id(self) -> dict[int, LlmRequest]:
+        requests_by_id = {}
+        for req in self.active_requests:
+            if req.py_request_id is not None:
+                requests_by_id[req.py_request_id] = req
+            if req.is_child:
+                requests_by_id[req.parent_request_id] = req
+        return requests_by_id
+
+    @nvtx_range("_check_requester_cache_transfer_status")
+    def _check_requester_cache_transfer_status(
+            self, atLeastNum: int = 0, error_msg_prefix: str = "requester requests"):
+        result = self.kv_cache_transceiver.check_requester_transfer_status(
+            atLeastNum)
+        if not isinstance(result, tuple):
+            self._finalize_context_prefetch_complete()
+            return
+
+        if len(result) == 2:
+            completed_req_ids, error_req_ids = result
+            cancelled_reqs = []
+        else:
+            completed_req_ids, error_req_ids, cancelled_reqs = result
+
+        requests_by_id = self._requester_transfer_request_by_id()
+        for req_id in completed_req_ids:
+            req = requests_by_id.get(req_id)
+            if req is None:
+                continue
+            if req.state == LlmRequestState.CONTEXT_PREFETCH_IN_PROGRESS:
+                req.state = LlmRequestState.CONTEXT_PREFETCH_COMPLETE
+            elif req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+
+        for req_id in error_req_ids:
+            req = requests_by_id.get(req_id)
+            if req is None:
+                continue
+            if req.state == LlmRequestState.CONTEXT_PREFETCH_IN_PROGRESS:
+                logger.warning(
+                    "Context KV cache prefetch for request "
+                    f"{req.py_request_id} failed; falling back to local "
+                    "context computation.")
+                self._release_context_prefetch_resources(req)
+            else:
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+
+        user_canceled_set = set(self.canceled_req_ids)
+        for req in cancelled_reqs:
+            req_id = req.parent_request_id if req.is_child else req.py_request_id
+            if req_id not in user_canceled_set:
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+
+        self._finalize_context_prefetch_complete()
+        if not self._is_disagg_inflight_cancel_active():
+            self._check_cache_transfer_errors(error_msg_prefix)
+
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
-        result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
-        if isinstance(result, tuple):
-            _, _, cancelled_reqs = result
-            user_canceled_set = set(self.canceled_req_ids)
-            for req in cancelled_reqs:
-                req_id = req.py_request_id if not req.is_child else req.parent_request_id
-                if req_id not in user_canceled_set:
-                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
-        if not self._is_disagg_inflight_cancel_active():
-            self._check_cache_transfer_errors("generation requests")
+        self._check_requester_cache_transfer_status(
+            atLeastNum, error_msg_prefix="generation requests")
 
     def _maybe_prefetch_next_iter_mm_encoders(
             self, scheduled_batch: ScheduledRequests) -> None:

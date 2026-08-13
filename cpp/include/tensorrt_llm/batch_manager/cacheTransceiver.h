@@ -240,11 +240,14 @@ public:
 
     virtual void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) = 0;
     virtual void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
+    virtual void requestContextPrefetchAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
     /// Check all requests transferring context, and return the requests that have completed or encountered an error.
     virtual RequestStatuses checkContextTransferStatus(
         std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false)
         = 0;
+
+    virtual RequestStatuses checkRequesterTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
     virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
@@ -298,9 +301,12 @@ public:
 
     void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) override;
     void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) override;
+    void requestContextPrefetchAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     RequestStatuses checkContextTransferStatus(
         std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override;
+
+    RequestStatuses checkRequesterTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
@@ -315,6 +321,9 @@ public:
     std::string getStatusDump() const;
 
 private:
+    RequestStatuses checkRequesterTransferStatusImpl(
+        std::optional<int> const& atLeastRequestNum, bool markGenerationComplete);
+
     struct StatusSnapshot
     {
         size_t senderAsyncActive{0};
