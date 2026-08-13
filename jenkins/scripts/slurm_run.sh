@@ -82,7 +82,7 @@ if [[ "${TRTLLM_VISUAL_GEN_MULTINODE_SLURM_PARENT:-0}" == "1" ]]; then
             sleep 10
         done
         # Rank0 must reach pytest without these: the test keys on them to tell a launching parent from a launched rank.
-        pytestCommand="env -u SLURM_PROCID -u SLURM_NTASKS -u SLURM_LOCALID -u SLURM_NODEID -u SLURM_GTIDS ${pytestCommand}"
+        pytestCommand="env -u SLURM_PROCID -u SLURM_NTASKS -u SLURM_LOCALID -u SLURM_NODEID -u SLURM_GTIDS PYTHONUNBUFFERED=1 ${pytestCommand}"
     else
         echo "Rank${SLURM_PROCID} finished setup; rank0 will run the VisualGen SLURM parent pytest"
         exit 0
@@ -105,14 +105,15 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
-# Turn off "exit on error" so the following lines always run
+# Turn off both "exit on error" mechanisms so the following lines always run.
 set +e
+trap - ERR
 
 pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-eval $pytestCommand
+eval "$pytestCommand"
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 python3 "$llmSrcNode/tests/test_common/s3_output.py" \
