@@ -53,7 +53,7 @@ For single-rank sanity checks:
 ```bash
 PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} python3 -m bench_moe \
   --world_size 1 \
-  --model mixtral_8x7b \
+  --model qwen1.5_moe \
   --backend CUTLASS \
   --balanced_total_num_tokens 8 \
   --no_cuda_graph \
@@ -87,7 +87,7 @@ every MPI rank to execute the benchmark worker.
 ```bash
 PYTHONPATH=tests/microbenchmarks:${PYTHONPATH:-} python3 -m bench_moe \
   --world_size 1 \
-  --model mixtral_8x7b \
+  --model qwen1.5_moe \
   --backend CUTLASS \
   --balanced_total_num_tokens 8 \
   --no_cuda_graph \
@@ -634,7 +634,6 @@ dispatch/expert matrices.
 | `kimi_k2` | 384 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
-| `mixtral_8x7b` | 8 | 2 | 4096 | 14336 | `FP8` | `RENORMALIZE` |
 | `gpt_oss_120b` | 128 | 4 | 2880 | 2880 | `W4A8_MXFP4_MXFP8` | `RENORMALIZE` |
 
 Custom shapes can be used instead of `--model`:
