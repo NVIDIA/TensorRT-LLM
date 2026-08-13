@@ -38,7 +38,9 @@ Note: PYTHONHASHSEED=0 must be set before the Python process starts
 to ensure deterministic cache key hashing in LMCache.
 
 Expected output:
-  Second request logs show "Retrieved N tokens" and both outputs are identical.
+  Both requests complete and the script prints "OK: outputs match."
+  This validates connector initialization and request execution, not an LMCache
+  cache hit. Use LMCache's version-specific observability to verify retrieval.
 
 See Also:
   examples/llm-api/configs/trtllm_lmcache_connector_extra.yaml -- trtllm-serve YAML
@@ -75,8 +77,8 @@ def main(model: str):
     kv_connector_config = KvCacheConnectorConfig(connector="lmcache")
     sampling_params = SamplingParams(max_tokens=32)
 
-    # Both requests go to the same LLM instance so the in-process LMCache
-    # engine (and its CPU memory cache) survives between the two calls.
+    # The in-process LMCache engine is scoped to the LLM instance, so both
+    # requests use the same instance.
     llm = LLM(
         model=model,
         backend="pytorch",
@@ -84,22 +86,20 @@ def main(model: str):
         kv_connector_config=kv_connector_config,
     )
 
-    print("--- First request (cold cache, KV will be computed and stored) ---")
+    print("--- First request ---")
     output0 = llm.generate([_TEST_PROMPT], sampling_params)
     text0 = output0[0].outputs[0].text
     print("First output:", text0)
 
-    print("\n--- Second request (warm cache, KV should be retrieved) ---")
+    print("\n--- Second request (same prompt) ---")
     output1 = llm.generate([_TEST_PROMPT], sampling_params)
     text1 = output1[0].outputs[0].text
-    print("Second output (using LMCache KV cache):", text1)
+    print("Second output:", text1)
 
     assert text0 == text1, (
-        f"Outputs differ — cache reuse may not have worked correctly.\n"
-        f"First:  {text0!r}\n"
-        f"Second: {text1!r}"
+        f"Outputs differ between identical requests.\nFirst:  {text0!r}\nSecond: {text1!r}"
     )
-    print("\nOK: outputs match, LMCache KV reuse confirmed.")
+    print("\nOK: outputs match.")
 
     destroy_engine()
 
