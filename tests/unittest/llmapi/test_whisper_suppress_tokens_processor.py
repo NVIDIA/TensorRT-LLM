@@ -16,6 +16,8 @@
 import copy
 import pickle
 import threading
+from collections.abc import Sequence
+from typing import Any
 
 import pytest
 import torch
@@ -32,17 +34,19 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 NEG_INF = float("-inf")
 
 
-def _make(suppress=(3, 5), begin=(7,)):
+def _make(
+    suppress: Sequence[int] = (3, 5), begin: Sequence[int] = (7,)
+) -> _WhisperSuppressTokensLogitsProcessor:
     return _WhisperSuppressTokensLogitsProcessor(
         suppress_token_ids=list(suppress), begin_suppress_token_ids=list(begin)
     )
 
 
-def _logits(vocab=10, device="cpu"):
+def _logits(vocab: int = 10, device: str = "cpu") -> torch.Tensor:
     return torch.zeros(1, vocab, device=device)
 
 
-def _masked(logits):
+def _masked(logits: torch.Tensor) -> set[int]:
     return {i for i, v in enumerate(logits[0].tolist()) if v == NEG_INF}
 
 
@@ -50,7 +54,7 @@ def _masked(logits):
 
 
 @cpu_only
-def test_suppress_masks_exactly_the_listed_tokens():
+def test_suppress_masks_exactly_the_listed_tokens() -> None:
     proc = _make()
     logits = _logits()
     proc(req_id=1, logits=logits, token_ids=[[0, 1]], stream_ptr=None, client_id=None)
@@ -59,7 +63,7 @@ def test_suppress_masks_exactly_the_listed_tokens():
 
 
 @cpu_only
-def test_begin_suppress_applies_only_while_the_window_is_open():
+def test_begin_suppress_applies_only_while_the_window_is_open() -> None:
     proc = _make()
     # First call captures prompt_len=2 and applies begin-suppression.
     proc(req_id=1, logits=_logits(), token_ids=[[0, 1]], stream_ptr=None, client_id=None)
@@ -70,7 +74,7 @@ def test_begin_suppress_applies_only_while_the_window_is_open():
 
 
 @cpu_only
-def test_masks_each_beam_independently():
+def test_masks_each_beam_independently() -> None:
     proc = _make(suppress=(3,), begin=())
     logits = torch.zeros(2, 10)
     proc(req_id=1, logits=logits, token_ids=[[0, 1], [0, 4]], stream_ptr=None, client_id=None)
@@ -80,7 +84,7 @@ def test_masks_each_beam_independently():
 
 
 @cpu_only
-def test_out_of_range_token_id_raises_every_call():
+def test_out_of_range_token_id_raises_every_call() -> None:
     """Caching must not turn a hard error into a one-shot one.
 
     An id outside the vocabulary has to fail on the second call exactly as it
@@ -96,7 +100,7 @@ def test_out_of_range_token_id_raises_every_call():
 
 
 @cpu_only
-def test_token_ids_are_read_only():
+def test_token_ids_are_read_only() -> None:
     """The public ids must not be changeable after construction.
 
     The index caches are keyed on device alone, so an id set that could change
@@ -117,7 +121,7 @@ def test_token_ids_are_read_only():
 
 
 @cpu_only
-def test_ids_still_honoured_after_a_rejected_mutation():
+def test_ids_still_honoured_after_a_rejected_mutation() -> None:
     """A rejected mutation must leave the processor masking its original ids."""
     proc = _make(suppress=(3,), begin=())
     proc(req_id=1, logits=_logits(), token_ids=[[0, 1]], stream_ptr=None, client_id=None)
@@ -130,7 +134,7 @@ def test_ids_still_honoured_after_a_rejected_mutation():
 
 
 @cpu_only
-def test_index_tensor_is_reused_per_device():
+def test_index_tensor_is_reused_per_device() -> None:
     """Repeated calls must reuse one index tensor per device.
 
     This is the point of the cache: every rebuild is a blocking host-to-device
@@ -154,7 +158,7 @@ def test_index_tensor_is_reused_per_device():
 
 
 @cpu_only
-def test_empty_lists_mask_nothing():
+def test_empty_lists_mask_nothing() -> None:
     proc = _WhisperSuppressTokensLogitsProcessor(suppress_token_ids=[], begin_suppress_token_ids=[])
     logits = _logits()
     proc(req_id=1, logits=logits, token_ids=[[0, 1]], stream_ptr=None, client_id=None)
@@ -163,7 +167,7 @@ def test_empty_lists_mask_nothing():
 
 
 @cpu_only
-def test_racing_callers_share_one_published_index(monkeypatch):
+def test_racing_callers_share_one_published_index(monkeypatch: pytest.MonkeyPatch) -> None:
     """Threads that race the lazy fill must end up using the same tensor.
 
     Tensor construction releases the GIL, so two threads can both miss the
@@ -182,19 +186,26 @@ def test_racing_callers_share_one_published_index(monkeypatch):
     both_missed = threading.Barrier(2, timeout=30)
     real_tensor = torch.tensor
     builds = []
+    seen = []
 
-    def rendezvous_tensor(*args, **kwargs):
+    def fill() -> None:
+        seen.append(proc._cached_index(cache, proc.suppress_token_ids, device))
+
+    threads = [threading.Thread(target=fill) for _ in range(2)]
+    racers = set(threads)
+
+    def rendezvous_tensor(*args: Any, **kwargs: Any) -> torch.Tensor:
+        # `torch.tensor` is patched process-wide, so only the two threads started
+        # here may rendezvous: any other caller that wandered in would join as a
+        # third party, open a new barrier generation and raise BrokenBarrierError
+        # somewhere unrelated to this test.
+        if threading.current_thread() not in racers:
+            return real_tensor(*args, **kwargs)
         builds.append(None)
         both_missed.wait()
         return real_tensor(*args, **kwargs)
 
     monkeypatch.setattr(torch, "tensor", rendezvous_tensor)
-    seen = []
-
-    def fill():
-        seen.append(proc._cached_index(cache, proc.suppress_token_ids, device))
-
-    threads = [threading.Thread(target=fill) for _ in range(2)]
     for t in threads:
         t.start()
     for t in threads:
@@ -212,7 +223,7 @@ def test_racing_callers_share_one_published_index(monkeypatch):
 
 
 @cpu_only
-def test_deepcopy_of_a_warmed_processor_drops_the_cache():
+def test_deepcopy_of_a_warmed_processor_drops_the_cache() -> None:
     """Callers deep-copy SamplingParams per request (evaluate/interface.py).
 
     The index cache is derived device state, so a copy must start cold rather
@@ -233,7 +244,7 @@ def test_deepcopy_of_a_warmed_processor_drops_the_cache():
 
 
 @cpu_only
-def test_pickle_roundtrip_drops_the_cache_and_still_masks():
+def test_pickle_roundtrip_drops_the_cache_and_still_masks() -> None:
     proc = _make()
     proc(req_id=1, logits=_logits(), token_ids=[[0, 1]], stream_ptr=None, client_id=None)
 
@@ -248,7 +259,7 @@ def test_pickle_roundtrip_drops_the_cache_and_still_masks():
 
 
 @requires_cuda
-def test_index_is_cached_on_the_logits_device():
+def test_index_is_cached_on_the_logits_device() -> None:
     proc = _make()
     logits = _logits(device="cuda")
     proc(req_id=1, logits=logits, token_ids=[[0, 1]], stream_ptr=None, client_id=None)
@@ -265,7 +276,7 @@ def test_index_is_cached_on_the_logits_device():
 
 
 @requires_cuda
-def test_cpu_and_cuda_use_separate_cache_entries():
+def test_cpu_and_cuda_use_separate_cache_entries() -> None:
     proc = _make(suppress=(3,), begin=())
     cpu_logits = _logits()
     cuda_logits = _logits(device="cuda")
@@ -278,7 +289,7 @@ def test_cpu_and_cuda_use_separate_cache_entries():
 
 
 @requires_cuda
-def test_half_precision_masking_matches_advanced_indexing():
+def test_half_precision_masking_matches_advanced_indexing() -> None:
     for dtype in (torch.float16, torch.bfloat16):
         proc = _make(suppress=(3, 5), begin=())
         got = torch.zeros(1, 10, dtype=dtype, device="cuda")
