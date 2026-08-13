@@ -16,10 +16,8 @@ from functools import wraps as _wraps
 
 from tensorrt_llm._utils import mpi_disabled as _mpi_disabled
 
-if _mpi_disabled():
-    raise RuntimeError(
-        "Ray requested (TLLM_DISABLE_MPI=1), but not installed. Please install Ray."
-    )
+# Don't raise error on import - only when Ray functionality is actually used
+_RAY_NOT_INSTALLED_MSG = "Ray requested (TLLM_DISABLE_MPI=1), but not installed. Please install Ray."
 
 
 def remote(*args, **kwargs):
@@ -42,6 +40,7 @@ def remote(*args, **kwargs):
 
 
 def __getattr__(name):
-    raise RuntimeError(
-        f'Ray not installed, so "ray.{name}" is unavailable. Please install Ray.'
-    )
+    msg = f'Ray not installed, so "ray.{name}" is unavailable.'
+    if _mpi_disabled():
+        msg = _RAY_NOT_INSTALLED_MSG
+    raise RuntimeError(msg)

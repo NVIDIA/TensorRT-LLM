@@ -1,4 +1,9 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 """Slimmed down PyTorch GLM4 MoE Lite model implementation for auto_deploy export.
 
@@ -18,6 +23,7 @@ The GLM4 MoE Lite model uses Multi-head Latent Attention (MLA), similar to DeepS
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -29,8 +35,10 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-from tensorrt_llm._torch.utils import ActivationType
+from ..._compat import ActivationType
+from ..hf import AutoModelForCausalLMFactory
+from . import mla_rope_utils
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
 class Glm4MoeLiteConfig(PretrainedConfig):
@@ -158,13 +166,11 @@ class Glm4MoeLiteRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-class Glm4MoeLiteRotaryEmbedding(nn.Module):
+class Glm4MoeLiteRotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding for GLM4 MoE Lite.
 
-    Simplified version that precomputes and caches cos/sin values.
-    Returns full cached values (not sliced by seq_len) to enable export.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
+    Keeps only the small inv_freq buffer before graph-cache transforms. The full
+    cos/sin table is graph-computed and materialized by later RoPE transforms.
     """
 
     def __init__(
@@ -183,25 +189,16 @@ class Glm4MoeLiteRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Build cos/sin cache with AD-specific naming
         self._set_cos_sin_cache(max_position_embeddings)
 
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        self.register_buffer("_ad_cos_cached", emb.cos() * self.attention_scaling, persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin() * self.attention_scaling, persistent=False)
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Return full cached cos/sin (not sliced) for export compatibility
-        return (
-            self._ad_cos_cached.to(dtype=x.dtype, device=x.device),
-            self._ad_sin_cached.to(dtype=x.dtype, device=x.device),
+        return build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
         )
 
 
@@ -249,19 +246,11 @@ class Glm4MoeLiteYarnRotaryEmbedding(Glm4MoeLiteRotaryEmbedding):
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        t = torch.arange(seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-
         _mscale = float(
             self._yarn_get_mscale(self.scaling_factor, self.mscale)
             / self._yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
         )
-
-        emb = torch.cat((freqs, freqs), dim=-1)
-        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        # Note: attention_scaling is already incorporated in _mscale for YaRN
-        self.register_buffer("_ad_cos_cached", (emb.cos() * _mscale), persistent=False)
-        self.register_buffer("_ad_sin_cached", (emb.sin() * _mscale), persistent=False)
+        self.attention_scaling = _mscale
 
     @staticmethod
     def _yarn_find_correction_dim(
@@ -444,7 +433,7 @@ class Glm4MoeLiteMoE(nn.Module):
         if self.shared_experts is not None:
             final_hidden_states = final_hidden_states + self.shared_experts(identity)
 
-        return final_hidden_states.to(hidden_states.dtype)
+        return final_hidden_states
 
 
 class Glm4MoeLiteAttention(nn.Module):
@@ -545,12 +534,13 @@ class Glm4MoeLiteAttention(nn.Module):
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
 
         # Get cos/sin from position_embeddings (full cached from shared rotary embedding)
-        cos, sin = position_embeddings  # Full table: [max_seq_len, head_dim]
+        cos = position_embeddings[0]  # Full table: [max_seq_len, head_dim]
+        sin = position_embeddings[1]  # Full table: [max_seq_len, head_dim]
         cos = cos[position_ids]  # [B, S, head_dim]
         sin = sin[position_ids]  # [B, S, head_dim]
 
-        # Apply RoPE using custom op
-        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_qk_interleaving(
+        # Apply RoPE using custom op (weights pre-permuted to NeoX format at load time)
+        q_pe_rotated, kpe = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin(
             q_pe,
             k_pe,
             cos,
@@ -781,13 +771,26 @@ class Glm4MoeLiteModel(Glm4MoeLitePreTrainedModel):
 class Glm4MoeLiteForCausalLM(Glm4MoeLitePreTrainedModel, GenerationMixin):
     """GLM4 MoE Lite model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)
         self.model = Glm4MoeLiteModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Pre-permute RoPE weight rows from interleaved to NeoX format at load time
+        # so the forward can use torch_rope_with_explicit_cos_sin (→ flashinfer_rope).
+        self._register_load_state_dict_pre_hook(
+            partial(
+                mla_rope_utils._rope_deinterleave_load_hook,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                num_heads=config.num_attention_heads,
+                kv_lora_rank=config.kv_lora_rank,
+                num_layers=config.num_hidden_layers,
+            )
+        )
 
         self.post_init()
 

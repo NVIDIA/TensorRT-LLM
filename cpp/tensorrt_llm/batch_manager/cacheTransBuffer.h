@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,7 +50,7 @@ public:
     size_t getSize() const;
 
     static size_t getAlignedSize(size_t size);
-    static bool supportFbaricMemory();
+    static bool supportFabricMemory();
 
 private:
     class Impl;
@@ -58,7 +58,6 @@ private:
 };
 
 /// @brief KV Cache specific transfer buffer manager.
-/// Inherits common buffer management from BaseTransBufferManager.
 class CacheTransBufferManager : public BaseTransBufferManager
 {
 public:
@@ -75,12 +74,24 @@ public:
         return mCacheManager;
     }
 
+    /// @brief Get the data type used by KV cache transfer buffers.
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const noexcept
+    {
+        return mDataType;
+    }
+
+    [[nodiscard]] BufferKind getBufferKind() const override
+    {
+        return mTransferIndexerKCache ? BufferKind::kKV_INDEXER : BufferKind::kKV;
+    }
+
 private:
     /// @brief Compute transfer buffer size from KV cache configuration.
     static size_t computeTransferBufferSize(KVCacheManager::BaseKVCacheManager* cacheManager,
         std::optional<size_t> maxNumTokens, bool transferIndexerKCache);
 
     KVCacheManager::BaseKVCacheManager* mCacheManager;
+    bool mTransferIndexerKCache;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

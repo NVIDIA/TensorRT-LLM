@@ -1,25 +1,53 @@
 from .auto_heuristic import suggest_spec_config
-from .eagle3 import Eagle3SpecMetadata
+from .dflash import DFlashSpecMetadata, DFlashWorker
+from .draft_target import (DraftTargetOneModelSpecMetadata,
+                           DraftTargetOneModelWorker)
+from .eagle3 import Eagle3SpecMetadata, MTPEagleWorker
 from .interface import (SpecMetadata, SpecWorkerBase,
+                        prepare_attn_metadata_for_draft_replay,
+                        restore_attn_metadata_after_draft_replay,
                         should_use_separate_draft_kv_cache)
-from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
+from .mtp import MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
-from .save_hidden_state import SaveHiddenStatesDrafter
+from .pard import PARDSpecMetadata, PARDWorker
+from .sa_enhancer import SADraftEnhancer
+from .sa_worker import SASpecMetadata, SAWorker
+from .save_hidden_state import (SaveHiddenStatesResourceManager,
+                                SaveHiddenStatesSpecMetadata)
+from .spec_sampler_base import (SampleStateSpec, SampleStateTensorsSpec,
+                                SpecSampler)
 from .spec_tree_manager import SpecTreeManager
+from .suffix_automaton import SuffixAutomatonManager
 from .utils import (get_draft_kv_cache_manager, get_num_extra_kv_tokens,
                     get_num_spec_layers, get_spec_decoder, get_spec_drafter,
                     get_spec_metadata, get_spec_resource_manager,
-                    get_spec_worker, update_spec_config_from_model_config)
+                    get_spec_worker, update_spec_config_from_draft_model_config,
+                    update_spec_config_from_loaded_model,
+                    update_spec_config_from_model_config)
 
 __all__ = [
+    "DFlashSpecMetadata",
+    "DFlashWorker",
+    "DraftTargetOneModelSpecMetadata",
+    "DraftTargetOneModelWorker",
     "Eagle3SpecMetadata",
     "MTPEagleWorker",
     "MTPSpecMetadata",
     "MTPWorker",
     "NGramDrafter",
     "NGramPoolManager",
-    "SaveHiddenStatesDrafter",
+    "PARDSpecMetadata",
+    "PARDWorker",
+    "SADraftEnhancer",
+    "SASpecMetadata",
+    "SAWorker",
+    "SuffixAutomatonManager",
+    "SampleStateSpec",
+    "SampleStateTensorsSpec",
+    "SaveHiddenStatesResourceManager",
+    "SaveHiddenStatesSpecMetadata",
     "SpecMetadata",
+    "SpecSampler",
     "SpecWorkerBase",
     "get_draft_kv_cache_manager",
     "get_num_extra_kv_tokens",
@@ -29,7 +57,11 @@ __all__ = [
     "get_spec_metadata",
     "get_spec_resource_manager",
     "get_spec_worker",
+    "prepare_attn_metadata_for_draft_replay",
+    "restore_attn_metadata_after_draft_replay",
     "should_use_separate_draft_kv_cache",
+    "update_spec_config_from_draft_model_config",
+    "update_spec_config_from_loaded_model",
     "update_spec_config_from_model_config",
     "suggest_spec_config",
     "SpecTreeManager",

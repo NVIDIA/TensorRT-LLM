@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -436,6 +436,13 @@ def verify_reference_result(
     topK: int,
     seq_len: int,
 ) -> torch.Tensor:
+    if isinstance(b_torch_cpu, list):
+        b_torch_cpu = torch.cat(b_torch_cpu, dim=2)
+    if isinstance(sfb_torch_cpu, list):
+        sfb_torch_cpu = torch.cat(sfb_torch_cpu, dim=2)
+    if isinstance(alpha_torch_cpu, list):
+        alpha_torch_cpu = torch.cat(alpha_torch_cpu, dim=0)
+
     gemm_output = torch.empty((1, valid_m, n), dtype=torch.float32)
     valid_mask = torch.zeros((valid_m,), dtype=torch.bool, device="cuda")
     #########  gemm calculation #########
@@ -556,6 +563,7 @@ def run(
 
     # Unpack parameters
     n, k, l = nkl  # noqa: E741
+    total_l = l
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
@@ -571,7 +579,7 @@ def run(
         m_aligned,
         n,
         k,
-        l,
+        total_l,
         a_major,
         b_major,
         out_major,
@@ -644,7 +652,7 @@ def run(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,
-        raster_along_m,
+        raster_along_m=raster_along_m,
     )
 
     # Compute max active clusters on current device
@@ -672,7 +680,6 @@ def run(
         current_stream,
         permuted_idx_to_expanded_idx,
         token_final_scales,
-        options="--opt-level 2",
     )
 
     # Compute reference result
@@ -821,16 +828,22 @@ def run(
 
     workspace_count = 1
     if use_cold_l2:
+
+        def _tensor_list_bytes(tensors):
+            if isinstance(tensors, list):
+                return sum(t.numel() * t.element_size() for t in tensors)
+            return tensors.numel() * tensors.element_size()
+
         one_workspace_bytes = (
-            a_torch_gpu.numel() * a_torch_gpu.element_size()
-            + b_torch_gpu.numel() * b_torch_gpu.element_size()
-            + out_torch_gpu.numel() * out_torch_gpu.element_size()
-            + sfa_torch_gpu.numel() * sfa_torch_gpu.element_size()
-            + sfb_torch_gpu.numel() * sfb_torch_gpu.element_size()
+            _tensor_list_bytes(a_torch_gpu)
+            + _tensor_list_bytes(b_torch_gpu)
+            + _tensor_list_bytes(out_torch_gpu)
+            + _tensor_list_bytes(sfa_torch_gpu)
+            + _tensor_list_bytes(sfb_torch_gpu)
             + (tensor_m // mma_tiler_mn[0])
             * 4  # tile_idx_to_expert_idx length (tiles) * sizeof(int32)
             + 1 * 4  # num_non_exiting_tiles (1 element) * sizeof(int32)
-            + alpha_torch_cpu.numel() * alpha_torch_cpu.element_size()
+            + _tensor_list_bytes(alpha_torch_cpu)
         )
         workspace_count = cute.testing.get_workspace_count(
             one_workspace_bytes, warmup_iterations, iterations

@@ -274,8 +274,10 @@ class MllamaForConditionalGeneration(nn.Module):
         self.hidden_size = pretrained_config.text_config.hidden_size
         self.max_num_tiles = pretrained_config.vision_config.max_num_tiles
         self.vision_output_dim = pretrained_config.vision_config.vision_output_dim
-        self.pad_token_id = (pretrained_config.pad_token_id if
-                             pretrained_config.pad_token_id is not None else -1)
+        self.pad_token_id = getattr(pretrained_config, 'pad_token_id', None)
+        if self.pad_token_id is None:
+            self.pad_token_id = getattr(pretrained_config.text_config,
+                                        'pad_token_id', -1) or -1
         self.image_size = pretrained_config.vision_config.image_size
 
         # hack config

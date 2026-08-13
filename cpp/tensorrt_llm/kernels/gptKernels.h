@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include <cstdint>
@@ -115,6 +116,10 @@ struct BuildDecoderInfoParams
     int* seqQOffsets;
     // The offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
     int* seqKVOffsets;
+    // Precomputed offsets to the 1st token in each sequence of Q buffer. Shape: [batchSize+1].
+    int const* precomputedSeqQOffsets;
+    // Precomputed offsets to the 1st token in each sequence of KV buffer. Shape: [batchSize+1].
+    int const* precomputedSeqKVOffsets;
     // The number of padded tokens in the corresponding padded tensor before the current token, for Decoder. Shape:
     // [numTokens].
     int* paddingOffsets;
@@ -168,7 +173,7 @@ struct BuildDecoderInfoParams
     // We will apply the limited_length_causal mask when there are not enough kv cache.
     int attentionWindowSize;
     // The number of sink tokens in the kv cache.
-    int sinkTokenLength;
+    int sinkTokenLength{0};
     // The number of tokens in total. It's \sum_{ii=0}^{batchSize} seqLengths[ii].
     int numTokens;
     // Remove padding or not.
@@ -223,29 +228,23 @@ struct BuildDecoderInfoParams
     std::string toString() const
     {
         std::stringstream ss;
+        auto printTensor = [&ss](char const* name, void* ptr, tensorrt_llm::Dims shape)
+        {
+            ss << name << ": ";
+            if (ptr)
+                ss << *(runtime::ITensor::wrap((void*) ptr, tensorrt_llm::DataType::kINT32, shape));
+            else
+                ss << "nullptr";
+            ss << std::endl;
+        };
         ss << "BuildDecoderInfoParams ====================" << std::endl;
-        ss << "seqQOffsets: "
-           << *(runtime::ITensor::wrap(
-                  (void*) seqQOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
-           << std::endl;
-        ss << "seqKVOffsets: "
-           << *(runtime::ITensor::wrap(
-                  (void*) seqKVOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
-           << std::endl;
-        ss << "paddingOffsets: "
-           << *(runtime::ITensor::wrap(
-                  (void*) paddingOffsets, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batchSize})))
-           << std::endl;
-        ss << "tokensInfo: "
-           << *(runtime::ITensor::wrap(
-                  (void*) tokensInfo, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({numTokens * 2})))
-           << std::endl;
+        printTensor("seqQOffsets", seqQOffsets, runtime::ITensor::makeShape({batchSize}));
+        printTensor("seqKVOffsets", seqKVOffsets, runtime::ITensor::makeShape({batchSize}));
+        printTensor("paddingOffsets", paddingOffsets, runtime::ITensor::makeShape({batchSize}));
+        printTensor("tokensInfo", tokensInfo, runtime::ITensor::makeShape({numTokens * 2}));
         if (encoderPaddingOffsets != nullptr)
         {
-            ss << "encoderPaddingOffsets: "
-               << *(runtime::ITensor::wrap((void*) encoderPaddingOffsets, nvinfer1::DataType::kINT32,
-                      runtime::ITensor::makeShape({batchSize})))
-               << std::endl;
+            printTensor("encoderPaddingOffsets", encoderPaddingOffsets, runtime::ITensor::makeShape({batchSize}));
         }
         ss << "attentionMask: " << static_cast<void*>(attentionMask) << std::endl;
         ss << "seqQLengths: " << seqQLengths << std::endl;

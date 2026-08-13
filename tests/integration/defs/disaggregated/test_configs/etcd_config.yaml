@@ -1,0 +1,4 @@
+server_type: "etcd"
+hostname: "localhost"
+port: 2379
+health_check_timeout: 5.0

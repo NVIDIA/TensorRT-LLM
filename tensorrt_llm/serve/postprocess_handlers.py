@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple, Union
 
@@ -11,8 +12,12 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
 from ..executor.postproc_worker import PostprocArgs
 from ..executor.result import Logprob, TokenLogprobs
 from ..llmapi import SamplingParams
+from ..llmapi.disagg_utils import (get_usage_tokens_from_ctx,
+                                   rewrite_usage_info_from_ctx,
+                                   rewrite_usage_response_from_ctx)
 from ..llmapi.reasoning_parser import (BaseReasoningParser,
-                                       ReasoningParserFactory)
+                                       ReasoningParserFactory,
+                                       ReasoningParserResult)
 from ..llmapi.tokenizer import TransformersTokenizer
 # yapf: disable
 from .chat_utils import make_tool_call_id
@@ -41,6 +46,28 @@ from .tool_parser.tool_parser_factory import ToolParserFactory
 # yapf: enable
 
 
+def _ctx_usage_from_outputs(outputs: List[Any]) -> Optional[UsageInfo]:
+    for output in outputs:
+        disaggregated_params = getattr(output, "disaggregated_params", None)
+        if disaggregated_params is None:
+            continue
+        ctx_usage = disaggregated_params.ctx_usage
+        if ctx_usage is None:
+            continue
+        if isinstance(ctx_usage, UsageInfo):
+            return ctx_usage
+        return UsageInfo.model_validate(ctx_usage)
+    return None
+
+
+def _ctx_usage_for_postproc(args: PostprocArgs,
+                            outputs: List[Any]) -> Optional[UsageInfo]:
+    ctx_usage = args.ctx_usage
+    if ctx_usage is not None:
+        return ctx_usage
+    return _ctx_usage_from_outputs(outputs)
+
+
 @dataclass(kw_only=True)
 class ChatPostprocArgs(PostprocArgs):
     echo: bool = False
@@ -62,6 +89,11 @@ class ChatPostprocArgs(PostprocArgs):
     has_tool_call: dict[int, bool] = field(default_factory=dict)
     tool_call_id_type: str = "random"
     chat_template_kwargs: Optional[dict[str, Any]] = None
+    ctx_usage: Optional[UsageInfo] = None
+    # Cache per-request stream metadata so every chunk reuses the same response
+    # id and created timestamp instead of regenerating them for each chunk.
+    stream_response_id: Optional[str] = None
+    stream_created: Optional[int] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -77,7 +109,18 @@ class ChatPostprocArgs(PostprocArgs):
             return_logprobs=bool(request.logprobs),
             top_logprobs=bool(request.top_logprobs),
             chat_template_kwargs=request.chat_template_kwargs,
+            ctx_usage=None if request.disaggregated_params is None else
+            request.disaggregated_params.ctx_usage,
         )
+
+
+def _ensure_stream_metadata(args: Any, rsp: GenerationResultBase,
+                            prefix: str) -> Tuple[str, int]:
+    if args.stream_response_id is None:
+        args.stream_response_id = f"{prefix}-{rsp.id}"
+    if args.stream_created is None:
+        args.stream_created = int(time.time())
+    return args.stream_response_id, args.stream_created
 
 
 def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
@@ -111,8 +154,11 @@ def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
     return chat_logprobs
 
 
-def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
-                           streaming: bool) -> Tuple[str, str]:
+def apply_reasoning_parser(args: ChatPostprocArgs,
+                           output_index: int,
+                           text: str,
+                           streaming: bool,
+                           finished: bool = False) -> Tuple[str, str]:
     reasoning_parser = None
     if args.reasoning_parser is not None:
         if output_index not in args.reasoning_parser_dict:
@@ -127,6 +173,13 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
+            if finished:
+                finish_result = reasoning_parser.finish()
+                result = ReasoningParserResult(
+                    content=result.content + finish_result.content,
+                    reasoning_content=result.reasoning_content +
+                    finish_result.reasoning_content,
+                )
         content, reasoning_content = result.content, result.reasoning_content
     else:
         content, reasoning_content = text, ""
@@ -173,7 +226,9 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                              content=content),
                                                          finish_reason=None)
         chunk = ChatCompletionStreamResponse(choices=[choice_data],
-                                             model=args.model)
+                                             model=args.model,
+                                             id=stream_response_id,
+                                             created=stream_created)
         if include_continuous_usage:
             chunk.usage = UsageInfo(
                 prompt_tokens=num_tokens,
@@ -182,12 +237,16 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 prompt_tokens_details=PromptTokensDetails(
                     cached_tokens=rsp.cached_tokens),
             )
+            rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_none=True)
         return data
 
     res: List[str] = []
     finish_reason_sent = [False] * args.num_choices
     prompt_tokens = args.num_prompt_tokens
+    ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
+    stream_response_id, stream_created = _ensure_stream_metadata(
+        args, rsp, "chatcmpl")
     if stream_option := args.stream_options:
         include_usage = stream_option.include_usage
         include_continuous_usage = include_usage and stream_option.continuous_usage_stats
@@ -211,10 +270,14 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         if finish_reason_sent[i]:
             continue
 
+        has_token_delta = bool(output.token_ids_diff)
         delta_text = output.text_diff
-
         delta_text, reasoning_delta_text = apply_reasoning_parser(
-            args, i, delta_text, True)
+            args,
+            i,
+            delta_text,
+            True,
+            finished=(output.finish_reason is not None))
 
         if args.tool_choice and type(
                 args.tool_choice) is ChatCompletionNamedToolChoiceParam:
@@ -252,7 +315,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                             arguments=call_item.parameters,
                         ),
                     ))
-            if tool_calls or delta_text or reasoning_delta_text or output.finish_reason:
+            # Keep token-bearing chunks visible even when detokenization has no
+            # text to flush yet.
+            if (tool_calls or delta_text or reasoning_delta_text
+                    or output.finish_reason or has_token_delta):
                 delta_message = DeltaMessage(
                     content=delta_text,
                     reasoning_content=reasoning_delta_text,
@@ -281,13 +347,17 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 choice.finish_reason = output.finish_reason
             choice.stop_reason = output.stop_reason
             finish_reason_sent[i] = True
-        chunk = ChatCompletionStreamResponse(choices=[choice], model=args.model)
+        chunk = ChatCompletionStreamResponse(choices=[choice],
+                                             model=args.model,
+                                             id=stream_response_id,
+                                             created=stream_created)
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
                                     total_tokens=output.length + prompt_tokens,
                                     prompt_tokens_details=PromptTokensDetails(
                                         cached_tokens=rsp.cached_tokens))
+            rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_none=True)
         res.append(f"data: {data}\n\n")
 
@@ -300,10 +370,13 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             prompt_tokens_details=PromptTokensDetails(
                 cached_tokens=rsp.cached_tokens),
         )
+        rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
         final_usage_chunk = ChatCompletionStreamResponse(choices=[],
                                                          model=args.model,
-                                                         usage=final_usage)
+                                                         usage=final_usage,
+                                                         id=stream_response_id,
+                                                         created=stream_created)
         final_usage_data = final_usage_chunk.model_dump_json()
         res.append(f"data: {final_usage_data}\n\n")
     return res
@@ -343,6 +416,17 @@ def chat_response_post_processor(
                                   tool_calls=tool_calls)
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
+        if (disaggregated_params is not None and args.chat_template_kwargs
+                and args.reasoning_parser
+                and ReasoningParserFactory.resolves_thinking_from_prompt(
+                    args.reasoning_parser)):
+            # Relay the mode we resolved from the rendered prompt; the
+            # generation worker never renders and so cannot resolve it. Gated
+            # on the parser opting in, so we never overwrite a mode another
+            # parser derives from the caller's own kwargs.
+            resolved = args.chat_template_kwargs.get("enable_thinking")
+            if resolved is not None:
+                disaggregated_params.resolved_thinking = resolved
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
@@ -378,11 +462,13 @@ def chat_response_post_processor(
         prompt_tokens_details=PromptTokensDetails(
             cached_tokens=rsp.cached_tokens),
     )
+    ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     response = ChatCompletionResponse(
         model=args.model,
         choices=choices,
         usage=usage,
     )
+    rewrite_usage_response_from_ctx(response, ctx_usage)
     return response
 
 
@@ -396,6 +482,11 @@ class CompletionPostprocArgs(PostprocArgs):
     prompt: Optional[str] = None
     return_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
+    ctx_usage: Optional[UsageInfo] = None
+    # Cache per-request stream metadata so every chunk reuses the same response
+    # id and created timestamp instead of regenerating them for each chunk.
+    stream_response_id: Optional[str] = None
+    stream_created: Optional[int] = None
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -406,6 +497,8 @@ class CompletionPostprocArgs(PostprocArgs):
             stream_options=request.stream_options,
             detokenize=request.detokenize,
             return_logprobs=bool(request.logprobs),
+            ctx_usage=None if request.disaggregated_params is None else
+            request.disaggregated_params.ctx_usage,
         )
 
 
@@ -447,6 +540,9 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                      args: CompletionPostprocArgs) -> List[str]:
     res: List[str] = []
     prompt_tokens = args.num_prompt_tokens
+    ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
+    stream_response_id, stream_created = _ensure_stream_metadata(
+        args, rsp, "cmpl")
     if stream_option := args.stream_options:
         include_usage = stream_option.include_usage
         include_continuous_usage = include_usage and stream_option.continuous_usage_stats
@@ -474,13 +570,17 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             choice.logprobs = create_completion_logprobs(
                 token_ids, args.tokenizer, logprobs, output._last_text_len)
 
-        chunk = CompletionStreamResponse(model=args.model, choices=[choice])
+        chunk = CompletionStreamResponse(model=args.model,
+                                         choices=[choice],
+                                         id=stream_response_id,
+                                         created=stream_created)
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
                                     total_tokens=output.length + prompt_tokens,
                                     prompt_tokens_details=PromptTokensDetails(
                                         cached_tokens=rsp.cached_tokens))
+            rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
         data = chunk.model_dump_json(exclude_unset=False)
         res.append(f"data: {data}\n\n")
 
@@ -493,10 +593,13 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             prompt_tokens_details=PromptTokensDetails(
                 cached_tokens=rsp.cached_tokens),
         )
+        rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
-        final_usage_chunk = ChatCompletionStreamResponse(choices=[],
-                                                         model=args.model,
-                                                         usage=final_usage)
+        final_usage_chunk = CompletionStreamResponse(choices=[],
+                                                     model=args.model,
+                                                     usage=final_usage,
+                                                     id=stream_response_id,
+                                                     created=stream_created)
         final_usage_data = final_usage_chunk.model_dump_json()
         res.append(f"data: {final_usage_data}\n\n")
     args.first_iteration = False
@@ -546,6 +649,8 @@ def completion_response_post_processor(
     response = CompletionResponse(choices=choices,
                                   model=args.model,
                                   usage=usage)
+    ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
+    rewrite_usage_response_from_ctx(response, ctx_usage)
     return response
 
 
@@ -556,7 +661,11 @@ class ChatCompletionPostprocArgs(PostprocArgs):
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
+    stream_options: Optional[StreamOptions] = None
     chat_template_kwargs: Optional[dict[str, Any]] = None
+    ctx_usage: Optional[UsageInfo] = None
+    stream_response_id: Optional[str] = None
+    stream_created: Optional[int] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -564,7 +673,10 @@ class ChatCompletionPostprocArgs(PostprocArgs):
             model=request.model,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            stream_options=request.stream_options if request.stream else None,
             chat_template_kwargs=request.chat_template_kwargs,
+            ctx_usage=None if request.disaggregated_params is None else
+            request.disaggregated_params.ctx_usage,
         )
 
 
@@ -578,22 +690,43 @@ def chat_harmony_post_processor(
         outputs=rsp.outputs,
         model=args.model,
         num_prompt_tokens=args.num_prompt_tokens,
+        cached_tokens=rsp.cached_tokens,
     )
+    ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
+    rewrite_usage_response_from_ctx(response, ctx_usage)
     return response
 
 
 @nvtx_range_debug("chat_harmony_streaming_post_processor")
 def chat_harmony_streaming_post_processor(
         rsp: GenerationResult, args: ChatCompletionPostprocArgs) -> List[str]:
+    # Read the request ID directly from rsp.id instead of args.request_id.
+    # Both are the same executor-assigned ID, but args.request_id is set too
+    # late (after generate_async returns) for the postprocess worker path:
+    # the worker receives a copy of args before the ID is assigned, so
+    # args.request_id is always None with num_postprocess_workers > 0.
+    prompt_tokens = args.num_prompt_tokens
+    cached_tokens = rsp.cached_tokens
+    ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
+    ctx_prompt_tokens, ctx_cached_tokens = get_usage_tokens_from_ctx(ctx_usage)
+    if ctx_prompt_tokens is not None:
+        prompt_tokens = ctx_prompt_tokens
+        cached_tokens = ctx_cached_tokens
+    stream_response_id, stream_created = _ensure_stream_metadata(
+        args, rsp, "chatcmpl")
     response = handle_streaming_response(
         tools=args.tools,
         tool_choice=args.tool_choice,
         result=rsp,
         model=args.model,
-        request_id=args.request_id,
+        request_id=str(rsp.id),
         done=rsp._done,
-        num_prompt_tokens=args.num_prompt_tokens,
+        num_prompt_tokens=prompt_tokens,
         first_iteration=args.first_iteration,
+        stream_options=args.stream_options,
+        cached_tokens=cached_tokens,
+        stream_response_id=stream_response_id,
+        stream_created=stream_created,
     )
     args.first_iteration = False
     return response

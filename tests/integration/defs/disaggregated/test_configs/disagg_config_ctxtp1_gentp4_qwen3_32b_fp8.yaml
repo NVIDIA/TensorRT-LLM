@@ -1,0 +1,54 @@
+hostname: localhost
+model: Qwen3/Qwen3-32B-FP8
+backend: pytorch
+cuda_graph_config: null
+guided_decoding_backend: xgrammar
+# speculative_config goes top-level so both context and generation workers
+# see it. Putting it under generation_servers: only causes the disagg KV
+# transceiver to reject the cacheState handshake (cacheStates differ when
+# only one side has spec config).
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 3
+  speculative_model: Zhi-Create-Qwen3-32B-Eagle3
+context_servers:
+  num_instances: 4
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  router:
+    type: kv_cache_aware
+  enable_chunked_prefill: true
+  max_num_tokens: 4096
+  max_seq_len: 10240
+  max_batch_size: 128
+  disable_overlap_scheduler: true
+  print_iter_log: true
+  kv_cache_config:
+    enable_block_reuse: true
+    enable_partial_reuse: true
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    event_buffer_max_size: 1024
+  cache_transceiver_config:
+    backend: DEFAULT
+    max_tokens_in_buffer: 16384
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 4
+  pipeline_parallel_size: 1
+  enable_chunked_prefill: true
+  max_num_tokens: 4096
+  max_seq_len: 10240
+  max_batch_size: 128
+  # Eagle3 requires the overlap scheduler off. Cache settings must match the
+  # context block or disagg KV transfer rejects the cacheState handshake.
+  disable_overlap_scheduler: true
+  print_iter_log: true
+  kv_cache_config:
+    enable_block_reuse: true
+    enable_partial_reuse: true
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+  cache_transceiver_config:
+    backend: DEFAULT
+    max_tokens_in_buffer: 16384

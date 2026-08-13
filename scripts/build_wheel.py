@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,21 +22,36 @@ import sys
 import sysconfig
 import tempfile
 import warnings
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
 from subprocess import DEVNULL, CalledProcessError, check_output, run
-from typing import Sequence
+from typing import Optional, Sequence
 
 try:
     from packaging.requirements import Requirement
+    from packaging.version import Version
 except (ImportError, ModuleNotFoundError):
     from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.version import Version
 
 build_run = partial(run, shell=True, check=True)
+
+
+def get_available_cpu_count() -> int:
+    """Return the number of CPUs available to this process.
+
+    Respects the process CPU affinity mask (Linux) so that builds launched
+    inside a cgroup or taskset-constrained environment don't over-subscribe.
+    Falls back to the total CPU count on platforms that don't expose affinity.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return cpu_count() or 1
 
 
 @contextmanager
@@ -52,6 +67,28 @@ def working_directory(path):
 
 def get_project_dir():
     return Path(__file__).parent.resolve().parent
+
+
+def apply_version_override(project_dir: Path,
+                           version_override: Optional[str]) -> None:
+    """Apply the requested package version before building the wheel."""
+    if not version_override:
+        return
+
+    version_file = project_dir / "tensorrt_llm" / "version.py"
+    version_content = version_file.read_text()
+    version_match = re.search(r'(?m)^__version__ = "([^"]+)"$', version_content)
+    current_version = version_match.group(1)
+
+    resolved_version = version_override
+    if version_override.startswith((".", "+")):
+        resolved_version = current_version
+        if not current_version.endswith(version_override):
+            resolved_version += version_override
+    resolved_version = str(Version(resolved_version))
+    version_file.write_text(
+        version_content.replace(f'__version__ = "{current_version}"',
+                                f'__version__ = "{resolved_version}"', 1))
 
 
 def get_source_dir():
@@ -122,8 +159,10 @@ def create_venv(project_dir: Path):
     return venv_prefix
 
 
-def setup_venv(project_dir: Path, requirements_file: Path,
-               no_venv: bool) -> tuple[Path, Path]:
+def setup_venv(project_dir: Path,
+               requirements_file: Path,
+               no_venv: bool,
+               yes: bool = False) -> tuple[Path, Path]:
     """Creates/updates a venv and installs requirements.
 
     Args:
@@ -157,7 +196,8 @@ def setup_venv(project_dir: Path, requirements_file: Path,
                 f"`build_wheel.py` can recreate a virtual environment using container-provided PyTorch installation."
             )
             print("^^^^^^^^^^ IMPORTANT WARNING ^^^^^^^^^^", file=sys.stderr)
-            input("Press Ctrl+C to stop, any key to continue...\n")
+            if not yes:
+                input("Press Ctrl+C to stop, any key to continue...\n")
 
         # Ensure inherited PyTorch version is compatible
         try:
@@ -248,9 +288,18 @@ def setup_conan(scripts_dir, venv_python):
     return venv_conan
 
 
+def _fmha_generation_stamp(fmha_v2_cu_dir: Path) -> Path:
+    # Written as the last step of generate_fmha_cu; its absence means a
+    # previous generation was interrupted and the directory contents cannot
+    # be trusted (the bare directory exists from the moment generation
+    # starts).
+    return fmha_v2_cu_dir / ".generation_complete"
+
+
 def generate_fmha_cu(project_dir, venv_python):
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
     fmha_v2_cu_dir.mkdir(parents=True, exist_ok=True)
+    _fmha_generation_stamp(fmha_v2_cu_dir).unlink(missing_ok=True)
 
     fmha_v2_dir = project_dir / "cpp/kernels/fmha_v2"
 
@@ -300,12 +349,19 @@ def generate_fmha_cu(project_dir, venv_python):
         move_if_updated(cu_file, dst_file)
         generated_files.add(str(dst_file.resolve()))
 
+    if not generated_files:
+        raise RuntimeError(
+            f"FMHA generation produced no *_sm*.cu files in {fmha_v2_cu_dir}; "
+            "generation may have failed silently.")
+
     # Remove extra files
     for root, _, files in os.walk(fmha_v2_cu_dir):
         for file in files:
             file_path = os.path.realpath(os.path.join(root, file))
             if file_path not in generated_files:
                 os.remove(file_path)
+
+    _fmha_generation_stamp(fmha_v2_cu_dir).touch()
 
 
 def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]) -> str:
@@ -372,6 +428,8 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
                                 binding_lib_name: str):
     build_run(f"\"{venv_python}\" -m pip install nanobind")
     build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
+    nanobind_stubgen_patterns = get_project_dir(
+    ) / "scripts" / "nanobind_stubgen.patterns"
 
     env_stub_gen = os.environ.copy()
     cuda_home_dir = env_stub_gen.get("CUDA_HOME") or env_stub_gen.get(
@@ -389,10 +447,15 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
         link_dir = None
 
     try:
-        build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
-                  env=env_stub_gen)
         build_run(
-            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+            f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O . "
+            f"-p \"{nanobind_stubgen_patterns}\" -q",
+            env=env_stub_gen)
+        # Pre-import torch so deep_gemm_cpp_tllm's FP4 scalar-type registration
+        # succeeds; CLI args after `-c ...` land in sys.argv[1:] for argparse.
+        build_run(
+            f"\"{venv_python}\" -c 'import torch; from pybind11_stubgen import main; main()' "
+            "-o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
         if flash_mla:
             build_run(
@@ -470,7 +533,6 @@ def main(*,
          job_count: int = None,
          extra_cmake_vars: Sequence[str] = tuple(),
          extra_make_targets: str = "",
-         trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
          nixl_root: str = None,
          mooncake_root: str = None,
@@ -478,25 +540,31 @@ def main(*,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
+         configure_only: bool = False,
          use_ccache: bool = False,
+         use_3rdparty_cache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
          skip_stubs: bool = False,
          generate_fmha: bool = False,
          no_venv: bool = False,
          nvrtc_dynamic_linking: bool = False,
-         mypyc: bool = False):
+         mypyc: bool = False,
+         require_dynamic_attributions: bool = False,
+         plat_name: Optional[str] = None,
+         yes: bool = False,
+         version_override: Optional[str] = None):
 
     if clean:
         clean_wheel = True
 
     project_dir = get_project_dir()
+    apply_version_override(project_dir, version_override)
     os.chdir(project_dir)
 
     # Get all submodules and check their folder exists. If not,
@@ -515,26 +583,33 @@ def main(*,
     # Setup venv and install requirements
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename,
-                                         no_venv)
-
-    # Ensure base TRT is installed (check inside the venv)
-    try:
-        check_output([str(venv_python), "-m", "pip", "show", "tensorrt"])
-    except CalledProcessError:
-        error_msg = "TensorRT was not installed properly."
-        if on_windows:
-            error_msg += (
-                " Please download the TensorRT zip file manually,"
-                " install it and relaunch build_wheel.py."
-                " See https://docs.nvidia.com/deeplearning/tensorrt/install-guide/index.html#installing-zip for more details."
-            )
-        else:
-            error_msg += f" Please install tensorrt into the venv using \"`{venv_python}` -m pip install tensorrt\" and relaunch build_wheel.py"
-        raise RuntimeError(error_msg)
+                                         no_venv,
+                                         yes=yes)
 
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
             raise RuntimeError("Volta architecture is deprecated support.")
+
+    # Debug and RelWithDebInfo enable CUDA `--generate-line-info`, which
+    # inflates .text so much that linking against every supported arch
+    # overflows section limits. Require an explicit arch list so the build
+    # won't silently fail deep into compilation.
+    if build_type in ("Debug", "RelWithDebInfo") and not cuda_architectures:
+        raise RuntimeError(
+            f"Building {build_type} requires --cuda_architectures to be set "
+            "explicitly (e.g. --cuda_architectures=90-real). Building for all "
+            "architectures with line info enabled exceeds linker section "
+            "limits. Pass a narrow arch list matching the GPU you intend to "
+            "debug/profile.")
+
+    if build_type == "Debug":
+        print(
+            "-- Debug build: only --generate-line-info is enabled by default. "
+            "Full device debug info (-G) is NOT enabled because it can make "
+            "ptxas memory usage explode and get OOM-killed on some kernels. "
+            "If you need cuda-gdb stepping inside kernels, opt in with "
+            "`--extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` and make sure "
+            "the build host has enough memory for ptxas.")
 
     cuda_architectures = cuda_architectures or 'all'
     cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
@@ -553,7 +628,7 @@ def main(*,
         cmake_generator = "-G" + generator
 
     if job_count is None:
-        job_count = cpu_count()
+        job_count = get_available_cpu_count()
 
     if len(extra_cmake_vars):
         # Backwards compatibility, we also support semicolon expansion for each value.
@@ -565,9 +640,6 @@ def main(*,
         extra_cmake_vars = ["\"-D{}\"".format(var) for var in expanded_args]
         # Don't include duplicate conditions
         cmake_def_args.extend(set(extra_cmake_vars))
-
-    if trt_root is not None:
-        cmake_def_args.append(f"-DTensorRT_ROOT={trt_root}")
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
@@ -595,10 +667,36 @@ def main(*,
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
 
+    # FetchContent bare-repo cache (see 3rdparty/CMakeLists.txt).  Forwarded
+    # as -D vars so the configuration is reproducible from CMakeCache.txt
+    # alone and doesn't depend on the caller's env.  The env var hand-off
+    # lets a wrapping agent point at a shared cache without patching
+    # build_wheel.py.
+    if use_3rdparty_cache:
+        cache_dir = os.environ.get("TRTLLM_FETCHCONTENT_CACHE") or str(
+            project_dir / "3rdparty" / ".cache_3rdparty")
+        cmake_def_args.append(f"-DTRTLLM_FETCHCONTENT_CACHE={cache_dir}")
+        update_cmd = os.environ.get("TRTLLM_FETCHCONTENT_UPDATE_CMD", "")
+        if update_cmd:
+            cmake_def_args.append(
+                f"-DTRTLLM_FETCHCONTENT_UPDATE_CMD={update_cmd}")
+
     if nvrtc_dynamic_linking:
         cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
 
-    targets = ["tensorrt_llm", "nvinfer_plugin_tensorrt_llm"]
+    # BOLT compatibility: Force dynamic linking for NVIDIA libraries
+    # Static NVIDIA libraries (libnvrtc_static.a, etc.) lack --emit-relocs,
+    # which BOLT requires for proper binary optimization.
+    bolt_enabled = any("ENABLE_BOLT_COMPATIBLE=ON" in var
+                       for var in extra_cmake_vars)
+    if bolt_enabled:
+        if not nvrtc_dynamic_linking:
+            cmake_def_args.append("-DNVRTC_DYNAMIC_LINKING=ON")
+            print(
+                "-- BOLT: Forcing NVRTC_DYNAMIC_LINKING=ON (static NVIDIA libs lack relocations)"
+            )
+
+    targets = ["tensorrt_llm"]
 
     if cpp_only:
         build_pyt = "OFF"
@@ -615,9 +713,6 @@ def main(*,
         build_deep_gemm = "ON"
         build_flash_mla = "ON"
 
-    if benchmarks:
-        targets.append("benchmarks")
-
     if micro_benchmarks:
         targets.append("micro_benchmarks")
         build_micro_benchmarks = "ON"
@@ -626,19 +721,17 @@ def main(*,
 
     disable_nvtx = "OFF" if nvtx else "ON"
 
-    if not on_windows:
-        targets.append("executorWorker")
-
     source_dir = get_source_dir()
 
     fmha_v2_cu_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu"
-    if clean or generate_fmha or not fmha_v2_cu_dir.exists():
+    if (clean or generate_fmha
+            or not _fmha_generation_stamp(fmha_v2_cu_dir).exists()):
         generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
-        if clean or first_build or configure_cmake:
+        if clean or first_build or configure_cmake or configure_only:
             build_run(
-                f"\"{venv_conan}\" install --build=missing --remote=TensorRT-LLM --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
@@ -659,9 +752,14 @@ def main(*,
             print(cmake_configure_command)
             build_run(cmake_configure_command)
 
+        if configure_only:
+            return
+
+        maybe_keep_depfile = " -- -d keepdepfile" if generator == "Ninja" else ""
         cmake_build_command = (
             f'cmake --build . --config {build_type} --parallel {job_count} '
-            f'--target build_wheel_targets {" ".join(extra_make_targets)}')
+            f'--target build_wheel_targets {" ".join(extra_make_targets)}{maybe_keep_depfile}'
+        )
         print("CMake Build command: ")
         print(cmake_build_command)
         build_run(cmake_build_command)
@@ -678,6 +776,10 @@ def main(*,
         clear_folder(lib_dir)
     if include_dir.exists():
         clear_folder(include_dir)
+    # Remove auto-generated attributions file from previous builds
+    auto_attr_file = project_dir / "ATTRIBUTIONS.md"
+    if auto_attr_file.exists():
+        os.remove(auto_attr_file)
 
     cache_dir = os.getenv("TRTLLM_DG_CACHE_DIR")
     if cache_dir is not None:
@@ -695,8 +797,33 @@ def main(*,
     if cache_dir.exists():
         clear_folder(cache_dir)
 
-    install_file = copy
-    install_tree = copytree
+    def safe_copy(src, dst):
+        """Copy a file, replacing a destination symlink with a real file."""
+        src_path = Path(src)
+        dst_path = Path(dst)
+        if dst_path.is_dir():
+            dst_path = dst_path / src_path.name
+        if dst_path.is_symlink():
+            dst_path.unlink()
+        return copy(src_path, dst_path)
+
+    install_file = safe_copy
+
+    # Wrapper for copytree that checks if source and destination are the same
+    def safe_copytree(src, dst, dirs_exist_ok=True):
+        """Copy tree, but skip if source and destination resolve to the same directory."""
+        src_path = Path(src).resolve()
+        dst_path = Path(dst)
+        if dst_path.is_symlink():
+            dst_path.unlink()
+        elif src_path == dst_path.resolve():
+            # Source and destination are the same, skip copying
+            return
+        if dst_path.exists() and dirs_exist_ok:
+            rmtree(dst_path)
+        copytree(src_path, dst_path, dirs_exist_ok=dirs_exist_ok)
+
+    install_tree = safe_copytree
     if skip_building_wheel and linking_install_binary:
 
         def symlink_remove_dst(src, dst):
@@ -704,7 +831,7 @@ def main(*,
             dst = os.path.abspath(dst)
             if os.path.isdir(dst):
                 dst = os.path.join(dst, os.path.basename(src))
-            if os.path.exists(dst):
+            if os.path.lexists(dst):
                 os.remove(dst)
             os.symlink(src, dst)
 
@@ -713,7 +840,7 @@ def main(*,
         def symlink_remove_dst_tree(src, dst, dirs_exist_ok=True):
             src = os.path.abspath(src)
             dst = os.path.abspath(dst)
-            if dirs_exist_ok and os.path.exists(dst):
+            if dirs_exist_ok and os.path.lexists(dst):
                 os.remove(dst)
             os.symlink(src, dst)
 
@@ -724,6 +851,92 @@ def main(*,
     install_tree(get_source_dir() / "include" / "tensorrt_llm" / "deep_gemm",
                  include_dir / "deep_gemm",
                  dirs_exist_ok=True)
+
+    # Copy FMHA kernel generation headers for JIT compilation
+    fmha_build_dir = build_dir / "tensorrt_llm" / "kernels" / "trtllmGenKernels" / "fmha"
+    fmha_include_dir = include_dir / "trtllm_gen_kernels" / "fmha"
+    if fmha_build_dir.exists():
+        fmha_include_dir.mkdir(parents=True, exist_ok=True)
+
+        # Helper function to resolve symlinks and copy actual content
+        def copy_resolving_symlink(src_path, dst_path):
+            """Copy file or directory, resolving symlinks to copy actual content.
+
+            Skips the copy when dst already exists and a stamp file confirms the
+            previous copy completed successfully, and the stamp is at least as new
+            as src.  Using a stamp (rather than dst mtime) avoids two pitfalls:
+            - Directory mtime on Linux only reflects direct-child changes, not
+              deeply nested ones, so a modified source file may not update it.
+            - An interrupted copy leaves dst with a fresh mtime that would
+              incorrectly satisfy an mtime check, causing the next build to skip.
+            """
+            if src_path.is_symlink():
+                resolved_src = src_path.resolve()
+            else:
+                resolved_src = src_path
+
+            if resolved_src.is_dir():
+                stamp = dst_path.parent / f".{dst_path.name}.stamp"
+                if dst_path.exists() and stamp.exists():
+                    if stamp.stat().st_mtime >= resolved_src.stat().st_mtime:
+                        return  # destination is up to date
+                    rmtree(dst_path)
+                elif dst_path.exists():
+                    rmtree(
+                        dst_path)  # dst exists but no stamp — interrupted copy
+                stamp.unlink(missing_ok=True)
+                # Shell out to cp -rL: dereferences symlinks like copytree(symlinks=False)
+                # but uses kernel-level copy primitives, which is significantly faster
+                # than Python's file-by-file copytree on network-mounted filesystems.
+                # Fall back to copytree if cp is unavailable (non-Linux or minimal containers).
+                cp_bin = shutil.which("cp")
+                if cp_bin is not None:
+                    try:
+                        run([cp_bin, "-rL",
+                             str(resolved_src),
+                             str(dst_path)],
+                            check=True)
+                    except FileNotFoundError:
+                        copytree(resolved_src, dst_path, symlinks=False)
+                else:
+                    copytree(resolved_src, dst_path, symlinks=False)
+                stamp.touch()
+            else:
+                if dst_path.is_dir():
+                    dst_path = dst_path / src_path.name
+                copy(resolved_src, dst_path)
+
+        # Copy cuda_ptx directory (actual directory, not symlink)
+        cuda_ptx_src = fmha_build_dir / "cuda_ptx"
+        if cuda_ptx_src.exists():
+            copy_resolving_symlink(cuda_ptx_src, fmha_include_dir / "cuda_ptx")
+
+        # Copy cutlass (symlink, need to resolve)
+        cutlass_src = fmha_build_dir / "cutlass"
+        if cutlass_src.exists():
+            copy_resolving_symlink(cutlass_src, fmha_include_dir / "cutlass")
+
+        # Copy trtllm directory (contains dev symlink)
+        trtllm_src = fmha_build_dir / "trtllm"
+        if trtllm_src.exists():
+            copy_resolving_symlink(trtllm_src, fmha_include_dir / "trtllm")
+
+        # Copy cuda (symlink, need to resolve)
+        cuda_src = fmha_build_dir / "cuda"
+        if cuda_src.exists():
+            copy_resolving_symlink(cuda_src, fmha_include_dir / "cuda")
+
+        # Copy KernelParams.h (actual file)
+        kernel_params_src = fmha_build_dir / "KernelParams.h"
+        if kernel_params_src.exists():
+            copy(kernel_params_src, fmha_include_dir / "KernelParams.h")
+
+        # Copy KernelParamsDecl.h (actual file)
+        kernel_params_decl_src = fmha_build_dir / "KernelParamsDecl.h"
+        if kernel_params_decl_src.exists():
+            copy(kernel_params_decl_src,
+                 fmha_include_dir / "KernelParamsDecl.h")
+
     required_cuda_headers = [
         "cuda_fp16.h", "cuda_fp16.hpp", "cuda_bf16.h", "cuda_bf16.hpp",
         "cuda_fp8.h", "cuda_fp8.hpp"
@@ -752,18 +965,11 @@ def main(*,
                      lib_dir / "tensorrt_llm.dll")
         install_file(build_dir / f"tensorrt_llm/thop/th_common.dll",
                      lib_dir / "th_common.dll")
-        install_file(
-            build_dir / f"tensorrt_llm/plugins/nvinfer_plugin_tensorrt_llm.dll",
-            lib_dir / "nvinfer_plugin_tensorrt_llm.dll")
     else:
         install_file(build_dir / "tensorrt_llm/libtensorrt_llm.so",
                      lib_dir / "libtensorrt_llm.so")
         install_file(build_dir / "tensorrt_llm/thop/libth_common.so",
                      lib_dir / "libth_common.so")
-        install_file(
-            build_dir /
-            "tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so",
-            lib_dir / "libnvinfer_plugin_tensorrt_llm.so")
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
@@ -848,23 +1054,9 @@ def main(*,
         clear_folder(deep_gemm_dir)
         deep_gemm_dir.rmdir()
 
-    bin_dir = pkg_dir / "bin"
-    if bin_dir.exists():
-        clear_folder(bin_dir)
-    bin_dir.mkdir(parents=True, exist_ok=True)
-
-    if not on_windows:
-        install_file(build_dir / "tensorrt_llm/executor_worker/executorWorker",
-                     bin_dir / "executorWorker")
-
     scripts_dir = pkg_dir / "scripts"
     if scripts_dir.exists():
         clear_folder(scripts_dir)
-    scripts_dir.mkdir(parents=True, exist_ok=True)
-
-    if not on_windows:
-        install_file(project_dir / "docker/common/install_tensorrt.sh",
-                     scripts_dir / "install_tensorrt.sh")
 
     if not cpp_only:
 
@@ -956,6 +1148,43 @@ def main(*,
             clear_folder(dist_dir)
 
         extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
+        plat_name_arg = ""
+        if plat_name:
+            plat_name_arg = f'--config-setting="--build-option=--plat-name={plat_name}"'
+            extra_wheel_build_args = " ".join(
+                arg for arg in (extra_wheel_build_args, plat_name_arg) if arg)
+
+        # Attempt to generate attributions using the dependency database
+        # Skip if output already exists and the build system hasn't changed
+        auto_attr = build_dir / "attribution" / "ATTRIBUTIONS.md"
+        if auto_attr.exists() and not (clean or first_build or configure_cmake):
+            print(f"Using cached attributions from {auto_attr}")
+        else:
+            try:
+                # Activate venv so that 'trtllm-sbom' CLI can be found after pip installs it
+                venv_bin = venv_python.parent
+                build_run(
+                    f'. "{venv_bin / "activate"}" && python {project_dir}/scripts/attribute.py --build-dir "{build_dir}" -j {job_count}'
+                )
+            except Exception as e:
+                if require_dynamic_attributions:
+                    raise RuntimeError(
+                        f"Attribution generation failed and --require_dynamic_attributions was set: {e}"
+                    ) from e
+                print(
+                    f"Warning: Attribution generation step failed with error: {e}",
+                    file=sys.stderr)
+                print(
+                    "You can run the dependency scanner manually and then use 'trtllm-sbom generate' as described in scripts/attribution/sbom/README.md.",
+                    file=sys.stderr)
+
+        # Copy auto-generated ATTRIBUTIONS.md to project root for wheel packaging
+        if auto_attr.exists():
+            install_file(auto_attr, project_dir / "ATTRIBUTIONS.md")
+            print(
+                f"Copied auto-generated attributions to {project_dir / 'ATTRIBUTIONS.md'}"
+            )
+
         build_run(
             f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {extra_wheel_build_args} --no-isolation --wheel --outdir "{dist_dir}"'
         )
@@ -966,7 +1195,7 @@ def main(*,
             env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"',
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
             env=env)
 
     if install:
@@ -1008,10 +1237,21 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--configure_cmake",
                         action="store_true",
                         help="Always configure cmake before building")
+    parser.add_argument(
+        "--configure-only",
+        action="store_true",
+        help="Run cmake configure and exit, skipping build and wheel packaging")
     parser.add_argument("--use_ccache",
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver for faster rebuilds")
+    parser.add_argument(
+        "--use-3rdparty-cache",
+        default=False,
+        action="store_true",
+        help="Accelerate FetchContent git clones via bare reference "
+        "repos under $TRTLLM_FETCHCONTENT_CACHE "
+        "(default: <project>/3rdparty/.cache_3rdparty).")
     parser.add_argument(
         "--fast_build",
         "-f",
@@ -1023,10 +1263,10 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument(
         "--job_count",
         "-j",
-        const=cpu_count(),
+        const=get_available_cpu_count(),
         nargs="?",
         help=
-        "Number of parallel jobs for compilation (default: number of CPU cores)"
+        "Number of parallel jobs for compilation (default: number of CPUs available to this process, respecting affinity)"
     )
     parser.add_argument(
         "--cpp_only",
@@ -1045,10 +1285,6 @@ def add_arguments(parser: ArgumentParser):
         help="Additional make targets to build. Example: \"target_1 target_2\"",
         nargs="+",
         default=[])
-    parser.add_argument(
-        "--trt_root",
-        default="/usr/local/tensorrt",
-        help="Directory containing TensorRT headers and libraries")
     parser.add_argument("--nccl_root",
                         help="Directory containing NCCL headers and libraries")
     parser.add_argument("--nixl_root",
@@ -1085,9 +1321,6 @@ def add_arguments(parser: ArgumentParser):
         help=
         "Install the built binary by creating symbolic links instead of copying files"
     )
-    parser.add_argument("--benchmarks",
-                        action="store_true",
-                        help="Build the benchmarks for the C++ runtime")
     parser.add_argument("--micro_benchmarks",
                         action="store_true",
                         help="Build the micro benchmarks for C++ components")
@@ -1113,6 +1346,37 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--mypyc",
                         action="store_true",
                         help="Compile kv_cache_manager_v2 with mypyc")
+    parser.add_argument("--require_dynamic_attributions",
+                        action="store_true",
+                        help="Fail the build if attribution generation fails")
+
+    def _plat_name_type(value):
+        import re
+        if not re.fullmatch(r'[a-zA-Z0-9_]+', value):
+            raise ArgumentTypeError(
+                f"Invalid plat name '{value}': only alphanumerics and underscores are allowed"
+            )
+        return value
+
+    parser.add_argument(
+        "--plat-name",
+        type=_plat_name_type,
+        help=
+        "Wheel platform tag passed to bdist_wheel --plat-name (e.g. linux_x86_64, manylinux_2_28_x86_64)"
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help=
+        "Skip interactive confirmation prompts (useful for non-interactive builds)",
+    )
+    parser.add_argument(
+        "--version-override",
+        help="Package version override. A leading '.' or '+' appends to the "
+        "current version; any other value replaces it.",
+    )
 
 
 if __name__ == "__main__":

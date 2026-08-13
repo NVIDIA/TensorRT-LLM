@@ -23,12 +23,11 @@ set(SRCS
     cache_transmission/agent_utils/connection.cpp
     cache_transmission/transferAgent.cpp
     cache_transmission/cacheSplitConcat.cu
+    cache_transmission/rnnCacheSplitConcat.cu
     contextPhaseParams.cpp
     debugConfig.cpp
     decodingConfig.cpp
-    executor.cpp
     executorConfig.cpp
-    executorImpl.cpp
     executorKVCacheEventManager.cpp
     extendedRuntimePerfKnobConfig.cpp
     guidedDecodingConfig.cpp
@@ -51,7 +50,6 @@ set(SRCS
     response.cpp
     samplingConfig.cpp
     dynamicBatchConfig.cpp
-    dynamicBatchTuner.cpp
     schedulerConfig.cpp
     serialization.cpp
     speculativeDecodingConfig.cpp
@@ -59,7 +57,6 @@ set(SRCS
     types.cpp
     requestUtils.cpp
     contextPhaseParams.cpp
-    disaggServerUtil.cpp
     cacheTransceiverConfig.cpp)
 
 if(NOT WIN32)

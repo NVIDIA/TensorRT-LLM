@@ -1,9 +1,10 @@
 import contextlib
 import functools
+import inspect
 import itertools
 import os
-import unittest.mock
 import weakref
+from dataclasses import replace
 from enum import IntEnum
 from typing import Optional
 
@@ -16,15 +17,15 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import GroupedGemmInputs
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_qwen3_hybrid_layer_masks,
     is_mla,
     is_nemotron_hybrid,
-    is_qwen3_next,
+    is_qwen3_hybrid,
     load_pretrained_config,
 )
 from tensorrt_llm._torch.pyexecutor.model_loader import (
@@ -235,8 +236,8 @@ def make_balanced_routing_method(
     dp_rank,
     ep_size,
 ):
-    def balanced_routing_method(router_logits):
-        token_selected_experts, token_final_scales = apply_method_orig(router_logits)
+    def balanced_routing_method(router_logits, input_ids=None):
+        token_selected_experts, token_final_scales = apply_method_orig(router_logits, input_ids)
         assert moe_module._routing_results_replaced_at in [None, "make_balanced_routing_method"]
         if balance_method == BalanceMethod.Balanced:
             token_selected_experts = get_balanced_selection(
@@ -297,19 +298,11 @@ def make_balanced_run_moe(
     dp_rank,
     ep_size,
 ):
-    def balanced_run_moe(
-        x, token_selected_experts, token_final_scales, x_sf, router_logits, do_finalize, moe_output
-    ):
+    def balanced_run_moe(ctx, *, workspace=None):
         if moe_module._routing_results_replaced_at is not None:
-            return run_moe_orig(
-                x,
-                token_selected_experts,
-                token_final_scales,
-                x_sf,
-                router_logits,
-                do_finalize,
-                moe_output,
-            )
+            return run_moe_orig(ctx, workspace=workspace)
+        x = ctx.x
+        do_finalize = ctx.do_finalize
         logger.warning_once(
             'Layer-wise benchmarks: Specifying routing results of "TRTLLM" MoE backend in TEP cases leads to different'
             " execution path around the topk kernel",
@@ -355,15 +348,14 @@ def make_balanced_run_moe(
         token_final_scales = get_token_final_scales(
             token_selected_experts.shape, token_selected_experts.device
         )
-        router_logits = None
         final_hidden_states = run_moe_orig(
-            x,
-            token_selected_experts,
-            token_final_scales,
-            x_sf,
-            router_logits,
-            do_finalize,
-            moe_output,
+            replace(
+                ctx,
+                token_selected_experts=token_selected_experts,
+                token_final_scales=token_final_scales,
+                router_logits=None,
+            ),
+            workspace=workspace,
         )
         if not do_finalize:
             final_hidden_states = (
@@ -443,9 +435,9 @@ class Runner:
 
         def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):
             # TODO: to be more general, we should call DecoderModel.forward
-            residual_fusion = hasattr(model.model.layers[layer_indices[0]], "next_layer_layernorm")
             for layer_idx in layer_indices:
                 layer = model.model.layers[layer_idx]
+                residual_fusion = "residual" in inspect.signature(layer.forward).parameters
                 if residual_fusion:
                     hidden_states, residual = layer(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
@@ -507,37 +499,9 @@ class Runner:
 
             return select_alltoall_method_type
 
-        def make_select_alltoall_method_type_2(select_alltoall_method_type_orig):
-            def select_alltoall_method_type(self):
-                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
-                # by replacing `top_k` with `fake_top_k`
-                top_k = self.routing_method.experts_per_token
-                if scaled_from <= top_k:
-                    fake_top_k = mapping.moe_ep_size + 1
-                else:
-                    fake_top_k = mapping.moe_ep_size - 1
-                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
-                with unittest.mock.patch.object(
-                    self.routing_method.__class__,
-                    "experts_per_token",
-                    new_callable=unittest.mock.PropertyMock,
-                ) as mock_top_k:
-                    mock_top_k.return_value = fake_top_k
-                    return select_alltoall_method_type_orig(self)
-
-            return select_alltoall_method_type
-
-        select_alltoall_method_type_cutlass = CutlassFusedMoE.select_alltoall_method_type
-        select_alltoall_method_type_trtllm_gen = TRTLLMGenFusedMoE.select_alltoall_method_type
         select_alltoall_method_type_wide_ep = WideEPMoE.select_alltoall_method_type
         tensorrt_llm._torch.model_config.load_pretrained_config = make_load_pretrained_config(
             mapping, load_pretrained_config
-        )
-        CutlassFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
-            select_alltoall_method_type_cutlass
-        )
-        TRTLLMGenFusedMoE.select_alltoall_method_type = make_select_alltoall_method_type_2(
-            select_alltoall_method_type_trtllm_gen
         )
         WideEPMoE.select_alltoall_method_type = make_select_alltoall_method_type(
             select_alltoall_method_type_wide_ep
@@ -546,8 +510,6 @@ class Runner:
             yield
         finally:
             tensorrt_llm._torch.model_config.load_pretrained_config = load_pretrained_config
-            CutlassFusedMoE.select_alltoall_method_type = select_alltoall_method_type_cutlass
-            TRTLLMGenFusedMoE.select_alltoall_method_type = select_alltoall_method_type_trtllm_gen
             WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod
@@ -603,10 +565,22 @@ class Runner:
     ):
         world_size = mpi_world_size()
         pretrained_config = self.model_config.pretrained_config
-        AttentionCls = get_attention_backend(
-            self.model_config.attn_backend, self.model_config.sparse_attention_config
+        sparse_attention_config = self.model_config.sparse_attention_config
+        sparse_params = (
+            sparse_attention_config.to_sparse_params(pretrained_config=pretrained_config)
+            if sparse_attention_config is not None
+            else None
         )
-        attn_metadata = AttentionCls.Metadata(
+        AttentionCls = get_attention_backend(
+            self.model_config.attn_backend, sparse_params=sparse_params
+        )
+        metadata_cls = AttentionCls.Metadata
+        sparse_metadata_params = (
+            sparse_attention_config.to_sparse_metadata_params(pretrained_config=pretrained_config)
+            if sparse_attention_config is not None
+            else None
+        )
+        attn_metadata = metadata_cls(
             seq_lens=torch.tensor([seq_len_q] * batch_size, dtype=torch.int),
             request_ids=list(range(request_id_begin, request_id_begin + batch_size)),
             max_num_requests=kv_cache_manager.max_batch_size,
@@ -629,9 +603,29 @@ class Runner:
             ),
             workspace=attn_workspace,
             mapping=self.model_config.mapping,
-            sparse_attention_config=self.model_config.sparse_attention_config,
+            sparse_metadata_params=sparse_metadata_params,
         )
         attn_metadata.all_rank_num_tokens = [batch_size * seq_len_q] * world_size
+        # seq_len_q > 1 means MTP: each request submits 1 + num_draft tokens. In
+        # serving the executor announces that via update_spec_dec_param(), the only
+        # place max_draft_tokens is set. Without it the DSA indexer's context_lens
+        # buffer stays one column wide and DeepGEMM aborts on the next_n mismatch.
+        # Shapes only -- spec-dec masking stays off.
+        #
+        # Gate on kv_lens_cuda_2d, not on the method: update_spec_dec_param() is on
+        # the base metadata class, so hasattr() would let every backend in, and the
+        # base sets max_total_draft_tokens unconditionally -- which reaches the
+        # attention op cache key and FMHA kernel selection. kv_lens_cuda_2d exists
+        # only on DSA metadata, which is the backend that needs this.
+        if run_type == "GEN" and seq_len_q > 1 and hasattr(attn_metadata, "kv_lens_cuda_2d"):
+            attn_metadata.update_spec_dec_param(
+                batch_size=batch_size,
+                is_spec_decoding_enabled=False,
+                is_spec_dec_tree=False,
+                is_spec_dec_dynamic_tree=False,
+                max_draft_len=seq_len_q - 1,
+                max_total_draft_tokens=seq_len_q - 1,
+            )
         attn_metadata.prepare()
         hidden_size = pretrained_config.hidden_size
         position_ids = torch.tensor(
@@ -647,12 +641,26 @@ class Runner:
         )
         kwargs = {}
 
-        if is_nemotron_hybrid(pretrained_config) or is_qwen3_next(pretrained_config):
-            # Please refer to `tensorrt_llm/_torch/models/modeling_qwen3_next.py` for the magic number chunk_size=128
+        # DeepSeek-V4 (multi-head hyper-connection) decoder layers take the initial residual
+        # as ``hc_state`` shaped ``[num_tokens, hc_mult, hidden_size]`` (not a 2D hidden-states
+        # tensor), and their MoE routing requires ``input_ids``. Both are absent from the
+        # generic single-layer harness, so synthesize them when the model exposes ``hc_mult``.
+        hc_mult = getattr(pretrained_config, "hc_mult", None)
+        if hc_mult is not None:
+            hidden_states = hidden_states.unsqueeze(1).expand(-1, hc_mult, -1).contiguous()
+            kwargs["input_ids"] = torch.randint(
+                0,
+                pretrained_config.vocab_size,
+                (batch_size * seq_len_q,),
+                dtype=torch.int32,
+                device="cuda",
+            )
+
+        if is_nemotron_hybrid(pretrained_config) or is_qwen3_hybrid(pretrained_config):
             mamba_metadata = Mamba2Metadata(
                 attn_metadata.max_num_requests,
                 chunk_size=128
-                if is_qwen3_next(pretrained_config)
+                if is_qwen3_hybrid(pretrained_config)
                 else pretrained_config.chunk_size,
             )
             mamba_metadata.prepare(attn_metadata)
@@ -665,7 +673,7 @@ class Runner:
                     hidden_states_out, residual_out = self.model(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
                     )
-            if check:
+            if check and isinstance(hidden_states_out, torch.Tensor):
                 if hidden_states_out.isnan().any():
                     raise ValueError("Has nan, please fix weights initialization")
                 if hidden_states_out.isinf().any():
@@ -686,7 +694,6 @@ class Runner:
             "CUTLASS",
             "DEEPGEMM",
             "TRTLLM",
-            "WIDEEP",
         ]:
             raise NotImplementedError(
                 f'Not support replace routing method for moe_backend "{self.model_config.moe_backend}",'
@@ -775,12 +782,12 @@ class Runner:
             assert tokens_per_block == 64
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
-        kv_cache_manager_cls = get_kv_cache_manager_cls(model_config)
         config = model_config.pretrained_config
         kv_cache_config = KvCacheConfig(
             max_tokens=max_batch_size * round_up(max_seq_len, tokens_per_block),
             enable_block_reuse=False,
         )
+        kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
             "FP8": tensorrt_llm.bindings.DataType.FP8,
             "NVFP4": tensorrt_llm.bindings.DataType.NVFP4,
@@ -803,7 +810,9 @@ class Runner:
                 dtype=kv_cache_dtype,
                 spec_config=None,
                 layer_mask=layer_mask,
-                sparse_attn_config=model_config.sparse_attention_config,
+                vocab_size=config.vocab_size,
+                sparse_attention_config=model_config.sparse_attention_config,
+                pretrained_config=model_config.pretrained_config,
             )
         elif is_nemotron_hybrid(config):
             mamba_layer_mask = [
@@ -841,17 +850,13 @@ class Runner:
                 dtype=kv_cache_dtype,
                 spec_config=None,
             )
-        elif is_qwen3_next(config):
-            mamba_layer_mask = [
-                i in layer_indices
-                if i % config.full_attention_interval != config.full_attention_interval - 1
-                else False
-                for i in range(config.num_hidden_layers)
-            ]
+        elif is_qwen3_hybrid(config):
+            full_layer_mask, full_mamba_layer_mask = get_qwen3_hybrid_layer_masks(config)
             layer_mask = [
-                False
-                if i % config.full_attention_interval != config.full_attention_interval - 1
-                else i in layer_indices
+                full_layer_mask[i] and i in layer_indices for i in range(config.num_hidden_layers)
+            ]
+            mamba_layer_mask = [
+                full_mamba_layer_mask[i] and i in layer_indices
                 for i in range(config.num_hidden_layers)
             ]
             num_mamba_layers = sum(mamba_layer_mask)

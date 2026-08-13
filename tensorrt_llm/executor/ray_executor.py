@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -8,9 +9,15 @@ except ModuleNotFoundError as e:
     e.msg = """Cannot import Ray. Please install 'ray' package to use ray orchestrator"""
     raise
 
-from ray.util.placement_group import (PlacementGroupSchedulingStrategy,
-                                      get_current_placement_group,
+from ray.util.placement_group import (get_current_placement_group,
                                       placement_group)
+
+try:
+    # Ray >= 2.55.0
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+except ImportError:
+    # Older Ray re-exported it from ray.util.placement_group
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
 
 from tensorrt_llm._ray_utils import unwrap_ray_errors
 from tensorrt_llm._utils import nvtx_range_debug
@@ -111,6 +118,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         llm_args = worker_kwargs.get("llm_args")
         placement_config = getattr(llm_args, 'ray_placement_config',
                                    None) if llm_args else None
+        ray_worker_nsight_options = getattr(
+            llm_args, 'ray_worker_nsight_options', None) if llm_args else None
 
         # When set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
@@ -121,11 +130,23 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         logger.debug(f"{num_gpus=} for each worker.")
 
         runtime_env = ray.runtime_env.RuntimeEnv()
-        runtime_env["env_vars"] = os.environ.copy()
+        # Exclude node-local env vars. e.g., The raylet that spawns each worker sets
+        # RAY_RAYLET_PID to its own PID at exec time.
+        _NODE_LOCAL_VARS = {
+            "RAY_RAYLET_PID",
+            "RAY_NODE_IP_ADDRESS",
+        }
+
+        runtime_env["env_vars"] = {
+            k: v
+            for k, v in os.environ.items() if k not in _NODE_LOCAL_VARS
+        }
         runtime_env["env_vars"].update({
             "TLLM_DISABLE_MPI": "1",
             "MASTER_ADDR": self.master_address,  # head-IP for NCCL/Gloo
         })
+        if ray_worker_nsight_options:
+            runtime_env["nsight"] = ray_worker_nsight_options
 
         placement_groups, self.bundle_indices = self._get_placement_group(
             tp_size=self.tp_size, worker_kwargs=worker_kwargs)
@@ -192,14 +213,19 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             ])
 
     @unwrap_ray_errors()
-    def collective_rpc(self,
-                       method: str,
-                       args: tuple = (),
-                       kwargs: Optional[dict] = None,
-                       non_block: bool = False,
-                       unique_reply_rank: Optional[int] = None) -> list[Any]:
-        workers = (self.workers[unique_reply_rank],
-                   ) if unique_reply_rank is not None else self.workers
+    def collective_rpc(
+            self,
+            method: str,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+            non_block: bool = False,
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: int | list[int] | None = None) -> list[Any]:
+        if target_ranks is None:
+            target_ranks = unique_reply_rank
+        workers = (self.workers if target_ranks is None else
+                   [self.workers[rank] for rank in target_ranks] if isinstance(
+                       target_ranks, list) else [self.workers[target_ranks]])
         kwargs = kwargs or {}
 
         refs = []
@@ -220,12 +246,14 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             method: str,
             args: tuple = (),
             kwargs: Optional[dict] = None,
-            unique_reply_rank: Optional[int] = None) -> list[Any]:
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: int | list[int] | None = None) -> list[Any]:
         refs = self.collective_rpc(method,
                                    args,
                                    kwargs,
                                    non_block=True,
-                                   unique_reply_rank=unique_reply_rank)
+                                   unique_reply_rank=unique_reply_rank,
+                                   target_ranks=target_ranks)
         return await asyncio.gather(*refs)
 
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
@@ -288,6 +316,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
                                   async_call=False,
                                   request_id=request_id)
 
+    def abort_all_requests(self) -> None:
+        """Abort all active generation requests."""
+        for result in list(self._results.values()):
+            result.abort()
+
     def shutdown(self):
         if hasattr(self, '_shutdown_event') and self._shutdown_event.is_set():
             return
@@ -323,6 +356,17 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             except Exception as e:
                 logger.warning(f"Error shutting down: {e}")
 
+            # The engines are already stopped by the shutdown RPC above, so
+            # kill the actor processes explicitly instead of relying on
+            # handle garbage collection. ray.kill() only *initiates* an
+            # asynchronous kill; _wait_for_cluster_resource_release() below
+            # blocks until Ray has reclaimed the workers' resources.
+            for worker in self.workers:
+                try:
+                    ray.kill(worker, no_restart=True)
+                except Exception as e:
+                    logger.warning(f"Error killing worker: {e}")
+
         if hasattr(self, 'rpc_client') and self.rpc_client is not None:
             try:
                 self.rpc_client.close()
@@ -339,9 +383,52 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             self.placement_group = None
         self.bundle_indices = None
 
+        # ray.kill() and remove_placement_group() above are asynchronous.
+        # Block until Ray has reclaimed the workers' resources so their GPU
+        # cleanup has completed before shutdown() returns.
+        self._wait_for_cluster_resource_release(timeout=30.0)
+
         if self.has_start_local_cluser and ray.is_initialized():
             logger.debug("Shutting down Ray cluster")
             ray.shutdown()
+
+    def _wait_for_cluster_resource_release(self, timeout: float = 30.0) -> None:
+        """Block until Ray returns the workers' resources to the cluster.
+
+        ray.kill() and remove_placement_group() only initiate an
+        asynchronous teardown; Ray reclaims an actor's logical resources
+        after the raylet has reaped the worker process, by which point the
+        CUDA driver has already destroyed its context (GPU memory and IPC
+        mappings). Waiting here therefore guarantees that a subsequent LLM
+        instance will not race against the dying workers, which can
+        otherwise fail spuriously (e.g. cudaErrorMapBufferObjectFailed when
+        opening CUDA IPC handles). Full availability can only be expected on
+        a cluster dedicated to this executor, so the wait is skipped when
+        attached to an external cluster. Best-effort: logs a warning on
+        timeout instead of raising, since shutdown must not fail.
+        """
+        if not self.has_start_local_cluser or not ray.is_initialized():
+            return
+        deadline = time.monotonic() + timeout
+        busy = {}
+        while time.monotonic() < deadline:
+            try:
+                cluster = ray.cluster_resources()
+                available = ray.available_resources()
+            except Exception as e:
+                logger.debug(f"Could not query Ray resources: {e}")
+                return
+            busy = {
+                key: cluster[key] - available.get(key, 0.0)
+                for key in ("GPU", "CPU") if key in cluster and cluster[key] -
+                available.get(key, 0.0) > 1e-6
+            }
+            if not busy:
+                return
+            time.sleep(0.1)
+        logger.warning(
+            f"Timed out after {timeout}s waiting for Ray to reclaim cluster "
+            f"resources; still in use: {busy}.")
 
     def _get_worker_ready_futures(self):
         return [worker.__ray_ready__.remote() for worker in self.workers]

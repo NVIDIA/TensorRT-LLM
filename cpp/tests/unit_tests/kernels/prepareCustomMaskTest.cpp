@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaKernels.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunnerParams.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/prepareCustomMask.h"
@@ -36,7 +37,6 @@ namespace
 
 using tensorrt_llm::kernels::FmhaKernelType;
 using tensorrt_llm::kernels::runPrepareCustomMask;
-using tensorrt_llm::kernels::TllmGenFmhaKernelMetaInfo;
 using tensorrt_llm::kernels::TllmGenFmhaRunnerParams;
 using tensorrt_llm::runtime::BufferManager;
 using tensorrt_llm::runtime::CudaStream;
@@ -294,21 +294,13 @@ protected:
         int64_t totalMaskSize = static_cast<int64_t>(batchSize) * maxNumTilesQ * maxNumCustomMaskTilesKv * numInstsQ
             * numInstsKv * (tileSizeQ * tileSizeKvPadded) / 32;
 
-        auto customMaskOffsetsDevice = mBufferManager->gpu(batchSize, nvinfer1::DataType::kINT64);
-        auto customMaskDevice = mBufferManager->gpu(totalMaskSize, nvinfer1::DataType::kINT32);
+        auto customMaskOffsetsDevice = mBufferManager->gpu(batchSize, tensorrt_llm::DataType::kINT64);
+        auto customMaskDevice = mBufferManager->gpu(totalMaskSize, tensorrt_llm::DataType::kINT32);
 
         // Clear GPU buffers to ensure no stale data from previous tests
         cudaMemsetAsync(bufferCast<int64_t>(*customMaskOffsetsDevice), 0, batchSize * sizeof(int64_t), mStream->get());
         cudaMemsetAsync(bufferCast<int32_t>(*customMaskDevice), 0, totalMaskSize * sizeof(int32_t), mStream->get());
         cudaStreamSynchronize(mStream->get());
-
-        // Setup kernel parameters
-        TllmGenFmhaKernelMetaInfo kernelMeta{};
-        kernelMeta.mTileSizeQ = tileSizeQ;
-        kernelMeta.mTileSizeKv = tileSizeKv;
-        kernelMeta.mStepQ = tileSizeQ * numInstsQ;
-        kernelMeta.mStepKv = tileSizeKv * numInstsKv;
-        kernelMeta.mKernelType = static_cast<int>(FmhaKernelType::KeepsMmaAbForGeneration);
 
         TllmGenFmhaRunnerParams runnerParams;
         runnerParams.mBatchSize = batchSize;
@@ -317,13 +309,16 @@ protected:
         runnerParams.mMaxSeqLenKv = *std::max_element(seqLensKv.begin(), seqLensKv.end());
         runnerParams.seqLensKvPtr = bufferCast<int32_t>(*seqLensKvDevice);
         runnerParams.cumSeqLensQPtr = bufferCast<int32_t>(*cumSeqLensQDevice);
-        runnerParams.seqlensQPtr = bufferCast<int32_t>(*specDecodingGenerationLengthsDevice);
+        runnerParams.seqLensQPtr = bufferCast<int32_t>(*specDecodingGenerationLengthsDevice);
         runnerParams.firstSparseMaskOffsetsKvPtr = bufferCast<int32_t>(*firstSparseMaskOffsetsKvDevice);
         runnerParams.generalPackedCustoMaskPtr = bufferCast<int32_t>(*inputPackedMaskDevice);
         runnerParams.customMaskOffsetsPtr = bufferCast<int64_t>(*customMaskOffsetsDevice);
         runnerParams.customMaskPtr = reinterpret_cast<uint32_t*>(bufferCast<int32_t>(*customMaskDevice));
 
-        runPrepareCustomMask(kernelMeta, runnerParams, mStream->get());
+        int32_t const stepQ = tileSizeQ * numInstsQ;
+        int32_t const stepKv = tileSizeKv * numInstsKv;
+        runPrepareCustomMask(runnerParams, FmhaKernelType::KeepsMmaAbForGeneration, stepQ, stepKv, tileSizeQ,
+            tileSizeKv, mStream->get());
         cudaError_t cudaErr = cudaStreamSynchronize(mStream->get());
         if (cudaErr != cudaSuccess)
         {
@@ -378,6 +373,14 @@ TEST_F(PrepareCustomMaskTest, MediumBatch)
         /* maxSeqLenQ */ 32,
         /* maxSeqLenKv */ 256,
         /* numHeadsQPerKv */ 8);
+}
+
+TEST_F(PrepareCustomMaskTest, LargeBatchParallelOffsetScan)
+{
+    testPrepareCustomMask(/* batchSize */ 128,
+        /* maxSeqLenQ */ 16,
+        /* maxSeqLenKv */ 128,
+        /* numHeadsQPerKv */ 4);
 }
 
 } // namespace

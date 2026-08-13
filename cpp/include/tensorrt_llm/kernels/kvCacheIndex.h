@@ -36,10 +36,15 @@ public:
     static constexpr UnderlyingType kSecondaryPoolFlag = static_cast<UnderlyingType>(1)
         << (8 * sizeof(UnderlyingType) - 1);
 
+    // The illegal value (INT32_MAX) ensures accidental use triggers an obvious OOB failure.
+    static constexpr UnderlyingType kInvalidPoolIndex = std::numeric_limits<UnderlyingType>::max();
+
+    static const KVCacheIndex nullIndex;
+
     explicit KVCacheIndex(UnderlyingType value, bool isSecondary = false)
         : value{isSecondary ? value | kSecondaryPoolFlag : value}
     {
-        TLLM_CHECK_DEBUG(value >= 0);
+        TLLM_CHECK_DEBUG(value >= 0 && this->value != kInvalidPoolIndex);
     }
 
     __host__ __device__ [[nodiscard]] UnderlyingType get() const
@@ -52,9 +57,21 @@ public:
         return (value & kSecondaryPoolFlag) == 0;
     }
 
+    [[nodiscard]] constexpr bool isNull() const
+    {
+        return value == kInvalidPoolIndex;
+    }
+
 private:
     UnderlyingType value;
+
+    constexpr KVCacheIndex()
+        : value{kInvalidPoolIndex}
+    {
+    }
 };
+
+constexpr KVCacheIndex KVCacheIndex::nullIndex{};
 
 } // namespace kernels
 

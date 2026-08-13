@@ -19,7 +19,7 @@ export EXPERT_STATISTIC_PATH=./expert_statistic
 export EXPERT_STATISTIC_ITER_RANGE=100-200
 ```
 
-Prepare a dataset following the [benchmarking documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/perf-benchmarking.md#preparing-a-dataset) and save it as `./dataset.json`.
+Prepare a dataset following the [benchmarking documentation](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/developer-guide/perf-benchmarking.md#preparing-a-dataset) and save it as `./dataset.json`.
 
 Run 32-way expert parallelism inference on the prepared dataset. Please refer to the [LLM API MGMN example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/llm_mgmn_trtllm_bench.sh) for details on running `trtllm-bench` on Slurm.
 
@@ -27,9 +27,8 @@ Run 32-way expert parallelism inference on the prepared dataset. Please refer to
 cat > ./config.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
-moe_backend: WideEP
 moe_config:
-    backend: WideEP
+    backend: CUTEDSL
     max_num_tokens: 8192
 EOF
 
@@ -119,7 +118,7 @@ cat > ./config_eplb.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
 moe_config:
-    backend: WideEP
+    backend: CUTEDSL
     max_num_tokens: 9216
     load_balancer: ./moe_load_balancer.yaml
 EOF
@@ -185,7 +184,7 @@ cat > ./config_eplb.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
 moe_config:
-    backend: WideEP
+    backend: CUTEDSL
     max_num_tokens: 9216
     load_balancer: ./moe_load_balancer.yaml
 EOF

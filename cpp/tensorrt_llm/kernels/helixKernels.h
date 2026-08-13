@@ -43,8 +43,17 @@ struct HelixPostProcParams
 template <typename T>
 void helixPostProcess(HelixPostProcParams<T> const& params, cudaStream_t stream);
 
+// Version 1: cp_dim=2 layout.
+// gathered_o: [num_tokens, num_heads, cp_size, kv_lora_rank].
+// gathered_stats: [num_tokens, num_heads, cp_size, 2].
 template <typename T>
-void helixPostProcessNative(HelixPostProcParams<T> const& params, cudaStream_t stream);
+void helixPostProcessNativeV1(HelixPostProcParams<T> const& params, cudaStream_t stream);
+
+// Version 2: cp_dim=1 layout.
+// gathered_o: [num_tokens, cp_size, num_heads, kv_lora_rank].
+// gathered_stats: [num_tokens, cp_size, num_heads, 2].
+template <typename T>
+void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t stream);
 
 } // namespace kernels
 

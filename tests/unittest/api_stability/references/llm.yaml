@@ -9,13 +9,13 @@ methods:
       moe_cluster_parallel_size:
         annotation: Optional[int]
         default: null
-        status: beta
+        status: deprecated
       enable_attention_dp:
         annotation: bool
         default: False
         status: beta
       cp_config:
-        annotation: Optional[dict]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CpConfig]
         default: null
         status: prototype
       pp_partition:
@@ -34,6 +34,10 @@ methods:
       return_perf_metrics:
         annotation: bool
         default: False
+        status: prototype
+      perf_metrics_output_dir:
+        annotation: Optional[str]
+        default: null
         status: prototype
       # Bindings and mirrored configs
       peft_cache_config:
@@ -60,7 +64,15 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      num_serve_frontends:
+        annotation: int
+        default: 1
+        status: prototype
       custom_tokenizer:
+        annotation: Optional[str]
+        default: null
+        status: prototype
+      post_processor_hook:
         annotation: Optional[str]
         default: null
         status: prototype
@@ -70,9 +82,9 @@ methods:
         default: null
         status: prototype
       # Runtime behavior
-      fail_fast_on_attention_window_too_large:
-        annotation: bool
-        default: false
+      generation_config:
+        annotation: Literal['auto', 'trtllm']
+        default: trtllm
         status: prototype
       garbage_collection_gen0_threshold:
         annotation: int
@@ -80,21 +92,33 @@ methods:
         status: beta
       # Misc
       backend:
-        annotation: Optional[str]
-        default: null
-        status: deprecated
-      build_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
-        default: null
+        annotation: Literal["pytorch"]
+        default: pytorch
         status: deprecated
       cuda_graph_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
+      encoder_cuda_graph_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig]
+        default: null
+        status: prototype
+      enable_encoder_decoder_mixed_cuda_graph:
+        annotation: bool
+        default: True
+        status: prototype
+      multimodal_config:
+        annotation: tensorrt_llm.llmapi.llm_args.MultimodalConfig
+        default: null
+        status: prototype
       attention_dp_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.AttentionDpConfig]
         default: null
         status: beta
+      dwdp_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DwdpConfig]
+        default: null
+        status: prototype
       checkpoint_loader:
         annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
@@ -103,18 +127,38 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mx_config:
+        annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
+        default: null
+        status: prototype
+      gms_config:
+        annotation: tensorrt_llm.llmapi.llm_args.GmsConfig
+        default: null
+        status: prototype
       mm_encoder_only:
         annotation: bool
         default: False
+        status: prototype
+      disable_mm_encoder:
+        annotation: bool
+        default: False
+        status: prototype
+      encode_only:
+        annotation: bool
+        default: False
+        status: prototype
+      encoder_max_batch_size:
+        annotation: Optional[int]
+        default: null
+        status: prototype
+      encoder_max_num_tokens:
+        annotation: Optional[int]
+        default: null
         status: prototype
       disable_overlap_scheduler:
         annotation: bool
         default: False
         status: beta
-      disable_flashinfer_sampling:
-        annotation: bool
-        default: False
-        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
@@ -130,8 +174,20 @@ methods:
       sampler_type:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
-        status: beta
+        status: deprecated
       sampler_force_async_worker:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_speculative_beam_history_d2h:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_early_first_token_response:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_low_latency_host_dispatch:
         annotation: bool
         default: False
         status: prototype
@@ -162,6 +218,14 @@ methods:
       perf_metrics_max_requests:
         annotation: int
         default: 0
+        status: deprecated
+      prometheus_metrics_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PrometheusMetricsConfig]
+        default: null
+        status: prototype
+      enable_energy_metrics:
+        annotation: bool
+        default: False
         status: prototype
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
@@ -204,7 +268,11 @@ methods:
         default: null
         status: prototype
       sparse_attention_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.SparseAttentionConfig]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
+        default: null
+        status: prototype
+      kv_cache_compression_config:
+        annotation: Union[tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig, NoneType]
         default: null
         status: prototype
       otlp_traces_endpoint:
@@ -219,12 +287,28 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.RayPlacementConfig]
         default: null
         status: prototype
-      enable_sleep:
+      ray_worker_nsight_options:
+        annotation: Optional[dict[str, str]]
+        default: null
+        status: prototype
+      sleep_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SleepConfig]
+        default: null
+        status: prototype
+      reorder_policy_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.ReorderRequestPolicyConfig]
+        default: null
+        status: prototype
+      enable_resource_governor:
         annotation: bool
         default: False
         status: prototype
       env_overrides:
         annotation: Optional[Dict[str, str]]
+        default: null
+        status: prototype
+      telemetry_config:
+        annotation: tensorrt_llm.usage.config.TelemetryConfig
         default: null
         status: prototype
       max_stats_len:
@@ -247,6 +331,14 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      use_cute_dsl_bf16_bmm:
+        annotation: bool
+        default: False
+        status: prototype
+      use_cute_dsl_bf16_gemm:
+        annotation: bool
+        default: False
+        status: prototype
     return_annotation: None
   generate:
     parameters:
@@ -259,9 +351,16 @@ methods:
       scheduling_params:
         annotation: Union[tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], NoneType]
         default: null
+      conversation_params:
+        annotation: Union[tensorrt_llm.conversation_params.ConversationParams, List[tensorrt_llm.conversation_params.ConversationParams], NoneType]
+        default: null
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
         default: null
+      priority:
+        annotation: Union[float, List[float]]
+        default: 0.5
+        status: prototype
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -275,6 +374,9 @@ methods:
         annotation: Optional[tensorrt_llm.scheduling_params.SchedulingParams]
         default: null
         status: prototype
+      conversation_params:
+        annotation: Optional[tensorrt_llm.conversation_params.ConversationParams]
+        default: null
       cache_salt:
         annotation: Optional[str]
         default: null
@@ -282,13 +384,57 @@ methods:
         annotation: Optional[Mapping[str, str]]
         default: null
         status: prototype
+      priority:
+        annotation: float
+        default: 0.5
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
+  encode:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
+          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]]]
+        default: inspect._empty
+      add_special_tokens:
+        annotation: bool
+        default: True
+      return_raw_logits:
+        annotation: bool
+        default: False
+      model_kwargs:
+        annotation: Any
+        default: inspect._empty
+      batch_indexed_model_output:
+        annotation: bool
+        default: True
+      copy_logits_to_host:
+        annotation: bool
+        default: True
+    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]
+    status: prototype
+  preprocess:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]
+        default: inspect._empty
+      sampling_params:
+        annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
+        default: null
+      disaggregated_params:
+        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
+        default: null
+    return_annotation: tensorrt_llm.llmapi.llm.PreprocessedInputs
+    status: prototype
   get_kv_cache_events:
     parameters:
       timeout:
         annotation: Optional[float]
         default: 2
     return_annotation: List[dict]
+    status: beta
+  get_kv_cache_capacity:
+    parameters: {}
+    return_annotation: dict
     status: beta
   get_kv_cache_events_async:
     parameters:
@@ -311,6 +457,10 @@ methods:
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
     status: beta
+  get_data_transceiver_state:
+    parameters: {}
+    return_annotation: bytes
+    status: prototype
   shutdown:
     parameters: {}
     return_annotation: None

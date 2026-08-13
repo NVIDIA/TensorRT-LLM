@@ -17,7 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <limits>
@@ -80,6 +80,7 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6,
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
+    RMS_NORM = 9,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -97,6 +98,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
     case AllReduceFusionOp::MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM:
         os << "MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM";
         break;
+    case AllReduceFusionOp::RMS_NORM: os << "RMS_NORM"; break;
     default: os << "UNKNOWN"; break;
     }
     return os;
@@ -176,23 +178,23 @@ struct AllReduceParams
 
     AllReduceFusionParams fusion_params;
 
-    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, nvinfer1::DataType dataType,
+    static AllReduceParams deserialize(int64_t* buffer, size_t tpSize, size_t tpRank, tensorrt_llm::DataType dataType,
         int token_num, int hidden_size, AllReduceFusionOp op);
 };
 
-bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, nvinfer1::DataType type);
+bool configurationSupported(AllReduceStrategyType algo, size_t msg_size, size_t n_ranks, tensorrt_llm::DataType type);
 
-void customAllReduce(kernels::AllReduceParams& params, nvinfer1::DataType dataType, AllReduceStrategyType strat,
+void customAllReduce(kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, AllReduceStrategyType strat,
     AllReduceStrategyConfig config, AllReduceFusionOp fusionOp, cudaStream_t stream);
 
 void residualRmsNorm(
-    kernels::AllReduceParams& params, nvinfer1::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
+    kernels::AllReduceParams& params, tensorrt_llm::DataType dataType, cudaStream_t stream, AllReduceFusionOp fusionOp);
 
-void lamportInitialize(void* buffer, size_t size, nvinfer1::DataType dataType, cudaStream_t stream);
+void lamportInitialize(void* buffer, size_t size, tensorrt_llm::DataType dataType, cudaStream_t stream);
 
 namespace reduce_fusion
 {
-bool is_lamport_supported(nvinfer1::DataType dataType, int token_num, int hidden_size);
+bool is_lamport_supported(tensorrt_llm::DataType dataType, int token_num, int hidden_size);
 }
 
 } // namespace kernels

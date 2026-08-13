@@ -186,6 +186,10 @@ class Communication(ABC):
         """
         raise NotImplementedError
 
+    def destroy(self):
+        """Synchronously release resources. Must be called on ALL ranks
+        before the object is discarded."""
+
     def get_eplb_gathered_statistics(self) -> Optional[torch.Tensor]:
         """
         Return gathered EPLB statistics from the last dispatch, if available.

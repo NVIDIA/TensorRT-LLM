@@ -1,12 +1,13 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 # Note: The code is to extract image embedding from RADIO model, to support Nano v2 VLM.
 # TODO: Check and add more compatible logic for the full-series RADIO model.
 
 import copy
+import dataclasses
 import math
 from collections import namedtuple
-from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
-                    Type, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Literal, Mapping,
+                    NamedTuple, Optional, Sequence, Tuple, Type, Union)
 
 import torch
 import torch.nn as nn
@@ -20,11 +21,31 @@ from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
+    _ENCODER_FALLBACK_MAX_NUM_REQUESTS, MultimodalEncoderMixin)
+from tensorrt_llm._torch.models.multimodal_encoder_graph import (
+    EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
+    MultimodalEncoderGraphRunner)
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
+
 InputDimT = Union[int, Tuple[int, int]]
+
+
+def calc_seq_len(size: Tuple[int, int], patch_size: int) -> int:
+    """Calculate the number of patches for a given image size."""
+    h, w = size
+    return (h // patch_size) * (w // patch_size)
+
+
+def calc_seq_lens(sizes: List[Tuple[int, int]], patch_size: int) -> List[int]:
+    """Calculate per-image patch counts."""
+    return [calc_seq_len(size, patch_size) for size in sizes]
 
 
 class VITTIMMConfig(NamedTuple):
@@ -102,6 +123,8 @@ class ViTPatchGenerator(nn.Module):
         register_multiple: Optional[int] = None,
         num_registers: Optional[int] = None,
         patch_bias: bool = False,
+        temporal_patch_size: int = 1,
+        separate_video_embedder: bool = True,
     ):
         super().__init__()
 
@@ -121,6 +144,7 @@ class ViTPatchGenerator(nn.Module):
         self.patch_size = patch_size
         self.abs_pos = abs_pos
         self.embed_dim = embed_dim
+        self.temporal_patch_size = temporal_patch_size
         self.num_rows = max_input_dims[0] // patch_size
         self.num_cols = max_input_dims[1] // patch_size
         self.input_dims = tuple(d // patch_size for d in input_dims)
@@ -129,6 +153,20 @@ class ViTPatchGenerator(nn.Module):
 
         self.im_to_patches = Im2Patches(patch_size)
         self.embedder = ViTPatchLinear(patch_size, embed_dim, bias=patch_bias)
+
+        if temporal_patch_size > 1:
+            if not separate_video_embedder:
+                raise NotImplementedError(
+                    "Only separate_video_embedder=True is supported for "
+                    "temporal compression (temporal_patch_size > 1).")
+            self.video_embedder = ViTPatchLinear(
+                patch_size,
+                embed_dim,
+                bias=patch_bias,
+                temporal_patch_size=temporal_patch_size,
+            )
+        self._video_embedder_loaded = False
+
         self.pos_embed = None
         if abs_pos:
             scale = embed_dim**-0.5
@@ -144,12 +182,126 @@ class ViTPatchGenerator(nn.Module):
         self.patch_normalizer = nn.LayerNorm(
             embed_dim) if normalize_patches else nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        patches = self.embed_patches(x)
-        patches, pos_enc = self.apply_pos_enc(patches, input_size=x.shape[2:])
+    def forward(self,
+                x: torch.Tensor,
+                image_sizes: Optional[List[Tuple[int, int]]] = None,
+                num_frames: Optional[int] = None) -> torch.Tensor:
+        if num_frames is not None and self.temporal_patch_size > 1:
+            return self.forward_video(x)
+        return self.forward_image(x, image_sizes=image_sizes)
+
+    def forward_image(
+            self,
+            x: torch.Tensor,
+            image_sizes: Optional[List[Tuple[int,
+                                             int]]] = None) -> torch.Tensor:
+        if image_sizes is not None:
+            # Dynamic resolution: x is pre-rearranged patches [1, total_patches, C*P*P]
+            patches = self.embedder(x)
+            patches, _ = self.apply_pos_enc_dynamic(patches, image_sizes)
+            patches = self.cls_token_dynamic(patches, image_sizes)
+        else:
+            patches = self.embed_patches(x)
+            patches, pos_enc = self.apply_pos_enc(patches,
+                                                  input_size=x.shape[2:])
+            patches = self.cls_token(patches)
+        patches = self.patch_normalizer(patches)
+        return patches
+
+    def forward_video(self, x: torch.Tensor) -> torch.Tensor:
+        """Process video frames with temporal compression.
+
+        Groups T consecutive frames into tubelets before embedding.
+
+        Args:
+            x: [num_frames, 3, H, W] tensor of video frames.
+
+        Returns:
+            Embedded patches with temporal compression applied,
+            shape [num_tubelets, seq_per_tubelet, embed_dim].
+        """
+        if not self._video_embedder_loaded:
+            raise ValueError(
+                "Temporal compression (video_temporal_patch_size > 1) requires "
+                "video_embedder weights, but they were never loaded. "
+                "Ensure the checkpoint was trained with temporal compression.")
+        T = self.temporal_patch_size
+        input_size = x.shape[2:]
+
+        patches = self.im_to_patches(x)  # [N, num_patches, 3*P*P]
+        num_frames, num_spatial, feat_dim = patches.shape
+
+        # Pad to a multiple of T by repeating the last frame.
+        num_pad_frames = (-num_frames) % T
+        if num_pad_frames > 0:
+            last_frame_dup = patches[-1:].expand(num_pad_frames, -1, -1)
+            patches = torch.cat([patches, last_frame_dup], dim=0)
+
+        # Group T frames per tubelet: concatenate features across T consecutive
+        # frames for each spatial position (matches Megatron training order).
+        num_frames_padded = patches.shape[0]
+        num_tubelets = num_frames_padded // T
+        patches = rearrange(
+            patches,
+            '(tubelets frames) spatial feat -> tubelets spatial (frames feat)',
+            tubelets=num_tubelets,
+            frames=T,
+            spatial=num_spatial,
+            feat=feat_dim,
+        )
+
+        patches = self.video_embedder(patches)
+        patches, _ = self.apply_pos_enc(patches, input_size=input_size)
         patches = self.cls_token(patches)
         patches = self.patch_normalizer(patches)
         return patches
+
+    def apply_pos_enc_dynamic(
+        self, patches: torch.Tensor, image_sizes: List[Tuple[int, int]]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Add per-image position encodings for variable-size images."""
+        if not self.abs_pos:
+            return patches, None
+
+        current_length = 0
+        pos_enc_list = []
+
+        for size in image_sizes:
+            seq_length = calc_seq_len(size, self.patch_size)
+            img_patches = patches[:,
+                                  current_length:current_length + seq_length, :]
+            pos_enc = self.get_pos_enc(input_size=size)
+            img_patches_with_pos = img_patches + pos_enc
+
+            patches = torch.cat([
+                patches[:, :current_length, :],
+                img_patches_with_pos,
+                patches[:, current_length + seq_length:, :],
+            ],
+                                dim=1)
+            pos_enc_list.append(pos_enc)
+            current_length += seq_length
+
+        full_pos_enc = torch.cat(pos_enc_list, dim=1) if pos_enc_list else None
+        return patches, full_pos_enc
+
+    def cls_token_dynamic(self, patches: torch.Tensor,
+                          image_sizes: List[Tuple[int, int]]) -> torch.Tensor:
+        """Insert CLS + register tokens before each image's patches."""
+        if not self.cls_token.enabled:
+            return patches
+
+        out = []
+        current_length = 0
+
+        for seq_len in calc_seq_lens(image_sizes, self.patch_size):
+            class_token = self.cls_token.token.unsqueeze(0).expand(
+                patches.shape[0], -1, -1)
+            out.append(class_token)
+            out.append(patches[:, current_length:current_length + seq_len, :])
+            current_length += seq_len
+
+        return torch.cat(out, dim=1)
 
     @property
     def num_cls_tokens(self):
@@ -218,7 +370,7 @@ class ViTPatchGenerator(nn.Module):
             max_dim = max(input_dims)
             pos_embed = F.interpolate(pos_embed.float(),
                                       size=(max_dim, max_dim),
-                                      align_corners=True,
+                                      align_corners=False,
                                       mode='bilinear').to(pos_embed.dtype)
             pos_embed = window_select(pos_embed)
         else:
@@ -227,7 +379,7 @@ class ViTPatchGenerator(nn.Module):
         if pos_embed.shape[-2:] != input_dims:
             pos_embed = F.interpolate(pos_embed.float(),
                                       size=input_dims,
-                                      align_corners=True,
+                                      align_corners=False,
                                       mode='bilinear').to(pos_embed.dtype)
 
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)
@@ -268,9 +420,13 @@ class ViTPatchLinear(nn.Linear):
         patch_size: int,
         embed_dim: int,
         bias: bool = False,
+        temporal_patch_size: int = 1,
     ):
-        super().__init__(3 * (patch_size**2), embed_dim, bias=bias)
+        super().__init__(3 * temporal_patch_size * (patch_size**2),
+                         embed_dim,
+                         bias=bias)
         self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
 
 
 class Block(nn.Module):
@@ -402,7 +558,7 @@ class Block(nn.Module):
         return x
 
 
-class VisionTransformer(nn.Module):
+class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     """ Vision Transformer.
 
     Modified from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.
@@ -559,6 +715,12 @@ class VisionTransformer(nn.Module):
         register_multiple = getattr(special_args, 'register_multiple', None)
         num_registers = getattr(special_args, 'cpe_num_registers', None)
 
+        # Temporal compression config (for video).
+        self.temporal_patch_size = getattr(self.config,
+                                           'video_temporal_patch_size', 1)
+        separate_video_embedder = getattr(self.config,
+                                          'separate_video_embedder', True)
+
         self.patch_generator = ViTPatchGenerator(
             patch_size=patch_size,
             embed_dim=embed_dim,
@@ -570,6 +732,8 @@ class VisionTransformer(nn.Module):
             num_cls_tokens=num_cls_tokens,
             register_multiple=register_multiple,
             num_registers=num_registers,
+            temporal_patch_size=self.temporal_patch_size,
+            separate_video_embedder=separate_video_embedder,
         )
         self.patch_embed = None
         self.cls_token = None
@@ -579,49 +743,246 @@ class VisionTransformer(nn.Module):
         self.num_cls_tokens = num_cls_tokens
         self.num_registers = self.patch_generator.num_registers
 
+        # Compute the max possible per-image sequence length (patches + CLS/registers).
+        # This is used as a fixed max_seq_len for attention metadata so the C++ attention
+        # op cache key stays stable across forward passes with different image resolutions.
+        # Without this, each unique max_seq_len creates a new AttentionOp (with its own
+        # GPU semaphore allocation), causing a memory leak over many inference steps.
+        max_patches_per_image = (max_img_size // patch_size)**2
+        self._fixed_max_seq_len = max_patches_per_image + self.patch_generator.num_skip
+
         self.metadata_cls = attention_utils.get_attention_backend(
             model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=model_config.max_num_tokens,
+        self._attn_backend = model_config.attn_backend
+
+        # Establish default encoder AttentionMetadata at construction (legacy
+        # 8192 requests, `model_config.max_num_tokens`) so the CUDA-graph runner
+        # / metadata provider can read `self.attn_metadata` before the engine
+        # re-sizes it via `setup_attn_metadata`.
+        self.setup_attn_metadata(max_num_requests=8192,
+                                 max_num_tokens=model_config.max_num_tokens)
+
+        # CUDA-graph runner for the block stack. None means graphs are off and
+        # the eager path is always taken; the caller opts in via
+        # `enable_blocks_cuda_graph`. Initialized here (not in
+        # `setup_attn_metadata`) so it is always present regardless of call
+        # order.
+        self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
+
+    def setup_attn_metadata(self, max_num_requests: int,
+                            max_num_tokens: int) -> None:
+        # Override the default to add `kv_layout="NHD"` for FlashInfer.
+        # FlashInfer's original default is "NHD"; TRT-LLM switched the default
+        # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
+        # (kv_cache_manager=None) computes k/v directly from input, which is
+        # always in NHD format ([tokens, heads, dim]).
+        # Floor the request capacity at the same legacy fallback as the mixin
+        # default: one attention segment per image, which can exceed the
+        # LLM-side `max_batch_size` that `encoder_max_batch_size` falls back to.
+        max_num_requests = max(max_num_requests,
+                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        metadata_kwargs = dict(
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
+        if self._attn_backend == "FLASHINFER":
+            metadata_kwargs["kv_layout"] = "NHD"
+        self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
-    def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int],
-                              attn_metadata: AttentionMetadata):
+    def enable_blocks_cuda_graph(
+        self,
+        config: "MultimodalEncoderCudaGraphConfig",
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Build the block-stack runner from `config` and capture startup graphs.
+
+        The caller must ensure the model parameters already live on `device`
+        (or on a CUDA device discoverable from `self.parameters()`); captures
+        are recorded immediately.
+        """
+        if self._blocks_graph_runner is not None:
+            return
+
+        graph_runner = self._build_blocks_graph_runner(config)
+        if device is None:
+            device = next(self.parameters()).device
+        graph_runner.capture_all(device)
+        self._blocks_graph_runner = graph_runner
+
+    def prepare_attn_metadata(
+            self, batch_size: int, seq_lengths: List[int],
+            attn_metadata: AttentionMetadata) -> AttentionMetadata:
         """
         To simplify the usage of the model, this function aims to fill the metadata for Attention
         Call this function before forward pass
         """
         prompt_lens = seq_lengths
-        seq_lens = torch.tensor(seq_lengths, dtype=torch.int, pin_memory=True)
+        seq_lens = torch.tensor(seq_lengths,
+                                dtype=torch.int32,
+                                pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.seq_lens = seq_lens
         attn_metadata.num_contexts = batch_size
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lens
-        attn_metadata.max_seq_len = seq_lens.max().item()
+        # Use fixed max_seq_len to keep the C++ attention op cache key stable.
+        # The actual per-sequence lengths are passed separately and used for computation.
+        attn_metadata.max_seq_len = self._fixed_max_seq_len
 
         attn_metadata.prepare()
         return attn_metadata
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
-        x = self.patch_generator(x)
+    def forward_features(self,
+                         x: torch.Tensor,
+                         image_sizes: Optional[List[Tuple[int, int]]] = None,
+                         num_frames: Optional[int] = None) -> torch.Tensor:
+        """Forward through embeddings, transformer blocks, and post-transformer norm.
 
-        batch_size, seq_len, hidden_size = x.shape
-        seq_lengths = [seq_len] * batch_size
+        Args:
+            x: Input pixel values.
+            image_sizes: Per-image pixel sizes for dynamic resolution.
+            num_frames: Number of video frames. When provided with
+                temporal_patch_size > 1, enables temporal compression.
+        """
+        T = self.temporal_patch_size
+        packed_batch_size = None  # set when we pack tubelets
+
+        x = self.patch_generator(x,
+                                 image_sizes=image_sizes,
+                                 num_frames=num_frames)
+
+        if num_frames is not None and T > 1:
+            packed_batch_size, seq_per_tubelet, hidden_size = x.shape
+            # Pack all tubelets into one sequence for attention.
+            x = x.reshape(1, -1, hidden_size)
+            seq_lengths = [seq_per_tubelet] * packed_batch_size
+            batch_size = packed_batch_size
+        elif image_sizes is not None:
+            # Dynamic resolution: each image is a separate "context".
+            num_skip = self.patch_generator.num_skip
+            seq_lengths = [
+                calc_seq_len(size, self.patch_size) + num_skip
+                for size in image_sizes
+            ]
+            batch_size = len(image_sizes)
+        else:
+            batch_size, seq_len, _ = x.shape
+            seq_lengths = [seq_len] * batch_size
+
         attn_metadata = self.prepare_attn_metadata(batch_size, seq_lengths,
                                                    self.attn_metadata)
+
+        hidden_size = x.shape[-1]
         # Need flatten batch/seq_len for trtllm attention.
-        x = x.reshape(batch_size * seq_len, hidden_size)
-        for block in self.blocks:
-            x = block(x, attn_metadata=attn_metadata)
-        x = x.reshape(batch_size, seq_len, hidden_size)
+        x = x.reshape(-1, hidden_size)
+        x = self._run_blocks(x, attn_metadata)
+
+        # Reshape back from flattened.
+        if packed_batch_size is not None:
+            x = x.reshape(packed_batch_size, seq_per_tubelet, hidden_size)
+        elif image_sizes is not None:
+            x = x.reshape(1, -1, hidden_size)
+        else:
+            x = x.reshape(batch_size, seq_lengths[0], hidden_size)
 
         x = self.norm(x)
         return x
+
+    def _build_blocks_graph_runner(
+        self, config: "MultimodalEncoderCudaGraphConfig"
+    ) -> MultimodalEncoderGraphRunner:
+        input_specs = {
+            "x":
+            EncoderGraphTensorSpec(shape=(self.embed_dim, ),
+                                   dtype=self.model_config.torch_dtype,
+                                   token_dim=0),
+        }
+        output_specs = {"x": 0}
+        return MultimodalEncoderGraphRunner(
+            encoder_fn=self._encoder_graph_fn,
+            metadata_provider=_VisionEncoderMetadataProvider(self),
+            input_specs=input_specs,
+            output_specs=output_specs,
+            config=config,
+        )
+
+    # This is what gets passed to the `MultimodalEncoderGraphRunner`.
+    def _encoder_graph_fn(
+        self,
+        inputs: Mapping[str, torch.Tensor],
+        md: AttentionMetadata,
+    ) -> Dict[str, torch.Tensor]:
+        return {"x": self._run_blocks_eager(inputs["x"], md)}
+
+    def _run_blocks(self, x: torch.Tensor,
+                    attn_metadata: AttentionMetadata) -> torch.Tensor:
+        if self._blocks_graph_runner is not None:
+            seq_lengths = attn_metadata.seq_lens.tolist()
+            output = self._blocks_graph_runner.maybe_run(
+                seq_lengths=seq_lengths,
+                inputs={"x": x},
+            )
+            if output is not None:
+                return output["x"]
+        return self._run_blocks_eager(x, attn_metadata)
+
+    def _run_blocks_eager(self, x: torch.Tensor,
+                          attn_metadata: AttentionMetadata) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x, attn_metadata=attn_metadata)
+        return x
+
+
+class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
+    """Bridges the multimodal encoder graph runner to the model's eager metadata path.
+
+    `build` returns a fresh `AttentionMetadata` with `is_cuda_graph=True`; that flag flips
+    `AttentionMetadata.seq_lens`'s setter into the in-place `copy_` branch (see
+    `attention_backend/interface.py`), which is what makes subsequent `refresh_in_place` calls safe
+    to run against captured CUDA graphs.
+
+    The runner double-checks via its `data_ptr` stability assertion against `graph_critical_attrs`.
+    """
+
+    # `_seq_lens_cuda` is the on-device buffer the captured attention kernels read sequence lengths
+    # from; the `seq_lens` setter copies into it in place when `is_cuda_graph=True`.
+    # FlashInfer also owns a persistent workspace buffer that backs its captured ragged-prefill run.
+    graph_critical_attrs: Sequence[str]
+
+    def __init__(self, vit: VisionTransformer) -> None:
+        self._vit = vit
+        self.graph_critical_attrs = ("_seq_lens_cuda", )
+        if vit.model_config.attn_backend == "FLASHINFER":
+            self.graph_critical_attrs += (
+                "workspace_buffer",
+                "_ragged_qo_indptr_buf",
+                "_ragged_kv_indptr_buf",
+            )
+
+    def build(self, key: EncoderGraphKey) -> AttentionMetadata:
+        vit = self._vit
+        metadata_kwargs = dict(
+            max_num_requests=max(vit.attn_metadata.max_num_requests,
+                                 key.num_contexts),
+            max_num_tokens=max(vit.attn_metadata.max_num_tokens,
+                               key.total_tokens),
+            kv_cache_manager=None,
+        )
+        if vit.model_config.attn_backend == "FLASHINFER":
+            metadata_kwargs["kv_layout"] = "NHD"
+        md = vit.metadata_cls(**metadata_kwargs)
+        md.is_cuda_graph = True
+        return md
+
+    def refresh_in_place(self, metadata: AttentionMetadata,
+                         padded_seq_lengths: Sequence[int]) -> None:
+        # Reuse the eager path so both modes go through the same setter logic; the captured graph
+        # holds the metadata's tensor addresses.
+        self._vit.prepare_attn_metadata(len(padded_seq_lengths),
+                                        list(padded_seq_lengths), metadata)
 
 
 class RADIOVisionModelBase(nn.Module):
@@ -724,28 +1085,55 @@ class RADIOVisionModelBase(nn.Module):
 
     def forward(self,
                 x: torch.Tensor,
-                feature_fmt: str = 'NLC') -> torch.Tensor:
-        res_step = self.min_resolution_step
-        if res_step is not None and (x.shape[-2] % res_step != 0
-                                     or x.shape[-1] % res_step != 0):
-            raise ValueError(
-                'The input resolution must be a multiple of `self.min_resolution_step`. '
-                '`self.get_nearest_supported_resolution(<height>, <width>) is provided as a convenience API. '
-                f'Input: {x.shape[-2:]}, Nearest: {self.get_nearest_supported_resolution(*x.shape[-2:])}'
-            )
-        x = self.input_conditioner(x)
-        y = self.model.forward_features(x)
-        ret = self._extract_final(x, y, feature_fmt=feature_fmt)
+                feature_fmt: str = 'NLC',
+                image_sizes: Optional[List[Tuple[int, int]]] = None,
+                num_frames: Optional[int] = None) -> torch.Tensor:
+        if image_sizes is None:
+            res_step = self.min_resolution_step
+            if res_step is not None and (x.shape[-2] % res_step != 0
+                                         or x.shape[-1] % res_step != 0):
+                raise ValueError(
+                    'The input resolution must be a multiple of `self.min_resolution_step`. '
+                    '`self.get_nearest_supported_resolution(<height>, <width>) is provided as a convenience API. '
+                    f'Input: {x.shape[-2:]}, Nearest: {self.get_nearest_supported_resolution(*x.shape[-2:])}'
+                )
+            x = self.input_conditioner(x)
+        y = self.model.forward_features(x,
+                                        image_sizes=image_sizes,
+                                        num_frames=num_frames)
+        ret = self._extract_final(x,
+                                  y,
+                                  feature_fmt=feature_fmt,
+                                  image_sizes=image_sizes)
         return ret
 
     def _extract_final(self,
                        x: torch.Tensor,
                        y: torch.Tensor,
-                       feature_fmt: str = 'NLC'):
+                       feature_fmt: str = 'NLC',
+                       image_sizes: Optional[List[Tuple[int, int]]] = None):
+        # TODO: remove dead `feature_fmt` code.
+        if image_sizes is not None and feature_fmt == 'NCHW':
+            raise ValueError(
+                f"{feature_fmt=} is not supported when `image_sizes` is provided."
+            )
         if isinstance(self.model, VisionTransformer):
             patch_gen = getattr(self.model, "patch_generator", None)
             if patch_gen is not None:
-                all_feat = y[:, patch_gen.num_skip:]
+                if image_sizes is not None:
+                    # Dynamic resolution: strip CLS/register per image
+                    num_skip = patch_gen.num_skip
+                    patch_size = patch_gen.patch_size
+                    all_patches = []
+                    current_pos = 0
+                    for num_patches in calc_seq_lens(image_sizes, patch_size):
+                        patches = y[:, current_pos + num_skip:current_pos +
+                                    num_skip + num_patches, :]
+                        all_patches.append(patches)
+                        current_pos += num_skip + num_patches
+                    all_feat = torch.cat(all_patches, dim=1)
+                else:
+                    all_feat = y[:, patch_gen.num_skip:]
             elif self.model.global_pool == "avg":
                 all_feat = y
             else:
@@ -772,25 +1160,42 @@ class RADIOVisionModelBase(nn.Module):
 class RADIOVisionModel(PreTrainedModel):
     """Modify from https://huggingface.co/nvidia/C-RADIOv2-H/blob/main/hf_model.py."""
 
+    # transformers>=5.5 strict-validates _attn_implementation in PreTrainedModel.__init__.
+    # RADIO uses TRT-LLM's own vision attention backend (FLASHINFER by default),
+    # not HF's flash_attention_2 path — declare both so super().__init__() accepts whatever
+    # backend HF auto-selects.
+    _supports_flash_attn = True
+    _supports_sdpa = True
+
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
-                 disable_quantization: bool = True):
+                 disable_quantization: bool = True,
+                 vision_attn_backend: Optional[str] = "FLASHINFER",
+                 encoder_cuda_graph_config: Optional[
+                     "MultimodalEncoderCudaGraphConfig"] = None):
         """
         Args:
             model_config: Model configuration.
             disable_quantization: Disable quantization for RADIO model.
                 Since the radio model is for vision only, we can disable quantization for it by default.
+            vision_attn_backend: Attention backend to use for the vision tower. Defaults to "FLASHINFER".
+            encoder_cuda_graph_config: Optional CUDA graph capture configuration for the vision tower.
         """
         config = model_config.pretrained_config
         super().__init__(config)
+        self._encoder_cuda_graph_config = encoder_cuda_graph_config
 
         self.model_config = copy.deepcopy(model_config)
         if self.model_config.quant_config is not None:
             if disable_quantization:
-                # The basic method `apply_quant_config_exclude_modules` in DecoderModelForCausalLM keeps the kv_cache_quant_algo so we also keep it here.
-                self.model_config.quant_config = QuantConfig(
-                    kv_cache_quant_algo=self.model_config.quant_config.
-                    kv_cache_quant_algo)
+                # Vision encoder runs with kv_cache_manager=None, so there is no KV cache to
+                # quantize. Keeping kv_cache_quant_algo would make FlashInfer raise:
+                # "FP8 KV cache is not supported without a KV cache manager" for FP8 LLM checkpoints
+                # that specify FP8 KV Cache.
+                self.model_config.quant_config = QuantConfig()
+
+        self.model_config = dataclasses.replace(
+            self.model_config, attn_backend=vision_attn_backend)
 
         self.config = config
 
@@ -884,8 +1289,23 @@ class RADIOVisionModel(PreTrainedModel):
             if not m.startswith('model.blocks.'):
                 raise ValueError(f"Missing key: {m}")
         for u in unexpected_keys:
-            if not u.startswith('model.blocks.'):
+            # model.blocks weights are loaded separately below via
+            # _load_weights_impl (to handle qkv splitting).
+            # video_embedder is only unexpected when temporal_patch_size==1
+            # (model doesn't have the submodule).
+            if not u.startswith((
+                    'model.blocks.',
+                    'model.patch_generator.video_embedder',
+            )):
                 raise ValueError(f"Unexpected key: {u}")
+
+        # Mark video_embedder as loaded only when the submodule exists and its weights were actually
+        # present in the checkpoint (i.e. not reported as unexpected).
+        patch_gen = self.radio_model.model.patch_generator
+        if (getattr(patch_gen, 'video_embedder', None) is not None
+                and 'model.patch_generator.video_embedder.weight'
+                not in unexpected_keys):
+            patch_gen._video_embedder_loaded = True
 
         # Load weights for vision transformer module.
         model_weights = {
@@ -915,5 +1335,21 @@ class RADIOVisionModel(PreTrainedModel):
                                           converted_weights,
                                           params_map=pattern_mapping)
 
-    def forward(self, x: torch.Tensor):
-        return self.radio_model.forward(x)
+    def enable_blocks_cuda_graph(
+        self,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Forward the configuration to the inner VisionTransformer."""
+        if self._encoder_cuda_graph_config is None:
+            return
+        self.radio_model.model.enable_blocks_cuda_graph(
+            self._encoder_cuda_graph_config, device=device)
+
+    def forward(self,
+                x: torch.Tensor,
+                image_sizes: Optional[List[Tuple[int, int]]] = None,
+                num_frames: Optional[int] = None):
+        return self.radio_model.forward(x,
+                                        image_sizes=image_sizes,
+                                        num_frames=num_frames)

@@ -37,7 +37,7 @@ Weight checkpoints can be generated from all sources, and may have different nam
 }
 ```
 
-Conversion means converting the dictionary of `{external_keys:external_weights}` into `{tllm_keys:tllm_weights}`, it includes changing the naming logic and data layouts, and is contains of the following parts:
+Conversion means converting the dictionary of `{external_keys:external_weights}` into `{tllm_keys:tllm_weights}`, it includes changing the naming logic and data layouts, and consists of the following parts:
 
 1. Translate a TRT-LLM parameter name into external-format name(s).
 2. Loading tensor slice(s) according to the translated names.
@@ -248,9 +248,9 @@ for tllm_key, param in tqdm(trtllm_model.named_parameters()):
 ```
 In this mode, every precision require user's own support.
 
-## Trouble shooting
+## Troubleshooting
 The weights loader is enabled for LLaMA family models and Qwen models by default with TensorRT flow only.
 
-If users are encountered with failure caused by `ModelWeightsLoader`, a workaround is passing environmental variable `TRTLLM_DISABLE_UNIFIED_CONVERTER=1` to disable the model weights loader and fallback to the legacy path.
+If users encounter failure caused by `ModelWeightsLoader`, a workaround is passing environmental variable `TRTLLM_DISABLE_UNIFIED_CONVERTER=1` to disable the model weights loader and fallback to the legacy path.
 
 This workaround will be removed in future version after the LLaMA/Qwen weights conversion is stable.

@@ -345,6 +345,7 @@ def run(
     use_cold_l2: bool = False,
     permuted_m: int = None,
     use_cupti: bool = False,
+    raster_along_m: bool = False,
     **kwargs,
 ):
     """Prepare A/B/C tensors, launch GPU kernel, and reference checking."""
@@ -366,6 +367,7 @@ def run(
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use CUPTI: {'True' if use_cupti else 'False'}")
+    print(f"Raster along M: {raster_along_m}")
 
     # Unpack parameters
     n, k, l = nkl  # noqa: E741
@@ -437,6 +439,7 @@ def run(
         sf_vec_size,
         mma_tiler_mn,
         cluster_shape_mn,
+        raster_along_m=raster_along_m,
     )
 
     # Compute max active clusters on current device
@@ -788,6 +791,12 @@ if __name__ == "__main__":
         default=False,
         help="Use CUPTI to measure execution time",
     )
+    parser.add_argument(
+        "--raster_along_m",
+        action="store_true",
+        default=False,
+        help="Raster along M dimension for tile scheduler",
+    )
     args = parser.parse_args()
 
     # Process arguments to generate nkl and group_m_list
@@ -825,6 +834,7 @@ if __name__ == "__main__":
         args.use_cold_l2,
         args.permuted_m,
         args.use_cupti,
+        args.raster_along_m,
     )
     print("exec_time: ", exec_time)
     print("PASS")

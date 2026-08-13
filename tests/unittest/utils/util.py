@@ -18,16 +18,15 @@ import math
 import os
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Callable, ContextManager, Generator, Protocol
 
 import psutil
 import pynvml
 import pytest
-import tensorrt as trt
 import torch
 
 try:
@@ -38,14 +37,9 @@ except ImportError:
 
 from parameterized import parameterized
 
-import tensorrt_llm
 from tensorrt_llm._torch.hostfunc import hostfunc
-from tensorrt_llm._utils import (mpi_disabled, torch_dtype_to_trt,
-                                 trt_dtype_to_torch)
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
-from tensorrt_llm.plugin.plugin import ContextFMHAType
-from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm.runtime import Session, TensorInfo
 
 
 def ASSERT_DRV(err):
@@ -63,6 +57,8 @@ def ASSERT_DRV(err):
 def getSMVersion():
     # Init
     err, = cuda.cuInit(0)
+    if err == cuda.CUresult.CUDA_ERROR_NO_DEVICE:
+        return -1
     ASSERT_DRV(err)
 
     # Device
@@ -156,25 +152,9 @@ def skip_fp8_pre_ada(use_fp8):
         pytest.skip("FP8 is not supported on pre-Ada architectures")
 
 
-def skip_blackwell_for_fmha_tests(context_fmha_type, head_size):
-    if (isSM100Family()) and (head_size not in [32, 64, 128] and
-                              context_fmha_type != ContextFMHAType.disabled):
-        pytest.skip(
-            "Context FMHA only supports head sizes [32, 64, 128] currently on blackwell."
-        )
-
-
 def skip_fp4_pre_blackwell(use_fp4):
     if use_fp4 and getSMVersion() < 100:
         pytest.skip("FP4 is not supported on pre-Blackwell architectures")
-
-
-def skip_bf16_fp32_accum(dtype, context_fmha_type):
-    if is_bf16(dtype
-               ) and context_fmha_type == ContextFMHAType.enabled_with_fp32_acc:
-        pytest.skip(
-            "bfloat16 Context FMHA will always accumulate on FP32, so it has been tested with ContextFMHAType.enabled"
-        )
 
 
 def skip_num_gpus_less_than(num_gpus: int):
@@ -273,123 +253,6 @@ def unittest_name_func(testcase_func, param_num, param):
         testcase_func.__name__,
         parameterized.to_safe_name(name),
     )
-
-
-def set_input_shape(profile,
-                    inp: tensorrt_llm.Tensor,
-                    shape: tuple,
-                    data: torch.Tensor = None):
-    set_input_shapes(profile, inp, shape, shape, shape, data)
-    return
-
-
-def set_input_shapes(profile,
-                     inp: tensorrt_llm.Tensor,
-                     min_shape: tuple,
-                     opt_shape: tuple,
-                     max_shape: tuple,
-                     data: torch.Tensor = None):
-    if inp.trt_tensor.is_shape_tensor:
-        # For shape tensors, TensorRT expects the full tensor (on CPU), not just shape
-        assert data is not None, f"For shape tensor {inp.name}, TensorRT needs the tensor value."
-        assert str(data.device) == "cpu", f"Shape tensor's data needs to be on CPU " \
-            f"(device found={data.device}) for both updating the profile and for execution."
-        np_data = data.flatten().numpy()
-        profile.set_shape_input(inp.name, np_data, np_data, np_data)
-        return
-    profile.set_shape(inp.name, min_shape, opt_shape, max_shape)
-    return
-
-
-def create_session(builder,
-                   network,
-                   precision="float32",
-                   int8=False,
-                   fp8=False,
-                   memory_pool_limit=None,
-                   optimization_profiles=[],
-                   quant_mode=QuantMode(0)):
-    """
-    This function creates an engine and a tensorrt_llm.runtime.Session for the engine.
-    Args:
-        network: a tensorrt_llm.Network object
-        precision: the precision of the network, choose from ["float32", "float16", "bfloat16"]
-        **kwargs: builder flags such as int8, fp8, etc.
-    Returns:
-        session: a tensorrt_llm.runtime.Session
-    """
-    builder_config = builder.create_builder_config(precision=precision,
-                                                   int8=int8,
-                                                   fp8=fp8,
-                                                   quant_mode=quant_mode)
-    # Some tests require to set mem pool limit to avoid OOM
-    if memory_pool_limit is not None:
-        builder_config.trt_builder_config.set_memory_pool_limit(
-            trt.MemoryPoolType.WORKSPACE, memory_pool_limit)
-    # Some tests include shape tensors, so the optimization profile needs to be feed in explicitly
-    if len(optimization_profiles) > 0:
-        for profile in optimization_profiles:
-            builder_config.trt_builder_config.add_optimization_profile(profile)
-    # Disable TF32 for accuracy in testing.
-    builder_config.trt_builder_config.clear_flag(trt.BuilderFlag.TF32)
-    engine = builder.build_engine(network, builder_config)
-    assert engine is not None, "Failed to build engine"
-    session = Session.from_serialized_engine(engine)
-    return session
-
-
-def run_session(session: Session,
-                inputs,
-                outputs={},
-                override_shapes={},
-                override_types={}):
-    """
-    The current session object needs to pass in both inputs and outputs bindings.
-    For test convenience, create a function that infers output shapes automatically,
-    This function is similar to tensorrt_llm.runtime.Session._debug_run, and Polygraphy runner.infer,
-    where only input shape is required.
-    NOTES:
-        1. The outputs dictionary is required for outputs for which the shapes cannot be inferred.
-           This function will prioritize to use the tensor in this dictionary.
-        2. `override_shapes` can be used to force some input tensors' shape to be different than the passed tensor.
-           Required for zero-volume tensors since torch.Tensor.data_ptr() is nullptr for such tensors.
-        3. `override_types` can be used to force some input tensors' type to be different than the passed tensor.
-           Required for zero-volume tensors since torch.Tensor.data_ptr() is nullptr for such tensors.
-    """
-
-    # Prepare output tensors.
-    output_info = session.infer_shapes([
-        TensorInfo(
-            name,
-            torch_dtype_to_trt(tensor.dtype if name not in
-                               override_types else override_types[name]),
-            tensor.shape
-            if name not in override_shapes else override_shapes[name])
-        for name, tensor in inputs.items()
-    ])
-
-    def create_torch(t):
-        if t.dtype == trt.fp4:
-            shape = list(t.shape)
-            shape[-1] = shape[-1] // 2
-            return torch.empty(tuple(shape), dtype=torch.uint8, device='cuda')
-        else:
-            return torch.empty(tuple(t.shape),
-                               dtype=trt_dtype_to_torch(t.dtype),
-                               device='cuda')
-
-    outputs = {
-        t.name: create_torch(t) if t.name not in outputs else outputs[t.name]
-        for t in output_info
-    }
-
-    # Execute model inference
-    stream = torch.cuda.current_stream()
-    ok = session.run(inputs=inputs, outputs=outputs, stream=stream.cuda_stream)
-    assert ok, 'Engine execution failed'
-    stream.synchronize()
-
-    return outputs
 
 
 @contextlib.contextmanager
@@ -520,6 +383,12 @@ def device_sleep(
         time.sleep(spin_s)
 
 
+class UutProvider(Protocol):
+
+    def __call__(self, is_warmup: bool) -> ContextManager[Callable[[], None]]:
+        ...
+
+
 @contextmanager
 def assert_no_cuda_sync(
     sync_timeout_s: float = 5, ) -> Generator[None, None, None]:
@@ -561,6 +430,47 @@ def assert_no_cuda_sync(
 
     sleep_ctl.cancel()
     scope_finished_event.synchronize()
+
+
+def run_test_with_warmup(
+    uut_provider: UutProvider,
+    warmup_sizes_bytes: tuple[int] = (4 * 2**30, ),
+    *,
+    max_sync_s: float | None,
+):
+    """Run UUT including setup and warmup.
+
+    This is mainly used to check that the UUT does not CUDA device sync. Thus,
+    given that PyTorch's caching memory allocator can device sync when it runs
+    out of cached GPU memory segments, the warmup allocates some GPU memory.
+
+    The warmup also runs the test once. This avoids issues with things like lazy loading
+    of device code. The UUT provider can use the 'is_warmup' argument to adapt its
+    behavior to the warmup and final test runs.
+
+    If max_sync_s is provided, this helper checks that the UUT does not device sync,
+    assuming that the sync (CPU) part of the code takes no longer than max_sync_s
+    seconds to complete.
+
+    It is the user's responsibility to ensure that the amount of submitted work
+    does not exceed the CUDA driver/device queue capacity, which would make
+    the execution appear synchronous.
+    """
+    with torch.cuda.Stream():
+        with uut_provider(is_warmup=True) as uut:
+            bufs = []
+            for warmup_size in warmup_sizes_bytes:
+                bufs.append(
+                    torch.ones(warmup_size,
+                               device=torch.cuda.current_device(),
+                               dtype=torch.int8))
+            del bufs
+            uut()
+
+        with uut_provider(is_warmup=False) as uut:
+            with (assert_no_cuda_sync(sync_timeout_s=max_sync_s)
+                  if max_sync_s is not None else nullcontext()):
+                uut()
 
 
 _pynvmlInited = False

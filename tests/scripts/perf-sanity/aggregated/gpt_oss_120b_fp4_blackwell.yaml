@@ -1,0 +1,103 @@
+metadata:
+  model_name: gpt_oss_120b_fp4
+  supported_gpus:
+  - B200
+hardware:
+  gpus_per_node: 8
+server_configs:
+  # 1k1k configs - TP2 with TRTLLM, MTP0
+  - name: "gpt_oss_fp4_tp2_mtp0_1k1k"
+    model_name: "gpt_oss_120b_fp4"
+    tensor_parallel_size: 2
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    max_batch_size: 512
+    max_num_tokens: 20000
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 512
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+    num_postprocess_workers: 4
+    stream_interval: 20
+    client_configs:
+      - name: "con4_iter10_1k1k"
+        concurrency: 4
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: datasets/perf-ci/gpt_oss_120b-1k1k-20480-ratio-1_for_serve.json
+
+  # 1k1k configs - TP1 with TRTLLM, MTP0
+  - name: "gpt_oss_fp4_tp1_mtp0_1k1k"
+    model_name: "gpt_oss_120b_fp4"
+    tensor_parallel_size: 1
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    max_batch_size: 512
+    max_num_tokens: 20000
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 512
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+    num_postprocess_workers: 4
+    stream_interval: 20
+    client_configs:
+      - name: "con256_iter10_1k1k"
+        concurrency: 256
+        iterations: 10
+        isl: 1024
+        osl: 1024
+        backend: "openai"
+        dataset_file: datasets/perf-ci/gpt_oss_120b-1k1k-20480-ratio-1_for_serve.json
+
+  # 8k1k configs - TP1 with TRTLLM, MTP0
+  - name: "gpt_oss_fp4_tp1_mtp0_8k1k"
+    model_name: "gpt_oss_120b_fp4"
+    tensor_parallel_size: 1
+    moe_expert_parallel_size: 1
+    pipeline_parallel_size: 1
+    max_batch_size: 512
+    max_num_tokens: 20000
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    moe_config:
+      backend: 'TRTLLM'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 512
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+    num_postprocess_workers: 4
+    stream_interval: 20
+    client_configs:
+      - name: "con4_iter10_8k1k"
+        concurrency: 4
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        dataset_file: datasets/perf-ci/gpt_oss_120b-8k1k-20480-ratio-1_for_serve.json
+      - name: "con256_iter10_8k1k"
+        concurrency: 256
+        iterations: 10
+        isl: 8192
+        osl: 1024
+        backend: "openai"
+        dataset_file: datasets/perf-ci/gpt_oss_120b-8k1k-20480-ratio-1_for_serve.json

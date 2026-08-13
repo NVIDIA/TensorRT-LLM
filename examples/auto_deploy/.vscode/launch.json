@@ -14,7 +14,6 @@
                 "--args.attn-page-size=16",
                 "--args.transforms.insert-cached-attention.backend=flashinfer",
                 "--args.model-factory=AutoModelForCausalLM",
-                "--benchmark.enabled=false",
                 "--prompt.batch-size=2",
                 "--args.model-kwargs.num-hidden-layers=3",
                 "--args.model-kwargs.num-attention-heads=32",

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,22 +15,24 @@
 import abc
 import contextlib
 import copy
+import inspect
 import io
 import os
 import re
+import signal
+import socket
 import subprocess
+import threading
+import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
-from _pytest.nodes import Item
-from _pytest.python import Function
-from defs.trt_test_alternative import (check_output, popen, print_error,
-                                       print_info)
-from test_common.http_utils import wait_for_endpoint_ready
+import pytest
+from defs.trt_test_alternative import print_error, print_info
 
-from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
+from ..common import get_trt_llm_lib_dir
 from ..local_venv import PythonVenvRunnerImpl
 from ..test_list_parser import parse_test_list
 from .data_export import (GPU_MONITORING_FORMAT_KEYS, write_csv,
@@ -100,7 +102,7 @@ class PerfMetricType(str, Enum):
     OUTPUT_TOKEN_TIME = "OUTPUT_TOKEN_TIME"
     MEDIAN_OUTPUT_TOKEN_TIME = "MEDIAN_OUTPUT_TOKEN_TIME"
     P99_OUTPUT_TOKEN_TIME = "P99_OUTPUT_TOKEN_TIME"
-    TOKEN_THROUGHPUT = "TOKEN_THROUGHPUT"
+    TOTAL_OUTPUT_THROUGHPUT = "TOTAL_OUTPUT_THROUGHPUT"
     TOTAL_TOKEN_THROUGHPUT = "TOTAL_TOKEN_THROUGHPUT"
     USER_THROUGHPUT = "USER_THROUGHPUT"
     BUILD_TIME = "BUILD_TIME"
@@ -112,8 +114,6 @@ class PerfMetricType(str, Enum):
     SEQ_THROUGHPUT = "SEQ_THROUGHPUT"
     SEQ_LATENCY = "SEQ_LATENCY"
     KV_CACHE_SIZE = "KV_CACHE_SIZE"
-    DISAGG_SERVER_E2EL = "DISAGG_SERVER_E2EL"
-    DISAGG_SERVER_TTFT = "DISAGG_SERVER_TTFT"
     PER_USER_OUTPUT_THROUGHPUT = "PER_USER_OUTPUT_THROUGHPUT"
     PER_GPU_OUTPUT_THROUGHPUT = "PER_GPU_OUTPUT_THROUGHPUT"
 
@@ -133,12 +133,148 @@ def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     return cmd + ["--host", host, "--port", str(port)]
 
 
+def resolve_node_hostname() -> str:
+    """Node(s) that ran a case, recorded per-case (not per-run).
+
+    Parallel splits are submitted as separate SLURM allocations and can land on
+    different nodes within a single run, so a per-run hostname would be
+    ambiguous. We deliberately prefer the SLURM nodelist (a single string that
+    also covers multi-node allocations) over ``socket.gethostname()``: for a
+    single-node allocation it *is* the executing host, and for a multi-node one
+    it records the full allocation rather than one arbitrary rank. Falls back to
+    the local hostname for bare-metal / non-SLURM runs. Precedence:
+    ``SLURM_JOB_NODELIST`` -> ``SLURM_NODELIST`` -> ``socket.gethostname()``.
+    """
+    return (os.environ.get("SLURM_JOB_NODELIST")
+            or os.environ.get("SLURM_NODELIST") or socket.gethostname())
+
+
+#if hang time > 30 mins, it will be killed
+_STALL_TIMEOUT = 1800
+#if hang with error time > 3 mins, it will be killed
+_ERROR_STALL_TIMEOUT = 180
+
+_FATAL_PATTERNS = [
+    'Segmentation fault',
+    'Fatal Python error:',
+    'terminate called',
+    'RuntimeError: [TensorRT-LLM][ERROR]',
+]
+
+
+def _run_command_with_captured_output(cmd: list[str],
+                                      env: dict[str, str] | None = None) -> str:
+    """Run a command, reading stdout line-by-line in a background thread.
+
+    Compared to subprocess.check_output() this has two advantages:
+    1. Output is accumulated incrementally, so even if the process is killed
+       (by our stall detector or by pytest-timeout SIGALRM) the partial
+       output is available and forwarded to Allure.
+    2. A stall detector monitors the output stream.  If a fatal error pattern
+       is seen and the process then produces no output for _ERROR_STALL_TIMEOUT
+       seconds it is killed immediately instead of waiting for the full
+       pytest-timeout (typically 3600 s).  A general _STALL_TIMEOUT applies
+       when no error pattern has been seen.
+    """
+    if env is not None:
+        env = env.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
+
+    proc = subprocess.Popen(cmd,
+                            env=env,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True)
+
+    output_lines: list = []
+    lock = threading.Lock()
+    last_output_time = [time.monotonic()]
+    has_error = [False]
+
+    def _reader():
+        try:
+            while True:
+                raw = proc.stdout.readline()
+                if not raw:
+                    break
+                line = raw.decode('utf-8', errors='replace')
+                with lock:
+                    output_lines.append(line)
+                    last_output_time[0] = time.monotonic()
+                    if not has_error[0]:
+                        for pat in _FATAL_PATTERNS:
+                            if pat in line:
+                                has_error[0] = True
+                                break
+        except (ValueError, OSError):
+            pass
+
+    thread = threading.Thread(target=_reader, daemon=True)
+    thread.start()
+
+    def _cleanup_after_abort():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        thread.join(timeout=10)
+
+    try:
+        while proc.poll() is None:
+            time.sleep(10)
+            now = time.monotonic()
+            with lock:
+                idle = now - last_output_time[0]
+                errored = has_error[0]
+
+            limit = _ERROR_STALL_TIMEOUT if errored else _STALL_TIMEOUT
+            if idle > limit:
+                tag = "errored and stalled" if errored else "stalled"
+                print_info(f"Process {tag} with no output for {idle:.0f}s "
+                           f"(limit={limit}s), killing")
+                os.killpg(proc.pid, signal.SIGKILL)
+                break
+
+        thread.join(timeout=30)
+        proc.wait()
+
+        with lock:
+            output = ''.join(output_lines)
+
+        if proc.returncode != 0:
+            err = subprocess.CalledProcessError(proc.returncode, cmd)
+            err.stdout = output.encode()
+            err.stderr = None
+            raise err
+
+        return output
+
+    except subprocess.CalledProcessError:
+        raise
+
+    except Exception as exc:
+        _cleanup_after_abort()
+        with lock:
+            partial = ''.join(output_lines)
+        if partial:
+            rc = proc.returncode if proc.returncode is not None else -9
+            err = subprocess.CalledProcessError(rc, cmd)
+            err.stdout = partial.encode()
+            err.stderr = None
+            raise err from exc
+        raise
+
+    except BaseException:
+        _cleanup_after_abort()
+        raise
+
+
 class PerfBenchScriptTestCmds(NamedTuple):
     data_cmds: List[List[str]]
     build_cmd: List[str]
     benchmark_cmds: List[List[str]]
     mpi_cmd: List[str]
-    is_python: bool
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
@@ -159,8 +295,9 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 else:
                     cmd = prepare_cmd
                     dataset_file = None
-                output += subprocess.check_output(cmd.split(),
-                                                  env=envs).decode()
+                # Pipe stderr separately so subprocess tracebacks land in e.stderr (forwarded to Allure), not just the inherited console fd.
+                output += subprocess.check_output(
+                    cmd.split(), env=envs, stderr=subprocess.PIPE).decode()
                 if dataset_file:
                     with open(f"{dataset_file}", 'w+') as f:
                         f.write(output)
@@ -169,55 +306,33 @@ class PerfBenchScriptTestCmds(NamedTuple):
             #running build
             if len(self.build_cmd) == 0:
                 pass
-            elif self.build_cmd[0].endswith('.py'):
-                print_info(
-                    f'Running engine building command: "{build_cmd_str}"')
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd,
-                                                    self.build_cmd)
-                else:
-                    output += venv.run_cmd(self.build_cmd, caller=check_output)
             else:
                 envs = copy.deepcopy(os.environ)
                 print_info(
                     f'Running engine building command: "{build_cmd_str}"')
                 command = self.build_cmd
-                output += subprocess.check_output(command, env=envs).decode()
+                output += _run_command_with_captured_output(command, env=envs)
         else:
             #running throughput
             print_info(f'Now running benchmarking command: "{current_cmd_str}"')
             command = self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)]
-            if self.is_python:
-                if len(mpi_cmd) > 0:
-                    output += venv_mpi_check_output(venv, mpi_cmd, command)
-                else:
-                    output += venv.run_cmd(command, caller=check_output)
-            else:
-                envs = copy.deepcopy(os.environ)
-                # Set LD_LIBRARY_PATH to the directory where the binary is located to find libtensorrt_llm.so and
-                # libnvinfer_plugin_tensorrt_llm.so.x.
-                envs[
-                    "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(venv)}:{os.path.dirname(command[0])}:{envs.get("LD_LIBRARY_PATH", "")}'
-                print(
-                    f'Augmented cpp runtime LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}'
-                )
-                benchmark_cmd = mpi_cmd + command
-                output += subprocess.check_output(benchmark_cmd,
-                                                  env=envs).decode()
-                # write config.json to output log
-                match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
-                if match:
-                    engine_dir = match.group(1)
-                    print_info(
-                        f'writing config.json in {engine_dir} to output log')
-                    with open(os.path.join(engine_dir, "config.json"),
-                              "r") as f:
-                        config_content = f.read()
-                        output += "\n" + "=" * 50 + "\n"
-                        output += "ENGINE CONFIG:\n"
-                        output += "=" * 50 + "\n"
-                        output += config_content
-                        output += "\n" + "=" * 50 + "\n"
+            envs = copy.deepcopy(os.environ)
+            envs[
+                "LD_LIBRARY_PATH"] = f'{get_trt_llm_lib_dir(venv)}:{os.path.dirname(command[0])}:{envs.get("LD_LIBRARY_PATH", "")}'
+            print(f'Augmented LD_LIBRARY_PATH={envs["LD_LIBRARY_PATH"]}')
+            benchmark_cmd = mpi_cmd + command
+            output += _run_command_with_captured_output(benchmark_cmd, env=envs)
+            match = re.search(r'--engine_dir=([^\s]+)', current_cmd_str)
+            if match:
+                engine_dir = match.group(1)
+                print_info(f'writing config.json in {engine_dir} to output log')
+                with open(os.path.join(engine_dir, "config.json"), "r") as f:
+                    config_content = f.read()
+                    output += "\n" + "=" * 50 + "\n"
+                    output += "ENGINE CONFIG:\n"
+                    output += "=" * 50 + "\n"
+                    output += config_content
+                    output += "\n" + "=" * 50 + "\n"
         return output
 
     def get_cmd_str(self, cmd_idx) -> List[str]:
@@ -225,68 +340,147 @@ class PerfBenchScriptTestCmds(NamedTuple):
                        " ") if len(self.mpi_cmd) > 0 else ""
         if cmd_idx <= len(self.data_cmds) - 1:
             cmd_str = " ".join(self.data_cmds[cmd_idx])
-        elif cmd_idx == len(self.data_cmds):  #for trtllm-bench build command
+        elif cmd_idx == len(self.data_cmds):
             if len(self.build_cmd) == 0:
                 cmd_str = ''
-            elif self.build_cmd[0].endswith('.py'):
-                cmd_str = mpi_cmd_str + "python3 " + " ".join(self.build_cmd)
             else:
-                cmd_str = mpi_cmd_str + "  " + " ".join(self.build_cmd)
+                cmd_str = mpi_cmd_str + " ".join(self.build_cmd)
         else:
-            python_str = "python3 " if self.is_python else ""
-            cmd_str = mpi_cmd_str + python_str + " ".join(
+            cmd_str = mpi_cmd_str + " ".join(
                 self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)])
 
         return cmd_str
 
 
-class PerfDisaggScriptTestCmds(NamedTuple):
-    ctx_cmd: str
-    gen_cmd: str
-    server_cmd: str
-    client_cmd: List[str]
-    benchmark_cmd: List[str]
+def _wait_for_server_ready(url: str,
+                           timeout: int = 600,
+                           server_proc: subprocess.Popen = None) -> None:
+    import requests
+
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if server_proc is not None:
+            exit_code = server_proc.poll()
+            if exit_code is not None:
+                raise RuntimeError(
+                    f"Server exited with code {exit_code} before becoming ready."
+                )
+        try:
+            time.sleep(1)
+            if requests.get(url, timeout=5).status_code == 200:
+                print_info(f"Server endpoint {url} is ready")
+                return
+        except requests.exceptions.RequestException:
+            pass
+    raise RuntimeError(f"Server {url} did not become ready within {timeout}s")
+
+
+class PerfServeScriptTestCmds:
+    """Commands for serve runtime perf tests (server-client model)."""
+
+    def __init__(self, server_cmd: List[str], client_cmds: List[List[str]],
+                 data_cmds: List[List[str]], server_env: Dict[str, str],
+                 server_timeout: int):
+        self.server_cmd = server_cmd
+        self.client_cmds = client_cmds
+        self.data_cmds = data_cmds
+        self.server_env = server_env
+        self.server_timeout = server_timeout
+        self._server_proc = None
+        self._server_log_path = None
+
+    def start_server(self) -> None:
+        if self._server_proc is not None:
+            return
+        from tensorrt_llm._utils import get_free_port
+        self._port = get_free_port()
+        self._host = "localhost"
+        cmd = self.server_cmd + [
+            "--host", self._host, "--port",
+            str(self._port)
+        ]
+        self._server_log_path = os.path.join(os.getcwd(),
+                                             "trtllm-serve-perf.log")
+        print_info(f"Starting trtllm-serve: {' '.join(cmd)}")
+        self._server_log_file = open(self._server_log_path, "w")
+        self._server_proc = subprocess.Popen(cmd,
+                                             env=self.server_env,
+                                             stdout=self._server_log_file,
+                                             stderr=subprocess.STDOUT)
+        _wait_for_server_ready(f"http://{self._host}:{self._port}/health",
+                               timeout=self.server_timeout,
+                               server_proc=self._server_proc)
+
+    def stop_server(self) -> None:
+        if self._server_proc is not None:
+            self._server_proc.terminate()
+            try:
+                self._server_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self._server_proc.kill()
+                self._server_proc.wait()
+            self._server_proc = None
+        if hasattr(self, '_server_log_file') and self._server_log_file:
+            self._server_log_file.close()
+            self._server_log_file = None
+
+    def get_server_log_content(self) -> str:
+        """Read back the server's captured stdout/stderr so far (e.g. to parse startup info like KV cache size)."""
+        if not self._server_log_path or not os.path.exists(
+                self._server_log_path):
+            return ""
+        with open(self._server_log_path,
+                  'r',
+                  encoding='utf-8',
+                  errors='replace') as f:
+            return f.read()
 
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
-        try:
-            with (  # Start ctx workers
-                    open('output_ctx.log', 'w') as output_ctx,
-                    popen(self.ctx_cmd,
-                          stdout=output_ctx,
-                          stderr=subprocess.STDOUT,
-                          env=venv._new_env,
-                          shell=True) as ctx_workers_proc,
-                    # Start gen workers
-                    open('output_gen.log', 'w') as output_gen,
-                    popen(self.gen_cmd,
-                          stdout=output_gen,
-                          stderr=subprocess.STDOUT,
-                          env=venv._new_env,
-                          shell=True) as gen_workers_proc,
-                    # Start server
-                    open('output_server.log', 'w') as output_server,
-                    popen(self.server_cmd,
-                          stdout=output_server,
-                          stderr=subprocess.STDOUT,
-                          env=venv._new_env,
-                          shell=True) as server_proc):
-                wait_for_endpoint_ready(
-                    f"http://localhost:8000/health",
-                    timeout=1800)  # 30 minutes for large models
-                check_output(self.client_cmd, env=venv._new_env)
-                output += check_output(self.benchmark_cmd, env=venv._new_env)
-        finally:
-            server_proc.terminate()
-            ctx_workers_proc.terminate()
-            gen_workers_proc.terminate()
-            server_proc.wait()
-            ctx_workers_proc.wait()
-            gen_workers_proc.wait()
+        if cmd_idx <= len(self.data_cmds) - 1:
+            print_info(f"Running prepare dataset command")
+            prepare_cmd = self.data_cmds[cmd_idx]
+            prepare_cmd_str = " ".join(prepare_cmd)
+            envs = copy.deepcopy(os.environ)
+            for sub_cmd in prepare_cmd_str.split(';'):
+                print_info(f'Now running prepare data command: "{sub_cmd}"')
+                if '>' in sub_cmd:
+                    cmd = sub_cmd.split('>')[0]
+                    dataset_file = sub_cmd.split('>')[1].split()[0]
+                else:
+                    cmd = sub_cmd
+                    dataset_file = None
+                # Pipe stderr separately so subprocess tracebacks land in e.stderr (forwarded to Allure), not just the inherited console fd.
+                output += subprocess.check_output(
+                    cmd.split(), env=envs, stderr=subprocess.PIPE).decode()
+                if dataset_file:
+                    with open(f"{dataset_file}", 'w+') as f:
+                        f.write(output)
+        elif cmd_idx == len(self.data_cmds):
+            self.start_server()
+            # Return the startup log (e.g. KV cache size) so it can be regex-parsed,
+            # instead of an empty string.
+            output = self.get_server_log_content()
+        else:
+            client_cmd = self.client_cmds[cmd_idx - 1 - len(self.data_cmds)]
+            client_cmd_with_port = client_cmd + [
+                "--host", self._host, "--port",
+                str(self._port)
+            ]
+            print_info(
+                f"Running benchmark client: {' '.join(client_cmd_with_port)}")
+            output = _run_command_with_captured_output(client_cmd_with_port,
+                                                       env=copy.deepcopy(
+                                                           os.environ))
         return output
 
-    def get_cmd_str(self, cmd_idx) -> List[str]:
-        return ["disaggregated server tests, please check config files"]
+    def get_cmd_str(self, cmd_idx) -> str:
+        if cmd_idx <= len(self.data_cmds) - 1:
+            return " ".join(self.data_cmds[cmd_idx])
+        elif cmd_idx == len(self.data_cmds):
+            return " ".join(self.server_cmd)
+        else:
+            return " ".join(self.client_cmds[cmd_idx - 1 - len(self.data_cmds)])
 
 
 class AbstractPerfScriptTestClass(abc.ABC):
@@ -420,6 +614,7 @@ class AbstractPerfScriptTestClass(abc.ABC):
 
         cmd_str = commands.get_cmd_str(cmd_idx)
         is_prepare_dataset_cmd = 'prepare_dataset' in cmd_str or "prepare-dataset" in cmd_str
+        is_setup_cmd = is_prepare_dataset_cmd or metric_type is None
         # Start the timer.
         self._start_timestamp = datetime.utcnow()
         try:
@@ -441,11 +636,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
                             # if not is_prepare_dataset_cmd:
                             print(collect_and_clean_myelin_time(output))
 
-                    # Check whether output has error message
-                    if not is_prepare_dataset_cmd:
+                    if not is_setup_cmd:
                         self._check_benchmark_output_for_errors(output)
 
-                    # Print the output log to stdout and cache it.
                     if is_prepare_dataset_cmd:
                         # For prepare_dataset commands, only print the prepare command info
                         for line in buf.getvalue().split('\n'):
@@ -470,25 +663,35 @@ class AbstractPerfScriptTestClass(abc.ABC):
             self._result_state = "failed"
             self._error = e
             print_error(f"Test command failed. Error: {e}")
+            partial_output = None
             if isinstance(e, subprocess.CalledProcessError):
-                print_error("--- stdout ---")
                 if e.stdout:
-                    print_error(clean_myelin_time(e.stdout.decode()))
-                else:
-                    print_error("<empty>")
+                    partial_output = clean_myelin_time(
+                        e.stdout.decode("utf-8", errors="replace"))
+                print_error("--- stdout ---")
+                print_error(partial_output if partial_output else "<empty>")
                 print_error("--------------")
                 print_error("--- stderr ---")
-                print_error(e.stderr.decode() if e.stderr else "<empty>")
+                print_error(
+                    e.stderr.decode("utf-8", errors="replace") if e.
+                    stderr else "<empty>")
                 print_error("--------------")
-
-        # Only save perf result if the result is valid.
-        if self._result_state == "valid":
-            # Parse the perf result from the test outputs.
-            if is_prepare_dataset_cmd:
-                print_info(
-                    f"skip writing perf result when calling generating dataset in trtllm-bench."
+            if partial_output and cmd_idx not in outputs:
+                outputs[cmd_idx] = partial_output
+                print(f"\n{'=' * 60}")
+                print(
+                    f"PARTIAL OUTPUT (captured before failure, cmd_idx={cmd_idx}):"
                 )
-                outputs.pop(cmd_idx)
+                print(f"{'=' * 60}")
+                print(partial_output)
+                print(f"{'=' * 60}\n")
+
+        if self._result_state == "valid":
+            if is_setup_cmd:
+                print_info(
+                    f"skip writing perf result for setup command (cmd_idx={cmd_idx})."
+                )
+                outputs.pop(cmd_idx, None)
             else:
                 self._perf_result = self.get_perf_result(outputs)
 
@@ -530,6 +733,10 @@ class AbstractPerfScriptTestClass(abc.ABC):
         if self._gpu_clock_lock:
             device_subtype = self._gpu_clock_lock.get_device_subtype()
 
+        # Node(s) that ran this case (see resolve_node_hostname for why this is
+        # per-case and prefers the SLURM nodelist over socket.gethostname()).
+        node_hostname = resolve_node_hostname()
+
         test_description_dict = {
             "network_name": self.get_test_name(),
             "network_hash":
@@ -537,7 +744,8 @@ class AbstractPerfScriptTestClass(abc.ABC):
             "sm_clk": gpu_clocks.get("gpu_clock__MHz", None),
             "mem_clk": gpu_clocks.get("memory_clock__MHz", None),
             "gpu_idx": gpu_idx,
-            "device_subtype": device_subtype
+            "device_subtype": device_subtype,
+            "hostname": node_hostname
         }
 
         # Serialize the commands.
@@ -626,51 +834,71 @@ class AbstractPerfScriptTestClass(abc.ABC):
                            os.path.join(output_dir, yaml_name)))
 
 
-def generate_one_test_node(session, config, domain_name, test_name, test_func):
+def _find_collected_dir_node(items, rootpath):
+    """Return the real rootdir ``Dir`` collection node created by pytest.
+
+    Since pytest 9.1, fixture visibility is matched by the actual collection-node
+    hierarchy instead of the textual nodeid (pytest issue #11785). Dynamically
+    generated perf nodes must therefore descend from this real ``Dir`` node to
+    inherit the fixtures declared in ``conftest.py``.
+    """
+    for item in items:
+        node = item
+        while node is not None:
+            if isinstance(node, pytest.Dir) and node.path == rootpath:
+                return node
+            node = node.parent
+    return None
+
+
+def generate_one_test_node(session,
+                           config,
+                           domain_name,
+                           test_name,
+                           test_func,
+                           parent_dir=None,
+                           module_cache=None):
     """
     A helper function to create a PyTest item with the specific name and specific test function.
     """
 
-    # Create the parent Item node.
-    # Pytest 8.x upgrade compatibility.
-    # We should never import Pytest internals within test-definitions.
+    # Attach the node under the real Dir -> Module hierarchy so it inherits the
+    # fixtures declared in conftest.py. Since pytest 9.1 fixture visibility is
+    # matched by the collection-node hierarchy rather than the textual nodeid
+    # (pytest issue #11785), a node attached directly to the session can no longer
+    # resolve those fixtures. The legacy nodeid is restored afterwards so that
+    # test-list filtering and --test-prefix rewriting keep working unchanged.
+    if parent_dir is not None:
+        if module_cache is None:
+            module_cache = {}
+        module_path = Path(inspect.getfile(test_func)).resolve()
+        module = module_cache.get(module_path)
+        if module is None:
+            module = pytest.Module.from_parent(parent_dir, path=module_path)
+            module_cache[module_path] = module
+        item = pytest.Function.from_parent(module,
+                                           name=test_name,
+                                           callobj=test_func)
+        item.obj = test_func
+        item._nodeid = f"{domain_name}::{test_name}"
+        return item
+
+    # Fallback when no collected Dir node is available (e.g. nothing was collected
+    # before the dynamic generation): mirror the legacy session-attached behavior.
     # TODO: TRT-23565
-    parent = None
-    if hasattr(Item, "from_parent"):
+    class TrtexecItem(pytest.Item):
 
-        class TrtexecItem(Item):
+        def runtest(self):
+            return test_func()
 
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-
-            def runtest(self):
-                return test_func()
-
-        parent = TrtexecItem.from_parent(session,
-                                         name=domain_name,
-                                         nodeid=domain_name)
-    else:
-        parent = Item(name=domain_name,
-                      parent=session,
-                      config=config,
-                      session=session,
-                      nodeid=domain_name)
-
+    parent = TrtexecItem.from_parent(session,
+                                     name=domain_name,
+                                     nodeid=domain_name)
     parent.obj = None
 
-    # Create the Function node for the test.
-    # For pytest 8.x compatibility
-    # TODO: TRT-23565
-    item = None
-    if hasattr(Function, "from_parent"):
-        item = Function.from_parent(parent, name=test_name, callobj=test_func)
-    else:
-        item = Function(name=test_name,
-                        parent=parent,
-                        config=config,
-                        session=session,
-                        callobj=test_func)
-
+    item = pytest.Function.from_parent(parent,
+                                       name=test_name,
+                                       callobj=test_func)
     item.obj = test_func
 
     # This has to be set but can be random as it isn't used.
@@ -697,6 +925,12 @@ def generate_test_nodes(session, config, items, valid_prefixes: List[str],
     except FileNotFoundError:
         pass
 
+    # Reuse the real rootdir Dir node that pytest created during collection so the
+    # generated nodes inherit conftest fixtures (see generate_one_test_node). The
+    # module node is created once and shared across all generated cases.
+    parent_dir = _find_collected_dir_node(items, config.rootpath)
+    module_cache = {}
+
     # Go through all test names and find the ones that need to be generated.
     for test_name in all_tests:
 
@@ -710,7 +944,8 @@ def generate_test_nodes(session, config, items, valid_prefixes: List[str],
             # Generate the test node and append it to the Pytest item list.
             items.append(
                 generate_one_test_node(session, config, domain_name,
-                                       short_test_name, test_func))
+                                       short_test_name, test_func, parent_dir,
+                                       module_cache))
             print(f"Dynamically generated test node: {test_name}")
 
     return items

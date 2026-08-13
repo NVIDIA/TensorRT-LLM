@@ -64,9 +64,7 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
         )
     else:
         classname = stage_name + "." + testname.split("::")[0].replace(".py", "").replace("/", ".")
-        if testname.startswith("accuracy/") or (
-            testname.startswith("examples/") and "[" not in testname
-        ):
+        if testname.startswith("accuracy/"):
             classname = ""
 
     return classname, name, file
@@ -131,7 +129,7 @@ def main():
 
     try:
         with open(full_path, "r", encoding="utf-8") as f:
-            timeoutTests = [line.strip() for line in f if line.strip()]
+            timeoutTests = list(dict.fromkeys(line.strip() for line in f if line.strip()))
     except IOError as e:
         print(f"Error reading {full_path}: {e}")
         return

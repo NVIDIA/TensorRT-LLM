@@ -80,13 +80,13 @@ To generate the checkpoint for NVFP4 KV cache:
 
 ```bash
 git clone https://github.com/NVIDIA/Model-Optimizer.git
-cd TensorRT-Model-Optimizer/examples/llm_ptq
+cd Model-Optimizer/examples/llm_ptq
 scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --kv_cache_quant nvfp4
 ```
 
 Note that currently TRT-LLM only supports FP8 weight/activation quantization when NVFP4 KV cache is enabled. Therefore, `--quant fp8` is required here.
 
-## Model Supported Matrix
+## Model Support Matrix
 
 | Model          |  NVFP4  | MXFP4  | FP8(per tensor)| FP8(block scaling) | FP8(rowwise) | FP8 KV Cache | NVFP4 KV Cache | W4A8 AWQ  | W4A16 AWQ | W4A8 GPTQ  | W4A16 GPTQ |
 | :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: |:---:| :-------: | :-------: | :--------: | :--------: |
@@ -113,7 +113,7 @@ Note that currently TRT-LLM only supports FP8 weight/activation quantization whe
 
 
 ```{note}
-The vision component of multi-modal models(BLIP2-OPT/BLIP2-T5/LLaVA/VILA/Nougat) uses FP16 by default.
+The vision component of multi-modal models (BLIP2-OPT/BLIP2-T5/LLaVA/VILA/Nougat) uses FP16 by default.
 The language component decides which quantization methods are supported by a given multi-modal model.
 ```
 

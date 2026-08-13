@@ -1,5 +1,7 @@
 __pycache__/
+.mypy_cache/
 .vscode
+.zed
 .cursor
 *.engine
 *.engine.config
@@ -45,14 +47,14 @@ tensorrt_llm/bindings.pyi
 tensorrt_llm/bindings/**/*.pyi
 tensorrt_llm/tensorrt_llm_transfer_agent_binding.*.so
 tensorrt_llm/tensorrt_llm_transfer_agent_binding.pyi
-tensorrt_llm/deep_ep/
+tensorrt_llm/deep_ep
 tensorrt_llm/deep_ep_cpp_tllm.*.so
 tensorrt_llm/deep_ep_cpp_tllm.pyi
-tensorrt_llm/deep_gemm/
+tensorrt_llm/deep_gemm
 tensorrt_llm/deep_gemm_cpp_tllm.*.so
 tensorrt_llm/deep_gemm_cpp_tllm.pyi
 tensorrt_llm/pg_utils_bindings.*.so
-tensorrt_llm/flash_mla/
+tensorrt_llm/flash_mla
 tensorrt_llm/flash_mla_cpp_tllm.*.so
 tensorrt_llm/flash_mla_cpp_tllm.pyi
 tensorrt_llm/runtime/kv_cache_manager_v2/**/*.so
@@ -62,9 +64,12 @@ tensorrt_llm/scripts
 *docs/source/_cpp_gen*
 docs/source/**/*.rst
 !docs/source/examples/index.rst
-!docs/source/deployment-guide/config_table.rst
 !docs/source/_includes/note_sections.rst
+!docs/source/features/auto_deploy/transforms.rst
+!docs/source/features/auto_deploy/transforms/
+!docs/source/features/auto_deploy/transforms/*.rst
 *.swp
+.nfs*
 
 # Testing
 .coverage.*
@@ -72,14 +77,19 @@ results_trt/
 llm-test-workspace/
 ad-test-workspace/
 
+# FetchContent reference cache
+3rdparty/.cache_3rdparty/
+
 # build/debug
 *.safetensors
 */tllm_debug/**
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
 examples/disaggregated/slurm/benchmark/logs/
+scripts/attribution/data/checksum_to_paths.yml
 
 # Generated files
+/ATTRIBUTIONS.md
 cpp/include/tensorrt_llm/executor/version.h
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmha_v2_cu/
 cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin/fmha_cubin.h
@@ -103,3 +113,14 @@ enroot/tensorrt_llm.devel.sqsh
 
 # MacOSX Files
 .DS_Store
+
+# stress test aiperf output artifacts
+tests/integration/defs/stress_test/artifacts/
+
+# Agent related files
+.claude/agent-memory/
+.claude/agent-tests/perf-test-sync/report.html
+.claude/agent-tests/perf-test-sync/results.json
+.claude/settings.json
+
+.plans/

@@ -1,10 +1,11 @@
 import gc
 import importlib
 import os
+import tempfile
 from functools import wraps
 from pathlib import Path
 from queue import Queue
-from typing import Any, List, Optional, Type, Union
+from typing import Any, List, Optional, Type
 
 import ray
 import torch
@@ -12,13 +13,13 @@ import torch
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
-                                                release_with_tag,
-                                                verify_sleep_wakeup_tags)
+                                                release_with_tag)
 
+from .. import TorchLlmArgs
 from ..bindings import executor as tllm
-from ..builder import Engine
-from ..llmapi.llm_args import BaseLlmArgs
+from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
+from ..llmapi.utils import configure_cpu_affinity
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
 from .postproc_worker import PostprocWorkerConfig
@@ -58,6 +59,10 @@ class RayWorkerWrapper:
         # Physical gpu id
         self.gpu = int(ray.get_gpu_ids()[0])
         self.local_gpu = self.physical_to_local_id(self.gpu)
+
+        # Per-worker DeepGemm JIT cache to avoid rename race across co-located workers
+        os.environ["DG_JIT_CACHE_DIR"] = os.path.join(
+            tempfile.gettempdir(), f"deep_gemm_rank{rank}_gpu{self.gpu}")
 
         torch.cuda.set_device(self.local_gpu)
 
@@ -208,7 +213,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
     def __init__(
         self,
         device_id: int,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -217,7 +222,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
         rpc_addr: Optional[str] = None,
-        hmac_key: Optional[bytes] = None,
+        hmac_key: bytes = b"",
     ) -> None:
         global logger
         from tensorrt_llm.logger import logger
@@ -257,12 +262,15 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
     @control_action_decorator
     def sleep(self, sleep_tags: List[str]):
-        if not self.llm_args.enable_sleep:
+        assert isinstance(self.llm_args,
+                          TorchLlmArgs), "sleep() only available for TorchLLM"
+
+        if self.llm_args.sleep_config is None:
             raise ValueError(
-                "Sleep feature is not enabled, please set enable_sleep=True in the LLM arguments."
+                "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
         try:
-            tags = verify_sleep_wakeup_tags(sleep_tags)
+            tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
             logger.info(f"Sleep: {tags}")
             torch.cuda.synchronize()
             release_with_tag(*tags)
@@ -275,12 +283,15 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
     @control_action_decorator
     def wakeup(self, wakeup_tags: List[str]):
-        if not self.llm_args.enable_sleep:
+        assert isinstance(self.llm_args,
+                          TorchLlmArgs), "wakeup() only available for TorchLLM"
+
+        if self.llm_args.sleep_config is None:
             raise ValueError(
-                "Sleep feature is not enabled, please set enable_sleep=True in the LLM arguments."
+                "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
         try:
-            tags = verify_sleep_wakeup_tags(wakeup_tags)
+            tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
             logger.info(f"Wakeup: {tags}")
             torch.cuda.synchronize()
             materialize_with_tag(*tags)
@@ -342,7 +353,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         torch.distributed.all_gather_object(comm_ranks, global_rank)
         torch.distributed.all_gather_object(device_ids, self.device_id)
 
-        self._configure_affinity(self.device_id)
+        configure_cpu_affinity(self.device_id)
 
         return comm_ranks, device_ids
 

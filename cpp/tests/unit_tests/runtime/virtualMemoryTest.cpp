@@ -18,6 +18,8 @@
 #include <nvml.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/nvmlWrapper.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/tllmBuffers.h"
 #include "tensorrt_llm/runtime/virtualMemory.h"
@@ -57,9 +59,11 @@ protected:
         TLLM_CU_CHECK(cuDevicePrimaryCtxRetain(&ctx, dev));
         TLLM_CU_CHECK(cuCtxSetCurrent(ctx));
 
-        // Initialize NVML
-        nvmlReturn_t nvmlResult = nvmlInit();
-        TLLM_CHECK_WITH_INFO(nvmlResult == NVML_SUCCESS, "Failed to initialize NVML: %s", nvmlErrorString(nvmlResult));
+        // Initialize NVML via wrapper
+        mNvml = tensorrt_llm::common::NVMLWrapper::getInstance();
+        nvmlReturn_t nvmlResult = mNvml->nvmlInit();
+        TLLM_CHECK_WITH_INFO(
+            nvmlResult == NVML_SUCCESS, "Failed to initialize NVML: %s", mNvml->nvmlErrorString(nvmlResult));
 
         if (!memoryInfoAvailable())
         {
@@ -88,14 +92,16 @@ protected:
 
     static size_t getCurrentProcessMemoryInfo()
     {
+        auto nvml = tensorrt_llm::common::NVMLWrapper::getInstance();
+
         // Get current process ID
         uint32_t currentPid = static_cast<uint32_t>(getpid());
 
         // Get device handle for GPU 0
         nvmlDevice_t device;
-        auto nvmlResult = nvmlDeviceGetHandleByIndex(0, &device);
+        auto nvmlResult = nvml->nvmlDeviceGetHandleByIndex(0, &device);
         TLLM_CHECK_WITH_INFO(
-            nvmlResult == NVML_SUCCESS, "Failed to get device handle: %s", nvmlErrorString(nvmlResult));
+            nvmlResult == NVML_SUCCESS, "Failed to get device handle: %s", nvml->nvmlErrorString(nvmlResult));
 
         // Get running processes
         unsigned int processCount = 1;
@@ -103,9 +109,9 @@ protected:
         nvmlResult = NVML_ERROR_INSUFFICIENT_SIZE;
         while (nvmlResult == NVML_ERROR_INSUFFICIENT_SIZE)
         {
-            nvmlResult = nvmlDeviceGetComputeRunningProcesses_v3(device, &processCount, processes.data());
+            nvmlResult = nvml->nvmlDeviceGetComputeRunningProcesses(device, &processCount, processes.data());
             TLLM_CHECK_WITH_INFO(nvmlResult == NVML_SUCCESS || nvmlResult == NVML_ERROR_INSUFFICIENT_SIZE,
-                "Failed to get process count: %s", nvmlErrorString(nvmlResult));
+                "Failed to get process count: %s", nvml->nvmlErrorString(nvmlResult));
             processes.resize(processCount);
         }
 
@@ -120,6 +126,8 @@ protected:
 
         return 0;
     }
+
+    std::shared_ptr<tensorrt_llm::common::NVMLWrapper> mNvml;
 };
 
 class VirtualMemoryTest : public VirtualMemoryTestBase
@@ -135,19 +143,12 @@ TEST_F(VirtualMemoryTest, TestBasic)
 
     CUDAVirtualMemoryChunk::CreatorPtr creator
         = std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                                               {
-                                                   CU_MEM_LOCATION_TYPE_DEVICE,
-                                                   0,
-                                               }},
+                                               CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}},
             size);
 
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<UnicastConfigurator>(address, size,
-        CUmemAccessDesc{{
-                            CU_MEM_LOCATION_TYPE_DEVICE,
-                            0,
-                        },
-            CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
 
     CUDAVirtualMemoryChunk vm(std::move(creator), std::move(configurators));
     ASSERT_EQ(vm.status(), CUDAVirtualMemoryChunk::RELEASED);
@@ -205,19 +206,12 @@ TEST_P(VirtualMemoryOffloadConfigurator, Test)
 
     CUDAVirtualMemoryChunk::CreatorPtr creator
         = std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                                               {
-                                                   CU_MEM_LOCATION_TYPE_DEVICE,
-                                                   0,
-                                               }},
+                                               CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}},
             size);
 
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<UnicastConfigurator>(address, size,
-        CUmemAccessDesc{{
-                            CU_MEM_LOCATION_TYPE_DEVICE,
-                            0,
-                        },
-            CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
     configurators.push_back(std::make_unique<OffloadConfigurator>(address, size, backType, stream.get(), false));
 
     CUDAVirtualMemoryChunk vm(std::move(creator), std::move(configurators));
@@ -604,14 +598,14 @@ TEST_F(VirtualMemoryTest, TestFacilities)
     {
 
         // Create original CUDAVirtualMemoryChunk
-        CUDAVirtualMemoryChunk::CreatorPtr creator
-            = std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED,
-                                                   CU_MEM_HANDLE_TYPE_NONE, {CU_MEM_LOCATION_TYPE_DEVICE, 0}},
-                size);
+        CUDAVirtualMemoryChunk::CreatorPtr creator = std::make_unique<LocalCreator<>>(
+            CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
+                CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}},
+            size);
 
         CUDAVirtualMemoryChunk::Configurators configurators;
-        configurators.push_back(std::make_unique<UnicastConfigurator>(
-            address, size, CUmemAccessDesc{{CU_MEM_LOCATION_TYPE_DEVICE, 0}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+        configurators.push_back(std::make_unique<UnicastConfigurator>(address, size,
+            CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
 
         CUDAVirtualMemoryChunk original(std::move(creator), std::move(configurators));
         original.materialize();
@@ -970,19 +964,12 @@ TEST_F(VirtualMemoryManagerTest, TestBasic)
 
     CUDAVirtualMemoryChunk::CreatorPtr creator
         = std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                                               {
-                                                   CU_MEM_LOCATION_TYPE_DEVICE,
-                                                   0,
-                                               }},
+                                               CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}},
             size);
 
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<UnicastConfigurator>(address, size,
-        CUmemAccessDesc{{
-                            CU_MEM_LOCATION_TYPE_DEVICE,
-                            0,
-                        },
-            CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {0}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
 
     auto memoryBegin = getCurrentProcessMemoryInfo();
 
@@ -1516,7 +1503,7 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
 
     // Create a buffer using the virtual address allocator
     auto buffer = std::make_unique<VirtualAddressDeviceBuffer>(
-        size, nvinfer1::DataType::kINT8, CudaVirtualMemoryAllocator{config});
+        size, tensorrt_llm::DataType::kINT8, CudaVirtualMemoryAllocator{config});
 
     auto memoryAfterAllocation = getCurrentProcessMemoryInfo();
     if (memoryInfoAvailable())
@@ -1527,7 +1514,7 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
     // Test that we can access the buffer data
     ASSERT_NE(buffer->data(), nullptr) << "Buffer data should not be null";
     ASSERT_EQ(buffer->getSize(), size) << "Buffer size should match requested size";
-    ASSERT_EQ(buffer->getDataType(), nvinfer1::DataType::kINT8) << "Buffer data type should be INT8";
+    ASSERT_EQ(buffer->getDataType(), tensorrt_llm::DataType::kINT8) << "Buffer data type should be INT8";
     ASSERT_EQ(buffer->getMemoryType(), MemoryType::kGPU) << "Buffer memory type should be GPU";
 
     // Test memory access by setting memory to a known pattern
@@ -1588,7 +1575,7 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocatorUnalignedSize)
 
     // Create a buffer using the virtual address allocator
     auto buffer = std::make_unique<VirtualAddressDeviceBuffer>(
-        size, nvinfer1::DataType::kINT8, CudaVirtualMemoryAllocator{config});
+        size, tensorrt_llm::DataType::kINT8, CudaVirtualMemoryAllocator{config});
 
     auto memoryAfterAllocation = getCurrentProcessMemoryInfo();
     if (memoryInfoAvailable())

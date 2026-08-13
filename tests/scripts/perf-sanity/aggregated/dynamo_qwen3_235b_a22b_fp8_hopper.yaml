@@ -1,0 +1,48 @@
+# Dynamo-replica: agg Qwen3-235B-A22B FP8 TRT-LLM deployment.
+#
+# Source (upstream Dynamo recipe):
+#   https://github.com/ai-dynamo/dynamo/tree/main/recipes/qwen3-235b-a22b-fp8/trtllm/agg
+
+metadata:
+  model_name: qwen3_235b_a22b_fp8
+  supported_gpus:
+  - H200
+hardware:
+  gpus_per_node: 8
+server_configs:
+  - name: "qwen3_235b_a22b_fp8_tp4_ep4_cutlass_8k1k"
+    model_name: "qwen3_235b_a22b_fp8"
+    trust_remote_code: true
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    moe_tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    max_batch_size: 128
+    max_num_tokens: 8192
+    max_seq_len: 8192
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: false
+    print_iter_log: false
+    moe_config:
+      backend: 'CUTLASS'
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 128
+    kv_cache_config:
+      dtype: 'auto'
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.8
+    cache_transceiver_config:
+      backend: DEFAULT
+    client_configs:
+      # ISL+OSL must stay within recipe's max_seq_len=8192, so use 7k/1k.
+      - name: "con128_iter10_7k1k"
+        concurrency: 128
+        iterations: 10
+        isl: 7168
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>

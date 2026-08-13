@@ -112,8 +112,7 @@ def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
                         current_sm = get_sm_version()
                         # If SM versions match, replace with test_prefix
                         if sm_version == current_sm:
-                            s = s.replace(f'sm{sm_version}',
-                                          test_prefix.split('-')[0])
+                            s = s.replace(f'sm{sm_version}', test_prefix)
                     except Exception:
                         # If can't get SM version, skip SM-based filtering
                         pass

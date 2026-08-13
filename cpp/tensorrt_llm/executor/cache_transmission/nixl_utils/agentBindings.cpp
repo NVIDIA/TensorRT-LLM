@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,11 +21,8 @@
 #include "transferAgent.h"
 #endif
 
-#ifdef ENABLE_MOONCAKE
-#include "../mooncake_utils/transferAgent.h"
-#endif
-
 #include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
@@ -83,6 +80,47 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
                 new (self) kvc::MemoryDescs(type, std::move(descs));
             },
             nb::arg("type"), nb::arg("tuples"))
+        // Classmethod: batch construction from numpy arrays
+        .def_static(
+            "from_arrays",
+            [](kvc::MemoryType type, nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
+                nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes,
+                nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> deviceIds)
+            {
+                size_t n = addrs.shape(0);
+                auto const* a = addrs.data();
+                auto const* s = sizes.data();
+                auto const* d = deviceIds.data();
+                std::vector<kvc::MemoryDesc> descs;
+                descs.reserve(n);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    descs.emplace_back(
+                        static_cast<uintptr_t>(a[i]), static_cast<size_t>(s[i]), static_cast<uint32_t>(d[i]));
+                }
+                return kvc::MemoryDescs(type, std::move(descs));
+            },
+            nb::arg("type"), nb::arg("addrs"), nb::arg("sizes"), nb::arg("device_ids"),
+            nb::call_guard<nb::gil_scoped_release>())
+        // Classmethod: batch construction with uniform device_id (avoids np.full allocation)
+        .def_static(
+            "from_arrays_uniform_device",
+            [](kvc::MemoryType type, nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> addrs,
+                nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu> sizes, uint32_t deviceId)
+            {
+                size_t n = addrs.shape(0);
+                auto const* a = addrs.data();
+                auto const* s = sizes.data();
+                std::vector<kvc::MemoryDesc> descs;
+                descs.reserve(n);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    descs.emplace_back(static_cast<uintptr_t>(a[i]), static_cast<size_t>(s[i]), deviceId);
+                }
+                return kvc::MemoryDescs(type, std::move(descs));
+            },
+            nb::arg("type"), nb::arg("addrs"), nb::arg("sizes"), nb::arg("device_id"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("type", &kvc::MemoryDescs::getType)
         .def_prop_ro("descs", &kvc::MemoryDescs::getDescs);
 
@@ -102,12 +140,41 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             {
                 auto const& desc = self.getBackendAgentDesc();
                 return nb::bytes(desc.data(), desc.size());
-            });
+            })
+        .def("serialize",
+            [](kvc::AgentDesc const& self)
+            {
+                auto s = self.serialize();
+                return nb::bytes(s.data(), s.size());
+            })
+        .def_static(
+            "deserialize",
+            [](nb::bytes data)
+            {
+                std::string str(data.c_str(), data.size());
+                return kvc::AgentDesc::deserialize(str);
+            },
+            nb::arg("data"));
 
     // TransferRequest class
+    //
+    // NOTE: The constructor uses std::move to transfer ownership of src_descs / dst_descs
+    // into the TransferRequest.  This avoids an O(n) copy of the internal
+    // std::vector<MemoryDesc> (24 bytes * n).  For 40k descriptors this saves ~937 KB
+    // of memcpy and turns a ~58 us copy into an O(1) pointer swap (~0.4 us).
+    //
+    // IMPORTANT: After construction, the Python MemoryDescs objects passed as src_descs
+    // and dst_descs are left in a moved-from state — their internal descriptor list
+    // becomes empty.  Do NOT access them after passing to TransferRequest.
     nb::class_<kvc::TransferRequest>(m, "TransferRequest")
-        .def(nb::init<kvc::TransferOp, kvc::TransferDescs, kvc::TransferDescs, std::string const&,
-                 std::optional<kvc::SyncMessage>>(),
+        .def(
+            "__init__",
+            [](kvc::TransferRequest* self, kvc::TransferOp op, kvc::TransferDescs& srcDescs,
+                kvc::TransferDescs& dstDescs, std::string const& remoteName,
+                std::optional<kvc::SyncMessage> syncMessage) {
+                new (self) kvc::TransferRequest(
+                    op, std::move(srcDescs), std::move(dstDescs), remoteName, std::move(syncMessage));
+            },
             nb::arg("op"), nb::arg("src_descs"), nb::arg("dst_descs"), nb::arg("remote_name"),
             nb::arg("sync_message") = std::nullopt)
         .def_prop_ro("op", &kvc::TransferRequest::getOp)
@@ -116,10 +183,13 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def_prop_ro("remote_name", &kvc::TransferRequest::getRemoteName)
         .def_prop_ro("sync_message", &kvc::TransferRequest::getSyncMessage);
 
-    // TransferStatus base class
+    // TransferStatus base class - release GIL for potentially blocking operations.
+    // All concrete subclasses (Nixl, Mooncake) perform blocking waits, so releasing
+    // the GIL here is safe and necessary for correct behavior when the concrete
+    // subclass type is not directly registered (e.g., agents created via factory).
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
-        .def("is_completed", &kvc::TransferStatus::isCompleted)
-        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1);
+        .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
+        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>());
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")
@@ -128,111 +198,109 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             "__init__",
             [](kvc::BaseAgentConfig* self, std::string name, bool use_prog_thread, bool multi_thread,
                 bool use_listen_thread, bool enable_telemetry,
-                std::unordered_map<std::string, std::string> backend_params)
+                std::unordered_map<std::string, std::string> backend_params, std::optional<int> rank,
+                std::optional<int> world_size)
             {
                 new (self) kvc::BaseAgentConfig{std::move(name), use_prog_thread, multi_thread, use_listen_thread,
-                    enable_telemetry, std::move(backend_params)};
+                    enable_telemetry, std::move(backend_params), rank, world_size};
             },
             nb::arg("name"), nb::arg("use_prog_thread") = true, nb::arg("multi_thread") = false,
             nb::arg("use_listen_thread") = false, nb::arg("enable_telemetry") = false,
-            nb::arg("backend_params") = std::unordered_map<std::string, std::string>{})
+            nb::arg("backend_params") = std::unordered_map<std::string, std::string>{}, nb::arg("rank") = std::nullopt,
+            nb::arg("world_size") = std::nullopt)
         .def_rw("name", &kvc::BaseAgentConfig::mName)
         .def_rw("use_prog_thread", &kvc::BaseAgentConfig::useProgThread)
         .def_rw("multi_thread", &kvc::BaseAgentConfig::multiThread)
         .def_rw("use_listen_thread", &kvc::BaseAgentConfig::useListenThread)
         .def_rw("enable_telemetry", &kvc::BaseAgentConfig::enableTelemetry)
-        .def_rw("backend_params", &kvc::BaseAgentConfig::backendParams);
+        .def_rw("backend_params", &kvc::BaseAgentConfig::backendParams)
+        .def_rw("rank", &kvc::BaseAgentConfig::rank)
+        .def_rw("world_size", &kvc::BaseAgentConfig::worldSize);
 
     // BaseTransferAgent class (abstract base)
+    // All transfer-engine operations release the GIL: they may block on NIXL /
+    // UCX / network / GPU memory pinning, and holding the GIL across them
+    // starves Python listener / progress threads in the same process.
     nb::class_<kvc::BaseTransferAgent>(m, "BaseTransferAgent")
-        .def("register_memory", &kvc::BaseTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::BaseTransferAgent::deregisterMemory, nb::arg("descs"))
+        .def("register_memory", &kvc::BaseTransferAgent::registerMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("deregister_memory", &kvc::BaseTransferAgent::deregisterMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent",
             nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::BaseTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
+            nb::arg("name"), nb::arg("agent_desc"), nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent_by_connection",
             nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
                 &kvc::BaseTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::BaseTransferAgent::getLocalAgentDesc)
-        .def("invalidate_remote_agent", &kvc::BaseTransferAgent::invalidateRemoteAgent, nb::arg("name"))
+            nb::arg("name"), nb::arg("connection_info"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_agent_desc", &kvc::BaseTransferAgent::getLocalAgentDesc,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("invalidate_remote_agent", &kvc::BaseTransferAgent::invalidateRemoteAgent, nb::arg("name"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "submit_transfer_requests",
             [](kvc::BaseTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership)
-        .def(
-            "notify_sync_message", &kvc::BaseTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::BaseTransferAgent::getNotifiedSyncMessages)
-        .def("get_local_connection_info", &kvc::BaseTransferAgent::getLocalConnectionInfo)
-        .def("check_remote_descs", &kvc::BaseTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"));
+            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>(),
+            nb::keep_alive<0, 1>())
+        .def("notify_sync_message", &kvc::BaseTransferAgent::notifySyncMessage, nb::arg("name"),
+            nb::arg("sync_message"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_notified_sync_messages", &kvc::BaseTransferAgent::getNotifiedSyncMessages,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_connection_info", &kvc::BaseTransferAgent::getLocalConnectionInfo,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("check_remote_descs", &kvc::BaseTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
+            nb::call_guard<nb::gil_scoped_release>());
 
 #ifdef ENABLE_NIXL
     // NixlTransferStatus class - release GIL for blocking operations
     nb::class_<kvc::NixlTransferStatus, kvc::TransferStatus>(m, "NixlTransferStatus")
         .def("is_completed", &kvc::NixlTransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
         .def("wait", &kvc::NixlTransferStatus::wait, nb::arg("timeout_ms") = -1,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_last_status", &kvc::NixlTransferStatus::getLastStatus)
+        .def("get_last_status_str", &kvc::NixlTransferStatus::getLastStatusStr);
 
     // NixlTransferAgent class
     nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
-        .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"))
-        .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::NixlTransferAgent::deregisterMemory, nb::arg("descs"))
+        .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
+        .def("shutdown", &kvc::NixlTransferAgent::shutdown, nb::call_guard<nb::gil_scoped_release>())
+        .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("deregister_memory", &kvc::NixlTransferAgent::deregisterMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent",
             nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::NixlTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
+            nb::arg("name"), nb::arg("agent_desc"), nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent_by_connection",
             nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
                 &kvc::NixlTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::NixlTransferAgent::getLocalAgentDesc)
-        .def("get_local_connection_info", &kvc::NixlTransferAgent::getLocalConnectionInfo)
-        .def("invalidate_remote_agent", &kvc::NixlTransferAgent::invalidateRemoteAgent, nb::arg("name"))
+            nb::arg("name"), nb::arg("connection_info"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_agent_desc", &kvc::NixlTransferAgent::getLocalAgentDesc,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_connection_info", &kvc::NixlTransferAgent::getLocalConnectionInfo,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("invalidate_remote_agent", &kvc::NixlTransferAgent::invalidateRemoteAgent, nb::arg("name"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "submit_transfer_requests",
             [](kvc::NixlTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>())
-        .def(
-            "notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages)
-        .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"));
-#endif
-
-#ifdef ENABLE_MOONCAKE
-    // MooncakeTransferStatus class - release GIL for blocking operations
-    nb::class_<kvc::MooncakeTransferStatus, kvc::TransferStatus>(m, "MooncakeTransferStatus")
-        .def("is_completed", &kvc::MooncakeTransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
-        .def("wait", &kvc::MooncakeTransferStatus::wait, nb::arg("timeout_ms") = -1,
+            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>(),
+            nb::keep_alive<0, 1>())
+        .def("notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"),
+            nb::arg("sync_message"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
             nb::call_guard<nb::gil_scoped_release>());
-
-    // MooncakeTransferAgent class
-    nb::class_<kvc::MooncakeTransferAgent, kvc::BaseTransferAgent>(m, "MooncakeTransferAgent")
-        .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"))
-        .def("register_memory", &kvc::MooncakeTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::MooncakeTransferAgent::deregisterMemory, nb::arg("descs"))
-        .def("load_remote_agent",
-            nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::MooncakeTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
-        .def("load_remote_agent_by_connection",
-            nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
-                &kvc::MooncakeTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::MooncakeTransferAgent::getLocalAgentDesc)
-        .def("get_local_connection_info", &kvc::MooncakeTransferAgent::getLocalConnectionInfo)
-        .def("invalidate_remote_agent", &kvc::MooncakeTransferAgent::invalidateRemoteAgent, nb::arg("name"))
-        .def(
-            "submit_transfer_requests",
-            [](kvc::MooncakeTransferAgent& self, kvc::TransferRequest const& request)
-            { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>())
-        .def("notify_sync_message", &kvc::MooncakeTransferAgent::notifySyncMessage, nb::arg("name"),
-            nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::MooncakeTransferAgent::getNotifiedSyncMessages)
-        .def("check_remote_descs", &kvc::MooncakeTransferAgent::checkRemoteDescs, nb::arg("name"),
-            nb::arg("memory_descs"));
 #endif
+
+    // NOTE: MooncakeTransferAgent/MooncakeTransferStatus class bindings are intentionally
+    // NOT registered here. Directly binding them would create a load-time dependency on
+    // libtensorrt_llm_mooncake_wrapper.so (and transitively libtransfer_engine.so),
+    // causing import to fail on machines without Mooncake installed.
+    // Instead, use make_transfer_agent("mooncake", config) which loads the library lazily.
 
     // Factory function to create transfer agent by backend name (uses dynamic loading)
     m.def(

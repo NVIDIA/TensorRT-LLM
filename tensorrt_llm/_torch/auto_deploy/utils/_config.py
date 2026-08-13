@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Helper functions for config-related settings."""
 
 import os
@@ -41,7 +55,8 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
                 "specify the `yaml_default` field in your pydantic model instead."
             )
 
-    def _read_files(self, files: PathType | None) -> dict[str, Any]:
+    def _read_files(self, files: PathType | None, **kwargs: Any) -> dict[str, Any]:
+        """Read and deep-merge YAML files. Accepts deep_merge kwarg for parent API compatibility."""
         if files is None:
             return {}
         if isinstance(files, (str, os.PathLike)):
@@ -124,7 +139,7 @@ class DynamicYamlMixInForSettings:
           settings.
     - Explicitly initialized fields for inner settings take precedence over outer yaml configs for
       inner settings since they are provided as init arguments.
-    - Check out ``tests/unittest/_torch/auto_deploy/unit/singlegpu/utils/test_config.py`` for more
+    - Check out ``tests/unittest/auto_deploy/singlegpu/utils/test_config.py`` for more
       examples.
 
 

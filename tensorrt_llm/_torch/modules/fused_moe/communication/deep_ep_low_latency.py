@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +25,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -35,6 +37,24 @@ from .base import Communication
 class DeepEPLowLatency(Communication):
     """
     DeepEP Low Latency strategy supporting both pre-quant and post-quant
+    """
+
+    SUPPORTED_HIDDEN_SIZES: frozenset[int] = frozenset({2048, 2560, 3584, 4096, 5120, 6144, 7168})
+    """frozenset[int]: Hidden sizes supported by the low-latency DeepEP kernel (SWITCH_HIDDEN in launch.cuh)."""
+
+    SUPPORTED_HIDDEN_SIZES_EXTENSION: frozenset[int] = frozenset({4096, 6144, 7168})
+    """frozenset[int]: Hidden sizes supported by extension kernels (nvfp4 post-quant/low-precision combine).
+
+    Sourced from SWITCH_HIDDEN_FOR_EXTENSION_KERNELS in extension_kernels.cu.
+    """
+
+    MAX_TOP_K: int = 9
+    """int: Compile-time top-k cap of the low-latency kernels.
+
+    ``kNumMaxTopK``/``kNumMaxTopk`` in internode_ll.cu (dispatch and combine)
+    size per-thread register arrays with it and guard it with
+    ``EP_HOST_ASSERT(num_topk <= kNumMaxTopK)`` — a larger top_k aborts on the
+    first dispatch/combine, so selection must reject it up front.
     """
 
     def __init__(
@@ -50,6 +70,13 @@ class DeepEPLowLatency(Communication):
         moe_max_num_tokens: Optional[int] = None,
     ):
         super().__init__(mapping)
+
+        # Validate hidden_size against kernel constraints
+        if hidden_size not in self.SUPPORTED_HIDDEN_SIZES:
+            raise RuntimeError(
+                f"DeepEPLowLatency does not support hidden_size={hidden_size}. "
+                f"Supported hidden sizes: {sorted(self.SUPPORTED_HIDDEN_SIZES)}"
+            )
 
         # Store needed parameters
         self.num_slots = num_slots
@@ -76,34 +103,69 @@ class DeepEPLowLatency(Communication):
 
         # Set nvshmem queue pair depth larger than the number of on-flight WRs
         # (ref: https://github.com/deepseek-ai/DeepEP/issues/427)
-        os.environ["NVSHMEM_QP_DEPTH"] = str(2 * (self.deep_ep_max_num_tokens + 1))
+        os.environ["NVSHMEM_QP_DEPTH"] = str(max(128, 2 * (self.deep_ep_max_num_tokens + 1)))
 
         self.deep_ep_buffer = buffer_pool.get_low_latency_buffer(mapping)
         self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens, hidden_size, num_slots)
 
+    def destroy(self):
+        """Release the DeepEP low-latency buffer to prevent deadlock/hang.
+
+        Buffer.__del__ calls intranode::barrier (collective op). Without
+        explicit release, non-deterministic GC timing across ranks causes
+        some ranks to block in the barrier indefinitely.
+        """
+        self.deep_ep_buffer = None
+
     @staticmethod
     def is_platform_supported() -> bool:
-        """
-        Check if DeepEP Low Latency is supported on the current platform
-        """
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") != "1":
-            return False
+        """Check if DeepEP Low Latency is supported on the current platform."""
         if not deep_ep_installed:
+            return False
+        # SM120/121 (RTX PRO 6000 Blackwell): no NVSwitch -> NVSHMEM-LL deadlocks.
+        if get_sm_version() in (120, 121):
+            return False
+        # Native NVSHMEM/IBGDA bootstrap aborts instead of raising on split
+        # H100/H200 NVL systems. Disabling P2P does not avoid the abort: this
+        # build has no IBRC fallback, and IBGDA fails before Buffer can use
+        # allow_nvlink_for_low_latency_mode=False. Reject before setup.
+        dev_id = torch.cuda.current_device()
+        if MnnvlMemory._is_pcie_nvl_sku(dev_id):
             return False
         return True
 
     def supports_post_quant_dispatch(self) -> bool:
         """
         DeepEP Low Latency supports post-quant for: fp8_qdq, nvfp4, w4afp8
+
+        Note: nvfp4 post-quant dispatch uses extension kernels which require
+        hidden_size in SUPPORTED_HIDDEN_SIZES_EXTENSION.
+
+        Note: fp8_qdq and w4afp8 post-quant dispatch views fp8 (1 byte) as
+        bf16 (2 bytes) via .view(torch.bfloat16), halving the hidden dimension.
+        The halved dimension must be in SUPPORTED_HIDDEN_SIZES for the dispatch
+        kernel (SWITCH_HIDDEN in internode_ll.cu) to work.
         """
         if not self.enable_postquant_alltoall:
             return False
-        return self._has_nvfp4() or self._has_fp8_qdq() or self._has_w4afp8()
+        if self._has_nvfp4():
+            # nvfp4 dispatch uses extension kernels with stricter hidden_size requirement
+            return self.hidden_size in self.SUPPORTED_HIDDEN_SIZES_EXTENSION
+        if self._has_fp8_qdq() or self._has_w4afp8():
+            # fp8/w4afp8 post-quant dispatch views fp8 (1 byte) as bf16 (2 bytes),
+            # halving the hidden dimension. The kernel must support the halved size.
+            return (self.hidden_size // 2) in self.SUPPORTED_HIDDEN_SIZES
+        return False
 
     def supports_low_precision_combine(self) -> bool:
         """
         DeepEP Low Latency supports low-precision combine for: fp8_qdq, nvfp4, w4afp8
+
+        Note: low-precision combine uses extension kernels which require
+        hidden_size in SUPPORTED_HIDDEN_SIZES_EXTENSION.
         """
+        if self.hidden_size not in self.SUPPORTED_HIDDEN_SIZES_EXTENSION:
+            return False
         return self._has_nvfp4() or self._has_fp8_qdq() or self._has_w4afp8()
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import array
+import concurrent.futures
 import ctypes
 import errno
 import functools
@@ -102,9 +103,48 @@ def exact_div(x: int, y: int) -> int:
     return x // y
 
 
-def overlap(a: tuple[Index, Index], b: tuple[Index, Index]) -> tuple[Index, Index] | tuple[()]:
-    "Returns the overlap of two ranges, or an empty tuple if they do not overlap."
-    return (max(a[0], b[0]), min(a[1], b[1])) if a[0] < b[1] and b[0] < a[1] else ()
+Idx = TypeVar("Idx", bound=int)
+
+
+class HalfOpenRange(tuple[Idx, Idx], Generic[Idx]):
+    """A half-open range [beg, end). Falsy when empty (beg >= end).
+    Generic over index type. Supports unpacking into (beg, end)."""
+
+    __slots__ = ()
+
+    def __new__(cls, beg: Idx, end: Idx) -> "HalfOpenRange[Idx]":
+        return tuple.__new__(cls, (beg, end))
+
+    @property
+    def beg(self) -> Idx:
+        return self[0]
+
+    @property
+    def end(self) -> Idx:
+        return self[1]
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, HalfOpenRange):
+            return NotImplemented
+        return (not self and not other) or tuple.__eq__(self, other)
+
+    def __hash__(self) -> int:
+        return hash((0, 0)) if not self else tuple.__hash__(self)
+
+    def __bool__(self) -> bool:
+        return self[0] < self[1]
+
+    def __len__(self) -> int:
+        return max(0, self[1] - self[0])
+
+    def __contains__(self, item: Any) -> bool:
+        return self[0] <= item < self[1]
+
+
+def intersect(a: HalfOpenRange[Idx], b: HalfOpenRange[Idx]) -> HalfOpenRange[Idx]:
+    """Returns the intersection of two half-open ranges [beg, end).
+    The result may be empty (beg >= end), which is safe to chain into further intersections."""
+    return HalfOpenRange(max(a[0], b[0]), min(a[1], b[1]))
 
 
 def value_or(opt: T | None, default: T) -> T:
@@ -238,7 +278,7 @@ class TypedIndexList(Protocol[Index, T]):
 
 
 # @TODO: use this where applicable.
-def to_typed(index_type: Type[Index], lst: list[T]) -> TypedIndexList[Index, T]:
+def to_typed(index_type: Callable[[Any], Index], lst: list[T]) -> TypedIndexList[Index, T]:
     """
     Casts a standard list to a TypedIndexList with a strongly typed integer index.
 
@@ -252,13 +292,17 @@ def to_typed(index_type: Type[Index], lst: list[T]) -> TypedIndexList[Index, T]:
     return cast(TypedIndexList[Index, T], lst)
 
 
+def typed_range(*args: Index) -> Reversible[Index]:
+    return cast(Reversible[Index], range(*args))
+
+
 def filled_list(value: T, count: Index) -> TypedIndexList[Index, T]:
     "Note that all elements will be the same value. Do not use mutable values."
     return cast(TypedIndexList[Index, T], [value] * int(count))
 
 
-def make_typed(generator: Callable[[], T], count: Index) -> TypedIndexList[Index, T]:
-    return cast(TypedIndexList[Index, T], [generator() for _ in range(int(count))])
+def make_typed(generator: Callable[[Index], T], count: Index) -> TypedIndexList[Index, T]:
+    return cast(TypedIndexList[Index, T], [generator(Index) for Index in typed_range(count)])
 
 
 def typed_len(iterable: TypedIndexList[IndexO, T]) -> IndexO:
@@ -319,10 +363,6 @@ def filled_array2d(rows: Row, cols: Col, val: T) -> Array2D[Row, Col, T]:
     return Array2D(rows, cols, [val] * rows * cols)
 
 
-def typed_range(*args: Index) -> Reversible[Index]:
-    return cast(Reversible[Index], range(*args))
-
-
 def find(seq: Sequence[T], predicate: Callable[[T], bool], default: U) -> T | U:
     return next((item for item in seq if predicate(item)), default)
 
@@ -335,32 +375,49 @@ def find_index(seq: Iterable[T], predicate: Callable[[T], bool]) -> int:
     return i + 1
 
 
-mem_alignment: Final[int] = 2 << 20  # 2MB
+# mmap constants (Linux x86_64)
+MAP_PRIVATE: Final[int] = 0x02
+MAP_ANONYMOUS: Final[int] = 0x20
+PROT_READ: Final[int] = 0x1
+PROT_WRITE: Final[int] = 0x2
+MREMAP_MAYMOVE: Final[int] = 1
+MAP_FAILED: Final[int] = -1
 
-_libc = ctypes.CDLL(find_library("c"))
-_libc.aligned_alloc.restype = ctypes.c_void_p
-_libc.aligned_alloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+_libc = ctypes.CDLL(find_library("c"), use_errno=True)
+_libc.mmap.restype = ctypes.c_void_p
+_libc.mmap.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_longlong,
+]
+_libc.munmap.restype = ctypes.c_int
+_libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_libc.mremap.restype = ctypes.c_void_p
+_libc.mremap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int]
 _libc.madvise.restype = ctypes.c_int
 _libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-_libc.realloc.restype = ctypes.c_void_p
-_libc.realloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-_libc.free.restype = None
-_libc.free.argtypes = [ctypes.c_void_p]
 _libc.posix_fallocate.restype = ctypes.c_int
 _libc.posix_fallocate.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
 
+MADV_HUGEPAGE: Final[int] = 14
+MADV_NOHUGEPAGE: Final[int] = 15
+MADV_POPULATE_WRITE: Final[int] = 23
 
-def _aligned_alloc(alignment: int, size: int) -> int:
-    """
-    Allocates size bytes of uninitialized storage whose alignment is specified by alignment.
-    Returns the address as an integer.
-    Raises HostOOMError on failure.
-    """
-    assert size % alignment == 0
-    memptr: ctypes.c_void_p = _libc.aligned_alloc(ctypes.c_size_t(alignment), ctypes.c_size_t(size))
-    if memptr == ctypes.c_void_p(0):
-        raise HostOOMError("aligned_alloc failed")
-    return int(memptr)
+# TLLM_KV_CACHE_MANAGER_V2_THP=0 backs host pools with regular 4KB pages
+# (MADV_NOHUGEPAGE). On nodes with fragmented physical memory and THP
+# defrag=madvise, every 2MB THP fault stalls in direct compaction that
+# rarely succeeds, slowing pool population from GB/s to GB/min.
+USE_THP: Final[bool] = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_THP", "1") == "1"
+# TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS=0 disables prefaulting; pages are
+# then faulted in lazily, single-threaded, inside cuMemHostRegister.
+PREFAULT_THREADS: Final[int] = int(
+    os.environ.get(
+        "TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS", str(min(64, (os.cpu_count() or 32) // 2))
+    )
+)
 
 
 def _madvise(ptr: int, size: int, advice: int) -> None:
@@ -369,27 +426,62 @@ def _madvise(ptr: int, size: int, advice: int) -> None:
     ret = _libc.madvise(ctypes.c_void_p(ptr), ctypes.c_size_t(size), ctypes.c_int(advice))
     if ret != 0:
         error_code = ctypes.get_errno()
-        error_msg = f"madvise failed with errno {error_code}: {errno.errorcode.get(error_code, 'Unknown error')}"
-        raise HostOOMError(error_msg)
+        # Advisory, so just warn
+        warnings.warn(
+            f"madvise failed with errno {error_code}: {errno.errorcode.get(error_code, 'Unknown error')}"
+        )
 
 
-MADV_HUGEPAGE: Final[int] = 14
-
-
-def _realloc(ptr: int, size: int) -> int:
+def _mmap(size: int) -> int:
     """
-    Reallocates size bytes of storage whose alignment is specified by alignment.
+    Allocates size bytes using mmap (anonymous, private).
     Returns the address as an integer.
-    Raises OSError on failure.
+    Raises HostOOMError on failure.
     """
-    ret = _libc.realloc(ctypes.c_void_p(ptr), ctypes.c_size_t(size))
-    if ret == ctypes.c_void_p(0):
-        raise HostOOMError("realloc failed.")
-    return int(ret)
+    prot = PROT_READ | PROT_WRITE
+    flags = MAP_PRIVATE | MAP_ANONYMOUS
+
+    ptr = _libc.mmap(
+        None,
+        ctypes.c_size_t(size),
+        ctypes.c_int(prot),
+        ctypes.c_int(flags),
+        ctypes.c_int(-1),
+        ctypes.c_longlong(0),
+    )
+
+    ptr_int = int(ptr) if ptr is not None else 0
+    if ptr_int == -1 or ptr_int == 0xFFFFFFFFFFFFFFFF or ptr_int == 0:
+        error_code = ctypes.get_errno()
+        raise HostOOMError(f"mmap failed with errno {error_code}")
+
+    return ptr_int
 
 
-def _free(ptr: int) -> None:
-    _libc.free(ctypes.c_void_p(ptr))
+def _munmap(ptr: int, size: int) -> None:
+    ret = _libc.munmap(ctypes.c_void_p(ptr), ctypes.c_size_t(size))
+    if ret != 0:
+        error_code = ctypes.get_errno()
+        warnings.warn(f"munmap failed with errno {error_code}")
+
+
+def _mremap(ptr: int, old_size: int, new_size: int) -> int:
+    """
+    Remaps memory using mremap.
+    Returns the new address as an integer.
+    Raises HostOOMError on failure.
+    """
+    ptr_new = _libc.mremap(
+        ctypes.c_void_p(ptr),
+        ctypes.c_size_t(old_size),
+        ctypes.c_size_t(new_size),
+        ctypes.c_int(MREMAP_MAYMOVE),
+    )
+    ptr_int = int(ptr_new) if ptr_new is not None else 0
+    if ptr_int == -1 or ptr_int == 0xFFFFFFFFFFFFFFFF or ptr_int == 0:
+        error_code = ctypes.get_errno()
+        raise HostOOMError(f"mremap failed with errno {error_code}")
+    return ptr_int
 
 
 def _posix_fallocate(fd: int, offset: int, length: int) -> None:
@@ -401,9 +493,10 @@ def _posix_fallocate(fd: int, offset: int, length: int) -> None:
 
 
 class HostMem:
-    ALIGNMENT: ClassVar[int] = 2 << 20
+    ALIGNMENT: ClassVar[int] = 4096  # 4KB
     """
-    Host memory aligned to 2MB, reallocable for low-cost resizing and registered to CUDA as page-locked memory.
+    Host memory, reallocable for low-cost resizing and registered to CUDA as page-locked memory.
+    Uses MADV_HUGEPAGE to opportunistically use Transparent Huge Pages (THP) where possible.
     Resizing will keep the original memory content, like `realloc` in C.
     """
     __slots__ = ("_address", "_size", "_num_registered_chunks")
@@ -431,17 +524,29 @@ class HostMem:
             self._address = 0
             self._size = 0
             return
-        self._address = _aligned_alloc(mem_alignment, size)
+
+        # Allocate with standard mmap (4KB alignment)
+        self._address = _mmap(size)
+        assert self._address % self.ALIGNMENT == 0
         self._size = size
-        _madvise(self._address, size, MADV_HUGEPAGE)
+
+        # Opportunistically advise huge pages for the whole range.
+        # The kernel will use huge pages for aligned 2MB chunks within this range.
+        _madvise(self._address, self._size, MADV_HUGEPAGE if USE_THP else MADV_NOHUGEPAGE)
+
+        if PREFAULT_THREADS > 0:
+            self._parallel_prefault(PREFAULT_THREADS)
         self._register_to_cuda()
 
     def resize(self, new_size: int) -> None:
         self._unregister_from_cuda()
         try:
-            self._address = _realloc(self._address, new_size)
+            self._address = _mremap(self._address, self._size, new_size)
+            assert self._address % self.ALIGNMENT == 0
             self._size = new_size
-            _madvise(self._address, new_size, MADV_HUGEPAGE)
+
+            # Re-advise the configured page mode for the new range.
+            _madvise(self._address, self._size, MADV_HUGEPAGE if USE_THP else MADV_NOHUGEPAGE)
         finally:
             self._register_to_cuda()
 
@@ -449,12 +554,56 @@ class HostMem:
         if self._address == 0:
             return
         self._unregister_from_cuda()
-        _free(self._address)
+        _munmap(self._address, self._size)
         self._address = 0
         self._size = 0
 
     def __del__(self) -> None:
         self.destroy()
+
+    def _parallel_prefault(self, nthreads: int) -> None:
+        """Fault in all pages with parallel threads before cuMemHostRegister,
+        so registration only pins pages (never allocates them).
+
+        Lazy faulting inside cuMemHostRegister is single-threaded and, under
+        memory pressure or THP compaction stalls, can take minutes for
+        multi-hundred-GiB pools. MADV_POPULATE_WRITE populates in bulk; small
+        chunks keep mmap_lock hold times short (one giant madvise per thread
+        serializes every other thread behind it) and let threads
+        load-balance.
+        """
+        chunk = 512 << 20
+
+        def populate(off: int) -> None:
+            ln = min(chunk, self._size - off)
+            if ln <= 0:
+                return
+            ret = _libc.madvise(
+                ctypes.c_void_p(self._address + off),
+                ctypes.c_size_t(ln),
+                ctypes.c_int(MADV_POPULATE_WRITE),
+            )
+            if ret != 0:
+                error_code = ctypes.get_errno()
+                if error_code in (errno.EINVAL, getattr(errno, "ENOSYS", -1)):
+                    # MADV_POPULATE_WRITE requires Linux >= 5.14; on older
+                    # kernels fall back to touching every page.
+                    ctypes.memset(self._address + off, 0, ln)
+                    return
+                error_name = errno.errorcode.get(error_code, "Unknown error")
+                if error_code == errno.ENOMEM:
+                    # Surface real allocation failures instead of masking them
+                    # with a memset that would trigger a system OOM kill.
+                    raise HostOOMError(
+                        f"madvise(MADV_POPULATE_WRITE) failed with errno {error_code}: {error_name}"
+                    )
+                raise OSError(
+                    error_code,
+                    f"madvise(MADV_POPULATE_WRITE) failed: {error_name}",
+                )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=nthreads) as executor:
+            list(executor.map(populate, range(0, self._size, chunk)))
 
     def _register_to_cuda(self) -> None:
         assert self._num_registered_chunks == 0
@@ -524,13 +673,28 @@ class DynamicBitset:
         return self._num_set_bits
 
     def resize(self, new_capacity: int) -> None:
-        extra_elems = div_up(new_capacity, 64) - len(self._bits)
-        if extra_elems > 0:
-            self._bits.extend(array.array(self.TYPE_CODE, [0] * extra_elems))
-        elif extra_elems < 0:
-            self._bits = self._bits[:extra_elems]
-            if new_capacity % 64 != 0:
-                self._bits[-1] &= self.ALL_SET_MASK >> (64 - (new_capacity % 64))
+        old_elems = len(self._bits)
+        new_elems = div_up(new_capacity, 64)
+
+        # When the capacity shrinks, every set bit at or above new_capacity is
+        # dropped. Account for those bits so num_set_bits stays accurate, and
+        # mask the retained partial word so any_set() cannot observe stale bits.
+        # This covers both fewer-words and same-word-count (new_elems ==
+        # old_elems with a smaller new_capacity) shrinks.
+        if new_elems <= old_elems:
+            for w in range(new_elems, old_elems):
+                self._num_set_bits -= bin(self._bits[w]).count("1")
+            if new_elems >= 1 and new_capacity % 64 != 0:
+                keep_mask = self.ALL_SET_MASK >> (64 - (new_capacity % 64))
+                word = self._bits[new_elems - 1]
+                dropped = word & ~keep_mask & self.ALL_SET_MASK
+                self._num_set_bits -= bin(dropped).count("1")
+                self._bits[new_elems - 1] = word & keep_mask
+
+        if new_elems > old_elems:
+            self._bits.extend(array.array(self.TYPE_CODE, [0] * (new_elems - old_elems)))
+        elif new_elems < old_elems:
+            self._bits = self._bits[:new_elems]
 
     # check if any bit in the range [start, end) is set
     def any_set(self, start: int, end: int) -> bool:
@@ -803,7 +967,7 @@ class TemporaryCudaStream(CachedCudaStream):
     """
     A cached non-blocking CUDA stream. Mainly used as temporary worker streams.
     Requires a list of prior events to wait for dependencies. A finish event is recorded when exiting
-    normally. Call take_finish_event() to get the finish event.
+    normally. Call take_finish_event() to consume the finish event, otherwise you get a warning.
     """
 
     __slots__ = "_finish_event"

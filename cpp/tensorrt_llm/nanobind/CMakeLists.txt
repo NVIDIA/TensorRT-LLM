@@ -11,17 +11,18 @@ set(SRCS
     batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/kvCacheManagerV2Utils.cpp
+    batch_manager/kvCacheManagerV2.cpp
     batch_manager/llmRequest.cpp
     common/tllmExceptions.cpp
     executor/bindings.cpp
-    executor/executor.cpp
     executor/executorConfig.cpp
     executor/request.cpp
     process_group/bindings.cpp
     runtime/bindings.cpp
     runtime/hostfunc.cpp
     runtime/moeBindings.cpp
-    testing/modelSpecBinding.cpp
+    suffixAutomaton/bindings.cpp
+    testing/kvCacheManagerTestUtilBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
@@ -29,7 +30,27 @@ set(SRCS
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
-nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
+# KV Cache Manager V2 include directory (global, needed during compilation of
+# SRCS) NOTE: PROJECT_SOURCE_DIR = cpp/ (build_wheel.py passes cpp/ as -S), so
+# batch_manager is one level down and the vendored SHA-256 is at
+# tensorrt_llm/common/sha256.
+set(KV_CACHE_MANAGER_V2_INCLUDE
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+include_directories(${KV_CACHE_MANAGER_V2_INCLUDE}
+                    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+
+# NOSTRIP: Disable stripping for BOLT compatibility (requires --emit-relocs)
+if(ENABLE_BOLT_COMPATIBLE)
+  nanobind_add_module(${TRTLLM_NB_MODULE} NOSTRIP ${SRCS})
+else()
+  nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
+endif()
+
+# SHA-256 symbols are provided by tensorrt_llm_batch_manager_static (via the
+# shared lib). Only add the include directory so headers resolve during
+# compilation of kvCacheManagerV2.cpp.
+target_include_directories(
+  ${TRTLLM_NB_MODULE} PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -48,7 +69,6 @@ target_link_libraries(
          ${TORCH_LIBRARIES}
          torch_python
          ${CUDA_DRV_LIB}
-         ${CUDA_NVML_LIB}
          th_common
          pg_utils)
 target_compile_definitions(

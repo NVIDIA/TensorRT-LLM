@@ -145,7 +145,9 @@ template <
     // Do we use half epilogue for the 2nd GEMM (hmma_fp32)
     bool BMM2_FP16_EPILOGUE = true,
     // non-positive means disabled
-    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0>
+    int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0,
+    // Enable skip softmax attention feature.
+    bool ENABLE_SKIP_SOFTMAX_ = false>
 struct Kernel_traits_
 {
 
@@ -196,6 +198,9 @@ struct Kernel_traits_
     {
         SAGE_BLOCK_SIZE_V = SAGE_BLOCK_SIZE_V_
     };
+
+    // Are we enabling skip softmax attention feature?
+    static constexpr bool ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_;
 
     // TODO: expose these tiling params to the interface
     enum
@@ -271,7 +276,8 @@ struct Kernel_traits_
         VERSION = VERSION_
     };
 
-    // The mask version: padding (2), causal (3), sliding_window_causal (4), custom_mask (5).
+    // The mask version: padding (2), causal (3), sliding_window_causal (4), bidirectional_sliding_window (5),
+    // custom_mask (6).
     enum
     {
         MASK_VERSION = MASK_VERSION_
@@ -289,10 +295,16 @@ struct Kernel_traits_
         SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4
     };
 
+    // Whether use the bidirectional sliding window attention or not.
+    enum
+    {
+        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5
+    };
+
     // Whether use the custom mask or not.
     enum
     {
-        CUSTOM_MASK = MASK_VERSION_ == 5
+        CUSTOM_MASK = MASK_VERSION_ == 6
     };
 
     // Do we use LDGSTS for Q, K or V.
@@ -551,13 +563,19 @@ struct Kernel_traits_fmhca_
     // Whether use causal mask or not.
     enum
     {
-        CAUSAL_MASK = MASK_VERSION >= 3
+        CAUSAL_MASK = MASK_VERSION == 3 || MASK_VERSION == 4
     };
 
     // Whether use the sliding window attention or not.
     enum
     {
         SLIDING_WINDOW_ATTENTION = MASK_VERSION == 4
+    };
+
+    // Whether use the bidirectional sliding window attention or not.
+    enum
+    {
+        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION == 5
     };
 
     // Do we use LDGSTS for Q, K or V.
@@ -745,13 +763,19 @@ struct Kernel_traits_interleaved_v2_
     // Whether use causal mask or not.
     enum
     {
-        CAUSAL_MASK = MASK_VERSION_ >= 3
+        CAUSAL_MASK = MASK_VERSION_ == 3 || MASK_VERSION_ == 4
     };
 
     // Whether use the sliding window attention or not.
     enum
     {
         SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4
+    };
+
+    // Whether use the bidirectional sliding window attention or not.
+    enum
+    {
+        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5
     };
 
     // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
@@ -986,10 +1010,13 @@ template <
     // The output type.
     typename OutputType = typename Traits::A_type,
     // The sage attention block size for Q, K and V
-    int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0>
+    int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0,
+    // Enable skip softmax attention feature.
+    bool ENABLE_SKIP_SOFTMAX = false>
 using Kernel_traits_v2 = Kernel_traits_<Traits, fmha::v2::Gmem_tile_qkv, fmha::v2::Gmem_tile_qkv,
     fmha::v2::Gmem_tile_qkv, Gmem_tile_o_dispatcher<Traits, OutputType>::Gmem_tile_o, S, D, DV, STEP, WARPS_M, WARPS_N,
-    CTAS_PER_HEAD, FLAGS, 2, MASK_VERSION, BMM2_FP16_EPILOGUE, SAGE_BLOCK_SIZE_Q, SAGE_BLOCK_SIZE_K, SAGE_BLOCK_SIZE_V>;
+    CTAS_PER_HEAD, FLAGS, 2, MASK_VERSION, BMM2_FP16_EPILOGUE, SAGE_BLOCK_SIZE_Q, SAGE_BLOCK_SIZE_K, SAGE_BLOCK_SIZE_V,
+    ENABLE_SKIP_SOFTMAX>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1019,11 +1046,13 @@ template <
     // The output type.
     typename OutputType = typename Traits::A_type,
     // The sage attention block size for Q, K and V
-    int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0>
-using Kernel_traits_v2_q_k_v
-    = Kernel_traits_<Traits, fmha::v2::Gmem_tile_q_k_v, fmha::v2::Gmem_tile_q_k_v, fmha::v2::Gmem_tile_q_k_v,
-        Gmem_tile_o_dispatcher<Traits, OutputType>::Gmem_tile_o, S, D, DV, STEP, WARPS_M, WARPS_N, CTAS_PER_HEAD, FLAGS,
-        2, MASK_VERSION, BMM2_FP16_EPILOGUE, SAGE_BLOCK_SIZE_Q, SAGE_BLOCK_SIZE_K, SAGE_BLOCK_SIZE_V>;
+    int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0,
+    // Enable skip softmax attention feature.
+    bool ENABLE_SKIP_SOFTMAX = false>
+using Kernel_traits_v2_q_k_v = Kernel_traits_<Traits, fmha::v2::Gmem_tile_q_k_v, fmha::v2::Gmem_tile_q_k_v,
+    fmha::v2::Gmem_tile_q_k_v, Gmem_tile_o_dispatcher<Traits, OutputType>::Gmem_tile_o, S, D, DV, STEP, WARPS_M,
+    WARPS_N, CTAS_PER_HEAD, FLAGS, 2, MASK_VERSION, BMM2_FP16_EPILOGUE, SAGE_BLOCK_SIZE_Q, SAGE_BLOCK_SIZE_K,
+    SAGE_BLOCK_SIZE_V, ENABLE_SKIP_SOFTMAX>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1053,11 +1082,13 @@ template <
     // The output type.
     typename OutputType = typename Traits::A_type,
     // The sage attention block size for Q, K and V
-    int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0>
-using Kernel_traits_v2_paged_kv_cache
-    = Kernel_traits_<Traits, fmha::v2::Gmem_tile_q_k_v, fmha::v2::Gmem_tile_paged_kv, fmha::v2::Gmem_tile_paged_kv,
-        Gmem_tile_o_dispatcher<Traits, OutputType>::Gmem_tile_o, S, D, DV, STEP, WARPS_M, WARPS_N, CTAS_PER_HEAD, FLAGS,
-        2, MASK_VERSION, BMM2_FP16_EPILOGUE, SAGE_BLOCK_SIZE_Q, SAGE_BLOCK_SIZE_K, SAGE_BLOCK_SIZE_V>;
+    int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0,
+    // Enable skip softmax attention feature.
+    bool ENABLE_SKIP_SOFTMAX = false>
+using Kernel_traits_v2_paged_kv_cache = Kernel_traits_<Traits, fmha::v2::Gmem_tile_q_k_v, fmha::v2::Gmem_tile_paged_kv,
+    fmha::v2::Gmem_tile_paged_kv, Gmem_tile_o_dispatcher<Traits, OutputType>::Gmem_tile_o, S, D, DV, STEP, WARPS_M,
+    WARPS_N, CTAS_PER_HEAD, FLAGS, 2, MASK_VERSION, BMM2_FP16_EPILOGUE, SAGE_BLOCK_SIZE_Q, SAGE_BLOCK_SIZE_K,
+    SAGE_BLOCK_SIZE_V, ENABLE_SKIP_SOFTMAX>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1087,11 +1118,13 @@ template <
     // The output type.
     typename OutputType = typename Traits::A_type,
     // The sage attention block size for Q, K and V
-    int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0>
+    int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0,
+    // Enable skip softmax attention feature.
+    bool ENABLE_SKIP_SOFTMAX = false>
 using Kernel_traits_v2_contiguous_kv_cache = Kernel_traits_<Traits, fmha::v2::Gmem_tile_q_k_v,
     fmha::v2::Gmem_tile_contiguous_kv, fmha::v2::Gmem_tile_contiguous_kv,
     Gmem_tile_o_dispatcher<Traits, OutputType>::Gmem_tile_o, S, D, 0, STEP, WARPS_M, WARPS_N, CTAS_PER_HEAD, FLAGS, 2,
-    MASK_VERSION, BMM2_FP16_EPILOGUE, SAGE_BLOCK_SIZE_Q, SAGE_BLOCK_SIZE_K, SAGE_BLOCK_SIZE_V>;
+    MASK_VERSION, BMM2_FP16_EPILOGUE, SAGE_BLOCK_SIZE_Q, SAGE_BLOCK_SIZE_K, SAGE_BLOCK_SIZE_V, ENABLE_SKIP_SOFTMAX>;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

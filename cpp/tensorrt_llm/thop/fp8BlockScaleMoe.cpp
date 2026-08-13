@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <torch/library.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <unordered_map>
 
@@ -40,11 +41,13 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     std::optional<at::Tensor> const& routing_bias, at::Tensor const& hidden_states,
     at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights, at::Tensor const& gemm1_weights_scale,
     at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale, int64_t const num_experts,
-    int64_t const top_k, std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group,
-    int64_t const intermediate_size, int64_t const local_expert_offset, int64_t const local_num_experts,
-    std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
-    MoeRunnerType& moe_runner, int64_t moeConfigIndex, std::optional<at::Tensor> const& topk_weights,
-    std::optional<at::Tensor> const& topk_ids)
+    int64_t const top_k, std::optional<int64_t> const num_fused_shared_experts, std::optional<int64_t> const n_group,
+    std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+    int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim,
+    int64_t const routing_method_type, MoeRunnerType& moe_runner, int64_t moeConfigIndex,
+    std::optional<at::Tensor> const& topk_weights, std::optional<at::Tensor> const& topk_ids,
+    std::optional<double> const& gemm1_clamp_limit = std::nullopt,
+    std::optional<at::Tensor> const& out_tensor = std::nullopt)
 {
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP8 block scale MOE");
 
@@ -63,15 +66,9 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     }
     else if (routing_logits.has_value())
     {
-        if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3)
-        {
-            TORCH_CHECK(routing_logits.value().scalar_type() == at::ScalarType::Float, "routing_logits must be float");
-        }
-        else
-        {
-            TORCH_CHECK(
-                routing_logits.value().scalar_type() == at::ScalarType::BFloat16, "routing_logits must be bfloat16");
-        }
+        TORCH_CHECK(routing_logits.value().scalar_type() == at::ScalarType::BFloat16
+                || routing_logits.value().scalar_type() == at::ScalarType::Float,
+            "routing_logits must be bfloat16 or float32");
         TORCH_CHECK(routing_logits.value().dim() == 2, "routing_logits must be 2D.");
         TORCH_CHECK(routing_logits.value().sizes()[1] == num_experts, "routing_logits dim1 must match num_experts.");
     }
@@ -99,7 +96,9 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
 
     if (routing_bias.has_value())
     {
-        TORCH_CHECK(routing_bias.value().scalar_type() == at::ScalarType::BFloat16, "routing_bias must be bfloat16.");
+        TORCH_CHECK(routing_bias.value().scalar_type() == at::ScalarType::BFloat16
+                || routing_bias.value().scalar_type() == at::ScalarType::Float,
+            "routing_bias must be bfloat16 or float32.");
         TORCH_CHECK(routing_bias.value().dim() == 1, "routing_bias must be 1D.");
         TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts, "routing_bias has incorrect shape.");
     }
@@ -121,16 +120,22 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
         || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
     {
-        TORCH_CHECK(top_k <= 10 && top_k > 0,
-            "Current routing kernel (no groups, renormalize) only supports top_k<=8 && top_k>0.");
+        TORCH_CHECK(top_k <= 32 && top_k > 0,
+            "Current routing kernel (no groups, renormalize) only supports top_k<=32 && top_k>0.");
     }
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
     {
         TORCH_CHECK(top_k == 1, "Current routing kernel (no groups, Llama4) only supports top_k=1.");
     }
 
-    TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
+
+    // Fused shared experts are appended by the integrated routing kernel (from routing_logits);
+    // that path is skipped when external topk_ids/topk_weights are supplied, which would silently
+    // drop the shared experts. Reject the unsupported combination up front.
+    TORCH_CHECK(num_fused_shared_experts.value_or(0) == 0 || (!topk_ids.has_value() && !topk_weights.has_value()),
+        "Fused shared experts require integrated routing; external topk_ids/topk_weights are not "
+        "supported when num_fused_shared_experts > 0.");
 
     // If both routing inputs are provided, they must be on the same device
     if (routing_logits.has_value() && topk_ids.has_value())
@@ -142,12 +147,17 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoERunnerArgs args;
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
+    TORCH_CHECK(num_fused_shared_experts.value_or(0) >= 0, "num_fused_shared_experts must be non-negative.");
+    int64_t const num_total_experts = num_experts + num_fused_shared_experts.value_or(0);
+    int64_t const total_experts_per_token = top_k + num_fused_shared_experts.value_or(0);
+    int64_t const num_total_local_experts = local_num_experts + num_fused_shared_experts.value_or(0);
+
     // setup args
     // note: the assumption is that output data type is always Bfloat16 (the default)
     args.mDtypeElt = btg::Dtype::E4m3;
     auto const routing_bias_dtype
         = routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
-    args.mDtypeExpW = routing_bias_dtype == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
+    args.mDtypeBias = routing_bias_dtype == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
     args.routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
     args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
@@ -165,6 +175,7 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     args.num_experts = num_experts;
     args.hidden_size = hidden_states.sizes()[1];
     args.top_k = top_k;
+    args.num_fused_shared_experts = num_fused_shared_experts.value_or(0);
     args.n_group = n_group.value_or(0);
     args.topk_group = topk_group.value_or(0);
     args.local_expert_offset = local_expert_offset;
@@ -172,6 +183,19 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     args.routed_scaling_factor = routed_scaling_factor.value_or(1.0);
     args.intermediate_size = intermediate_size;
     args.mUseDeepSeekFp8 = true;
+
+    if (gemm1_clamp_limit.has_value())
+    {
+        // FP8 path's separate activation kernel honors a single uniform clamp;
+        // see DevKernel.h::activation::Data::swigluLimit. NVFP4 path's
+        // fused-activation cubins consume a per-expert tensor via
+        // args.gemm1_clamp_limit (kept for API symmetry, populated by
+        // run_fp4_block_scale_moe). If non-uniform usage becomes necessary on
+        // the FP8 path, extend the activation kernel with a
+        // permutedIdx -> expertIdx lookup and surface a tensor variant here.
+        args.gemm1_clamp_limit_value = static_cast<float>(gemm1_clamp_limit.value());
+        args.has_gemm1_clamp_limit_value = true;
+    }
 
     // allocate workspace for routing kernel
     if (routing_logits.has_value() && topk_ids.has_value())
@@ -184,7 +208,7 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         = at::detail::empty_cuda({num_experts}, at::ScalarType::Int, routing_device, std::nullopt);
     int32_t max_num_padded_tokens
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxPermutedPaddedCount(
-            args.num_tokens, top_k, num_experts, tile_tokens_dim);
+            args.num_tokens, total_experts_per_token, num_total_experts, tile_tokens_dim);
     int32_t max_num_padded_tokens_gemm1
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, 2 * args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
@@ -193,15 +217,35 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
             max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
     at::Tensor total_num_padded_tokens
         = at::empty({}, at::TensorOptions().device(routing_device).dtype(at::ScalarType::Int));
-    at::Tensor expanded_idx_to_permuted_idx
-        = at::detail::empty_cuda({args.num_tokens * args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
+    at::Tensor expanded_idx_to_permuted_idx = at::detail::empty_cuda(
+        {args.num_tokens * total_experts_per_token}, at::ScalarType::Int, routing_device, std::nullopt);
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_device, std::nullopt);
-    at::Tensor expert_weights
-        = at::detail::empty_cuda({args.num_tokens, args.top_k}, routing_bias_dtype, routing_device, std::nullopt);
-    at::Tensor expert_indexes
-        = at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
-    int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));
+    // expert_weights is the routing kernel's topk-weights output and is consumed by moe_finalize,
+    // which requires `dtype == scale_dtype` against gemm2_output. Track args.mDtypeOut so the two
+    // buffers stay in lock-step automatically; do NOT tie this to the bias dtype, which is allowed
+    // to differ.
+    auto const expert_weights_scalar_type = [&]()
+    {
+        switch (args.mDtypeOut)
+        {
+        case btg::Dtype::Bfloat16: return at::ScalarType::BFloat16;
+        case btg::Dtype::Fp16: return at::ScalarType::Half;
+        case btg::Dtype::Fp32: return at::ScalarType::Float;
+        default:
+            TORCH_CHECK(false,
+                "Unsupported MoE output dtype for expert_weights allocation: ", btg::dtypeToString(args.mDtypeOut),
+                ". Expected Bfloat16/Fp16/Fp32.");
+        }
+    }();
+    at::Tensor expert_weights = at::detail::empty_cuda(
+        {args.num_tokens, total_experts_per_token}, expert_weights_scalar_type, routing_device, std::nullopt);
+    at::Tensor expert_indexes = at::detail::empty_cuda(
+        {args.num_tokens, total_experts_per_token}, at::ScalarType::Int, routing_device, std::nullopt);
+    // Size for both histogram halves [counts | offsets] over the fused expert set
+    // (num_experts + num_fused_shared_experts); the large-#tokens offsets kernel indexes
+    // up to 2 * num_total_experts. num_tokens_per_expert stays at num_experts (unused by routing).
+    int64_t const size_of_expert_count_histogram = std::max(num_total_experts * 2, int64_t(256 * 2));
     at::Tensor expert_count_histogram
         = at::detail::empty_cuda({size_of_expert_count_histogram}, at::ScalarType::Int, routing_device, std::nullopt);
 
@@ -218,7 +262,7 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
     int32_t max_num_ctas = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getMaxNumCtasInBatchDim(
-        args.num_tokens, args.top_k, args.num_experts, tile_tokens_dim);
+        args.num_tokens, total_experts_per_token, num_total_experts, tile_tokens_dim);
     at::Tensor cta_idx_xy_to_batch_idx
         = at::detail::empty_cuda({max_num_ctas}, at::ScalarType::Int, routing_device, std::nullopt);
     at::Tensor cta_idx_xy_to_mn_limit
@@ -232,14 +276,18 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(
         routing_logits.has_value() ? routing_logits.value().get_device() : topk_ids.value().get_device());
+    auto const dtypeRoutingLogits = routing_logits.has_value()
+        ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
+        : btg::Dtype::Bfloat16;
     routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
-        args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
-        expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
-        expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr /*permuted_idx_to_expanded_idx.data_ptr<int>()*/,
-        permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, args.topk_ids,
-        num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
-        cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, false, true,
-        static_cast<RoutingMethodType>(routing_method_type), stream);
+        args.num_fused_shared_experts, args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts,
+        args.routed_scaling_factor, expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(),
+        total_num_padded_tokens.data_ptr<int>(), expanded_idx_to_permuted_idx.data_ptr<int>(),
+        nullptr /*permuted_idx_to_expanded_idx.data_ptr<int>()*/, permuted_idx_to_token_idx.data_ptr<int>(),
+        expert_weights_ptr, args.topk_ids, num_tokens_per_expert.data_ptr<int>(),
+        cta_idx_xy_to_batch_idx.data_ptr<int>(), cta_idx_xy_to_mn_limit.data_ptr<int>(),
+        num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt, false, true,
+        static_cast<RoutingMethodType>(routing_method_type), stream, dtypeRoutingLogits, args.mDtypeBias);
 
     // MoE kernel except routing
     TORCH_CHECK(hidden_states.scalar_type() == at::ScalarType::Float8_e4m3fn, "hidden_states must be fp8.");
@@ -250,36 +298,49 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     TORCH_CHECK(hidden_states_scale.sizes()[1] == args.num_tokens, "hidden_states_scale dim1 must match num_tokens.");
     TORCH_CHECK(gemm1_weights.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm1_weights must be fp8.");
     TORCH_CHECK(gemm1_weights.dim() == 3, "gemm1_weights must be 3D.");
+    TORCH_CHECK(gemm1_weights.sizes()[0] == num_total_local_experts, "gemm1_weights has incorrect shape.");
     TORCH_CHECK(gemm1_weights.sizes()[1] % 2 == 0, "the second dimension of weights must be even.");
     TORCH_CHECK(intermediate_size == gemm1_weights.sizes()[1] / 2, "intermediate_size has incorrect shape.");
     TORCH_CHECK(gemm1_weights.sizes()[2] == hidden_states.sizes()[1],
         "the third dimension of weights must be equal to hidden_size.");
     TORCH_CHECK(gemm1_weights_scale.scalar_type() == at::ScalarType::Float, "gemm1_weights_scale must be float.");
     TORCH_CHECK(gemm1_weights_scale.dim() == 3, "gemm1_weights_scale must be 3D.");
-
-    TORCH_CHECK(gemm1_weights_scale.sizes()[0] == local_num_experts, "gemm1_weights_scale has incorrect shape.");
+    TORCH_CHECK(gemm1_weights_scale.sizes()[0] == num_total_local_experts, "gemm1_weights_scale has incorrect dim 0.");
     TORCH_CHECK(intermediate_size % 128 == 0, "the second dimension of weights must be a multiple of 128.");
     TORCH_CHECK(
         gemm1_weights_scale.sizes()[1] == 2 * intermediate_size / 128, "gemm1_weights_scale has incorrect shape.");
     TORCH_CHECK(gemm1_weights_scale.sizes()[2] == args.hidden_size / 128, "gemm1_weights_scale has incorrect shape.");
     TORCH_CHECK(gemm2_weights.scalar_type() == at::ScalarType::Float8_e4m3fn, "gemm2_weights must be fp8.");
     TORCH_CHECK(gemm2_weights.dim() == 3, "gemm2_weights must be 3D.");
+    TORCH_CHECK(gemm2_weights.sizes()[0] == num_total_local_experts, "gemm2_weights has incorrect shape.");
     TORCH_CHECK(gemm2_weights.sizes()[2] == intermediate_size,
         "the third dimension of weights must be equal to intermediate_size.");
     TORCH_CHECK(gemm2_weights_scale.scalar_type() == at::ScalarType::Float, "gemm2_weights_scale must be float.");
     TORCH_CHECK(gemm2_weights_scale.dim() == 3, "gemm2_weights_scale must be 3D.");
-    TORCH_CHECK(gemm2_weights_scale.sizes()[0] == local_num_experts, "gemm2_weights_scale has incorrect shape.");
+    TORCH_CHECK(gemm2_weights_scale.sizes()[0] == num_total_local_experts, "gemm2_weights_scale has incorrect dim 0.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[1] == args.hidden_size / 128, "gemm2_weights_scale has incorrect shape.");
     TORCH_CHECK(gemm2_weights_scale.sizes()[2] == intermediate_size / 128, "gemm2_weights_scale has incorrect shape.");
 
-    // allocate output
-    at::Tensor output = at::detail::empty_cuda(
-        {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+    // allocate or use provided output
+    at::Tensor output;
+    if (out_tensor.has_value())
+    {
+        TORCH_CHECK(out_tensor->scalar_type() == at::ScalarType::BFloat16, "out_tensor must be bfloat16.");
+        TORCH_CHECK(out_tensor->dim() == 2, "out_tensor must be 2D.");
+        TORCH_CHECK(out_tensor->sizes()[0] == args.num_tokens && out_tensor->sizes()[1] == args.hidden_size,
+            "out_tensor has incorrect shape.");
+        TORCH_CHECK(out_tensor->device() == hidden_states.device(), "out_tensor must be on the same device as inputs.");
+        output = out_tensor.value();
+    }
+    else
+    {
+        output = at::detail::empty_cuda(
+            {args.num_tokens, args.hidden_size}, at::ScalarType::BFloat16, hidden_states.device(), std::nullopt);
+    }
 
     // setup workspace
     workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
     workspace.total_max_padded_tokens = std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
-    workspace.ProjUpTileN = tile_tokens_dim;
     workspace.routing_expert_indexes = expert_indexes.data_ptr<int>();
     workspace.permuted_idx_size = total_num_padded_tokens.data_ptr<int>();
     workspace.expanded_idx_to_permuted_idx
@@ -331,20 +392,39 @@ public:
         }
     }
 
-    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(
-        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(int64_t topK,
+        std::optional<int64_t> const numFusedSharedExpert, int64_t hiddenSize, int64_t intermediateSize,
+        int64_t numLocalExperts, int64_t numTokens) const
     {
+        TORCH_CHECK(numFusedSharedExpert.value_or(0) >= 0, "num_fused_shared_experts must be non-negative.");
+        int64_t const totalExpertsPerToken = topK + numFusedSharedExpert.value_or(0);
+        int64_t const numTotalLocalExperts = numLocalExperts + numFusedSharedExpert.value_or(0);
+        // WAR: the small-tile (tileN 8/16) dynB TRTLLM-Gen batched-GEMM cubins flakily hit an
+        // illegal memory access (garbage TMA-descriptor pointer, MMU fault in the gemm2 K-loop)
+        // when shared experts are fused into the grouped GEMM (num_fused_shared_experts > 0);
+        // tileN >= 32 is unaffected (10/10 clean vs minutes-to-crash baseline on B300 TP=4).
+        // Restrict the fused path to tileN >= 32 until the kernel-side fix lands (nvbug TBD).
+        // TLLM_MOE_FUSED_MIN_TILEN overrides the threshold (0 disables) for A/B experiments.
+        static int const fusedMinTileN = []()
+        {
+            char const* env = std::getenv("TLLM_MOE_FUSED_MIN_TILEN");
+            return env != nullptr ? std::atoi(env) : 32;
+        }();
         // returns (tileN, config)
         std::vector<std::vector<int64_t>> tactics;
         for (auto& [tileN, runner] : mRunners)
         {
-            auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, topK, numLocalExperts);
+            if (numFusedSharedExpert.value_or(0) > 0 && tileN < fusedMinTileN)
+            {
+                continue;
+            }
+            auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, totalExpertsPerToken, numTotalLocalExperts);
             if (chosen.find(tileN) == chosen.end())
             {
                 continue;
             }
-            auto config_indices_per_runner
-                = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
+            auto config_indices_per_runner = runner->getValidConfigIndices(
+                totalExpertsPerToken, hiddenSize, intermediateSize, numTotalLocalExperts, numTokens);
             for (auto cfg : config_indices_per_runner)
             {
                 tactics.push_back({tileN, cfg});
@@ -357,11 +437,12 @@ public:
         std::optional<at::Tensor> const& routing_bias, at::Tensor const& hidden_states,
         at::Tensor const& hidden_states_scale, at::Tensor const& gemm1_weights, at::Tensor const& gemm1_weights_scale,
         at::Tensor const& gemm2_weights, at::Tensor const& gemm2_weights_scale, int64_t num_experts, int64_t top_k,
-        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t const intermediate_size,
-        int64_t const local_expert_offset, int64_t const local_num_experts,
-        std::optional<double> const routed_scaling_factor, int64_t routing_method_type,
+        std::optional<int64_t> const num_fused_shared_experts, std::optional<int64_t> const n_group,
+        std::optional<int64_t> const topk_group, int64_t const intermediate_size, int64_t const local_expert_offset,
+        int64_t const local_num_experts, std::optional<double> const routed_scaling_factor, int64_t routing_method_type,
         std::vector<int64_t> tile_config_pair, std::optional<at::Tensor> const& topk_weights,
-        std::optional<at::Tensor> const& topk_ids)
+        std::optional<at::Tensor> const& topk_ids, std::optional<double> const& gemm1_clamp_limit = std::nullopt,
+        std::optional<at::Tensor> const& output = std::nullopt)
     {
         // tile_config_pair corresponds to pair (tileN, config)
         auto [tileN, config] = std::tie(tile_config_pair[0], tile_config_pair[1]);
@@ -369,20 +450,66 @@ public:
         // Autotuner has requested a default or 'fallback' config index
         if (tileN == -1 || config == -1)
         {
+            TORCH_CHECK(num_fused_shared_experts.value_or(0) >= 0, "num_fused_shared_experts must be non-negative.");
+            int64_t const total_experts_per_token = top_k + num_fused_shared_experts.value_or(0);
+            int64_t const num_total_local_experts = local_num_experts + num_fused_shared_experts.value_or(0);
+
             auto const num_tokens = hidden_states.sizes()[0];
             auto const hidden_size = hidden_states.sizes()[1];
 
-            float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
+            float const avg_tokens_per_expert
+                = static_cast<float>(num_tokens * total_experts_per_token) / num_total_local_experts;
             tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
 
-            config = mRunners.at(tileN)->getDefaultValidConfigIndex(
-                top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+            if (num_fused_shared_experts.value_or(0) > 0)
+            {
+                // getDefaultValidConfigIndex only pairs the per-GEMM "default" indices without
+                // re-validating them against the actual problem size. For the inflated fused
+                // expert/topK counts that can return a config whose kernel is absent (illegal
+                // memory access at launch). Pick an explicitly-validated config instead -- the
+                // same set the autotuner draws from -- searching the heuristic tileN first.
+                config = -1;
+                std::vector<int32_t> tileN_candidates{static_cast<int32_t>(tileN)};
+                for (auto t : mSupportedTileN)
+                {
+                    if (t != tileN)
+                        tileN_candidates.push_back(t);
+                }
+                // Same small-tile exclusion as getValidConfigs (see the WAR comment there).
+                static int const fusedMinTileNFallback = []()
+                {
+                    char const* env = std::getenv("TLLM_MOE_FUSED_MIN_TILEN");
+                    return env != nullptr ? std::atoi(env) : 32;
+                }();
+                for (auto t : tileN_candidates)
+                {
+                    if (t < fusedMinTileNFallback)
+                    {
+                        continue;
+                    }
+                    auto valid = mRunners.at(t)->getValidConfigIndices(
+                        total_experts_per_token, hidden_size, intermediate_size, num_total_local_experts, num_tokens);
+                    if (!valid.empty())
+                    {
+                        tileN = t;
+                        config = valid.front();
+                        break;
+                    }
+                }
+                TLLM_CHECK_WITH_INFO(
+                    config != -1, "No valid TRTLLM-Gen config found for fused shared-expert FP8 block-scale MoE.");
+            }
+            else
+            {
+                config = mRunners.at(tileN)->getDefaultValidConfigIndex(
+                    total_experts_per_token, hidden_size, intermediate_size, num_total_local_experts, num_tokens);
+            }
         }
 
         return run_fp8_block_scale_moe(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
-            gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, n_group, topk_group,
-            intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor, tileN,
-            routing_method_type, *mRunners.at(tileN), config, topk_weights, topk_ids);
+            gemm1_weights_scale, gemm2_weights, gemm2_weights_scale, num_experts, top_k, num_fused_shared_experts,
+            n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts, routed_scaling_factor,
+            tileN, routing_method_type, *mRunners.at(tileN), config, topk_weights, topk_ids, gemm1_clamp_limit, output);
     }
 
 private:

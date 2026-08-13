@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from enum import IntFlag, auto
 from typing import List, NamedTuple, Optional
 
+import numpy as np
+
 
 @dataclass(frozen=True)
 class IndexRange:
@@ -33,15 +35,8 @@ class MemRegion(NamedTuple):
 class MemRegionGroup(NamedTuple):
     """Describes a block of memory by starting pointer and size in bytes."""
 
-    ptrs: List[int]
+    ptrs: np.ndarray  # dtype=np.int64
     bytes_per_region: int
-
-
-class DataRole(IntFlag):
-    """Logical role(s) a memory region plays. Supports combinations."""
-
-    KEY = auto()
-    VALUE = auto()
 
 
 class DataLayout(IntFlag):
@@ -67,7 +62,6 @@ class KVRegionSpec(RegionSpec):
     Specifies a region within the Key/Value cache, with optional axes.
     """
 
-    role: DataRole = DataRole.KEY | DataRole.VALUE
     heads: Optional[IndexRange] = None
     tokens: Optional[IndexRange] = None
 
@@ -87,10 +81,10 @@ class RegionExtractorBase(ABC):
     """
 
     @abstractmethod
-    def extract(self, region_ids: Optional[List[int]] = None) -> List[SpecRegion]:
+    def extract(self, region_ids: Optional[np.ndarray] = None) -> List[SpecRegion]:
         """
         Args:
-            region_ids: (Optional) List of integer region identifiers to extract.
+            region_ids: (Optional) np.ndarray of integer region identifiers to extract.
         Returns:
             List of Regions for corresponding regions.
         """

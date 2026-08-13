@@ -13,22 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import AllReduce, MiniMaxAllReduceRMS
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
-from ..modules.linear import Linear
+from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
@@ -40,6 +43,26 @@ from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto
 #  2. QK layer normalization needs to be performed across the head_num * head_size dimension,
 #     which conflicts with the current TP-mode attention logic.
 # For the better performance, we suggest to enable attention DP when using MiniMax M2/M2.1 model.
+class _EScoreCorrectionBiasHolder(nn.Module):
+    """Holds e_score_correction_bias so the generic weight loader visits it with a narrow
+    prefix (block_sparse_moe.e_score_correction_bias). This avoids mark_consumed deleting
+    the whole block_sparse_moe prefix before gate and experts.backend load (see #11119).
+    """
+
+    def __init__(self, num_experts: int):
+        super().__init__()
+        self.e_score_correction_bias = nn.Parameter(
+            torch.empty((num_experts), dtype=torch.float32), requires_grad=False
+        )
+
+    def load_weights(self, weights: List[Dict]):
+        assert len(weights) == 1
+        w = weights[0]
+        # MiniMax M2: HF key is prefix.e_score_correction_bias, so filter_weights yields {"": tensor}.
+        src = w[""]
+        self.e_score_correction_bias.copy_(src[:].to(self.e_score_correction_bias.dtype))
+
+
 class MiniMaxM2MoE(nn.Module):
     def __init__(
         self,
@@ -60,16 +83,12 @@ class MiniMaxM2MoE(nn.Module):
             self.hidden_dim, self.num_experts, bias=False, dtype=torch.float32, quant_config=None
         )
 
-        self.e_score_correction_bias = nn.Parameter(
-            torch.empty((self.num_experts), dtype=torch.float32), requires_grad=False
-        )
-
         reduce_results = True
         self.experts = create_moe(
             routing_method=MiniMaxM2MoeRoutingMethod(
                 top_k=self.top_k,
                 num_experts=self.num_experts,
-                callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
+                callable_e_score_correction_bias=lambda: self.e_score_correction_bias.e_score_correction_bias,
             ),
             num_experts=self.num_experts,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
@@ -77,13 +96,9 @@ class MiniMaxM2MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
         )
-
-    def load_weights(self, weights: List[Dict]):
-        assert len(weights) == 1
-
-        self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
-        )
+        # Holder ensures generic loader only marks block_sparse_moe.e_score_correction_bias
+        # consumed, so gate and experts.backend can still load (see #11119).
+        self.e_score_correction_bias = _EScoreCorrectionBiasHolder(self.num_experts)
 
     def forward(
         self,
@@ -100,6 +115,76 @@ class MiniMaxM2MoE(nn.Module):
             use_dp_padding=False,
         )
         return final_hidden_states
+
+
+# We use all_reduce across all tp gpus to get the rms norm variance sum
+class MiniMaxRMSNorm(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        eps: float,
+        mapping: Mapping,
+        dtype: torch.dtype = torch.bfloat16,
+        head_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        self.mapping = mapping
+        # for attention input, tp_size * hidden_size = head_num * head_size
+        self.weight = nn.Parameter(torch.empty(hidden_size, dtype=dtype), requires_grad=False)
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.dtype = dtype
+        self.head_dim = head_dim
+        self.is_p2p_supported = can_access_peer(mapping)
+        self.all_reduce = AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.NCCL)
+
+        self.minimax_all_reduce_rms = MiniMaxAllReduceRMS(mapping=self.mapping)
+
+    def load_weights(self, weights: List[Dict]):
+        assert len(weights) == 1
+        src = weights[0]["weight"]
+        # When num_total_heads < tp_size (e.g. 8 KV heads, tp=16), the checkpoint weight
+        # [num_total_heads * head_dim] is smaller than what TP sharding expects
+        # [tp_size * local_hidden_size]. Replicate at the head level before sharding,
+        # consistent with how duplicate_kv_weight handles k_proj/v_proj.
+        full_size = self.mapping.tp_size * self.hidden_size
+        if src.shape[0] < full_size and self.head_dim is not None:
+            assert src.shape[0] % self.head_dim == 0, (
+                f"checkpoint weight size {src.shape[0]} is not divisible by head_dim {self.head_dim}"
+            )
+            num_total_heads = src.shape[0] // self.head_dim
+            assert self.mapping.tp_size % num_total_heads == 0, (
+                f"tp_size {self.mapping.tp_size} must be divisible by num_total_heads {num_total_heads} "
+                f"for head-level weight replication"
+            )
+            reps = self.mapping.tp_size // num_total_heads
+            src = (
+                src.reshape(num_total_heads, self.head_dim)
+                .repeat_interleave(reps, dim=0)
+                .reshape(-1)
+            )
+        weight = load_weight_shard(
+            src,
+            tensor_parallel_size=self.mapping.tp_size,
+            tensor_parallel_rank=self.mapping.tp_rank,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+        )
+        copy_weight(self.weight, weight)
+
+    def forward(self, hidden_states: torch.Tensor):
+        hidden_states = hidden_states.contiguous()
+        if not self.is_p2p_supported:
+            # Inter-node TP: IPC is unavailable, fall back to NCCL all-reduce of
+            # partial sum-of-squares followed by local RMS normalization.
+            hidden_f32 = hidden_states.float()
+            local_sum_sq = hidden_f32.pow(2).sum(-1, keepdim=True)
+            total_sum_sq = self.all_reduce(local_sum_sq)
+            total_hidden = self.hidden_size * self.mapping.tp_size
+            rms_inv = torch.rsqrt(total_sum_sq / total_hidden + self.eps)
+            return (hidden_f32 * rms_inv).to(hidden_states.dtype) * self.weight
+        rms_norm_out = self.minimax_all_reduce_rms(hidden_states, self.weight, self.eps)
+        return rms_norm_out
 
 
 # It's a little bit tricky to implement special qk norm
@@ -136,37 +221,46 @@ class MiniMaxM2Attention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
         )
-
-        self.q_norm = RMSNorm(
-            hidden_size=self.q_size * self.tp_size,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
-        self.k_norm = RMSNorm(
-            hidden_size=self.kv_size * self.tp_size,
-            eps=config.rms_norm_eps,
-            dtype=config.torch_dtype,
-        )
+        if self.qkv_proj.mapping.tp_size > 1:
+            self.q_norm = MiniMaxRMSNorm(
+                hidden_size=self.q_size,
+                eps=config.rms_norm_eps,
+                mapping=self.qkv_proj.mapping,
+                dtype=config.torch_dtype,
+                head_dim=self.head_dim,
+            )
+            self.k_norm = MiniMaxRMSNorm(
+                hidden_size=self.kv_size,
+                eps=config.rms_norm_eps,
+                mapping=self.qkv_proj.mapping,
+                dtype=config.torch_dtype,
+                head_dim=self.head_dim,
+            )
+        else:
+            self.q_norm = RMSNorm(
+                hidden_size=self.q_size * self.tp_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
+            self.k_norm = RMSNorm(
+                hidden_size=self.kv_size * self.tp_size,
+                eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+            )
 
     def apply_qk_norm(self, q, k):
         if self.qkv_proj.mapping.tp_size > 1:
-            # collect q and k from all gpus
-            from ..distributed import allgather
-
-            temp_q = allgather(q, self.qkv_proj.mapping)
-            temp_k = allgather(k, self.qkv_proj.mapping)
-            temp_q = self.q_norm(temp_q)
-            temp_k = self.k_norm(temp_k)
-            q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.tp_rank, :].reshape(
-                -1, self.q_size
-            )
-            k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.tp_rank, :].reshape(
-                -1, self.kv_size
+            if not self.q_norm.is_p2p_supported:
+                # Inter-node TP: fall back to separate per-tensor NCCL-based norm.
+                return self.q_norm(q), self.k_norm(k)
+            q = q.contiguous()
+            k = k.contiguous()
+            q, k = self.q_norm.minimax_all_reduce_rms.forward_qk(
+                q, k, self.q_norm.weight, self.k_norm.weight, self.q_norm.eps
             )
         else:
             q = self.q_norm(q)
             k = self.k_norm(k)
-
         return q, k
 
     def apply_rope(
@@ -305,6 +399,13 @@ class MiniMaxM2Model(DecoderModel):
 
 @register_auto_model("MiniMaxM2ForCausalLM")
 class MiniMaxM2ForCausalLM(DecoderModelForCausalLM[MiniMaxM2Model, PretrainedConfig]):
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for MiniMax M2."""
+        return "V2"
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(
             MiniMaxM2Model(model_config),

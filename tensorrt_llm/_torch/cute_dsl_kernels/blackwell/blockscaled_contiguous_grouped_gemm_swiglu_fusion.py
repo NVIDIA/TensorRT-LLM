@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
 # Redistribution and use in source and binary forms, with or without
@@ -40,6 +40,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .utils import (
     TRTLLM_ENABLE_PDL,
+    fclip_xorsign,
     fmin,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
@@ -180,6 +181,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
         vectorized_f32: bool,
+        swiglu_limit: cutlass.Float32 = float("inf"),
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with SwiGLU fusion.
 
@@ -265,6 +267,11 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.vectorized_f32 = vectorized_f32
+
+        if swiglu_limit < 0:
+            swiglu_limit = float("inf")
+        self.swiglu_limit = swiglu_limit
+        self.has_swiglu_limit = swiglu_limit != float("inf")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -871,7 +878,9 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
 
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-        num_acc_consumer_threads = len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
+        num_acc_consumer_threads = (
+            len(self.epilog_warp_id) * self.threads_per_warp * (2 if use_2cta_instrs else 1)
+        )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
         )
@@ -1129,8 +1138,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                         )
                         # fence view async shared
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
 
                     self.sched_sync_barrier.arrive_and_wait()
@@ -1147,8 +1156,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                 sInfo[(2, tile_info_producer_state.index)] = -1
                 sInfo[(3, tile_info_producer_state.index)] = cutlass.Int32(0)
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             self.sched_sync_barrier.arrive_and_wait()
             tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -1183,8 +1192,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
@@ -1282,8 +1291,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    "async.shared",
+                    space="cta",
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
@@ -1375,8 +1384,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
@@ -1533,8 +1542,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    "async.shared",
+                    space="cta",
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
@@ -1643,8 +1652,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared,
-                space=cute.arch.SharedSpace.shared_cta,
+                "async.shared",
+                space="cta",
             )
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
@@ -1745,8 +1754,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                         if subtile_idx // 2 == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
-                            with cute.arch.elect_one():
-                                acc_pipeline.consumer_release(acc_consumer_state)
+                            acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
                     acc_vec_up = tTR_rAcc_up.load()
@@ -1772,6 +1780,14 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                                 (acc_vec_gate[i], acc_vec_gate[i + 1]),
                                 (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
                             )
+                            # SwiGLU clamp
+                            if cutlass.const_expr(self.has_swiglu_limit):
+                                gate_lo = fmin(acc_vec_gate_alpha[0], self.swiglu_limit)
+                                gate_hi = fmin(acc_vec_gate_alpha[1], self.swiglu_limit)
+                                acc_vec_gate_alpha = (gate_lo, gate_hi)
+                                up_lo = fclip_xorsign(acc_vec_up_alpha[0], self.swiglu_limit)
+                                up_hi = fclip_xorsign(acc_vec_up_alpha[1], self.swiglu_limit)
+                                acc_vec_up_alpha = (up_lo, up_hi)
                             tCompute_log2e = cute.arch.mul_packed_f32x2(
                                 (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]), (-LOG2_E, -LOG2_E)
                             )
@@ -1807,6 +1823,11 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                         for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
                             acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
                             acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                            if cutlass.const_expr(self.has_swiglu_limit):
+                                acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit)
+                                acc_vec_up_alpha = fclip_xorsign(
+                                    acc_vec_up_alpha, self.swiglu_limit
+                                )
                             tCompute[i] = acc_vec_up_alpha * silu_f32(
                                 acc_vec_gate_alpha, fastmath=True
                             )
@@ -1951,8 +1972,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                     )
                     # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
+                        "async.shared",
+                        space="cta",
                     )
                     self.epilog_sync_barrier.arrive_and_wait()
                     #
@@ -1973,8 +1994,7 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                 # Async arrive accumulator buffer empty
                 #
                 if cutlass.const_expr(not self.overlapping_accum):
-                    with cute.arch.elect_one():
-                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
                 #
@@ -1985,8 +2005,8 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
+                    "async.shared",
+                    space="cta",
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()

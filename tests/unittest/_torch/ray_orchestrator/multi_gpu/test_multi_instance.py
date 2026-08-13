@@ -3,11 +3,14 @@ import os
 import pytest
 import ray
 import torch
-from ray.util.placement_group import (
-    PlacementGroupSchedulingStrategy,
-    placement_group,
-    remove_placement_group,
-)
+from ray.util.placement_group import placement_group, remove_placement_group
+
+try:
+    # Ray >= 2.55.0
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+except ImportError:
+    # Older Ray re-exported it from ray.util.placement_group
+    from ray.util.placement_group import PlacementGroupSchedulingStrategy
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import AsyncLLM
@@ -36,7 +39,6 @@ class TRTLLMInstance:
         self.llm = None
 
 
-@pytest.mark.gpu4
 @pytest.mark.parametrize(
     "tp_size, num_instances", [(2, 2), (1, 4)], ids=["tp2_2instances", "tp1_4instances"]
 )

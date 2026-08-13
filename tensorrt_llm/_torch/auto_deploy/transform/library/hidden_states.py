@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,13 +21,13 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import GraphModule, Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    EphemeralResourceHandler,
     MHACallable,
-    ResourceHandler,
     ResourceHandlerDict,
     SequenceInfo,
 )
@@ -75,9 +75,6 @@ def cached_residual_add_fake(
 
 class DetectHiddenStatesForCaptureConfig(TransformConfig):
     """Configuration for the hidden states detection transform."""
-
-    # Whether to capture hidden states at all. If False we will not capture any layers.
-    capture_hidden_states: bool = False
 
     # TODO: figure out how to get layers to capture.
     # We should consider if we can use the layer indices stored in eagle checkpoints, e.g.
@@ -133,16 +130,26 @@ class DetectHiddenStatesForCapture(BaseTransform):
             # using a future residual add node for the next layer.
             # 2. is the last add node in a 1 user chain (for last layer or layers with no following residual add)
             # This stops us before we go to the next layer.
+            #
+            # IR-aware models (e.g. modeling_nemotron_h.py post-IR-fication) insert
+            # ``torch.ops.auto_deploy.all_reduce`` between the closing linear and the residual add.
+            # That op is identity at world_size=1 and a sharding-injected collective otherwise, so
+            # walk transparently through it without recording it as the residual add.
             res_node = lin_node_closing
+            last_add: Optional[Node] = None
             while len(res_node.users) == 1:
                 user_node = list(res_node.users)[0]
-                if not is_op(user_node, torch.ops.aten.add):
+                if is_op(user_node, torch.ops.aten.add):
+                    last_add = user_node
+                    res_node = user_node
+                elif is_op(user_node, torch.ops.auto_deploy.all_reduce):
+                    res_node = user_node
+                else:
                     break
-                res_node = user_node
 
-            if is_op(res_node, torch.ops.aten.add):
+            if last_add is not None:
                 # this stores the last residual add node encountered for each layer
-                residual_add_nodes[layer_number] = res_node
+                residual_add_nodes[layer_number] = last_add
 
         return residual_add_nodes
 
@@ -153,15 +160,24 @@ class DetectHiddenStatesForCapture(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        if not self.config.capture_hidden_states:
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-            return gm, info
+        """Apply the hidden states capture transform to a single graph module.
 
+        Returns:
+            The transformed graph module and transform info.
+        """
+        if getattr(gm, "is_draft", False):
+            # Draft models do not capture hidden states through this mechanism.
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # Skip if already processed
         if gm.graph.find_nodes(
             op="call_function", target=torch.ops.auto_deploy.residual_add_for_capture.default
         ):
-            info = TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-            return gm, info
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         residual_add_nodes = self.collect_residual_add_nodes(gm)
 
@@ -169,16 +185,20 @@ class DetectHiddenStatesForCapture(BaseTransform):
             num_hidden_layers = len(residual_add_nodes)
             self.config.set_default_eagle3_layers_to_capture(num_hidden_layers)
 
-        residual_add_nodes = {
-            k: v for k, v in residual_add_nodes.items() if k in self.config.eagle3_layers_to_capture
-        }
+        layers_to_capture = self.config.eagle3_layers_to_capture.copy()
+        if -1 in layers_to_capture:
+            num_hidden_layers = len(residual_add_nodes)
+            layers_to_capture.remove(-1)
+            layers_to_capture.add(num_hidden_layers - 1)
 
-        assert residual_add_nodes.keys() == self.config.eagle3_layers_to_capture, (
-            f"Unable to find residual add nodes for layers. Expected: {self.config.eagle3_layers_to_capture}, \
-            Found: {residual_add_nodes.keys()}"
+        residual_add_nodes = {k: v for k, v in residual_add_nodes.items() if k in layers_to_capture}
+
+        assert residual_add_nodes.keys() == layers_to_capture, (
+            f"Unable to find residual add nodes for layers. "
+            f"Expected: {layers_to_capture}, Found: {residual_add_nodes.keys()}"
         )
 
-        # replace residual add nodes with special placeholder nodes
+        # Replace residual add nodes with special placeholder nodes
         for layer_number, res_node in residual_add_nodes.items():
             with gm.graph.inserting_before(res_node):
                 new_node = gm.graph.call_function(
@@ -190,17 +210,21 @@ class DetectHiddenStatesForCapture(BaseTransform):
             gm.graph.erase_node(res_node)
 
         cnt = len(residual_add_nodes)
-        info = TransformInfo(
+        return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=(cnt == 0), has_valid_shapes=(cnt == 0)
         )
-        return gm, info
 
 
-class HiddenStatesResourceHandler(ResourceHandler):
+class HiddenStatesResourceHandler(EphemeralResourceHandler):
     """A resource handler for hidden states."""
 
     def __init__(self, hidden_size: int, dtype: torch.dtype) -> None:
         """Initialize the HiddenStatesResourceHandler.
+
+        MTP/Eagle collects hidden states from the target model and reads them in the draft model
+        in the same forward pass. We store these resources in an EphemeralResourceHandler because
+        they do not need to persist between iterations, and can be dropped when transferring
+        resources between forward passes.
 
         Args:
             hidden_size: The size of the hidden states resource.

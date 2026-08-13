@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,13 +15,14 @@
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import product
+from types import SimpleNamespace
 from typing import (
+    Any,
     Callable,
     ContextManager,
     Final,
     Generator,
     Optional,
-    Protocol,
     Type,
     TypeVar,
     Union,
@@ -33,37 +34,98 @@ import numpy as np
 import pytest
 import torch
 from scipy.stats import power_divergence
-from utils.util import assert_no_cuda_sync, force_ampere
+from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
-from tensorrt_llm._torch.pyexecutor.llm_request import convert_wordlist
-from tensorrt_llm._torch.pyexecutor.sampler import (
-    GREEDY,
+from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
-    ScheduledRequests,
-    SimpleGroupedStrategySampler,
-    StrategyMetadata,
+    convert_wordlist,
+    get_draft_token_length,
+)
+from tensorrt_llm._torch.pyexecutor.sampler import (
+    SampleStateTensorsHostTorch,
+    SampleStateTorch,
     TorchSampler,
     _BatchedSamplingResult,
     _request_get_sampling_params,
     _request_strategy,
-    get_draft_token_length,
+    _SeedManager,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import min_p_renorm_probs
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import UtilsSamplingParams
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import (
+    GREEDY,
     BeamSearch,
+    FlashInferGroupedStrategySampler,
     Greedy,
+    MinP,
+    RequestSeeds,
     Strategy,
+    StrategyMetadata,
     TemperatureOnly,
     TopK,
     TopKTopP,
     TopP,
-    UtilsSamplingParams,
+    TopPDecayMetadata,
+    resolve_sampling_strategy,
+    sample,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import (
-    FlashInferGroupedStrategySampler,
-)
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
+
+
+class TestSetupSamplerStepRequestSelection:
+    @staticmethod
+    def _make_request(
+        *,
+        is_attention_dp_dummy: bool = False,
+        is_finished: bool = False,
+        py_is_draft: bool = False,
+    ) -> LlmRequest:
+        return cast(
+            LlmRequest,
+            SimpleNamespace(
+                is_attention_dp_dummy=is_attention_dp_dummy,
+                is_finished=is_finished,
+                py_is_draft=py_is_draft,
+            ),
+        )
+
+    def test_collect_new_requests_for_setup_includes_adp_dummy_generation_requests(self):
+        scheduled_requests = ScheduledRequests()
+
+        context_request = self._make_request()
+        finished_context_request = self._make_request(is_finished=True)
+        draft_context_request = self._make_request(py_is_draft=True)
+        adp_dummy_generation_request = self._make_request(is_attention_dp_dummy=True)
+        regular_generation_request = self._make_request()
+        finished_adp_dummy_generation_request = self._make_request(
+            is_attention_dp_dummy=True, is_finished=True
+        )
+        draft_adp_dummy_generation_request = self._make_request(
+            is_attention_dp_dummy=True, py_is_draft=True
+        )
+
+        scheduled_requests.context_requests_last_chunk = [
+            context_request,
+            finished_context_request,
+            draft_context_request,
+        ]
+        scheduled_requests.generation_requests = [
+            adp_dummy_generation_request,
+            regular_generation_request,
+            finished_adp_dummy_generation_request,
+            draft_adp_dummy_generation_request,
+        ]
+
+        collected = TorchSampler._collect_new_requests_for_setup(scheduled_requests)
+        assert len(collected) == 4
+        assert collected[0] is context_request
+        assert collected[1] is adp_dummy_generation_request
+        assert collected[2] is finished_adp_dummy_generation_request
+        assert collected[3] is draft_adp_dummy_generation_request
 
 
 @force_ampere
@@ -83,9 +145,10 @@ class TestStrategySelection:
     class MockLlmRequest:
         sampling_config: SamplingConfig
         is_context_init_state: bool  # Torch sampler accesses this, but it does not affect this test
-
-        def __init__(self):
-            self._py_sampling_strategy: Strategy | None = None
+        py_sampling_strategy: Strategy | None
+        # Read by the row_stride query in sampler_common; these tests are
+        # single-beam, so the static admission width is 1.
+        py_beam_width: int
 
         def get_beam_width_by_iter(
             self, for_next_iteration: bool = False
@@ -108,6 +171,8 @@ class TestStrategySelection:
         request = self.MockLlmRequest()
         request.sampling_config = SamplingConfig(params._get_sampling_config())
         request.is_context_init_state = False  # Not used in this test
+        request.py_sampling_strategy = None  # used for caching
+        request.py_beam_width = 1
         return cast(LlmRequest, request)
 
     def test_defaults(self):
@@ -298,6 +363,88 @@ class TestStrategySelection:
         assert strat[2] == pytest.approx(0.7)
         assert strat[3] == pytest.approx(0.9)
 
+    # --- min_p ---
+    # A min_p strategy is ("min_p", top_k, top_p, min_p, temperature). When
+    # unset, top_k carries the disabled sentinel 0 ("keep all"; sanitized to
+    # vocab_size downstream) and top_p carries 1.0, so min_p composes with any
+    # subset of temperature/top_k/top_p.
+
+    @pytest.mark.parametrize(
+        "trivial_temperature, trivial_top_p, trivial_top_k",
+        [
+            pytest.param(temperature, top_p, top_k)
+            for (temperature, top_k, top_p) in product(
+                TEMPERATURE_NEUTRAL_VALS, TOP_K_NEUTRAL_VALS, TOP_P_NEUTRAL_VALS
+            )
+        ],
+    )
+    def test_min_p_only(
+        self,
+        trivial_temperature: Optional[float],
+        trivial_top_p: Optional[float],
+        trivial_top_k: Optional[int],
+    ):
+        params = SamplingParams(
+            min_p=0.1, temperature=trivial_temperature, top_p=trivial_top_p, top_k=trivial_top_k
+        )
+        self._check_params(params)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert len(strat) == 5
+        assert strat[0] == "min_p"
+        assert strat[1] == 0  # top_k disabled sentinel (0 == "keep all")
+        assert strat[2] == pytest.approx(1.0)  # top_p disabled sentinel
+        assert strat[3] == pytest.approx(0.1)
+        assert strat[4] == pytest.approx(1.0)  # temperature default
+
+    def test_min_p_with_temperature(self):
+        params = SamplingParams(min_p=0.1, temperature=0.8)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert strat[0] == "min_p"
+        assert strat[3] == pytest.approx(0.1)
+        assert strat[4] == pytest.approx(0.8)
+
+    def test_min_p_with_top_k_top_p(self):
+        params = SamplingParams(min_p=0.1, top_k=42, top_p=0.7, temperature=0.8)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert len(strat) == 5
+        assert strat[0] == "min_p"
+        assert strat[1] == 42
+        assert strat[2] == pytest.approx(0.7)
+        assert strat[3] == pytest.approx(0.1)
+        assert strat[4] == pytest.approx(0.8)
+
+    def test_min_p_0_not_selected(self):
+        # min_p == 0 disables min_p; a plain temperature strategy is chosen.
+        params = SamplingParams(min_p=0.0, temperature=0.7)
+        request = self._build_mock_llm_request(params)
+        strat = _request_strategy(request, vocab_size=self.VOCAB_SIZE)
+        assert strat[0] == "temperature"
+
+    def test_min_p_1_is_greedy(self):
+        # min_p == 1 keeps only the row max, i.e. an explicit greedy control
+        # (like top_p == 0), so it must not reach the min_p sampling path.
+        params = SamplingParams(min_p=1.0, temperature=0.7)
+        self._check_params(params)
+        request = self._build_mock_llm_request(params)
+        assert _request_strategy(request, vocab_size=self.VOCAB_SIZE) is GREEDY
+
+    @pytest.mark.parametrize(
+        "greedy_kwargs",
+        [
+            pytest.param({"top_k": 1}, id="top_k_1"),
+            pytest.param({"temperature": 0}, id="temperature_0"),
+        ],
+    )
+    def test_min_p_greedy_triggers_win(self, greedy_kwargs: dict[str, Any]):
+        # An explicit greedy trigger collapses to a single token even with min_p.
+        params = SamplingParams(min_p=0.1, **greedy_kwargs)
+        self._check_params(params)
+        request = self._build_mock_llm_request(params)
+        assert _request_strategy(request, vocab_size=self.VOCAB_SIZE) is GREEDY
+
     def test_param_validation(self):
         with pytest.raises(ValueError, match="require temperature >= 0, got temperature=-1"):
             SamplingParams(temperature=-1)
@@ -310,6 +457,12 @@ class TestStrategySelection:
 
         with pytest.raises(ValueError, match="require top_k >= 0, got top_k=-1"):
             SamplingParams(top_k=-1)
+
+        with pytest.raises(ValueError, match="require 0 <= min_p <= 1, got min_p=-1"):
+            SamplingParams(min_p=-1)
+
+        with pytest.raises(ValueError, match="require 0 <= min_p <= 1, got min_p=2"):
+            SamplingParams(min_p=2)
 
     @pytest.mark.parametrize(
         "top_k, top_p",
@@ -366,66 +519,23 @@ class TestStrategySelection:
         assert torch_sampler.should_provide_draft_probs(request) == (not is_greedy)
 
 
-class UutProvider(Protocol):
-    def __call__(self, is_warmup: bool) -> ContextManager[Callable[[], None]]: ...
-
-
-def _run_test_with_warmup(
-    uut_provider: UutProvider,
-    warmup_sizes_bytes: tuple[int] = (4 * 2**30,),
-    max_sync_s: Optional[float] = None,
-):
-    """Run UUT including setup and warmup.
-
-    This is mainly used to check that the UUT does not CUDA device sync. Thus,
-    given that PyTorch's caching memory allocator can device sync when it runs
-    out of cached GPU memory segments, the warmup allocates some GPU memory.
-
-    The warmup also runs the test once. This avoids issues with things like lazy loading
-    of device code. The UUT provider can use the 'is_warmup' argument to adapt its
-    behavior to the warmup and final test runs.
-
-    If max_sync_s is provided, this helper checks that the UUT does not device sync,
-    assuming that the sync (CPU) part of the code takes no longer than max_sync_s
-    seconds to complete.
-
-    It is the user's responsibility to ensure that the amount of submitted work
-    does not exceed the CUDA driver/device queue capacity, which would make
-    the execution appear synchronous.
-    """
-    with torch.cuda.Stream():
-        with uut_provider(is_warmup=True) as uut:
-            bufs = []
-            for warmup_size in warmup_sizes_bytes:
-                bufs.append(
-                    torch.ones(warmup_size, device=torch.cuda.current_device(), dtype=torch.int8)
-                )
-            del bufs
-            uut()
-
-        with uut_provider(is_warmup=False) as uut:
-            with (
-                assert_no_cuda_sync(sync_timeout_s=max_sync_s)
-                if max_sync_s is not None
-                else nullcontext()
-            ):
-                uut()
-
-
 @force_ampere
 @pytest.mark.parametrize(
-    "draft_len, with_ctx, with_gen",
+    "draft_len, with_ctx_chunking, with_ctx_last_chunk, with_gen",
     [
-        pytest.param(draft_len, with_ctx, with_gen)
-        for (draft_len, with_ctx, with_gen) in product(
+        pytest.param(draft_len, with_ctx_chunking, with_ctx_last_chunk, with_gen)
+        for (draft_len, with_ctx_chunking, with_ctx_last_chunk, with_gen) in product(
             [0, 3],
             [False, True],
             [False, True],
+            [False, True],
         )
-        if with_ctx or with_gen
+        if with_ctx_chunking or with_ctx_last_chunk or with_gen
     ],
 )
-def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool):
+def test_select_generated_logits(
+    draft_len: int, with_ctx_chunking: bool, with_ctx_last_chunk: bool, with_gen: bool
+):
     # Currently only checks that this works and does not sync
 
     device = torch.device("cuda")
@@ -437,7 +547,6 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class ContextRequestMock:
             def __init__(self, is_last_context_chunk: bool, return_context_logits: bool):
-                self.is_context_init_state = True
                 self.is_last_context_chunk = is_last_context_chunk
                 self.py_draft_tokens = torch.tensor([], dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
@@ -454,84 +563,85 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class GenRequestMock:
             def __init__(self, draft_len: int):
-                self.is_context_init_state = False
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
+                # Read by the row_stride query in sampler_common.
+                self.py_beam_width = 1
 
             def get_beam_width_by_iter(
                 self, for_next_iteration: bool = False
             ) -> int:  # Torch sampler accesses this, but it does not affect this test
                 return self.sampling_config.beam_width
 
-        class ScheduledRequestsMock:
-            @property
-            def context_requests(self) -> list[LlmRequest]:
-                return (
-                    [
-                        # NB: One request with py_return_context_logits is enough
-                        #     to trigger tested code.
-                        cast(
-                            LlmRequest,
-                            ContextRequestMock(
-                                is_last_context_chunk=True, return_context_logits=True
-                            ),
-                        ),
-                        cast(
-                            LlmRequest,
-                            ContextRequestMock(
-                                is_last_context_chunk=True, return_context_logits=False
-                            ),
-                        ),
-                        cast(
-                            LlmRequest,
-                            ContextRequestMock(
-                                is_last_context_chunk=True, return_context_logits=True
-                            ),
-                        ),
-                    ]
-                    if with_ctx
-                    else []
-                )
+        def _build_scheduled_requests() -> ScheduledRequests:
+            scheduled_requests = ScheduledRequests()
+            scheduled_requests.context_requests_chunking = (
+                [
+                    # This request is expected to be skipped
+                    cast(
+                        LlmRequest,
+                        ContextRequestMock(is_last_context_chunk=False, return_context_logits=True),
+                    )
+                ]
+                if with_ctx_chunking
+                else []
+            )
+            scheduled_requests.context_requests_last_chunk = (
+                [
+                    # NB: One request with py_return_context_logits is enough
+                    #     to trigger tested code.
+                    cast(
+                        LlmRequest,
+                        ContextRequestMock(is_last_context_chunk=True, return_context_logits=True),
+                    ),
+                    cast(
+                        LlmRequest,
+                        ContextRequestMock(is_last_context_chunk=True, return_context_logits=False),
+                    ),
+                    cast(
+                        LlmRequest,
+                        ContextRequestMock(is_last_context_chunk=True, return_context_logits=True),
+                    ),
+                ]
+                if with_ctx_last_chunk
+                else []
+            )
 
-            @property
-            def generation_requests(self) -> list[LlmRequest]:
-                # NB: Currently this list is not inspected, UUT only checks that this
-                #     is not empty.
-                return (
-                    [
-                        cast(LlmRequest, GenRequestMock(draft_len=draft_len_req1)),
-                        cast(LlmRequest, GenRequestMock(draft_len=draft_len_req2)),
-                    ]
-                    if with_gen
-                    else []
-                )
+            # NB: Currently this list is not inspected, UUT only checks that this
+            #     is not empty.
+            scheduled_requests.generation_requests = (
+                [
+                    cast(LlmRequest, GenRequestMock(draft_len=draft_len_req1)),
+                    cast(LlmRequest, GenRequestMock(draft_len=draft_len_req2)),
+                ]
+                if with_gen
+                else []
+            )
+            return scheduled_requests
 
-            def all_requests(self) -> list[LlmRequest]:
-                return self.context_requests + self.generation_requests
-
-        expected_num_requests = with_ctx * 3 + with_gen * 2
+        expected_num_requests = with_ctx_last_chunk * 3 + with_gen * 2
         expected_req_num_beams = torch.tensor([1] * expected_num_requests, dtype=torch.int32)
 
-        num_context_logits_prefix_sum = [
-            0,
-            *(
-                [
-                    100 + 1,  # context req. 1 (assume context len. 100)
-                    (100 + 1) + (0 + 1),  # context req. 2 (not returning context)
-                    (100 + 1) + (0 + 1) + (50 + 1),  # context req. 3 (assume context len. 50)
-                ]
-                if with_ctx
-                else []
-            ),
-        ]
+        num_context_logits_prefix_sum = [0]
+        if with_ctx_chunking:
+            # context req. 1 (assume context len. 10)
+            num_context_logits_prefix_sum.append(num_context_logits_prefix_sum[-1] + 10 + 1)
+        if with_ctx_last_chunk:
+            # context req. 2 (assume context len. 100)
+            num_context_logits_prefix_sum.append(num_context_logits_prefix_sum[-1] + 100 + 1)
+            # context req. 3 (not returning context)
+            num_context_logits_prefix_sum.append(num_context_logits_prefix_sum[-1] + 0 + 1)
+            # context req. 4 (assume context len. 50)
+            num_context_logits_prefix_sum.append(num_context_logits_prefix_sum[-1] + 50 + 1)
+
         expected_req_num_generation_steps = [
             *(
                 [
-                    1,  # context req. 1
                     1,  # context req. 2
                     1,  # context req. 3
+                    1,  # context req. 4
                 ]
-                if with_ctx
+                if with_ctx_last_chunk
                 else []
             ),
             *(
@@ -547,13 +657,17 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
             expected_req_num_generation_steps, dtype=torch.int32
         )
 
-        expected_req_offsets = torch.cumsum(expected_req_num_generation_steps_tensor, dim=0).roll(1)
-        expected_req_offsets[0] = 0
+        if expected_req_num_generation_steps_tensor.numel() > 0:
+            expected_req_offsets = torch.cumsum(
+                expected_req_num_generation_steps_tensor, dim=0
+            ).roll(1)
+            expected_req_offsets[0] = 0
+        else:
+            expected_req_offsets = torch.empty_like(expected_req_num_generation_steps_tensor)
 
-        # num_logits_to_keep = cast(int, req_num_generation_steps_tensor.sum().item())
-        generation_requests_total_steps = (draft_len_req1 + 1) + (
-            draft_len_req2 + 1
-        )  # cf. req_num_generation_steps
+        generation_requests_total_steps = (
+            (draft_len_req1 + 1) + (draft_len_req2 + 1) if with_gen else 0
+        )
 
         vocab_size = 12
 
@@ -566,11 +680,15 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         all_logits_cuda = all_logits.to(device=device)
 
         expected_logit_indices = []
-        if with_ctx:
+        if with_ctx_last_chunk:
+            if with_ctx_chunking:
+                begin_offset = 11
+            else:
+                begin_offset = 0
             expected_logit_indices += [
-                100,  # gen logits from context req. 1
-                101,  # gen logits from context req. 2
-                152,  # gen logits from context req. 3
+                begin_offset + 100,  # gen logits from context req. 2
+                begin_offset + 101,  # gen logits from context req. 3
+                begin_offset + 152,  # gen logits from context req. 4
             ]
         if with_gen:
             gen_logit_offset = num_context_logits_prefix_sum[-1]
@@ -588,6 +706,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         @dataclass
         class UutResult:
+            selected_requests: list[LlmRequest]
             req_num_generated_tokens: torch.Tensor
             req_num_beams: torch.Tensor
             req_num_steps: torch.Tensor
@@ -602,14 +721,16 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         def _uut(res=res):
             (
+                selected_requests,
                 sampling_requests_metadata,
                 selected_logits,
             ) = TorchSampler._select_generated_logits(
-                cast(ScheduledRequests, ScheduledRequestsMock()),
+                _build_scheduled_requests(),
                 all_logits_cuda,
                 num_context_logits_prefix_sum=num_context_logits_prefix_sum,
             )
             res.result = UutResult(
+                selected_requests=selected_requests,
                 req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
                 req_num_beams=sampling_requests_metadata.req_num_beams,
                 req_num_steps=sampling_requests_metadata.req_num_steps,
@@ -622,6 +743,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         # Check results
         assert res.result is not None
 
+        assert len(res.result.selected_requests) == expected_num_requests
         torch.testing.assert_close(
             res.result.req_num_generated_tokens.to("cpu"), expected_req_num_generation_steps_tensor
         )
@@ -632,234 +754,738 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         torch.testing.assert_close(res.result.req_offsets.to("cpu"), expected_req_offsets)
         torch.testing.assert_close(res.result.selected_logits.to("cpu"), expected_logits)
 
-    _run_test_with_warmup(_test_runner, max_sync_s=0.3)
+    run_test_with_warmup(_test_runner, max_sync_s=0.3)
 
 
-MAX_NUM_SEQUENCES = 128
-NOT_FINISHED = FinishReason.NOT_FINISHED
-STOP_WORDS = FinishReason.STOP_WORDS
-END_ID = FinishReason.END_ID
-LENGTH = FinishReason.LENGTH
-BEAM = 0
+def test_stable_greedy_cache_key_includes_sequence_slots(monkeypatch: pytest.MonkeyPatch):
+    sampler = object.__new__(TorchSampler)
+    sampler.max_beam_width = 1
+    sampler._stable_greedy_request_ids = []
+    sampler._stable_greedy_seq_slots = []
+    sampler._stable_greedy_seq_slots_host = None
+    sampler._stable_greedy_seq_slots_cuda = None
+    monkeypatch.setattr(sampler, "_copy_to_host", lambda tensor: tensor.clone())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.sampler.sampler.prefer_pinned", lambda: False
+    )
 
+    original_tensor_to = torch.Tensor.to
 
-class RequestCase:
-    MAX_NEW_TOKENS = 10
-    seq_slots = torch.randperm(MAX_NUM_SEQUENCES).tolist()
+    def copy_without_cuda(tensor: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if kwargs.get("device") == "cuda":
+            kwargs["device"] = "cpu"
+        return original_tensor_to(tensor, *args, **kwargs)
 
-    def __init__(
-        self,
-        *,
-        prompt: list[int],
-        new_tokens: list[int],
-        finish_reasons: list[FinishReason],
-        max_new_tokens: int = MAX_NEW_TOKENS,
-        end_id: Optional[int] = None,
-        num_draft_tokens: int | None = None,
-        stop_words_list: Optional[list[list[int]]] = None,
-    ):
-        seq_slot = self.seq_slots.pop()  # random seq slot in MAX_NUM_SEQUENCES
-        self.prompt = prompt
-        if num_draft_tokens is None:
-            num_draft_tokens = len(new_tokens) - 1
-        self.request = LlmRequest(
-            request_id=seq_slot,
-            seq_slot=seq_slot,
-            input_tokens=prompt,
-            max_new_tokens=max_new_tokens,
-            stop_words_list=convert_wordlist(stop_words_list)
-            if stop_words_list is not None
-            else None,
-            end_id=end_id,
+    monkeypatch.setattr(torch.Tensor, "to", copy_without_cuda)
+
+    logits = torch.tensor([[0.0, 1.0, 2.0]])
+    new_tokens = torch.zeros((1, 2, 1), dtype=torch.int32)
+    requests = [
+        LlmRequest(
+            request_id=0,
+            max_new_tokens=4,
+            input_tokens=[1],
             sampling_config=SamplingConfig(),
+            seq_slot=seq_slot,
             is_streaming=False,
-            draft_tokens=new_tokens[:num_draft_tokens],
+            is_draft=is_draft,
         )
-        assert len(new_tokens) == len(finish_reasons)
-        self.new_tokens = new_tokens
-        self.finish_reasons = finish_reasons
+        for seq_slot, is_draft in ((0, False), (1, True))
+    ]
 
-    def __repr__(self):
-        return f"RequestCase({self.prompt=}, {self.new_tokens=}, {self.finish_reasons=}, \
-        {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.stop_words_list=})"
+    for seq_slot, request in enumerate(requests):
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.generation_requests = [request]
 
-    @staticmethod
-    def setup(requests: list["RequestCase"]):
-        max_tokens = set(len(req.new_tokens) for req in requests)
-        assert len(max_tokens) == 1
-        max_draft_len = max_tokens.pop() - 1
-        sampler_args = TorchSampler.Args(
-            max_seq_len=20,
-            max_draft_len=max_draft_len,
-            max_total_draft_tokens=max_draft_len,
-            # Fill with many more max requests than below,
-            # so we can test that write_finish_reasons uses seq_slots correctly
-            max_num_sequences=MAX_NUM_SEQUENCES,
+        (
+            _,
+            seq_slots_host,
+            _,
+            seq_slots_cuda,
+            _,
+            _,
+            single_step_greedy,
+        ) = sampler._process_requests(
+            scheduled_requests,
+            {"logits": logits},
+            new_tokens,
+            [0],
+        )
+
+        assert single_step_greedy
+        assert seq_slots_host.tolist() == [seq_slot]
+        assert seq_slots_cuda.tolist() == [seq_slot]
+        assert new_tokens[0, seq_slot, 0].item() == 2
+
+
+@force_ampere
+def test_greedy_no_repeat_ngram_uses_token_ban_path():
+    sampler = TorchSampler(
+        TorchSampler.Args(
+            max_seq_len=16,
+            max_draft_len=0,
+            max_num_sequences=1,
             max_beam_width=1,
-            disable_overlap_scheduler=False,
+            max_total_draft_tokens=0,
+            disable_overlap_scheduler=True,
         )
-        sampler = TorchSampler(args=sampler_args)
+    )
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=4,
+        input_tokens=[1, 2, 1],
+        sampling_config=SamplingConfig(),
+        seq_slot=0,
+        is_streaming=False,
+    )
+    setattr(request, "py_no_repeat_ngram_size", 2)
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.generation_requests = [request]
+    logits = torch.tensor([[0.0, 0.0, 10.0, 9.0]], device="cuda")
 
-        # fill with garbage value so we can observe that finish reasons are filled
-        # with NOT_FINISHED before we write to them.
-        sampler.store.finish_reasons.fill_(205)
-        seq_slots = torch.tensor(
-            [req.request.py_seq_slot for req in requests], device="cuda", dtype=torch.int64
+    *_, new_tokens_host, single_step_greedy = sampler._process_requests(
+        scheduled_requests,
+        {"logits": logits},
+        sampler.store.new_tokens,
+        [0],
+    )
+    torch.cuda.synchronize()
+
+    assert not single_step_greedy
+    assert new_tokens_host.reshape(-1)[0].item() == 3
+
+
+@force_ampere
+@pytest.mark.parametrize(
+    ("penalty_name", "penalty_value"),
+    [
+        pytest.param("repetition_penalty", 100.0, id="repetition"),
+        pytest.param("presence_penalty", 2.0, id="presence"),
+        pytest.param("frequency_penalty", 2.0, id="frequency"),
+    ],
+)
+def test_greedy_occurrence_penalties_bypass_stable_path(penalty_name: str, penalty_value: float):
+    if penalty_name == "repetition_penalty":
+        sampling_params = SamplingParams(repetition_penalty=penalty_value)
+    elif penalty_name == "presence_penalty":
+        sampling_params = SamplingParams(presence_penalty=penalty_value)
+    else:
+        assert penalty_name == "frequency_penalty"
+        sampling_params = SamplingParams(frequency_penalty=penalty_value)
+
+    sampler = TorchSampler(
+        TorchSampler.Args(
+            max_seq_len=16,
+            max_draft_len=0,
+            max_num_sequences=1,
+            max_beam_width=1,
+            max_total_draft_tokens=0,
+            disable_overlap_scheduler=True,
         )
-        seq_lens = torch.tensor(
-            [req.request.max_beam_num_tokens for req in requests], dtype=torch.int32, device="cuda"
-        )
-        new_tokens = torch.tensor(
-            [req.new_tokens for req in requests], dtype=torch.int32, device="cuda"
-        ).T
-        sampler.store.new_tokens[:, seq_slots, BEAM] = new_tokens
-        max_seq_lens = torch.tensor(
-            [
-                min(
-                    sampler.max_seq_len, req.request.orig_prompt_len + req.request.py_max_new_tokens
-                )
-                for req in requests
-            ],
-            dtype=torch.int32,
-            device="cuda",
-        )
-        end_ids = torch.tensor(
-            [
-                req.request.py_end_id if req.request.py_end_id is not None else -1
-                for req in requests
-            ],
-            dtype=torch.int32,
-            device="cuda",
-        )
-        sampler.store.max_lengths_tensor[seq_slots] = max_seq_lens
-        sampler.store.end_ids[seq_slots] = end_ids
+    )
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=4,
+        input_tokens=[1],
+        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+        seq_slot=0,
+        is_streaming=False,
+    )
 
-        def run():
-            sampler._write_finish_reasons(
-                [req.request for req in requests],
-                finish_reasons=sampler.store.finish_reasons,
-                new_tokens=sampler.store.new_tokens,
-                seq_lens=seq_lens,
-                seq_slots=seq_slots,
-            )
+    admission = ScheduledRequests()
+    admission.context_requests_last_chunk = [request]
+    sampler.setup_sampler_step(admission)
 
-            reasons = sampler.store.finish_reasons[:, seq_slots, BEAM].T.tolist()
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.generation_requests = [request]
+    logits = torch.tensor([[0.0, 10.0, 9.0]], device="cuda")
 
-            for actual, request in zip(reasons, requests, strict=True):
-                expected = request.finish_reasons
-                msg = f"actual={[FinishReason(reason) for reason in actual]} != expected={expected}\nFor {request}"
-                assert actual == [reason.value for reason in expected], msg
+    *_, new_tokens_host, single_step_greedy = sampler._process_requests(
+        scheduled_requests,
+        {"logits": logits},
+        sampler.store.new_tokens,
+        [0],
+    )
+    torch.cuda.synchronize()
 
-        return run, sampler
+    assert not single_step_greedy
+    assert new_tokens_host.reshape(-1)[0].item() == 2
 
 
-def test_write_finish_reasons():
-    """We don't really care about the finish reason past the first infraction, because we're not going to use it,
-    although in some instance it is written anyway."""
-    run, _ = RequestCase.setup(
-        [
-            RequestCase(
-                prompt=[13, 14],
-                new_tokens=[60, 61, 62],
-                # We pre-fill the finish reasons with NOT_FINISHED.
-                finish_reasons=[NOT_FINISHED, NOT_FINISHED, NOT_FINISHED],
-            ),
-            RequestCase(
-                prompt=[7, 8, 6],
-                stop_words_list=[[12, 13]],
-                new_tokens=[12, 13, 60],
-                finish_reasons=[NOT_FINISHED, STOP_WORDS, NOT_FINISHED],
-            ),
-            RequestCase(
-                prompt=[7, 8, 6],
-                stop_words_list=[[12, 13]],
-                new_tokens=[60, 12, 13],
-                # The request has stop words, but no draft is created
-                # Tokens at indices greater than 0 should be ignored
-                num_draft_tokens=0,
-                finish_reasons=[NOT_FINISHED, NOT_FINISHED, NOT_FINISHED],
-            ),
-            RequestCase(
-                prompt=[1, 2, 3, 4],
-                end_id=99,
-                new_tokens=[55, 99, 58],
-                finish_reasons=[NOT_FINISHED, END_ID, NOT_FINISHED],
-            ),
-            RequestCase(
-                prompt=[4, 5, 6],
-                max_new_tokens=2,
-                new_tokens=[56, 57, 59],
-                # The LENGTH check happens to not have an early exit
-                finish_reasons=[NOT_FINISHED, LENGTH, LENGTH],
-            ),
-            RequestCase(
-                prompt=[1, 12],
-                stop_words_list=[[12, 13], [14, 15]],
-                new_tokens=[13, 14, 15],
-                # We don't use early exit to avoid stream synchronization for stop words
-                finish_reasons=[STOP_WORDS, NOT_FINISHED, STOP_WORDS],
-            ),
-            RequestCase(
-                prompt=[1, 12],
-                stop_words_list=[[12, 13, 14, 15], [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]],
-                new_tokens=[13, 14, 15],
-                # Stop words of different lengths are handled correctly with respect to padding of stop words and tokens
-                finish_reasons=[NOT_FINISHED, NOT_FINISHED, STOP_WORDS],
-            ),
-            RequestCase(
-                prompt=[1],
-                max_new_tokens=2,
-                end_id=99,
-                stop_words_list=[[1, 12]],
-                new_tokens=[12, 99, 63],
-                # Different infractions are written to different places as
-                # we don't have an early exit between infractions
-                finish_reasons=[STOP_WORDS, END_ID, LENGTH],
-            ),
-            RequestCase(
-                prompt=[1, 12, 56, 67, 68, 234, 678],
-                stop_words_list=[[12, 56, 67, 68, 234, 678, 129, 182]],
-                new_tokens=[129, 182, 600],
-                # Notice the offending stop sequence is concatenated, as we lookback
-                finish_reasons=[NOT_FINISHED, STOP_WORDS, NOT_FINISHED],
-            ),
-            RequestCase(
-                prompt=[1, 12],
-                end_id=99,
+class TestFinishReasons:
+    NOT_FINISHED = FinishReason.NOT_FINISHED
+    STOP_WORDS = FinishReason.STOP_WORDS
+    END_ID = FinishReason.END_ID
+    LENGTH = FinishReason.LENGTH
+
+    def test_single_step_greedy_updates_finish_reasons_and_filters_completed_requests(self):
+        sampler = object.__new__(TorchSampler)
+        sampler.max_seq_len = 20
+        sampler._track_pending_steps = False
+        requests = [
+            LlmRequest(
+                request_id=0,
+                seq_slot=0,
+                input_tokens=[2, 0],
                 max_new_tokens=1,
-                stop_words_list=[[1, 12, 99]],
-                new_tokens=[99, 100, 101],
-                # The latest infraction check overrides the earlier infraction checks,
-                # hence the first finish_reason is END_ID
-                finish_reasons=[END_ID, LENGTH, LENGTH],
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+            LlmRequest(
+                request_id=1,
+                seq_slot=1,
+                input_tokens=[2, 0],
+                max_new_tokens=1,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+            ),
+            LlmRequest(
+                request_id=2,
+                seq_slot=2,
+                input_tokens=[2, 0],
+                max_new_tokens=10,
+                end_id=2,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
             ),
         ]
-    )
-    run()
+        requests[2].finish_by(FinishReason.LENGTH, 0)
+        new_tokens = torch.tensor([2, 7, 99], dtype=torch.int32)
+        state = SampleStateTorch(
+            requests=requests,
+            device=None,
+            host=SampleStateTensorsHostTorch(
+                new_tokens=new_tokens,
+                finish_reasons=None,
+                first_finish_reasons=None,
+            ),
+            single_step_greedy=True,
+        )
 
+        sampler.update_requests(state)
 
-def test_are_stop_words_isnt_called_when_no_stop_words():
-    """We don't want to call are_stop_words when there are no stop words because it's expensive"""
+        assert all(request.is_finished for request in requests)
+        # The first request reaches EOS and length together; EOS takes precedence.
+        assert not requests[0].is_finished_due_to_length
+        assert requests[1].is_finished_due_to_length
+        assert requests[0].get_tokens(0)[-1] == 2
+        assert requests[1].get_tokens(0)[-1] == 7
+        assert requests[2].get_tokens(0) == [2, 0]
 
-    def stop_words_that_raises(*args, **kwargs):
-        raise AssertionError
+    class RequestCase:
+        MAX_NEW_TOKENS = 10
+        MAX_NUM_SEQUENCES = 128
+        seq_slots = torch.randperm(MAX_NUM_SEQUENCES).tolist()
+        BEAM = 0
 
-    run_with_stop_words, sampler = RequestCase.setup(
-        [
-            RequestCase(
-                prompt=[1], stop_words_list=[[1]], new_tokens=[4], finish_reasons=[NOT_FINISHED]
+        def __init__(
+            self,
+            *,
+            prompt: list[int],
+            new_tokens: list[int],
+            finish_reasons: list[FinishReason],
+            max_new_tokens: int = MAX_NEW_TOKENS,
+            end_id: Optional[int] = None,
+            num_draft_tokens: int | None = None,
+            stop_words_list: Optional[list[list[int]]] = None,
+        ):
+            seq_slot = self.seq_slots.pop()  # random seq slot in MAX_NUM_SEQUENCES
+            self.prompt = prompt
+            if num_draft_tokens is None:
+                num_draft_tokens = len(new_tokens) - 1
+            self.request = LlmRequest(
+                request_id=seq_slot,
+                seq_slot=seq_slot,
+                input_tokens=prompt,
+                max_new_tokens=max_new_tokens,
+                stop_words_list=convert_wordlist(stop_words_list)
+                if stop_words_list is not None
+                else None,
+                end_id=end_id,
+                sampling_config=SamplingConfig(),
+                is_streaming=False,
+                draft_tokens=new_tokens[:num_draft_tokens],
             )
-        ]
-    )
-    sampler._are_stop_words = stop_words_that_raises
-    with pytest.raises(AssertionError):
-        run_with_stop_words()
+            assert len(new_tokens) == len(finish_reasons)
+            self.new_tokens = new_tokens
+            self.finish_reasons = finish_reasons
 
-    run_without_stop_words, sampler = RequestCase.setup(
-        [RequestCase(prompt=[1], new_tokens=[4], finish_reasons=[NOT_FINISHED])]
-    )
-    sampler._are_stop_words = stop_words_that_raises
-    _ = run_without_stop_words()
+        def __repr__(self):
+            return f"RequestCase({self.prompt=}, {self.new_tokens=}, {self.finish_reasons=}, \
+            {self.request.max_new_tokens=}, {self.request.end_id=}, {self.request.stop_words_list=})"
+
+        @classmethod
+        def build(
+            cls,
+            requests: list["TestFinishReasons.RequestCase"],
+            *,
+            check_no_cuda_sync: bool = True,
+            extra_context: Callable[[], ContextManager[Any]] | None = None,
+            expect_result: bool = True,
+        ) -> UutProvider:
+            @contextmanager
+            def _uut_provider(is_warmup: bool) -> Generator[Callable[[], None], None, None]:
+                max_tokens = set(len(req.new_tokens) for req in requests)
+                assert len(max_tokens) == 1
+                max_draft_len = max_tokens.pop() - 1
+                sampler_args = TorchSampler.Args(
+                    max_seq_len=20,
+                    max_draft_len=max_draft_len,
+                    max_total_draft_tokens=max_draft_len,
+                    # Fill with many more max requests than below,
+                    # so we can test that write_finish_reasons uses seq_slots correctly
+                    max_num_sequences=cls.MAX_NUM_SEQUENCES,
+                    max_beam_width=1,
+                    disable_overlap_scheduler=False,
+                )
+                sampler = TorchSampler(args=sampler_args)
+                finish_reasons_store = sampler._finish_reasons_handler.store
+                # setup the sampler store for the requests
+                scheduled_requests = ScheduledRequests()
+                scheduled_requests.context_requests_last_chunk = [req.request for req in requests]
+                sampler.setup_sampler_step(scheduled_requests)
+
+                # fill with garbage value so we can observe that finish reasons are filled
+                # with NOT_FINISHED before we write to them.
+                finish_reasons_store.finish_reasons_cuda.fill_(205)
+                seq_slots_host = torch.tensor(
+                    [req.request.py_seq_slot for req in requests], device="cpu", dtype=torch.int64
+                )
+                seq_slots_cuda = seq_slots_host.to(device="cuda", non_blocking=True)
+                seq_lens_cuda = torch.tensor(
+                    [req.request.max_beam_num_tokens for req in requests],
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                new_tokens_cuda = torch.tensor(
+                    [req.new_tokens for req in requests], dtype=torch.int32, device="cuda"
+                ).T
+                sampler.store.new_tokens[:, seq_slots_cuda, cls.BEAM] = new_tokens_cuda
+
+                is_draft_batch = False
+                # Capture return value of write_finish_reasons for use after _uut() runs.
+                write_finish_reasons_result: list[torch.Tensor] = []
+
+                def _uut():
+                    with extra_context() if extra_context is not None else nullcontext():
+                        result = sampler._finish_reasons_handler.write_finish_reasons(
+                            seq_slots_host=seq_slots_host,
+                            is_draft_batch=is_draft_batch,
+                            seq_slots_cuda=seq_slots_cuda,
+                            seq_lens_cuda=seq_lens_cuda,
+                            new_tokens_cuda=sampler.store.new_tokens,
+                            first_finish_reasons_cuda=None,
+                        )
+                        write_finish_reasons_result.append(result)
+
+                yield _uut
+
+                if not expect_result:
+                    assert len(write_finish_reasons_result) == 0, (
+                        f"Expected no results, got {len(write_finish_reasons_result)}"
+                    )
+                else:
+                    assert len(write_finish_reasons_result) > 0, "Expected results, got none"
+                    # write_finish_reasons_result[0] is the return value from write_finish_reasons.
+                    reasons = write_finish_reasons_result[0][:, seq_slots_cuda, cls.BEAM].T.tolist()
+
+                    for actual, request in zip(reasons, requests, strict=True):
+                        expected = request.finish_reasons
+                        msg = f"actual={[FinishReason(reason) for reason in actual]} \
+                            != expected={expected}\nFor {request}"
+                        assert actual == [reason.value for reason in expected], msg
+
+            return _uut_provider
+
+    @classmethod
+    def test_write_finish_reasons(cls):
+        """We don't really care about the finish reason past the first infraction, because we're not going to use it,
+        although in some instance it is written anyway."""
+        uut_provider = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[13, 14],
+                    new_tokens=[60, 61, 62],
+                    # We pre-fill the finish reasons with NOT_FINISHED.
+                    finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.NOT_FINISHED],
+                ),
+                cls.RequestCase(
+                    prompt=[7, 8, 6],
+                    stop_words_list=[[12, 13]],
+                    new_tokens=[12, 13, 60],
+                    finish_reasons=[cls.NOT_FINISHED, cls.STOP_WORDS, cls.NOT_FINISHED],
+                ),
+                cls.RequestCase(
+                    prompt=[1, 2, 3, 4],
+                    end_id=99,
+                    new_tokens=[55, 99, 58],
+                    finish_reasons=[cls.NOT_FINISHED, cls.END_ID, cls.NOT_FINISHED],
+                ),
+                cls.RequestCase(
+                    prompt=[4, 5, 6],
+                    max_new_tokens=2,
+                    new_tokens=[56, 57, 59],
+                    # The LENGTH check happens to not have an early exit
+                    finish_reasons=[cls.NOT_FINISHED, cls.LENGTH, cls.LENGTH],
+                ),
+                cls.RequestCase(
+                    prompt=[1, 12],
+                    stop_words_list=[[12, 13], [14, 15]],
+                    new_tokens=[13, 14, 15],
+                    # We don't use early exit to avoid stream synchronization for stop words
+                    finish_reasons=[cls.STOP_WORDS, cls.NOT_FINISHED, cls.STOP_WORDS],
+                ),
+                cls.RequestCase(
+                    prompt=[1, 12],
+                    stop_words_list=[
+                        [12, 13, 14, 15],
+                        [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24],
+                    ],
+                    new_tokens=[13, 14, 15],
+                    # Stop words of different lengths are handled correctly with respect to padding of stop words
+                    # and tokens
+                    finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.STOP_WORDS],
+                ),
+                cls.RequestCase(
+                    prompt=[1],
+                    max_new_tokens=2,
+                    end_id=99,
+                    stop_words_list=[[1, 12]],
+                    new_tokens=[12, 99, 63],
+                    # Different infractions are written to different places as
+                    # we don't have an early exit between infractions
+                    finish_reasons=[cls.STOP_WORDS, cls.END_ID, cls.LENGTH],
+                ),
+                cls.RequestCase(
+                    prompt=[1, 12, 56, 67, 68, 234, 678],
+                    stop_words_list=[[12, 56, 67, 68, 234, 678, 129, 182]],
+                    new_tokens=[129, 182, 600],
+                    # Notice the offending stop sequence is concatenated, as we lookback
+                    finish_reasons=[cls.NOT_FINISHED, cls.STOP_WORDS, cls.NOT_FINISHED],
+                ),
+                cls.RequestCase(
+                    prompt=[1, 12],
+                    end_id=99,
+                    max_new_tokens=1,
+                    stop_words_list=[[1, 12, 99]],
+                    new_tokens=[99, 100, 101],
+                    # The latest infraction check overrides the earlier infraction checks,
+                    # hence the first finish_reason is END_ID
+                    finish_reasons=[cls.END_ID, cls.LENGTH, cls.LENGTH],
+                ),
+            ]
+        )
+
+        run_test_with_warmup(uut_provider, max_sync_s=0.5)
+
+    @classmethod
+    def test_are_stop_words_isnt_called_when_no_stop_words(cls, monkeypatch: pytest.MonkeyPatch):
+        """We don't want to call are_stop_words when there are no stop words because it's expensive"""
+
+        def stop_words_that_raises(*args, **kwargs):
+            raise AssertionError
+
+        @contextmanager
+        def raising_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                patch_ctx.setattr(FinishReasonsHandler, "_are_stop_words", stop_words_that_raises)
+                patch_ctx.setattr(
+                    FinishReasonsHandler,
+                    "_are_stop_words_single_token",
+                    stop_words_that_raises,
+                )
+                with pytest.raises(AssertionError) if expect_raise else nullcontext():
+                    yield
+
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1, 2]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                ),
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                ),
+            ],
+            extra_context=lambda: raising_stop_words_ctx(True),
+            expect_result=False,
+        )
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: raising_stop_words_ctx(False),
+        )
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+    @classmethod
+    def test_are_stop_words_single_token_is_called_when_single_token_stop_words_are_present(
+        cls, monkeypatch: pytest.MonkeyPatch
+    ):
+        """We don't want to call are_stop_words when there are only single token stop words because it's expensive"""
+
+        def stop_words_that_raises(*args, **kwargs):
+            raise AssertionError
+
+        @contextmanager
+        def raising_single_token_stop_words_ctx(expect_raise: bool) -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                patch_ctx.setattr(
+                    FinishReasonsHandler,
+                    "_are_stop_words_single_token",
+                    stop_words_that_raises,
+                )
+                with pytest.raises(AssertionError) if expect_raise else nullcontext():
+                    yield
+
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: raising_single_token_stop_words_ctx(True),
+            expect_result=False,
+        )
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+        uut_provider_with_stop_words = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[[1, 2]],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: raising_single_token_stop_words_ctx(False),
+        )
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+
+    @classmethod
+    def check_resize_and_update_stop_words_buffer(
+        cls,
+        old_stop_words: torch.Tensor,
+        old_past_tokens: torch.Tensor,
+        new_stop_words: torch.Tensor,
+        new_past_tokens: torch.Tensor,
+        seq_slots_to_compare: torch.Tensor,
+        num_draft_tokens: int,
+    ):
+        old_num_stop_words = old_stop_words.shape[0]
+        old_stop_word_length = old_stop_words.shape[1]
+
+        old_past_token_length = old_past_tokens.shape[0]
+
+        # These sizes should not change after the resize
+        assert old_stop_words.shape[2] == new_stop_words.shape[2]
+        assert old_past_tokens.shape[1] == new_past_tokens.shape[1]
+        assert old_past_tokens.shape[2] == new_past_tokens.shape[2]
+
+        assert (
+            new_stop_words[-old_num_stop_words:, -old_stop_word_length:, seq_slots_to_compare]
+            == old_stop_words[..., seq_slots_to_compare]
+        ).all()
+        # initial fill has an offset of 1, as there will be a shift happening during sample_async
+        assert (
+            new_past_tokens[-old_past_token_length:-num_draft_tokens, seq_slots_to_compare, :]
+            == old_past_tokens[:-num_draft_tokens, seq_slots_to_compare, :]
+        ).all()
+
+    @classmethod
+    def test_stop_words_buffer_resize(cls, monkeypatch: pytest.MonkeyPatch):
+        @contextmanager
+        def check_resize_ctx() -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                setup_sampler_step_orig = TorchSampler.setup_sampler_step
+
+                def setup_sampler_step_with_size_check(self, scheduled_requests: ScheduledRequests):
+                    # RequestCase.build calls setup_sampler_step to fill the buffers for all context requests
+                    # Move the context requests to the generation requests
+                    scheduled_requests.generation_requests = scheduled_requests.context_requests
+                    # Add a request that enforces a resize
+                    scheduled_requests.context_requests_last_chunk = [
+                        cls.RequestCase(
+                            prompt=[1],
+                            stop_words_list=[
+                                [x for x in range(2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH)]
+                            ],
+                            new_tokens=[4],
+                            finish_reasons=[cls.NOT_FINISHED],
+                        ).request
+                    ]
+                    # Store the old stop words and past tokens for comparison
+                    old_stop_words = self.store.stop_words.clone()
+                    old_past_tokens = self.store.past_tokens.clone()
+                    # Call setup sampler step to trigger the resize
+                    setup_sampler_step_orig(self, scheduled_requests)
+
+                    # Check if sizes are correct
+                    assert self.store.stop_words.shape[0] == TorchSampler.DEFAULT_MAX_STOP_WORDS
+                    assert (
+                        self.store.stop_words.shape[1]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH
+                    )
+                    assert self.max_tokens == 1
+                    assert (
+                        self.store.past_tokens.shape[0]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH - 1 + self.max_tokens
+                    )
+                    # Check if values are added correctly
+                    seq_slots_to_compare_cuda = torch.Tensor(
+                        [
+                            scheduled_requests.generation_requests[x].py_seq_slot
+                            for x in range(len(scheduled_requests.generation_requests))
+                        ]
+                    ).to(device="cuda", dtype=torch.int32, non_blocking=True)
+                    cls.check_resize_and_update_stop_words_buffer(
+                        old_stop_words,
+                        old_past_tokens,
+                        self.store.stop_words,
+                        self.store.past_tokens,
+                        seq_slots_to_compare_cuda,
+                        self.max_draft_len,
+                    )
+
+                patch_ctx.setattr(
+                    TorchSampler, "setup_sampler_step", setup_sampler_step_with_size_check
+                )
+                yield
+
+        # The test adds one more request
+        num_requests = 8
+        uut_provider_with_resize_on_demand = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1 + x],
+                    stop_words_list=[[x + 100]],
+                    new_tokens=[x + 4, x + 3, x + 2],
+                    finish_reasons=[cls.NOT_FINISHED, cls.NOT_FINISHED, cls.NOT_FINISHED],
+                )
+                for x in range(num_requests)
+            ],
+            extra_context=lambda: check_resize_ctx(),
+        )
+        run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=0.5)
+
+    @classmethod
+    def test_stop_words_buffer_resizes_on_demand(cls, monkeypatch: pytest.MonkeyPatch):
+        @contextmanager
+        def check_resize_ctx() -> Generator[None, None, None]:
+            with monkeypatch.context() as patch_ctx:
+                setup_sampler_step_orig = TorchSampler.setup_sampler_step
+
+                def setup_sampler_step_with_size_check(self, scheduled_requests: ScheduledRequests):
+                    setup_sampler_step_orig(self, scheduled_requests)
+                    assert self.store.stop_words.shape[0] == TorchSampler.DEFAULT_MAX_STOP_WORDS
+                    assert (
+                        self.store.stop_words.shape[1]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH
+                    )
+                    assert self.max_tokens == 1
+                    assert (
+                        self.store.past_tokens.shape[0]
+                        == 2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH - 1 + self.max_tokens
+                    )
+
+                patch_ctx.setattr(
+                    TorchSampler, "setup_sampler_step", setup_sampler_step_with_size_check
+                )
+                yield
+
+        uut_provider_with_resize_on_demand = cls.RequestCase.build(
+            [
+                cls.RequestCase(
+                    prompt=[1],
+                    stop_words_list=[
+                        [x for x in range(2 * TorchSampler.DEFAULT_MAX_STOP_WORD_LENGTH)]
+                    ],
+                    new_tokens=[4],
+                    finish_reasons=[cls.NOT_FINISHED],
+                )
+            ],
+            extra_context=lambda: check_resize_ctx(),
+        )
+        run_test_with_warmup(uut_provider_with_resize_on_demand, max_sync_s=None)
+
+
+@pytest.mark.parametrize("min_p", [0.0, 0.1, 0.5, 0.9])
+def test_min_p_renorm_probs(min_p: float):
+    """min_p_renorm_probs keeps tokens with p >= min_p * max and renormalizes."""
+    torch.manual_seed(0)
+    probs = torch.softmax(torch.randn(4, 16), dim=-1)
+
+    got = min_p_renorm_probs(probs.clone(), min_p)
+
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    kept = probs >= (min_p * max_probs)
+    expected = torch.where(kept, probs, torch.zeros_like(probs))
+    expected = expected / expected.sum(dim=-1, keepdim=True)
+
+    torch.testing.assert_close(got, expected)
+    # every row still sums to 1 and the argmax token always survives
+    torch.testing.assert_close(got.sum(dim=-1), torch.ones(probs.size(0)))
+    assert (got.gather(1, probs.argmax(dim=-1, keepdim=True)) > 0).all()
+
+
+def test_min_p_renorm_probs_per_request_tensor():
+    """A per-request min_p tensor applies a distinct threshold per row."""
+    torch.manual_seed(1)
+    probs = torch.softmax(torch.randn(3, 16), dim=-1)
+    min_p = torch.tensor([0.0, 0.3, 0.95])
+
+    got = min_p_renorm_probs(probs.clone(), min_p)
+
+    max_probs = probs.max(dim=-1, keepdim=True).values
+    kept = probs >= (min_p.reshape(-1, 1) * max_probs)
+    expected = torch.where(kept, probs, torch.zeros_like(probs))
+    expected = expected / expected.sum(dim=-1, keepdim=True)
+    torch.testing.assert_close(got, expected)
+    # row 0 (min_p=0) keeps everything; row 2 (min_p=0.95) prunes more aggressively
+    assert (got[0] > 0).all()
+    assert (got[2] > 0).sum() <= (got[0] > 0).sum()
+
+
+def test_min_p_sample_top_k_disabled_sentinel():
+    """min_p + unset top_k must survive the standalone sample() dispatch.
+
+    Draft-model rejection sampling resolves strategies with vocab_size=2**31
+    (the greedy probe), so a min_p request with an unset top_k carries the
+    disabled-top_k sentinel 0. That 0 flows straight into sample() ->
+    top_k_top_p_sampling_batch without sanitize_top_k, so the vanilla path must
+    treat it as "keep all" instead of tripping ``assert top_k > 1``. Regression
+    test for min_p under speculative decoding with rejection sampling.
+    """
+    min_p = 0.5
+    # ("min_p", top_k, top_p, min_p, temperature) with the top_k=0 sentinel.
+    strategy: MinP = ("min_p", 0, 1.0, min_p, 1.0)
+
+    torch.manual_seed(0)
+    logits = torch.randn(4, 32)
+    # Must not raise (top_k=0 previously hit ``assert top_k > 1``).
+    tokens, _, _ = sample(strategy, logits.clone())
+
+    assert tokens.shape == (4,)
+    # min_p filtering was applied: every sampled token clears the min_p mask.
+    probs = torch.softmax(logits, dim=-1)
+    kept = probs >= (min_p * probs.max(dim=-1, keepdim=True).values)
+    assert kept.gather(1, tokens.unsqueeze(-1)).all()
 
 
 class TestBatchedSampling:
@@ -892,6 +1518,7 @@ class TestBatchedSampling:
             TopP: SamplingParams(top_p=0.42, temperature=0.2),
             TopK: SamplingParams(top_k=27, temperature=0.5),
             TopKTopP: SamplingParams(top_k=27, top_p=0.6, temperature=0.5),
+            MinP: SamplingParams(min_p=0.02, top_k=40, top_p=0.9, temperature=1.0),
         }
 
         # Check that all relevant strategies are covered
@@ -909,7 +1536,9 @@ class TestBatchedSampling:
             for strategy_type, params in BASE_CASES.items():
                 if strategy_type == Greedy and not allow_greedy:
                     continue
-                strategy_name = _get_strategy_name(strategy_type)
+                strategy_name = _get_strategy_name(
+                    cast(Type[Strategy], strategy_type),
+                )
                 test_cases.append(
                     (
                         [params],
@@ -926,7 +1555,9 @@ class TestBatchedSampling:
                 batch_size = rng.integers(low=1, high=max_batch_size)
                 if strategy_type == Greedy and not allow_greedy:
                     continue
-                strategy_name = _get_strategy_name(strategy_type)
+                strategy_name = _get_strategy_name(
+                    cast(Type[Strategy], strategy_type),
+                )
                 test_cases.append(
                     (
                         [params] * batch_size,
@@ -948,7 +1579,6 @@ class TestBatchedSampling:
             # Batches containing requests with different sampling params
             max_sub_batch_size: Final = 6
             type_to_constrain = TopK
-            mixed_params_list = None
             for constraint_value in [
                 None,  # all sub-batches have at least two requests
                 0,  # one sub-batch omitted
@@ -957,10 +1587,10 @@ class TestBatchedSampling:
                 Shuffle(),  # random ordering
                 VaryParams(),  # random ordering + randomized request parameter values
             ]:
-                mixed_params_list = []
+                mixed_params_list: list[SamplingParams] = []
                 constrained_indices = None
                 for strategy_type, params in BASE_CASES.items():
-                    sub_batch_size = rng.integers(low=2, high=max_sub_batch_size)
+                    sub_batch_size = rng.integers(low=2, high=max_sub_batch_size).item()
                     if strategy_type == Greedy and not allow_greedy:
                         continue
                     if strategy_type == type_to_constrain and constraint_value is not None:
@@ -971,7 +1601,7 @@ class TestBatchedSampling:
                                 len(mixed_params_list),
                                 len(mixed_params_list) + sub_batch_size,
                             )
-                    strategy_name = _get_strategy_name(strategy_type)
+                    strategy_name = _get_strategy_name(cast(Type[Strategy], strategy_type))
                     mixed_params_list += [params] * sub_batch_size
                 label = "mixed_batch"
                 if isinstance(constraint_value, OneContinguous):
@@ -996,16 +1626,20 @@ class TestBatchedSampling:
                     def _perturb_params(param: SamplingParams):
                         top_k = param.top_k
                         if top_k is not None:
-                            top_k = rng.integers(2, vocab_size // 3)
+                            top_k = int(rng.integers(2, vocab_size // 3))
                         top_p = param.top_p
                         if top_p is not None:
                             top_p *= max(rng.random(), 1e-6)
                         temperature = param.temperature
                         if temperature is not None:
                             temperature *= max(rng.random(), 1e-6)
+                        min_p = param.min_p
+                        if min_p is not None:
+                            min_p *= max(rng.random(), 1e-6)
                         return SamplingParams(
                             top_p=top_p,
                             top_k=top_k,
+                            min_p=min_p,
                             temperature=temperature,
                         )
 
@@ -1080,64 +1714,42 @@ class TestBatchedSampling:
         """Build a batch of test requests consumable by sample_async."""
         seq_slots, num_seq_slots = seq_slot_assignment
 
-        class ScheduledRequestsMock:
-            def __init__(
-                self,
-                sampling_params_list: list[SamplingParams],
-                *,
-                draft_lens: list[int],
-            ):
-                self._sampling_params_list = sampling_params_list
-
-                # NB:
-                #   -  stop words are tested in test_write_finish_reasons
-                #   -  'end_id' is tested in test_write_finish_reasons
-                #   -  embedding bias is tested elsewhere
-                #   -  py_min_length is tested elsewhere
-                #   -  py_return_log_probs is tested elsewhere
-                #   -  code paths gated by py_return_context_logits tested in test_select_generated_logits
-                self._gen_requests = [
-                    LlmRequest(
-                        request_id=seq_slot,
-                        max_new_tokens=(2 * draft_len),  # not used by tested code
-                        input_tokens=[12],  # not used by tested code
-                        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
-                        seq_slot=seq_slot,
-                        is_streaming=False,  # not relevant for tested code
-                        draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
-                            torch.testing.make_tensor(
-                                (draft_len,),
-                                dtype=torch.int32,
-                                device="cpu",
-                            ).tolist()
-                            if draft_len
-                            else None
-                        ),
-                    )
-                    for sampling_params, seq_slot, draft_len in zip(
-                        sampling_params_list, seq_slots, draft_lens
-                    )
-                ]
-
-            @property
-            def context_requests(self) -> list[LlmRequest]:
-                # Code paths excluded by this choice are addressed by test_select_generated_logits
-                return []
-
-            @property
-            def generation_requests(self) -> list[LlmRequest]:
-                # The batched sampling code in sample_async only checks that this is not empty
-                return self._gen_requests
-
-            def all_requests(self) -> list[LlmRequest]:
-                # The sampling code relies on this ordering assumption
-                return self.context_requests + self.generation_requests
-
         with torch.inference_mode(True):
-            return cast(
-                ScheduledRequests,
-                ScheduledRequestsMock(sampling_params_list, draft_lens=draft_lens),
-            )
+            scheduled_requests = ScheduledRequests()
+            # Code paths excluded by this choice are addressed by test_select_generated_logits
+            scheduled_requests.context_requests_chunking = []
+            # Code paths excluded by this choice are addressed by test_select_generated_logits
+            scheduled_requests.context_requests_last_chunk = []
+            # NB:
+            #   -  stop words are tested in test_write_finish_reasons
+            #   -  'end_id' is tested in test_write_finish_reasons
+            #   -  embedding bias is tested elsewhere
+            #   -  py_min_length is tested elsewhere
+            #   -  py_return_log_probs is tested elsewhere
+            #   -  code paths gated by py_return_context_logits tested in test_select_generated_logits
+            scheduled_requests.generation_requests = [
+                LlmRequest(
+                    request_id=seq_slot,
+                    max_new_tokens=(2 * draft_len),  # not used by tested code
+                    input_tokens=[12],  # not used by tested code
+                    sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+                    seq_slot=seq_slot,
+                    is_streaming=False,  # not relevant for tested code
+                    draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
+                        torch.testing.make_tensor(
+                            (draft_len,),
+                            dtype=torch.int32,
+                            device="cpu",
+                        ).tolist()
+                        if draft_len
+                        else None
+                    ),
+                )
+                for sampling_params, seq_slot, draft_len in zip(
+                    sampling_params_list, seq_slots, draft_lens
+                )
+            ]
+            return scheduled_requests
 
     @pytest.fixture(scope="function")
     def model_outputs(
@@ -1168,12 +1780,10 @@ class TestBatchedSampling:
     @pytest.fixture(scope="function")
     def sampler(
         self,
-        use_flashinfer: bool,
         max_draft_len: int,
         seq_slot_assignment: tuple[list[int], int],
     ) -> TorchSampler:
         return self._build_sampler(
-            use_flashinfer=use_flashinfer,
             max_draft_len=max_draft_len,
             seq_slot_assignment=seq_slot_assignment,
         )
@@ -1181,7 +1791,6 @@ class TestBatchedSampling:
     def _build_sampler(
         self,
         *,
-        use_flashinfer: bool,
         max_draft_len: int,
         seq_slot_assignment: tuple[list[int], int],
     ) -> TorchSampler:
@@ -1193,7 +1802,6 @@ class TestBatchedSampling:
                 max_beam_width=1,  # currently the only supported value
                 max_num_sequences=num_seq_slots,
                 max_total_draft_tokens=max_draft_len,
-                disable_flashinfer_sampling=(not use_flashinfer),
                 disable_overlap_scheduler=False,
             )
         )
@@ -1206,12 +1814,14 @@ class TestBatchedSampling:
         *,
         num_repeats: Optional[int] = None,
         allow_sync: bool = True,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> torch.Tensor:
         """Call sample_async.
 
         Optionally, run sampling repeatedly, e.g., to gather statistics.
         """
-        assert not scheduled_requests.context_requests
+        assert scheduled_requests.num_context_requests == 0
+
         num_actual_repeats = num_repeats if num_repeats is not None else 1
 
         T = TypeVar("T")
@@ -1230,52 +1840,46 @@ class TestBatchedSampling:
                 is_first = False
                 return func()
 
-        sample_states = [
-            maybe_check_no_sync(
-                lambda: sampler.sample_async(
-                    scheduled_requests,
-                    model_outputs=model_outputs,
-                    num_context_logits_prefix_sum=[0],
-                    resource_manager=None,  #  only used for tree sampling, which is not tested here
+        with monkeypatch.context() as patcher:
+            # Ensure that internal sampler data structures are set up for all requests
+            # (production code only considers context requests and examines other not mocked
+            # LlmRequest fields)
+            def _mock_filter(self, requests: ScheduledRequests) -> list[LlmRequest]:
+                return requests.all_requests()
+
+            patcher.setattr(TorchSampler, "_collect_new_requests_for_setup", _mock_filter)
+
+            sample_states = [
+                maybe_check_no_sync(
+                    lambda: sampler.sample_async(
+                        scheduled_requests,
+                        model_outputs=model_outputs,
+                        num_context_logits_prefix_sum=[0],
+                        resource_manager=None,  #  only used for tree sampling, which is not tested here
+                    )
                 )
-            )
-            for _ in range(num_actual_repeats)
-        ]
+                for _ in range(num_actual_repeats)
+            ]
         new_tokens_tensors = []
         for sample_state in sample_states:
             assert sample_state.sampler_event is not None
             sample_state.sampler_event.synchronize()
             assert sample_state.host is not None
-            new_tokens_tensors.append(sample_state.host.new_tokens.unsqueeze(-1))
+            host_new_tokens = sample_state.host.new_tokens
+            if sample_state.single_step_greedy:
+                # The stable greedy path copies one token per active request instead of
+                # the full [step, slot, beam] buffer. This fixture uses dense sequence
+                # slots, so restore that layout before comparing sampling results.
+                assert host_new_tokens.shape == (len(sample_state.requests),)
+                host_new_tokens = host_new_tokens.reshape(1, -1, 1)
+            new_tokens_tensors.append(host_new_tokens.unsqueeze(-1))
         new_tokens = torch.cat(new_tokens_tensors, dim=-1)
         if num_repeats is None:
             new_tokens = new_tokens.squeeze(-1)
         return new_tokens
 
     @pytest.mark.parametrize(
-        "use_flashinfer, max_draft_len, sampling_params_list",
-        [
-            pytest.param(use_flashinfer, max_draft_len, [])
-            for (use_flashinfer, max_draft_len) in product(
-                [False, True],
-                [0, 3],
-            )
-        ],
-    )
-    def test_backend_selection(
-        self,
-        sampler: TorchSampler,
-        use_flashinfer: bool,
-    ):
-        """Check that TorchSampler uses the correct sampling backend."""
-        expected_cls = (
-            FlashInferGroupedStrategySampler if use_flashinfer else SimpleGroupedStrategySampler
-        )
-        assert sampler._grouped_sampler_cls == expected_cls
-
-    @pytest.mark.parametrize(
         (
-            "use_flashinfer",
             "max_draft_len",
             "draft_lens",
             "sampling_params_list",
@@ -1286,18 +1890,16 @@ class TestBatchedSampling:
         [
             # NB: non-zero draft len ensures that LlmRequest.py_target_probs is set.
             pytest.param(
-                use_flashinfer,
                 3,
                 [3] * len(sampling_params_list),
                 sampling_params_list,
                 params_label,
                 False,
                 vocab_size,
-                id=f"{'FlashInfer' if use_flashinfer else 'Torch'}-{params_label}",
+                id=f"FlashInfer-{params_label}",
             )
             # https://stackoverflow.com/a/75421799, does not work with nested loops
-            for (use_flashinfer, (sampling_params_list, params_label), vocab_size) in product(
-                [False, True],
+            for ((sampling_params_list, params_label), vocab_size) in product(
                 _build_test_cases(
                     vocab_size=VOCAB_SIZE,
                     allow_greedy=False,  # Greedy does not return probs
@@ -1317,6 +1919,7 @@ class TestBatchedSampling:
         allow_zero_draft_len: bool,  # used by fixtures
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
+        monkeypatch: pytest.MonkeyPatch,
     ):
         """Validate probabilities returned by sample_async.
 
@@ -1338,6 +1941,7 @@ class TestBatchedSampling:
                     TopP,
                     TopK,
                     TopKTopP,
+                    MinP,
                 ]
             }
 
@@ -1358,6 +1962,7 @@ class TestBatchedSampling:
                     scheduled_requests=uut_mock_requests,
                     model_outputs=model_outputs,
                     allow_sync=is_warmup,
+                    monkeypatch=monkeypatch,
                 )
 
             yield _uut
@@ -1400,7 +2005,8 @@ class TestBatchedSampling:
                     torch.testing.assert_close(probs, expected_probs_after_temperature)
                 else:
                     if strategy[0] not in [
-                        strategy_tags[strategy_type] for strategy_type in [TopP, TopK, TopKTopP]
+                        strategy_tags[strategy_type]
+                        for strategy_type in [TopP, TopK, TopKTopP, MinP]
                     ]:
                         raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -1466,6 +2072,14 @@ class TestBatchedSampling:
                             cast(float, top_p),
                         ).all()
 
+                    if strategy[0] == strategy_tags[MinP]:
+                        # Renorm preserves the ratio, so every kept token satisfies
+                        # prob >= min_p * max (holds with top_k/top_p also applied).
+                        min_p_val = cast(float, strategy[3])
+                        kept = probs != 0.0
+                        ratio = probs / probs.amax(dim=-1, keepdim=True)
+                        assert torch.all((ratio >= min_p_val - 1e-6)[kept])
+
                     # All indices not selected must have logits less or equal
                     # to the smallest selected logit.
                     probs_selected_min = torch.where(
@@ -1485,18 +2099,21 @@ class TestBatchedSampling:
 
                 logit_offset += steps
 
-        _run_test_with_warmup(_uut_provider)
+        run_test_with_warmup(
+            _uut_provider,
+            max_sync_s=None,  # NB: assert_no_cuda_sync called in TestBatchedSampler._sample
+        )
 
     def _compute_probs(
         self,
         *,
-        use_flashinfer: bool,
         model_outputs: dict[str, torch.Tensor],
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
         vocab_size: int,
         max_draft_len: int,
         draft_lens: list[int],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> ScheduledRequests:
         """Construct a batch of requests with given sampling params and invoke sampler to compute probs.
 
@@ -1510,7 +2127,6 @@ class TestBatchedSampling:
         # compute probs in general.
         draft_len_with_probs = max(1, max_draft_len)
         sampler_with_probs = self._build_sampler(
-            use_flashinfer=use_flashinfer,
             max_draft_len=draft_len_with_probs,
             seq_slot_assignment=seq_slot_assignment,
         )
@@ -1541,6 +2157,7 @@ class TestBatchedSampling:
             sampler_with_probs,
             scheduled_requests=mock_requests_with_probs,
             model_outputs=model_outputs_with_probs,
+            monkeypatch=monkeypatch,
         )
         return mock_requests_with_probs
 
@@ -1549,84 +2166,91 @@ class TestBatchedSampling:
         patch_ctx: pytest.MonkeyPatch,
         *,
         sampler: TorchSampler,
-        use_flashinfer: bool,
     ):
         """Setup interception of sample_async and request grouping.
 
-        If FlashInfer.sampling is used, this validates that at every
-        invocation of sample_async, the sampling backend is called at most
-        once for any given sampling strategy (if FlashInfer.sampling is used).
+        Validates that at every invocation of sample_async, the FlashInfer
+        sampling backend is called at most once for any given sampling strategy.
 
         Used by test_samples.
         """
         # FlashInfer sampling batches requests of the same kind (e.g. top-p)
         # together even if they have different parameter values (e.g. probability thresholds).
         # This variable tracks which request types have been encountered.
-        flashinfer_keys_seen = set()
+        flashinfer_keys_seen: set[Any] = set()
 
-        if use_flashinfer:
-            sample_grouped_strategies_orig = sampler._grouped_sampler_cls.sample_grouped_strategies
+        assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
+        sample_grouped_strategies_orig = sampler._grouped_sampler_cls.sample_grouped_strategies
 
-            def _sample_grouped_strategies(
-                group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
-                strategies: list[Strategy],
-                logits: torch.Tensor,
-                *,
-                group_logit_indices: Optional[torch.Tensor] = None,
-                generator: Optional[torch.Generator] = None,
-                return_probs: bool,
-                group_metadata: StrategyMetadata | None = None,
-            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
-                assert generator is sampler.get_generator(logits.device)
-                if isinstance(group_key, tuple):
-                    assert isinstance(group_key[0], str)
-                else:
-                    assert isinstance(group_key, str)
-                nonlocal flashinfer_keys_seen
-                assert (group_key, return_probs) not in flashinfer_keys_seen
-                flashinfer_keys_seen.add((group_key, return_probs))
-                return sample_grouped_strategies_orig(
+        def _sample_grouped_strategies(
+            group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
+            strategies: list[Strategy],
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            return_probs: bool,
+            group_metadata: StrategyMetadata | None = None,
+            seeds: Optional[RequestSeeds] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
+            assert generator is sampler.get_generator(logits.device)
+            if isinstance(group_key, tuple):
+                assert isinstance(group_key[0], str)
+            else:
+                assert isinstance(group_key, str)
+            nonlocal flashinfer_keys_seen
+            assert (group_key, return_probs) not in flashinfer_keys_seen
+            flashinfer_keys_seen.add((group_key, return_probs))
+            result: tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float] = (
+                sample_grouped_strategies_orig(
                     group_key,
                     strategies,
                     logits,
                     group_logit_indices=group_logit_indices,
                     generator=generator,
                     return_probs=return_probs,
+                    group_metadata=group_metadata,
+                    seeds=seeds,
                 )
+            )
+            return result
 
-            patch_ctx.setattr(
-                sampler._grouped_sampler_cls,
-                "sample_grouped_strategies",
-                _sample_grouped_strategies,
+        # _grouped_sampler_cls is a class; point the instance at a subclass
+        # that overrides the callable, rather than mutating the shared class.
+        instrumented_cls = type(
+            "InstrumentedFlashInferGroupedStrategySampler",
+            (FlashInferGroupedStrategySampler,),
+            {"sample_grouped_strategies": staticmethod(_sample_grouped_strategies)},
+        )
+        patch_ctx.setattr(sampler, "_grouped_sampler_cls", instrumented_cls)
+
+        sample_async_orig = sampler.sample_async
+
+        def _sample_async(
+            scheduled_requests: ScheduledRequests,
+            model_outputs: dict[str, torch.Tensor],
+            num_context_logits_prefix_sum: list[int],
+            resource_manager=None,
+        ):
+            nonlocal flashinfer_keys_seen
+            flashinfer_keys_seen.clear()
+            res = sample_async_orig(
+                scheduled_requests,
+                model_outputs,
+                num_context_logits_prefix_sum,
+                resource_manager,
             )
 
-            sample_async_orig = sampler.sample_async
+            # Fast greedy path bypasses flashinfer sampling, so flashinfer_keys_seen
+            # will be empty when all requests are greedy
+            all_greedy = all(
+                _request_strategy(req, vocab_size=2**31) == GREEDY
+                for req in scheduled_requests.all_requests()
+            )
+            assert flashinfer_keys_seen or all_greedy
+            return res
 
-            def _sample_async(
-                scheduled_requests: ScheduledRequests,
-                model_outputs: dict[str, torch.Tensor],
-                num_context_logits_prefix_sum: list[int],
-                resource_manager=None,
-            ):
-                nonlocal flashinfer_keys_seen
-                flashinfer_keys_seen.clear()
-                res = sample_async_orig(
-                    scheduled_requests,
-                    model_outputs,
-                    num_context_logits_prefix_sum,
-                    resource_manager,
-                )
-
-                # Fast greedy path bypasses flashinfer sampling, so flashinfer_keys_seen
-                # will be empty when all requests are greedy
-                all_greedy = all(
-                    _request_strategy(req, vocab_size=2**31) == GREEDY
-                    for req in scheduled_requests.all_requests()
-                )
-                assert flashinfer_keys_seen or all_greedy
-                return res
-
-            patch_ctx.setattr(sampler, "sample_async", _sample_async)
+        patch_ctx.setattr(sampler, "sample_async", _sample_async)
 
     @dataclass(frozen=True, kw_only=True)
     class _TorchUtilsSamplingParams:
@@ -1638,6 +2262,7 @@ class TestBatchedSampling:
         temperature: Optional[torch.Tensor]
         top_p: Optional[torch.Tensor]
         top_k: Optional[torch.Tensor]
+        min_p: Optional[torch.Tensor] = None
 
     @dataclass(frozen=True, kw_only=True)
     class _MockSamplingLogEntry:
@@ -1670,6 +2295,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert filter_apply_order == "top_k_first"
             assert deterministic
@@ -1697,6 +2324,52 @@ class TestBatchedSampling:
             flashinfer.sampling,
             "top_k_top_p_sampling_from_logits",
             _mock_flashinfer_top_k_top_p,
+        )
+
+        def _mock_flashinfer_top_k_top_p_from_probs(
+            probs: torch.Tensor,
+            *,
+            top_k: torch.Tensor,
+            top_p: torch.Tensor,
+            filter_apply_order: str,
+            deterministic: bool,
+            check_nan: bool,
+            generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
+        ) -> torch.Tensor:
+            # The min_p strategy terminates its renorm chain here, so the probs
+            # recorded below already have min_p applied; min_p itself never
+            # reaches a flashinfer kernel and thus cannot be captured as a param.
+            # Patching this is not optional: unpatched, the real flashinfer
+            # implementation delegates to the *patched* top_p_sampling_from_probs
+            # with kwargs its mock does not accept.
+            assert filter_apply_order == "top_k_first"
+            assert deterministic
+            assert not check_nan, "check_nan syncs"
+            assert generator is sampler.get_generator(probs.device)
+            nonlocal mock_sampling_log
+            new_entries = [
+                TestBatchedSampling._MockSamplingLogEntry(
+                    probs=probs[row_idx],
+                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
+                        top_k=top_k[row_idx],
+                        top_p=top_p[row_idx],
+                        temperature=None,
+                    ),
+                )
+                for row_idx in range(probs.size(0))
+            ]
+            mock_tokens = torch.arange(
+                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            )
+            mock_sampling_log += new_entries
+            return mock_tokens
+
+        patch_ctx.setattr(
+            flashinfer.sampling,
+            "top_k_top_p_sampling_from_probs",
+            _mock_flashinfer_top_k_top_p_from_probs,
         )
 
         def _mock_flashinfer_from_logits(
@@ -1736,6 +2409,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert deterministic
             assert not check_nan, "check_nan syncs"
@@ -1767,6 +2442,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert deterministic
             assert not check_nan, "check_nan syncs"
@@ -1791,12 +2468,48 @@ class TestBatchedSampling:
 
         patch_ctx.setattr(flashinfer.sampling, "top_p_sampling_from_probs", _mock_flashinfer_top_p)
 
+        def _mock_flashinfer_min_p(
+            probs: torch.Tensor,
+            min_p: torch.Tensor,
+            *,
+            deterministic: bool,
+            check_nan: bool,
+            generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
+        ) -> torch.Tensor:
+            assert deterministic
+            assert not check_nan, "check_nan syncs"
+            assert generator is sampler.get_generator(probs.device)
+            nonlocal mock_sampling_log
+            new_entries = [
+                TestBatchedSampling._MockSamplingLogEntry(
+                    probs=probs[row_idx],
+                    sampling_params=TestBatchedSampling._TorchUtilsSamplingParams(
+                        top_k=None,
+                        top_p=None,
+                        temperature=None,
+                        min_p=min_p[row_idx],
+                    ),
+                )
+                for row_idx in range(probs.size(0))
+            ]
+            mock_tokens = torch.arange(
+                len(mock_sampling_log), len(mock_sampling_log) + len(new_entries)
+            )
+            mock_sampling_log += new_entries
+            return mock_tokens
+
+        patch_ctx.setattr(flashinfer.sampling, "min_p_sampling_from_probs", _mock_flashinfer_min_p)
+
         def _mock_flashinfer_from_probs(
             probs: torch.Tensor,
             *,
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert deterministic
             assert not check_nan, "check_nan syncs"
@@ -1873,6 +2586,10 @@ class TestBatchedSampling:
             log_entry.sampling_params.top_k is not None
             and log_entry.sampling_params.top_k.item() != vocab_size
         )
+        req_has_min_p = (
+            log_entry.sampling_params.min_p is not None
+            and log_entry.sampling_params.min_p.item() != 0
+        )
         if req_has_top_k:
             assert req_params.top_k is not None
             assert log_entry.sampling_params.top_k is not None
@@ -1881,7 +2598,12 @@ class TestBatchedSampling:
             assert req_params.top_p is not None
             assert log_entry.sampling_params.top_p is not None
             assert np.allclose(req_params.top_p, log_entry.sampling_params.top_p.item())
-        if req_has_top_k or req_has_top_p:
+        if req_has_min_p:
+            assert req_params.min_p is not None
+            assert log_entry.sampling_params.min_p is not None
+            assert np.allclose(req_params.min_p, log_entry.sampling_params.min_p.item())
+        # min_p also filters to a top-prefix subset, so it reuses the validation below.
+        if req_has_top_k or req_has_top_p or req_has_min_p:
             # for top-k and/or top-p _sampling_, probs contains only the top probs,
             # whereas log_entry.probs contains all probs passed to the sampling code.
 
@@ -1918,11 +2640,11 @@ class TestBatchedSampling:
             test_expected_counts != 0, 0, test_token_counts
         )
         assert (test_token_counts_for_zero_prob == 0).all()
-        test_expected_counts_ma = np.ma.masked_array(
+        test_expected_counts_ma = np.ma.MaskedArray(
             test_expected_counts.numpy(),
             mask=(test_expected_counts.numpy() == 0),
         )
-        test_token_counts_ma = np.ma.masked_array(
+        test_token_counts_ma = np.ma.MaskedArray(
             test_token_counts.numpy(),
             mask=test_expected_counts_ma.mask,
         )
@@ -1958,9 +2680,10 @@ class TestBatchedSampling:
             axis=-1,
             lambda_="log-likelihood",  # = KL divergence
         )
+        pvalue: np.ndarray | float
         if hasattr(test_result.pvalue, "mask"):
-            assert test_result.pvalue.mask
-            pvalue = test_result.pvalue.data
+            assert test_result.pvalue.mask  # pyright: ignore
+            pvalue = test_result.pvalue.data  # pyright: ignore
         else:
             pvalue = test_result.pvalue
         if not np.all(pvalue > 0.1):  # This can happen by "chance" (many test instances)
@@ -1971,14 +2694,13 @@ class TestBatchedSampling:
             prob_delta = np.where(prob_delta > 5e-2, prob_delta, 0)  # NB: this is rather liberal
             # bound relative differences on remaining probs
             prob_delta_rel = (
-                np.ma.masked_array(num_samples * prob_delta, mask=test_expected_counts_ma.mask)
+                np.ma.MaskedArray(num_samples * prob_delta, mask=test_expected_counts_ma.mask)
                 / test_expected_counts_ma.data
             )
             assert prob_delta_rel.max() < 0.05
 
     @pytest.mark.parametrize(
         (
-            "use_flashinfer",
             "max_draft_len",
             "sampling_params_list",
             "allow_zero_draft_len",
@@ -1987,7 +2709,6 @@ class TestBatchedSampling:
         ),
         [
             pytest.param(
-                use_flashinfer,
                 max_draft_len,
                 sampling_params_list,
                 allow_zero_draft_len,
@@ -1998,21 +2719,19 @@ class TestBatchedSampling:
                 ),  # bypass_sampling
                 vocab_size,
                 id=(
-                    f"{'FlashInfer' if use_flashinfer else 'Torch'}"
+                    f"FlashInfer"
                     f"-draft_len={0 if allow_zero_draft_len else 1}..{max_draft_len}"
                     f"-{params_label}"
                 ),
             )
             # https://stackoverflow.com/a/75421799, does not work with nested loops
             for (
-                use_flashinfer,
                 is_mixed,
                 max_draft_len,
                 allow_zero_draft_len,
                 _build_test_cases,
                 vocab_size,
             ) in product(
-                [False, True],
                 [False, True],
                 [0, 3],
                 [False, True],
@@ -2038,7 +2757,6 @@ class TestBatchedSampling:
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
         max_draft_len: int,
-        use_flashinfer: bool,
         allow_zero_draft_len: bool,  # used by fixtures
         bypass_sampling: bool,
         monkeypatch: pytest.MonkeyPatch,
@@ -2064,13 +2782,13 @@ class TestBatchedSampling:
             # model_outputs. These probs, the computation of which is validated by 'test_probs',
             # are used to validate the batched sampling process later in this test.
             mock_requests_with_probs = self._compute_probs(
-                use_flashinfer=use_flashinfer,
                 model_outputs=model_outputs,
                 sampling_params_list=sampling_params_list,
                 seq_slot_assignment=seq_slot_assignment,
                 vocab_size=vocab_size,
                 max_draft_len=max_draft_len,
                 draft_lens=draft_lens,
+                monkeypatch=monkeypatch,
             )
 
             num_samples = 5000 if not (bypass_sampling or is_warmup) else 1
@@ -2079,9 +2797,7 @@ class TestBatchedSampling:
             mock_sampling_log: Optional[list[TestBatchedSampling._MockSamplingLogEntry]] = None
 
             with monkeypatch.context() as patch_ctx:
-                self._inject_batching_check(
-                    patch_ctx, sampler=sampler, use_flashinfer=use_flashinfer
-                )
+                self._inject_batching_check(patch_ctx, sampler=sampler)
                 if bypass_sampling:
                     mock_sampling_log = self._instrument_sampling_backend(
                         patch_ctx, sampler=sampler
@@ -2104,6 +2820,7 @@ class TestBatchedSampling:
                         model_outputs=model_outputs,
                         num_repeats=num_samples,
                         allow_sync=is_warmup,
+                        monkeypatch=monkeypatch,
                     )
                     res.result = UutResult(new_tokens_repeats=new_tokens_repeats)
 
@@ -2197,7 +2914,10 @@ class TestBatchedSampling:
                         num_samples=num_samples,
                     )
 
-        _run_test_with_warmup(_uut_provider)
+        run_test_with_warmup(
+            _uut_provider,
+            max_sync_s=None,  # NB: assert_no_cuda_sync called in TestBatchedSampler._sample
+        )
 
     @staticmethod
     def _build_seq_slot_assignments() -> list[tuple[list[int], int, str]]:
@@ -2213,12 +2933,12 @@ class TestBatchedSampling:
 
         seq_slot_assignments = []
         for include_first, include_last in product([False, True], [False, True]):
-            total_seq_slots = rng.integers(max_seq_slots // 2, max_seq_slots)
-            start = 0 if include_first else rng.integers(margin)
-            end = total_seq_slots - (0 if include_last else rng.integers(margin))
+            total_seq_slots = rng.integers(max_seq_slots // 2, max_seq_slots).item()
+            start = 0 if include_first else rng.integers(margin).item()
+            end = total_seq_slots - (0 if include_last else rng.integers(margin).item())
             for dense in [False, True]:
                 if dense:
-                    seq_slots = range(start, end)
+                    seq_slots = list(range(start, end))
                 else:
                     allowed_slots = np.arange(start, end)
                     num_seq_slots = rng.integers(len(allowed_slots) // 2, len(allowed_slots))
@@ -2239,7 +2959,6 @@ class TestBatchedSampling:
 
     @pytest.mark.parametrize(
         (
-            "use_flashinfer",
             "max_draft_len",
             "allow_zero_draft_len",
             "vocab_size",
@@ -2248,7 +2967,6 @@ class TestBatchedSampling:
         ),
         [
             pytest.param(
-                False,  # NB: _unbatch_sampling_results does not depend on backend
                 max_draft_len,
                 allow_zero_draft_len,
                 vocab_size,
@@ -2284,7 +3002,6 @@ class TestBatchedSampling:
         vocab_size: int,  # used by fixtures
         seq_slot_assignment: tuple[list[int], int],
         max_draft_len: int,
-        use_flashinfer: bool,  # used by fixtures
         allow_zero_draft_len: bool,  # used by fixtures
         ordered: bool,
     ):
@@ -2317,7 +3034,7 @@ class TestBatchedSampling:
             )
 
             req_num_steps = torch.tensor(draft_lens, dtype=torch.int32) + 1
-            total_steps = cast(int, req_num_steps.sum())
+            total_steps = cast(int, req_num_steps.sum().item())
 
             new_tokens_cuda = torch.testing.make_tensor(
                 (max_draft_len + 1, total_seq_slots, 1),
@@ -2330,14 +3047,14 @@ class TestBatchedSampling:
             if not ordered:
                 batch_req_indices = batch_req_indices[torch.randperm(batch_req_indices.numel())]
 
-            first_token = rng.integers(123456)
+            first_token = rng.integers(123456).item()
             batch_next_tokens_cuda_int = torch.arange(
                 first_token, first_token + total_steps, dtype=torch.int32, device="cuda"
             ).unsqueeze(1)  # Add a dimension for beam width
 
             batched_sampling_result = _BatchedSamplingResult(
-                batch_req_indices=batch_req_indices.clone(),
-                batch_next_tokens_cuda_int=batch_next_tokens_cuda_int.clone(),
+                req_indices=batch_req_indices.clone(),
+                next_tokens_cuda_int=batch_next_tokens_cuda_int.clone(),
             )
             seq_slots_tensor_snapshot = seq_slots_tensor.clone()
 
@@ -2350,6 +3067,11 @@ class TestBatchedSampling:
                 result: Optional[UutResult] = None
 
             res = UutResultWrapper()
+            # Precomputed outside the no-sync region (mirrors the production
+            # resident device copy of seq_slots).
+            seq_slots_tensor_cuda = (
+                seq_slots_tensor.to(torch.int64).pin_memory().to("cuda", non_blocking=True)
+            )
 
             def _uut(res=res):
                 new_tokens_host = sampler._unbatch_sampling_results(
@@ -2357,6 +3079,7 @@ class TestBatchedSampling:
                     new_tokens_cuda=new_tokens_cuda,
                     req_num_generated_tokens=req_num_steps,
                     seq_slots=seq_slots_tensor,
+                    seq_slots_cuda=seq_slots_tensor_cuda,
                 )
                 res.result = UutResult(new_tokens_host=new_tokens_host)
 
@@ -2375,9 +3098,9 @@ class TestBatchedSampling:
                     new_tokens_cuda_snapshot[:, slot], new_tokens_cuda[:, slot]
                 )
             torch.testing.assert_close(
-                batch_next_tokens_cuda_int, batched_sampling_result.batch_next_tokens_cuda_int
+                batch_next_tokens_cuda_int, batched_sampling_result.next_tokens_cuda_int
             )
-            torch.testing.assert_close(batch_req_indices, batched_sampling_result.batch_req_indices)
+            torch.testing.assert_close(batch_req_indices, batched_sampling_result.req_indices)
             torch.testing.assert_close(seq_slots_tensor, seq_slots_tensor_snapshot)
 
             # validate tokens returned
@@ -2390,4 +3113,385 @@ class TestBatchedSampling:
                 torch.testing.assert_close(new_tokens_host[:steps, seq_slot], req_tokens.cpu())
                 input_offset += steps
 
-        _run_test_with_warmup(_uut_provider, max_sync_s=0.2)
+        run_test_with_warmup(_uut_provider, max_sync_s=0.2)
+
+
+class TestRequestSeed:
+    """Functional guards for per-request ``SamplingParams.seed``.
+
+    The property that matters is reproducibility that does not depend on batch
+    composition: a seeded request must draw the same tokens whether it runs
+    alone or beside unrelated requests, which is exactly what a single
+    batch-wide generator cannot provide.
+    """
+
+    VOCAB_SIZE = 128
+    NUM_STEPS = 8
+
+    @staticmethod
+    def _sampling_params(seed: Optional[int]) -> SamplingParams:
+        # Temperature+top_k keeps sampling stochastic, so matching tokens across
+        # runs indicate the seed is being honored rather than coincidence.
+        return SamplingParams(temperature=1.0, top_k=64, seed=seed)
+
+    def _run(
+        self,
+        sampling_params_list: list[SamplingParams],
+        *,
+        logits: torch.Tensor,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> torch.Tensor:
+        """Sample ``NUM_STEPS`` steps; returns tokens indexed by [step, seq slot]."""
+        harness = TestBatchedSampling()
+        seq_slot_assignment = (list(range(len(sampling_params_list))), len(sampling_params_list))
+        scheduled_requests = harness._build_mock_requests(
+            sampling_params_list=sampling_params_list,
+            seq_slot_assignment=seq_slot_assignment,
+            draft_lens=[0] * len(sampling_params_list),
+        )
+        sampler = TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=321,
+                max_draft_len=42,
+                max_beam_width=1,
+                max_num_sequences=len(sampling_params_list),
+                max_total_draft_tokens=0,
+                disable_overlap_scheduler=False,
+            )
+        )
+        return harness._sample(
+            sampler,
+            scheduled_requests,
+            {"logits": logits},
+            num_repeats=self.NUM_STEPS,
+            monkeypatch=monkeypatch,
+        )
+
+    def _logits(self, num_requests: int) -> torch.Tensor:
+        return torch.testing.make_tensor(
+            (num_requests, self.VOCAB_SIZE), dtype=torch.float32, device="cuda"
+        )
+
+    def test_seed_is_independent_of_batch_composition(self, monkeypatch: pytest.MonkeyPatch):
+        """The core guarantee: batching must not perturb a seeded stream."""
+        logits = self._logits(3)
+        seeded = self._sampling_params(1234)
+
+        alone = self._run([seeded], logits=logits[:1], monkeypatch=monkeypatch)
+
+        # Same seeded request, now in slot 0 of a batch whose other members
+        # draw from the same strategy group and would advance a shared
+        # generator's state.
+        batched = self._run(
+            [seeded, self._sampling_params(None), self._sampling_params(999)],
+            logits=logits,
+            monkeypatch=monkeypatch,
+        )
+
+        torch.testing.assert_close(alone[:, 0], batched[:, 0])
+
+        # Negative control, disabled until FlashInfer honors per-row seeds.
+        #
+        # The assertion above passes even if the seed path is entirely inert,
+        # because slot 0 is the one row whose seed is read either way. This
+        # check would catch that -- but flashinfer-python 0.6.15 reads only
+        # seed[0]/offset[0] for the whole call and distinguishes rows by
+        # blockIdx.x, so rows 1..N sample from row 0's seed and this assertion
+        # fails for reasons outside this code. Re-enable once the pinned
+        # FlashInfer supports per-row seeds -- tracked upstream in
+        # https://github.com/flashinfer-ai/flashinfer/pull/2345 (note it lands
+        # the feature as generator=(seed_arr, offset_arr), so the sampler call
+        # sites change with it).
+        #
+        # assert not torch.equal(batched[:, 0], batched[:, 2])
+
+    def test_draft_batch_does_not_disturb_target_seed_state(self):
+        """Draft slots come from a different SeqSlotManager over the same range.
+
+        Observing a draft batch must not look like a change of occupant for the
+        target request holding that slot number, which would reset its offset
+        and make it replay part of its stream.
+        """
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+
+        target = cast(
+            LlmRequest,
+            SimpleNamespace(
+                py_seq_slot=0,
+                py_request_id=100,
+                py_is_draft=False,
+                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+            ),
+        )
+        manager.observe([target])
+        manager.advance([0, 0, 0])
+        assert manager.any_seeded is False  # target carries no user seed
+        offset_before = manager._offsets[0].item()
+
+        # A draft request lands on slot 0, owned by `target` above.
+        draft = cast(
+            LlmRequest,
+            SimpleNamespace(
+                py_seq_slot=0,
+                py_request_id=200,
+                py_is_draft=True,
+                sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+            ),
+        )
+        manager.observe([draft])
+        assert manager.any_seeded is False  # draft never uses the per-row path
+        assert manager._offsets[0].item() == offset_before
+        assert manager._slot_owner[0] == 100  # still the target request
+
+        # The target is unchanged when it comes back around.
+        manager.observe([target])
+        assert manager._offsets[0].item() == offset_before
+
+    def test_multi_row_offsets_do_not_overlap(self):
+        """Speculative decoding draws several rows per request per step.
+
+        Those rows must be assigned distinct stretches of the request's stream,
+        and the next step must resume past all of them -- otherwise a request
+        would replay the same random numbers across steps.
+
+        This asserts the offsets ``_SeedManager`` produces, not what the kernel
+        does with them: the pinned flashinfer reads only ``offset[0]``, so the
+        per-row values are not yet honored downstream.
+        """
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        manager._seeds[0] = 1234
+        manager._seeds[1] = 999
+        manager._any_seeded = True
+
+        rows = [0, 0, 0, 1]  # slot 0 draws 3 tokens this step, slot 1 draws 1
+        device = torch.device("cpu")
+
+        first = manager.make_row_seeds(rows, device=device)
+        assert first.seed.tolist() == [1234, 1234, 1234, 999]
+
+        manager.advance(rows)
+        second = manager.make_row_seeds(rows, device=device)
+
+        # Each row reserves a stretch of the stream; the invariant is that no
+        # two stretches overlap, within a step or across steps. Asserted as a
+        # property rather than against OFFSET_STRIDE, so that a stride too small
+        # for the kernel's per-row consumption fails here instead of silently
+        # rescaling the expected values.
+        #
+        # flashinfer 0.6.15 reserves 32 offset units per row for the top-k/top-p
+        # rejection samplers, so a stride below that would replay random values.
+        # Only within a slot: distinct slots carry distinct seeds, so they are
+        # independent streams and may legitimately share offsets.
+        assert _SeedManager.OFFSET_STRIDE >= 32
+        per_slot: dict[int, set[int]] = {}
+        for offsets in (first.offset.tolist(), second.offset.tolist()):
+            for slot, off in zip(rows, offsets):
+                stretch = range(off, off + _SeedManager.OFFSET_STRIDE)
+                used = per_slot.setdefault(slot, set())
+                assert used.isdisjoint(stretch), (
+                    f"slot {slot} reuses offsets {off}..{off + _SeedManager.OFFSET_STRIDE - 1}; "
+                    "the stream is replayed"
+                )
+                used.update(stretch)
+
+
+class TestTopPDecay:
+    """Minimal functional guards for Top-P Decay in TorchSampler.
+
+    Covers strategy routing, the post-sample runtime update (parity with the
+    C++ computeToppDecay recurrence; cases ported from
+    topPSamplingLayerTest.cpp), and per-request rejection of unsupported
+    combinations.
+    """
+
+    VOCAB_SIZE = 1000
+
+    @staticmethod
+    def _params(**kw) -> UtilsSamplingParams:
+        base = dict(temperature=None, top_p=None, top_k=None, use_beam_search=False)
+        base.update(kw)
+        return UtilsSamplingParams(**base)
+
+    @staticmethod
+    def _make_sampler(*, max_draft_len=0):
+        return TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=128,
+                max_draft_len=max_draft_len,
+                max_num_sequences=8,
+                max_beam_width=1,
+                max_total_draft_tokens=max_draft_len,
+                disable_overlap_scheduler=True,
+            )
+        )
+
+    def test_strategy_routing(self):
+        # Active decay (set and < 1.0) forces a top-p-capable strategy even for
+        # an otherwise-greedy request (initial top-p defaults to 1.0), so the
+        # decayed runtime value can take effect on later steps.
+        s = resolve_sampling_strategy(self._params(top_p_decay=0.5), vocab_size=self.VOCAB_SIZE)
+        assert s[0] == "top_p" and s[1] == pytest.approx(1.0)
+        s = resolve_sampling_strategy(
+            self._params(top_k=50, top_p=0.9, top_p_decay=0.8), vocab_size=self.VOCAB_SIZE
+        )
+        assert s[0] == "top_k_top_p"
+        # decay == 1.0 (the C++ default) is a no-op and does not activate...
+        s = resolve_sampling_strategy(self._params(top_p_decay=1.0), vocab_size=self.VOCAB_SIZE)
+        assert s is GREEDY
+        # ...and an explicit greedy control wins over an active decay.
+        s = resolve_sampling_strategy(
+            self._params(top_p_decay=0.5, top_k=1), vocab_size=self.VOCAB_SIZE
+        )
+        assert s is GREEDY
+        # min_p wins the strategy choice, but the request keeps carrying top_p,
+        # so decay stays applicable (see test_decay_metadata_dispatch).
+        s = resolve_sampling_strategy(
+            self._params(min_p=0.1, top_p=0.9, top_p_decay=0.8), vocab_size=self.VOCAB_SIZE
+        )
+        assert s[0] == "min_p"
+
+    # Every strategy a decay-active request can resolve to carries a per-row
+    # top-p, so all of them must be offered the decay metadata. A strategy
+    # missing from the dispatch silently drops decay: the request is still
+    # admitted and its runtime top-p still decays, but sampling keeps reading
+    # the static initial value.
+    @pytest.mark.parametrize(
+        "params",
+        [
+            pytest.param(dict(top_p_decay=0.8), id="top_p"),
+            pytest.param(dict(top_k=50, top_p=0.9, top_p_decay=0.8), id="top_k_top_p"),
+            pytest.param(dict(min_p=0.1, top_p=0.9, top_p_decay=0.8), id="min_p"),
+        ],
+    )
+    def test_decay_metadata_dispatch(self, params):
+        strategy = resolve_sampling_strategy(self._params(**params), vocab_size=self.VOCAB_SIZE)
+        group_key = FlashInferGroupedStrategySampler.strategy_grouping_key(strategy)
+        assert (
+            FlashInferGroupedStrategySampler.get_metadata_type_for_group(group_key)
+            is TopPDecayMetadata
+        )
+
+    # Companion to the dispatch test: the metadata must not just be handed over
+    # but actually override the per-row top-p. Logits are chosen so the static
+    # top_p=1.0 leaves every token samplable (min_p=0.1 keeps them all too),
+    # while the decayed runtime top-p of 0.3 is below the argmax's own
+    # probability and collapses the nucleus onto it.
+    @pytest.mark.parametrize(
+        "strategy",
+        [
+            pytest.param(("top_p", 1.0, 1.0), id="top_p"),
+            pytest.param(("top_k_top_p", 5, 1.0, 1.0), id="top_k_top_p"),
+            pytest.param(("min_p", 0, 1.0, 0.1, 1.0), id="min_p"),
+        ],
+    )
+    @pytest.mark.parametrize("return_probs", [True, False], ids=["with_probs", "sample_only"])
+    def test_decay_override_reaches_sampling(self, strategy, return_probs):
+        num_rows, vocab, decayed_top_p = 64, 5, 0.3
+        logits = torch.zeros(num_rows, vocab, device="cuda")
+        logits[:, 0] = 1.0
+        argmax = 0
+
+        def run(is_decay_slot: bool) -> set[int]:
+            metadata = TopPDecayMetadata(
+                # All rows share slot 0, so a single store entry gates them all.
+                slots=torch.zeros(num_rows, dtype=torch.int64, device="cuda"),
+                runtime_top_p=torch.tensor([decayed_top_p], dtype=torch.float32, device="cuda"),
+                is_decay_slot=torch.tensor([is_decay_slot], dtype=torch.bool, device="cuda"),
+            )
+            tokens, _, _ = FlashInferGroupedStrategySampler.sample_grouped_strategies(
+                FlashInferGroupedStrategySampler.strategy_grouping_key(strategy),
+                [cast(Strategy, strategy)] * num_rows,
+                logits,
+                generator=torch.Generator(device="cuda").manual_seed(0),
+                return_probs=return_probs,
+                group_metadata=metadata,
+            )
+            return set(tokens.flatten().tolist())
+
+        # Gate off: the static top-p applies and sampling spreads over the vocab.
+        assert len(run(is_decay_slot=False)) > 1
+        # Gate on: the decayed runtime top-p replaces it and only the argmax survives.
+        assert run(is_decay_slot=True) == {argmax}
+
+    def test_runtime_update_parity(self):
+        # Post-sample update parity with the C++ computeToppDecay recurrence
+        # (a negative reset_id never matches, since token ids are non-negative):
+        #   runtime = initial                    if token == reset_id
+        #           = max(runtime * decay, min)  otherwise
+        sampler = self._make_sampler()
+        store = sampler._top_p_decay.store
+        configs = [
+            dict(initial=0.8, decay=0.3, top_p_min=0.5, reset_id=2),  # decay, then reset
+            dict(initial=0.2, decay=0.9, top_p_min=0.1, reset_id=-1),  # plain decay, floored
+            dict(initial=0.3, decay=0.5, top_p_min=0.6, reset_id=-1),  # min > initial: rises
+        ]
+        token_steps = [[1, 2, 3], [9, 9, 9], [9, 9, 9]]
+        slots = list(range(len(configs)))
+        for slot, cfg in zip(slots, configs):
+            sampler._top_p_decay._slots.add(slot)
+            store.runtime_top_p_decay_cuda[slot] = cfg["initial"]
+            store.initial_top_p_decay_cuda[slot] = cfg["initial"]
+            store.top_p_decay_cuda[slot] = cfg["decay"]
+            store.top_p_decay_min_cuda[slot] = cfg["top_p_min"]
+            store.top_p_decay_reset_ids_cuda[slot] = cfg["reset_id"]
+            store.is_top_p_decay_slot_cuda[slot] = True
+
+        runtime = [cfg["initial"] for cfg in configs]
+        slots_cuda = torch.tensor(slots, dtype=torch.int64, device="cuda")
+        for step in range(3):
+            for slot in slots:
+                sampler.store.new_tokens[0, slot, 0] = token_steps[slot][step]
+            sampler._top_p_decay.update_after_sample(
+                step_tokens=sampler.store.new_tokens[0, :, 0], sampled_slots_cuda=slots_cuda
+            )
+            got = store.runtime_top_p_decay_cuda.cpu()
+            for slot, cfg in zip(slots, configs):
+                tok = token_steps[slot][step]
+                if tok == cfg["reset_id"]:
+                    runtime[slot] = cfg["initial"]
+                else:
+                    runtime[slot] = max(runtime[slot] * cfg["decay"], cfg["top_p_min"])
+                assert got[slot].item() == pytest.approx(runtime[slot], abs=1e-6), (step, slot)
+
+    @staticmethod
+    def _mock_request(params: SamplingParams, *, draft_tokens=None):
+        params._validate()
+        req = SimpleNamespace(
+            sampling_config=SamplingConfig(params._get_sampling_config()),
+            is_context_init_state=False,
+            py_sampling_strategy=None,
+            py_draft_tokens=draft_tokens,
+            # Read by the row_stride query in sampler_common; these tests are
+            # single-beam, so the static admission width is 1.
+            py_beam_width=1,
+        )
+        req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
+        return cast(LlmRequest, req)
+
+    @pytest.mark.parametrize(
+        "bad_kwargs",
+        [
+            {"top_p_decay": 1.5},
+            {"top_p_decay": -0.5},
+            {"top_p_decay": 0.0},
+            {"top_p_min": 0.0},
+            {"top_p_min": 1.5},
+            {"top_p_reset_ids": -1},
+        ],
+    )
+    def test_out_of_range_decay_params_rejected(self, bad_kwargs):
+        # Out-of-range decay params raise (mirroring the executor::SamplingConfig
+        # constructor's hard checks) instead of the former warn-and-default.
+        with pytest.raises(ValueError):
+            SamplingParams(**bad_kwargs)
+
+    def test_reject_speculative_draft_tokens(self):
+        # Decay + draft tokens through TorchSampler is rejected per-request at
+        # admission (validate_request), so only the offending request fails.
+        sampler = self._make_sampler(max_draft_len=4)
+        with pytest.raises(ValueError, match="speculative"):
+            sampler.validate_request(
+                self._mock_request(SamplingParams(top_p=0.9, top_p_decay=0.5), draft_tokens=[1, 2])
+            )
+        # Same request without decay is accepted.
+        sampler.validate_request(self._mock_request(SamplingParams(top_p=0.9), draft_tokens=[1, 2]))

@@ -2,7 +2,7 @@
 
 # Tuning Max Batch Size and Max Num Tokens
 
-One of TensorRT-LLM's key features is it's inflight batching scheduler and runtime that handles simultaneously scheduling and executing requests in both context and generation phases. Max-Num tokens, in conjunction with Max-Batch size dictates how and when the scheduler schedules new and current requests, and understanding their role and how to tune them can provide significant performance benefits.
+One of TensorRT-LLM's key features is its inflight batching scheduler and runtime, which simultaneously schedules and executes requests in both context and generation phases. Max num tokens, together with max batch size, dictate how and when the scheduler admits new requests and continues current ones, and understanding how to tune them can provide significant performance benefits.
 
 > Disclaimer: While performance numbers shown here are real, they are only for demonstration purposes. Differences in environment, SKU, interconnect, and workload can all significantly affect performance and lead to your results differing from what is shown here.
 
@@ -67,7 +67,7 @@ From this its clear a max batch size of 64 results in bottlenecking whereas a ma
 
 ## Tuning Max Num Tokens
 
-If max num tokens is too small it can bottleneck request scheduling. However if it is too large it can result in prompt tokens taking up too much memory (especially in long context workloads), not leaving enough for kv-cache and resulting in performance hits or even out of memory errors. The default value of max num tokens is is 8192. It's recommended that you sweep across several values of max num tokens to identify the best number for your workload. Good values to try are powers of 2 >= 1024. Since max num tokens and max batch size both affect scheduling, grid searching across combinations of them if possible is ideal.
+If max num tokens is too small it can bottleneck request scheduling. However, if it is too large it can result in prompt tokens taking up too much memory (especially in long-context workloads), not leaving enough for kv-cache and resulting in performance hits or even out-of-memory errors. The default value of max num tokens is 8192. It's recommended that you sweep across several values of max num tokens to identify the best number for your workload. Good values to try are powers of 2 >= 1024. Since max num tokens and max batch size both affect scheduling, grid searching across combinations of them if possible is ideal.
 
 ### How to change Max Num Tokens
 
@@ -97,7 +97,7 @@ For this particular workload max num tokens of 2048 provides the best performanc
 
 ## Revisiting Paged Context Attention and Context Chunking
 
-[Previously](./useful-build-time-flags.md#paged-context-attention) we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Having now understood the TensorRT-LLM scheduler we can now explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
+Previously we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Having now understood the TensorRT-LLM scheduler we can now explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
 
 The [visualization](#understanding-the-trt-llm-scheduler) of the TensorRT-LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However with context chunking, this is no longer the case, and the first chunk of Request 3 would be able to be scheduled.
 
@@ -107,7 +107,7 @@ This is extremely beneficial for several reasons. Firstly it eliminates the poss
 
 ## Conclusion
 
-The TensorRT-LLM Scheduler plays a large role in performance, and properly tuning it can provide significant performance uplifts. In the case-study example, tuning max batch size and max num tokens provided the following boosts to performance when compared to the [results from the previous page](./useful-build-time-flags.md#conclusion):
+The TensorRT-LLM Scheduler plays a large role in performance, and properly tuning it can provide significant performance uplifts. In the case-study example, tuning max batch size and max num tokens provided the following boosts to performance when compared to the results from the previous page:
 
 | Metric                           | Build-Time Flags ON | Tuned Max Batch Size and Max Num Tokens | % Improvement |
 | -------------------------------- | ------------------- | --------------------------------------- | ------------- |

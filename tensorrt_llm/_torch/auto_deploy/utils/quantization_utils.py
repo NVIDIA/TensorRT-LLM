@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from fnmatch import fnmatch
 from typing import Dict, Optional, Tuple, Union
 
@@ -18,9 +21,61 @@ from .node_utils import (
 )
 
 try:
-    from ....quantization.utils.fp4_utils import float4_sf_dtype
+    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
+
+
+FLOAT8_DTYPES = tuple(
+    dtype
+    for dtype_name in (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    if (dtype := getattr(torch, dtype_name, None)) is not None
+)
+
+
+def ensure_tma_col_major(t: torch.Tensor) -> torch.Tensor:
+    """Re-apply TMA-aligned column-major layout to a torch.int scale tensor.
+
+    torch.cat always produces contiguous (row-major) output, which violates
+    DeepGEMM's stride(-2) == 1 requirement. This function re-creates the
+    column-major layout.
+
+    Only affects Blackwell + DeepGEMM: post_load_hook converts scales to
+    UE8M0 (torch.int) col-major only in that configuration. On other GPUs
+    or without DeepGEMM, scales remain torch.float and this is a no-op.
+    """
+    if t.dtype != torch.int:
+        return t  # Not UE8M0
+    # Both stride(-2) and stride(-1) must match the col-major TMA-aligned
+    # layout DeepGEMM expects. When size(-1) == 1, a row-major contiguous
+    # tensor has stride(-2) == 1 too, so checking stride(-2) alone would
+    # incorrectly short-circuit and leave stride(-1) un-aligned.
+    expected_inner = ((t.size(-2) + 3) // 4) * 4
+    if t.stride(-2) == 1 and t.stride(-1) == expected_inner:
+        return t  # Already column-major and TMA-aligned
+
+    remove_dim = False
+    if t.dim() == 2:
+        t = t.unsqueeze(0)
+        remove_dim = True
+
+    b, mn, k = t.shape
+    # TMA alignment: 16 bytes / 4 bytes per int32 = 4 elements
+    aligned_mn = ((mn + 3) // 4) * 4
+
+    # Create column-major buffer via transpose trick (same as get_col_major_tma_aligned_packed_tensor)
+    col_major = torch.transpose(
+        torch.empty((b, k, aligned_mn), device=t.device, dtype=torch.int), 1, 2
+    )
+    col_major[:, :mn, :] = t
+    result = col_major[:, :mn, :]
+
+    return result.squeeze(0) if remove_dim else result
 
 
 def modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale: torch.Tensor) -> torch.Tensor:
@@ -102,25 +157,97 @@ def get_quantization_from_linear_node(node: torch.fx.node.Node):
             return "NVFP4"
         else:
             ad_logger.info("Found unsupported quantized nodes. Performance will be sub-optimal.")
-            print(input_params, weight_params)
 
     return ""
+
+
+def _pattern_matches(modname: str, pattern: str) -> bool:
+    """Check if an exclude pattern matches the module name.
+
+    Keep behavior aligned with upstream: evaluate exclude entries via fnmatch.
+    This preserves exact module-path excludes (for example:
+    ``model.layers.0.self_attn.q_a_proj``) and wildcard entries.
+    """
+    return fnmatch(modname, pattern)
 
 
 def should_skip_quantization(
     node_or_name: Union[Node, str],
     excluded_patterns: list[str],
 ) -> bool:
-    """Check if a node or parameter name should be skipped based on excluded patterns."""
+    """Check if a node or parameter name should be skipped based on excluded patterns.
+
+    Supports both glob patterns (e.g., "*gate*") and simple substring patterns
+    (e.g., "gate" matches "model.layers.0.block_sparse_moe.gate").
+    """
     if isinstance(node_or_name, str):
         modname, _, _ = node_or_name.rpartition(".")
     else:
         if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
             return True
         weight_name = extract_weight_name(node_or_name)
+        # extract_weight_name can return False when weight node is not found (e.g. after
+        # PR 10718 get_weight_node uses forward mapping; some graph shapes may have no mapping).
+        if weight_name is False or not isinstance(weight_name, str):
+            return True
         modname = weight_name.rpartition(".")[0]
 
-    return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
+    return any(_pattern_matches(modname, pattern) for pattern in excluded_patterns)
+
+
+def _extract_modname(node_or_name: Union[Node, str]) -> Optional[str]:
+    """Extract the module name from a graph node or parameter name string.
+
+    Returns None if the module name cannot be determined.
+    """
+    if isinstance(node_or_name, str):
+        modname, _, _ = node_or_name.rpartition(".")
+        return modname
+
+    if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
+        return None
+    weight_name = extract_weight_name(node_or_name)
+    if weight_name is False or not isinstance(weight_name, str):
+        return None
+    return weight_name.rpartition(".")[0]
+
+
+def should_skip_mixed_precision_quantization(
+    node_or_name: Union[Node, str],
+    algo_name: str,
+    quantized_layers: Dict[str, Dict],
+) -> bool:
+    """For MIXED_PRECISION configs, check whether this node's per-layer algo matches.
+
+    Returns True (skip) if the layer is absent from quantized_layers or its
+    per-layer quant_algo doesn't match ``algo_name``.
+    """
+    modname = _extract_modname(node_or_name)
+    if modname is None:
+        return True
+
+    layer_info = quantized_layers.get(modname)
+    if layer_info is None:
+        return True
+
+    layer_algo = layer_info.get("quant_algo", "").upper()
+    if layer_algo != algo_name.upper():
+        return True
+
+    return False
+
+
+def is_mixed_precision_config(qcfg: Dict) -> bool:
+    """Return True if the quantization config uses MIXED_PRECISION."""
+    return qcfg.get("quant_algo", "").upper() == "MIXED_PRECISION"
+
+
+def mixed_precision_has_algo(qcfg: Dict, algo_name: str) -> bool:
+    """Return True if the MIXED_PRECISION config contains any layer with the given algo."""
+    for layer_info in qcfg.get("quantized_layers", {}).values():
+        if layer_info.get("quant_algo", "").upper() == algo_name.upper():
+            return True
+    return False
 
 
 def extract_scales_from_node(node: Node, scale_names: list[str]) -> Dict[str, Optional[Node]]:

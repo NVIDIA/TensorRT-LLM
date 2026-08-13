@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include <gtest/gtest.h>
 
@@ -120,8 +121,7 @@ protected:
         auto constexpr blocksInSecondaryPool = 0;
 
         auto constexpr enableBlockReuse = true;
-        auto constexpr onboardBlocks = true;
-        auto constexpr dataType = nvinfer1::DataType::kFLOAT;
+        auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
         BlocksPerWindow const blocksPerWindow
@@ -129,7 +129,7 @@ protected:
 
         mCacheManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            std::nullopt, dataType, sinkTokenLength, stream, kvMaxNumTokens, enableBlockReuse, onboardBlocks, cacheType,
+            dataType, sinkTokenLength, stream, kvMaxNumTokens, kvMaxNumTokens, enableBlockReuse, cacheType,
             std::nullopt, nullptr, true);
 
         mCacheManager->allocatePools(false);
@@ -155,7 +155,7 @@ protected:
 
 TEST_P(AgentCommTest, AgentConnectionManagerBasic)
 {
-    std::vector<CacheTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> bufferManagers{mTransBufferManager.get()};
     auto connectionManager = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
     ASSERT_TRUE(connectionManager != nullptr);
     ASSERT_EQ(connectionManager->getCacheTransBufferManagers().size(), bufferManagers.size());
@@ -170,7 +170,7 @@ TEST_P(AgentCommTest, AgentConnectionManagerBasic)
 
 TEST_P(AgentCommTest, AgentConnectionManagerConnect)
 {
-    std::vector<CacheTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> bufferManagers{mTransBufferManager.get()};
     auto connectionManager0 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
     auto connectionManager1 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
     auto agentName0 = connectionManager0->getAgentName();

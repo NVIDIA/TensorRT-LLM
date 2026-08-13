@@ -270,13 +270,18 @@ struct LowLatencyLayerNorm
         {
             auto n_base = (thread_id + i * N_THREADS) * Traits::PACKED_ELEMS_PER_COMPUTE;
             auto in_bound = n_base < param.n;
-            if (!in_bound)
+
+            // FP4Converter uses __shfl_xor_sync — all warp threads must stay converged.
+            if constexpr (std::is_same_v<typename Traits::FusedOperator, void>)
             {
-                break;
+                if (!in_bound)
+                {
+                    break;
+                }
             }
 
             typename PackType<typename Traits::OutputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type normed_output;
-            typename PackType<typename Traits::AccumulatorType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
+            typename PackType<typename Traits::InputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
                 high_precision_normed_output;
             for (int j = 0; j < Traits::PACKED_ELEMS_PER_COMPUTE; j++)
             {
@@ -300,7 +305,7 @@ struct LowLatencyLayerNorm
                 }
                 if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
                 {
-                    high_precision_normed_output.array[j] = normed_out;
+                    high_precision_normed_output.array[j] = (typename Traits::InputType) normed_out;
                 }
                 if constexpr (Traits::OUTPUT_SCALE == SCALE_TYPE::SCALAR)
                 {
@@ -317,13 +322,16 @@ struct LowLatencyLayerNorm
             else
             {
                 fused_operator.template post_process<Traits::PACKED_ELEMS_PER_COMPUTE, decltype(normed_output)>(
-                    work_id, n_base, normed_output);
+                    work_id, n_base, normed_output, in_bound);
             }
             if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
             {
-                reinterpret_cast<decltype(high_precision_normed_output)*>(
-                    &param.high_precision_normed_output[work_id * param.n + n_base])[0]
-                    = high_precision_normed_output;
+                if (in_bound)
+                {
+                    reinterpret_cast<decltype(high_precision_normed_output)*>(
+                        &param.high_precision_normed_output[work_id * param.n + n_base])[0]
+                        = high_precision_normed_output;
+                }
             }
         }
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,8 +24,186 @@
 #include <limits>
 #include <stdexcept>
 
+namespace
+{
+
+// RAII guard for cudaMalloc. Frees the pointer on destruction, logging a warning on failure.
+struct CudaMallocGuard
+{
+    void* ptr{nullptr};
+
+    explicit CudaMallocGuard(void* p) noexcept
+        : ptr(p)
+    {
+    }
+
+    ~CudaMallocGuard()
+    {
+        if (ptr)
+        {
+            TLLM_CUDA_CHECK_WARN(cudaFree(ptr));
+        }
+    }
+
+    void* release() noexcept
+    {
+        void* p = ptr;
+        ptr = nullptr;
+        return p;
+    }
+
+    CudaMallocGuard(CudaMallocGuard const&) = delete;
+    CudaMallocGuard& operator=(CudaMallocGuard const&) = delete;
+};
+
+// RAII guard for ncclMemAlloc. Frees the pointer on destruction, logging a warning on failure.
+struct NcclMemGuard
+{
+    void* ptr{nullptr};
+
+    explicit NcclMemGuard(void* p) noexcept
+        : ptr(p)
+    {
+    }
+
+    ~NcclMemGuard()
+    {
+        if (ptr)
+        {
+            TLLM_NCCL_CHECK_WARN(ncclMemFree(ptr));
+        }
+    }
+
+    void* release() noexcept
+    {
+        void* p = ptr;
+        ptr = nullptr;
+        return p;
+    }
+
+    NcclMemGuard(NcclMemGuard const&) = delete;
+    NcclMemGuard& operator=(NcclMemGuard const&) = delete;
+};
+
+} // namespace
+
 namespace tensorrt_llm::common::nccl_util
 {
+
+namespace
+{
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+constexpr int kNcclWindowMinRuntimeVersion = NCCL_VERSION(2, 28, 0);
+constexpr int kNcclGb10WindowFixedVersion = NCCL_VERSION(2, 30, 4);
+constexpr int kGb10RealSmVersion = 121;
+
+bool isGb10Platform(int realSmVersion, bool isIntegrated)
+{
+    return realSmVersion == kGb10RealSmVersion && isIntegrated;
+}
+#endif
+
+bool queryNcclWindowSupported()
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    int version = 0;
+    if (ncclGetVersion(&version) != ncclSuccess)
+    {
+        TLLM_LOG_WARNING("[NCCLUtil] Failed to query NCCL runtime version; falling back to regular tensors.");
+        return false;
+    }
+
+    if (version < kNcclWindowMinRuntimeVersion)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] NCCL runtime version %d.%d.%d does not support window buffers; falling back to regular "
+            "tensors.",
+            version / 10000, (version % 10000) / 100, version % 100);
+        return false;
+    }
+
+    if (version >= kNcclGb10WindowFixedVersion)
+    {
+        return true;
+    }
+
+    int device = -1;
+    cudaError_t const deviceErr = cudaGetDevice(&device);
+    if (deviceErr != cudaSuccess)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] Failed to query the current CUDA device while checking NCCL window support: %s; "
+            "falling back to regular tensors.",
+            cudaGetErrorString(deviceErr));
+        return false;
+    }
+
+    int isIntegrated = 0;
+    cudaError_t const integratedErr = cudaDeviceGetAttribute(&isIntegrated, cudaDevAttrIntegrated, device);
+    if (integratedErr != cudaSuccess)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] Failed to query CUDA integrated-device attribute for device %d while checking NCCL window "
+            "support: %s; falling back to regular tensors.",
+            device, cudaGetErrorString(integratedErr));
+        return false;
+    }
+
+    int realSmVersion = -1;
+    try
+    {
+        realSmVersion = tensorrt_llm::common::getSMVersion(/*queryRealSmArch=*/true);
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] Failed to query real CUDA SM version while checking NCCL window support: %s; falling back "
+            "to regular tensors.",
+            e.what());
+        return false;
+    }
+
+    bool const supported = !isGb10Platform(realSmVersion, isIntegrated != 0);
+    if (!supported)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] Disabling NCCL window buffers on integrated SM %d with NCCL runtime version %d.%d.%d; "
+            "GB10 requires NCCL 2.30.4 or newer for symmetric window registration.",
+            realSmVersion, version / 10000, (version % 10000) / 100, version % 100);
+    }
+    return supported;
+#else
+    return false;
+#endif
+}
+
+} // namespace
+
+bool isNcclWindowSupportedForPlatform(int realSmVersion, bool isIntegrated, int ncclRuntimeVersion)
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    if (ncclRuntimeVersion < kNcclWindowMinRuntimeVersion)
+    {
+        return false;
+    }
+
+    return !(ncclRuntimeVersion < kNcclGb10WindowFixedVersion && isGb10Platform(realSmVersion, isIntegrated));
+#else
+    (void) realSmVersion;
+    (void) isIntegrated;
+    (void) ncclRuntimeVersion;
+    return false;
+#endif
+}
+
+bool isNcclWindowSupported()
+{
+    static std::once_flag supportCheckFlag;
+    static bool windowBuffersSupported = false;
+    std::call_once(supportCheckFlag, []() { windowBuffersSupported = queryNcclWindowSupported(); });
+    return windowBuffersSupported;
+}
 
 //==============================================================================
 // NcclCommResourceManager Implementation
@@ -211,136 +389,10 @@ size_t NcclCommResourceManager::getResourceCount(ncclComm_t comm) const noexcept
 }
 
 //==============================================================================
-// NCCLHelper Implementation
-//==============================================================================
-
-NCCLHelper& NCCLHelper::getInstance()
-{
-    static NCCLHelper instance;
-    return instance;
-}
-
-NCCLHelper::NCCLHelper()
-    : mLibraryHandle(nullptr)
-    , mNCCLCommWindowRegister(nullptr)
-    , mNCCLMemAlloc(nullptr)
-    , mIsLoaded(false)
-{
-    loadNCCLLibrary();
-}
-
-NCCLHelper::~NCCLHelper()
-{
-    if (mLibraryHandle)
-    {
-#ifdef _WIN32
-        FreeLibrary(mLibraryHandle);
-#else
-        dlclose(mLibraryHandle);
-#endif
-        mLibraryHandle = nullptr;
-    }
-}
-
-void NCCLHelper::loadNCCLLibrary()
-{
-    try
-    {
-#ifdef _WIN32
-        char const* libraryNames[] = {"nccl.dll"};
-#else
-        char const* libraryNames[] = {"libnccl.so"};
-#endif
-
-        for (auto const* name : libraryNames)
-        {
-            mLibraryHandle = loadLibraryHandle(name);
-            if (mLibraryHandle)
-            {
-                TLLM_LOG_INFO("Successfully loaded NCCL library: %s", name);
-                break;
-            }
-        }
-
-        if (!mLibraryHandle)
-        {
-            TLLM_LOG_WARNING("Failed to load NCCL library");
-            return;
-        }
-
-        // Load the required symbols
-        mNCCLCommWindowRegister
-            = reinterpret_cast<ncclCommWindowRegisterFunc>(getSymbolAddress(mLibraryHandle, "ncclCommWindowRegister"));
-
-        mNCCLMemAlloc = reinterpret_cast<ncclMemAllocFunc>(getSymbolAddress(mLibraryHandle, "ncclMemAlloc"));
-
-        if (mNCCLCommWindowRegister == nullptr)
-        {
-            TLLM_LOG_WARNING("Failed to load ncclCommWindowRegister symbol, NCCL symmetric will not be supported.");
-        }
-
-        if (mNCCLMemAlloc == nullptr)
-        {
-            TLLM_LOG_WARNING("Failed to load ncclMemAlloc symbol, NCCL symmetric will not be supported.");
-        }
-
-        if (mNCCLCommWindowRegister != nullptr && mNCCLMemAlloc != nullptr)
-        {
-            mIsLoaded = true;
-        }
-        else
-        {
-            TLLM_LOG_WARNING(
-                "Failed to load required NCCL symbols (both ncclCommWindowRegister and ncclMemAlloc are required)");
-        }
-    }
-    catch (std::exception const& e)
-    {
-        TLLM_LOG_WARNING("Exception while loading NCCL library: %s", e.what());
-    }
-}
-
-void* NCCLHelper::loadLibraryHandle(char const* libName)
-{
-#ifdef _WIN32
-    return LoadLibraryA(libName);
-#else
-    return dlopen(libName, RTLD_LAZY | RTLD_GLOBAL);
-#endif
-}
-
-void* NCCLHelper::getSymbolAddress(void* handle, char const* symbolName)
-{
-    if (!handle)
-    {
-        return nullptr;
-    }
-
-#ifdef _WIN32
-    return GetProcAddress(static_cast<HMODULE>(handle), symbolName);
-#else
-    return dlsym(handle, symbolName);
-#endif
-}
-
-NCCLHelper::ncclCommWindowRegisterFunc NCCLHelper::getNCCLCommWindowRegister()
-{
-    return mNCCLCommWindowRegister;
-}
-
-NCCLHelper::ncclMemAllocFunc NCCLHelper::getNCCLMemAlloc()
-{
-    return mNCCLMemAlloc;
-}
-
-bool NCCLHelper::isLoaded() const
-{
-    return mIsLoaded;
-}
-
-//==============================================================================
 // NCCLWindowAllocator Implementation
 //==============================================================================
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
 NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
 {
@@ -350,6 +402,11 @@ NCCLWindowAllocator& NCCLWindowAllocator::getInstance()
 
 NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size)
 {
+    if (!isNcclWindowSupported())
+    {
+        return NCCLWindowBuffer();
+    }
+
     TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
 
@@ -383,6 +440,17 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         return bestFit->buffer;
     }
 
+    // If a previous allocateAndRegisterBuffer call collectively failed for this comm at a size
+    // no larger than this request, do not retry the known-failing new allocation path. Smaller
+    // requests and already-pooled buffers can still use NCCL windows.
+    auto const failureIt = mMinSymmetricFailureSize.find(comm);
+    if (failureIt != mMinSymmetricFailureSize.end() && size >= failureIt->second)
+    {
+        TLLM_LOG_DEBUG("[NCCLUtil] Skipping NCCL window allocation for comm %p, size=%zu; known failure threshold=%zu",
+            static_cast<void*>(comm), size, failureIt->second);
+        return NCCLWindowBuffer();
+    }
+
     // No available buffer found, avoid registration during CUDA graph capture
     auto stream = at::cuda::getCurrentCUDAStream();
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
@@ -403,9 +471,45 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         "[NCCLUtil] Allocating new NCCL window buffer for comm %p, size=%zu", static_cast<void*>(comm), size);
     int handle = static_cast<int>(commBuffers.size());
     NCCLWindowBuffer buffer = allocateAndRegisterBuffer(comm, size, handle);
-    commBuffers.push_back({buffer, true});
+    // Only cache valid buffers. allocateAndRegisterBuffer returns an empty buffer when any rank
+    // failed ncclMemAlloc (collective fallback to plain allreduce); caching it would leak a
+    // permanently "in use" empty entry per request because releaseBuffer is a no-op for nullptr.
+    if (buffer.isValid())
+    {
+        commBuffers.push_back({buffer, true});
+    }
+    else
+    {
+        // The collective allreduce inside allocateAndRegisterBuffer agreed that this request
+        // cannot use symmetric memory on at least one rank. Remember the smallest failing
+        // request size so repeated too-large autotuner probes do not keep stressing this path.
+        recordSymmetricFailureLocked(comm, size);
+    }
 
     return buffer;
+}
+
+void NCCLWindowAllocator::recordSymmetricFailureLocked(ncclComm_t comm, size_t size)
+{
+    auto failureIt = mMinSymmetricFailureSize.find(comm);
+    if (failureIt == mMinSymmetricFailureSize.end())
+    {
+        mMinSymmetricFailureSize.emplace(comm, size);
+    }
+    else if (size < failureIt->second)
+    {
+        failureIt->second = size;
+    }
+}
+
+cudaError_t NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(
+    int localAllocOk, CudaGetLastErrorFunc getLastError) noexcept
+{
+    if (localAllocOk == 0)
+    {
+        return getLastError();
+    }
+    return cudaSuccess;
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::searchBuffer(ncclComm_t comm, void* ptr) const
@@ -505,50 +609,72 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle)
 {
-    NCCLWindowBuffer buffer;
-    buffer.handle = handle;
+    // Step 1: Pre-allocate the rank-sync flag before ncclMemAlloc. ncclMemAlloc can fail
+    // asymmetrically with ncclUnhandledCudaError on configurations where the symmetric/VMM path
+    // is unavailable; that failure may leave a sticky CUDA last-error on the device. If we
+    // deferred this cudaMalloc until after the failure, the sticky error would propagate into
+    // cudaMalloc, TLLM_CUDA_CHECK would throw, and the failing rank would never reach the
+    // collective ncclAllReduce(min) below, hanging every other rank that did succeed.
+    int* rankSyncFlag = nullptr;
+    TLLM_CUDA_CHECK(cudaMalloc(&rankSyncFlag, sizeof(int)));
+    CudaMallocGuard flagGuard{rankSyncFlag}; // frees rankSyncFlag on any early return or exception
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    TLLM_CUDA_CHECK(cudaMemsetAsync(rankSyncFlag, 0, sizeof(int), stream));
 
-    // Get NCCL helper for dynamic symbol loading
-    auto& ncclHelper = NCCLHelper::getInstance();
-    if (!ncclHelper.isLoaded())
+    // Step 2: Allocate symmetric memory. This per-rank, non-collective call can fail
+    // asymmetrically. When it fails, NCCL may leave a sticky CUDA error behind; clear it before
+    // the stream-ordered flag copy and collective fallback so the failing rank still reaches
+    // ncclAllReduce with the other ranks.
+    void* ncclPtr = nullptr;
+    TLLM_NCCL_CHECK_WARN(ncclMemAlloc(&ncclPtr, size));
+    int const localAllocOk = (ncclPtr != nullptr) ? 1 : 0;
+    NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
+    clearCudaErrorIfSymmetricAllocationFailed(localAllocOk);
+
+    // Step 3: ncclCommWindowRegister is collective. If any rank skips it, all other ranks hang.
+    // Populate flag, reduce with min across ranks (0 if any rank failed), then read back.
+    // The flag is initialized to 0, so H2D failure is non-fatal and conservatively falls back
+    // to regular NCCL while still reaching the collective. allreduce and D2H failures throw.
+    if (localAllocOk != 0)
     {
-        TLLM_THROW("NCCL library could not be loaded for dynamic symbol access");
+        TLLM_CUDA_CHECK_WARN(
+            cudaMemcpyAsync(rankSyncFlag, &localAllocOk, sizeof(localAllocOk), cudaMemcpyHostToDevice, stream));
+    }
+    TLLM_NCCL_CHECK(ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream));
+    TLLM_CUDA_CHECK_WARN(cudaStreamSynchronize(stream));
+
+    int allAllocOk = 0;
+    TLLM_CUDA_CHECK(cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost));
+    // flagGuard frees rankSyncFlag here at end of its scope
+
+    if (!allAllocOk)
+    {
+        if (localAllocOk)
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] ncclMemAlloc failed on at least one other rank; "
+                "freeing local allocation (size=%zu) and aborting window registration on all ranks.",
+                size);
+        }
+        return NCCLWindowBuffer{}; // ncclGuard frees ncclPtr
     }
 
-    auto ncclMemAllocFunc = ncclHelper.getNCCLMemAlloc();
-    auto ncclCommWindowRegisterFunc = ncclHelper.getNCCLCommWindowRegister();
-
-    // Defensive checks: both function pointers must be non-null
-    if (ncclMemAllocFunc == nullptr)
-    {
-        TLLM_THROW("ncclMemAlloc function pointer is null, cannot allocate NCCL window buffer");
-    }
-
-    if (ncclCommWindowRegisterFunc == nullptr)
-    {
-        TLLM_THROW("ncclCommWindowRegister function pointer is null, cannot register NCCL window buffer");
-    }
-
-    // Allocate device memory using ncclMemAlloc
-    ncclResult_t allocResult = ncclMemAllocFunc(&buffer.ptr, size);
-    if (allocResult != ncclSuccess)
-    {
-        TLLM_THROW("ncclMemAlloc failed with error: %d", allocResult);
-    }
-    buffer.size = size;
-
-    // Register the buffer with NCCL as a window
-    ncclResult_t regResult
-        = ncclCommWindowRegisterFunc(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
+    // Step 4: Register with NCCL as a window. This is collective, so all ranks must reach it.
+    // Failure here is non-fatal: warn and fall back to regular allreduce.
+    // ncclGuard frees ncclPtr on return.
+    ncclWindow_t window = nullptr;
+    ncclResult_t const regResult = ncclCommWindowRegister(comm, ncclPtr, size, &window, NCCL_WIN_COLL_SYMMETRIC);
+    TLLM_NCCL_CHECK_WARN(regResult);
     if (regResult != ncclSuccess)
     {
-        ncclMemFree(buffer.ptr);
-        TLLM_THROW("ncclCommWindowRegister failed with error: %d", regResult);
+        return NCCLWindowBuffer{};
     }
 
+    // Step 5: Success. Transfer ownership to the returned buffer.
+    ncclGuard.release();
+    NCCLWindowBuffer buffer{ncclPtr, handle, size, window};
     TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",
-        handle, buffer.ptr, size, static_cast<void*>(buffer.window));
-
+        handle, buffer.ptr, buffer.size, static_cast<void*>(buffer.window));
     return buffer;
 }
 
@@ -617,6 +743,7 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     {
         // No buffers to clean up, but mark as cleaned
         mRegisteredComms.erase(comm);
+        mMinSymmetricFailureSize.erase(comm);
         return;
     }
 
@@ -626,8 +753,10 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     // Check for buffers still in use - this shouldn't happen if cleanup is called properly,
     // but we log a warning if it does
     size_t inUseCount = 0;
+    size_t totalBytes = 0;
     for (auto const& entry : commIt->second)
     {
+        totalBytes += entry.buffer.size;
         if (entry.inUse)
         {
             ++inUseCount;
@@ -640,6 +769,8 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
             "This may indicate buffers weren't properly released before cleanup.",
             inUseCount, static_cast<void*>(comm));
     }
+    TLLM_LOG_DEBUG("[NCCLUtil] NCCL window allocator teardown for comm %p: %zu buffers, %zu bytes total",
+        static_cast<void*>(comm), commIt->second.size(), totalBytes);
 
     for (auto& entry : commIt->second)
     {
@@ -688,7 +819,10 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
     mBufferPool.erase(commIt);
     mRegisteredComms.erase(comm);
+    mMinSymmetricFailureSize.erase(comm);
 }
+
+#endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
 } // namespace tensorrt_llm::common::nccl_util
 

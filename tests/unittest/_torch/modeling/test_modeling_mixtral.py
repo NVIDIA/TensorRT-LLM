@@ -15,7 +15,8 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.mixtral_weight_mapper import \
     MixtralHfWeightMapper
-from tensorrt_llm._torch.models.modeling_mixtral import MixtralForCausalLM
+from tensorrt_llm._torch.models.modeling_mixtral import (MixtralAttention,
+                                                         MixtralForCausalLM)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -355,3 +356,33 @@ class TestMixtral(unittest.TestCase):
         if graph_runner is not None:
             graph_runner.clear()
         kv_cache_manager.shutdown()
+
+    @unittest.mock.patch(
+        "tensorrt_llm._torch.models.modeling_mixtral.Attention.forward")
+    def test_mixtral_attention_swa_wiring(self, mocked_forward):
+        """Verify MixtralAttention.forward passes sliding_window to Attention.forward."""
+        config_dict = deepcopy(MIXTRAL_8X7B_CONFIG)
+        config_dict["sliding_window"] = 4096
+        config = MixtralConfig.from_dict(config_dict)
+        mc = ModelConfig(pretrained_config=config,
+                         mapping=Mapping(world_size=1, tp_size=1, rank=0))
+        attn = MixtralAttention(mc, layer_idx=0)
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+        mocked_forward.assert_called_once()
+        _, call_kwargs = mocked_forward.call_args
+        self.assertEqual(call_kwargs["attention_window_size"], 4096)
+
+    @unittest.mock.patch(
+        "tensorrt_llm._torch.models.modeling_mixtral.Attention.forward")
+    def test_mixtral_attention_swa_none_when_unset(self, mocked_forward):
+        """Verify MixtralAttention.forward passes None when sliding_window is unset."""
+        config_dict = deepcopy(MIXTRAL_8X7B_CONFIG)
+        config_dict["sliding_window"] = None
+        config = MixtralConfig.from_dict(config_dict)
+        mc = ModelConfig(pretrained_config=config,
+                         mapping=Mapping(world_size=1, tp_size=1, rank=0))
+        attn = MixtralAttention(mc, layer_idx=0)
+        attn.forward(position_ids=None, hidden_states=None, attn_metadata=None)
+        mocked_forward.assert_called_once()
+        _, call_kwargs = mocked_forward.call_args
+        self.assertIsNone(call_kwargs["attention_window_size"])

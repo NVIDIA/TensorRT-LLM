@@ -54,7 +54,7 @@ Note:
 * The command also maps port `8000` from the container to your host so you can access the LLM API endpoint from your host
 * See the <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all the available containers. The containers published in the main branch weekly have `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html>.
+If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source.html>.
 
 ### Recommended Performance Settings
 
@@ -226,8 +226,8 @@ Here is an example response, showing that the TensorRT LLM server reasons and an
 
 ### Running Evaluations to Verify Accuracy (Optional)
 
-We use OpenAI's official evaluation tool to test the model's accuracy. For more information see [https://github.com/openai/gpt-oss/tree/main/gpt_oss/evals](gpt-oss-eval).
-With the added support of Chat Completions and Responses API in `trtllm-serve,` `gpt_oss.evals` works directly without any modifications.
+We use OpenAI's official evaluation tool to test the model's accuracy. For more information see [gpt-oss-eval](https://github.com/openai/gpt-oss/tree/main/gpt_oss/evals).
+With the added support of Chat Completions and Responses API in `trtllm-serve`, `gpt_oss.evals` works directly without any modifications.
 
 You need to set `enable_attention_dp`, `tp_size`, `ep_size`, `max_batch_size` and `max_num_tokens` when launching the trtllm server and set `reasoning-effort` when launching evaluation in gpt-oss. Below are some reference configurations for accuracy evaluation on B200.
 
@@ -253,7 +253,7 @@ python -m gpt_oss.evals \
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT-LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT-LLM server you can leverage the built-in `benchmark_serving.py` script. To do this, first create a wrapper `bench.sh` script.
 
 ```shell
 cat <<'EOF' > bench.sh
@@ -286,7 +286,7 @@ EOF
 chmod +x bench.sh
 ```
 
-To achieve max through-put, with attention DP on, one needs to sweep up to `concurrency = max_batch_size * num_gpus`.
+To achieve max throughput, with attention DP on, one needs to sweep up to `concurrency = max_batch_size * num_gpus`.
 
 If you want to save the results to a file add the following options.
 
@@ -393,12 +393,4 @@ The following sections help you pick a known-good `trtllm-serve --config` for yo
 .. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
-```
-
-### Recipe database
-
-```{eval-rst}
-.. include:: config_table.rst
-   :start-after: .. start-openai/gpt-oss-120b
-   :end-before: .. end-openai/gpt-oss-120b
 ```

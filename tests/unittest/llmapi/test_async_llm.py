@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import pytest
@@ -8,8 +9,8 @@ from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import AsyncLLM
 from tensorrt_llm._torch.utils import get_device_uuid
-from tensorrt_llm._torch.virtual_memory import ExecutorMemoryType
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
 
 @pytest.mark.ray
@@ -23,7 +24,7 @@ async def test_async_llm_awaitable():
 
     llm = await AsyncLLM(
         model=llama_model_path,
-        enable_sleep=True,
+        sleep_config=SleepConfig(),
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
     )
@@ -49,7 +50,7 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
 
     async with AsyncLLM(
         model=llama_model_path,
-        enable_sleep=True,
+        sleep_config=SleepConfig(),
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
         tensor_parallel_size=2,
@@ -135,3 +136,96 @@ async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
         llm.shutdown()
         if pg is not None:
             remove_placement_group(pg)
+
+
+@pytest.mark.ray
+@pytest.mark.asyncio
+async def test_async_llm_reset_prefix_cache():
+    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+    prompt = "The future of AI is " * 20
+    sampling_params = SamplingParams(temperature=0, max_tokens=5, return_perf_metrics=True)
+
+    async with AsyncLLM(
+        model=llama_model_path,
+        kv_cache_config=kv_cache_config,
+        cuda_graph_config=None,
+    ) as llm:
+        # Cold cache: first run should have no reused blocks
+        out1 = await llm.generate_async(prompt, sampling_params)
+        m1 = out1.outputs[0].request_perf_metrics
+        assert m1 is not None
+        assert m1.kv_cache_metrics.num_reused_blocks == 0, (
+            f"Expected 0 reused blocks on cold cache, got {m1.kv_cache_metrics.num_reused_blocks}"
+        )
+
+        # Warm cache: same prompt should hit prefix cache
+        out2 = await llm.generate_async(prompt, sampling_params)
+        m2 = out2.outputs[0].request_perf_metrics
+        assert m2 is not None
+        assert m2.kv_cache_metrics.num_reused_blocks > 0, (
+            f"Expected >0 reused blocks on warm cache, got {m2.kv_cache_metrics.num_reused_blocks}"
+        )
+
+        await llm.collective_rpc("reset_prefix_cache")
+
+        # After reset: cache should be cold again
+        out3 = await llm.generate_async(prompt, sampling_params)
+        m3 = out3.outputs[0].request_perf_metrics
+        assert m3 is not None
+        assert m3.kv_cache_metrics.num_reused_blocks == 0, (
+            f"Expected 0 reused blocks after reset_prefix_cache, "
+            f"got {m3.kv_cache_metrics.num_reused_blocks}"
+        )
+
+
+@pytest.mark.ray
+@pytest.mark.asyncio
+async def test_async_llm_pause_resume():
+    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    prompt = "The future of AI is"
+    sampling_params = SamplingParams(temperature=0, max_tokens=10)
+
+    async with AsyncLLM(
+        model=llama_model_path,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        cuda_graph_config=None,
+    ) as llm:
+        baseline = (await llm.generate_async(prompt, sampling_params)).outputs[0].text
+        assert baseline
+
+        for _ in range(2):
+            await llm.pause_generation()
+            assert llm._paused
+            with pytest.raises(RuntimeError, match="paused"):
+                llm.generate_async(prompt, sampling_params)
+
+            await llm.resume_generation()
+            assert not llm._paused
+            out = await llm.generate_async(prompt, sampling_params)
+            assert out.outputs[0].text == baseline
+
+
+@pytest.mark.ray
+@pytest.mark.asyncio
+async def test_async_llm_pause_aborts_inflight():
+    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    prompt = "The future of AI is"
+    inflight_params = SamplingParams(temperature=0, max_tokens=512)
+    normal_params = SamplingParams(temperature=0, max_tokens=10)
+
+    async with AsyncLLM(
+        model=llama_model_path,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        cuda_graph_config=None,
+    ) as llm:
+        inflight = llm.generate_async(prompt, inflight_params)
+
+        await llm.pause_generation()
+
+        result = await asyncio.wait_for(inflight, timeout=30.0)
+        assert result.aborted
+
+        await llm.resume_generation()
+        out = await llm.generate_async(prompt, normal_params)
+        assert out.outputs[0].text

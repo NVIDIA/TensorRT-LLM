@@ -1,4 +1,4 @@
-# Copyright 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -40,16 +40,15 @@ import numpy as np
 import pandas as pd
 import triton_python_backend_utils as pb_utils
 import yaml
-from helpers import (get_input_tensor_by_name, get_output_config_from_request,
+from helpers import (get_input_tensor_by_name, get_lora_request_from_request,
+                     get_output_config_from_request,
                      get_sampling_params_from_request,
                      get_streaming_from_request)
-from mpi4py.futures import MPICommExecutor
-from mpi4py.MPI import COMM_WORLD
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._utils import global_mpi_rank, global_mpi_size
-from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
+# NOTE: tensorrt_llm imports are deferred to initialize() to support multi-instance deployments.
+# Root cause: CUDA is not fork-safe. Importing tensorrt_llm imports torch, which initializes
+# CUDA and opens file descriptors to /dev/nvidia* devices. MPI_Comm_spawn (used by mpi4py)
+# inherits these FDs, causing child processes to ignore CUDA_VISIBLE_DEVICES.
 
 
 @dataclass
@@ -57,7 +56,7 @@ class RequestData:
     triton_req_id: int
     triton_user_id: str
     triton_request: Any
-    response_iterator: RequestOutput
+    response_iterator: Any  # tensorrt_llm.llmapi.RequestOutput (deferred import)
 
 
 def get_model_config(filename, include_keys=None, exclude_keys=None):
@@ -140,8 +139,6 @@ class TritonPythonModel:
             - `initialize` is called only once when the model is being loaded.
             - Implementing `initialize` function is optional.
         """
-        from tensorrt_llm.llmapi import MpiCommSession
-
         self.model_config = json.loads(args["model_config"])
         triton_config = get_model_config(os.environ.get('LLM_CONFIG_PATH',
                                                         'model.yaml'),
@@ -151,11 +148,66 @@ class TritonPythonModel:
         self.params = self.model_config['parameters']
         self.logger = pb_utils.Logger
 
+        # Check instance count from config.pbtxt
+        instance_count = int(
+            self.model_config.get("instance_group", [{}])[0].get("count", 1))
+        self._use_multi_instance = instance_count > 1
+        self._instance_idx = 0
+
+        # Get GPU device IDs from config.pbtxt parameters
+        # Format: "0,1;2,3" means instance 0 gets GPUs 0,1, instance 1 gets GPUs 2,3
+        if self._use_multi_instance:
+            gpu_device_ids_param = self.params.get("gpu_device_ids",
+                                                   {}).get("string_value", "")
+            if not gpu_device_ids_param:
+                self.logger.log_error(
+                    "[trtllm] gpu_device_ids parameter required for multi-instance mode"
+                )
+                raise ValueError(
+                    "gpu_device_ids parameter required when instance count > 1")
+
+            # Get instance index from instance name (e.g., "tensorrt_llm_0" -> 0)
+            import re
+            instance_name = args.get("model_instance_name", "")
+            if instance_name:
+                match = re.search(r'_(\d+)$', instance_name)
+                if match:
+                    self._instance_idx = int(match.group(1))
+
+            # Parse: split by semicolon for instances, comma for GPUs
+            instance_gpu_lists = gpu_device_ids_param.split(";")
+            if self._instance_idx >= len(instance_gpu_lists):
+                self.logger.log_error(
+                    f"[trtllm] Instance {self._instance_idx} requested but gpu_device_ids only has {len(instance_gpu_lists)} entries: '{gpu_device_ids_param}'"
+                )
+                raise ValueError(
+                    f"gpu_device_ids mismatch: instance {self._instance_idx} >= {len(instance_gpu_lists)} entries"
+                )
+            self._gpu_ids = instance_gpu_lists[self._instance_idx].strip()
+            self._gpu_id_list = [
+                g.strip() for g in self._gpu_ids.split(",") if g.strip()
+            ]
+
+            # Set CUDA_VISIBLE_DEVICES BEFORE importing tensorrt_llm (see module-level comment)
+            os.environ["CUDA_VISIBLE_DEVICES"] = self._gpu_ids
+
+            self.logger.log_info(
+                f"[trtllm] Instance {self._instance_idx}: gpu_ids={self._gpu_ids}, instance_count={instance_count}"
+            )
+
+        # Import tensorrt_llm AFTER setting CUDA_VISIBLE_DEVICES
+        from tensorrt_llm.llmapi.llm_utils import \
+            update_llm_args_with_extra_dict
+
         text_output_config = pb_utils.get_output_config_by_name(
             self.model_config, "text_output")
         self.output_dtype = pb_utils.triton_string_to_numpy(
             text_output_config["data_type"])
-        if global_mpi_rank() == 0:
+
+        from tensorrt_llm._utils import global_mpi_rank
+        is_leader = global_mpi_rank() == 0
+
+        if is_leader:
             # Initialize engine arguments
             self.llm_engine_args = update_llm_args_with_extra_dict(
                 {},
@@ -163,6 +215,11 @@ class TritonPythonModel:
                                                 'model.yaml'),
                                  exclude_keys=["triton_config"]),
             )
+
+            # For multi-instance mode, set gpus_per_node to match the assigned GPUs
+            if self._use_multi_instance:
+                self.llm_engine_args["gpus_per_node"] = len(self._gpu_id_list)
+
             self.logger.log_info(
                 f"[trtllm] rank{global_mpi_rank()} is starting trtllm engine with args: {self.llm_engine_args}"
             )
@@ -174,7 +231,11 @@ class TritonPythonModel:
                 triton_config["cancellation_check_period_ms"]
             ) if "cancellation_check_period_ms" in triton_config else 100
 
+            from tensorrt_llm._utils import global_mpi_size
             if global_mpi_size() > 1:
+                from mpi4py.MPI import COMM_WORLD
+
+                from tensorrt_llm.llmapi import MpiCommSession
                 mpi_session = MpiCommSession(comm=COMM_WORLD,
                                              n_workers=COMM_WORLD.Get_size())
                 self.llm_engine_args["_mpi_session"] = mpi_session
@@ -198,6 +259,8 @@ class TritonPythonModel:
             self.running = True
             self.cancellation_thread.start()
         else:
+            from mpi4py.futures import MPICommExecutor
+            from mpi4py.MPI import COMM_WORLD
             self.logger.log_info(
                 f"[trtllm] rank{global_mpi_rank()} is waiting for the leader node..."
             )
@@ -241,6 +304,8 @@ class TritonPythonModel:
 
         @asynccontextmanager
         async def async_llm_wrapper():
+            from tensorrt_llm import LLM
+
             # Create LLM in a thread to avoid blocking
             loop = asyncio.get_running_loop()
             try:
@@ -350,6 +415,18 @@ class TritonPythonModel:
                 req_ids = self.triton_user_id_to_req_ids[triton_user_id]
                 for req_id in req_ids:
                     request_data = self.req_id_to_request_data[req_id]
+                    # Send a COMPLETE_FINAL CANCELLED response on the main
+                    # request's response_sender so an in-flight streaming
+                    # client doesn't wait forever for a final chunk after
+                    # the iterator is aborted. Mirrors what
+                    # cancellation_loop does for Triton-level cancels.
+                    main_response_sender = (
+                        request_data.triton_request.get_response_sender())
+                    main_response_sender.send(
+                        pb_utils.InferenceResponse(error=pb_utils.TritonError(
+                            "Request cancelled by client",
+                            pb_utils.TritonError.CANCELLED)),
+                        flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
                     request_data.response_iterator.abort()
                     del self.req_id_to_request_data[req_id]
 
@@ -370,7 +447,6 @@ class TritonPythonModel:
         """
         # TODO: [JIRA-4040] Add health check here
         for request in requests:
-            # TODO : [JIRA-4040] Verify Lora
             if request is not None:
                 assert (
                     self._llm_engine_shutdown_event.is_set() is False
@@ -405,15 +481,20 @@ class TritonPythonModel:
         triton_req_id = str(randint(0, sys.maxsize))
 
         try:
+            from tensorrt_llm import SamplingParams
+
             # TODO: [JIRA-4496] Implement when request contains batched prompts
-            (prompt, sampling_params, streaming,
-             output_config) = self._convert_request(request)
+            (prompt, sampling_params, streaming, output_config,
+             lora_request) = self._convert_request(request)
             if streaming and not self.decoupled:
                 raise pb_utils.TritonModelException(
                     "Streaming is only supported in decoupled mode.")
             # Generate the response.
             response_iterator = self._llm_engine.generate_async(
-                prompt, SamplingParams(**sampling_params), streaming)
+                prompt,
+                sampling_params=SamplingParams(**sampling_params),
+                lora_request=lora_request,
+                streaming=streaming)
 
             with self.lock:
                 self.req_id_to_request_data[triton_req_id] = RequestData(
@@ -443,6 +524,20 @@ class TritonPythonModel:
                     self._response_queue.put_nowait(
                         (response_state, response, flags))
 
+            # Ensure COMPLETE_FINAL is always sent for streaming, even if the
+            # iterator exited without yielding a chunk whose .finished was True
+            # (e.g. trtllm exits the async generator after the engine completes
+            # without setting finished on the last RequestOutput). Without this
+            # marker, clients keep the gRPC stream open forever waiting on the
+            # next chunk. Mirrors the pattern in tensorrt_llm_bls/1/model.py
+            # which sends an empty COMPLETE_FINAL after its streaming loop.
+            if streaming and not response_state["last_response_generated"]:
+                response_state["last_response_generated"] = True
+                decrement_ongoing_request_count = False
+                self._response_queue.put_nowait(
+                    (response_state, pb_utils.InferenceResponse(),
+                     pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL))
+
             # Send the last response which contains all the outputs if not streaming.
             if not streaming:
                 # If the request was cancelled, we don't need to send the last response
@@ -461,13 +556,21 @@ class TritonPythonModel:
 
         except Exception as e:
             self.logger.log_error(f"[trtllm] Error generating request: {e}")
-            error = pb_utils.TritonError(f"Error generating request: {e}")
-            text_output_tensor = pb_utils.Tensor(
-                "text_output", np.asarray(["N/A"], dtype=self.output_dtype))
-            response = pb_utils.InferenceResponse(
-                output_tensors=[text_output_tensor], error=error)
-            response_sender.send(
-                response, flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
+            # Skip sending if cancellation_loop or handle_stop_request
+            # already sent a COMPLETE_FINAL on this response_sender; they
+            # remove the entry from req_id_to_request_data as the signal.
+            with self.lock:
+                was_cancelled = (triton_req_id
+                                 not in self.req_id_to_request_data)
+            if not was_cancelled:
+                error = pb_utils.TritonError(f"Error generating request: {e}")
+                text_output_tensor = pb_utils.Tensor(
+                    "text_output", np.asarray(["N/A"], dtype=self.output_dtype))
+                response = pb_utils.InferenceResponse(
+                    output_tensors=[text_output_tensor], error=error)
+                response_sender.send(
+                    response,
+                    flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
             raise e
 
         finally:
@@ -508,7 +611,8 @@ class TritonPythonModel:
         sampling_params = get_sampling_params_from_request(request)
         output_config = get_output_config_from_request(request)
         streaming = get_streaming_from_request(request)
-        return prompt, sampling_params, streaming, output_config
+        lora_request = get_lora_request_from_request(request)
+        return prompt, sampling_params, streaming, output_config, lora_request
 
     def _create_response(self, request_output, output_config):
         """Process the generated request_output and create the client response.

@@ -49,6 +49,8 @@ enum class Attention_mask_type
     CAUSAL,
     // Causal mask + attend to the specific sliding window or chunk.
     SLIDING_OR_CHUNKED_CAUSAL,
+    // Bidirectional sliding window attention.
+    BIDIRECTIONAL_SLIDING_WINDOW,
     // The custom mask input.
     CUSTOM_MASK,
 };
@@ -62,6 +64,7 @@ static inline std::string mask_type_to_string(Attention_mask_type mask_type)
     case Attention_mask_type::PADDING: return "padding";
     case Attention_mask_type::CAUSAL: return "causal";
     case Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL: return "sliding_or_chunked_causal";
+    case Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW: return "bidirectional_sliding_window";
     case Attention_mask_type::CUSTOM_MASK: return "custom_mask";
     default: assert(false); return "";
     }

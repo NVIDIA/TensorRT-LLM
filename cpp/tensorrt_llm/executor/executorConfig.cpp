@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,8 +65,8 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mEnableTrtOverlap(enableTrtOverlap)
     , mFailFastOnAttentionWindowTooLarge(failFastOnAttentionWindowTooLarge)
 {
-    TLLM_CHECK(iterStatsMaxIterations >= 0);
-    TLLM_CHECK(requestStatsMaxIterations >= 0);
+    TLLM_CHECK(iterStatsMaxIterations >= kUnlimitedStatsMaxIterations);
+    TLLM_CHECK(requestStatsMaxIterations >= kUnlimitedStatsMaxIterations);
     TLLM_CHECK(mMaxBeamWidth > 0);
     TLLM_CHECK(maxSeqIdleMicroseconds > 0);
 }
@@ -271,13 +271,13 @@ void ExecutorConfig::setNormalizeLogProbs(bool normalizeLogProbs)
 void ExecutorConfig::setIterStatsMaxIterations(SizeType32 iterStatsMaxIterations)
 {
     mIterStatsMaxIterations = iterStatsMaxIterations;
-    TLLM_CHECK(mIterStatsMaxIterations >= 0);
+    TLLM_CHECK(mIterStatsMaxIterations >= kUnlimitedStatsMaxIterations);
 }
 
 void ExecutorConfig::setRequestStatsMaxIterations(SizeType32 requestStatsMaxIterations)
 {
     mRequestStatsMaxIterations = requestStatsMaxIterations;
-    TLLM_CHECK(mRequestStatsMaxIterations >= 0);
+    TLLM_CHECK(mRequestStatsMaxIterations >= kUnlimitedStatsMaxIterations);
 }
 
 void ExecutorConfig::setBatchingType(BatchingType batchingType)

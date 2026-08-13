@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,17 +19,36 @@ from typing import NamedTuple
 
 import pytest
 
+from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
-from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
+from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
+                                                       StructureInfo)
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
+from tensorrt_llm.serve.tool_parser.deepseekv4_parser import DeepSeekV4Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
+from tensorrt_llm.serve.tool_parser.gemma4_parser import Gemma4ToolParser
+from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
+from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
+from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import KimiK3ToolParser
+from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
+from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
+    PoolsideV1ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
+from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
+
+from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
+    BOT_TOKEN, CALL_PREFIX, EOT_TOKEN, STRING_DELIM, _extract_tool_calls,
+    _find_matching_brace, _parse_gemma4_args, _parse_gemma4_array,
+    _parse_gemma4_value,
+)
+
+pytestmark = pytest.mark.cpu_only
 
 
 # Test fixtures for common tools
@@ -190,8 +209,11 @@ class TestBaseToolParser:
 
         results = parser.parse_base_json(action, sample_tools)
 
-        # Should return empty list and log warning
-        assert len(results) == 0
+        # Should return the tool call with tool_index=-1 and log warning.
+        assert len(results) == 1
+        assert results[0].name == "undefined_function"
+        assert results[0].tool_index == -1
+        assert json.loads(results[0].parameters) == {}
 
     def test_parse_base_json_missing_parameters(self, sample_tools):
         """Test parse_base_json handles missing parameters."""
@@ -298,14 +320,14 @@ class TestBaseToolParser:
         """Test streaming parser handles invalid tool name."""
         parser = ConcreteToolParser()
 
-        # Send invalid tool name
+        # Send invalid tool name - parser streams it through.
         result = parser.parse_streaming_increment(
             '[TOOL_CALLS] {"name":"invalid_tool"', sample_tools)
 
-        # Should reset state
-        assert len(result.calls) == 0
-        assert parser._buffer == ""
-        assert parser.current_tool_id == -1
+        # Should still return the tool call.
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "invalid_tool"
+        assert result.calls[0].tool_index == 0
 
     def test_supports_structural_tag(self):
         """Test supports_structural_tag returns True."""
@@ -469,8 +491,9 @@ class BaseToolParserTestClass:
 
         result = parser.detect_and_parse(text, sample_tools)
 
-        # Should not return any calls for undefined function
-        assert len(result.calls) == 0
+        # Should return the tool call with tool_index=-1.
+        assert len(result.calls) == 1
+        assert result.calls[0].tool_index == -1
 
 
 class TestKimiK2ToolParser(BaseToolParserTestClass):
@@ -602,6 +625,14 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
         assert "get_weather" in info1.begin
         assert "search_web" in info2.begin
         assert info1.end == info2.end == "<|tool_call_end|><|tool_calls_section_end|>"
+
+    def test_undefined_tool(self, sample_tools, parser, tool_parser_test_cases):
+        """KimiK2 has custom detect_and_parse that filters undefined tools."""
+        text = tool_parser_test_cases.undefined_tool
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 0
 
     def test_kimi_k2_format_compliance(self, sample_tools, parser):
         """Test that KimiK2ToolParser follows the documented format structure."""
@@ -769,6 +800,221 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+    # ------------------------------------------------------------------
+    # NVBug 6240584: bare-JSON fallback in detect_and_parse
+    #
+    # Some Qwen3 chat templates (notably Qwen3.6 FP8 with
+    # `--reasoning_parser qwen3_5 --tool_parser qwen3`) emit tool calls
+    # as bare JSON, without a `<tool_call>...</tool_call>` wrapper, once
+    # the reasoning parser strips the `</think>` block. The parser must
+    # recover those before dropping the text into `normal_text`.
+    # ------------------------------------------------------------------
+
+    def test_detect_and_parse_bare_json_dict(self, sample_tools, parser):
+        """Bare JSON dict without <tool_call> wrapper is parsed as a tool call."""
+        text = '{"name":"get_weather","arguments":{"location":"Paris"}}'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
+
+    def test_detect_and_parse_bare_json_list(self, sample_tools, parser):
+        """Bare JSON list of tool calls without wrapper is parsed."""
+        text = '[{"name":"get_weather","arguments":{"location":"Paris"}}]'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
+
+    def test_detect_and_parse_bare_json_parameters_key(self, sample_tools,
+                                                       parser):
+        """Bare JSON with `parameters` (instead of `arguments`) is still parsed."""
+        text = '{"name":"get_weather","parameters":{"location":"Paris"}}'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Paris"}
+
+    def test_detect_and_parse_non_json_text_falls_through(
+            self, sample_tools, parser):
+        """Plain non-JSON text passes through as normal_text with no calls."""
+        text = "Hello world"
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == "Hello world"
+        assert result.calls == []
+
+    def test_detect_and_parse_bare_json_scalar_falls_through(
+            self, sample_tools, parser):
+        """A JSON scalar (e.g. `"42"`) must fall through cleanly, not crash.
+
+        This exercises the explicit `isinstance(parsed, (dict, list))` guard —
+        `parse_base_json` would raise `AttributeError` on a bare int, so the
+        guard prevents relying on exception catching for scalar JSON.
+        """
+        text = "42"
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.calls == []
+        # No crash is the important part.
+
+    def test_detect_and_parse_malformed_bare_json_falls_through(
+            self, sample_tools, parser):
+        """Malformed JSON without <tool_call> wrapper falls through cleanly."""
+        text = '{"name": "get_weather", "arguments": MALFORMED}'
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.calls == []
+        assert result.normal_text == text
+
+    def test_detect_and_parse_bare_json_with_trailing_content(
+            self, sample_tools, parser):
+        """Bare JSON followed by trailing non-whitespace text is still parsed.
+
+        NVBug 6240584 review follow-up: `json.loads(text.strip())` raises
+        `json.JSONDecodeError: Extra data` on `'{...} trailing text'`, which
+        used to drop the valid tool call into `normal_text`. The parser now
+        uses `raw_decode` to consume only the leading JSON value and must
+        recover the tool call regardless of what follows.
+        """
+        text = ('{"name":"get_weather","arguments":{"city":"Paris"}}\n'
+                'Extra text after the tool call.')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"city": "Paris"}
+
+    # ------------------------------------------------------------------
+    # NVBug 6240584: bare-JSON fallback in parse_streaming_increment
+    #
+    # The streaming path must also recover bare-JSON tool calls when the
+    # `<tool_call>` wrapper never appears. Without this, streaming clients
+    # receive the JSON as `delta.content` with `finish_reason="stop"`.
+    # ------------------------------------------------------------------
+
+    def test_streaming_bare_json_one_chunk(self, sample_tools, parser):
+        """A complete bare-JSON tool call arriving in a single chunk emits calls."""
+        result = parser.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"city":"Paris"}}', sample_tools)
+
+        names = [c.name for c in result.calls if c.name]
+        assert "get_weather" in names
+        params = "".join(c.parameters for c in result.calls if c.parameters)
+        assert "Paris" in params
+        assert result.normal_text == ""
+
+    def test_streaming_bare_json_split_across_chunks(self, sample_tools,
+                                                     parser):
+        """Bare-JSON tool call split across multiple chunks parses on completion."""
+        r1 = parser.parse_streaming_increment('{"name":"get_', sample_tools)
+        r2 = parser.parse_streaming_increment('weather","arguments":',
+                                              sample_tools)
+        r3 = parser.parse_streaming_increment('{"city":"Paris"}}', sample_tools)
+
+        all_calls = list(r1.calls) + list(r2.calls) + list(r3.calls)
+        names = [c.name for c in all_calls if c.name]
+        assert "get_weather" in names
+        params = "".join(c.parameters for c in all_calls if c.parameters)
+        assert "Paris" in params
+
+    def test_streaming_bare_json_does_not_leak_content(self, sample_tools,
+                                                       parser):
+        """After a bare-JSON tool call is emitted, trailing text is not leaked.
+
+        This must be the case even for subsequent empty/whitespace chunks:
+        leaking any normal_text would flip `finish_reason` back to `stop`.
+        """
+        r1 = parser.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"city":"Paris"}}', sample_tools)
+        # Any subsequent chunks must not emit normal_text either.
+        r2 = parser.parse_streaming_increment("", sample_tools)
+
+        assert r1.normal_text == ""
+        assert r2.normal_text == ""
+
+    def test_streaming_non_json_text_flushed_as_normal(self, sample_tools,
+                                                       parser):
+        """Non-JSON text without a wrapper is flushed to normal_text."""
+        result = parser.parse_streaming_increment("Hello world", sample_tools)
+
+        assert result.normal_text == "Hello world"
+        assert result.calls == []
+
+    def test_streaming_bare_json_with_trailing_content(self, sample_tools,
+                                                       parser):
+        """Bare-JSON tool call plus trailing text: emit calls, don't buffer.
+
+        NVBug 6240584 review follow-up: previously the streaming path called
+        `json.loads(stripped)`, which fails with `Extra data` when the
+        buffered content is `'{...} trailing text'`. The parser would then
+        keep buffering forever and never emit the tool call. With
+        `raw_decode`, the tool call must be emitted at the JSON boundary
+        and the trailing text must be dropped (bare-JSON mode already
+        suppresses subsequent chunks).
+        """
+        result = parser.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"city":"Paris"}}\n'
+            'Extra text after the tool call.', sample_tools)
+
+        names = [c.name for c in result.calls if c.name]
+        assert "get_weather" in names
+        params = "".join(c.parameters for c in result.calls if c.parameters)
+        assert "Paris" in params
+        # Trailing text must NOT be surfaced as normal_text — it would flip
+        # finish_reason back to "stop".
+        assert result.normal_text == ""
+
+    def test_streaming_bare_json_trailing_content_split_chunk(
+            self, sample_tools, parser):
+        """Same as above but the trailing text arrives in a later chunk.
+
+        This exercises the state machine: chunk 1 completes the JSON (parser
+        must emit calls now, not wait for more input), chunk 2 arrives after
+        the parser is already in `_STREAM_MODE_BARE_JSON` and must be
+        suppressed.
+        """
+        r1 = parser.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"city":"Paris"}}', sample_tools)
+        r2 = parser.parse_streaming_increment('\nExtra text.', sample_tools)
+
+        names = [c.name for c in r1.calls if c.name]
+        assert "get_weather" in names
+        assert r1.normal_text == ""
+        # Trailing chunk is fully suppressed.
+        assert r2.calls == []
+        assert r2.normal_text == ""
+
+    def test_streaming_wrapped_form_unregressed(self, sample_tools, parser):
+        """The pre-existing wrapped-form streaming path continues to work."""
+        # Send bot token.
+        parser.parse_streaming_increment("<tool_call>\n", sample_tools)
+
+        # Partial JSON with name -> emits name with empty params.
+        r_name = parser.parse_streaming_increment('{"name":"get_weather"',
+                                                  sample_tools)
+        assert len(r_name.calls) == 1
+        assert r_name.calls[0].name == "get_weather"
+        assert r_name.calls[0].parameters == ""
+
+        # Complete the JSON and the wrapper.
+        r_args = parser.parse_streaming_increment(
+            ',"arguments":{"location":"SF"}}\n</tool_call>', sample_tools)
+        assert len(r_args.calls) == 1
+        assert json.loads(r_args.calls[0].parameters) == {"location": "SF"}
 
 
 class TestQwen3CoderToolParser(BaseToolParserTestClass):
@@ -993,6 +1239,127 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 "arg2": [1, 2]
             }
         }
+
+    def test_parse_anyof_parameter_type_conversion(self, parser):
+        """Test that parameters using anyOf schemas are correctly type-converted."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="create_record",
+                description="Create a record with various optional fields",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string"
+                        },
+                        "count": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "score": {
+                            "anyOf": [{
+                                "type": "number"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "active": {
+                            "anyOf": [{
+                                "type": "boolean"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "metadata": {
+                            "anyOf": [{
+                                "type": "object"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "tags": {
+                            "anyOf": [{
+                                "type": "array"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                        "label": {
+                            "anyOf": [{
+                                "type": "string"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                    "required": ["name"],
+                },
+            ),
+        )
+
+        text = ("<tool_call>\n"
+                "<function=create_record>\n"
+                "<parameter=name>test</parameter>\n"
+                "<parameter=count>42</parameter>\n"
+                "<parameter=score>3.14</parameter>\n"
+                "<parameter=active>true</parameter>\n"
+                '<parameter=metadata>{"key": "value"}</parameter>\n'
+                "<parameter=tags>[1, 2, 3]</parameter>\n"
+                "<parameter=label>hello</parameter>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool_def])
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params["name"] == "test"
+        assert params["count"] == 42
+        assert isinstance(params["count"], int)
+        assert params["score"] == 3.14
+        assert isinstance(params["score"], float)
+        assert params["active"] is True
+        assert params["metadata"] == {"key": "value"}
+        assert params["tags"] == [1, 2, 3]
+        assert params["label"] == "hello"
+
+    def test_parse_anyof_null_value(self, parser):
+        """Test that null values are handled correctly for anyOf parameters."""
+        tool_def = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="set_value",
+                description="Set a value",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "anyOf": [{
+                                "type": "integer"
+                            }, {
+                                "type": "null"
+                            }],
+                        },
+                    },
+                },
+            ),
+        )
+
+        text = ("<tool_call>\n"
+                "<function=set_value>\n"
+                "<parameter=value>null</parameter>\n"
+                "</function>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, [tool_def])
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params["value"] is None
 
     def test_qwen3_coder_format_compliance(
         self,
@@ -1314,6 +1681,1226 @@ class TestDeepSeekV32Parser(BaseToolParserTestClass):
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
 
+    def test_encode_messages_multi_turn_with_tool_calls(self):
+        """NVBug 5937478: encode_messages must handle dict-typed tool_call arguments.
+
+        chat_utils deserializes arguments to dict; encode_arguments_to_dsml
+        must not call json.loads() on it again.
+        """
+        messages = [
+            {
+                "role": "user",
+                "content": "list files"
+            },
+            {
+                "role":
+                "assistant",
+                "content":
+                None,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": {
+                            "command": "ls"
+                        },  # dict, not str
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "content": "a.py b.py",
+                "tool_call_id": "c1"
+            },
+            {
+                "role": "user",
+                "content": "open a.py"
+            },
+        ]
+        result = encode_messages(messages, thinking_mode="chat")
+        assert '<｜DSML｜invoke name="bash">' in result
+        assert 'name="command"' in result
+        assert ">ls<" in result
+
+
+# ============================================================================
+# DeepSeekV4Parser Tests
+# ============================================================================
+
+
+class TestDeepSeekV4Parser(BaseToolParserTestClass):
+    """Test suite for DeepSeekV4Parser class."""
+
+    def make_parser(self):
+        return DeepSeekV4Parser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=
+            ('Some text <｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+             '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+             "</｜DSML｜invoke> </｜DSML｜tool_calls>"),
+            detect_and_parse_single_tool=(
+                ('Normal text<｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+                 '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+                 "</｜DSML｜invoke> </｜DSML｜tool_calls>"),
+                "Normal text",
+                "get_weather",
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                ('<｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+                 '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+                 '</｜DSML｜invoke> <｜DSML｜invoke name="search_web"> '
+                 '{ "query": "AI" } </｜DSML｜invoke> </｜DSML｜tool_calls>'),
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=
+            ('<|DSML|tool_calls> <|DSML|invoke name="get_weather"> '
+             '<|DSML|parameter name="location" string="true">NYC</|DSML|parameter> '
+             "</|DSML|invoke> </|DSML|tool_calls>"),
+            detect_and_parse_with_parameters_key=(
+                ('<｜DSML｜tool_calls> <｜DSML｜invoke name="search_web"> '
+                 '{ "query": "test" } </｜DSML｜invoke> </｜DSML｜tool_calls>'),
+                "search_web",
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<｜DSML｜tool",
+            undefined_tool=
+            ('<｜DSML｜tool_calls> <｜DSML｜invoke name="undefined_func"> '
+             '<｜DSML｜parameter name="arg" string="true">value</｜DSML｜parameter> '
+             "</｜DSML｜invoke> </｜DSML｜tool_calls>"),
+        )
+
+
+# ============================================================================
+# Glm4ToolParser Tests
+# ============================================================================
+
+
+class TestGlm4ToolParser(BaseToolParserTestClass):
+    """Test suite for Glm4ToolParser class."""
+
+    def make_parser(self):
+        return Glm4ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        single_text = ("Normal text"
+                       "<tool_call>get_weather\n"
+                       "<arg_key>location</arg_key>\n"
+                       "<arg_value>NYC</arg_value>\n"
+                       "</tool_call>")
+        single_expected_normal = "Normal text"
+        single_expected_name = "get_weather"
+        single_expected_params = {"location": "NYC"}
+
+        multiple_text = ("<tool_call>get_weather\n"
+                         "<arg_key>location</arg_key>\n"
+                         "<arg_value>LA</arg_value>\n"
+                         "</tool_call>"
+                         "<tool_call>search_web\n"
+                         "<arg_key>query</arg_key>\n"
+                         "<arg_value>AI</arg_value>\n"
+                         "</tool_call>")
+        multiple_names = ("get_weather", "search_web")
+
+        malformed_text = ("<tool_call>get_weather"
+                          "MALFORMED_NO_NEWLINE</tool_call>")
+
+        with_parameters_text = ("<tool_call>search_web\n"
+                                "<arg_key>query</arg_key>\n"
+                                "<arg_value>test</arg_value>\n"
+                                "</tool_call>")
+        with_parameters_name = "search_web"
+        with_parameters_params = {"query": "test"}
+
+        partial_bot_token = "<tool_cal"
+
+        undefined_tool_text = ("<tool_call>undefined_func\n"
+                               "<arg_key>arg</arg_key>\n"
+                               "<arg_value>value</arg_value>\n"
+                               "</tool_call>")
+
+        return ToolParserTestCases(
+            has_tool_call_true=
+            "Some text <tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>NYC</arg_value>\n</tool_call>",
+            detect_and_parse_single_tool=(
+                single_text,
+                single_expected_normal,
+                single_expected_name,
+                single_expected_params,
+            ),
+            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
+            detect_and_parse_malformed_tool=malformed_text,
+            detect_and_parse_with_parameters_key=(
+                with_parameters_text,
+                with_parameters_name,
+                with_parameters_params,
+            ),
+            parse_streaming_increment_partial_bot_token=partial_bot_token,
+            undefined_tool=undefined_tool_text,
+        )
+
+    def test_initialization(self, parser):
+        """Test that Glm4ToolParser initializes correctly."""
+        assert parser.bot_token == "<tool_call>"
+        assert parser.eot_token == "</tool_call>"
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Test streaming parser with complete tool call in chunks."""
+
+        # Send bot token with function name
+        result = parser.parse_streaming_increment("<tool_call>get_weather\n",
+                                                  sample_tools)
+
+        # Should send tool name
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+
+        # Send arguments
+        result = parser.parse_streaming_increment(
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>SF</arg_value>\n"
+            "</tool_call>", sample_tools)
+
+        # Should stream arguments and complete the tool call
+        all_params = "".join(call.parameters for call in result.calls
+                             if call.parameters)
+        assert "location" in all_params
+        assert "SF" in all_params
+
+    def test_parse_streaming_increment_multiple_tools_streaming(
+            self, sample_tools, parser):
+        """Test streaming parser handles multiple tool calls."""
+
+        # First tool
+        parser.parse_streaming_increment("<tool_call>get_weather\n",
+                                         sample_tools)
+        parser.parse_streaming_increment(
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n"
+            "</tool_call>", sample_tools)
+
+        # Second tool
+        result = parser.parse_streaming_increment("<tool_call>search_web\n",
+                                                  sample_tools)
+
+        # Should have started second tool
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "search_web"
+        assert result.calls[0].parameters == ""
+        assert result.calls[0].tool_index == 1
+
+    def test_parse_streaming_multiple_params(self, sample_tools, parser):
+        """Test streaming parser handles multiple parameters."""
+
+        # Send function name
+        parser.parse_streaming_increment("<tool_call>get_weather\n",
+                                         sample_tools)
+
+        # Send first parameter
+        result1 = parser.parse_streaming_increment(
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n", sample_tools)
+
+        params1 = "".join(call.parameters for call in result1.calls
+                          if call.parameters)
+        assert "location" in params1
+
+        # Send second parameter and close
+        result2 = parser.parse_streaming_increment(
+            "<arg_key>unit</arg_key>\n"
+            "<arg_value>celsius</arg_value>\n"
+            "</tool_call>", sample_tools)
+
+        params2 = "".join(call.parameters for call in result2.calls
+                          if call.parameters)
+        assert "unit" in params2
+
+    def test_detect_and_parse_multiple_params(self, sample_tools):
+        """Test one-shot parsing with multiple parameters."""
+        parser = Glm4ToolParser()
+        text = ("<tool_call>get_weather\n"
+                "<arg_key>location</arg_key>\n"
+                "<arg_value>Tokyo</arg_value>\n"
+                "<arg_key>unit</arg_key>\n"
+                "<arg_value>celsius</arg_value>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"location": "Tokyo", "unit": "celsius"}
+
+    def test_detect_and_parse_with_number_type(self):
+        """Test parsing with number type coercion."""
+        parser = Glm4ToolParser()
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="set_temperature",
+                    description="Set temperature",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "type": "number",
+                            },
+                            "label": {
+                                "type": "string",
+                            },
+                        },
+                        "required": ["value"],
+                    },
+                ),
+            )
+        ]
+
+        text = ("<tool_call>set_temperature\n"
+                "<arg_key>value</arg_key>\n"
+                "<arg_value>72.5</arg_value>\n"
+                "<arg_key>label</arg_key>\n"
+                "<arg_value>room temp</arg_value>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, tools)
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params["value"] == 72.5
+        assert params["label"] == "room temp"
+
+    def test_glm4_format_compliance(self, sample_tools, parser):
+        """Test that Glm4ToolParser follows the documented format structure."""
+
+        text = ("<tool_call>get_weather\n"
+                "<arg_key>location</arg_key>\n"
+                "<arg_value>Tokyo</arg_value>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+    def test_streaming_no_args(self, sample_tools, parser):
+        """Test streaming a tool call with no arguments."""
+
+        # First increment sends the tool name
+        result1 = parser.parse_streaming_increment("<tool_call>get_weather\n",
+                                                   sample_tools)
+        names = [c.name for c in result1.calls if c.name]
+        assert "get_weather" in names
+
+        # Second increment closes the tool call with empty args
+        result2 = parser.parse_streaming_increment("</tool_call>", sample_tools)
+        params = "".join(c.parameters for c in result2.calls)
+        assert "{}" in params
+
+    def test_supports_structural_tag(self, parser):
+        """Test that supports_structural_tag returns False."""
+        assert parser.supports_structural_tag() is False
+
+
+# ============================================================================
+# Glm47ToolParser Tests
+# ============================================================================
+
+
+class TestGlm47ToolParser(BaseToolParserTestClass):
+    """Test suite for Glm47ToolParser class (GLM-4.7/GLM-5 format)."""
+
+    def make_parser(self):
+        return Glm47ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        # GLM-4.7 format: no newline required between func name and args
+        single_text = ("Normal text"
+                       "<tool_call>get_weather"
+                       "<arg_key>location</arg_key>"
+                       "<arg_value>NYC</arg_value>"
+                       "</tool_call>")
+        single_expected_normal = "Normal text"
+        single_expected_name = "get_weather"
+        single_expected_params = {"location": "NYC"}
+
+        multiple_text = ("<tool_call>get_weather"
+                         "<arg_key>location</arg_key>"
+                         "<arg_value>LA</arg_value>"
+                         "</tool_call>"
+                         "<tool_call>search_web"
+                         "<arg_key>query</arg_key>"
+                         "<arg_value>AI</arg_value>"
+                         "</tool_call>")
+        multiple_names = ("get_weather", "search_web")
+
+        # Malformed: no arg_key/arg_value and no closing pattern
+        malformed_text = "<tool_call>MALFORMED_NO_ARGS"
+
+        with_parameters_text = ("<tool_call>search_web"
+                                "<arg_key>query</arg_key>"
+                                "<arg_value>test</arg_value>"
+                                "</tool_call>")
+        with_parameters_name = "search_web"
+        with_parameters_params = {"query": "test"}
+
+        partial_bot_token = "<tool_cal"
+
+        undefined_tool_text = ("<tool_call>undefined_func"
+                               "<arg_key>arg</arg_key>"
+                               "<arg_value>value</arg_value>"
+                               "</tool_call>")
+
+        return ToolParserTestCases(
+            has_tool_call_true=
+            "Some text <tool_call>get_weather<arg_key>location</arg_key><arg_value>NYC</arg_value></tool_call>",
+            detect_and_parse_single_tool=(
+                single_text,
+                single_expected_normal,
+                single_expected_name,
+                single_expected_params,
+            ),
+            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
+            detect_and_parse_malformed_tool=malformed_text,
+            detect_and_parse_with_parameters_key=(
+                with_parameters_text,
+                with_parameters_name,
+                with_parameters_params,
+            ),
+            parse_streaming_increment_partial_bot_token=partial_bot_token,
+            undefined_tool=undefined_tool_text,
+        )
+
+    def test_initialization(self, parser):
+        """Test that Glm47ToolParser initializes correctly."""
+        assert parser.bot_token == "<tool_call>"
+        assert parser.eot_token == "</tool_call>"
+
+    def test_zero_arg_tool_call(self, parser):
+        """Test parsing a zero-argument tool call (GLM-4.7 feature)."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+        text = "<tool_call>get_time</tool_call>"
+
+        result = parser.detect_and_parse(text, tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_time"
+        assert json.loads(result.calls[0].parameters) == {}
+
+    def test_no_newline_format(self, sample_tools, parser):
+        """Test parsing tool call without newline between name and args."""
+        text = ("<tool_call>get_weather"
+                "<arg_key>location</arg_key>"
+                "<arg_value>Tokyo</arg_value>"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+    def test_newline_format_also_works(self, sample_tools, parser):
+        """Test that GLM-4.5 newline format also works with GLM-4.7 parser."""
+        text = ("<tool_call>get_weather\n"
+                "<arg_key>location</arg_key>\n"
+                "<arg_value>Tokyo</arg_value>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Test streaming parser with complete tool call in chunks."""
+        # Send bot token with function name and first arg_key
+        result = parser.parse_streaming_increment(
+            "<tool_call>get_weather<arg_key>", sample_tools)
+
+        # Should send tool name (has_arg_key is True)
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+
+        # Send arguments
+        result = parser.parse_streaming_increment(
+            "location</arg_key>"
+            "<arg_value>SF</arg_value>"
+            "</tool_call>", sample_tools)
+
+        # Should stream arguments and complete the tool call
+        all_params = "".join(call.parameters for call in result.calls
+                             if call.parameters)
+        assert "location" in all_params
+        assert "SF" in all_params
+
+    def test_parse_streaming_increment_multiple_tools_streaming(
+            self, sample_tools, parser):
+        """Test streaming parser handles multiple tool calls."""
+        # First tool
+        parser.parse_streaming_increment(
+            "<tool_call>get_weather<arg_key>location</arg_key>"
+            "<arg_value>NYC</arg_value></tool_call>", sample_tools)
+
+        # Second tool
+        result = parser.parse_streaming_increment(
+            "<tool_call>search_web<arg_key>", sample_tools)
+
+        # Should have started second tool
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "search_web"
+        assert result.calls[0].parameters == ""
+        assert result.calls[0].tool_index == 1
+
+    def test_streaming_zero_arg_tool(self, parser):
+        """Test streaming a zero-argument tool call."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+
+        # Send the complete zero-arg tool call
+        result = parser.parse_streaming_increment(
+            "<tool_call>get_time</tool_call>", tools)
+
+        names = [c.name for c in result.calls if c.name]
+        assert "get_time" in names
+
+        # Should have sent empty object for no-arg function
+        params = "".join(c.parameters for c in result.calls)
+        assert "{}" in params
+
+    def test_detect_and_parse_multiple_params(self, sample_tools):
+        """Test one-shot parsing with multiple parameters."""
+        parser = Glm47ToolParser()
+        text = ("<tool_call>get_weather"
+                "<arg_key>location</arg_key>"
+                "<arg_value>Tokyo</arg_value>"
+                "<arg_key>unit</arg_key>"
+                "<arg_value>celsius</arg_value>"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"location": "Tokyo", "unit": "celsius"}
+
+    def test_detect_and_parse_with_number_type(self):
+        """Test parsing with number type coercion."""
+        parser = Glm47ToolParser()
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="set_temperature",
+                    description="Set temperature",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "type": "number",
+                            },
+                            "label": {
+                                "type": "string",
+                            },
+                        },
+                        "required": ["value"],
+                    },
+                ),
+            )
+        ]
+
+        text = ("<tool_call>set_temperature"
+                "<arg_key>value</arg_key>"
+                "<arg_value>72.5</arg_value>"
+                "<arg_key>label</arg_key>"
+                "<arg_value>room temp</arg_value>"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, tools)
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params["value"] == 72.5
+        assert params["label"] == "room temp"
+
+    def test_supports_structural_tag(self, parser):
+        """Test that supports_structural_tag returns False."""
+        assert parser.supports_structural_tag() is False
+
+    def test_normal_text_before_tool_call(self, sample_tools, parser):
+        """Test that text before tool call is returned as normal_text."""
+        text = ("Here is the weather info "
+                "<tool_call>get_weather"
+                "<arg_key>location</arg_key>"
+                "<arg_value>NYC</arg_value>"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "Here is the weather info" in result.normal_text
+        assert len(result.calls) == 1
+
+    def test_text_between_tool_calls(self, sample_tools, parser):
+        """Test that text between tool calls is preserved as normal_text."""
+        text = ("<tool_call>get_weather"
+                "<arg_key>location</arg_key>"
+                "<arg_value>NYC</arg_value>"
+                "</tool_call>"
+                " some text between "
+                "<tool_call>search_web"
+                "<arg_key>query</arg_key>"
+                "<arg_value>AI</arg_value>"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "some text between" in result.normal_text
+        assert len(result.calls) == 2
+
+
+# ============================================================================
+# Glm47ToolParser — scenarios ported from sglang's reference test suite
+# (sgl-project/sglang :: test/registered/unit/function_call/test_glm47_moe_detector.py).
+# These are the edge cases most likely to surface in real GLM-5 MTP output.
+# ============================================================================
+
+
+class TestGlm47ToolParserSglangSuite:
+    """Port of sglang's Glm47MoeDetector tests against our Glm47ToolParser."""
+
+    @staticmethod
+    def _tool(name, properties, required=None):
+        params = {"type": "object", "properties": properties}
+        if required is not None:
+            params["required"] = required
+        return ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(name=name, parameters=params),
+        )
+
+    @staticmethod
+    def _stream(parser, chunks, tools):
+        calls = []
+        normal = ""
+        for chunk in chunks:
+            result = parser.parse_streaming_increment(chunk, tools)
+            calls.extend(result.calls)
+            normal += result.normal_text or ""
+        return calls, normal
+
+    def test_mtp_func_and_string_split(self):
+        """MTP splits the function name and string values mid-word."""
+        tools = [
+            self._tool(
+                "create_task",
+                {
+                    "title": {
+                        "type": "string"
+                    },
+                    "location": {
+                        "type": "string"
+                    },
+                },
+            )
+        ]
+        chunks = [
+            "I'll create a task.",
+            "<tool_call>create_ta",
+            "sk<arg_key>title</arg_key><arg_value>Go to Bei",
+            "jing</arg_value>",
+            "<arg_key>location</arg_key><arg_value>San Fran",
+            "cisco</arg_value></tool_call>",
+        ]
+        calls, normal = self._stream(Glm47ToolParser(), chunks, tools)
+
+        assert "I'll create a task." in normal
+        names = [c.name for c in calls if c.name]
+        assert names == ["create_task"]
+        params = json.loads("".join(c.parameters for c in calls
+                                    if c.parameters))
+        assert params == {"title": "Go to Beijing", "location": "San Francisco"}
+
+    def test_mtp_noarg_and_multiple_calls(self):
+        """No-arg call followed by regular call: state must reset cleanly."""
+        tools = [
+            self._tool("list_files", {}),
+            self._tool("get_weather", {"city": {
+                "type": "string"
+            }}),
+        ]
+        chunks = [
+            "<tool_call>list_files</tool_call>",
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>Beijing</arg_value></tool_call>",
+        ]
+        calls, _ = self._stream(Glm47ToolParser(), chunks, tools)
+
+        names = [c.name for c in calls if c.name]
+        assert names == ["list_files", "get_weather"]
+
+        empty_calls = [c for c in calls if c.parameters == "{}"]
+        assert len(empty_calls) <= 1, \
+            "No-arg function should emit at most one '{}'"
+
+        weather_params = "".join(c.parameters for c in calls
+                                 if c.parameters and c.tool_index == 1)
+        assert json.loads(weather_params) == {"city": "Beijing"}
+
+    def test_mtp_number_and_complex_json(self):
+        """Numbers preserved as numbers; JSON array reassembled across splits."""
+        tools = [
+            self._tool(
+                "create_todos",
+                {
+                    "priority": {
+                        "type": "number"
+                    },
+                    "count": {
+                        "type": "integer"
+                    },
+                    "items": {
+                        "type": "array"
+                    },
+                },
+            )
+        ]
+        chunks = [
+            "<tool_call>create_todos",
+            "<arg_key>priority</arg_key><arg_value>5.5</arg_value>",
+            "<arg_key>count</arg_key><arg_value>10</arg_value>",
+            '<arg_key>items</arg_key><arg_value>[{"description',
+            '": "Test',
+            'Todo 1"}, {"description": "TestTodo 2"}]</arg_value></tool_call>',
+        ]
+        calls, _ = self._stream(Glm47ToolParser(), chunks, tools)
+
+        names = [c.name for c in calls if c.name]
+        assert names == ["create_todos"]
+
+        params = json.loads("".join(c.parameters for c in calls
+                                    if c.parameters))
+        assert params["priority"] == 5.5
+        assert isinstance(params["priority"], (int, float))
+        assert params["count"] == 10
+        assert isinstance(params["count"], int)
+        assert isinstance(params["items"], list)
+        assert len(params["items"]) == 2
+        assert params["items"][0]["description"] == "TestTodo 1"
+        assert params["items"][1]["description"] == "TestTodo 2"
+
+    def test_array_argument_with_escaped_json(self):
+        r"""Arrays with escaped quotes, Windows paths, literal \n."""
+        tools = [self._tool("todo_write", {"todos": {"type": "array"}})]
+        parser = Glm47ToolParser()
+
+        text = ('<tool_call>todo_write<arg_key>todos</arg_key><arg_value>'
+                '[{"id": "1", "task": "Check file at C:\\\\Users\\\\test.txt", '
+                '"status": "pending"}]'
+                '</arg_value></tool_call>')
+        result = parser.detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert params["todos"][0]["task"] == r"Check file at C:\Users\test.txt"
+
+        parser = Glm47ToolParser()
+        text = ('<tool_call>todo_write<arg_key>todos</arg_key><arg_value>'
+                '[{"id": "1", "task": "Print \\\\n to see newline",'
+                '"status": "pending"}]'
+                '</arg_value></tool_call>')
+        result = parser.detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert params["todos"][0]["task"] == r"Print \n to see newline"
+
+    def test_boundary_param_value_extreme_split(self):
+        """Worst-case: one character per chunk."""
+        tools = [self._tool("search", {"query": {"type": "string"}})]
+        chunks = [
+            "<tool_call>search<arg_key>query</arg_key><arg_value>N",
+            "e",
+            "w ",
+            "Y",
+            "o",
+            "rk</arg_value></tool_call>",
+        ]
+        calls, _ = self._stream(Glm47ToolParser(), chunks, tools)
+        params = json.loads("".join(c.parameters for c in calls
+                                    if c.parameters))
+        assert params == {"query": "New York"}
+
+    def test_boundary_empty_param_value(self):
+        """Empty string values are preserved."""
+        tools = [
+            self._tool(
+                "create_note",
+                {
+                    "title": {
+                        "type": "string"
+                    },
+                    "content": {
+                        "type": "string"
+                    },
+                },
+            )
+        ]
+        text = ("<tool_call>create_note"
+                "<arg_key>title</arg_key><arg_value>Test</arg_value>"
+                "<arg_key>content</arg_key><arg_value></arg_value>"
+                "</tool_call>")
+        result = Glm47ToolParser().detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"title": "Test", "content": ""}
+
+    def test_boundary_json_empty_structures(self):
+        """Empty {} and [] as argument values shouldn't collide with no-arg '{}'."""
+        tools = [
+            self._tool(
+                "create_structure",
+                {
+                    "empty_obj": {
+                        "type": "object"
+                    },
+                    "empty_arr": {
+                        "type": "array"
+                    },
+                },
+            )
+        ]
+        text = ("<tool_call>create_structure"
+                "<arg_key>empty_obj</arg_key><arg_value>{}</arg_value>"
+                "<arg_key>empty_arr</arg_key><arg_value>[]</arg_value>"
+                "</tool_call>")
+        result = Glm47ToolParser().detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"empty_obj": {}, "empty_arr": []}
+
+    def test_boundary_number_edge_values(self):
+        """Zero, negative, scientific notation preserved as numbers."""
+        tools = [
+            self._tool(
+                "calculate",
+                {
+                    "zero": {
+                        "type": "number"
+                    },
+                    "negative": {
+                        "type": "number"
+                    },
+                    "large": {
+                        "type": "number"
+                    },
+                },
+            )
+        ]
+        text = ("<tool_call>calculate"
+                "<arg_key>zero</arg_key><arg_value>0</arg_value>"
+                "<arg_key>negative</arg_key><arg_value>-42.5</arg_value>"
+                "<arg_key>large</arg_key><arg_value>1e10</arg_value>"
+                "</tool_call>")
+        result = Glm47ToolParser().detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert params["zero"] == 0
+        assert params["negative"] == -42.5
+        assert params["large"] == 1e10
+
+    def test_boundary_type_string_with_numeric_content(self):
+        """Schema says string -> numeric-looking content stays string."""
+        tools = [
+            self._tool(
+                "store_data",
+                {
+                    "id": {
+                        "type": "string"
+                    },
+                    "code": {
+                        "type": "string"
+                    },
+                },
+            )
+        ]
+        text = ("<tool_call>store_data"
+                "<arg_key>id</arg_key><arg_value>12345</arg_value>"
+                "<arg_key>code</arg_key><arg_value>67.89</arg_value>"
+                "</tool_call>")
+        result = Glm47ToolParser().detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert isinstance(params["id"], str) and params["id"] == "12345"
+        assert isinstance(params["code"], str) and params["code"] == "67.89"
+
+    def test_error_undefined_tool(self, sample_tools):
+        """Undefined tool names parse cleanly with tool_index=-1.
+
+        TRT-LLM base behavior: warn + emit, unlike sglang which drops them.
+        """
+        text = ("<tool_call>nonexistent_function"
+                "<arg_key>param</arg_key><arg_value>value</arg_value>"
+                "</tool_call>")
+        result = Glm47ToolParser().detect_and_parse(text, sample_tools)
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "nonexistent_function"
+        assert result.calls[0].tool_index == -1
+        assert json.loads(result.calls[0].parameters) == {"param": "value"}
+
+    def test_error_incomplete_buffer_at_end(self, sample_tools):
+        """Stream ends mid-parse: no exception, returns a valid result."""
+        parser = Glm47ToolParser()
+        result = parser.parse_streaming_increment(
+            "<tool_call>get_weather<arg_key>location</arg_key>"
+            "<arg_value>Beijing", sample_tools)
+        assert isinstance(result, StreamingParseResult)
+
+
+class TestGlm47ToolParserFactory:
+    """Test that GLM-4.7 parser is registered in the factory."""
+
+    def test_glm47_registered(self):
+        """Test that glm47 parser is registered in factory."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        assert "glm47" in ToolParserFactory.parsers
+
+    def test_create_glm47_parser(self):
+        """Test creating glm47 parser via factory."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        parser = ToolParserFactory.create_tool_parser("glm47")
+        assert isinstance(parser, Glm47ToolParser)
+
+
+# ============================================================================
+# PoolsideV1ToolParser Tests
+# ============================================================================
+
+
+class TestPoolsideV1ToolParser(BaseToolParserTestClass):
+    """Test suite for Poolside Laguna v1 tool calls."""
+
+    def make_parser(self):
+        return PoolsideV1ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=("Some text <tool_call>get_weather\n"
+                                "<arg_key>location</arg_key>\n"
+                                "<arg_value>NYC</arg_value>\n"
+                                "</tool_call>"),
+            detect_and_parse_single_tool=(
+                ("Normal text\n"
+                 "<tool_call>get_weather\n"
+                 "<arg_key>location</arg_key>\n"
+                 "<arg_value>NYC</arg_value>\n"
+                 "</tool_call>"),
+                "Normal text",
+                "get_weather",
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                ("<tool_call>get_weather\n"
+                 "<arg_key>location</arg_key>\n"
+                 "<arg_value>LA</arg_value>\n"
+                 "</tool_call>\n"
+                 "<tool_call>search_web\n"
+                 "<arg_key>query</arg_key>\n"
+                 "<arg_value>AI</arg_value>\n"
+                 "</tool_call>"),
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=("<tool_call>get_weather\n"
+                                             "<arg_key>location</arg_key>\n"
+                                             "<arg_value>NYC</arg_value>"),
+            detect_and_parse_with_parameters_key=(
+                ("<tool_call>search_web\n"
+                 "<arg_key>query</arg_key>\n"
+                 "<arg_value>test</arg_value>\n"
+                 "</tool_call>"),
+                "search_web",
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<tool",
+            undefined_tool=("<tool_call>undefined_func\n"
+                            "<arg_key>arg</arg_key>\n"
+                            "<arg_value>value</arg_value>\n"
+                            "</tool_call>"),
+        )
+
+    def test_initialization(self, parser):
+        assert parser.bot_token == "<tool_call>"
+        assert parser.eot_token == "</tool_call>"
+        assert parser.supports_structural_tag() is False
+
+    def test_no_newline_format(self, sample_tools, parser):
+        text = ("<tool_call>get_weather"
+                "<arg_key>location</arg_key>"
+                "<arg_value>Tokyo</arg_value>"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+    def test_zero_arg_tool_call(self, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+        text = "<tool_call>get_time</tool_call>"
+
+        result = parser.detect_and_parse(text, tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_time"
+        assert json.loads(result.calls[0].parameters) == {}
+
+    def test_detect_and_parse_preserves_suffix(self, sample_tools, parser):
+        text = ("prefix "
+                "<tool_call>get_weather\n"
+                "<arg_key>location</arg_key>\n"
+                "<arg_value>NYC</arg_value>\n"
+                "</tool_call>"
+                " suffix")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "prefix" in result.normal_text
+        assert "suffix" in result.normal_text
+        assert len(result.calls) == 1
+
+    def test_detect_and_parse_allows_end_tag_text_in_string_arg(
+            self, sample_tools, parser):
+        text = ("<tool_call>search_web\n"
+                "<arg_key>query</arg_key>\n"
+                "<arg_value>literal </tool_call> marker</arg_value>\n"
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "search_web"
+        assert json.loads(result.calls[0].parameters) == {
+            "query": "literal </tool_call> marker"
+        }
+
+    def test_schema_aware_argument_coercion(self, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="set_values",
+                    description="Set typed values",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "string_value": {
+                                "type": "string"
+                            },
+                            "integer_value": {
+                                "type": "integer"
+                            },
+                            "number_value": {
+                                "type": "number"
+                            },
+                            "boolean_value": {
+                                "type": "boolean"
+                            },
+                            "array_value": {
+                                "type": "array"
+                            },
+                            "object_value": {
+                                "type": "object"
+                            },
+                        },
+                    },
+                ),
+            )
+        ]
+        text = ("<tool_call>set_values\n"
+                "<arg_key>string_value</arg_key>\n"
+                "<arg_value>true</arg_value>\n"
+                "<arg_key>integer_value</arg_key>\n"
+                "<arg_value>42</arg_value>\n"
+                "<arg_key>number_value</arg_key>\n"
+                "<arg_value>3.5</arg_value>\n"
+                "<arg_key>boolean_value</arg_key>\n"
+                "<arg_value>true</arg_value>\n"
+                "<arg_key>array_value</arg_key>\n"
+                "<arg_value>[1, 2]</arg_value>\n"
+                "<arg_key>object_value</arg_key>\n"
+                '<arg_value>{"k": 1}</arg_value>\n'
+                "</tool_call>")
+
+        result = parser.detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+
+        assert params == {
+            "string_value": "true",
+            "integer_value": 42,
+            "number_value": 3.5,
+            "boolean_value": True,
+            "array_value": [1, 2],
+            "object_value": {
+                "k": 1
+            },
+        }
+
+    def test_parse_streaming_increment_split_tags(self, sample_tools, parser):
+        result = parser.parse_streaming_increment("<tool", sample_tools)
+        assert result.normal_text == ""
+        assert len(result.calls) == 0
+
+        result = parser.parse_streaming_increment("_call>get_weather\n<arg",
+                                                  sample_tools)
+        assert result.normal_text == ""
+        assert len(result.calls) == 0
+
+        result = parser.parse_streaming_increment(
+            "_key>location</arg_key>"
+            "<arg_value>SF</arg_value>"
+            "</tool_call>", sample_tools)
+        assert len(result.calls) == 2
+        assert result.calls[0].tool_index == 0
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+        assert result.calls[1].tool_index == 0
+        assert json.loads(result.calls[1].parameters) == {"location": "SF"}
+
+    def test_parse_streaming_increment_buffers_truncated_tool_call(
+            self, sample_tools, parser):
+        result = parser.parse_streaming_increment(
+            "<tool_call>get_weather\n"
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>SF",
+            sample_tools,
+        )
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 0
+
+    def test_parse_streaming_increment_allows_end_tag_text_in_string_arg(
+            self, sample_tools, parser):
+        result = parser.parse_streaming_increment(
+            "<tool_call>search_web\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>literal </tool_call> marker</arg_value>\n"
+            "</tool_call>",
+            sample_tools,
+        )
+
+        assert len(result.calls) == 2
+        assert result.calls[0].tool_index == 0
+        assert result.calls[0].name == "search_web"
+        assert result.calls[0].parameters == ""
+        assert result.calls[1].tool_index == 0
+        assert json.loads(result.calls[1].parameters) == {
+            "query": "literal </tool_call> marker"
+        }
+
+    def test_parse_streaming_increment_multiple_tools(self, sample_tools,
+                                                      parser):
+        result = parser.parse_streaming_increment(
+            "<tool_call>get_weather\n"
+            "<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n"
+            "</tool_call>"
+            "<tool_call>search_web\n"
+            "<arg_key>query</arg_key>\n"
+            "<arg_value>AI</arg_value>\n"
+            "</tool_call>",
+            sample_tools,
+        )
+
+        assert [call.name for call in result.calls if call.name] == [
+            "get_weather",
+            "search_web",
+        ]
+        assert [call.tool_index for call in result.calls if call.name] == [0, 1]
+        params = [
+            json.loads(call.parameters) for call in result.calls
+            if call.parameters
+        ]
+        assert params == [{"location": "NYC"}, {"query": "AI"}]
+
+
+class TestPoolsideV1ToolParserFactory:
+    """Test that Poolside v1 parser is registered in the factory."""
+
+    def test_poolside_v1_registered(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        assert "poolside_v1" in ToolParserFactory.parsers
+
+    def test_create_poolside_v1_parser(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        parser = ToolParserFactory.create_tool_parser("poolside_v1")
+        assert isinstance(parser, PoolsideV1ToolParser)
+
+    def test_laguna_model_type_mapping(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            MODEL_TYPE_TO_TOOL_PARSER
+        assert MODEL_TYPE_TO_TOOL_PARSER["laguna"] == "poolside_v1"
+
+    def test_auto_detect_laguna(self, tmp_path):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            resolve_auto_tool_parser
+        model_dir = tmp_path / "Laguna"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(
+            json.dumps({"model_type": "laguna"}))
+
+        assert resolve_auto_tool_parser(str(model_dir)) == "poolside_v1"
+
 
 # ============================================================================
 # Integration Tests
@@ -1322,6 +2909,153 @@ class TestDeepSeekV32Parser(BaseToolParserTestClass):
 
 class TestToolParserIntegration:
     """Integration tests for tool parsers."""
+
+    def test_qwen3_5_reasoning_plus_qwen3_tool_parser_bare_json_pipeline(
+            self, sample_tools):
+        r"""NVBug 6240584: end-to-end reasoning + tool parser pipeline.
+
+        Reproduces the exact scenario from the bug report: the Qwen3.6 FP8
+        chat template pre-injects `<think>\n` into the assistant prompt
+        prefix, so the model output starts *inside* the reasoning block
+        with no opening `<think>` tag. Content up to `</think>` is the
+        reasoning, and what follows is a bare JSON tool call (no
+        `<tool_call>` wrapper). The `qwen3_5` reasoning parser (registered
+        with `reasoning_at_start=True`) strips the thinking block, then
+        the `qwen3` tool parser must recover the tool call so
+        `args.has_tool_call[0]` is True and downstream logic sets
+        `finish_reason="tool_calls"` (see chat_response_post_processor).
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import (
+            ChatPostprocArgs, apply_reasoning_parser, apply_tool_parser)
+
+        # Bug-report input: reasoning content (no leading `<think>` — the
+        # chat template already injected it into the prompt prefix) followed
+        # by a bare JSON tool call.
+        text = ('Reasoning here.</think>\n'
+                '{"name":"get_weather","arguments":{"city":"Paris"}}')
+
+        # Build a minimal request so we can construct ChatPostprocArgs.
+        req = ChatCompletionRequest(
+            model="Qwen/Qwen3.6-27B-FP8",
+            messages=[{
+                "role": "user",
+                "content": "What is the weather in Paris?"
+            }],
+            tools=sample_tools,
+        )
+        args = ChatPostprocArgs.from_request(req)
+        args.reasoning_parser = "qwen3_5"
+        args.tool_parser = "qwen3"
+
+        # Non-streaming path.
+        content, reasoning_content = apply_reasoning_parser(args,
+                                                            output_index=0,
+                                                            text=text,
+                                                            streaming=False)
+        assert reasoning_content == "Reasoning here."
+        # The reasoning parser strips `<think>...</think>` — the remaining
+        # content is the bare JSON, possibly with a leading newline.
+        assert '"name":"get_weather"' in content
+
+        normal_text, calls = apply_tool_parser(args,
+                                               output_index=0,
+                                               text=content,
+                                               streaming=False)
+
+        assert len(calls) == 1
+        assert calls[0].name == "get_weather"
+        assert json.loads(calls[0].parameters) == {"city": "Paris"}
+        # Downstream (chat_response_post_processor) checks this flag to flip
+        # finish_reason from "stop" to "tool_calls".
+        assert args.has_tool_call.get(0) is True
+        # And no bare JSON leaks into the visible content.
+        assert normal_text == ""
+
+    def test_qwen3_5_reasoning_plus_qwen3_tool_parser_bare_json_streaming(
+            self, sample_tools):
+        r"""NVBug 6240584: streaming variant of reasoning+tool parser pipeline.
+
+        The bug most commonly reproduces on streamed chat completions —
+        the model emits tokens one at a time and the OpenAI server relies
+        on the tool parser to flip `finish_reason` to `tool_calls` before
+        the stream ends. Feed the same reasoning + bare-JSON payload
+        through `apply_reasoning_parser` / `apply_tool_parser` with
+        `streaming=True` in small chunks and assert:
+          - `args.has_tool_call[0]` is True at end-of-stream,
+          - the accumulated tool-call name/arguments are correct,
+          - the bare JSON never leaks into visible content.
+        """
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+        from tensorrt_llm.serve.postprocess_handlers import (
+            ChatPostprocArgs, apply_reasoning_parser, apply_tool_parser)
+
+        text = ('Reasoning here.</think>\n'
+                '{"name":"get_weather","arguments":{"city":"Paris"}}')
+
+        # Chunk the input to force the streaming state machines to buffer
+        # across boundaries. The split intentionally lands inside both the
+        # `</think>` tag and the JSON payload.
+        chunks = [
+            'Reasoning ',
+            'here.</thi',
+            'nk>\n{"name":"get_',
+            'weather","arguments":',
+            '{"city":"Pa',
+            'ris"}}',
+        ]
+
+        req = ChatCompletionRequest(
+            model="Qwen/Qwen3.6-27B-FP8",
+            messages=[{
+                "role": "user",
+                "content": "What is the weather in Paris?"
+            }],
+            tools=sample_tools,
+        )
+        args = ChatPostprocArgs.from_request(req)
+        args.reasoning_parser = "qwen3_5"
+        args.tool_parser = "qwen3"
+
+        accumulated_content = ""
+        accumulated_normal_text = ""
+        collected_calls = []
+
+        for chunk in chunks:
+            content, _reasoning = apply_reasoning_parser(args,
+                                                         output_index=0,
+                                                         text=chunk,
+                                                         streaming=True)
+            accumulated_content += content
+            if not content:
+                continue
+            normal_text, calls = apply_tool_parser(args,
+                                                   output_index=0,
+                                                   text=content,
+                                                   streaming=True)
+            if normal_text:
+                accumulated_normal_text += normal_text
+            collected_calls.extend(calls)
+
+        # The reasoning parser must have stripped everything through the
+        # `</think>` tag; the bare JSON survives into content.
+        assert '"name":"get_weather"' in accumulated_content
+
+        # The tool parser must have flipped `has_tool_call` before the
+        # stream ended — this is the exact condition
+        # `chat_response_post_processor` uses to set
+        # `finish_reason="tool_calls"`.
+        assert args.has_tool_call.get(0) is True
+
+        # We must have received the tool name and its arguments (potentially
+        # across multiple streaming increments).
+        names = [c.name for c in collected_calls if c.name]
+        assert names == ["get_weather"]
+        params = "".join(c.parameters for c in collected_calls if c.parameters)
+        assert json.loads(params) == {"city": "Paris"}
+
+        # And no visible content is leaked from the bare-JSON payload.
+        assert accumulated_normal_text == ""
 
     def test_end_to_end_single_tool(self, sample_tools):
         """Test end-to-end parsing of a single tool call."""
@@ -1378,5 +3112,1246 @@ class TestToolParserIntegration:
         assert result2.calls[0].name == "search_web"
 
 
+# ============================================================================
+# MiniMaxM2ToolParser Tests
+# ============================================================================
+
+
+class TestMiniMaxM2ToolParser:
+    """Test suite for MiniMaxM2ToolParser class."""
+
+    @pytest.fixture
+    def parser(self):
+        return MiniMaxM2ToolParser()
+
+    def test_initialization(self, parser):
+        """Test that MiniMaxM2ToolParser initializes correctly."""
+        assert parser.bot_token == "<minimax:tool_call>"
+        assert parser.eot_token == "</minimax:tool_call>"
+
+    def test_has_tool_call_true(self, parser):
+        """Test has_tool_call returns True when tool call present."""
+        text = '<minimax:tool_call><invoke name="get_weather"><parameter name="location">NYC</parameter></invoke></minimax:tool_call>'
+        assert parser.has_tool_call(text) is True
+
+    def test_has_tool_call_false(self, parser):
+        """Test has_tool_call returns False when no tool call present."""
+        text = "Just some regular text without tool calls"
+        assert parser.has_tool_call(text) is False
+
+    def test_detect_and_parse_single_tool(self, sample_tools, parser):
+        """Test detect_and_parse with a single tool call."""
+        text = ('I will check the weather.'
+                '<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">NYC</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "I will check the weather." in result.normal_text
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"location": "NYC"}
+
+    def test_detect_and_parse_multiple_tools(self, sample_tools, parser):
+        """Test detect_and_parse with multiple tool calls (parallel)."""
+        text = ('<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">NYC</parameter>'
+                '</invoke>'
+                '<invoke name="search_web">'
+                '<parameter name="query">AI news</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 2
+        assert result.calls[0].name == "get_weather"
+        assert result.calls[1].name == "search_web"
+        assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
+        assert json.loads(result.calls[1].parameters) == {"query": "AI news"}
+
+    def test_detect_and_parse_no_tool_call(self, sample_tools, parser):
+        """Test detect_and_parse with text containing no tool calls."""
+        text = "This is just a regular response."
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == text
+        assert len(result.calls) == 0
+
+    def test_detect_and_parse_with_thinking(self, sample_tools, parser):
+        """Test detect_and_parse with interleaved thinking content before tool call."""
+        text = ('Let me think about this...\n'
+                '<minimax:tool_call>'
+                '<invoke name="search_web">'
+                '<parameter name="query">weather forecast</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "Let me think about this..." in result.normal_text
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "search_web"
+
+    def test_detect_and_parse_multiple_params(self, sample_tools, parser):
+        """Test parsing with multiple parameters."""
+        text = ('<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">Tokyo</parameter>'
+                '<parameter name="unit">celsius</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"location": "Tokyo", "unit": "celsius"}
+
+    def test_detect_and_parse_no_params(self):
+        """Test parsing tool call with no parameters."""
+        parser = MiniMaxM2ToolParser()
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get current time",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                    },
+                ),
+            )
+        ]
+        text = ('<minimax:tool_call>'
+                '<invoke name="get_time">'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_time"
+        assert json.loads(result.calls[0].parameters) == {}
+
+    def test_parse_streaming_increment_normal_text(self, sample_tools, parser):
+        """Test streaming parser handles normal text without tool calls."""
+        text = "Hello, how can I help?"
+
+        result = parser.parse_streaming_increment(text, sample_tools)
+
+        assert result.normal_text == text
+        assert len(result.calls) == 0
+
+    def test_parse_streaming_increment_partial_bot_token(
+            self, sample_tools, parser):
+        """Test streaming parser buffers partial bot token."""
+        result = parser.parse_streaming_increment("<minimax:tool_cal",
+                                                  sample_tools)
+
+        assert result.normal_text == ""
+        assert len(result.calls) == 0
+
+    def test_parse_streaming_increment_complete_tool(self, sample_tools):
+        """Test streaming parser with complete tool call."""
+        parser = MiniMaxM2ToolParser()
+
+        # Send the complete tool call
+        result = parser.parse_streaming_increment(
+            '<minimax:tool_call>'
+            '<invoke name="get_weather">'
+            '<parameter name="location">NYC</parameter>'
+            '</invoke>'
+            '</minimax:tool_call>', sample_tools)
+
+        # Should have parsed the tool call
+        names = [c.name for c in result.calls if c.name]
+        assert "get_weather" in names
+
+    def test_supports_structural_tag(self, parser):
+        """Test that supports_structural_tag returns False."""
+        assert parser.supports_structural_tag() is False
+
+    def test_parse_param_value_string_not_coerced(self):
+        """Test that string-typed params are not coerced by json.loads."""
+        from tensorrt_llm.serve.tool_parser.minimax_m2_parser import \
+            _parse_param_value
+
+        # Values that json.loads would coerce if not short-circuited.
+        assert _parse_param_value("42", "string") == "42"
+        assert _parse_param_value("true", "string") == "true"
+        assert _parse_param_value("null", "string") == "null"
+        assert _parse_param_value('{"k": 1}', "string") == '{"k": 1}'
+        assert _parse_param_value("[1,2]", "string") == "[1,2]"
+        # Non-string types should still be parsed.
+        assert _parse_param_value("42", "integer") == 42
+        assert _parse_param_value("3.14", "number") == 3.14
+        assert _parse_param_value("true", "boolean") is True
+        assert _parse_param_value('{"k": 1}', "object") == {"k": 1}
+
+    def test_detect_and_parse_preserves_suffix(self, sample_tools):
+        """Test that text after </minimax:tool_call> is preserved."""
+        parser = MiniMaxM2ToolParser()
+        text = ('prefix text'
+                '<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">NYC</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>'
+                ' suffix text')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert "prefix text" in result.normal_text
+        assert "suffix text" in result.normal_text
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+
+    def test_streaming_preserves_prefix_in_same_chunk(self, sample_tools):
+        """Test streaming returns prefix when it arrives with the tool token."""
+        parser = MiniMaxM2ToolParser()
+        result = parser.parse_streaming_increment(
+            'Hello! <minimax:tool_call>'
+            '<invoke name="get_weather">'
+            '<parameter name="location">NYC</parameter>'
+            '</invoke>'
+            '</minimax:tool_call>', sample_tools)
+
+        assert "Hello!" in result.normal_text
+        names = [c.name for c in result.calls if c.name]
+        assert "get_weather" in names
+
+
+# ============================================================================
+# Reasoning Parser Tests for Interleaved Thinking
+# ============================================================================
+
+
+class TestInterleavedThinkingReasoningParsers:
+    """Test reasoning parsers used for interleaved thinking models."""
+
+    def test_minimax_m2_reasoning_parser_registered(self):
+        """Test that minimax_m2 reasoning parser is registered."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+        assert "minimax_m2" in ReasoningParserFactory.keys()
+
+    def test_minimax_m2_append_think_reasoning_parser_registered(self):
+        """Test that minimax_m2_append_think reasoning parser is registered."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+        assert "minimax_m2_append_think" in ReasoningParserFactory.keys()
+
+    def test_minimax_m2_parser_handles_think_tags(self):
+        """Test MiniMax-M2 reasoning parser correctly extracts thinking content."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+        parser = ReasoningParserFactory.create_reasoning_parser("minimax_m2")
+
+        text = "Let me reason about this...</think>Here is the answer."
+        result = parser.parse(text)
+
+        assert result.reasoning_content == "Let me reason about this..."
+        assert result.content == "Here is the answer."
+
+    def test_interleaved_thinking_minimax_with_tool_call(self):
+        """Test MiniMax-M2 reasoning + tool parsing pipeline."""
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            "minimax_m2_append_think")
+        text = ("Let me search for the latest news.</think>"
+                '<minimax:tool_call>'
+                '<invoke name="search_web">'
+                '<parameter name="query">latest AI news</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.parse(text)
+
+        assert result.reasoning_content == "Let me search for the latest news."
+        assert "<minimax:tool_call>" in result.content
+
+        # Tool parser processes the content
+        tool_parser = MiniMaxM2ToolParser()
+        tool_result = tool_parser.detect_and_parse(result.content, [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="search_web",
+                    description="Search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string"
+                            },
+                        },
+                    },
+                ),
+            )
+        ])
+        assert len(tool_result.calls) == 1
+        assert tool_result.calls[0].name == "search_web"
+
+
+# ============================================================================
+# Gemma4 Tool Parser Tests
+# ============================================================================
+
+# Gemma4 helpers
+
+
+def _g4_tc(func_name: str, args_str: str) -> str:
+    """Build a Gemma4 tool call string."""
+    return (f'{BOT_TOKEN}{CALL_PREFIX}{func_name}'
+            f'{{{args_str}}}{EOT_TOKEN}')
+
+
+def _g4_s(val: str) -> str:
+    """Wrap a string value in Gemma4 string delimiters."""
+    return f'{STRING_DELIM}{val}{STRING_DELIM}'
+
+
+class TestGemma4ParsingHelpers:
+    """Tests for low-level Gemma4 format parsing functions."""
+
+    @pytest.mark.parametrize(
+        "text,start,expected",
+        [
+            ("{hello}", 0, 6),
+            ("{a:{b:1}}", 0, 8),
+            # Brace inside a string-delim'd value is ignored.
+            ('{key:' + STRING_DELIM + 'v{al}' + STRING_DELIM + '}', 0,
+             len('{key:' + STRING_DELIM + 'v{al}' + STRING_DELIM + '}') - 1),
+            # No matching closer => -1.
+            ("{incomplete", 0, -1),
+        ],
+        ids=["simple", "nested", "string_delim", "unmatched"],
+    )
+    def test_find_matching_brace(self, text, start, expected):
+        assert _find_matching_brace(text, start) == expected
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (STRING_DELIM + "hello" + STRING_DELIM, "hello"),
+            ("42", 42),
+            ("3.14", 3.14),
+            ("true", True),
+            ("false", False),
+            ("null", None),
+        ],
+        ids=["string", "int", "float", "bool_true", "bool_false", "null"],
+    )
+    def test_parse_value(self, raw, expected):
+        assert _parse_gemma4_value(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("[]", []),
+            (f'[{_g4_s("a")},{_g4_s("b")}]', ["a", "b"]),
+            (f'[{_g4_s("hello")},42,true]', ["hello", 42, True]),
+            (
+                f'[{{name:{_g4_s("Alice")}}},{{name:{_g4_s("Bob")}}}]',
+                [{
+                    "name": "Alice"
+                }, {
+                    "name": "Bob"
+                }],
+            ),
+        ],
+        ids=["empty", "strings", "mixed_types", "nested_objects"],
+    )
+    def test_parse_array(self, raw, expected):
+        assert _parse_gemma4_array(raw) == expected
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (f'location:{_g4_s("Tokyo")}', {
+                "location": "Tokyo"
+            }),
+            (
+                f'location:{_g4_s("Tokyo")},unit:{_g4_s("celsius")}',
+                {
+                    "location": "Tokyo",
+                    "unit": "celsius"
+                },
+            ),
+            (
+                f'name:{_g4_s("test")},count:42,active:true',
+                {
+                    "name": "test",
+                    "count": 42,
+                    "active": True
+                },
+            ),
+            (
+                f'loc:{{city:{_g4_s("Tokyo")},country:{_g4_s("Japan")}}}',
+                {
+                    "loc": {
+                        "city": "Tokyo",
+                        "country": "Japan"
+                    }
+                },
+            ),
+            (f'tags:[{_g4_s("a")},{_g4_s("b")}]', {
+                "tags": ["a", "b"]
+            }),
+            ("", {}),
+            # Strings carrying : or { must not be parsed as separators / braces.
+            (f'url:{_g4_s("http://example.com:8080")}', {
+                "url": "http://example.com:8080"
+            }),
+            ('tpl:' + _g4_s('Hello {name}'), {
+                "tpl": "Hello {name}"
+            }),
+        ],
+        ids=[
+            "single_string",
+            "multiple_values",
+            "mixed_types",
+            "nested_object",
+            "with_array",
+            "empty",
+            "string_with_colon",
+            "string_with_braces",
+        ],
+    )
+    def test_parse_args(self, raw, expected):
+        assert _parse_gemma4_args(raw) == expected
+
+    def test_extract_tool_calls_single(self):
+        text = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
+        calls = _extract_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0][0] == "get_weather"
+
+    def test_extract_tool_calls_multiple(self):
+        text = (_g4_tc("get_weather", f'location:{_g4_s("Tokyo")}') +
+                _g4_tc("search_web", f'query:{_g4_s("AI")}'))
+        calls = _extract_tool_calls(text)
+        assert len(calls) == 2
+        assert calls[0][0] == "get_weather"
+        assert calls[1][0] == "search_web"
+
+    def test_extract_tool_calls_none(self):
+        assert _extract_tool_calls("regular text") == []
+
+    def test_extract_tool_calls_incomplete(self):
+        # Missing EOT_TOKEN — must yield no calls.
+        text = (f'{BOT_TOKEN}{CALL_PREFIX}'
+                f'func{{arg:{_g4_s("val")}}}')
+        assert _extract_tool_calls(text) == []
+
+
+class TestGemma4ToolParser(BaseToolParserTestClass):
+    """Test suite for Gemma4ToolParser class."""
+
+    def make_parser(self):
+        return Gemma4ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        single_text = _g4_tc("get_weather", f'location:{_g4_s("NYC")}')
+        single_expected_normal = ""
+        single_expected_name = "get_weather"
+        single_expected_params = {"location": "NYC"}
+
+        multiple_text = (_g4_tc("get_weather", f'location:{_g4_s("LA")}') +
+                         _g4_tc("search_web", f'query:{_g4_s("AI")}'))
+        multiple_names = ("get_weather", "search_web")
+
+        # Malformed: missing call: prefix, so no function name is found
+        malformed_text = (f'{BOT_TOKEN}'
+                          f'MALFORMED_NO_CALL_PREFIX{EOT_TOKEN}')
+
+        with_parameters_text = _g4_tc("search_web", f'query:{_g4_s("test")}')
+        with_parameters_name = "search_web"
+        with_parameters_params = {"query": "test"}
+
+        partial_bot_token = "<|tool"
+
+        undefined_tool_text = _g4_tc("undefined_func", f'arg:{_g4_s("val")}')
+
+        return ToolParserTestCases(
+            has_tool_call_true=(
+                f'Text {BOT_TOKEN}{CALL_PREFIX}'
+                f'get_weather{{loc:{_g4_s("NYC")}}}{EOT_TOKEN}'),
+            detect_and_parse_single_tool=(
+                single_text,
+                single_expected_normal,
+                single_expected_name,
+                single_expected_params,
+            ),
+            detect_and_parse_multiple_tools=(multiple_text, multiple_names),
+            detect_and_parse_malformed_tool=malformed_text,
+            detect_and_parse_with_parameters_key=(
+                with_parameters_text,
+                with_parameters_name,
+                with_parameters_params,
+            ),
+            parse_streaming_increment_partial_bot_token=partial_bot_token,
+            undefined_tool=undefined_tool_text,
+        )
+
+    def test_initialization(self, parser):
+        assert parser.bot_token == BOT_TOKEN
+        assert parser.eot_token == EOT_TOKEN
+        assert parser.needs_raw_special_tokens is True
+
+    def test_detect_and_parse_with_text_before(self, sample_tools, parser):
+        text = ("Let me check. " +
+                _g4_tc("get_weather", f'location:{_g4_s("NYC")}'))
+        result = parser.detect_and_parse(text, sample_tools)
+        assert result.normal_text == "Let me check."
+        assert len(result.calls) == 1
+
+    def test_detect_and_parse_multiple_params(self, sample_tools, parser):
+        text = _g4_tc("get_weather",
+                      f'location:{_g4_s("NYC")},unit:{_g4_s("celsius")}')
+        result = parser.detect_and_parse(text, sample_tools)
+        assert len(result.calls) == 1
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"location": "NYC", "unit": "celsius"}
+
+    def test_detect_and_parse_nested_object(self, sample_tools, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="create_event",
+                    description="Create event",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "data": {
+                                "type": "object"
+                            }
+                        },
+                    },
+                ),
+            ),
+        ]
+        text = _g4_tc("create_event",
+                      f'data:{{city:{_g4_s("Tokyo")},pop:1400}}')
+        result = parser.detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"data": {"city": "Tokyo", "pop": 1400}}
+
+    def test_detect_and_parse_array_param(self, sample_tools, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="add_tags",
+                    description="Add tags",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "tags": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                            },
+                        },
+                    },
+                ),
+            ),
+        ]
+        text = _g4_tc("add_tags", f'tags:[{_g4_s("py")},{_g4_s("ai")}]')
+        result = parser.detect_and_parse(text, tools)
+        params = json.loads(result.calls[0].parameters)
+        assert params == {"tags": ["py", "ai"]}
+
+    def test_detect_and_parse_empty_args(self, parser):
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_time",
+                    description="Get time",
+                    parameters={},
+                ),
+            ),
+        ]
+        text = _g4_tc("get_time", "")
+        result = parser.detect_and_parse(text, tools)
+        assert len(result.calls) == 1
+        assert json.loads(result.calls[0].parameters) == {}
+
+    def test_structure_info(self, parser):
+        info_fn = parser.structure_info()
+        info = info_fn("get_weather")
+        assert info.begin == f'{BOT_TOKEN}{CALL_PREFIX}get_weather{{'
+        assert info.end == f'}}{EOT_TOKEN}'
+        assert info.trigger == BOT_TOKEN
+
+    def test_parse_streaming_increment_complete_tool_call(
+            self, sample_tools, parser):
+        """Complete tool call in a single streaming chunk."""
+        text = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
+        result = parser.parse_streaming_increment(text, sample_tools)
+        assert len(result.calls) >= 1
+        assert result.calls[0].name == "get_weather"
+
+    def test_parse_streaming_increment_multi_chunk(self, sample_tools, parser):
+        """Tool call split across two chunks."""
+        chunk1 = (f'{BOT_TOKEN}{CALL_PREFIX}'
+                  f'get_weather{{location:')
+        result1 = parser.parse_streaming_increment(chunk1, sample_tools)
+        assert len(result1.calls) == 1
+        assert result1.calls[0].name == "get_weather"
+
+        chunk2 = f'{_g4_s("Tokyo")}}}{EOT_TOKEN}'
+        result2 = parser.parse_streaming_increment(chunk2, sample_tools)
+        assert len(result2.calls) >= 1
+
+    def test_parse_streaming_increment_multiple_tools(self, sample_tools,
+                                                      parser):
+        """Multiple tool calls in streaming mode."""
+        tc1 = _g4_tc("get_weather", f'location:{_g4_s("Tokyo")}')
+        result1 = parser.parse_streaming_increment(tc1, sample_tools)
+        assert len(result1.calls) >= 1
+
+        tc2 = _g4_tc("search_web", f'query:{_g4_s("weather")}')
+        result2 = parser.parse_streaming_increment(tc2, sample_tools)
+        assert len(result2.calls) >= 1
+
+    def test_parse_streaming_increment_text_then_tool(self, sample_tools,
+                                                      parser):
+        """Normal text followed by tool call."""
+        result1 = parser.parse_streaming_increment("Checking...", sample_tools)
+        assert result1.normal_text == "Checking..."
+
+        tc = _g4_tc("get_weather", f'location:{_g4_s("NYC")}')
+        result2 = parser.parse_streaming_increment(tc, sample_tools)
+        assert len(result2.calls) >= 1
+
+    def test_real_world_weather_query(self, sample_tools, parser):
+        """Simulate real model output: text + tool call."""
+        text = ("I'll check. " +
+                _g4_tc("get_weather", (f'location:{_g4_s("San Francisco, CA")},'
+                                       f'unit:{_g4_s("fahrenheit")}')))
+        result = parser.detect_and_parse(text, sample_tools)
+        assert result.normal_text == "I'll check."
+        params = json.loads(result.calls[0].parameters)
+        assert params == {
+            "location": "San Francisco, CA",
+            "unit": "fahrenheit",
+        }
+
+    def test_factory_creates_gemma4_parser(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        p = ToolParserFactory.create_tool_parser("gemma4")
+        assert isinstance(p, Gemma4ToolParser)
+
+    def test_model_type_mapping(self):
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            MODEL_TYPE_TO_TOOL_PARSER
+        assert MODEL_TYPE_TO_TOOL_PARSER.get("gemma4") == "gemma4"
+        assert MODEL_TYPE_TO_TOOL_PARSER.get("gemma4_text") == "gemma4"
+
+
+# ============================================================================
+# Tool Parser Factory Tests
+# ============================================================================
+
+
+class TestToolParserFactory:
+    """Test that the tool parser factory registers all expected parsers."""
+
+    def test_minimax_m2_registered(self):
+        """Test that minimax_m2 parser is registered in factory."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        assert "minimax_m2" in ToolParserFactory.parsers
+
+    def test_create_minimax_m2_parser(self):
+        """Test creating minimax_m2 parser via factory."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        parser = ToolParserFactory.create_tool_parser("minimax_m2")
+        assert isinstance(parser, MiniMaxM2ToolParser)
+
+
+# ============================================================================
+# FunctionDefinition strict field and ChatCompletionRequest store field Tests
+# ============================================================================
+
+
+class TestFunctionDefinitionStrictField:
+    """Test that FunctionDefinition accepts the strict field (TRTLLM-11616)."""
+
+    def test_strict_true_accepted(self):
+        """FunctionDefinition should accept strict=True without validation error."""
+        func_def = FunctionDefinition(
+            name="get_weather",
+            description="Get weather",
+            parameters={
+                "type": "object",
+                "properties": {}
+            },
+            strict=True,
+        )
+        assert func_def.strict is True
+
+    def test_strict_false_accepted(self):
+        """FunctionDefinition should accept strict=False without validation error."""
+        func_def = FunctionDefinition(
+            name="get_weather",
+            description="Get weather",
+            parameters={
+                "type": "object",
+                "properties": {}
+            },
+            strict=False,
+        )
+        assert func_def.strict is False
+
+    def test_strict_none_by_default(self):
+        """FunctionDefinition should default strict to None."""
+        func_def = FunctionDefinition(
+            name="get_weather",
+            description="Get weather",
+        )
+        assert func_def.strict is None
+
+    def test_tool_param_with_strict(self):
+        """ChatCompletionToolsParam should accept function with strict field."""
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="search_web",
+                description="Search",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string"
+                        }
+                    },
+                },
+                strict=True,
+            ),
+        )
+        assert tool.function.strict is True
+        assert tool.function.name == "search_web"
+
+
+# ============================================================================
+# Strict tool structural tag constraint building Tests
+# ============================================================================
+
+
+class TestBuildToolStrictGuidedDecoding:
+    """Test _build_tool_strict_guided_decoding_params from openai_server."""
+
+    def test_no_strict_tools_returns_none(self):
+        """Should return None when no tool has strict=True."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {}
+                    },
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        assert result is None
+
+    def test_strict_false_returns_none(self):
+        """Should return None when all tools have strict=False."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {}
+                    },
+                    strict=False,
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        assert result is None
+
+    def test_no_tools_returns_none(self):
+        """Should return None when tools list is empty or None."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        assert _build_tool_strict_guided_decoding_params(None, "qwen3") is None
+        assert _build_tool_strict_guided_decoding_params([], "qwen3") is None
+
+    def test_no_parser_returns_none(self):
+        """Should return None when no tool parser is provided."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {}
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        assert _build_tool_strict_guided_decoding_params(tools, None) is None
+        assert _build_tool_strict_guided_decoding_params(tools, "") is None
+
+    def test_strict_tool_with_qwen3_parser(self):
+        """Should build GuidedDecodingParams with structural_tag for Qwen3."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string"
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        assert result is not None
+        assert result.structural_tag is not None
+
+        stag = json.loads(result.structural_tag)
+        assert stag["type"] == "structural_tag"
+        fmt = stag["format"]
+        assert fmt["type"] == "triggered_tags"
+        assert "<tool_call>" in fmt["triggers"]
+        assert len(fmt["tags"]) == 1
+
+        tag = fmt["tags"][0]
+        assert "get_weather" in tag["begin"]
+        assert tag["content"]["type"] == "json_schema"
+        assert tag["content"]["json_schema"]["properties"]["location"][
+            "type"] == "string"
+
+    def test_mixed_strict_and_non_strict(self):
+        """Should constrain strict tools and allow any text for non-strict."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                    strict=True,
+                ),
+            ),
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="search_web",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                    strict=False,
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        assert result is not None
+
+        stag = json.loads(result.structural_tag)
+        fmt = stag["format"]
+        assert len(fmt["tags"]) == 2
+
+        # First tag (strict) should have json_schema content
+        assert fmt["tags"][0]["content"]["type"] == "json_schema"
+        # Second tag (non-strict) should have any_text content
+        assert fmt["tags"][1]["content"]["type"] == "any_text"
+
+    def test_unsupported_parser_returns_none(self):
+        """Should return None for parsers that don't support structural tags."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get_weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {}
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        # glm4 does not support structural tags
+        result = _build_tool_strict_guided_decoding_params(tools, "glm4")
+        assert result is None
+
+    def test_strict_tool_with_deepseek_parser(self):
+        """Should build GuidedDecodingParams with structural_tag for DeepSeek."""
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="calculate",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "expr": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        result = _build_tool_strict_guided_decoding_params(tools, "deepseek_v3")
+        assert result is not None
+        assert result.structural_tag is not None
+
+        stag = json.loads(result.structural_tag)
+        fmt = stag["format"]
+        assert fmt["type"] == "triggered_tags"
+        assert len(fmt["tags"]) == 1
+        assert "calculate" in fmt["tags"][0]["begin"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestKimiK3ToolParser(BaseToolParserTestClass):
+    """Test suite for KimiK3ToolParser (XTML tool-call format).
+
+    Fixture strings follow the checkpoint's `encoding_k3.py` rendering:
+    `<|open|>tag key="value"<|sep|>` / `<|close|>tag<|sep|>`, attributes
+    space-prefixed and `&`/`"`-escaped, call indices 1-based, string
+    argument bodies raw and non-string bodies JSON.
+    """
+
+    BOT = "<|open|>tools<|sep|>"
+    EOT = "<|close|>tools<|sep|>"
+
+    @staticmethod
+    def _call(name: str, index: int, body: str) -> str:
+        return (f'<|open|>call tool="{name}" index="{index}"<|sep|>'
+                f'{body}<|close|>call<|sep|>')
+
+    @staticmethod
+    def _argument(key: str, type_: str, value: str) -> str:
+        return (f'<|open|>argument key="{key}" type="{type_}"<|sep|>'
+                f'{value}<|close|>argument<|sep|>')
+
+    def _section(self, *calls: str) -> str:
+        return self.BOT + "".join(calls) + self.EOT
+
+    def make_parser(self):
+        return KimiK3ToolParser()
+
+    def make_tool_parser_test_cases(self):
+        single_call = self._section(
+            self._call("get_weather", 1,
+                       self._argument("location", "string", "NYC")))
+        return ToolParserTestCases(
+            has_tool_call_true="Some text " + single_call,
+            detect_and_parse_single_tool=(
+                "Normal text" + single_call,
+                "Normal text",
+                "get_weather",
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                self._section(
+                    self._call("get_weather", 1,
+                               self._argument("location", "string", "LA")),
+                    self._call("search_web", 2,
+                               self._argument("query", "string", "AI")),
+                ),
+                ("get_weather", "search_web"),
+            ),
+            # A call without the mandatory tool="..." attribute is skipped.
+            detect_and_parse_malformed_tool=self._section(
+                '<|open|>call index="1"<|sep|>'
+                '<|open|>argument key="location" type="string"<|sep|>NYC'
+                '<|close|>argument<|sep|><|close|>call<|sep|>'),
+            # K3 has no JSON "parameters" key wrapper; the closest analogue
+            # is the raw-JSON call body variant.
+            detect_and_parse_with_parameters_key=(
+                self._section(
+                    self._call(
+                        "search_web", 1,
+                        '<|open|>json type="object"<|sep|>{"query": "test"}'
+                        '<|close|>json<|sep|>')),
+                "search_web",
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<|open|>too",
+            undefined_tool=self._section(
+                self._call("undefined_func", 1,
+                           self._argument("arg", "string", "any value"))),
+        )
+
+    def test_initialization(self, parser):
+        assert parser.bot_token == self.BOT
+        assert parser.eot_token == self.EOT
+
+    def test_undefined_tool(self, sample_tools, parser, tool_parser_test_cases):
+        """Keep undefined-tool calls at their positional index.
+
+        K3 warns about undefined tools rather than remapping ``tool_index`` to
+        ``-1``.
+        """
+        text = tool_parser_test_cases.undefined_tool
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "undefined_func"
+        assert result.calls[0].tool_index == 0
+
+    def test_supports_structural_tag(self):
+        """Reject JSON-schema structural tagging for XTML bodies.
+
+        XTML bodies already use tag-structured text, so JSON-schema
+        structural-tag constrained decoding does not apply.
+        """
+        parser = KimiK3ToolParser()
+        assert parser.supports_structural_tag() is False
+        with pytest.raises(NotImplementedError):
+            parser.structure_info()
+
+    def test_argument_type_coercion(self, sample_tools, parser):
+        """Non-string argument bodies are JSON; string bodies stay raw."""
+        text = self._section(
+            self._call(
+                "get_weather", 1,
+                self._argument("location", "string", '"quoted" & raw') +
+                self._argument("count", "number", "3") +
+                self._argument("celsius", "boolean", "true") +
+                self._argument("extra", "null", "null") +
+                self._argument("nested", "object", '{"a": [1, 2]}') +
+                self._argument("tags", "array", '["x", "y"]')))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert json.loads(result.calls[0].parameters) == {
+            "location": '"quoted" & raw',
+            "count": 3,
+            "celsius": True,
+            "extra": None,
+            "nested": {
+                "a": [1, 2]
+            },
+            "tags": ["x", "y"],
+        }
+
+    def test_argument_invalid_json_falls_back_to_raw(self, sample_tools,
+                                                     parser):
+        """Keep a non-string argument's invalid JSON body as raw text.
+
+        Invalid JSON should fall back to its original text instead of raising.
+        """
+        text = self._section(
+            self._call("get_weather", 1,
+                       self._argument("count", "number", "not-a-number")))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert json.loads(result.calls[0].parameters) == {
+            "count": "not-a-number"
+        }
+
+    def test_attribute_unescaping(self, sample_tools, parser):
+        """Unescape encoded XTML attribute values.
+
+        K3 attributes arrive escaped by ``encoding_k3._escape_attr_value``.
+        """
+        text = self._section(
+            self._call(
+                "get_weather", 1,
+                self._argument("say &quot;hi&quot; &amp; bye", "string", "v")))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert json.loads(result.calls[0].parameters) == {'say "hi" & bye': "v"}
+
+    def test_empty_arguments(self, sample_tools, parser):
+        """A call with no argument tags yields an empty JSON object."""
+        text = self._section(self._call("search_web", 1, ""))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].parameters == "{}"
+
+    def test_trailing_structural_markup_stripped(self, sample_tools, parser):
+        """Strip trailing XTML terminators from standalone normal text.
+
+        This covers parsing without a tools section or reasoning parser.
+        """
+        text = "The answer is 4.<|close|>message<|sep|><|end_of_msg|>"
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == "The answer is 4."
+        assert len(result.calls) == 0
+
+    def test_streaming_buffers_section_until_complete(self, sample_tools,
+                                                      parser):
+        """Buffer an incomplete tools section while streaming response text.
+
+        Response text is emitted immediately, but calls wait for the closing
+        ``<|close|>tools<|sep|>`` marker.
+        """
+        result = parser.parse_streaming_increment("Checking. ", sample_tools)
+        assert result.normal_text == "Checking. "
+        assert result.calls == []
+
+        # Section opener + call header: everything buffered.
+        result = parser.parse_streaming_increment(
+            self.BOT + '<|open|>call tool="get_weather" index="1"<|sep|>',
+            sample_tools)
+        assert result.normal_text == ""
+        assert result.calls == []
+
+        # Arguments still buffered.
+        result = parser.parse_streaming_increment(
+            self._argument("location", "string", "NYC"), sample_tools)
+        assert result.normal_text == ""
+        assert result.calls == []
+
+        # Section close: the complete call is emitted.
+        result = parser.parse_streaming_increment(
+            "<|close|>call<|sep|>" + self.EOT, sample_tools)
+        assert result.normal_text == ""
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "NYC"}
+
+    def test_composes_with_kimi_k3_reasoning_parser(self, sample_tools, parser):
+        """Parse tools passed through the Kimi-K3 reasoning parser.
+
+        The reasoning parser preserves the tools section verbatim for this
+        parser.
+        """
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        completion = (
+            "Need the weather.<|close|>think<|sep|>"
+            "<|open|>response<|sep|>Checking."
+            "<|close|>response<|sep|>" + self._section(
+                self._call("get_weather", 1,
+                           self._argument("location", "string", "NYC"))) +
+            "<|close|>message<|sep|><|end_of_msg|>")
+
+        reasoning = ReasoningParserFactory.create_reasoning_parser("kimi_k3")
+        stage1 = reasoning.parse(completion)
+        assert stage1.reasoning_content == "Need the weather."
+
+        stage2 = parser.detect_and_parse(stage1.content, sample_tools)
+        assert stage2.normal_text == "Checking."
+        assert len(stage2.calls) == 1
+        assert stage2.calls[0].name == "get_weather"
+        assert json.loads(stage2.calls[0].parameters) == {"location": "NYC"}
+
+
+class TestConfigureParserSpecialTokenDecoding:
+    """Test parser-specific detokenization settings in the OpenAI server."""
+
+    @staticmethod
+    def _configure(reasoning_parser_name: str | None = None,
+                   tool_parser_name: str | None = None,
+                   has_tools: bool = False) -> SamplingParams:
+        from tensorrt_llm.serve.openai_server import \
+            _configure_parser_special_token_decoding
+
+        sampling_params = SamplingParams()
+        _configure_parser_special_token_decoding(
+            sampling_params,
+            reasoning_parser_name=reasoning_parser_name,
+            tool_parser_name=tool_parser_name,
+            has_tools=has_tools)
+        return sampling_params
+
+    def test_kimi_k3_reasoning_parser_preserves_compact_xtml(self) -> None:
+        sampling_params = self._configure(reasoning_parser_name="kimi_k3")
+
+        assert sampling_params.skip_special_tokens is False
+        assert sampling_params.spaces_between_special_tokens is False
+
+    def test_kimi_k3_tool_parser_preserves_compact_xtml(self) -> None:
+        sampling_params = self._configure(tool_parser_name="KIMI_K3",
+                                          has_tools=True)
+
+        assert sampling_params.skip_special_tokens is False
+        assert sampling_params.spaces_between_special_tokens is False
+
+    def test_tool_parser_does_not_apply_without_tools(self) -> None:
+        sampling_params = self._configure(tool_parser_name="kimi_k3")
+
+        assert sampling_params.skip_special_tokens is True
+        assert sampling_params.spaces_between_special_tokens is True
+
+    def test_other_raw_token_parser_keeps_spacing_contract(self) -> None:
+        sampling_params = self._configure(tool_parser_name="deepseek_v32",
+                                          has_tools=True)
+
+        assert sampling_params.skip_special_tokens is False
+        assert sampling_params.spaces_between_special_tokens is True

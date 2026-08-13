@@ -1,5 +1,14 @@
 # TensorRT-LLM Build Workflow
 
+```{caution}
+The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
+```
+
+> [!WARNING]
+> This page describes the **legacy** TensorRT engine-build workflow.
+> For new projects, use [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 ## Overview
 
 
@@ -159,7 +168,7 @@ if rank == 0:
     LLaMAForCausalLM.quantize(hf_model_dir,
                           checkpoint_dir,
                           quant_config=quant_config)
-mpi_barrier() # wait for rank-o finishes the quantization
+mpi_barrier() # wait for rank-0 to finish the quantization
 llama = LLaMAForCausalLM.from_checkpoint(checkpoint_dir, rank)
 engine = build(llama, build_config)
 engine.save(engine_dir)

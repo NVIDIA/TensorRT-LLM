@@ -40,16 +40,21 @@ from openai_harmony import (Author, Conversation, DeveloperContent,
                             ToolDescription, load_harmony_encoding)
 from transformers import AutoProcessor, PretrainedConfig
 
-from tensorrt_llm.bindings import steady_clock_now
+from tensorrt_llm._utils import \
+    get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
 from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.inputs.utils import apply_chat_template
+from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
-                                                  ReasoningParserFactory)
+                                                  ReasoningParserFactory,
+                                                  ReasoningParserResult)
+from tensorrt_llm.llmapi.thinking_budget import \
+    add_thinking_budget_logits_processor
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+from tensorrt_llm.serve.chat_utils import (parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
@@ -107,10 +112,6 @@ def _decode_tokens(
     if tokenizer is not None:
         return tokenizer.decode(tokens)
     return _get_encoding().decode(tokens)
-
-
-def get_steady_clock_now_in_seconds() -> float:
-    return steady_clock_now().total_seconds()
 
 
 def _parse_response_input(
@@ -214,9 +215,10 @@ class ConversationHistoryStore:
                                  Union[list[Message],
                                        list[ChatCompletionMessageParam]]] = [],
                              prev_resp_id: Optional[str] = None) -> None:
-        """
-        Store the response and its messages(model output messages) in the conversation store. If the previous response id is provided,
-        the messages will be appended to the conversation. Otherwise, a new conversation will be created.
+        """Store a response and its model-output messages.
+
+        If the previous response ID is provided, the messages are appended to
+        that conversation. Otherwise, a new conversation is created.
 
         Args:
             resp: ResponsesResponse
@@ -252,9 +254,6 @@ class ConversationHistoryStore:
 
                 conversation_id = self.response_to_conversation[prev_resp_id]
                 self.conversations[conversation_id].extend(resp_msgs)
-                while len(self.conversations[conversation_id]
-                          ) > self.conversation_capacity:
-                    self._pop_conversation(resp_id)
             else:
                 conversation_id = _random_uuid()
                 self.conversations[conversation_id] = resp_msgs
@@ -264,6 +263,7 @@ class ConversationHistoryStore:
 
             self.response_to_conversation[resp_id] = conversation_id
             self.conversation_to_response[conversation_id] = resp_id
+            self._trim_conversation(conversation_id)
             self._update_visited_conversation(conversation_id)
 
     async def pop_response(self, resp_id: Optional[str] = None) -> bool:
@@ -302,12 +302,10 @@ class ConversationHistoryStore:
             _responses_debug_log(
                 f" * storing at conversation: {conversation_id}")
             self.conversations[conversation_id] = msgs
-            if len(self.conversations[conversation_id]
-                   ) > self.conversation_capacity:
-                self._pop_conversation(resp_id)
 
             self.response_to_conversation[resp_id] = conversation_id
             self.conversation_to_response[conversation_id] = resp_id
+            self._trim_conversation(conversation_id)
             self._update_visited_conversation(conversation_id)
 
     async def get_conversation_history(
@@ -326,8 +324,8 @@ class ConversationHistoryStore:
             return []
 
     def _update_visited_conversation(self, conversation_id) -> None:
-        """
-        Update the visited conversation to the front of the conversation store.
+        """Move the visited conversation to the front of the store.
+
         This function is used to keep the conversation store sorted by the visited time.
         And also remove the least recently visited conversation if the number of conversations exceeds the limit.
 
@@ -352,8 +350,8 @@ class ConversationHistoryStore:
             self.conversation_to_response.pop(removed_id)
 
     def _pop_conversation(self, resp_id) -> None:
-        """
-        Pop the oldest conversation messages from a conversation.
+        """Pop the oldest messages from a conversation.
+
         The conversation is starting by a user message and ending by an assistant message.
         This function is used to keep the number of messages in a conversation within the limit.
 
@@ -367,8 +365,20 @@ class ConversationHistoryStore:
         if conversation_id is None:
             return
 
-        conversation = self.conversations[conversation_id]
-        if len(conversation) == 0:
+        self._pop_conversation_by_conversation_id(conversation_id)
+
+    def _trim_conversation(self, conversation_id: str) -> None:
+        conversation = self.conversations.get(conversation_id)
+        if conversation is None:
+            return
+
+        while len(conversation) > self.conversation_capacity:
+            self._pop_conversation_by_conversation_id(conversation_id)
+
+    def _pop_conversation_by_conversation_id(self,
+                                             conversation_id: str) -> None:
+        conversation = self.conversations.get(conversation_id)
+        if conversation is None or len(conversation) == 0:
             return
 
         is_harmony_conversation = isinstance(conversation[0], Message)
@@ -659,16 +669,17 @@ def _response_output_item_to_chat_completion_message(
                 return item
             else:
                 raise ValueError(f"Invalid input message item: {item}")
-        case "message":
-            return {
-                "role": "assistant",
-                "content": item["content"][0]["text"],
-            }
-        case "reasoning":
-            return {
-                "role": "assistant",
-                "reasoning": item["content"][0]["text"],
-            }
+        case "message" | "reasoning":
+            content = item.get("content") or []
+            if not content:
+                raise ValueError(
+                    f"Input item of type {item_type!r} has empty or missing 'content'"
+                )
+            first = content[0]
+            text = first.get("text", "") if isinstance(
+                first, dict) else getattr(first, "text", "")
+            key = "content" if item_type == "message" else "reasoning"
+            return {"role": "assistant", key: text}
         case "function_call":
             return {
                 "role": "function",
@@ -815,16 +826,14 @@ async def _create_input_tokens(
         await conversation_store.store_messages(request.request_id, messages,
                                                 request.previous_response_id)
 
-    conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+    conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
         messages, model_config)
-    mm_data = await mm_coroutines
-
     tools_dict = [
         tool.model_dump()
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
-    token_ids = apply_chat_template(
-        model_type=model_config.model_type,
+    token_task = async_apply_chat_template(
+        model_type=resolve_top_level_model_type(model_config),
         tokenizer=tokenizer,
         processor=processor,
         conversation=conversation,
@@ -833,6 +842,9 @@ async def _create_input_tokens(
         mm_placeholder_counts=mm_placeholder_counts,
         enable_tokenize=True,
     )
+    token_ids, (mm_data,
+                _mm_embeddings) = await asyncio.gather(token_task,
+                                                       mm_coroutines)
 
     return token_ids, mm_data
 
@@ -917,6 +929,11 @@ async def request_preprocess(
     _responses_debug_log("======= Complete Inputs to model =======")
     _responses_debug_log(_decode_tokens(input_tokens, tokenizer))
     _responses_debug_log("========================================")
+    add_thinking_budget_logits_processor(
+        sampling_params,
+        reasoning_parser=reasoning_parser,
+        tokenizer=tokenizer,
+    )
     return input_tokens, sampling_params
 
 
@@ -927,6 +944,7 @@ def _apply_reasoning_parser(
     text: str,
     streaming: bool,
     reasoning_parser_dict: Optional[dict[int, BaseReasoningParser]] = None,
+    finished: bool = False,
 ) -> Tuple[str, str]:
     reasoning_parser: Optional[BaseReasoningParser] = None
     if reasoning_parser_id is not None:
@@ -946,6 +964,13 @@ def _apply_reasoning_parser(
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
+            if finished:
+                finish_result = reasoning_parser.finish()
+                result = ReasoningParserResult(
+                    content=result.content + finish_result.content,
+                    reasoning_content=result.reasoning_content +
+                    finish_result.reasoning_content,
+                )
         content, reasoning_content = result.content, result.reasoning_content
     else:
         content, reasoning_content = text, ""
@@ -1356,9 +1381,10 @@ class ResponsesStreamingEventsHelper:
     def _get_output_added_events(
         self, output_item: ResponseOutputMessage | ResponseReasoningItem
     ) -> list[StreamingResponsesResponse]:
-        """
-        Get item added event and content part added event for a message item which is starting
-        to be generated.
+        """Get the added events for a message item.
+
+        Returns the item-added and content-part-added events when generation
+        starts.
 
         Returns:
             list[StreamingResponsesResponse]: A list of streaming responses responses
@@ -1490,6 +1516,14 @@ def _should_send_done_events(
             should_send_reasoning_done = True
             reasoning_content = full_reasoning
 
+    # No closing tag: reasoning was streamed but re-parse shows everything as
+    # content (no </think> found). Close the reasoning section so the text
+    # section can be properly opened and closed.
+    if not full_reasoning and full_text and finished_generation:
+        if streaming_events_helper and streaming_events_helper.is_reasoning_sent:
+            should_send_reasoning_done = True
+            reasoning_content = full_text
+
     return should_send_reasoning_done, should_send_text_done, reasoning_content, text_content
 
 
@@ -1525,6 +1559,7 @@ def _generate_streaming_event(
         text=delta_text,
         streaming=True,
         reasoning_parser_dict=reasoning_parser_dict,
+        finished=finished_generation,
     )
 
     if delta_text:
@@ -1594,6 +1629,37 @@ def _generate_streaming_event(
         streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
         streaming_events_helper.is_text_sent = False
+
+    # Handle no-closing-tag case: reasoning was streamed but finish() moved
+    # all accumulated reasoning to content. Emit the full text section
+    # lifecycle (added → delta → done) since the reasoning section was just
+    # closed and generation is finished.
+    if (finished_generation and delta_text and should_send_reasoning_done
+            and not should_send_text_done):
+        streaming_events_helper.is_text_sent = True
+        yield from streaming_events_helper.get_message_output_added_events()
+        yield streaming_events_helper.get_text_delta_event(delta_text, [])
+        text_content_obj = ResponseOutputText(
+            text=delta_text,
+            annotations=[],
+            type="output_text",
+            logprobs=None,
+        )
+        text_item = ResponseOutputMessage(
+            id=streaming_events_helper.item_id,
+            content=[text_content_obj],
+            role="assistant",
+            status="completed",
+            type="message",
+        )
+        yield streaming_events_helper.get_text_done_event(delta_text, [])
+        yield streaming_events_helper.get_content_part_done_event(
+            text_content_obj)
+        yield streaming_events_helper.get_output_item_done_event(text_item)
+        streaming_events_helper.output_index_increment()
+        streaming_events_helper.is_output_item_added_sent = False
+        streaming_events_helper.is_text_sent = False
+        delta_text = ""
 
     # Send delta events for ongoing content
     if delta_text:
@@ -1936,6 +2002,36 @@ class ServerArrivalTimeMiddleware:
         await self.app(scope, receive, send)
 
 
+class PeriodicLatencyLogger:
+    """Periodically log latency percentiles for a named coordinator API.
+
+    This lock-free, self-resetting logger runs on one asyncio loop and profiles
+    the in-process owner and HTTP client without per-call log spam.
+    """
+
+    def __init__(self, name: str, window: int = 500):
+        self._name = name
+        self._window = window
+        self._samples: List[float] = []
+        self._n = 0
+
+    def record(self, dt_s: float) -> None:
+        self._samples.append(dt_s * 1000.0)  # ms
+        self._n += 1
+        if self._n % self._window == 0:
+            s = sorted(self._samples)
+            m = len(s)
+
+            def percentile(q):
+                return s[min(int(q * m), m - 1)]
+
+            logger.info(f"[coord_api] {self._name} n={self._n} ms: "
+                        f"mean={sum(s)/m:.2f} p50={percentile(0.5):.2f} "
+                        f"p90={percentile(0.9):.2f} "
+                        f"p99={percentile(0.99):.2f} max={s[-1]:.2f}")
+            self._samples = []
+
+
 class ResponseHooks(ABC):
     """
     Hooks for response processing and (disagg) service perf observability.
@@ -1944,6 +2040,19 @@ class ResponseHooks(ABC):
     @abstractmethod
     def on_req_begin(self, request: UCompletionRequest):
         pass
+
+    def on_disagg_request_id(self, disagg_request_id: int):
+        """Receive the request ID immediately after the service allocates it."""
+
+    def on_ctx_dispatch(self, request: UCompletionRequest):
+        """Record when the disaggregated service starts context placement.
+
+        Arrival to this point measures the pre-context wait in the orchestrator
+        or fleet. The default is a no-op for non-instrumented implementations.
+        """
+
+    def on_perf_metrics(self, server: str, role: str, metrics: dict):
+        """Receive request-local metrics carried by an upstream response."""
 
     @abstractmethod
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):

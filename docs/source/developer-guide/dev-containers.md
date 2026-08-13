@@ -5,7 +5,7 @@ configuration in `.devcontainer`. These files are intended for
 use with [Visual Studio Code](https://code.visualstudio.com/).
 
 Due to the various container options supported by TensorRT LLM (see
-[](/installation/build-from-source-linux.md) and
+[Build from Source](/installation/build-from-source.md) and
 <https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker>), the Dev
 Container configuration also offers some degree of customization.
 
@@ -93,7 +93,7 @@ This mechanism can be used, e.g., to add custom volume mounts:
 ```
 
 It is possible to conditionally mount volumes by combining, e.g.,
-[this method] (https://stackoverflow.com/a/61954812) and shell command
+[this method](https://stackoverflow.com/a/61954812) and shell command
 substitution in `.devcontainer/devcontainer.env.user`.
 
 If no `.devcontainer/docker-compose.override.yml` file is found, the Dev Container

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,11 +33,29 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref || github.ref }}
 
+      - name: Test stale pull request cleanup workflow
+        run: node .github/scripts/cleanup_stale_prs.test.js
+
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: 'pip'
 
+      - name: Get changed files
+        id: changed-files
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate --jq '.[].filename' | paste -sd ' ' -)
+          echo "files=$files" >> $GITHUB_OUTPUT
+
       - name: Run pre-commit checks
         run: |
-          python3 -u scripts/release_check.py
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "${{ steps.changed-files.outputs.files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
+            python3 -u scripts/release_check.py --files-from changed_files.txt
+          else
+            python3 -u scripts/release_check.py
+          fi

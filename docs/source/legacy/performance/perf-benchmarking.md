@@ -8,7 +8,7 @@ Expect breaking API changes.
 ```
 
 TensorRT-LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility that aims to make it
-easier for users to reproduce our officially published [performance overiew](./perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
+easier for users to reproduce our officially published [performance overview](../../developer-guide/perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
 
 - A streamlined way to build tuned engines for benchmarking for a variety of models and platforms.
 - An entirely Python workflow for benchmarking.
@@ -63,7 +63,7 @@ sudo nvidia-smi boost-slider --vboost <max_boost_slider>
 
 While `trtllm-bench` should be able to run any network that TensorRT-LLM supports, the following are the list
 that have been validated extensively and is the same listing as seen on the
-[Performance Overview](./perf-overview.md) page.
+[Performance Overview](../../developer-guide/perf-overview.md) page.
 
 - [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf)
 - [meta-llama/Llama-2-70b-hf](https://huggingface.co/meta-llama/Llama-2-70b-hf)
@@ -110,7 +110,7 @@ of 128:128.
 To run the benchmark from start to finish, run the following commands:
 
 ```shell
-trtllm-bench --tokenizer meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synthetic_128_128.txt token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000
+trtllm-bench --model meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synthetic_128_128.txt token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000
 trtllm-bench --model meta-llama/Llama-3.1-8B build --dataset /tmp/synthetic_128_128.txt --quantization FP8
 trtllm-bench --model meta-llama/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt --engine_dir /tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 ```
@@ -171,11 +171,11 @@ The throughput benchmark utilizes a fixed JSON schema to specify requests. The s
 | :-------------- | :------: | :-----------: | :---------------------------------------------- |
 | `task_id`       |    Y     |    String     | Unique identifier for the request.              |
 | `prompt`        |    N*    |    String     | Input text for a generation request.            |
-| `input_ids`     |    Y*    | List[Integer] | List of logits that make up the request prompt. |
+| `input_ids`     |    Y*    | List[Integer] | List of token IDs that make up the request prompt. |
 | `output_tokens` |    Y     |    Integer    | Number of generated tokens for this request.    |
 
 ```{tip}
-\* Specifying `prompt` or `input_ids` is required. However, you can not have both prompts and logits (`input_ids`)
+\* Specifying `prompt` or `input_ids` is required. However, you cannot have both prompts and token IDs (`input_ids`)
 defined at the same time. If you specify `input_ids`, the `prompt` entry is ignored for request generation.
 ```
 
@@ -202,12 +202,12 @@ can simply read a line and assume a complete entry. When creating a dataset, be 
 JSON entry is on every line.
 ```
 
-In order to prepare a synthetic dataset, you can use the provided script in the `benchmarks/cpp`
+In order to prepare a synthetic dataset, you can use the provided script in the `benchmarks`
 directory. For example, to generate a synthetic dataset of 1000 requests with a uniform ISL/OSL of
 128/128 for [meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B), run:
 
 ```shell
-trtllm-bench --tokenizer meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synthetic_128_128.txt token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000
+trtllm-bench --model meta-llama/Llama-3.1-8B prepare-dataset --output /tmp/synthetic_128_128.txt token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 3000
 ```
 
 ### Building a Benchmark Engine
@@ -335,10 +335,10 @@ upper bound throughput number.
 
 The benchmarker reads a data file where a single line contains
 a complete JSON request entry as specified in [](#preparing-a-dataset).
-The process that the benchmarker is as follows:
+The process that the benchmarker follows is:
 
 1. Iterate over all input requests. If `logits` is specified, construct the request using the specified
-list of logits. Otherwise, tokenize the `prompt` with as specified by `--model $HF_MODEL_NAME`.
+list of logits. Otherwise, tokenize the `prompt` as specified by `--model $HF_MODEL_NAME`.
 1. Submit the dataset to the TensorRT-LLM `Executor` API as fast as possible (offline mode).
 1. Wait for all requests to return, compute statistics, and then report results.
 
@@ -481,7 +481,7 @@ The PyTorch workflow supports benchmarking with LoRA (Low-Rank Adaptation) adapt
 Use `prepare_dataset.py` with LoRA-specific options to generate requests with LoRA metadata:
 
 ```shell
-python3 benchmarks/cpp/prepare_dataset.py \
+python3 benchmarks/prepare_dataset.py \
   --stdout \
   --rand-task-id 0 1 \
   --tokenizer /path/to/tokenizer \
@@ -555,7 +555,7 @@ To benchmark multi-modal models with PyTorch workflow, you can follow the simila
 
 First, prepare the dataset:
 ```
-python ./benchmarks/cpp/prepare_dataset.py \
+python ./benchmarks/prepare_dataset.py \
   --tokenizer Qwen/Qwen2-VL-2B-Instruct \
   --stdout \
   dataset \
@@ -698,7 +698,7 @@ follow when a checkpoint does not specify a KV cache quantization algorithm:
 | `FP8` | `null` | `FP8` | Set to `FP8` via benchmark |
 | `NVFP4` | `null` | `FP8` | Set to `FP8` via benchmark |
 
-If you would like to force the KV cache quantizaton, you can specify the following in the YAML file to force the precision
+If you would like to force the KV cache quantization, you can specify the following in the YAML file to force the precision
 when the checkpoint precision is `null`:
 
 ```yaml
@@ -706,7 +706,7 @@ kv_cache_dtype: "fp8"
 ```
 
 ```{tip}
-The two valid values for `kv_cache_dtype` are `auto` and `fp8`.
+The valid values for `kv_cache_dtype` are `auto`, `fp8`, and `nvfp4`.
 ```
 
 ## Low Latency Benchmark
@@ -846,7 +846,7 @@ The following table summarizes the commands needed for running benchmarks:
 
 | Scenario | Phase | Command |
 | - | - | - |
-| Dataset | Preparation | `python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer $HF_MODEL token-norm-dist --input-mean $ISL --output-mean $OSL --input-stdev 0 --output-stdev 0 --num-requests $NUM_REQUESTS > $DATASET_PATH` |
+| Dataset | Preparation | `python benchmarks/prepare_dataset.py --stdout --tokenizer $HF_MODEL token-norm-dist --input-mean $ISL --output-mean $OSL --input-stdev 0 --output-stdev 0 --num-requests $NUM_REQUESTS > $DATASET_PATH` |
 | Throughput | Build | `trtllm-bench --model $HF_MODEL build --dataset $DATASET_PATH` |
 | Throughput | Benchmark | `trtllm-bench --model $HF_MODEL throughput --dataset $DATASET_PATH --engine_dir $ENGINE_DIR` |
 | Latency | Build | See [section about building low latency engines](#low-latency-tensorrt-llm-engine-for-llama-3-70b) |

@@ -16,7 +16,7 @@
 
 #pragma once
 #include "tensorrt_llm/common/assert.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -64,7 +64,10 @@ enum class AllReduceFusionPattern : int
     // The difference between these two and the standard version is that the NormOut version outputs the result of the
     // norm.
     kARResidualRMSNormOutFP8Quant = 4,
-    kARResidualRMSNormOutFP4Quant = 5
+    kARResidualRMSNormOutFP4Quant = 5,
+    // AllReduce + RMSNorm without residual addition. Useful when there is no
+    // external residual to add (e.g. models where residual is handled externally).
+    kARRMSNorm = 6,
 };
 
 enum class QuantType : int
@@ -101,6 +104,7 @@ DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, false, true, true, true, true, QuantType::kFP8);
 DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, true, true, true, true, QuantType::kFP4);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARRMSNorm, false, false, false, true, true, QuantType::kNone);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -120,7 +124,7 @@ struct AllReduceFusionParams
 {
     int nranks;
     int rank;
-    nvinfer1::DataType dtype;
+    tensorrt_llm::DataType dtype;
     int size;
     int hidden_dim;
     void** workspace;

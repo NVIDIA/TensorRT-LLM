@@ -8,6 +8,9 @@ from parameterized import parameterized
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
+pytestmark = pytest.mark.cpu_only
+
+
 TEST_CASES = [
     {
         "name": "valid_message",
@@ -121,6 +124,25 @@ def test_req_rep(create_messenger_pair):
 
     req.stop()
     rep.stop()
+
+
+def test_zmq_messenger_context_manager(dynamic_endpoint):
+    with ZMQMessenger("ROUTER", endpoint=dynamic_endpoint) as messenger:
+        assert messenger.endpoint == dynamic_endpoint
+    assert messenger._closed is True
+
+
+def test_zmq_messenger_invalid_mode():
+    with pytest.raises(ValueError, match="Invalid mode"):
+        ZMQMessenger("INVALID_MODE")
+
+
+def test_zmq_messenger_double_start_listener(dynamic_endpoint):
+    messenger = ZMQMessenger("ROUTER", endpoint=dynamic_endpoint)
+    messenger.start_listener(lambda msgs: None)
+    with pytest.raises(RuntimeError, match="Listener already running"):
+        messenger.start_listener(lambda msgs: None)
+    messenger.stop()
 
 
 if __name__ == "__main__":

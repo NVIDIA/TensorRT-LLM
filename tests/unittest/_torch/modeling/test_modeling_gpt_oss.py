@@ -1,14 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import os
 import shutil
 
 import pytest
-from transformers import AutoTokenizer
+import torch
+from torch.profiler import ProfilerActivity
+from transformers import AutoTokenizer, GptOssConfig
 from utils.llm_data import llm_models_root
 from utils.util import skip_no_hopper
 
+import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
+from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_gpt_oss import GptOssForCausalLM
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.bindings.executor import \
+    KvCacheConfig as BindingsKvCacheConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
+                                 KvCacheConfig, MoeConfig)
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import _resolve_kv_cache_manager_v2_auto
+from tensorrt_llm.mapping import Mapping
 
 configs = """
 {
@@ -34,6 +51,37 @@ configs = """
     "rope_ntk_beta": 32
 }
 """
+
+
+def test_gpt_oss_prefers_python_transceiver() -> None:
+    assert GptOssForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
+
+
+def _resolve_gpt_oss_kv_cache_manager_v2(**llm_args_kwargs) -> bool:
+    """Resolve the GPT-OSS preference through the model-loading path."""
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model", **llm_args_kwargs)
+    return _resolve_kv_cache_manager_v2_auto(llm_args, GptOssForCausalLM)
+
+
+def test_gpt_oss_model_preference_selects_v2():
+    """GPT-OSS is VSWA, so "auto" resolves to KVCacheManagerV2."""
+    assert _resolve_gpt_oss_kv_cache_manager_v2() is True
+
+
+@pytest.mark.parametrize("user_setting", [False, True])
+def test_gpt_oss_explicit_setting_wins(user_setting):
+    """An explicit user value is never overridden by the model preference."""
+    assert _resolve_gpt_oss_kv_cache_manager_v2(kv_cache_config=KvCacheConfig(
+        use_kv_cache_manager_v2=user_setting)) is user_setting
+
+
+def test_gpt_oss_one_model_eagle3_keeps_v2():
+    """One-model Eagle3 shares the target engine, so V2 still applies."""
+    assert _resolve_gpt_oss_kv_cache_manager_v2(
+        speculative_config=Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model="/tmp/dummy_eagle_model",
+            eagle3_one_model=True)) is True
 
 
 def dump_config_json(dst_dir):
@@ -89,3 +137,139 @@ def test_gpt_oss_trtllmgen(moe_backend):
 
     sampling_params = SamplingParams(max_tokens=20)
     llm.generate(prompts, sampling_params)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or "H200" not in torch.cuda.get_device_name(0),
+                    reason="This test is only supported on H200 Hopper GPUs")
+def test_gpt_oss_xqa_kernel_selection():
+    """NVBug 5720470: GPT-OSS-20B must use XQA kernel (not MMHA) in decode.
+
+    GPT-OSS-20B config: num_heads=64, num_kv_heads=8, head_dim=64, bfloat16.
+    With batch_size=8 and sufficient decode history, the XQA heuristic
+    (mayHavePerfGain) should select XQA over MMHA.
+
+    Verification: use torch.profiler to capture CUDA kernels and assert that
+    XQA kernel (kernel_mha) is launched instead of MMHA
+    (masked_multihead_attention_kernel).
+    """
+    config_dict = json.loads(configs)
+    # Use fewer layers for faster test
+    config_dict["num_hidden_layers"] = 1
+    gpt_oss_config = GptOssConfig.from_dict(config_dict)
+
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+
+    model_config = ModelConfig(pretrained_config=gpt_oss_config,
+                               attn_backend="TRTLLM")
+    with torch.no_grad():
+        model = GptOssForCausalLM(model_config).cuda()
+        # Cast model weights to bfloat16 but keep float32 params (e.g. sinks).
+        for name, param in model.named_parameters():
+            if param.dtype == torch.float32 and 'sinks' not in name:
+                param.data = param.data.to(dtype)
+            elif param.dtype not in (torch.float32, dtype):
+                param.data = param.data.to(dtype)
+
+    # All-decode batch: 8 sequences in generation phase with past history.
+    # This triggers the generation-phase attention where XQA/MMHA dispatch
+    # happens. batch_size=8, past_kv >= 128 ensures the occupancy heuristic
+    # selects XQA: num_kv_heads(8) * batch(8) * multi_block(>=1) * 4.0 >= SM_count.
+    batch_size = 8
+    context_sequence_length = []  # no context (prefill) sequences
+    sequence_length = [1] * batch_size  # all decode, 1 new token each
+    past_seen_tokens = [256] * batch_size  # enough history for multi-block
+    request_ids = list(range(batch_size))
+    token_nums = [p + s for p, s in zip(past_seen_tokens, sequence_length)]
+    prompt_lens = past_seen_tokens
+
+    num_blocks = 200
+    tokens_per_block = 128
+    head_dim = gpt_oss_config.head_dim
+    num_layers = gpt_oss_config.num_hidden_layers
+    num_kv_heads = gpt_oss_config.num_key_value_heads
+    max_seq_len = num_blocks * tokens_per_block
+
+    kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    kv_cache_config = BindingsKvCacheConfig(max_tokens=num_blocks *
+                                            tokens_per_block)
+    kv_cache_manager = KVCacheManager(
+        kv_cache_config,
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=max_seq_len,
+        max_batch_size=batch_size,
+        mapping=mapping,
+        dtype=kv_cache_dtype,
+    )
+    kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+
+    metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+    attn_metadata = metadata_cls(
+        seq_lens=torch.tensor(sequence_length, dtype=torch.int32),
+        num_contexts=len(context_sequence_length),
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=past_seen_tokens,
+        ),
+        kv_cache_manager=kv_cache_manager,
+        request_ids=request_ids,
+        prompt_lens=prompt_lens,
+        max_num_requests=batch_size,
+        max_num_tokens=8192,
+    )
+
+    # 1 token per decode sequence
+    input_ids = torch.randint(0,
+                              gpt_oss_config.vocab_size, (batch_size, ),
+                              dtype=torch.int32,
+                              device=device)
+    position_ids = torch.tensor(past_seen_tokens,
+                                dtype=torch.long,
+                                device=device).unsqueeze(0)
+
+    # Warm-up run (JIT compile XQA kernels, allocate buffers).
+    with torch.inference_mode():
+        attn_metadata.prepare()
+        model.forward(input_ids=input_ids,
+                      position_ids=position_ids,
+                      attn_metadata=attn_metadata)
+
+    # Profiled run: capture CUDA kernel names to verify XQA dispatch.
+    kernel_names = []
+    with torch.inference_mode(), \
+         torch.profiler.profile(activities=[ProfilerActivity.CUDA]) as prof:
+        attn_metadata.prepare()
+        logits = model.forward(input_ids=input_ids,
+                               position_ids=position_ids,
+                               attn_metadata=attn_metadata)
+
+    assert logits.shape[0] == batch_size, \
+        f"Expected {batch_size} logits, got {logits.shape[0]}"
+
+    kv_cache_manager.shutdown()
+
+    # Collect CUDA kernel names from the profiler trace.
+    kernel_names = [
+        evt.key for evt in prof.key_averages()
+        if evt.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    all_kernels = " ".join(kernel_names)
+
+    # XQA kernel: "kernel_mha" (from decoderXQA JIT).
+    # MMHA kernel: "masked_multihead_attention_kernel".
+    has_xqa = any("kernel_mha" in k for k in kernel_names)
+    has_mmha = any("masked_multihead_attention_kernel" in k
+                   for k in kernel_names)
+
+    assert has_xqa, (
+        "GPT-OSS-20B decode did not launch XQA kernel (kernel_mha). "
+        f"See NVBug 5720470. Captured CUDA kernels: {all_kernels}")
+    assert not has_mmha, (
+        "GPT-OSS-20B decode launched MMHA kernel instead of XQA. "
+        f"See NVBug 5720470. Captured CUDA kernels: {all_kernels}")

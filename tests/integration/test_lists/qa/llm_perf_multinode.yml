@@ -1,0 +1,23 @@
+version: 0.0.1
+llm_perf_multinode:
+
+# 1: B200 test cases
+- condition:
+    wildcards:
+      gpu:
+      - 'b200'
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-b200_deepseek-r1-fp4_8k1k_con1536_ctx1_dep4_gen1_dep8_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-b200_deepseek-r1-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-b200_deepseek-r1-fp4_8k1k_con256_ctx1_dep4_gen1_dep8_eplb0_mtp1_ccb-NIXL] TIMEOUT (120)
+
+# 2: GB200 test cases
+- condition:
+    wildcards:
+      gpu:
+      - 'gb200'
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_gpt-oss-120b-fp4_8k1k_con128_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_gpt-oss-120b-fp4_8k1k_con4_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_deepseek-r1-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (120)
+  - perf/test_perf_sanity.py::test_e2e[disagg-gen_only-gb200_deepseek-r1-fp4_128k8k_con1_ctx1_pp8_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (120)

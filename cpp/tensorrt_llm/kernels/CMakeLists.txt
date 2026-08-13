@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -28,6 +28,12 @@ add_subdirectory(groupRmsNormKernels)
 add_subdirectory(llama4MinLatencyKernels)
 add_subdirectory(dsv3MinLatencyKernels)
 add_subdirectory(causalConv1d)
+add_subdirectory(fusedGatedRMSNormQuant)
+add_subdirectory(mamba2MTPSSMCache)
+add_subdirectory(kdaDecode)
+add_subdirectory(kimiK3AttnRes)
+add_subdirectory(mhcKernels)
+add_subdirectory(compressorKernels)
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
@@ -51,12 +57,57 @@ list(FILTER SRC_CU EXCLUDE REGEX "selectiveScan/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "userbuffers/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "userbuffers/.*")
 list(FILTER SRC_CU EXCLUDE REGEX "fusedLayernormKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "fusedGatedRMSNormQuant/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "mamba2MTPSSMCache/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "kdaDecode/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "kdaDecode/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "kimiK3AttnRes/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "kimiK3AttnRes/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "mhcKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "mhcKernels/.*")
+list(FILTER SRC_CPP EXCLUDE REGEX "compressorKernels/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "compressorKernels/.*")
+# Marlin is built as its own architecture-scoped OBJECT library below.
+list(FILTER SRC_CPP EXCLUDE REGEX "marlin/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "marlin/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
 endif()
 
-add_library(kernels_src STATIC ${SRC_CPP} ${SRC_CU})
+# Lower CUDA optimization level when FAST_BUILD is enabled to speed up
+# compilation. CMake by default adds -O3 to CMAKE_CUDA_FLAGS_RELEASE. We
+# override it here before creating the target to avoid the "incompatible
+# redefinition" warning.
+if(FAST_BUILD)
+  string(REPLACE "-O3" "-O1" CMAKE_CUDA_FLAGS_RELEASE
+                 "${CMAKE_CUDA_FLAGS_RELEASE}")
+  string(REPLACE "-O3" "-O1" CMAKE_CUDA_FLAGS_RELWITHDEBINFO
+                 "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+  message(
+    STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
+endif()
+
+# Marlin NVFP4: build Ada/Hopper kernels and the dense W4A16/repack kernels used
+# on SM12x. Unsupported device passes emit empty kernel stubs.
+file(GLOB_RECURSE MARLIN_SRC "marlin/*.cu" "marlin/*.cpp")
+if(MARLIN_SRC)
+  add_library(marlin_src OBJECT ${MARLIN_SRC})
+  set_property(TARGET marlin_src PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set_property(TARGET marlin_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_include_directories(
+    marlin_src
+    PRIVATE
+      $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
+  )
+  target_link_libraries(marlin_src PRIVATE trtllm_gen_fmha_interface)
+  set_cuda_architectures(marlin_src 89 90 120f)
+endif()
+
+add_library(
+  kernels_src STATIC
+  ${SRC_CPP} ${SRC_CU}
+  $<$<TARGET_EXISTS:marlin_src>:$<TARGET_OBJECTS:marlin_src>>)
 set_property(TARGET kernels_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET kernels_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 target_include_directories(

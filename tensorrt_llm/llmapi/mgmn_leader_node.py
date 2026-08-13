@@ -37,7 +37,7 @@ def launch_server_main(sub_comm=None):
 def stop_server_main():
     hmac_key = get_spawn_proxy_process_ipc_hmac_key_env()
     queue = ZeroMqQueue((get_spawn_proxy_process_ipc_addr_env(), hmac_key),
-                        use_hmac_encryption=bool(hmac_key),
+                        use_hmac_encryption=True,
                         is_server=False,
                         socket_type=zmq.PAIR)
 

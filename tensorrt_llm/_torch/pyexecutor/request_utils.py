@@ -1,9 +1,10 @@
 """Utility functions for request processing."""
 
-import heapq
 import os
-from collections import deque, namedtuple
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from .scheduler import WaitingQueue
 
 import torch
 
@@ -32,13 +33,15 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
 
 
 def collect_py_objects_from_requests(
-    requests: List, attribute_name: str
+    requests: List, attribute_name: str, include_none: bool = False
 ) -> Optional[Tuple[str, Dict]]:
     """Collect Python-only objects from requests.
 
     Args:
         requests: List of RequestQueueItem objects.
         attribute_name: Name of the attribute to collect.
+        include_none: Include requests whose attribute value is None. When
+            enabled, the source request must have the attribute.
 
     Returns:
         Tuple of (attribute_name, dict mapping request_id to object) or None if empty.
@@ -48,9 +51,12 @@ def collect_py_objects_from_requests(
         if not item.is_normal_request:
             continue
         if item.request:
-            obj = getattr(item.request, attribute_name, None)
-            if obj is not None:
-                req_id_to_obj[item.id] = obj
+            if include_none:
+                req_id_to_obj[item.id] = getattr(item.request, attribute_name)
+            else:
+                obj = getattr(item.request, attribute_name, None)
+                if obj is not None:
+                    req_id_to_obj[item.id] = obj
     return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
 
 
@@ -64,157 +70,35 @@ def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> 
     for attr_name, req_obj_dict in py_request_objects:
         for item in requests:
             if item.request:
-                py_obj = req_obj_dict.get(item.id)
-                if py_obj is not None:
-                    setattr(item.request, attr_name, py_obj)
+                if item.id in req_obj_dict:
+                    setattr(item.request, attr_name, req_obj_dict[item.id])
 
 
-def schedule_attention_dp_requests(
-    new_requests: List[Any],
-    all_ranks_num_active_requests: List[int],
-    all_ranks_num_active_tokens: List[int],
-    tp_size: int,
-    max_num_active_requests: int,
-) -> Tuple[Dict[int, List[Any]], int]:
-    """Schedule attention DP requests across ranks.
-
-    This function distributes requests across tensor parallel ranks for attention DP.
-    It first tries to assign requests to their target dp_rank (if specified and has capacity),
-    then balances the remaining requests across all ranks.
+def derive_attention_dp_per_rank_request_cap(
+    base_cap: int,
+    max_num_tokens: Optional[int],
+    max_total_draft_tokens: int,
+) -> int:
+    """Cap per-rank requests at ``max_num_tokens // (1 + max_total_draft_tokens)``
+    so gen-phase per-step token load cannot exceed ``max_num_tokens`` under
+    attention DP, where no component otherwise enforces a per-rank token cap
+    (nvbug-6133201). Each gen request occupies ``1 + max_total_draft_tokens``
+    token slots per step. Mirrors the CUDA graph batch-size cap at
+    ``model_engine._filter_cuda_graph_batch_sizes``.
 
     Args:
-        new_requests: List of RequestQueueItem to schedule.
-        all_ranks_num_active_requests: Number of active requests per rank (will be modified).
-        all_ranks_num_active_tokens: Number of active tokens per rank.
-        tp_size: Number of tensor parallel ranks.
-        max_num_active_requests: Maximum number of active requests per rank.
+        base_cap: Per-rank request cap from ``get_max_num_sequences()``.
+        max_num_tokens: ``LlmArgs.max_num_tokens``; ``None`` disables tightening.
+        max_total_draft_tokens: Draft tokens per gen request (0 without spec
+            decoding); negative values are clamped to 0.
 
     Returns:
-        Tuple of:
-            - all_ranks_new_requests: Dict mapping rank to list of assigned requests.
-            - expected_num_active_requests: Expected number of active requests per rank.
+        The tighter of ``base_cap`` and ``max_num_tokens // step_tokens``.
     """
-    # Map from ranks to new requests
-    all_ranks_new_requests = {tp_rank: [] for tp_rank in range(tp_size)}
-
-    # Prioritize the requests that are not in relax mode
-    def get_relax_value(req_item):
-        scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-        if scheduling_params is None:
-            return True
-        return scheduling_params.attention_dp_relax
-
-    new_requests = sorted(new_requests, key=get_relax_value)
-
-    # Try to put the requests to the target dp rank until the max_num_active_requests is reached
-    remaining_unscheduled = []
-    for req_item in new_requests:
-        scheduled = False
-        scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-        if scheduling_params is not None:
-            target_dp_rank = scheduling_params.attention_dp_rank
-            if (
-                target_dp_rank is not None
-                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
-            ):
-                all_ranks_num_active_requests[target_dp_rank] += 1
-                scheduled = True
-                all_ranks_new_requests[target_dp_rank].append(req_item)
-
-        if not scheduled:
-            remaining_unscheduled.append(req_item)
-
-    # Balance the remaining unscheduled requests across ranks
-    num_new_requests_all_ranks = len(remaining_unscheduled)
-    total_num_active_requests = sum(all_ranks_num_active_requests)
-    expected_num_active_requests = max(
-        (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
-        max(all_ranks_num_active_requests),
-    )
-
-    all_ranks_new_requests = balance_requests_across_ranks(
-        remaining_unscheduled,
-        all_ranks_new_requests,
-        all_ranks_num_active_requests,
-        all_ranks_num_active_tokens,
-        expected_num_active_requests,
-    )
-
-    return all_ranks_new_requests, expected_num_active_requests
-
-
-def balance_requests_across_ranks(
-    new_requests: List,
-    all_ranks_new_requests: Dict[int, List],
-    all_ranks_num_active_requests: List[int],
-    all_ranks_num_active_tokens: List[int],
-    expected_num_active_requests: int,
-) -> Dict[int, List]:
-    """Balance requests across ranks for attention DP.
-
-    Uses a heap-based algorithm to distribute requests evenly across ranks,
-    prioritizing ranks with fewer tokens for better load balancing.
-
-    Args:
-        new_requests: List of new requests to distribute.
-        all_ranks_new_requests: Dict mapping rank to list of already assigned requests.
-        all_ranks_num_active_requests: Number of active requests per rank.
-        all_ranks_num_active_tokens: Number of active tokens per rank.
-        expected_num_active_requests: Target number of active requests per rank.
-
-    Returns:
-        Updated all_ranks_new_requests dict with new requests distributed.
-    """
-    if new_requests:
-        # Balance context tokens across ranks using heap
-        HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
-
-        all_ranks_new_requests_heap = [
-            HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
-            for tp_rank, val in enumerate(all_ranks_num_active_requests)
-        ]
-
-        all_ranks_new_requests_heap = [
-            val
-            for val in all_ranks_new_requests_heap
-            if val.num_requests < expected_num_active_requests
-        ]
-
-        all_ranks_new_scheduled_requests = {
-            val.rank: val.request_list for val in all_ranks_new_requests_heap
-        }
-
-        heapq.heapify(all_ranks_new_requests_heap)
-
-        # Sort by token count (descending) for better load balancing
-        new_requests = sorted(
-            new_requests,
-            key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
-            reverse=True,
-        )
-
-        # Distribute requests across ranks
-        for req_item in new_requests:
-            val = heapq.heappop(all_ranks_new_requests_heap)
-            token_count = (
-                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
-            )
-            # Update the heap value with the new request
-            val = val._replace(
-                num_tokens=val.num_tokens + token_count,
-                num_requests=val.num_requests + 1,
-            )
-
-            val.request_list.append(req_item)
-            # If rank still has room for new requests, push back into heap
-            if val.num_requests < expected_num_active_requests:
-                heapq.heappush(all_ranks_new_requests_heap, val)
-
-        # Extend all_ranks_new_requests with the new requests that have been scheduled
-        for rank, reqs in all_ranks_new_scheduled_requests.items():
-            all_ranks_new_requests[rank].extend(reqs)
-
-    return all_ranks_new_requests
+    if max_num_tokens is None:
+        return base_cap
+    step_tokens_per_req = 1 + max(max_total_draft_tokens, 0)
+    return min(base_cap, max_num_tokens // step_tokens_per_req)
 
 
 def can_process_attention_dp_request(
@@ -246,7 +130,7 @@ def can_process_attention_dp_request(
 
 
 def get_from_waiting_queue(
-    waiting_queue: deque,
+    waiting_queue: "WaitingQueue",
     max_req_count: int,
     enable_attention_dp: bool,
     max_num_active_requests: int,
@@ -277,11 +161,11 @@ def get_from_waiting_queue(
     )
 
     while req_count < max_req_count and waiting_queue:
-        req_item = waiting_queue[0]
+        req_item = waiting_queue.peek_request()
         num_children = len(req_item.child_req_ids) if req_item.child_req_ids else 0
         if (req_count + 1 + num_children) > max_req_count:
             break
-        req_item = waiting_queue.popleft()
+        req_item = waiting_queue.pop_request()
 
         can_process = (
             can_process_attention_dp_request(
@@ -299,7 +183,7 @@ def get_from_waiting_queue(
 
     # Put the pending requests back to the waiting queue
     # All ranks should have the same waiting queue
-    waiting_queue.extendleft(reversed(pending_requests))
+    waiting_queue.prepend_requests(pending_requests)
 
     return items
 
@@ -372,21 +256,27 @@ def partition_context_for_helix(
     Returns:
         Tuple of (input_ids_this_rank, position_ids_this_rank, input_len, padding_len).
 
+        When num_total_blocks < cp_size, the highest-indexed CP ranks own no blocks
+        for this sequence; those empty ranks return empty token and position lists.
+        input_len still reflects the full prompt length so global position ids stay
+        correct.
+
     Raises:
-        ValueError: If there aren't enough tokens for at least one block per CP rank.
+        ValueError: If the prompt is empty (no blocks to distribute).
     """
     all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
     input_len = all_input_ids.shape[-1]
 
     num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
-    if num_total_blocks < cp_size:
-        raise ValueError(
-            f"There aren't enough tokens to get at least one block per CP rank. "
-            f"num_total_blocks {num_total_blocks} < num_cp_ranks {cp_size}. "
-            f"Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
-        )
+    if num_total_blocks == 0:
+        raise ValueError("Cannot partition an empty prompt for Helix CP: num_total_blocks == 0.")
+    # NOTE: When num_total_blocks < cp_size, CP ranks in [num_total_blocks, cp_size)
+    # own zero blocks ("empty" ranks). This is supported: such ranks contribute a
+    # no-op (-inf, 0) to the Helix attention combine and receive zero KV blocks
+    # during cache transmission. Rank 0 always owns global block 0, so the combine
+    # denominator is never zero.
 
-    # Padding to ensure torch.stack used with torch.tensor_split works properly.
+    # Pad the last (partial) block so every block has exactly tokens_per_block tokens.
     padding_len = 0
     if input_len % tokens_per_block != 0:
         padding_len = tokens_per_block - (input_len % tokens_per_block)
@@ -394,20 +284,25 @@ def partition_context_for_helix(
         all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
     all_position_ids = torch.arange(0, input_len + padding_len, dtype=torch.int64).unsqueeze(0)
 
-    input_id_blocks_per_rank = torch.tensor_split(
-        torch.stack(all_input_ids.split(tokens_per_block, dim=-1)), cp_size
-    )
-    position_id_blocks_per_rank = torch.tensor_split(
-        torch.stack(all_position_ids.split(tokens_per_block, dim=-1)), cp_size
-    )
+    # Round-robin block assignment across CP ranks: rank r owns blocks {r, r+cp_size, r+2*cp_size, ...}.
+    # This must agree with the C++ KV cache split kernels (cacheSplitConcat.cu) so that the input
+    # tokens this rank processes correspond to the KV blocks it received from the context server.
+    input_id_blocks = list(all_input_ids.split(tokens_per_block, dim=-1))
+    position_id_blocks = list(all_position_ids.split(tokens_per_block, dim=-1))
 
-    # Get the input_ids and position_ids for this rank.
-    input_ids_this_rank = input_id_blocks_per_rank[cp_rank].flatten().tolist()
-    position_ids_this_rank = position_id_blocks_per_rank[cp_rank].flatten().tolist()
+    curank_input_blocks = input_id_blocks[cp_rank::cp_size]
+    curank_position_blocks = position_id_blocks[cp_rank::cp_size]
+    # Empty rank: this CP rank owns no blocks for this sequence (num_total_blocks < cp_size).
+    if len(curank_input_blocks) == 0:
+        return [], [], input_len, padding_len
 
-    # Undo the padding. Only last rank's last block will be padded right now
-    # given contiguous block assignment.
-    if cp_rank == cp_size - 1 and padding_len > 0:
+    input_ids_this_rank = torch.cat(curank_input_blocks, dim=-1).flatten().tolist()
+    position_ids_this_rank = torch.cat(curank_position_blocks, dim=-1).flatten().tolist()
+
+    # The (single) padded block is the global last block; under round-robin it is owned by rank
+    # (num_total_blocks - 1) % cp_size, and is the last local block on that rank. Strip its padding.
+    last_block_owner = (num_total_blocks - 1) % cp_size
+    if cp_rank == last_block_owner and padding_len > 0:
         input_ids_this_rank = input_ids_this_rank[:-padding_len]
         position_ids_this_rank = position_ids_this_rank[:-padding_len]
 
@@ -617,6 +512,15 @@ class RequestBroadcaster:
 
     def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks."""
+        request_count = len(new_requests) if self.dist.rank == 0 else 0
+        # Idle non-root ranks can wait here while rank 0 blocks in the
+        # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
+        with self.hang_detector.pause():
+            request_count = self._broadcast_request_count(request_count)
+
+        if request_count == 0:
+            return [], None
+
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)
         else:
@@ -633,6 +537,30 @@ class RequestBroadcaster:
 
         return new_requests, py_request_objects
 
+    def _broadcast_request_count(self, request_count: int) -> int:
+        """Broadcast rank 0's request count using the same PP route as requests."""
+        if self.dist.world_size == 1:
+            return request_count
+
+        if not self.dist.has_pp:
+            return self.dist.broadcast(request_count, root=0)
+
+        if self.dist.is_first_pp_rank:
+            with nvtx_range("tp_broadcast_request_count"):
+                request_count = self.dist.tp_cp_broadcast(request_count, root=0)
+
+        tag = self.dist.pp_size + 1  # Avoid the heavy request payload tag.
+
+        if not self.dist.is_first_pp_rank:
+            with nvtx_range("recv_request_count_from_prev_pp"):
+                request_count = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+
+        if not self.dist.is_last_pp_rank:
+            with nvtx_range("send_request_count_to_next_pp"):
+                self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
+
+        return request_count
+
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""
         py_logits_post_processors = collect_py_objects_from_requests(
@@ -646,6 +574,10 @@ class RequestBroadcaster:
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
+        py_conversation_params = collect_py_objects_from_requests(
+            new_requests, "py_conversation_params", include_none=True
+        )
+        py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
 
         return tuple(
             filter(
@@ -656,6 +588,8 @@ class RequestBroadcaster:
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,
+                    py_conversation_params,
+                    py_lora_path,
                 ],
             )
         )
@@ -666,6 +600,9 @@ class RequestBroadcaster:
     ) -> Tuple[List, Optional[Dict]]:
         """Broadcast requests across pipeline stages."""
         payloads = (new_requests, py_request_objects)
+
+        if self.dist.world_size == 1:
+            return payloads
 
         if not self.dist.has_pp:
             return self.dist.broadcast(payloads, root=0)

@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <cassert>
 #include <cstring>
 #include <string>
 
@@ -58,6 +59,11 @@ inline bool isArchHopper(CudaArch cudaArch)
 inline bool isArchBlackwell(CudaArch cudaArch)
 {
     return cudaArch == CudaArch::Sm100a || cudaArch == CudaArch::Sm100f || cudaArch == CudaArch::Sm103a;
+}
+
+inline bool isArchBlackwellUltra(CudaArch cudaArch)
+{
+    return cudaArch == CudaArch::Sm103a;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
