@@ -25,13 +25,11 @@ MAX_SAMPLES = 10  # Small number for efficient testing
 MIN_PATTERN_LENGTH = 3  # Minimum length for search patterns
 
 
-def _stage_backed_tests(stage_query):
+def _stage_backed_tests(stage_query: StageQuery) -> list[str]:
     """Return tests from YAML files that are wired to a Jenkins stage."""
-    return [
-        test for test, mappings in stage_query.test_map.items()
-        if any(yml in stage_query.yaml_to_stages
-               for yml, _stage, _backend in mappings)
-    ]
+    return sorted(test for test, mappings in stage_query.test_map.items()
+                  if any(yml in stage_query.yaml_to_stages
+                         for yml, _stage, _backend in mappings))
 
 
 @pytest.fixture(scope="module")
@@ -41,9 +39,8 @@ def stage_query():
 
 
 @pytest.fixture(scope="module")
-def sample_test_cases(stage_query):
+def sample_test_cases(stage_query: StageQuery) -> list[str]:
     """Fixture that samples tests backed by a live Jenkins stage."""
-    random.seed(0)  # Ensure deterministic test results
     all_tests = _stage_backed_tests(stage_query)
     if not all_tests:
         raise RuntimeError(
@@ -54,14 +51,13 @@ def sample_test_cases(stage_query):
     if len(all_tests) <= MAX_SAMPLES:
         return all_tests
 
-    return random.sample(all_tests, MAX_SAMPLES)
+    return random.Random(0).sample(all_tests, MAX_SAMPLES)
 
 
 @pytest.fixture(scope="module")
-def sample_stages(stage_query):
+def sample_stages(stage_query: StageQuery) -> list[str]:
     """Fixture that provides sample stages from actual data."""
-    random.seed(0)  # Ensure deterministic test results
-    all_stages = list(stage_query.stage_to_yaml.keys())
+    all_stages = sorted(stage_query.stage_to_yaml)
     if not all_stages:
         raise RuntimeError(
             "No stages found in stage mapping. This indicates a configuration "
@@ -74,7 +70,7 @@ def sample_stages(stage_query):
     if len(all_stages) <= MAX_SAMPLES:
         return all_stages
 
-    return random.sample(all_stages, MAX_SAMPLES)
+    return random.Random(0).sample(all_stages, MAX_SAMPLES)
 
 
 def test_data_availability(stage_query):
@@ -88,7 +84,7 @@ def test_data_availability(stage_query):
     print(f"Max samples configured: {MAX_SAMPLES}")
 
 
-def test_all_stage_backed_tests_map(stage_query):
+def test_all_stage_backed_tests_map(stage_query: StageQuery) -> None:
     """Every test in a Jenkins-wired YAML must resolve to a live stage."""
     stage_backed_tests = _stage_backed_tests(stage_query)
     assert stage_backed_tests, "No tests are backed by a live Jenkins stage"
