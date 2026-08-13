@@ -32,6 +32,13 @@ list(FILTER SRC_CU EXCLUDE REGEX "fmha_v2_cu/.*")
 list(FILTER SRC_CPP EXCLUDE REGEX "cubin/fmha_cubin\\.cpp$")
 if(EXISTS "${TRTLLM_FMHA_GEN_DIR}/cubin/fmha_cubin.cpp")
   list(APPEND SRC_CPP "${TRTLLM_FMHA_GEN_DIR}/cubin/fmha_cubin.cpp")
+else()
+  message(
+    FATAL_ERROR
+      "Generated FMHA source ${TRTLLM_FMHA_GEN_DIR}/cubin/fmha_cubin.cpp is "
+      "missing. It is produced by the FMHA generation step "
+      "(scripts/build_wheel.py runs it before CMake); a missing file means "
+      "generation did not complete. Regenerate before configuring.")
 endif()
 # The skip_softmax sm_120/sm_121 warp-specialized FMHA is a hand-written TU that
 # only compiles for the sm_120 family; it is added explicitly to the sm_120 arch
@@ -123,5 +130,17 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
     set_cuda_architectures(${TARGET_NAME} ${TARGET_ARCH})
     target_sources(context_attention_src
                    PUBLIC $<TARGET_OBJECTS:${TARGET_NAME}>)
+  else()
+    # arch is enabled (disabled archs already `continue`d above) but the
+    # generation step produced no *_sm${arch}.cu kernels for it. Fail rather
+    # than silently building without this architecture's FMHA kernels, which
+    # would surface only as a missing-kernel failure at runtime. (arch 120
+    # always has the hand-written skip_softmax TU appended above, so this branch
+    # covers the generated-only architectures.)
+    message(
+      FATAL_ERROR
+        "No generated FMHA kernels (*_sm${arch}.cu) found in "
+        "${TRTLLM_FMHA_GEN_DIR}/fmha_v2_cu for enabled architecture ${arch}. "
+        "The FMHA generation step did not produce sources for this arch.")
   endif()
 endforeach()
