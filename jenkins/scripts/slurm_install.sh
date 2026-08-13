@@ -69,7 +69,7 @@ slurm_install_setup() {
             which python3
             python3 --version
             retry_command apt-get install -y libffi-dev
-            if [[ $pytestCommand == *--run-ray* ]]; then
+            if [[ "${pytestCommand:-}" == *--run-ray* ]]; then
                 retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
                 mambaArch=$(uname -m)
                 retry_command --timeout 2700 pip3 install --retries 10 --no-deps \

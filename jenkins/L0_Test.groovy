@@ -5189,7 +5189,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // symlink it to skip the ~2-min download.  In all other contexts (K8s pods,
         // non-fat-sqsh SLURM) the directory does not exist, so fall back to wget + tar.
         def tarName = BUILD_CONFIGS[config][TARNAME]
-        def isFatSqsh = sh(script: "test -d /tmp/TensorRT-LLM && echo yes || echo no", returnStdout: true).trim() == "yes"
+        // /tmp/trtllm_installed.txt is written only by fat_build_inline.sh, distinguishing
+        // a pre-baked fat sqsh from a base image that merely has /tmp/TensorRT-LLM after
+        // a prior normal install on the same node.
+        def isFatSqsh = sh(script: "test -f /tmp/trtllm_installed.txt && test -d /tmp/TensorRT-LLM && echo yes || echo no", returnStdout: true).trim() == "yes"
         if (isFatSqsh) {
             sh "ln -sfn /tmp/TensorRT-LLM ${llmPath}/TensorRT-LLM"
             // Resolve to real path so pytest --rootdir doesn't produce ../../../ node IDs.
