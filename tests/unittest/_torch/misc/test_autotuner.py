@@ -1405,12 +1405,47 @@ def test_post_tune_merge_tactics_min_time_and_subset_kept():
 
     tuner._dist = _FakeDist()
     tuner.profiling_cache.cache = dict(r0)
+    generation_before_merge = tuner.profiling_cache.generation
     tuner.post_tune_merge_tactics()
 
     cache = tuner.profiling_cache.cache
+    assert tuner.profiling_cache.generation == generation_before_merge + 1
     assert cache[("gemm", "X")] == (0, ("cublaslt", 0), 0.5)
     assert cache[("q", "A")] == r0[("q", "A")]
     assert cache[("vae", "B")] == r1[("vae", "B")]
+
+
+def test_profiling_cache_generation_tracks_mutations():
+    cache = autotuner.AutoTuner().profiling_cache
+    initial_generation = cache.generation
+
+    cache[("gemm", "X")] = (0, ("cutlass", 10), 1.0)
+    assert cache.generation == initial_generation + 1
+
+    cache.merge_cache_data({("vae", "B"): (0, ("cutlass", 2), 1.0)})
+    assert cache.generation == initial_generation + 2
+
+    cache.clear()
+    assert cache.generation == initial_generation + 3
+
+
+def test_is_capturing_tactics_tracks_capture_and_replay():
+    tuner = autotuner.AutoTuner()
+    assert not tuner.is_capturing_tactics
+    runner = GemmRunner()
+    tuning_config = TuningConfig()
+    inputs = [torch.empty(1), torch.empty(1)]
+
+    with tuner.capture() as all_tactics:
+        assert tuner.is_capturing_tactics
+        tuner.choose_one("capture-state", [runner], tuning_config, inputs)
+
+    assert not tuner.is_capturing_tactics
+    (runner, tactic), = next(iter(all_tactics))
+    with tuner.replay(((runner, tactic), )):
+        assert tuner.is_capturing_tactics
+        tuner.choose_one("capture-state", [runner], tuning_config, inputs)
+    assert not tuner.is_capturing_tactics
 
 
 def test_post_tune_merge_tactics_single_rank_noop():
