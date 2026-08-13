@@ -585,11 +585,14 @@ def test_load_cache_skips_non_literal_tactic():
 _CACHE_ENTRY_KEY = ("op", "R", "0", ((1, 128), ))
 
 
-def _cache_entry():
+def _cache_entry() -> dict[str, object]:
     return {"runner_id": 0, "tactic": "7", "min_time": 0.001}
 
 
-def _write_cache_doc(metadata, ranks=(0, )):
+def _write_cache_doc(
+    metadata: dict[str, object] | None,
+    ranks: tuple[int, ...] = (0, ),
+) -> tuple[str, tempfile.TemporaryDirectory]:
     """One-entry-per-rank cache file. Returns (path, tmpdir); keep tmpdir alive."""
     doc = {"shared": {}}
     for rank in ranks:
@@ -603,7 +606,7 @@ def _write_cache_doc(metadata, ranks=(0, )):
     return cache_path, temp_dir
 
 
-def test_load_cache_discards_other_device_capability():
+def test_load_cache_discards_other_device_capability() -> None:
     """The cache key has no device in it, so a foreign entry can hit."""
     cache = AutoTuner.get().profiling_cache
     cache.clear()
@@ -616,7 +619,7 @@ def test_load_cache_discards_other_device_capability():
     assert cache.device_capability == torch.cuda.get_device_capability()
 
 
-def test_load_cache_tolerates_version_and_name_drift():
+def test_load_cache_tolerates_version_and_name_drift() -> None:
     """An upgrade or a driver rename must not throw away a good cache."""
     cache = AutoTuner.get().profiling_cache
     cache.clear()
@@ -629,7 +632,7 @@ def test_load_cache_tolerates_version_and_name_drift():
     assert _CACHE_ENTRY_KEY in cache.cache
 
 
-def test_load_cache_without_metadata_is_discarded_not_raised():
+def test_load_cache_without_metadata_is_discarded_not_raised() -> None:
     """load_cache passes .get("metadata", {}), which used to hit KeyError."""
     cache = AutoTuner.get().profiling_cache
     cache.clear()
@@ -639,7 +642,7 @@ def test_load_cache_without_metadata_is_discarded_not_raised():
     assert _CACHE_ENTRY_KEY not in cache.cache
 
 
-def test_save_cache_replaces_discarded_foreign_cache():
+def test_save_cache_replaces_discarded_foreign_cache() -> None:
     """save_cache merges into the file, so it must replace a rejected one.
 
     Otherwise our metadata lands next to the foreign entries and the next load
@@ -674,7 +677,7 @@ def test_save_cache_replaces_discarded_foreign_cache():
     assert _CACHE_ENTRY_KEY not in cache.cache
 
 
-def test_save_cache_after_discard_keeps_later_ranks():
+def test_save_cache_after_discard_keeps_later_ranks() -> None:
     """Replacing the file drops every rank's section, not just ours.
 
     That is fine for foreign entries, but ranks must not then overwrite each

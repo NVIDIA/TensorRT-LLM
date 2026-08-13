@@ -775,7 +775,7 @@ class AutoTunerProfilingCache:
         }
 
     @staticmethod
-    def _normalize_metadata_value(value: Any) -> Any:
+    def _normalize_metadata_value(value: object) -> object:
         # JSON turns the (10, 0) capability tuple back into [10, 0].
         if isinstance(value, (list, tuple)):
             return tuple(
@@ -783,7 +783,7 @@ class AutoTunerProfilingCache:
                 for v in value)
         return value
 
-    def _metadata_matches_device(self, metadata: Dict[str, Any]) -> bool:
+    def _metadata_matches_device(self, metadata: object) -> bool:
         """True if `metadata` records this device's compute capability.
 
         Silent so save_cache can re-check without logging it twice.
@@ -795,8 +795,7 @@ class AutoTunerProfilingCache:
             metadata["device_capability"]) == self._normalize_metadata_value(
                 self.device_capability))
 
-    def _validate_metadata(self, metadata: Dict[str, Any],
-                           file_path: Union[str, Path]) -> bool:
+    def _validate_metadata(self, metadata: object, file_path: Path) -> bool:
         """True if the entries can be used on this device.
 
         The cache key has no device in it, so an entry profiled on another
