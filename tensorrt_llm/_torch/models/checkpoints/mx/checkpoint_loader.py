@@ -29,6 +29,7 @@ HuggingFace checkpoint loading (disk -> CPU -> GPU) by way of its
 
 import inspect
 import json
+import logging
 import os
 import threading
 import traceback
@@ -187,6 +188,16 @@ def _synchronize_cuda_for_mx_publish() -> None:
 
     if torch.cuda.is_initialized():
         torch.cuda.synchronize()
+
+
+def _enable_mx_transfer_logging() -> None:
+    """Enable upstream INFO records when per-rank transfer logs are requested."""
+    if not os.environ.get("MX_TRANSFER_LOG_DIR"):
+        return
+
+    mx_logger = logging.getLogger("modelexpress")
+    if mx_logger.getEffectiveLevel() > logging.INFO:
+        mx_logger.setLevel(logging.INFO)
 
 
 @register_checkpoint_loader("MX")
@@ -362,6 +373,12 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 "or select a different "
                 "`checkpoint_format` to continue without MX."
             ) from exc
+
+        # ModelExpress 0.4.1 installs an INFO-level file handler for
+        # MX_TRANSFER_LOG_DIR, but leaves its logger at Python's WARNING
+        # default outside vLLM. Enable the records in the worker that performs
+        # the transfer so the requested per-rank diagnostics are not empty.
+        _enable_mx_transfer_logging()
 
         try:
             with _MX_TRANSFER_STATE_LOCK:

@@ -378,12 +378,19 @@ def _load_tokens(output_path: Path) -> list[list[int]]:
     return token_ids
 
 
-def _transfer_logs_by_rank(transfer_log_dir: Path) -> dict[int, str]:
-    logs = tuple(
-        path for path in transfer_log_dir.rglob("*") if path.is_file() and path.stat().st_size > 0
-    )
+def _transfer_logs_by_rank(transfer_log_dir: Path, receiver_log: str) -> dict[int, str]:
+    log_files = tuple(path for path in transfer_log_dir.rglob("*") if path.is_file())
+    logs = tuple(path for path in log_files if path.stat().st_size > 0)
     if not logs:
-        pytest.fail(f"ModelExpress created no receiver transfer logs in {transfer_log_dir}")
+        entries = ", ".join(
+            f"{path.relative_to(transfer_log_dir)} ({path.stat().st_size} bytes)"
+            for path in log_files
+        )
+        pytest.fail(
+            f"ModelExpress created no non-empty receiver transfer logs in "
+            f"{transfer_log_dir}; entries: {entries or '<none>'}\n"
+            f"Receiver log:\n{receiver_log}"
+        )
 
     logs_by_rank = {}
     for path in sorted(logs):
@@ -403,7 +410,7 @@ def _assert_transfer_evidence(
     receiver_transfer_log_dir: Path,
 ) -> None:
     receiver_log = receiver_log_path.read_text(encoding="utf-8", errors="replace")
-    transfer_logs = _transfer_logs_by_rank(receiver_transfer_log_dir)
+    transfer_logs = _transfer_logs_by_rank(receiver_transfer_log_dir, receiver_log)
     expected_ranks = set(range(case.tp_size))
     assert set(transfer_logs) == expected_ranks, (
         f"Expected receiver transfer logs for ranks {expected_ranks}, got {set(transfer_logs)}"

@@ -14,6 +14,7 @@ assertion is about our dependency handling, not the upstream API.
 """
 
 import json
+import logging
 import os
 import sys
 from contextlib import ExitStack
@@ -153,6 +154,25 @@ class TestConstruction:
 
         loader._source_identity_compatible_for_last_load = True
         assert loader.is_post_transform_weights_preloaded() is True
+
+    @pytest.mark.parametrize(
+        ("effective_level", "expected_level"),
+        ((logging.WARNING, logging.INFO), (logging.DEBUG, None)),
+    )
+    def test_transfer_log_dir_enables_info_records(
+        self, monkeypatch, effective_level, expected_level
+    ):
+        monkeypatch.setenv("MX_TRANSFER_LOG_DIR", "/tmp/mx-transfer-logs")
+        mx_logger = MagicMock()
+        mx_logger.getEffectiveLevel.return_value = effective_level
+
+        with patch.object(mx_checkpoint_loader.logging, "getLogger", return_value=mx_logger):
+            mx_checkpoint_loader._enable_mx_transfer_logging()
+
+        if expected_level is None:
+            mx_logger.setLevel.assert_not_called()
+        else:
+            mx_logger.setLevel.assert_called_once_with(expected_level)
 
 
 # ---------------------------------------------------------------------------
