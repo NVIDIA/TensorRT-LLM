@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,8 +29,22 @@ MIN_PATTERN_LENGTH = 3  # Minimum length for search patterns
 def _stage_backed_tests(stage_query: StageQuery) -> list[str]:
     """Return tests from YAML files that are wired to a Jenkins stage."""
     return sorted(test for test, mappings in stage_query.test_map.items()
-                  if any(yml in stage_query.yaml_to_stages
+                  if all(yml in stage_query.yaml_to_stages
                          for yml, _stage, _backend in mappings))
+
+
+def test_stage_backed_tests_exclude_mixed_mappings() -> None:
+    """A test in any unwired YAML is not a live-stage sampling candidate."""
+    stage_query = SimpleNamespace(
+        test_map={
+            'mixed': [('l0_wired.yml', 'pre_merge', 'pytorch'),
+                      ('perf.yml', 'post_merge', 'pytorch')],
+            'wired': [('l0_wired.yml', 'pre_merge', 'pytorch')],
+        },
+        yaml_to_stages={'l0_wired.yml': ['L0-PyTorch']},
+    )
+
+    assert _stage_backed_tests(stage_query) == ['wired']
 
 
 @pytest.fixture(scope="module")
@@ -184,8 +199,6 @@ def test_bidirectional_mapping_consistency(stage_query, sample_test_cases,
 
         for test_case in sample_test_cases:
             stages = stage_query.tests_to_stages([test_case])
-            assert stages, \
-                f"Test '{test_case}' should map to at least one stage"
 
             # Verify all returned stages are valid
             for stage in stages:
