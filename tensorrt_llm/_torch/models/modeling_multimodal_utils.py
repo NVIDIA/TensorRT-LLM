@@ -19,8 +19,8 @@
 import functools
 import math
 import os
-from typing import (Any, Callable, Dict, List, Optional, Tuple, TypedDict,
-                    Union, cast)
+from typing import (Any, Callable, Dict, List, Optional, Sequence, Tuple,
+                    TypedDict, Union, cast)
 
 import torch
 import torch.nn.functional as F
@@ -386,14 +386,16 @@ def get_attached_multimodal_embeddings(
 
 
 def find_input_mm_embeds(
-        mm_embeds: List[torch.Tensor],
+        mm_embeds: Sequence[torch.Tensor],
         multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
     """
     Find the multimodal mm_embeds that need processing from multimodal_params for each batch.
     Supports both KV cache reuse and chunked prefill scenarios.
 
     Args:
-        - mm_embeds: List[torch.Tensor] - Multimodal embeddings for each batch
+        - mm_embeds: Multimodal embeddings. A tuple marks cache-owned item
+          segments that must remain separate; a list uses the existing
+          per-request or pre-concatenated batching modes.
         - multimodal_params: List[MultimodalParams] - Multimodal parameters with runtime data
 
     Returns:
@@ -419,20 +421,20 @@ def find_input_mm_embeds(
           executor-precomputed ``mm_token_indices`` / ``text_token_indices``
           through to that call — see the contract there.
     """
-    if not isinstance(mm_embeds, list):
-        raise TypeError("mm_embeds must be a list")
+    if not isinstance(mm_embeds, (list, tuple)):
+        raise TypeError("mm_embeds must be a list or tuple")
 
-    # Current support two batching modes:
-    # 1. Pre-concatenated mm_embeds for each batch, i.e., len(mm_embeds) == 1
-    # 2. Individual mm_embeds for each multimodal param, i.e., len(mm_embeds) == len(multimodal_params)
-    if len(mm_embeds) > 1 and len(mm_embeds) != len(multimodal_params):
+    is_segmented = isinstance(mm_embeds, tuple)
+
+    if (not is_segmented and len(mm_embeds) > 1
+            and len(mm_embeds) != len(multimodal_params)):
         raise ValueError(
-            f"Number of mm_embeds ({len(mm_embeds)}) does not match number of multimodal params ({len(multimodal_params)})."
-        )
+            f"Number of mm_embeds ({len(mm_embeds)}) does not match number of "
+            f"multimodal params ({len(multimodal_params)}).")
 
     if not multimodal_params or multimodal_params[0].multimodal_runtime is None:
         # No slicing, return the full mm_embeds
-        return mm_embeds
+        return list(mm_embeds)
 
     total_mm_tokens = sum(param.multimodal_runtime.num_mm_tokens_in_chunk
                           for param in multimodal_params
@@ -450,25 +452,70 @@ def find_input_mm_embeds(
         )
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
-        return mm_embeds
+        return list(mm_embeds)
 
-    current_pos = 0
-    slices = []
+    if not is_segmented:
+        current_pos = 0
+        slices = []
+        for param in multimodal_params:
+            runtime = param.multimodal_runtime
+            if runtime is None:
+                continue
+            local_start_pos = runtime.num_cached_mm_tokens
+            local_end_pos = local_start_pos + runtime.num_mm_tokens_in_chunk
+            slices.append(
+                (current_pos + local_start_pos, current_pos + local_end_pos))
+            if len(mm_embeds) == 1:
+                current_pos += runtime.total_embeds_in_request
+
+        if len(mm_embeds) == 1:
+            return [
+                _join_embeddings(
+                    [mm_embeds[0][start:end] for start, end in slices])
+            ]
+        return [
+            mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)
+        ]
+
+    request_start = 0
+    active_ranges = []
     for param in multimodal_params:
         runtime = param.multimodal_runtime
         if runtime is None:
             continue
         local_start_pos = runtime.num_cached_mm_tokens
         local_end_pos = local_start_pos + runtime.num_mm_tokens_in_chunk
-        slices.append(
-            (current_pos + local_start_pos, current_pos + local_end_pos))
-        if len(mm_embeds) == 1:  # pre-concatenated; advance global cursor
-            current_pos += runtime.total_embeds_in_request
+        active_ranges.append(
+            (request_start + local_start_pos, request_start + local_end_pos))
+        request_start += runtime.total_embeds_in_request
 
-    if len(mm_embeds) == 1:
-        sliced = [mm_embeds[0][start:end] for start, end in slices]
-        return [_join_embeddings(sliced)]
-    return [mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)]
+    # Preserve cache-owned item segmentation. Each active range may intersect
+    # one or more input segments; return views in prompt order and let fusion
+    # scatter them directly without a final concatenation allocation.
+    active_segments = []
+    segment_start = 0
+    range_idx = 0
+    for segment in mm_embeds:
+        segment_end = segment_start + segment.shape[0]
+        while range_idx < len(
+                active_ranges) and active_ranges[range_idx][1] <= segment_start:
+            range_idx += 1
+        scan_idx = range_idx
+        while scan_idx < len(
+                active_ranges) and active_ranges[scan_idx][0] < segment_end:
+            active_start, active_end = active_ranges[scan_idx]
+            overlap_start = max(segment_start, active_start)
+            overlap_end = min(segment_end, active_end)
+            if overlap_start < overlap_end:
+                active_segments.append(
+                    segment[overlap_start - segment_start:overlap_end -
+                            segment_start])
+            if active_end <= segment_end:
+                scan_idx += 1
+            else:
+                break
+        segment_start = segment_end
+    return active_segments
 
 
 def filter_mm_token_from_input_ids(
@@ -565,7 +612,7 @@ def fuse_input_embeds(
             return input_ids, None, extra_embeds
         return input_ids, None
 
-    mm_embed = _join_embeddings(mm_embeds)
+    total_mm_rows = sum(mm_embed.shape[0] for mm_embed in mm_embeds)
 
     # TODO: support the case where only one index tensor is provided, the other is derived as the complement (try to avoid implicit host-device synchronization)
     if text_token_indices is None or mm_token_indices is None:
@@ -574,10 +621,10 @@ def fuse_input_embeds(
             input_ids,
             vocab_size=embedding_layer.num_embeddings,
             mm_token_ids=mm_token_ids)
-    if mm_token_indices.shape[0] != mm_embed.shape[0]:
+    if mm_token_indices.shape[0] != total_mm_rows:
         raise ValueError(
             f"Multimodal token count mismatch: found {len(mm_token_indices)} image tokens in input_ids "
-            f"but received {mm_embed.shape[0]} image embeddings.")
+            f"but received {total_mm_rows} image embeddings.")
 
     if mm_token_ids is not None:
         # In-vocab fast path: caller declared mm tokens are real vocabulary
@@ -593,7 +640,7 @@ def fuse_input_embeds(
         # scatter into a fresh buffer.
         text_embed = embedding_layer(input_ids[text_token_indices])
         input_embeds = torch.empty(input_ids.shape[0],
-                                   mm_embed.shape[-1],
+                                   mm_embeds[0].shape[-1],
                                    device=text_embed.device,
                                    dtype=text_embed.dtype)
         input_embeds[text_token_indices, :] = text_embed
@@ -602,15 +649,19 @@ def fuse_input_embeds(
         for i, extra_feature in enumerate(extra_embeds):
             extra_embed = torch.zeros(
                 input_ids.shape[0],
-                mm_embed.shape[-1],
+                mm_embeds[0].shape[-1],
                 device=extra_feature.device,
                 dtype=extra_feature.dtype,
             )
             extra_embed[mm_token_indices, :] = extra_feature
             extra_embeds[i] = extra_embed
 
-    input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
-                                                    device=input_embeds.device)
+    row_start = 0
+    for mm_embed in mm_embeds:
+        row_end = row_start + mm_embed.shape[0]
+        input_embeds[mm_token_indices[row_start:row_end], :] = mm_embed.to(
+            dtype=input_embeds.dtype, device=input_embeds.device)
+        row_start = row_end
     if extra_embeds is not None and len(extra_embeds) > 0:
         return None, cast(torch.FloatTensor, input_embeds), extra_embeds
     return None, cast(torch.FloatTensor, input_embeds)

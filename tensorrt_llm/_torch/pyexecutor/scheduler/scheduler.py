@@ -7,6 +7,7 @@ import dataclasses
 import inspect
 from abc import ABC, abstractmethod
 from collections import namedtuple
+from collections.abc import Hashable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional, Set, TypeAlias, TypeVar
@@ -16,6 +17,8 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import internal as tb_internal
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
+
+from ...tensor_lru_cache import CacheAllocationKind, TensorLRUCache
 
 # Assuming these imports exist in your environment
 from ..llm_request import (
@@ -75,8 +78,12 @@ SchedulerOutput = namedtuple(
         # request id -> prompt-ordered indices of its MM items selected for
         # encoder execution this iteration
         "scheduled_mm_encoder_items",
+        # requests excluded from LLM scheduling by MM output readiness
+        "mm_encoder_blocked_request_ids",
+        # exact physical cache entries removed before producer execution
+        "mm_encoder_cache_removals",
     ],
-    defaults=[None],
+    defaults=[None, None, None],
 )
 
 
@@ -180,6 +187,10 @@ class ScheduledRequests:
     """Maps a request id to the prompt-ordered indices of its multimodal items
     selected for encoder execution this iteration (only items whose encoder
     outputs are still missing). ``None`` when no items were scheduled."""
+    mm_encoder_blocked_request_ids: list[int] | None
+    """Request IDs excluded from LLM scheduling by MM readiness."""
+    mm_encoder_cache_removals: list[Hashable] | None
+    """Exact physical encoder-cache entries removed before production."""
 
     def __init__(self):
         self.encoder_requests: RequestList = []
@@ -189,6 +200,8 @@ class ScheduledRequests:
         self.paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+        self.mm_encoder_blocked_request_ids: list[int] | None = None
+        self.mm_encoder_cache_removals: list[Hashable] | None = None
 
     @property
     def is_generation_only(self) -> bool:
@@ -309,6 +322,8 @@ class SerializableSchedulerOutput:
     # request id -> prompt-ordered indices of its MM items selected for
     # encoder execution this iteration
     scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+    mm_encoder_blocked_request_ids: list[int] | None = None
+    mm_encoder_cache_removals: list[Hashable] | None = None
 
     @classmethod
     def from_scheduler_result(
@@ -334,6 +349,8 @@ class SerializableSchedulerOutput:
             num_fitting_requests=num_fitting_requests,
             wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
             scheduled_mm_encoder_items=scheduled_requests.scheduled_mm_encoder_items,
+            mm_encoder_blocked_request_ids=(scheduled_requests.mm_encoder_blocked_request_ids),
+            mm_encoder_cache_removals=scheduled_requests.mm_encoder_cache_removals,
         )
 
     def to_scheduler_result(
@@ -357,6 +374,8 @@ class SerializableSchedulerOutput:
             id_to_request[req_id] for req_id in self.paused_requests
         ]
         scheduled_requests.scheduled_mm_encoder_items = self.scheduled_mm_encoder_items
+        scheduled_requests.mm_encoder_blocked_request_ids = self.mm_encoder_blocked_request_ids
+        scheduled_requests.mm_encoder_cache_removals = self.mm_encoder_cache_removals
         fitting_disagg_gen_init_requests = [
             id_to_request[req_id] for req_id in self.fitting_disagg_gen_init_requests
         ]
@@ -524,7 +543,7 @@ class SimpleScheduler(RequestScheduler):
 
 
 class MultimodalScheduler(RequestScheduler):
-    """Add atomic multimodal item budgeting around the existing scheduler.
+    """Add cache-aware atomic MM item budgeting around the LLM scheduler.
 
     The wrapper is constructed only for ``MultimodalModelMixin`` models. It
     deliberately reuses the wrapped scheduler's capacity and microbatch
@@ -536,12 +555,10 @@ class MultimodalScheduler(RequestScheduler):
     attention sequences. Those attention metadata capacities are derived
     separately from the token budget and model geometry.
 
-    When ``output_budget_bytes`` is configured, selection also enforces the
-    encoder output byte budget (allocate-before-compute): an item is only
-    selected when its embedding bytes fit alongside the outputs already
-    resident on live requests and bytes claimed earlier in the pass.
-    Occupancy is derived from request states each pass rather than tracked
-    by a counter, so a stripped or aborted request self-heals the budget.
+    The scheduling lane allocates prompt-ordered cache entries before charging
+    compute. READY hits and existing reservations consume no encoder budget;
+    only a new reservation selects one producer. The cache owns byte
+    accounting, references, retention, and exact pre-launch LRU victims.
     """
 
     def __init__(
@@ -550,26 +567,20 @@ class MultimodalScheduler(RequestScheduler):
         max_batch_size: int,
         max_num_tokens: int,
         *,
-        output_budget_bytes: int | None = None,
-        bytes_per_encoder_embedding: int = 0,
+        encoder_cache: TensorLRUCache[Hashable],
+        get_cache_item_keys: Callable[[LlmRequest], list[Hashable] | None],
+        bytes_per_encoder_embedding: int,
+        retain_cache_entries: bool,
     ) -> None:
         self.scheduler = scheduler
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
-        # Optional byte budget for encoder outputs living outside a forward
-        # pass. Item selection performs allocate-before-compute against it:
-        # occupancy is *derived* each pass from live request states (their
-        # recorded, not-yet-consumed outputs) — there is no counter to
-        # release or keep in sync; a stripped or aborted request simply
-        # stops contributing. `bytes_per_encoder_embedding` converts declared
-        # embedding rows to bytes and must be positive alongside a budget.
-        self.output_budget_bytes = output_budget_bytes
+        self.encoder_cache = encoder_cache
+        self.get_cache_item_keys = get_cache_item_keys
         self.bytes_per_encoder_embedding = bytes_per_encoder_embedding
-        if output_budget_bytes is not None and bytes_per_encoder_embedding <= 0:
-            raise ValueError(
-                "bytes_per_encoder_embedding must be positive when a byte "
-                "budget bounds MM encoder outputs"
-            )
+        self.retain_cache_entries = retain_cache_entries
+        if bytes_per_encoder_embedding <= 0:
+            raise ValueError("bytes_per_encoder_embedding must be positive")
         self.has_separate_stages = hasattr(scheduler, "capacity_scheduler") and hasattr(
             scheduler, "micro_batch_scheduler"
         )
@@ -578,23 +589,95 @@ class MultimodalScheduler(RequestScheduler):
     def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
         return self.scheduler.scheduling_state_range
 
-    def _total_resident_output_bytes(self, active_requests: RequestList) -> int:
-        """Sum per-request resident encoder-output bytes across live states.
+    @staticmethod
+    def _transient_entry_id(request: LlmRequest, item_idx: int) -> Hashable:
+        return ("mm_transient", request.request_id, item_idx)
 
-        Summed fresh every pass: a request whose outputs were consumed
-        (stripped post-prefill) or that was aborted no longer contributes,
-        so the accounting self-heals with no release bookkeeping.
-        """
-        return sum(
-            state.resident_output_bytes(self.bytes_per_encoder_embedding)
-            for request in active_requests
-            if (state := request.py_mm_encoder_state) is not None
-        )
+    def _request_entry_ids(self, request: LlmRequest) -> tuple[list[Hashable], bool]:
+        state = request.py_mm_encoder_state
+        if state is None:
+            raise RuntimeError("MM cache allocation requires encoder request state")
+        stable_keys = self.get_cache_item_keys(request)
+        if stable_keys is None:
+            return (
+                [
+                    self._transient_entry_id(request, item_idx)
+                    for item_idx in range(state.num_items)
+                ],
+                False,
+            )
+        if len(stable_keys) != state.num_items:
+            raise ValueError("MM encoder cache keys must match request item count")
+        return list(stable_keys), self.retain_cache_entries
+
+    def _allocate_request_entries(self, request: LlmRequest) -> tuple[bool, list[int]]:
+        """Allocate every unbound item, rolling back this attempt on pressure."""
+        state = request.py_mm_encoder_state
+        if state is None:
+            return True, []
+        entry_ids, retain_after_release = self._request_entry_ids(request)
+        expected_bytes_by_entry: dict[Hashable, int] = {}
+        for item_idx, entry_id in enumerate(entry_ids):
+            expected_bytes = state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+            previous_bytes = expected_bytes_by_entry.setdefault(entry_id, expected_bytes)
+            if previous_bytes != expected_bytes:
+                raise ValueError("duplicate MM encoder cache keys must have matching output sizes")
+        request_bytes = sum(expected_bytes_by_entry.values())
+        if request_bytes > self.encoder_cache.max_bytes:
+            raise RuntimeError(
+                format_multimodal_encoder_output_budget_error(
+                    request_bytes,
+                    self.encoder_cache.max_bytes,
+                    self.max_num_tokens,
+                    request_id=request.py_request_id,
+                )
+            )
+        acquired_item_indices: list[int] = []
+        for item_idx, entry_id in enumerate(entry_ids):
+            if state.entry_ids[item_idx] is not None:
+                if state.entry_ids[item_idx] != entry_id:
+                    raise RuntimeError("MM request cache entry identity changed")
+                continue
+            if state.recorded[item_idx]:
+                # Compatibility for pre-unification request state constructed
+                # with an already-owned output. The unified path always has a
+                # binding for a ready item.
+                continue
+            expected_bytes = state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+            allocation = self.encoder_cache.allocate(
+                entry_id,
+                expected_bytes,
+                retain_after_release=retain_after_release,
+            )
+            if allocation is None:
+                for acquired_item_idx in reversed(acquired_item_indices):
+                    acquired_entry_id = state.unbind_entry(acquired_item_idx)
+                    self.encoder_cache.release(acquired_entry_id)
+                return False, []
+            state.bind_entry(
+                item_idx,
+                entry_id,
+                ready=allocation is CacheAllocationKind.READY_HIT,
+            )
+            acquired_item_indices.append(item_idx)
+        return True, acquired_item_indices
+
+    def _rollback_request_entries(
+        self, request: LlmRequest, acquired_item_indices: list[int]
+    ) -> None:
+        state = request.py_mm_encoder_state
+        if state is None:
+            return
+        for item_idx in reversed(acquired_item_indices):
+            entry_id = state.unbind_entry(item_idx)
+            removed_entry_id = self.encoder_cache.release(entry_id)
+            if removed_entry_id is not None:
+                raise RuntimeError("admission rollback unexpectedly removed a physical entry")
 
     def _select_items(
-        self, requests: RequestList, *, active_requests: RequestList | None = None
-    ) -> tuple[dict[int, list[int]], RequestList]:
-        """Greedily select pending MM items under the encoder budgets.
+        self, requests: RequestList
+    ) -> tuple[dict[int, list[int]], RequestList, list[int], list[Hashable]]:
+        """Allocate output entries and select unique producer items.
 
         Requests are visited in the wrapped capacity scheduler's FCFS order
         with no explicit `MultimodalEncoderProgress`-based priority: a
@@ -602,97 +685,87 @@ class MultimodalScheduler(RequestScheduler):
         anything admitted later, so its remaining items resume before newer
         work by order alone.
 
-        When a byte budget is configured, selection also performs
-        allocate-before-compute, per request rather than per item: a request
-        starts only if its *whole* embedding fits alongside (a) storage
-        already held by live requests (derived from `active_requests`) and
-        (b) bytes claimed earlier in this pass. That matches how the storage
-        is allocated — the first recorded item sizes the buffer for all of
-        them — and means a started request can always finish, so no
-        head-of-line reservation is needed to keep later requests from
-        squatting the space it still needs.
-
-        Returns the selected item indices per request id, plus the requests
-        eligible for LLM microbatch scheduling this iteration (encoder
-        outputs already ready, or every pending item selected above).
+        Cache hits and followers consume no encoder compute budget. A request
+        that acquires new references keeps them only if it can make producer
+        progress (directly or through another selected representative).
         """
         remaining_batch_slots = self.max_batch_size
         remaining_tokens = self.max_num_tokens
-        budget = self.output_budget_bytes
-        resident_bytes = (
-            self._total_resident_output_bytes(
-                active_requests if active_requests is not None else requests
-            )
-            if budget is not None
-            else 0
-        )
-        reserved_bytes = 0
         selected: dict[int, list[int]] = {}
-        llm_eligible: RequestList = []
+        selected_entry_ids: set[Hashable] = set()
+        request_by_id = {request.request_id: request for request in requests}
 
         for request in requests:
             state = request.py_mm_encoder_state
-            if state is None:
-                llm_eligible.append(request)
+            if state is None or is_multimodal_encoder_ready(request):
                 continue
-            if is_multimodal_encoder_ready(request):
-                llm_eligible.append(request)
+            allocated, acquired_item_indices = self._allocate_request_entries(request)
+            if not allocated:
                 continue
-
-            # Admission validates user-provided item metadata and stores an
-            # owned copy on the request state. Reading only that state here
-            # keeps malformed-input failures scoped to the affected request
-            # instead of raising from the scheduler loop.
-            token_lengths = state.encoder_token_lengths
-
-            pending = state.pending_item_indices()
-            # The first item scheduled for a request allocates the storage for
-            # *all* of its items, so the byte budget is charged once per
-            # request rather than per item. A request that cannot be charged
-            # yet stays fully pending instead of occupying part of the budget
-            # with work that cannot be prefilled until it completes.
-            if (
-                budget is not None
-                and not state.has_storage
-                and pending
-                and remaining_batch_slots > 0
-                and token_lengths[pending[0]] <= remaining_tokens
-            ):
-                request_bytes = sum(state.embedding_lengths) * self.bytes_per_encoder_embedding
-                if request_bytes > budget:
-                    # Liveness backstop: admission
-                    # (`initialize_multimodal_encoder_request`) already
-                    # rejects requests whose outputs can never coexist
-                    # within the budget, so reaching this means an
-                    # accounting bug rather than a user input.
-                    raise RuntimeError(
-                        format_multimodal_encoder_output_budget_error(
-                            request_bytes,
-                            budget,
-                            self.max_num_tokens,
-                            request_id=request.py_request_id,
-                        )
-                    )
-                if resident_bytes + reserved_bytes + request_bytes > budget:
-                    continue
-                reserved_bytes += request_bytes
-
             request_items: list[int] = []
-            for item_idx in pending:
-                cost = token_lengths[item_idx]
+            for item_idx in state.pending_item_indices():
+                entry_id = state.entry_ids[item_idx]
+                if entry_id is None:
+                    raise RuntimeError("allocated MM item has no cache entry")
+                if entry_id in selected_entry_ids:
+                    continue
+                cost = state.encoder_token_lengths[item_idx]
                 if remaining_batch_slots == 0 or cost > remaining_tokens:
                     break
                 request_items.append(item_idx)
+                selected_entry_ids.add(entry_id)
                 remaining_batch_slots -= 1
                 remaining_tokens -= cost
 
             if request_items:
                 selected[request.request_id] = request_items
 
-            if pending and len(request_items) == len(pending):
-                llm_eligible.append(request)
+            pending_entry_ids = {
+                state.entry_ids[item_idx] for item_idx in state.pending_item_indices()
+            }
+            if (
+                acquired_item_indices
+                and pending_entry_ids
+                and not (pending_entry_ids & selected_entry_ids)
+            ):
+                self._rollback_request_entries(request, acquired_item_indices)
 
-        return selected, llm_eligible
+        llm_eligible: RequestList = []
+        blocked_request_ids: list[int] = []
+        for request in requests:
+            state = request.py_mm_encoder_state
+            if state is None:
+                llm_eligible.append(request)
+                continue
+            projected_ready = all(
+                ready or (entry_id is not None and entry_id in selected_entry_ids)
+                for ready, entry_id in zip(state.recorded, state.entry_ids, strict=True)
+            )
+            if projected_ready:
+                llm_eligible.append(request)
+            else:
+                blocked_request_ids.append(request.request_id)
+
+        removals: list[Hashable] = []
+        planned_producer_bytes = 0
+        for request_id, item_indices in selected.items():
+            request = request_by_id[request_id]
+            state = request.py_mm_encoder_state
+            assert state is not None
+            for item_idx in item_indices:
+                entry_id = state.entry_ids[item_idx]
+                assert entry_id is not None
+                removals.extend(
+                    self.encoder_cache.evict_for(
+                        entry_id,
+                        additional_bytes=planned_producer_bytes,
+                    )
+                )
+                planned_producer_bytes += (
+                    state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+                )
+
+        return selected, llm_eligible, blocked_request_ids, removals
 
     def _schedule_micro_batch(
         self,
@@ -703,6 +776,8 @@ class MultimodalScheduler(RequestScheduler):
         *,
         llm_eligible: RequestList,
         selected_items: dict[int, list[int]] | None = None,
+        blocked_request_ids: list[int] | None = None,
+        cache_removals: list[Hashable] | None = None,
     ) -> SchedulerOutput:
         encoder_requests, context_requests, generation_requests = (
             self.scheduler.micro_batch_scheduler.schedule(llm_eligible, inflight_request_ids)
@@ -715,6 +790,8 @@ class MultimodalScheduler(RequestScheduler):
             fitting_disagg_gen_init_requests=list(fitting_disagg_gen_init_requests),
             num_fitting_requests=len(fitting_requests),
             scheduled_mm_encoder_items=selected_items or None,
+            mm_encoder_blocked_request_ids=blocked_request_ids or None,
+            mm_encoder_cache_removals=cache_removals or None,
         )
 
     def schedule_request(
@@ -738,13 +815,17 @@ class MultimodalScheduler(RequestScheduler):
             scheduler_output = self.scheduler.schedule_request(
                 active_requests, inflight_request_ids
             )
-            selected_items, llm_eligible = self._select_items(
-                list(scheduler_output.context_requests),
-                active_requests=active_requests,
-            )
+            (
+                selected_items,
+                llm_eligible,
+                blocked_request_ids,
+                cache_removals,
+            ) = self._select_items(list(scheduler_output.context_requests))
             return scheduler_output._replace(
                 context_requests=llm_eligible,
                 scheduled_mm_encoder_items=selected_items or None,
+                mm_encoder_blocked_request_ids=blocked_request_ids or None,
+                mm_encoder_cache_removals=cache_removals or None,
             )
 
         # Only requests admitted by ordinary LLM/KV capacity may consume MM
@@ -752,9 +833,12 @@ class MultimodalScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.scheduler.capacity_scheduler.schedule_request(active_requests)
         )
-        selected_items, llm_eligible = self._select_items(
-            list(fitting_requests), active_requests=active_requests
-        )
+        (
+            selected_items,
+            llm_eligible,
+            blocked_request_ids,
+            cache_removals,
+        ) = self._select_items(list(fitting_requests))
         # Preserve the capacity scheduler's decisions while attaching the MM
         # item plan that the executor must run before the selected LLM
         # microbatch.
@@ -765,6 +849,40 @@ class MultimodalScheduler(RequestScheduler):
             inflight_request_ids,
             llm_eligible=llm_eligible,
             selected_items=selected_items,
+            blocked_request_ids=blocked_request_ids,
+            cache_removals=cache_removals,
+        )
+
+    def replay_request(
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+        *,
+        blocked_request_ids: list[int] | None,
+        scheduled_items: dict[int, list[int]] | None,
+        cache_removals: list[Hashable] | None,
+    ) -> SchedulerOutput:
+        """Replay authority MM filtering while preserving local LLM side effects."""
+        if not self.has_separate_stages:
+            raise RuntimeError(
+                "MM follower replay requires separate capacity and microbatch schedulers"
+            )
+        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
+            self.scheduler.capacity_scheduler.schedule_request(active_requests)
+        )
+        blocked = set(blocked_request_ids or ())
+        llm_eligible = [
+            request for request in fitting_requests if request.request_id not in blocked
+        ]
+        return self._schedule_micro_batch(
+            fitting_requests,
+            fitting_disagg_gen_init_requests,
+            paused_requests,
+            inflight_request_ids,
+            llm_eligible=llm_eligible,
+            selected_items=scheduled_items,
+            blocked_request_ids=blocked_request_ids,
+            cache_removals=cache_removals,
         )
 
     def can_schedule(self, requests: RequestList) -> bool:
@@ -783,11 +901,20 @@ class MultimodalEagerEncoderScheduler(MultimodalScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
-        selected_items, llm_eligible = self._select_items(active_requests)
+        (
+            selected_items,
+            llm_eligible,
+            blocked_request_ids,
+            cache_removals,
+        ) = self._select_items(active_requests)
 
         if not self.has_separate_stages:
             scheduler_output = self.scheduler.schedule_request(llm_eligible, inflight_request_ids)
-            return scheduler_output._replace(scheduled_mm_encoder_items=selected_items or None)
+            return scheduler_output._replace(
+                scheduled_mm_encoder_items=selected_items or None,
+                mm_encoder_blocked_request_ids=blocked_request_ids or None,
+                mm_encoder_cache_removals=cache_removals or None,
+            )
 
         llm_eligible_ids = {request.request_id for request in llm_eligible}
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
@@ -803,6 +930,8 @@ class MultimodalEagerEncoderScheduler(MultimodalScheduler):
             inflight_request_ids,
             llm_eligible=fitting_llm_eligible,
             selected_items=selected_items,
+            blocked_request_ids=blocked_request_ids,
+            cache_removals=cache_removals,
         )
 
 

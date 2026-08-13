@@ -29,7 +29,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
-                                            strip_mm_data_for_generation)
+                                            strip_mm_data_for_generation,
+                                            strip_mm_encoder_inputs)
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor,
                                           create_input_processor,
@@ -78,7 +79,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
-from ..tensor_lru_cache import TensorLRUCache
+from ..tensor_lru_cache import CacheEntryState, TensorLRUCache
 from ..utils import (get_model_extra_attrs,
                      get_per_request_prefill_cuda_graph_flag,
                      set_per_request_prefill_cuda_graph_flag,
@@ -93,6 +94,7 @@ from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import (LlmRequest, LlmRequestState,
+                          MultimodalEncoderProgress,
                           MultimodalEncoderRequestError, _Unset,
                           get_draft_token_length,
                           get_multimodal_embedding_lengths)
@@ -555,11 +557,11 @@ class PyTorchModelEngine(ModelEngine):
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
         # Item scheduling is declared once, as a model capability (the
-        # `MultimodalModelMixin` ClassVar). The engine stores only the
-        # actionable flag: whether the item-scheduling wiring is engaged this
-        # run (setup below, scheduler wrap, executor encoder step). A
-        # `DISABLED` policy keeps the capability but runs only the base LLM
-        # scheduler with legacy inline encode.
+        # `MultimodalModelMixin` ClassVar). The engine stores whether the
+        # item-scheduling protocol is active across the pipeline. Individual
+        # encoder/cache operations additionally check PP ownership at their
+        # call sites. A `DISABLED` policy keeps the capability but runs only
+        # the base LLM scheduler with legacy inline encode.
         _mm_config = getattr(self.llm_args, "multimodal_config", None)
         _mm_scheduling_policy = (_mm_config.encoder_scheduling_policy
                                  if _mm_config is not None else
@@ -587,9 +589,8 @@ class PyTorchModelEngine(ModelEngine):
         #       post-encoder embeddings produced by one legal encoder iteration,
         #       converted to bytes. Enforced by the scheduler; any capacity not
         #       materialized by warmup is reserved in KV-capacity estimation.
-        #   (D) reuse cache bytes — `encoder_cache_max_bytes` on the mixin's
-        #       `TensorLRUCache`, self-bounded by LRU; unprofiled capacity is
-        #       reserved on top of (C) for cache-enabled models.
+        #   (D) optional reuse retention — `encoder_cache_max_bytes` may raise
+        #       the one store's capacity above (C); it is not a second pool.
         # Prefill currently waits for every item in a request, so admission
         # rejects a request whose complete MM embedding exceeds (C).
         if self.mm_encoder_item_scheduling_enabled:
@@ -642,6 +643,13 @@ class PyTorchModelEngine(ModelEngine):
                         f"{self.mm_encoder_attention_metadata_capacity}.")
             self.mm_encoder_output_budget_bytes = (
                 self._resolve_mm_encoder_output_budget_bytes())
+            if mapping.is_first_pp_rank():
+                encoder_cache = self.model._get_multimodal_encoder_cache(
+                    required_capacity_bytes=self.mm_encoder_output_budget_bytes)
+                if encoder_cache is None:
+                    raise RuntimeError(
+                        "MM encoder item scheduling failed to initialize its "
+                        "required output store")
         self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
@@ -3290,106 +3298,204 @@ class PyTorchModelEngine(ModelEngine):
         self,
         requests: List[LlmRequest],
         scheduled_items: Dict[int, List[int]],
+        *,
+        is_cache_authority: bool = True,
     ) -> None:
-        """Forward selected MM encoder items and commit request-local outputs."""
+        """Forward selected producer items into the unified encoder cache."""
         if not scheduled_items:
             return
         if not isinstance(self.model, MultimodalModelMixin):
             raise TypeError(
                 "Item-level MM scheduling requires MultimodalModelMixin")
-
-        # Read-through against the model's encoder cache when enabled
-        # (`supports_encoder_cache` + `encoder_cache_max_bytes > 0`): a hit
-        # records a clone and skips the encode; a miss encodes, records, and
-        # populates the cache. The hit/miss branch runs here — at encode time,
-        # on every rank against rank-local cache state — so ranks perform
-        # identical get/put sequences and stay in sync. When the cache is off
-        # (`encoder_cache` is None), every item is a miss and outputs live only
-        # on the request. Records take a clone regardless, so a recorded slot
-        # never aliases a batch output or an evictable cache entry.
         encoder_cache = self.mm_encoder_cache
+        if encoder_cache is None:
+            raise RuntimeError(
+                "MM item scheduling requires a model-owned encoder cache")
         request_by_id = {request.request_id: request for request in requests}
-        miss_items = []
-        miss_owners: List[Tuple[LlmRequest, int, Optional[Hashable]]] = []
-        touched_requests: Dict[int, LlmRequest] = {}
+        producer_items = []
+        producer_owners: List[Tuple[LlmRequest, int, Hashable]] = []
+        producer_entry_ids: set[Hashable] = set()
+
+        def dependent_request_ids(entry_ids: set[Hashable]) -> set[int]:
+            return {
+                request.request_id
+                for request in requests
+                if request.py_mm_encoder_state is not None and any(
+                    entry_id in entry_ids
+                    for entry_id in request.py_mm_encoder_state.entry_ids
+                    if entry_id is not None)
+            }
+
         for request_id, item_indices in scheduled_items.items():
             request = request_by_id.get(request_id)
             if request is None:
                 raise MultimodalEncoderRequestError(
-                    f"Scheduled MM request {request_id} is no longer active")
+                    f"Scheduled MM request {request_id} is no longer active",
+                    request_ids={request_id})
             state = request.py_mm_encoder_state
             if state is None:
                 raise MultimodalEncoderRequestError(
                     f"Scheduled MM request {request_id} has no encoder "
-                    "item state")
-            touched_requests[request_id] = request
+                    "item state",
+                    request_ids={request_id})
             multimodal_param = MultimodalParams(
                 multimodal_data=request.py_multimodal_data)
-            # Scope the lookup to this iteration's items: probing an item the
-            # budget cannot encode yet would still refresh its LRU recency and
-            # reorder eviction against items actually in flight.
-            # Keys come from the request: the executor's params carry
-            # `py_multimodal_data` only, while the content hashes live on the
-            # `LlmRequest`.
-            item_keys = (self.get_mm_encoder_item_keys(request)
-                         if encoder_cache is not None else None)
-            try:
-                partition = (self.model.partition_encoder_cache(
-                    multimodal_param,
-                    encoder_cache,
-                    item_indices=item_indices,
-                    keys=item_keys) if item_keys is not None else None)
-            except MultimodalEncoderContractError as error:
-                raise MultimodalEncoderRequestError(str(error)) from error
-            if partition is None:
-                # No cache, or the request cannot build stable content keys:
-                # every scheduled item is a miss and its output lives only on
-                # the request.
-                for item_idx in item_indices:
-                    miss_items.append((multimodal_param, item_idx))
-                    miss_owners.append((request, item_idx, None))
-                continue
-            for item_idx, cached in partition.hits.items():
-                state.record(item_idx, cached)
-            for item_idx in partition.miss_indices:
-                miss_items.append((multimodal_param, item_idx))
-                miss_owners.append(
-                    (request, item_idx, partition.keys[item_idx]))
+            for item_idx in item_indices:
+                entry_id = state.entry_ids[item_idx]
+                if entry_id is None:
+                    raise MultimodalEncoderRequestError(
+                        f"Scheduled MM item {item_idx} has no cache entry",
+                        request_ids={request_id})
+                if state.recorded[item_idx]:
+                    raise MultimodalEncoderRequestError(
+                        f"Scheduled MM item {item_idx} is already ready",
+                        request_ids={request_id})
+                if entry_id in producer_entry_ids:
+                    raise MultimodalEncoderRequestError(
+                        "MM scheduler selected more than one producer for one cache entry",
+                        request_ids=dependent_request_ids({entry_id}),
+                    )
+                producer_entry_ids.add(entry_id)
+                producer_items.append((multimodal_param, item_idx))
+                producer_owners.append((request, item_idx, entry_id))
 
-        if miss_items:
-            try:
-                encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
-                    miss_items)
-            except MultimodalEncoderContractError as error:
-                raise MultimodalEncoderRequestError(str(error)) from error
-            for encoder_input, _, _ in encoder_inputs:
-                encoder_input.to_device(
-                    "multimodal_data",
-                    "cuda",
-                    pin_memory=prefer_pinned(),
-                    target_keywords=getattr(self.model,
-                                            "multimodal_data_device_paths",
-                                            None),
-                )
+        try:
+            encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
+                producer_items)
+        except MultimodalEncoderContractError as error:
+            raise MultimodalEncoderRequestError(
+                str(error),
+                request_ids=dependent_request_ids(producer_entry_ids),
+            ) from error
+        for encoder_input, _, _ in encoder_inputs:
+            encoder_input.to_device(
+                "multimodal_data",
+                "cuda",
+                pin_memory=prefer_pinned(),
+                target_keywords=getattr(self.model,
+                                        "multimodal_data_device_paths", None),
+            )
 
-            try:
-                outputs = self.model.forward_multimodal_encoder_items(
-                    encoder_inputs)
-            except MultimodalEncoderContractError as error:
-                raise MultimodalEncoderRequestError(str(error)) from error
-            if len(outputs) != len(miss_owners):
+        try:
+            outputs = self.model.forward_multimodal_encoder_items(
+                encoder_inputs)
+        except MultimodalEncoderContractError as error:
+            raise MultimodalEncoderRequestError(
+                str(error),
+                request_ids=dependent_request_ids(producer_entry_ids),
+            ) from error
+        if len(outputs) != len(producer_owners):
+            raise MultimodalEncoderRequestError(
+                "MM item encoder must return one output per item",
+                request_ids=dependent_request_ids(producer_entry_ids),
+            )
+
+        for output, (request, item_idx, entry_id) in zip(outputs,
+                                                         producer_owners,
+                                                         strict=True):
+            state = request.py_mm_encoder_state
+            assert state is not None
+            expected_rows = state.embedding_lengths[item_idx]
+            if output.shape[0] != expected_rows:
                 raise MultimodalEncoderRequestError(
-                    "MM item encoder must return one output per item")
+                    f"MM item {item_idx} produced {output.shape[0]} embeddings; "
+                    f"expected {expected_rows}",
+                    request_ids=dependent_request_ids({entry_id}),
+                )
+            expected_bytes = (expected_rows *
+                              self.bytes_per_mm_encoder_embedding)
+            expected_state = (CacheEntryState.RESERVED
+                              if is_cache_authority else CacheEntryState.ABSENT)
+            encoder_cache.put(entry_id,
+                              output,
+                              expected_state=expected_state,
+                              expected_bytes=expected_bytes)
+            for live_request in requests:
+                live_state = live_request.py_mm_encoder_state
+                if live_state is not None:
+                    live_state.mark_entry_ready(entry_id)
 
-            for output, (request, item_idx, key) in zip(outputs,
-                                                        miss_owners,
-                                                        strict=True):
-                request.py_mm_encoder_state.record(item_idx, output)
-                if encoder_cache is not None and key is not None:
-                    encoder_cache.put(key, output)
+        for request in requests:
+            state = request.py_mm_encoder_state
+            if state is not None and state.progress is MultimodalEncoderProgress.READY:
+                strip_mm_encoder_inputs(request.py_multimodal_data)
 
-        for request in touched_requests.values():
-            request.py_mm_encoder_state.finalize(request.py_multimodal_data)
+    def replay_multimodal_cache_plan(
+        self,
+        requests: List[LlmRequest],
+        scheduled_requests: ScheduledRequests,
+        *,
+        is_cache_authority: bool,
+    ) -> None:
+        """Apply one authority schedule to logical or physical cache state."""
+        encoder_cache = self.mm_encoder_cache
+        if encoder_cache is None:
+            raise RuntimeError(
+                "MM item scheduling requires a model-owned encoder cache")
+
+        removals = scheduled_requests.mm_encoder_cache_removals or ()
+        if not is_cache_authority:
+            for entry_id in removals:
+                encoder_cache.pop(entry_id,
+                                  expected_state=CacheEntryState.READY)
+
+            relevant_request_ids = set(
+                scheduled_requests.mm_encoder_blocked_request_ids or ())
+            relevant_request_ids.update(
+                request.request_id
+                for request in scheduled_requests.context_requests)
+            relevant_request_ids.update(
+                (scheduled_requests.scheduled_mm_encoder_items or {}).keys())
+            for request in requests:
+                state = request.py_mm_encoder_state
+                if state is None or request.request_id not in relevant_request_ids:
+                    continue
+                stable_keys = self.get_mm_encoder_item_keys(request)
+                entry_ids = ([("mm_transient", request.request_id, item_idx)
+                              for item_idx in range(state.num_items)]
+                             if stable_keys is None else stable_keys)
+                if len(entry_ids) != state.num_items:
+                    raise MultimodalEncoderRequestError(
+                        "MM encoder cache keys must match request item count",
+                        request_ids={request.request_id},
+                    )
+                for item_idx, entry_id in enumerate(entry_ids):
+                    bound_entry_id = state.entry_ids[item_idx]
+                    if bound_entry_id is None:
+                        state.bind_entry(item_idx, entry_id, ready=False)
+                    elif bound_entry_id != entry_id:
+                        raise RuntimeError(
+                            "MM request cache entry identity changed during replay"
+                        )
+
+        self.forward_multimodal_encoder_items(
+            requests,
+            scheduled_requests.scheduled_mm_encoder_items or {},
+            is_cache_authority=is_cache_authority,
+        )
+
+        for request in scheduled_requests.context_requests:
+            state = request.py_mm_encoder_state
+            if state is None:
+                continue
+            for item_idx, entry_id in enumerate(state.entry_ids):
+                if entry_id is None:
+                    raise MultimodalEncoderRequestError(
+                        f"Scheduled MM context item {item_idx} has no cache entry",
+                        request_ids={request.request_id},
+                    )
+                if encoder_cache.get(entry_id, record_lookup=False) is None:
+                    raise MultimodalEncoderRequestError(
+                        f"Scheduled MM context item {item_idx} is absent from the encoder cache",
+                        request_ids={request.request_id},
+                    )
+                state.mark_entry_ready(entry_id)
+            if state.progress is not MultimodalEncoderProgress.READY:
+                raise MultimodalEncoderRequestError(
+                    f"Scheduled MM context request {request.request_id} is not ready",
+                    request_ids={request.request_id},
+                )
+            strip_mm_encoder_inputs(request.py_multimodal_data)
 
     def _resolve_mm_encoder_output_budget_bytes(self) -> int:
         """Resolve the byte budget for resident MM encoder outputs.
@@ -3402,10 +3508,11 @@ class PyTorchModelEngine(ModelEngine):
         bytes per encoder embedding; the LLM-side `max_num_tokens` does not
         participate.
 
-        It caps outputs held between encode and prefill and is reserved during
-        KV-capacity estimation. It is separate from the optional reuse cache
-        (`encoder_cache_max_bytes`). A request whose total embedding exceeds
-        this budget is rejected at admission.
+        It is the correctness floor for the one model-owned output store and
+        is reserved during KV-capacity estimation. Optional persistent reuse
+        may raise the store capacity above this floor; it does not create a
+        second pool. A request whose total embedding exceeds this budget is
+        rejected at admission.
         """
         max_output_embeddings = (
             self.input_processor.get_max_mm_encoder_output_embeddings(
@@ -3422,33 +3529,80 @@ class PyTorchModelEngine(ModelEngine):
 
     @property
     def mm_encoder_cache(self) -> Optional[TensorLRUCache]:
-        """The encoder cache the item path reads through, or `None`.
+        """Return the one model-owned multimodal encoder-output cache.
 
-        Only models that opt into the encoder cache
-        (`supports_encoder_cache` with `encoder_cache_max_bytes > 0`)
-        participate — the same lazily created `TensorLRUCache` instance the
-        legacy inline path uses. Item-scheduled models without the flag
-        (e.g. Qwen today) get `None` and never touch the cache; cross-request
-        reuse for them is out of scope here.
+        Item scheduling requires the store even when persistent reuse is off.
+        PP stages after PP0 perform symmetric request validation but own no
+        encoder output store. Legacy execution without reuse also returns
+        `None`.
         """
         model = self.model
-        if not getattr(model, "supports_encoder_cache", False):
+        if not isinstance(model, MultimodalModelMixin):
             return None
-        getter = getattr(model, "_get_multimodal_encoder_cache", None)
-        return getter() if getter is not None else None
+        item_scheduling_enabled = getattr(self,
+                                          "mm_encoder_item_scheduling_enabled",
+                                          False)
+        if item_scheduling_enabled and not self.mapping.is_first_pp_rank():
+            return None
+        if not item_scheduling_enabled and not model.encoder_cache_active:
+            return None
+        return model._get_multimodal_encoder_cache()
+
+    def invalidate_multimodal_encoder_cache(self) -> None:
+        """Hard-clear reusable MM encoder outputs at a quiescent boundary."""
+        encoder_cache = self.mm_encoder_cache
+        if encoder_cache is not None:
+            encoder_cache.clear()
+
+    def _multimodal_data_for_llm(
+            self, request: LlmRequest) -> Optional[Dict[str, Any]]:
+        """Attach prompt-ordered cache segments to one ephemeral forward view."""
+        state = request.py_mm_encoder_state
+        if state is None:
+            return request.py_multimodal_data
+        if state.progress is not MultimodalEncoderProgress.READY:
+            raise MultimodalEncoderRequestError(
+                f"MM request {request.request_id} reached prefill before its encoder entries "
+                "were ready")
+        encoder_cache = self.mm_encoder_cache
+        if encoder_cache is None:
+            raise RuntimeError(
+                "MM item scheduling requires a model-owned encoder cache")
+
+        segments: list[torch.Tensor] = []
+        for item_idx, (entry_id, expected_rows) in enumerate(
+                zip(state.entry_ids, state.embedding_lengths, strict=True)):
+            if entry_id is None:
+                raise MultimodalEncoderRequestError(
+                    f"Ready MM item {item_idx} has no cache entry")
+            segment = encoder_cache.get(entry_id, record_lookup=False)
+            if segment is None:
+                raise MultimodalEncoderRequestError(
+                    f"Ready MM item {item_idx} is absent from the encoder cache"
+                )
+            if segment.shape[0] != expected_rows:
+                raise MultimodalEncoderRequestError(
+                    f"MM item {item_idx} cache entry has {segment.shape[0]} embeddings; "
+                    f"expected {expected_rows}")
+            segments.append(segment)
+
+        multimodal_data = dict(request.py_multimodal_data or {})
+        multimodal_data["multimodal_embedding"] = tuple(segments)
+        return multimodal_data
 
     def get_mm_encoder_item_keys(
             self, request: LlmRequest) -> Optional[List[Hashable]]:
         """Return the request's per-item cache keys, or `None`.
 
         `None` means the request cannot build stable content keys (no item
-        metadata, content hashes, or processor-kwargs hash), so its items
-        bypass the cache (always encoded; outputs live only on the request).
+        metadata, content hashes, or processor-kwargs hash), so its items use
+        deterministic request/item transient entry identities.
         The key format is shared with the legacy full-request path
         (`_encoder_cache_item_key`) so entries hit across both.
         """
         # `getattr`: unit tests exercise partially constructed engines.
-        if not getattr(self, "mm_encoder_item_scheduling_enabled", False):
+        if (not getattr(self, "mm_encoder_item_scheduling_enabled", False)
+                or not self.mapping.is_first_pp_rank()):
             return None
         # Memoized on the request's encoder state: the inputs are fixed at
         # admission, and a request whose items span several iterations would
@@ -3475,22 +3629,28 @@ class PyTorchModelEngine(ModelEngine):
     def _resolve_bytes_per_mm_encoder_embedding(self) -> int:
         """Bytes occupied by one multimodal encoder output embedding.
 
-        Prefers the mixin's explicit `embedding_dim`/`embedding_dtype`
-        contract, then the text embedding layer's weight, then the
-        pretrained config's hidden size with the loaded weights' dtype —
-        both mixin properties are optional and most VLMs implement
-        neither.
+        Prefers the mixin's explicit output width. Its dtype may need to come
+        from the rank-symmetric model config on a downstream PP stage whose
+        text embedding has no local weight. Models without an explicit width
+        fall back to the text embedding weight, then pretrained hidden size.
         """
         model = self.model
+        embedding_dim = None
         try:
-            return (model.embedding_dim * torch.empty(
-                (), dtype=model.embedding_dtype).element_size())
-        except NotImplementedError:
+            embedding_dim = model.embedding_dim
+        except (AttributeError, NotImplementedError):
             pass
+        if embedding_dim is not None:
+            try:
+                embedding_dtype = model.embedding_dtype
+            except (AttributeError, NotImplementedError):
+                embedding_dtype = model.model_config.torch_dtype
+            return embedding_dim * torch.empty(
+                (), dtype=embedding_dtype).element_size()
         try:
             weight = model.text_embedding_layer.weight
             return weight.shape[-1] * weight.element_size()
-        except NotImplementedError:
+        except (AttributeError, NotImplementedError):
             pass
         pretrained = model.model_config.pretrained_config
         hidden_size = getattr(pretrained, "hidden_size", None)
@@ -3503,7 +3663,7 @@ class PyTorchModelEngine(ModelEngine):
                 "implements neither embedding_dim/embedding_dtype nor "
                 "text_embedding_layer, and its pretrained config exposes "
                 "no (text_config.)hidden_size")
-        element_size = next(model.parameters()).dtype.itemsize
+        element_size = model.model_config.torch_dtype.itemsize
         return hidden_size * element_size
 
     def _set_up_multimodal_encoder_attn_metadata(self) -> None:
@@ -5332,7 +5492,7 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_params = MultimodalParams(
                 multimodal_input=_build_request_multimodal_input(
                     request, self._mm_encoder_cache_enabled),
-                multimodal_data=request.py_multimodal_data,
+                multimodal_data=self._multimodal_data_for_llm(request),
                 multimodal_runtime=py_multimodal_runtime,
                 mm_item_order=getattr(request, "py_mm_item_order", None),
                 input_ids_start_offset=context_start_idx)
@@ -6455,7 +6615,7 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_params = MultimodalParams(
                     multimodal_input=_build_request_multimodal_input(
                         request, self._mm_encoder_cache_enabled),
-                    multimodal_data=request.py_multimodal_data,
+                    multimodal_data=self._multimodal_data_for_llm(request),
                     mm_item_order=getattr(request, "py_mm_item_order", None),
                     input_ids_start_offset=context_start_idx)
                 multimodal_params.to_device("multimodal_data",

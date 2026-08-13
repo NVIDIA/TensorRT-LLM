@@ -294,6 +294,40 @@ def test_encoder_cache_requires_model_opt_in():
     assert not model.encoder_cache_active
 
 
+def test_item_scheduling_floor_creates_cache_without_persistent_reuse():
+    model = DummyMultimodalModel(make_embedding(hidden_size=4), torch.tensor([7]))
+    model.model_config = ModelConfig(
+        multimodal_config=MultimodalConfig(encoder_cache_max_bytes=4096)
+    )
+
+    cache = model._get_multimodal_encoder_cache(required_capacity_bytes=1024)
+
+    assert cache is not None
+    assert cache.max_bytes == 1024
+    assert model._get_multimodal_encoder_cache() is cache
+    with pytest.raises(RuntimeError, match="initialized with capacity 1024"):
+        model._get_multimodal_encoder_cache(required_capacity_bytes=2048)
+
+
+def test_item_scheduling_floor_can_exceed_persistent_reuse_capacity():
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4),
+        torch.tensor([7]),
+        encoder_cache_max_bytes=1024,
+    )
+
+    cache = model._get_multimodal_encoder_cache(required_capacity_bytes=2048)
+
+    assert cache is not None
+    assert cache.max_bytes == 2048
+    assert model._get_multimodal_encoder_cache() is cache
+
+
+def test_segmented_embeddings_require_matching_tensor_contracts():
+    with pytest.raises(ValueError, match="matching trailing shape"):
+        MultimodalModelMixin._validate_embeddings([torch.ones(1, 2), torch.ones(1, 3)], [])
+
+
 def test_encoder_cache_creation_logs_embedding_row_capacity():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),

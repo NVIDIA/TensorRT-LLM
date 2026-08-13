@@ -401,13 +401,18 @@ def test_qwen3vl_deepstack_fusion_reuses_registered_buffer():
         )
     ]
     deepstack_embeds = [
-        torch.full(
-            (2, hidden_size),
-            value,
-            dtype=model.embedding_dtype,
-            device="cuda",
+        torch.cat(
+            [
+                torch.full(
+                    (2, hidden_size),
+                    value,
+                    dtype=model.embedding_dtype,
+                    device="cuda",
+                )
+                for value in (20.0, 30.0)
+            ],
+            dim=1,
         )
-        for value in (20.0, 30.0)
     ]
 
     _, _, fused_deepstack = model._fuse_multimodal_embeddings(
@@ -431,11 +436,11 @@ def test_qwen3vl_deepstack_fusion_reuses_registered_buffer():
     # the right token rows, so verify the multimodal positions independently.
     torch.testing.assert_close(
         fused_deepstack[0][mm_token_indices],
-        deepstack_embeds[0],
+        deepstack_embeds[0][:, :hidden_size],
     )
     torch.testing.assert_close(
         fused_deepstack[1][mm_token_indices],
-        deepstack_embeds[1],
+        deepstack_embeds[0][:, hidden_size:],
     )
     # The scratch buffer is reused across forwards; non-multimodal positions
     # must be cleared before every scatter to avoid leaking stale features.

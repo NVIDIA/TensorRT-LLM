@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Hashable
 from dataclasses import dataclass
+from enum import Enum, auto
 from threading import RLock
 from typing import Generic, NamedTuple, TypeVar
 
@@ -29,18 +30,36 @@ from tensorrt_llm.logger import logger
 K = TypeVar("K", bound=Hashable)
 
 
-class _Entry(NamedTuple):
-    value: torch.Tensor
+class CacheEntryState(Enum):
+    ABSENT = auto()
+    RESERVED = auto()
+    READY = auto()
+
+
+class CacheAllocationKind(Enum):
+    READY_HIT = auto()
+    NEW_RESERVATION = auto()
+    EXISTING_RESERVATION = auto()
+
+
+@dataclass
+class _Entry:
+    state: CacheEntryState
     size_bytes: int
+    reference_count: int
+    retain_after_release: bool
+    value: torch.Tensor | None = None
     # CUDA event recorded on the producing stream right after the clone in `put`. Consumers on a
     # different stream wait on it before reading `value`. `None` for CPU tensors or when the cache
     # is not stream-aware.
-    producer_event: torch.cuda.Event | None
+    producer_event: torch.cuda.Event | None = None
 
 
 class TensorLRUCacheStats(NamedTuple):
     max_bytes: int
     current_bytes: int
+    reserved_bytes: int
+    pinned_bytes: int
     item_count: int
     hits: int
     misses: int
@@ -48,6 +67,9 @@ class TensorLRUCacheStats(NamedTuple):
     replacements: int
     evictions: int
     rejected_insertions: int
+    producer_misses: int
+    inflight_deduplications: int
+    blocked_allocations: int
     hit_rate: float
 
 
@@ -59,6 +81,9 @@ class _CacheCounters:
     replacements: int = 0
     evictions: int = 0
     rejected_insertions: int = 0
+    producer_misses: int = 0
+    inflight_deduplications: int = 0
+    blocked_allocations: int = 0
 
     @property
     def hit_rate(self) -> float:
@@ -107,6 +132,8 @@ class TensorLRUCache(Generic[K]):
         self._name = name
         self._cuda_stream_aware = cuda_stream_aware
         self._current_bytes = 0
+        self._reserved_bytes = 0
+        self._pinned_bytes = 0
         self._items: OrderedDict[K, _Entry] = OrderedDict()
         self._lock = RLock()
         self._counters = _CacheCounters()
@@ -124,31 +151,123 @@ class TensorLRUCache(Generic[K]):
         with self._lock:
             return len(self._items)
 
-    def get(self, key: K) -> torch.Tensor | None:
+    def allocate(
+        self,
+        key: K,
+        expected_bytes: int,
+        *,
+        retain_after_release: bool = True,
+    ) -> CacheAllocationKind | None:
+        """Acquire one logical reference or reserve one missing entry.
+
+        `None` indicates temporary capacity pressure. A value larger than the
+        full cache or a size/policy conflict for an existing key is a permanent
+        caller contract error.
+        """
+        if expected_bytes <= 0:
+            raise ValueError("expected_bytes must be positive")
+        if expected_bytes > self._max_bytes:
+            raise ValueError(
+                f"expected_bytes ({expected_bytes}) exceeds cache capacity ({self._max_bytes})"
+            )
+
+        with self._lock:
+            entry = self._items.get(key)
+            if entry is not None:
+                if entry.size_bytes != expected_bytes:
+                    raise ValueError(
+                        f"existing cache entry size ({entry.size_bytes}) does not match "
+                        f"expected_bytes ({expected_bytes})"
+                    )
+                if entry.retain_after_release != retain_after_release:
+                    raise ValueError("existing cache entry retention policy does not match")
+
+                if entry.state is CacheEntryState.RESERVED:
+                    entry.reference_count += 1
+                    self._counters.inflight_deduplications += 1
+                    return CacheAllocationKind.EXISTING_RESERVATION
+                if entry.state is not CacheEntryState.READY:
+                    raise RuntimeError(f"unexpected cache entry state: {entry.state}")
+
+                if entry.reference_count == 0:
+                    if self._accounted_bytes + entry.size_bytes > self._max_bytes:
+                        self._counters.blocked_allocations += 1
+                        return None
+                    self._pinned_bytes += entry.size_bytes
+                entry.reference_count += 1
+                self._items.move_to_end(key)
+                self._counters.hits += 1
+                return CacheAllocationKind.READY_HIT
+
+            if self._accounted_bytes + expected_bytes > self._max_bytes:
+                self._counters.blocked_allocations += 1
+                return None
+
+            self._items[key] = _Entry(
+                state=CacheEntryState.RESERVED,
+                size_bytes=expected_bytes,
+                reference_count=1,
+                retain_after_release=retain_after_release,
+            )
+            self._reserved_bytes += expected_bytes
+            self._counters.misses += 1
+            self._counters.producer_misses += 1
+            return CacheAllocationKind.NEW_RESERVATION
+
+    def get(self, key: K, *, record_lookup: bool = True) -> torch.Tensor | None:
         """Return a cache-owned, immutable tensor and promote it to most-recently-used.
 
         The returned tensor aliases the cached value. Callers must not mutate it.
         """
         with self._lock:
             entry = self._items.get(key)
-            if entry is None:
-                self._counters.misses += 1
+            if entry is None or entry.state is not CacheEntryState.READY:
+                if record_lookup:
+                    self._counters.misses += 1
                 return None
 
-            self._counters.hits += 1
+            if record_lookup:
+                self._counters.hits += 1
             self._items.move_to_end(key)
             self._prepare_for_current_stream(entry)
+            assert entry.value is not None
             return entry.value
 
-    def put(self, key: K, value: torch.Tensor) -> bool:
+    def put(
+        self,
+        key: K,
+        value: torch.Tensor,
+        *,
+        expected_state: CacheEntryState | None = None,
+        expected_bytes: int | None = None,
+    ) -> bool:
         """Insert or replace a tensor.
 
         Returns `False` and leaves the cache unchanged when `value` is larger than the full
-        cache capacity.
+        cache capacity. Supplying `expected_state` enables strict planned
+        insertion without implicit replacement or eviction.
         """
         size_bytes = self._tensor_size_bytes(value)
 
+        if expected_state not in (
+            None,
+            CacheEntryState.ABSENT,
+            CacheEntryState.RESERVED,
+        ):
+            raise ValueError("strict put only supports ABSENT or RESERVED expected state")
+        if expected_state is None and expected_bytes is not None:
+            raise ValueError("expected_bytes requires expected_state")
+        if expected_state is CacheEntryState.ABSENT and expected_bytes is None:
+            raise ValueError("strict ABSENT insertion requires expected_bytes")
+        if expected_bytes is not None and size_bytes != expected_bytes:
+            raise ValueError(
+                f"tensor size ({size_bytes}) does not match expected_bytes ({expected_bytes})"
+            )
         if size_bytes > self._max_bytes:
+            if expected_state is not None:
+                raise ValueError(
+                    f"tensor size ({size_bytes}) exceeds cache capacity ({self._max_bytes})"
+                )
             with self._lock:
                 self._counters.rejected_insertions += 1
             logger.debug(
@@ -157,23 +276,34 @@ class TensorLRUCache(Generic[K]):
             )
             return False
 
-        stored_value = value.detach().clone()
+        stored_value = None
         producer_event = None
-        if self._cuda_stream_aware and stored_value.is_cuda:
-            producer_event = torch.cuda.Event()
-            producer_event.record(torch.cuda.current_stream(stored_value.device))
+        if expected_state is None:
+            stored_value, producer_event = self._clone_for_storage(value)
 
         with self._lock:
-            old_entry = self._items.pop(key, None)
+            if expected_state is not None:
+                return self._put_strict(key, value, size_bytes, expected_state)
+
+            old_entry = self._items.get(key)
             if old_entry is not None:
+                if old_entry.state is not CacheEntryState.READY:
+                    raise RuntimeError("cannot replace a reserved cache entry")
+                if old_entry.reference_count:
+                    raise RuntimeError("cannot replace a referenced cache entry")
+                del self._items[key]
                 self._current_bytes -= old_entry.size_bytes
                 self._counters.replacements += 1
             else:
                 self._counters.insertions += 1
 
+            assert stored_value is not None
             self._items[key] = _Entry(
-                value=stored_value,
+                state=CacheEntryState.READY,
                 size_bytes=size_bytes,
+                reference_count=0,
+                retain_after_release=True,
+                value=stored_value,
                 producer_event=producer_event,
             )
             self._current_bytes += size_bytes
@@ -188,19 +318,107 @@ class TensorLRUCache(Generic[K]):
                 )
             return True
 
-    def pop(self, key: K) -> torch.Tensor | None:
+    def evict_for(self, key: K, *, additional_bytes: int = 0) -> list[K]:
+        """Evict exact LRU victims for `key` and earlier planned producers."""
+        if additional_bytes < 0:
+            raise ValueError("additional_bytes must be non-negative")
+        with self._lock:
+            entry = self._items.get(key)
+            if entry is None or entry.state is not CacheEntryState.RESERVED:
+                raise RuntimeError("evict_for requires an existing reserved entry")
+
+            required_bytes = max(
+                0,
+                self._current_bytes + additional_bytes + entry.size_bytes - self._max_bytes,
+            )
+            if required_bytes == 0:
+                return []
+
+            victims: list[tuple[K, _Entry]] = []
+            freed_bytes = 0
+            for victim_key, victim in list(self._items.items()):
+                if victim.state is not CacheEntryState.READY or victim.reference_count != 0:
+                    continue
+                victims.append((victim_key, victim))
+                freed_bytes += victim.size_bytes
+                if freed_bytes >= required_bytes:
+                    break
+
+            if freed_bytes < required_bytes:
+                raise RuntimeError("reserved entry has insufficient evictable physical capacity")
+
+            for victim_key, victim in victims:
+                del self._items[victim_key]
+                self._current_bytes -= victim.size_bytes
+            self._counters.evictions += len(victims)
+            return [victim_key for victim_key, _ in victims]
+
+    def release(self, key: K) -> K | None:
+        """Release one reference and remove non-retained state at the last release.
+
+        Returns the key only when a materialized physical entry was removed.
+        """
+        with self._lock:
+            entry = self._items.get(key)
+            if entry is None or entry.reference_count == 0:
+                raise RuntimeError("cannot release an unreferenced cache entry")
+
+            entry.reference_count -= 1
+            if entry.reference_count:
+                return None
+
+            if entry.state is CacheEntryState.RESERVED:
+                self._reserved_bytes -= entry.size_bytes
+                del self._items[key]
+                return None
+
+            if entry.state is not CacheEntryState.READY:
+                raise RuntimeError(f"unexpected cache entry state: {entry.state}")
+
+            self._pinned_bytes -= entry.size_bytes
+            if entry.retain_after_release:
+                return None
+
+            self._current_bytes -= entry.size_bytes
+            del self._items[key]
+            return key
+
+    def pop(self, key: K, *, expected_state: CacheEntryState | None = None) -> torch.Tensor | None:
         """Remove one key and return its tensor, or `None` on miss."""
         with self._lock:
-            entry = self._items.pop(key, None)
+            entry = self._items.get(key)
             if entry is None:
+                if expected_state is not None:
+                    raise RuntimeError("planned cache removal target is absent")
+                return None
+            if expected_state is not None and entry.state is not expected_state:
+                raise RuntimeError(
+                    f"planned cache removal expected {expected_state}, found {entry.state}"
+                )
+            if entry.reference_count:
+                raise RuntimeError("cannot remove a referenced cache entry")
+
+            del self._items[key]
+            if entry.state is CacheEntryState.RESERVED:
+                self._reserved_bytes -= entry.size_bytes
                 return None
 
             self._current_bytes -= entry.size_bytes
             self._prepare_for_current_stream(entry)
+            assert entry.value is not None
             return entry.value
 
     def clear(self) -> None:
+        """Remove every unreferenced ready entry.
+
+        A live reference or reservation is correctness state rather than
+        reusable cache state. Silently dropping it would leave request entry
+        slots pointing at absent tensors, so hard invalidation is allowed only
+        after the owner has quiesced those lifetimes.
+        """
         with self._lock:
+            if self._accounted_bytes:
+                raise RuntimeError("cannot clear cache with live references or reservations")
             self._items.clear()
             self._current_bytes = 0
 
@@ -209,6 +427,8 @@ class TensorLRUCache(Generic[K]):
             return TensorLRUCacheStats(
                 max_bytes=self._max_bytes,
                 current_bytes=self._current_bytes,
+                reserved_bytes=self._reserved_bytes,
+                pinned_bytes=self._pinned_bytes,
                 item_count=len(self._items),
                 hits=self._counters.hits,
                 misses=self._counters.misses,
@@ -216,6 +436,9 @@ class TensorLRUCache(Generic[K]):
                 replacements=self._counters.replacements,
                 evictions=self._counters.evictions,
                 rejected_insertions=self._counters.rejected_insertions,
+                producer_misses=self._counters.producer_misses,
+                inflight_deduplications=self._counters.inflight_deduplications,
+                blocked_allocations=self._counters.blocked_allocations,
                 hit_rate=self._counters.hit_rate,
             )
 
@@ -226,12 +449,80 @@ class TensorLRUCache(Generic[K]):
             f"bytes={stats.current_bytes}/{stats.max_bytes}, hits={stats.hits}, "
             f"misses={stats.misses}, hit_rate={stats.hit_rate:.3f}, "
             f"insertions={stats.insertions}, replacements={stats.replacements}, "
-            f"evictions={stats.evictions}, rejected_insertions={stats.rejected_insertions}"
+            f"evictions={stats.evictions}, rejected_insertions={stats.rejected_insertions}, "
+            f"producer_misses={stats.producer_misses}, "
+            f"inflight_deduplications={stats.inflight_deduplications}, "
+            f"blocked_allocations={stats.blocked_allocations}"
         )
+
+    @property
+    def _accounted_bytes(self) -> int:
+        return self._reserved_bytes + self._pinned_bytes
 
     @staticmethod
     def _tensor_size_bytes(tensor: torch.Tensor) -> int:
         return tensor.numel() * tensor.element_size()
+
+    def _clone_for_storage(
+        self, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.cuda.Event | None]:
+        stored_value = value.detach().clone()
+        producer_event = None
+        if self._cuda_stream_aware and stored_value.is_cuda:
+            producer_event = torch.cuda.Event()
+            producer_event.record(torch.cuda.current_stream(stored_value.device))
+        return stored_value, producer_event
+
+    def _put_strict(
+        self,
+        key: K,
+        value: torch.Tensor,
+        size_bytes: int,
+        expected_state: CacheEntryState,
+    ) -> bool:
+        entry = self._items.get(key)
+        actual_state = CacheEntryState.ABSENT if entry is None else entry.state
+        if actual_state is not expected_state:
+            raise RuntimeError(
+                f"planned cache insertion expected {expected_state}, found {actual_state}"
+            )
+
+        if expected_state is CacheEntryState.RESERVED:
+            assert entry is not None
+            if size_bytes != entry.size_bytes:
+                raise ValueError(
+                    f"tensor size ({size_bytes}) does not match reserved bytes ({entry.size_bytes})"
+                )
+            if self._current_bytes + size_bytes > self._max_bytes:
+                raise RuntimeError("reserved entry was not given physical cache headroom")
+
+            stored_value, producer_event = self._clone_for_storage(value)
+            entry.state = CacheEntryState.READY
+            entry.value = stored_value
+            entry.producer_event = producer_event
+            self._reserved_bytes -= size_bytes
+            self._pinned_bytes += size_bytes
+            self._current_bytes += size_bytes
+            self._items.move_to_end(key)
+            self._counters.insertions += 1
+            return True
+
+        assert expected_state is CacheEntryState.ABSENT
+        if self._current_bytes + size_bytes > self._max_bytes:
+            raise RuntimeError("planned replica insertion exceeds physical cache capacity")
+
+        stored_value, producer_event = self._clone_for_storage(value)
+        self._items[key] = _Entry(
+            state=CacheEntryState.READY,
+            size_bytes=size_bytes,
+            reference_count=0,
+            retain_after_release=True,
+            value=stored_value,
+            producer_event=producer_event,
+        )
+        self._current_bytes += size_bytes
+        self._counters.insertions += 1
+        return True
 
     def _prepare_for_current_stream(self, entry: _Entry) -> None:
         """Order and anchor a cached tensor for consumption on the current stream.
@@ -243,6 +534,8 @@ class TensorLRUCache(Generic[K]):
           the storage while consumer-stream work is still pending, even if a later replacement or
           eviction drops the cache's own reference.
         """
+        if entry.value is None:
+            raise RuntimeError("cannot access an unmaterialized cache entry")
         if not self._cuda_stream_aware or not entry.value.is_cuda:
             return
 
@@ -255,9 +548,15 @@ class TensorLRUCache(Generic[K]):
     def _evict_until_within_limit(self) -> tuple[int, int]:
         evicted_count = 0
         evicted_bytes = 0
-        while self._current_bytes > self._max_bytes:
-            _, entry = self._items.popitem(last=False)
+        for key, entry in list(self._items.items()):
+            if self._current_bytes <= self._max_bytes:
+                break
+            if entry.state is not CacheEntryState.READY or entry.reference_count:
+                continue
+            del self._items[key]
             self._current_bytes -= entry.size_bytes
             evicted_count += 1
             evicted_bytes += entry.size_bytes
+        if self._current_bytes > self._max_bytes:
+            raise RuntimeError("cache has insufficient evictable physical capacity")
         return evicted_count, evicted_bytes

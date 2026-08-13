@@ -776,9 +776,9 @@ class MultimodalModelMixin:
         *,
         input_ids: torch.Tensor,
         multimodal_params: Sequence[MultimodalParams],
-        embeddings: torch.Tensor,
+        embeddings: Sequence[torch.Tensor],
         **forward_kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Sequence[torch.Tensor]]:
         """Optional hook before active chunk rows are selected.
 
         Runs after cache lookup or encoder execution has produced full
@@ -1004,6 +1004,8 @@ class MultimodalModelMixin:
             return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
 
         full_embeddings = self._get_or_encode_multimodal_embeddings(context_params)
+        if isinstance(full_embeddings, torch.Tensor):
+            full_embeddings = [full_embeddings]
 
         input_ids, full_embeddings = self.after_full_multimodal_embeddings(
             input_ids=input_ids,
@@ -1012,7 +1014,10 @@ class MultimodalModelMixin:
             **forward_kwargs,
         )
 
-        active_embeddings = find_input_mm_embeds([full_embeddings], list(context_params))
+        active_embeddings = find_input_mm_embeds(
+            full_embeddings,
+            list(context_params),
+        )
         active_embeddings, extra_embeds = self.after_active_multimodal_embeddings(
             active_embeddings=active_embeddings,
             multimodal_params=context_params,
@@ -1043,17 +1048,41 @@ class MultimodalModelMixin:
     def _get_or_encode_multimodal_embeddings(
         self,
         multimodal_params: Sequence[MultimodalParams],
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Return cached multimodal embeddings or run the encoder for misses.
 
-        Delegates cache lookup and gather behavior to `get_multimodal_embeddings`, then validates
-        the single tensor contract for both encoded and cached-only paths.
+        Item-scheduled requests keep prompt-ordered cache tensors segmented.
+        Legacy callers retain their existing concatenated gather contract.
 
         During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
         the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
         records each entry's producer event on the issuing (aux) stream; the next iteration's
         main-stream consumer waits on the request-level `encoder_event` for ordering.
         """
+        # Item-scheduled execution attaches cache-owned entries as an immutable
+        # tuple to distinguish them from legacy chunk-accumulation lists. Keep
+        # those per-item segments intact through chunk selection and fusion.
+        scheduled_segments: list[torch.Tensor] = []
+        has_scheduled_segments = False
+        for param in multimodal_params:
+            embedding = param.multimodal_data.get("multimodal_embedding")
+            if isinstance(embedding, tuple):
+                has_scheduled_segments = True
+                segments = embedding
+            elif isinstance(embedding, torch.Tensor):
+                segments = (embedding,)
+            elif isinstance(embedding, list):
+                segments = tuple(embedding)
+            else:
+                scheduled_segments = []
+                break
+            if not all(isinstance(segment, torch.Tensor) for segment in segments):
+                raise TypeError("multimodal_embedding segments must be tensors")
+            scheduled_segments.extend(segments)
+        if has_scheduled_segments and scheduled_segments:
+            self._validate_embeddings(scheduled_segments, multimodal_params)
+            return tuple(scheduled_segments)
+
         encoder_cache = self._get_multimodal_encoder_cache()
         cache_misses: list[MultimodalParams] = []
         partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
@@ -1095,60 +1124,81 @@ class MultimodalModelMixin:
         self._validate_embeddings(embeddings, multimodal_params)
         return embeddings[0]
 
-    def _get_multimodal_encoder_cache(self) -> Optional[TensorLRUCache]:
-        """Return the per-model full-request-path encoder clone cache, if enabled.
+    def _get_multimodal_encoder_cache(
+        self, *, required_capacity_bytes: int = 0
+    ) -> Optional[TensorLRUCache]:
+        """Return the one model-owned multimodal encoder-output cache.
 
         The cache stores per-item embeddings for params that can be represented by one modality.
         See `_encoder_cache_keys` for the mixed-modality skip path and its technical limitation.
 
-        Scope: the single encoder cache instance for a cache-enabled model
-        (`supports_encoder_cache`). The full-request (legacy inline-encode) consumers — side-stream
-        prefetch, `mm_encoder_only`/disagg encoding — populate and read it inline; the
-        item-scheduling path consumes the same instance read-through at encode time
-        (`ModelEngine.forward_multimodal_encoder_items`). The key format is shared
-        (`_encoder_cache_item_key`) so hits cross between paths. The item path's recorded outputs
-        are cloned, so cache eviction never invalidates an in-flight request.
+        `required_capacity_bytes` is the correctness floor derived by item
+        scheduling. Persistent cross-request reuse remains independently
+        controlled by `encoder_cache_active`.
         """
-        if not self.encoder_cache_active:
+        if required_capacity_bytes < 0:
+            raise ValueError("required_capacity_bytes must be non-negative")
+
+        multimodal_config = self.model_config.multimodal_config
+        reuse_capacity_bytes = (
+            multimodal_config.encoder_cache_max_bytes
+            if self.encoder_cache_active and multimodal_config is not None
+            else 0
+        )
+        max_bytes = max(required_capacity_bytes, reuse_capacity_bytes)
+        if self._multimodal_encoder_cache is not None:
+            # A zero floor is a read of the already-established model-owned
+            # store. Its capacity may legitimately exceed the persistent-
+            # reuse setting because item scheduling established a larger
+            # correctness floor during ModelEngine initialization.
+            if (
+                required_capacity_bytes > 0
+                and self._multimodal_encoder_cache.max_bytes != max_bytes
+            ):
+                raise RuntimeError(
+                    "multimodal encoder cache was initialized with capacity "
+                    f"{self._multimodal_encoder_cache.max_bytes}, requested {max_bytes}"
+                )
+            return self._multimodal_encoder_cache
+
+        if max_bytes == 0:
             logger.debug_once(
-                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because the model does not opt in via "
-                "supports_encoder_cache or multimodal_config.encoder_cache_max_bytes=0.",
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: disabled because neither item scheduling nor "
+                "persistent reuse requires storage.",
                 key="mm_encoder_cache_disabled",
             )
             return None
 
-        multimodal_config = self.model_config.multimodal_config
-        max_bytes = multimodal_config.encoder_cache_max_bytes
-        if self._multimodal_encoder_cache is None:
-            # Per-item embeddings are views produced by splitting a request-level encoder output.
-            # Clone them so a cached item neither aliases mutable caller output nor retains the
-            # entire batch allocation while cache accounting charges only its logical size. This
-            # briefly needs source and clone memory during insertion, but preserves existing cache
-            # entries when the copy cannot be allocated.
-            self._multimodal_encoder_cache = TensorLRUCache(
-                max_bytes,
-                name=_MM_ENCODER_CACHE_LOG_NAME,
-                cuda_stream_aware=multimodal_config.encoder_side_stream_max_ahead > 0,
+        # Per-item embeddings are views produced by splitting a request-level encoder output.
+        # Clone them so a cached item neither aliases mutable caller output nor retains the
+        # entire batch allocation while cache accounting charges only its logical size.
+        self._multimodal_encoder_cache = TensorLRUCache(
+            max_bytes,
+            name=_MM_ENCODER_CACHE_LOG_NAME,
+            cuda_stream_aware=(
+                multimodal_config is not None
+                and multimodal_config.encoder_side_stream_max_ahead > 0
+            ),
+        )
+        try:
+            embedding_dim = self.embedding_dim
+            embedding_dtype = self.embedding_dtype
+        except NotImplementedError:
+            logger.info(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
+                "embedding row capacity unavailable because the model does not implement "
+                "embedding_dim and embedding_dtype."
             )
-            try:
-                embedding_dim = self.embedding_dim
-                embedding_dtype = self.embedding_dtype
-            except NotImplementedError:
-                logger.info(
-                    f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
-                    "embedding row capacity unavailable because the model does not implement "
-                    "embedding_dim and embedding_dtype."
-                )
-            else:
-                bytes_per_embedding_row = (
-                    embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
-                )
-                max_embedding_rows = max_bytes // bytes_per_embedding_row
-                logger.info(
-                    f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
-                    f"max_embedding_rows={max_embedding_rows}, embedding_dim={embedding_dim}, "
-                    f"embedding_dtype={embedding_dtype}"
-                )
+        else:
+            bytes_per_embedding_row = (
+                embedding_dim * torch.empty((), dtype=embedding_dtype).element_size()
+            )
+            max_embedding_rows = max_bytes // bytes_per_embedding_row
+            logger.info(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: created with max_bytes={max_bytes}, "
+                f"max_embedding_rows={max_embedding_rows}, embedding_dim={embedding_dim}, "
+                f"embedding_dtype={embedding_dtype}"
+            )
         return self._multimodal_encoder_cache
 
     @staticmethod
@@ -1539,18 +1589,25 @@ class MultimodalModelMixin:
         embeddings: list[torch.Tensor],
         multimodal_params: Sequence[MultimodalParams],
     ) -> None:
-        """Validate gathered embeddings' row count against runtime metadata.
+        """Validate gathered embedding segments and their aggregate row count.
 
         Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
         cannot be evaluated without complete metadata.
         """
-        if len(embeddings) != 1:
-            raise ValueError(
-                f"MultimodalModelMixin requires a single embedding tensor, got {len(embeddings)} "
-                "tensors."
-            )
+        if not embeddings:
+            raise ValueError("Multimodal embeddings must contain at least one tensor.")
+        reference = embeddings[0]
+        for embedding in embeddings[1:]:
+            if (
+                embedding.shape[1:] != reference.shape[1:]
+                or embedding.dtype != reference.dtype
+                or embedding.device != reference.device
+            ):
+                raise ValueError(
+                    "Multimodal embedding segments must have matching trailing "
+                    "shape, dtype, and device."
+                )
 
-        embeddings_tensor = embeddings[0]
         expected_rows = 0
         has_runtime_metadata = []
         for param in multimodal_params:
@@ -1571,7 +1628,7 @@ class MultimodalModelMixin:
             )
             return
 
-        actual_rows = embeddings_tensor.shape[0]
+        actual_rows = sum(embedding.shape[0] for embedding in embeddings)
         if actual_rows != expected_rows:
             raise ValueError(
                 f"Multimodal embedding row count mismatch: expected {expected_rows}, got {actual_rows}."

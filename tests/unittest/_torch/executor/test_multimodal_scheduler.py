@@ -31,7 +31,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     ScheduledRequests,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
-from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
+from tensorrt_llm._torch.tensor_lru_cache import CacheEntryState, TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -68,6 +68,30 @@ class _BaseScheduler:
         return bool(requests)
 
 
+def _cache_item_keys(request):
+    state = request.py_mm_encoder_state
+    return [("test_mm", request.request_id, item_idx) for item_idx in range(state.num_items)]
+
+
+def _scheduler(
+    *,
+    max_batch_size,
+    max_num_tokens,
+    cache_capacity=1 << 20,
+    base_scheduler=None,
+    scheduler_cls=MultimodalScheduler,
+):
+    return scheduler_cls(
+        base_scheduler or _BaseScheduler(),
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        encoder_cache=TensorLRUCache(cache_capacity),
+        get_cache_item_keys=_cache_item_keys,
+        bytes_per_encoder_embedding=4,
+        retain_cache_entries=False,
+    )
+
+
 def _llm_request(request_id, multimodal_data=None):
     return LlmRequest(
         request_id=request_id,
@@ -80,11 +104,8 @@ def _llm_request(request_id, multimodal_data=None):
 
 
 def _record(state, item_idx, *, hidden=1, fill=0.0):
-    """Write one item the way the encoder step does, sized from its declaration."""
-    state.record(
-        item_idx,
-        torch.full((state.embedding_lengths[item_idx], hidden), fill),
-    )
+    del hidden, fill
+    state.recorded[item_idx] = True
 
 
 def _request(request_id, costs, *, ready=()):
@@ -146,7 +167,7 @@ def test_item_scheduling_rejects_raw_payload_without_item_metadata():
 
 
 def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_batch_size=2, max_num_tokens=10)
+    scheduler = _scheduler(max_batch_size=2, max_num_tokens=10)
     first = _request(1, [7, 7])
     second = _request(2, [3])
 
@@ -156,17 +177,33 @@ def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
     assert output.context_requests == [second]
 
 
+def test_multimodal_scheduler_collapses_same_step_stable_key_producers():
+    cache = TensorLRUCache(8)
+    scheduler = MultimodalScheduler(
+        _BaseScheduler(),
+        max_batch_size=2,
+        max_num_tokens=8,
+        encoder_cache=cache,
+        get_cache_item_keys=lambda _request: [("stable", 0)],
+        bytes_per_encoder_embedding=4,
+        retain_cache_entries=True,
+    )
+    first = _request(1, [4])
+    second = _request(2, [4])
+
+    output = scheduler.schedule_request([first, second], set())
+
+    assert output.scheduled_mm_encoder_items == {first.request_id: [0]}
+    assert output.context_requests == [first, second]
+    assert first.py_mm_encoder_state.entry_ids == second.py_mm_encoder_state.entry_ids
+    assert cache.stats().inflight_deduplications == 1
+
+
 def test_scheduler_defers_items_beyond_output_byte_budget():
     # Budget hosts exactly one 1-row item (4 bytes): the second request's
     # item must wait even though the token budget would admit it
     # (allocate-before-compute).
-    scheduler = MultimodalScheduler(
-        _BaseScheduler(),
-        max_batch_size=8,
-        max_num_tokens=1 << 20,
-        output_budget_bytes=4,
-        bytes_per_encoder_embedding=4,
-    )
+    scheduler = _scheduler(max_batch_size=8, max_num_tokens=1 << 20, cache_capacity=4)
     first = _request(1, [3])
     second = _request(2, [3])
 
@@ -176,26 +213,28 @@ def test_scheduler_defers_items_beyond_output_byte_budget():
     assert output.context_requests == [first]
 
 
-def test_resident_outputs_of_active_requests_block_new_admissions():
-    # A request that already holds recorded-but-unconsumed outputs (e.g.
-    # mid-chunked-prefill) occupies the budget purely through its live
-    # state — no counter, no release call — deferring new encoder work.
-    scheduler = MultimodalScheduler(
-        _BaseScheduler(),
-        max_batch_size=8,
-        max_num_tokens=1 << 20,
-        output_budget_bytes=4,
-        bytes_per_encoder_embedding=4,
-    )
-    holder = _request(1, [3], ready=(0,))  # 1 row resident = full budget
+def test_pinned_outputs_block_new_admissions_until_explicit_release():
+    scheduler = _scheduler(max_batch_size=8, max_num_tokens=1 << 20, cache_capacity=4)
+    holder = _request(1, [3])
     newcomer = _request(2, [3])
+
+    first_output = scheduler.schedule_request([holder], set())
+    assert first_output.scheduled_mm_encoder_items == {1: [0]}
+    holder_entry_id = holder.py_mm_encoder_state.entry_ids[0]
+    assert holder_entry_id is not None
+    assert scheduler.encoder_cache.put(
+        holder_entry_id,
+        torch.ones(1, dtype=torch.float32),
+        expected_state=CacheEntryState.RESERVED,
+    )
+    holder.py_mm_encoder_state.mark_entry_ready(holder_entry_id)
 
     output = scheduler.schedule_request([holder, newcomer], set())
     assert output.scheduled_mm_encoder_items is None
 
-    # Consumption (post-prefill strip clears the state) frees the budget on
-    # the next pass with no further bookkeeping — same for an aborted
-    # request, which simply leaves the active list.
+    drained = holder.py_mm_encoder_state.drain_entry_ids()
+    assert drained == [holder_entry_id]
+    assert scheduler.encoder_cache.release(holder_entry_id) == holder_entry_id
     holder.py_mm_encoder_state = None
     output = scheduler.schedule_request([holder, newcomer], set())
     assert output.scheduled_mm_encoder_items == {2: [0]}
@@ -206,13 +245,7 @@ def test_started_request_holds_its_whole_footprint_across_iterations():
     # first item already allocates storage for all of them, so the bytes it
     # still needs are charged from the start. A request behind it cannot
     # squat that space and leave the head unable to finish.
-    scheduler = MultimodalScheduler(
-        _BaseScheduler(),
-        max_batch_size=8,
-        max_num_tokens=5,
-        output_budget_bytes=8,
-        bytes_per_encoder_embedding=4,
-    )
+    scheduler = _scheduler(max_batch_size=8, max_num_tokens=5, cache_capacity=8)
     head = _request(1, [5, 5])  # second item exceeds this iteration's tokens
     follower = _request(2, [3])
 
@@ -254,13 +287,7 @@ def test_admission_rejects_requests_larger_than_output_budget():
 
 
 def test_oversized_request_fails_fast_instead_of_starving():
-    scheduler = MultimodalScheduler(
-        _BaseScheduler(),
-        max_batch_size=8,
-        max_num_tokens=1 << 20,
-        output_budget_bytes=4,
-        bytes_per_encoder_embedding=4,
-    )
+    scheduler = _scheduler(max_batch_size=8, max_num_tokens=1 << 20, cache_capacity=4)
     request = _request(1, [3, 3])  # 2 rows = 8 bytes > 4-byte budget
 
     with pytest.raises(RuntimeError, match="raise encoder_max_num_tokens") as exc_info:
@@ -275,12 +302,15 @@ def test_scheduler_requires_bytes_per_embedding_alongside_budget():
             _BaseScheduler(),
             max_batch_size=1,
             max_num_tokens=1,
-            output_budget_bytes=4,
+            encoder_cache=TensorLRUCache(4),
+            get_cache_item_keys=_cache_item_keys,
+            bytes_per_encoder_embedding=0,
+            retain_cache_entries=False,
         )
 
 
 def test_multimodal_scheduler_selects_all_items_and_admits_request_when_batch_fits():
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_batch_size=2, max_num_tokens=10)
+    scheduler = _scheduler(max_batch_size=2, max_num_tokens=10)
     request = _request(1, [6, 4])
 
     output = scheduler.schedule_request([request], set())
@@ -293,7 +323,7 @@ def test_multimodal_scheduler_selects_all_items_and_admits_request_when_batch_fi
 
 
 def test_multimodal_scheduler_respects_encoder_batch_size():
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_batch_size=2, max_num_tokens=4)
+    scheduler = _scheduler(max_batch_size=2, max_num_tokens=4)
     request = _request(1, [1, 1, 1, 1])
 
     output = scheduler.schedule_request([request], set())
@@ -303,7 +333,7 @@ def test_multimodal_scheduler_respects_encoder_batch_size():
 
 
 def test_multimodal_scheduler_withholds_request_on_budget_overflow():
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_batch_size=3, max_num_tokens=10)
+    scheduler = _scheduler(max_batch_size=3, max_num_tokens=10)
     request = _request(1, [6, 4, 1])
 
     output = scheduler.schedule_request([request], set())
@@ -313,7 +343,7 @@ def test_multimodal_scheduler_withholds_request_on_budget_overflow():
 
 
 def test_multimodal_scheduler_preserves_non_multimodal_requests():
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_batch_size=1, max_num_tokens=1)
+    scheduler = _scheduler(max_batch_size=1, max_num_tokens=1)
     request = _llm_request(1)
     initialize_multimodal_encoder_request(request, max_num_tokens=1)
 
@@ -339,6 +369,34 @@ def test_qwen_output_budget_uses_post_merge_embedding_capacity():
     assert engine.max_mm_encoder_output_embeddings == 16384
     assert engine.bytes_per_mm_encoder_embedding == 32768
     assert budget == 512 * 1024**2
+
+
+def test_output_row_bytes_use_config_dtype_without_pp_embedding_weight():
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = SimpleNamespace(
+        embedding_dim=16384,
+        model_config=SimpleNamespace(torch_dtype=torch.bfloat16),
+    )
+
+    assert engine._resolve_bytes_per_mm_encoder_embedding() == 32768
+
+
+def test_downstream_pp_item_scheduler_does_not_create_encoder_store():
+    class _CacheModel(MultimodalModelMixin):
+        supports_encoder_cache = True
+
+    model = _CacheModel()
+    model.model_config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(encoder_cache_max_bytes=64)
+    )
+    model._multimodal_encoder_cache = None
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = model
+    engine.mm_encoder_item_scheduling_enabled = True
+    engine.mapping = SimpleNamespace(is_first_pp_rank=lambda: False)
+
+    assert engine.mm_encoder_cache is None
+    assert model._multimodal_encoder_cache is None
 
 
 def test_output_budget_requires_processor_embedding_capacity():
@@ -397,7 +455,12 @@ def test_request_rejects_item_above_effective_startup_maximum():
 def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():
     base_scheduler = _BaseScheduler()
     base_scheduler.capacity_scheduler = _RejectMultimodalCapacityScheduler()
-    scheduler = MultimodalEagerEncoderScheduler(base_scheduler, max_batch_size=1, max_num_tokens=8)
+    scheduler = _scheduler(
+        max_batch_size=1,
+        max_num_tokens=8,
+        base_scheduler=base_scheduler,
+        scheduler_cls=MultimodalEagerEncoderScheduler,
+    )
     multimodal_request = _request(1, [8])
     text_request = _llm_request(2)
     initialize_multimodal_encoder_request(text_request, max_num_tokens=8)
@@ -408,33 +471,73 @@ def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():
     assert output.context_requests == [text_request]
 
 
+def test_multimodal_scheduler_follower_replay_skips_logical_cache_policy():
+    scheduler = _scheduler(max_batch_size=1, max_num_tokens=4)
+    blocked = _request(1, [4])
+    text_request = _llm_request(2)
+
+    output = scheduler.replay_request(
+        [blocked, text_request],
+        set(),
+        blocked_request_ids=[blocked.request_id],
+        scheduled_items={blocked.request_id: [0]},
+        cache_removals=[("old", 0)],
+    )
+
+    assert output.context_requests == [text_request]
+    assert output.scheduled_mm_encoder_items == {blocked.request_id: [0]}
+    assert output.mm_encoder_cache_removals == [("old", 0)]
+    assert blocked.py_mm_encoder_state.entry_ids == [None]
+    assert len(scheduler.encoder_cache) == 0
+
+
 def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
     failed = _request(1, [4])
+    follower = _request(4, [4])
+    unrelated_mm_context = _request(5, [4])
     unrelated_context = _llm_request(2)
     unrelated_generation = _llm_request(3)
     handled = []
 
-    def fail_encoder(*_):
-        raise MultimodalEncoderRequestError("bad MM output")
+    def fail_encoder(*_, **__):
+        raise MultimodalEncoderRequestError(
+            "bad MM output", request_ids={failed.request_id, follower.request_id}
+        )
 
     executor = object.__new__(PyExecutor)
-    executor.active_requests = [failed, unrelated_context, unrelated_generation]
+    executor.active_requests = [
+        failed,
+        follower,
+        unrelated_mm_context,
+        unrelated_context,
+        unrelated_generation,
+    ]
     executor.enable_attention_dp = False
-    executor.dist = SimpleNamespace(world_size=1)
-    executor.model_engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
+    executor._mm_encoder_item_scheduling_enabled = True
+    executor.global_rank = 0
+    executor.dist = SimpleNamespace(world_size=1, is_first_pp_rank=True, pp_size=1)
+    executor.model_engine = SimpleNamespace(replay_multimodal_cache_plan=fail_encoder)
     executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
 
     scheduled_requests = ScheduledRequests()
-    scheduled_requests.reset_context_requests([failed, unrelated_context])
+    scheduled_requests.reset_context_requests(
+        [failed, follower, unrelated_mm_context, unrelated_context]
+    )
     scheduled_requests.append_generation_request(unrelated_generation)
     scheduled_requests.scheduled_mm_encoder_items = {failed.request_id: [0]}
 
-    executor._forward_multimodal_encoder_step(scheduled_requests)
+    result = executor._forward_multimodal_encoder_step(scheduled_requests)
 
-    assert scheduled_requests.context_requests == [unrelated_context]
+    assert scheduled_requests.context_requests == [unrelated_mm_context, unrelated_context]
     assert scheduled_requests.generation_requests == [unrelated_generation]
     assert scheduled_requests.scheduled_mm_encoder_items is None
-    assert handled == [("bad MM output", {"requests": [failed], "charge_budget": False})]
+    assert result == ("bad MM output", [failed.request_id, follower.request_id])
+    assert handled == [
+        (
+            "bad MM output",
+            {"requests": [failed, follower], "charge_budget": False},
+        )
+    ]
 
 
 def test_forward_multimodal_encoder_step_contains_model_contract_error():
@@ -443,14 +546,18 @@ def test_forward_multimodal_encoder_step_contains_model_contract_error():
     unrelated = _llm_request(2)
     handled = []
 
-    engine = object.__new__(PyTorchModelEngine)
-    engine.model = MultimodalModelMixin()
+    def fail_replay(*_, **__):
+        raise MultimodalEncoderRequestError(
+            "multimodal_encoder_item_metadata must be a MultimodalEncoderItemMetadata"
+        )
 
     executor = object.__new__(PyExecutor)
     executor.active_requests = [failed, unrelated]
     executor.enable_attention_dp = False
-    executor.dist = SimpleNamespace(world_size=1)
-    executor.model_engine = engine
+    executor._mm_encoder_item_scheduling_enabled = True
+    executor.global_rank = 0
+    executor.dist = SimpleNamespace(world_size=1, is_first_pp_rank=True, pp_size=1)
+    executor.model_engine = SimpleNamespace(replay_multimodal_cache_plan=fail_replay)
     executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
 
     scheduled_requests = ScheduledRequests()
@@ -470,14 +577,16 @@ def test_forward_multimodal_encoder_step_contains_stale_schedule():
     unrelated = _llm_request(2)
     handled = []
 
-    engine = object.__new__(PyTorchModelEngine)
-    engine.model = MultimodalModelMixin()
+    def fail_replay(*_, **__):
+        raise MultimodalEncoderRequestError("Scheduled MM request 1 is no longer active")
 
     executor = object.__new__(PyExecutor)
     executor.active_requests = [unrelated]
     executor.enable_attention_dp = False
-    executor.dist = SimpleNamespace(world_size=1)
-    executor.model_engine = engine
+    executor._mm_encoder_item_scheduling_enabled = True
+    executor.global_rank = 0
+    executor.dist = SimpleNamespace(world_size=1, is_first_pp_rank=True, pp_size=1)
+    executor.model_engine = SimpleNamespace(replay_multimodal_cache_plan=fail_replay)
     executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
 
     scheduled_requests = ScheduledRequests()
@@ -502,12 +611,16 @@ def test_forward_multimodal_encoder_step_contains_stale_schedule():
 def test_forward_multimodal_encoder_step_propagates_system_errors():
     failed = _request(1, [4])
 
-    def fail_encoder(*_):
+    def fail_encoder(*_, **__):
         raise torch.cuda.OutOfMemoryError("encoder OOM")
 
     executor = object.__new__(PyExecutor)
     executor.active_requests = [failed]
-    executor.model_engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
+    executor.enable_attention_dp = False
+    executor._mm_encoder_item_scheduling_enabled = True
+    executor.global_rank = 0
+    executor.dist = SimpleNamespace(is_first_pp_rank=True, pp_size=1)
+    executor.model_engine = SimpleNamespace(replay_multimodal_cache_plan=fail_encoder)
 
     scheduled_requests = ScheduledRequests()
     scheduled_requests.reset_context_requests([failed])
@@ -682,79 +795,6 @@ def test_prepare_multimodal_encoder_inputs_rejects_invalid_metadata_types():
         MultimodalModelMixin().prepare_multimodal_encoder_inputs([(multimodal_param, 0)])
 
 
-def test_item_encoder_classifies_request_state_contract_errors():
-    class _Model(MultimodalModelMixin):
-        pass
-
-    engine = object.__new__(PyTorchModelEngine)
-    engine.model = _Model()
-    request = _llm_request(1)
-
-    with pytest.raises(MultimodalEncoderRequestError, match="no longer active"):
-        engine.forward_multimodal_encoder_items([], {request.request_id: [0]})
-
-    with pytest.raises(MultimodalEncoderRequestError, match="no encoder item state"):
-        engine.forward_multimodal_encoder_items([request], {request.request_id: [0]})
-
-
-def test_item_encoder_classifies_output_count_contract_error():
-    class _Model(MultimodalModelMixin):
-        def prepare_multimodal_encoder_inputs(self, _):
-            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
-            return [(encoder_input, [1], "image")]
-
-        def forward_multimodal_encoder_items(self, _):
-            return []
-
-    engine = object.__new__(PyTorchModelEngine)
-    engine.model = _Model()
-    request = _request(1, [4])
-
-    with pytest.raises(MultimodalEncoderRequestError, match="one output per item"):
-        engine.forward_multimodal_encoder_items([request], {request.request_id: [0]})
-
-
-@pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
-def test_item_encoder_translates_model_contract_errors(failure_stage):
-    class _Model(MultimodalModelMixin):
-        def prepare_multimodal_encoder_inputs(self, _):
-            if failure_stage == "prepare":
-                raise MultimodalEncoderContractError("bad request metadata")
-            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
-            return [(encoder_input, [1], "image")]
-
-        def forward_multimodal_encoder_items(self, _):
-            raise MultimodalEncoderContractError("bad encoder output rows")
-
-    engine = object.__new__(PyTorchModelEngine)
-    engine.model = _Model()
-    request = _request(1, [4])
-
-    expected = "bad request metadata" if failure_stage == "prepare" else "bad encoder output rows"
-    with pytest.raises(MultimodalEncoderRequestError, match=expected):
-        engine.forward_multimodal_encoder_items([request], {request.request_id: [0]})
-
-
-@pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
-def test_item_encoder_does_not_translate_system_errors(failure_stage):
-    class _Model(MultimodalModelMixin):
-        def prepare_multimodal_encoder_inputs(self, _):
-            if failure_stage == "prepare":
-                raise torch.cuda.OutOfMemoryError("encoder OOM")
-            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
-            return [(encoder_input, [1], "image")]
-
-        def forward_multimodal_encoder_items(self, _):
-            raise torch.cuda.OutOfMemoryError("encoder OOM")
-
-    engine = object.__new__(PyTorchModelEngine)
-    engine.model = _Model()
-    request = _request(1, [4])
-
-    with pytest.raises(torch.cuda.OutOfMemoryError, match="encoder OOM"):
-        engine.forward_multimodal_encoder_items([request], {request.request_id: [0]})
-
-
 def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():
     embedding = torch.empty(3, 4)
     mm_data = {
@@ -772,31 +812,76 @@ def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():
     assert "multimodal_embed_mask_cumsum" in mm_data
 
 
-def test_terminate_request_releases_partial_multimodal_encoder_state():
+@pytest.mark.parametrize(
+    "pp_size, expected_pending_removals", [(1, []), (2, [("mm_transient", 1, 0)])]
+)
+def test_terminate_request_releases_multimodal_cache_refs_idempotently(
+    pp_size, expected_pending_removals
+):
     request = _request(1, [4, 4])
-    _record(request.py_mm_encoder_state, 0)
+    state = request.py_mm_encoder_state
+    cache = TensorLRUCache(16)
+    entry_id = ("mm_transient", request.request_id, 0)
+    cache.allocate(entry_id, 4, retain_after_release=False)
+    cache.put(entry_id, torch.ones(1), expected_state=CacheEntryState.RESERVED, expected_bytes=4)
+    state.bind_entry(0, entry_id, ready=True)
     freed = []
 
     executor = object.__new__(PyExecutor)
+    executor._mm_encoder_item_scheduling_enabled = True
+    executor.enable_attention_dp = False
+    executor.global_rank = 0
+    executor.model_engine = SimpleNamespace(mm_encoder_cache=cache)
+    executor._pending_mm_encoder_cache_removals = []
     executor.resource_manager = SimpleNamespace(free_resources=freed.append)
     executor._prefetched_request_ids = {request.py_request_id}
     executor._disagg_timed_out_ctx_cancelled_ids = {request.py_request_id}
     executor._disagg_timed_out_gen_cancelled_ids = {request.py_request_id}
     executor.gather_all_responses = False
-    executor.dist = SimpleNamespace(rank=1)
+    executor.dist = SimpleNamespace(rank=0, is_first_pp_rank=True, pp_size=pp_size)
+    executor.result_wait_queues = {}
 
     executor._do_terminate_request(request)
+    executor._release_py_multimodal_resources(request)
 
     assert freed == [request]
     assert request.py_mm_encoder_state is None
     assert request.py_multimodal_data == {}
+    assert executor._pending_mm_encoder_cache_removals == expected_pending_removals
     assert executor._prefetched_request_ids == set()
     assert executor._disagg_timed_out_ctx_cancelled_ids == set()
     assert executor._disagg_timed_out_gen_cancelled_ids == set()
 
 
-def test_item_outputs_accumulate_on_request_and_release_raw_data(monkeypatch):
+def test_weight_invalidation_clears_old_removal_delta_and_rejects_live_refs():
+    invalidations = []
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = []
+    executor.model_engine = SimpleNamespace(
+        invalidate_multimodal_encoder_cache=lambda: invalidations.append(True)
+    )
+    executor._pending_mm_encoder_cache_removals = [("old", 0)]
+
+    executor.invalidate_multimodal_encoder_cache()
+
+    assert invalidations == [True]
+    assert executor._pending_mm_encoder_cache_removals == []
+
+    request = _request(1, [4])
+    request.py_mm_encoder_state.bind_entry(0, ("entry", 0), ready=False)
+    executor.active_requests = [request]
+    with pytest.raises(RuntimeError, match="live multimodal cache references"):
+        executor.invalidate_multimodal_encoder_cache()
+    assert invalidations == [True]
+
+
+def test_item_outputs_commit_to_prompt_ordered_cache_entries(monkeypatch):
+    cache = TensorLRUCache(1 << 20, name="test")
+
     class _Model(MultimodalModelMixin):
+        def _get_multimodal_encoder_cache(self):
+            return cache
+
         def forward_multimodal_encoder_items(self, encoder_inputs):
             return [
                 torch.full((embedding_length, 2), float(embedding_length))
@@ -808,6 +893,8 @@ def test_item_outputs_accumulate_on_request_and_release_raw_data(monkeypatch):
     engine = object.__new__(PyTorchModelEngine)
     engine.model = _Model()
     engine.mm_encoder_item_scheduling_enabled = True
+    engine.mapping = SimpleNamespace(is_first_pp_rank=lambda: True)
+    engine.bytes_per_mm_encoder_embedding = 8
     request = _llm_request(
         1,
         multimodal_data={
@@ -824,183 +911,28 @@ def test_item_outputs_accumulate_on_request_and_release_raw_data(monkeypatch):
         },
     )
     initialize_multimodal_encoder_request(request, max_num_tokens=8)
-    assert request.py_mm_encoder_state.embedding_lengths == [2, 3]
+    state = request.py_mm_encoder_state
+    entry_ids = [
+        ("mm_transient", request.request_id, item_idx) for item_idx in range(state.num_items)
+    ]
+    for item_idx, (entry_id, rows) in enumerate(
+        zip(entry_ids, state.embedding_lengths, strict=True)
+    ):
+        cache.allocate(entry_id, rows * 8, retain_after_release=False)
+        state.bind_entry(item_idx, entry_id, ready=False)
 
     engine.forward_multimodal_encoder_items([request], {1: [0]})
 
-    # Items encoded across iterations land in their own rows of one buffer
-    # sized for the whole request, so the charge is already the full
-    # footprint. Raw inputs stay until every item is in.
-    state = request.py_mm_encoder_state
-    assert state.embeddings.shape == (2 + 3, 2)
     assert state.recorded == [True, False]
-    assert state.resident_output_bytes(8) == (2 + 3) * 8
+    torch.testing.assert_close(cache.get(entry_ids[0]), torch.full((2, 2), 2.0))
     assert "image" in request.py_multimodal_data
 
     engine.forward_multimodal_encoder_items([request], {1: [1]})
 
-    # Publishing is by reference: the buffer is already the contiguous form
-    # prefill consumes, so nothing is copied or concatenated here.
-    published = request.py_multimodal_data["multimodal_embedding"]
-    assert published is state.embeddings
-    assert published.tolist() == [
-        [2.0, 2.0],
-        [2.0, 2.0],
-        [3.0, 3.0],
-        [3.0, 3.0],
-        [3.0, 3.0],
-    ]
+    torch.testing.assert_close(cache.get(entry_ids[1]), torch.full((3, 2), 3.0))
+    assert "multimodal_embedding" not in request.py_multimodal_data
     assert "image" not in request.py_multimodal_data
-    assert state.resident_output_bytes(8) == (2 + 3) * 8
     assert is_multimodal_encoder_ready(request)
-
-
-# ---------------------------------------------------------------------------
-# Item-path read-through against the encoder cache (supports_encoder_cache)
-# ---------------------------------------------------------------------------
-
-
-def _cache_request(request_id, *, hashes, embedding_lengths, kwargs_hash="kw"):
-    """A cache-keyable item-scheduling request with raw image payload."""
-    num_items = len(embedding_lengths)
-    multimodal_data = {
-        "image": {
-            "pixel_values": torch.arange(sum(embedding_lengths)).unsqueeze(1),
-            "image_grid_thw": torch.tensor([[1, 1, length] for length in embedding_lengths]),
-        },
-        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
-            item_refs=[("image", item_idx) for item_idx in range(num_items)],
-            encoder_token_lengths=list(embedding_lengths),
-            output_embedding_lengths=list(embedding_lengths),
-        ),
-        "multimodal_embedding_lengths": list(embedding_lengths),
-    }
-    if kwargs_hash is not None:
-        multimodal_data["mm_processor_kwargs_hash"] = kwargs_hash
-    request = LlmRequest(
-        request_id=request_id,
-        max_new_tokens=1,
-        input_tokens=[1, 2, 3],
-        sampling_config=SamplingConfig(),
-        is_streaming=False,
-        py_multimodal_data=multimodal_data,
-        multimodal_hashes=hashes,
-    )
-    initialize_multimodal_encoder_request(request, max_num_tokens=1 << 30)
-    return request
-
-
-def _cache_engine(cache, monkeypatch, *, supports_encoder_cache=True):
-    class _Model(MultimodalModelMixin):
-        supports_encoder_cache = False
-
-        def __init__(self):
-            self.encoded_item_counts = []
-
-        def _get_multimodal_encoder_cache(self):
-            return cache
-
-        def forward_multimodal_encoder_items(self, encoder_inputs):
-            # Items, not input tuples: adjacent same-request same-modality
-            # items are sliced into one tuple.
-            self.encoded_item_counts.append(sum(len(lengths) for _, lengths, _ in encoder_inputs))
-            return [
-                torch.full((embedding_length, 2), float(embedding_length))
-                for _, embedding_lengths, _ in encoder_inputs
-                for embedding_length in embedding_lengths
-            ]
-
-    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
-    engine = object.__new__(PyTorchModelEngine)
-    model = _Model()
-    model.supports_encoder_cache = supports_encoder_cache
-    engine.model = model
-    engine.mm_encoder_item_scheduling_enabled = True
-    return engine
-
-
-def test_duplicate_request_hits_cache_and_skips_encoding(monkeypatch):
-    cache = TensorLRUCache(1 << 20, name="test")
-    engine = _cache_engine(cache, monkeypatch)
-    first = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
-    engine.forward_multimodal_encoder_items([first], {1: [0, 1]})
-    assert engine.model.encoded_item_counts == [2]
-
-    second = _cache_request(2, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
-    engine.forward_multimodal_encoder_items([second], {2: [0, 1]})
-
-    # Read-through: every item hit, so the encoder never ran again, and each
-    # request owns an independent copy (no cross-request aliasing).
-    assert engine.model.encoded_item_counts == [2]
-    assert is_multimodal_encoder_ready(second)
-    published = second.py_multimodal_data["multimodal_embedding"]
-    first_published = first.py_multimodal_data["multimodal_embedding"]
-    assert torch.equal(published, first_published)
-    assert published.untyped_storage().data_ptr() != first_published.untyped_storage().data_ptr()
-
-
-def test_cache_hit_at_encode_skips_only_hit_items(monkeypatch):
-    cache = TensorLRUCache(1 << 20, name="test")
-    engine = _cache_engine(cache, monkeypatch)
-    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
-    key0, _ = MultimodalModelMixin.build_encoder_cache_item_keys(
-        [[1, 2], [3, 4]], [("image", 0), ("image", 1)], [2, 3], "kw"
-    )
-    cache.put(key0, torch.full((2, 2), 7.0))  # entry from an earlier request
-    engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
-
-    assert engine.model.encoded_item_counts == [1]  # only the miss encoded
-    published = request.py_multimodal_data["multimodal_embedding"]
-    assert torch.equal(published[:2], torch.full((2, 2), 7.0))
-    assert is_multimodal_encoder_ready(request)
-
-
-def test_cache_eviction_leaves_recorded_slots_intact(monkeypatch):
-    cache = TensorLRUCache(2 * 2 * 4, name="test")  # holds exactly one 2-row item
-    engine = _cache_engine(cache, monkeypatch)
-    request = _cache_request(1, hashes=[[1, 2]], embedding_lengths=[2])
-    engine.forward_multimodal_encoder_items([request], {1: [0]})
-    recorded = request.py_multimodal_data["multimodal_embedding"][:2]
-    assert len(cache) == 1
-
-    cache.clear()  # simulate eviction of the entry the request came from
-
-    assert torch.equal(recorded, torch.full((2, 2), 2.0))  # owned clone, untouched
-    assert is_multimodal_encoder_ready(request)
-
-
-def test_cache_off_encodes_every_item_without_touching_cache(monkeypatch):
-    # supports_encoder_cache=False -> mm_encoder_cache is None -> pure encode.
-    cache = TensorLRUCache(1 << 20, name="test")
-    engine = _cache_engine(cache, monkeypatch, supports_encoder_cache=False)
-    assert engine.mm_encoder_cache is None
-    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
-
-    engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
-
-    assert engine.model.encoded_item_counts == [2]
-    assert is_multimodal_encoder_ready(request)
-    assert len(cache) == 0  # never populated
-
-
-@pytest.mark.parametrize("case", ["no_hashes", "no_kwargs_hash", "count_mismatch"])
-def test_key_guards_bypass_cache(case, monkeypatch):
-    cache = TensorLRUCache(1 << 20, name="test")
-    engine = _cache_engine(cache, monkeypatch)
-    request = _cache_request(
-        1,
-        hashes=None
-        if case == "no_hashes"
-        else ([[1, 2]] if case == "count_mismatch" else [[1, 2], [3, 4]]),
-        embedding_lengths=[2, 3],
-        kwargs_hash=None if case == "no_kwargs_hash" else "kw",
-    )
-
-    assert engine.get_mm_encoder_item_keys(request) is None
-
-    engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
-    assert is_multimodal_encoder_ready(request)
-    assert len(cache) == 0  # unkeyable items never populate the cache
 
 
 # ---------------------------------------------------------------------------
@@ -1024,111 +956,32 @@ def test_mm_encoder_state_copies_validated_scheduler_costs_at_admission():
     metadata.encoder_token_lengths[0] = 100
     assert request.py_mm_encoder_state.encoder_token_lengths == [4, 7]
 
-    scheduler = MultimodalScheduler(_BaseScheduler(), max_batch_size=2, max_num_tokens=11)
+    scheduler = _scheduler(max_batch_size=2, max_num_tokens=11)
     output = scheduler.schedule_request([request], set())
     assert output.scheduled_mm_encoder_items == {1: [0, 1]}
 
 
-def test_mm_encoder_state_progress_and_pending_transitions():
+def test_mm_encoder_state_tracks_prompt_ordered_entry_readiness():
     state = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
+    first_entry = ("entry", 0)
+    second_entry = ("entry", 1)
 
-    assert state.progress is MultimodalEncoderProgress.PENDING
-    assert state.pending_item_indices() == [0, 1]
-
-    state.record(1, torch.ones(3, 2))
+    state.bind_entry(0, first_entry, ready=False)
+    state.bind_entry(1, second_entry, ready=False)
+    state.mark_entry_ready(second_entry)
     assert state.progress is MultimodalEncoderProgress.PARTIAL
     assert state.pending_item_indices() == [0]
 
-    state.record(0, torch.zeros(2, 2))
+    state.mark_entry_ready(first_entry)
     assert state.progress is MultimodalEncoderProgress.READY
-    # Items land in prompt order in their own row ranges of one buffer.
-    assert state.embeddings.tolist() == [
-        [0, 0],
-        [0, 0],
-        [1, 1],
-        [1, 1],
-        [1, 1],
-    ]
+    assert state.drain_entry_ids() == [first_entry, second_entry]
+    assert state.entry_ids == [None, None]
+    assert state.progress is MultimodalEncoderProgress.PENDING
 
 
-def test_mm_encoder_state_record_rejects_mismatched_outputs():
-    state = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
-
-    with pytest.raises(MultimodalEncoderRequestError, match="expected 2"):
-        state.record(0, torch.ones(5, 2))
-
-    state.record(0, torch.ones(2, 2))
-    with pytest.raises(MultimodalEncoderRequestError, match="matching"):
-        state.record(1, torch.ones(3, 4))  # hidden dim mismatch vs items
-    with pytest.raises(MultimodalEncoderRequestError, match="already recorded"):
-        state.record(0, torch.ones(2, 2))  # items encode at most once
-
-
-def test_mm_encoder_state_record_copies_into_owned_storage():
+def test_mm_encoder_state_rejects_double_binding():
     state = MultimodalEncoderRequestState.from_embedding_lengths([2])
-    batch = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    view = batch[1:3]  # a view into a larger batched encoder output
+    state.bind_entry(0, ("entry", 0), ready=False)
 
-    state.record(0, view)
-
-    assert torch.equal(state.embeddings, view)
-    # The buffer neither aliases the batch storage (which a view would pin in
-    # full) nor can be invalidated by whoever owns the source tensor, and it
-    # is sized for this request alone.
-    assert state.embeddings.untyped_storage().data_ptr() != batch.untyped_storage().data_ptr()
-    assert state.embeddings.untyped_storage().nbytes() == 2 * 2 * 4
-
-
-def test_mm_encoder_state_charges_the_whole_request_from_its_first_item():
-    state = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
-    assert state.resident_output_bytes(4) == 0
-    assert not state.has_storage
-
-    # The first item allocates storage for every item, so the charge is the
-    # full footprint immediately -- which is what the request occupies.
-    state.record(1, torch.ones(3, 2))
-    assert state.has_storage
-    assert state.resident_output_bytes(4) == (2 + 3) * 4
-
-    state.record(0, torch.ones(2, 2))
-    assert state.resident_output_bytes(4) == (2 + 3) * 4
-
-
-def test_mm_encoder_state_finalize_is_a_conditional_no_op():
-    state = MultimodalEncoderRequestState.from_embedding_lengths([2])
-    multimodal_data = {"image": {"pixel_values": torch.empty(2, 1)}}
-
-    assert state.finalize(multimodal_data) is False
-    assert "multimodal_embedding" not in multimodal_data
-
-    state.record(0, torch.ones(2, 2))
-    assert state.finalize(multimodal_data) is True
-    assert multimodal_data["multimodal_embedding"] is state.embeddings
-    assert "image" not in multimodal_data
-
-
-def test_mm_encoder_state_publishes_the_buffer_without_copying():
-    """Publishing must hand over the buffer itself, not a second materialization.
-
-    The buffer is already the contiguous form the prefill path consumes, so a
-    copy here (or a per-item list that prefill has to concatenate) would put a
-    second full copy of the request's embeddings on the device that the byte
-    budget does not account for.
-    """
-    state = MultimodalEncoderRequestState.from_embedding_lengths([2, 3])
-    multimodal_data = {"image": {"pixel_values": torch.empty(2, 1)}}
-    state.record(0, torch.ones(2, 2))
-    state.record(1, torch.ones(3, 2))
-    buffer_ptr = state.embeddings.untyped_storage().data_ptr()
-
-    assert state.finalize(multimodal_data) is True
-
-    published = multimodal_data["multimodal_embedding"]
-    assert published is state.embeddings
-    assert published.untyped_storage().data_ptr() == buffer_ptr
-    assert published.shape == (2 + 3, 2)
-    # Readiness and byte accounting are unchanged by publishing: the rows stay
-    # resident until the request is stripped.
-    assert state.progress is MultimodalEncoderProgress.READY
-    assert state.pending_item_indices() == []
-    assert state.resident_output_bytes(4) == (2 + 3) * 4
+    with pytest.raises(RuntimeError, match="already has a cache entry"):
+        state.bind_entry(0, ("entry", 1), ready=False)
