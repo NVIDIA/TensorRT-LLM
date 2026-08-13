@@ -17,6 +17,7 @@ without allocating the CUDA buffers that function also fills.
 """
 
 import types
+from typing import Optional
 
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 
@@ -24,7 +25,7 @@ MAX_DRAFT_LEN = 3
 WINDOW = MAX_DRAFT_LEN + 1
 
 
-def _meta(max_num_requests=8):
+def _meta(max_num_requests: int = 8) -> SpecMetadata:
     return SpecMetadata(
         max_num_requests=max_num_requests,
         max_draft_len=MAX_DRAFT_LEN,
@@ -32,13 +33,13 @@ def _meta(max_num_requests=8):
     )
 
 
-def _request(slot, decoding_iter=0):
+def _request(slot: Optional[int], decoding_iter: int = 0) -> types.SimpleNamespace:
     return types.SimpleNamespace(py_seq_slot=slot, py_decoding_iter=decoding_iter)
 
 
-def _offsets(meta, requests):
+def _offsets(meta: SpecMetadata, requests: list[types.SimpleNamespace]) -> list[int]:
     """The offset base each request gets, as _populate_request_rng_state computes it."""
-    out = []
+    out: list[int] = []
     for request in requests:
         slot = request.py_seq_slot
         step = meta._rng_window_counter.get(slot, 0)
@@ -47,7 +48,7 @@ def _offsets(meta, requests):
     return out
 
 
-def test_offsets_advance_across_passes():
+def test_offsets_advance_across_passes() -> None:
     meta = _meta()
     reqs = [_request(0), _request(1)]
     assert _offsets(meta, reqs) == [0, 0]
@@ -55,7 +56,7 @@ def test_offsets_advance_across_passes():
     assert _offsets(meta, reqs) == [2 * WINDOW, 2 * WINDOW]
 
 
-def test_stale_decoding_iter_does_not_repeat_a_window():
+def test_stale_decoding_iter_does_not_repeat_a_window() -> None:
     # The overlap-scheduler case: py_decoding_iter is unchanged between two
     # adjacent batches because _update_requests has not run yet. Keyed off that
     # field both passes would share an offset window; the counter must not.
@@ -68,7 +69,7 @@ def test_stale_decoding_iter_does_not_repeat_a_window():
     assert first != second
 
 
-def test_counter_is_keyed_by_slot_not_batch_position():
+def test_counter_is_keyed_by_slot_not_batch_position() -> None:
     # Batch composition shifts between iterations; a slot's stream must follow
     # the slot, not where it happens to sit in the batch.
     meta = _meta()
@@ -77,7 +78,7 @@ def test_counter_is_keyed_by_slot_not_batch_position():
     assert _offsets(meta, [_request(2), _request(0)]) == [WINDOW, WINDOW]
 
 
-def test_dummy_requests_do_not_perturb_real_slots():
+def test_dummy_requests_do_not_perturb_real_slots() -> None:
     # CUDA-graph padding requests have py_seq_slot=None. They share one
     # counter and must leave real slots' streams untouched.
     meta = _meta()
@@ -86,7 +87,7 @@ def test_dummy_requests_do_not_perturb_real_slots():
     assert _offsets(meta, [_request(0)]) == [WINDOW]
 
 
-def test_graph_copy_shares_the_counter():
+def test_graph_copy_shares_the_counter() -> None:
     # create_cuda_graph_metadata shallow-copies, and the copies are reseated as
     # the live spec_metadata on replay. A per-copy counter would restart the
     # stream on every graph replay.
