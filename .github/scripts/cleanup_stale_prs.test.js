@@ -93,6 +93,10 @@ async function run({
   requireCompleteListingBeforeWrites = false,
   eventLog = [],
   nowValues = [],
+  eventName = dryRun ? 'workflow_dispatch' : 'schedule',
+  // Value of the STALE_PR_CLEANUP_LIVE repository variable. GitHub renders an
+  // unset variable as an empty string.
+  live = 'true',
 }) {
   const events = eventLog;
   const warnings = [];
@@ -267,13 +271,13 @@ async function run({
   await execute(
     github,
     {
-      eventName: dryRun ? 'workflow_dispatch' : 'schedule',
+      eventName,
       repo: { owner: 'NVIDIA', repo: 'TensorRT-LLM' },
       runId: 123456,
     },
     core,
     quietConsole,
-    { env: { DRY_RUN: String(dryRun) } },
+    { env: { DRY_RUN: String(dryRun), LIVE: String(live) } },
     immediateTimeout,
     fakeDate
   );
@@ -320,6 +324,43 @@ async function main() {
     assert(comments.some((event) => event.startsWith('comment:4:')));
     assert(events.some((event) => event.startsWith('state:5:')));
     assert(!comments.some((event) => event.startsWith('comment:5:')));
+  }
+
+  {
+    // GitHub orders this connection loosely, so a recently updated pull request
+    // can be returned ahead of long-idle ones, both within a page and across
+    // pages. Every page must still be scanned and filtered locally.
+    const fresh = pullRequest(10, { updatedAt: oldDate(2) });
+    const idle = pullRequest(11);
+    const oldest = pullRequest(12, { updatedAt: oldDate(200) });
+    const { events, summaries } = await run({
+      pullRequests: { 10: fresh, 11: idle, 12: oldest },
+      listingPages: [[fresh, idle], [oldest]],
+    });
+    assert(!events.some((event) => event.startsWith('state:10:')));
+    assert(events.some((event) => event.startsWith('comment:11:')));
+    assert(events.some((event) => event.startsWith('comment:12:')));
+    assert.deepEqual(summaryCounts(summaries), {
+      Mode: 'Run',
+      Closed: '0',
+      Exempt: '0',
+      Pinged: '2',
+      Scanned: '2',
+      Skipped: '0',
+    });
+  }
+
+  {
+    // Scheduled runs stay in dry-run mode until STALE_PR_CLEANUP_LIVE is set.
+    const { events, summaries } = await run({
+      pullRequests: { 13: pullRequest(13) },
+      eventName: 'schedule',
+      live: '',
+    });
+    assert(!events.some((event) => event.startsWith('comment:')));
+    assert(!events.some((event) => event.startsWith('close:')));
+    assert.equal(summaryCounts(summaries).Mode, 'Dry run');
+    assert.equal(summaryCounts(summaries).Pinged, '1');
   }
 
   {
