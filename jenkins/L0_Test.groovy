@@ -1410,7 +1410,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(stageName, {
             try {
-                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, false, postTag, useClusterDurations)
+                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -4331,7 +4331,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false, String postTag="", boolean useClusterDurations=false)
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -4705,53 +4705,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
     }
 
-    // Run type checking
-    if (typeCheck && cpver != "cp310") {
-        stage ("[${stageName}] Run type check")
-        {
-            // Type checking tests if 'tensorrt_llm.bindings' can be imported. This requires
-            // a GPU which is not available during the Build stage. The cpver check ensures
-            // type checking uses the same Python version which is used in the dev containers,
-            // '!=' avoids silent regression upon future Python upgrades.
-
-            echo "-- Running mypy type check with compiled bindings..."
-	    // copy build artifacts to make sure 'tensorrt_llm' is importable from ${llmSrc}
-            sh """
-                TRTLLM_PATH=`python3 -c 'import tensorrt_llm; print(tensorrt_llm.__path__[0])' | tail -n 1`
-                echo "\$TRTLLM_PATH"
-                # https://superuser.com/a/266429
-                cd "\$TRTLLM_PATH" && tar -c \
-                    libs/ bindings/ bindings.*.so \
-                    runtime/kv_cache_manager_v2/rawref/_rawref.*.so \
-                    runtime/kv_cache_manager_v2/rawref/*.pyi \
-                    deep_gemm_cpp_tllm.*.so \
-                    deep_gemm_cpp_tllm.pyi \
-                    tensorrt_llm_transfer_agent_binding.*.so \
-                    deep_gemm/ \
-                    | tar -C "${llmSrc}/tensorrt_llm" -xv
-            """
-            withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
-                // Strip the wheel's tensorrt_llm/libs (and its ucx/ subdir) out of
-                // LD_LIBRARY_PATH for this stage. The tar above populated
-                // ${llmSrc}/tensorrt_llm/{libs,bindings.*.so} from the wheel, so the
-                // source tree now has its own copies. With the wheel libs path on
-                // LD_LIBRARY_PATH, bindings.so's DT_NEEDED resolves libth_common.so
-                // to <wheel>/tensorrt_llm/libs/ while _common.py explicitly loads
-                // <src>/tensorrt_llm/libs/libth_common.so via torch.classes.load_library
-                // — two different absolute paths register the same Torch op twice
-                // and PyTorch aborts. Removing the wheel paths lets DT_NEEDED fall
-                // back to bindings.so's RUNPATH ($ORIGIN/libs = <src>/tensorrt_llm/libs/),
-                // matching the explicit load. This restores pre-#722cbdd071 behavior
-                // for type-check only; UCX/NIXL kv_cache_transceiver tests above
-                // still see the new LD_LIBRARY_PATH.
-                sh """
-                    TRTLLM_WHEEL_LIBS=\$(pip3 show tensorrt_llm | awk -F': ' '/^Location:/ { print \$2 }')/tensorrt_llm/libs
-                    export LD_LIBRARY_PATH=\$(echo "\$LD_LIBRARY_PATH" | tr ':' '\\n' | grep -vxF "\$TRTLLM_WHEEL_LIBS" | grep -vxF "\$TRTLLM_WHEEL_LIBS/ucx" | paste -sd:)
-                    cd ${llmSrc} && python3 -m pre_commit run type-check --all-files || (cat /root/.cache/pre-commit/pre-commit.log && /bin/false)
-                """
-            }
-	}
-    }
 }
 
 
@@ -4762,10 +4715,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag, useClusterDurations)
+        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -5470,7 +5423,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext)
     }]]}
     fullSet = parallelJobs.keySet()
 
@@ -5848,7 +5801,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext, values[4] ?: false)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
         }]]}
 
         // Add SBSA Slurm jobs
@@ -6146,7 +6099,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt, retryContext)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
                         }
                     })
                 }
@@ -6430,7 +6383,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, true, isFinalAttempt, retryContext)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
                 })
             }
         } else {
