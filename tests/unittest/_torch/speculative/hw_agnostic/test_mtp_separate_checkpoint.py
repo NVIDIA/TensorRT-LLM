@@ -207,7 +207,7 @@ def test_skip_modules_for_separate_mtp_checkpoint_shared_head():
     assert skip_modules_for_separate_mtp_checkpoint(step3_keys) == []
 
 
-def _make_one_engine_stub(spec_config):
+def _make_one_engine_stub(spec_config, num_hidden_layers: int = 52):
     """A bare SpecDecOneEngineForCausalLM with just the module tree we need.
 
     ``__init__`` builds a whole target model, so construct the instance
@@ -216,7 +216,12 @@ def _make_one_engine_stub(spec_config):
     """
     from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 
-    model = object.__new__(SpecDecOneEngineForCausalLM)
+    class _OneEngineStub(SpecDecOneEngineForCausalLM):
+        # The real ``config`` is a read-only property over
+        # ``model_config.pretrained_config``, which this stub never builds.
+        config = SimpleNamespace(num_hidden_layers=num_hidden_layers)
+
+    model = object.__new__(_OneEngineStub)
     torch.nn.Module.__init__(model)
 
     head = torch.nn.Module()
@@ -398,8 +403,7 @@ def test_separate_mtp_draft_load_skip_shared_head_scales(monkeypatch):
     monkeypatch.setattr(modeling_utils, "_load_weights_impl_v2", fake_load_weights_impl_v2)
 
     spec_config = MTPDecodingConfig(max_draft_len=1, speculative_model="/path/to/mtp")
-    model = _make_one_engine_stub(spec_config)
-    model.config = SimpleNamespace(num_hidden_layers=52)
+    model = _make_one_engine_stub(spec_config, num_hidden_layers=52)
     mapper = _PassthroughMtpMapper(num_hidden_layers=52)
 
     model.load_draft_weights(
