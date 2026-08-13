@@ -118,8 +118,16 @@ class InfraDryRunPipelineTest(unittest.TestCase):
     def test_agent_flow_uses_prepared_standard_pytest_workspace_only_for_dry_run(self):
         body = _function_body(L0_TEST, "runLLMAgentFlowTest", "launchTestListCheck")
         self.assertIn("if (isInfraDryRun())", body)
+        infra_pytest_install = (
+            "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout"
+        )
+        self.assertIn(infra_pytest_install, body)
         self.assertIn(
             "runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)", body
+        )
+        self.assertLess(
+            body.index(infra_pytest_install),
+            body.index("runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)"),
         )
         self.assertLess(body.index("if (isInfraDryRun())"), body.index("pip3 install -e"))
 
@@ -157,7 +165,11 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn(", false, false, globalVars,", helper)
         self.assertIn("'testPhase2StageName': ''", helper)
         self.assertIn("additionalParameters.containsKey('testPhase2StageName')", launch)
-        self.assertIn("parallelJobs.failFast = enableFailFast", L0_PARENT)
+        self.assertIn(
+            "def effectiveFailFast = testFilter[INFRA_DRY_RUN] ? false : enableFailFast",
+            L0_PARENT,
+        )
+        self.assertIn("parallelJobs.failFast = effectiveFailFast", L0_PARENT)
 
     def test_normal_gating_and_result_collection_remain_in_place(self):
         stages_start = L0_PARENT.index("def launchStages")
