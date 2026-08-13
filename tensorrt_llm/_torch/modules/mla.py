@@ -557,7 +557,7 @@ class MLA(nn.Module):
             sparse_params=self.sparse_params,
             dtype=dtype,
             aux_stream=mqa_aux_stream,
-            rope_append=getattr(self.sparse_params, "algorithm", None) != "deepseek_v4",
+            rope_append=(self.sparse_attn_hooks is None or self.sparse_attn_hooks.mqa_rope_append),
             kv_cache_dtype=self.kv_cache_dtype,
         )
         if self.mqa is None:

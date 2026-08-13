@@ -38,6 +38,7 @@ __all__ = [
 class MLASparseHooks(ABC):
     """Typed module-layer adapter for a sparse MLA algorithm."""
 
+    mqa_rope_append = True
     need_absorption = True
     need_dense_mha = True
     need_default_o_proj = True

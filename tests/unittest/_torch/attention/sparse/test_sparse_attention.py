@@ -210,12 +210,14 @@ def test_sparse_attn_hook_registration() -> None:
     hook_module.sparse_params.algorithm = "dsa"
     dsa_hooks = get_sparse_mla_hooks(hook_module)
     assert isinstance(dsa_hooks, MLASparseHooks)
+    assert dsa_hooks.mqa_rope_append
     assert dsa_hooks.need_absorption
     assert get_sparse_attention_hooks(hook_module) is None
 
     hook_module.sparse_params.algorithm = "deepseek_v4"
     dsv4_hooks = get_sparse_mla_hooks(hook_module)
     assert isinstance(dsv4_hooks, MLASparseHooks)
+    assert not dsv4_hooks.mqa_rope_append
     assert not dsv4_hooks.need_absorption
 
     hook_module.sparse_params.algorithm = "rocket"

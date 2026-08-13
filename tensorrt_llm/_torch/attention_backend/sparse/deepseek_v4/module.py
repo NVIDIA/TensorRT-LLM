@@ -1227,6 +1227,7 @@ def forward_sparse_attn(
 class DeepSeekV4Hooks(MLASparseHooks):
     """Typed DeepSeek-V4 adapter for the shared MLA module."""
 
+    mqa_rope_append = False
     need_absorption = False
     need_dense_mha = False
     need_default_o_proj = False
