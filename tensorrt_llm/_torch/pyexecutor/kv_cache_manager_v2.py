@@ -35,7 +35,9 @@ from tensorrt_llm._utils import (
 from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, KvCacheStats
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper,
+    copy_base_page_rows_to_device,
     copy_batch_block_offsets_to_device,
+    gather_base_page_rows,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
@@ -766,6 +768,329 @@ def _copy_swa_block_offsets_with_scratch_compiled(
     output.copy_(converted.permute(0, 2, 1, 3))
 
 
+_DEVICE_PAGE_TABLE_ENV = "TLLM_KVCM_V2_DEVICE_PAGE_TABLE"
+_ENV_TRUE = frozenset(("1", "true", "on", "yes"))
+_ENV_FALSE = frozenset(("0", "false", "off", "no"))
+
+
+def _use_device_page_table(host_block_offsets: torch.Tensor) -> bool:
+    """Whether the per-step page table must be expanded from device memory.
+
+    ``copyBatchBlockOffsetsToDevice`` dereferences the host page table (and
+    ``index_scales``/``kv_offset``) from *inside* the kernel, so it only works
+    while those allocations are mapped into the GPU's address space. Pageable
+    memory never is, and Confidential Compute does not map host memory at all,
+    so pinning would not make the kernel safe there either. ``auto`` therefore
+    keys off :func:`prefer_pinned`, the allocation policy whose CC-mode
+    ``False`` first exposed the mismatch (NVBug 6248648).
+    """
+    setting = os.getenv(_DEVICE_PAGE_TABLE_ENV, "auto").strip().lower()
+    if setting in _ENV_TRUE:
+        return True
+    if setting in _ENV_FALSE:
+        return False
+    if setting != "auto":
+        raise ValueError(
+            f"{_DEVICE_PAGE_TABLE_ENV} must be 'auto', one of "
+            f"{sorted(_ENV_TRUE)}, or one of {sorted(_ENV_FALSE)}; got {setting!r}"
+        )
+    return not prefer_pinned() or not host_block_offsets.is_pinned()
+
+
+def _check_page_table_is_gpu_addressable(**tensors: torch.Tensor) -> None:
+    """Fail at startup instead of with an async illegal access mid-run.
+
+    See :func:`_use_device_page_table` for the contract being checked. Without
+    this the symptom is a CUDA fault reported at an arbitrary later point --
+    in NVBug 6248648 it surfaced as an unrelated CUDA graph teardown abort.
+    """
+    pageable = sorted(name for name, tensor in tensors.items() if not tensor.is_pinned())
+    if pageable:
+        raise RuntimeError(
+            f"KVCacheManagerV2 page-table tensors {pageable} are pageable, but "
+            "copyBatchBlockOffsetsToDevice dereferences them from the GPU. Unset "
+            f"{_DEVICE_PAGE_TABLE_ENV} (or set it to 'auto') to expand the page "
+            "table from device memory instead."
+        )
+
+
+class _BasePageTableMaterializer:
+    """Materialize batch-dense tables from V2's stable base-page rows.
+
+    The native kernel pulls the batch's page-table rows straight out of host
+    memory over the zero-copy mapping when all inputs are GPU-addressable. CC
+    gathers stable rows on the host and moves those base indices through a
+    runtime-managed H2D copy before invoking that same K/V expansion kernel.
+    Pinned snapshots can invoke the kernel directly from their dense host
+    staging. This deliberately shares materialization semantics without
+    forcing the established non-CC paths through the CC transport policy.
+
+    Deleting that gather needs KVCM to report which stable rows changed since
+    the previous step; both the gather and the upload would then shrink to the
+    dirty rows. That is the intended follow-up. The upload is issued separately
+    for each pool and skips the unused V plane, minimizing H2D volume. CUDA does
+    not guarantee host-asynchronous ``cudaMemcpy2DAsync`` from pageable memory,
+    however, so its CPU critical-path cost must be measured on CC hardware.
+    """
+
+    def __init__(
+        self,
+        host_block_offsets: torch.Tensor,
+        stream: torch.cuda.Stream,
+        index_scales: Optional[torch.Tensor] = None,
+        kv_offset: Optional[torch.Tensor] = None,
+        allocate_device_source: bool = True,
+    ) -> None:
+        assert host_block_offsets.ndim == 4 and host_block_offsets.shape[2] == 2
+        self._host_block_offsets = host_block_offsets
+        self._host_base_page_indices = host_block_offsets[:, :, 0, :]
+        self._num_pools, self._row_capacity, self._max_blocks_per_seq = (
+            self._host_base_page_indices.shape
+        )
+        self._stream = stream
+        self._device = stream.device
+        if (index_scales is None) != (kv_offset is None):
+            raise ValueError("index_scales and kv_offset must be provided together")
+        self._index_scales = index_scales
+        self._kv_offset = kv_offset
+        self._use_device_staging = _use_device_page_table(host_block_offsets)
+        self._use_device_expansion = index_scales is not None and self._use_device_staging
+        if index_scales is not None and not self._use_device_expansion:
+            _check_page_table_is_gpu_addressable(
+                host_kv_cache_block_offsets=host_block_offsets,
+                index_scales=index_scales,
+                kv_offset=kv_offset,
+            )
+        self._index_scales_device = (
+            index_scales.to(device=self._device) if self._use_device_expansion else None
+        )
+        self._kv_offset_device = (
+            kv_offset.to(device=self._device) if self._use_device_expansion else None
+        )
+        if self._use_device_expansion:
+            self._identity_copy_idx_device = torch.arange(
+                self._row_capacity,
+                dtype=torch.int32,
+                device=self._device,
+            )
+            # Only plane 0 is initialized by the pitched H2D. The existing
+            # expansion kernel reads exactly that plane and materializes both
+            # K and V in its destination.
+            self._device_base_page_rows = (
+                torch.empty_like(host_block_offsets, device=self._device)
+                if allocate_device_source
+                else None
+            )
+        else:
+            self._identity_copy_idx_device = None
+            self._device_base_page_rows = None
+
+    @property
+    def uses_device_expansion(self) -> bool:
+        return self._use_device_expansion
+
+    @property
+    def uses_device_staging(self) -> bool:
+        """Whether host pointers must be hidden behind runtime-managed H2D copies."""
+        return self._use_device_staging
+
+    def _prepare_host_rows(
+        self,
+        num_seqs: int,
+        *,
+        num_blocks: Optional[int] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Prepare the dense destination used by a native host-row gather.
+
+        A fresh output is the default because an asynchronous H2D may still be
+        reading iteration N after the overlap scheduler starts iteration N+1.
+        ``out`` is a reusable, base-aligned staging tensor: it must already
+        own enough storage for the exact batch shape, is resized in place, and
+        is populated. The resize is forbidden from reallocating so its pinned
+        state cannot change. Callers supplying it must externally order its
+        reuse.
+        """
+        num_blocks = self._max_blocks_per_seq if num_blocks is None else num_blocks
+        assert 0 < num_blocks <= self._max_blocks_per_seq
+        expected_shape = (self._num_pools, num_seqs, 2, num_blocks)
+        if out is None:
+            rows = torch.empty(
+                expected_shape,
+                dtype=self._host_base_page_indices.dtype,
+                device="cpu",
+                # Fresh staging on the device path must be pageable: this raw
+                # CUDA copy is not visible to PyTorch's pinned allocator, so a
+                # freshly freed pinned buffer could otherwise be recycled while
+                # the transfer is still in flight. Reusable caller-owned pinned
+                # staging has an explicit lifetime/reuse contract instead.
+                pin_memory=prefer_pinned() and not self._use_device_staging,
+            )
+        else:
+            assert out.ndim == 4
+            assert out.shape[0] == self._num_pools and out.shape[2:] == (2, num_blocks)
+            assert out.device.type == "cpu" and out.dtype == self._host_base_page_indices.dtype
+            assert out.is_contiguous() and out.storage_offset() == 0, (
+                "out must be a contiguous, base-aligned staging tensor"
+            )
+            required_storage_bytes = math.prod(expected_shape) * out.element_size()
+            available_storage_bytes = out.untyped_storage().nbytes()
+            if available_storage_bytes < required_storage_bytes:
+                raise ValueError(
+                    f"out storage holds {available_storage_bytes} bytes, "
+                    f"but gathering {expected_shape} requires {required_storage_bytes}"
+                )
+            data_ptr = out.data_ptr()
+            was_pinned = out.is_pinned()
+            out.resize_(expected_shape)
+            if out.data_ptr() != data_ptr:
+                raise RuntimeError("out resize unexpectedly reallocated storage")
+            if out.is_pinned() != was_pinned:
+                raise RuntimeError("out resize unexpectedly changed pinned state")
+            rows = out
+
+        return rows
+
+    def _gather_host_rows(
+        self,
+        copy_idx: torch.Tensor,
+        *,
+        num_blocks: Optional[int] = None,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Snapshot ``copy_idx`` rows in batch order with native row copies."""
+        assert copy_idx.ndim == 1 and copy_idx.device.type == "cpu"
+        num_blocks = self._max_blocks_per_seq if num_blocks is None else num_blocks
+        rows = self._prepare_host_rows(copy_idx.shape[0], num_blocks=num_blocks, out=out)
+        gather_base_page_rows(self._host_block_offsets, rows, copy_idx, num_blocks)
+        return rows
+
+    def copy_rows_to_device(
+        self,
+        dst_tensor: torch.Tensor,
+        copy_idx: torch.Tensor,
+        *,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> int:
+        """Snapshot active base rows into the front of a device staging table."""
+        assert self._use_device_staging, "CPU row staging is reserved for the device-staging path"
+        assert dst_tensor.ndim == 4 and dst_tensor.is_cuda
+        num_pools, row_capacity, kv_factor, max_blocks_per_seq = dst_tensor.shape
+        assert num_pools == self._num_pools and row_capacity >= copy_idx.shape[0]
+        assert kv_factor == 2
+        assert max_blocks_per_seq == self._max_blocks_per_seq
+        num_seqs = copy_idx.shape[0]
+        if num_seqs == 0:
+            return 0
+        host_rows = self._gather_host_rows(copy_idx)
+        stream = torch.cuda.current_stream(dst_tensor.device) if stream is None else stream
+        with torch.cuda.stream(stream):
+            copy_base_page_rows_to_device(
+                host_rows,
+                dst_tensor,
+                num_seqs,
+                stream.cuda_stream,
+            )
+        return num_seqs
+
+    def _get_device_conversion_metadata(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        # These immutable copies are built before any CUDA graph capture and
+        # may therefore be consumed safely from every materialization stream.
+        assert self._index_scales_device is not None and self._kv_offset_device is not None
+        return self._index_scales_device, self._kv_offset_device
+
+    def copy_gathered_rows_to(
+        self,
+        dst_tensor: torch.Tensor,
+        host_rows: torch.Tensor,
+        *,
+        device_source: Optional[torch.Tensor] = None,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Expand already-dense host base rows into the attention ABI."""
+        assert self._use_device_expansion
+        assert host_rows.ndim == 4 and host_rows.device.type == "cpu" and host_rows.is_contiguous()
+        num_pools, num_seqs, kv_factor, num_blocks = host_rows.shape
+        assert kv_factor == 2
+        assert dst_tensor.ndim == 4 and dst_tensor.is_cuda
+        assert dst_tensor.shape[0] == num_pools == self._num_pools
+        assert dst_tensor.shape[1] >= num_seqs and dst_tensor.shape[2] == 2
+        assert dst_tensor.shape[3] == num_blocks
+        if num_seqs == 0:
+            return
+        assert num_blocks % 4 == 0, "blocks per sequence must be a multiple of 4"
+        assert self._index_scales is not None and self._kv_offset is not None
+        stream = self._stream if stream is None else stream
+
+        with torch.cuda.stream(stream):
+            source = (
+                torch.empty_like(host_rows, device=self._device)
+                if device_source is None
+                else device_source
+            )
+            assert source.ndim == 4 and source.is_cuda and source.is_contiguous()
+            assert source.shape[0] == num_pools and source.shape[1] >= num_seqs
+            assert source.shape[2:] == (2, num_blocks)
+            copy_base_page_rows_to_device(
+                host_rows,
+                source,
+                num_seqs,
+                stream.cuda_stream,
+            )
+        assert self._identity_copy_idx_device is not None
+        copy_idx = self._identity_copy_idx_device[:num_seqs]
+        index_scales, kv_offset = self._get_device_conversion_metadata()
+
+        copy_batch_block_offsets_to_device(
+            source,
+            dst_tensor,
+            copy_idx,
+            index_scales,
+            kv_offset,
+            stream.cuda_stream,
+        )
+
+    def copy_block_offsets_to(
+        self,
+        dst_tensor: torch.Tensor,
+        copy_idx: torch.Tensor,
+        *,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Materialize the attention ABI ``[pool, batch, K/V, block]`` table."""
+        assert self._use_device_expansion
+        assert dst_tensor.ndim == 4 and dst_tensor.is_cuda
+        num_pools, _, kv_factor, max_blocks_per_seq = dst_tensor.shape
+        assert num_pools == self._num_pools and kv_factor == 2, (
+            f"dst_tensor has {num_pools} pools and kv factor {kv_factor}, "
+            f"expected {self._num_pools} and 2"
+        )
+        assert max_blocks_per_seq <= self._max_blocks_per_seq, (
+            f"dst_tensor holds {max_blocks_per_seq} blocks per sequence, "
+            f"but the stable table holds only {self._max_blocks_per_seq}"
+        )
+        num_seqs = copy_idx.shape[0]
+        if num_seqs == 0:
+            return
+        assert max_blocks_per_seq % 4 == 0, "blocks per sequence must be a multiple of 4"
+        assert self._index_scales is not None and self._kv_offset is not None
+        stream = self._stream if stream is None else stream
+
+        host_rows = self._gather_host_rows(
+            copy_idx,
+            num_blocks=max_blocks_per_seq,
+        )
+        device_source = (
+            self._device_base_page_rows if max_blocks_per_seq == self._max_blocks_per_seq else None
+        )
+        self.copy_gathered_rows_to(
+            dst_tensor,
+            host_rows,
+            device_source=device_source,
+            stream=stream,
+        )
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
@@ -1445,8 +1770,28 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device="cpu",
         )
+        self._page_table_materializer = _BasePageTableMaterializer(
+            self.host_kv_cache_block_offsets,
+            self._stream,
+            self.index_scales,
+            self.kv_offset,
+            allocate_device_source=not self.enable_swa_scratch_reuse,
+        )
+        if not self._page_table_materializer.uses_device_expansion:
+            # get_copy_index always slices the mapper's persistent copy-index
+            # allocation. Probe that allocation once here instead of adding a
+            # pinned-memory query to the non-CC per-step critical path.
+            _check_page_table_is_gpu_addressable(
+                copy_idx=self.index_mapper.get_copy_index([], 0, 1)
+            )
         if self.enable_swa_scratch_reuse:
             self._prepare_swa_scratch_copy_tensors(index_mapper_capacity)
+
+        if self._page_table_materializer.uses_device_expansion:
+            logger.info(
+                "[KVCacheManager] Expanding the V2 page table from device memory: "
+                "the host table is not addressable by the native page-table kernel."
+            )
 
     def _kv_pool_mapping_offset(
         self, layer_id: LayerId, layer_group_id: int, key_base_addr: int
@@ -1670,17 +2015,24 @@ class KVCacheManagerV2(BaseResourceManager):
             self.host_kv_cache_block_offsets,
             device=device,
         )
+        if self._page_table_materializer.uses_device_staging:
+            self._device_copy_idx_staging = torch.arange(
+                staging_capacity,
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            self._device_copy_idx_staging = torch.zeros(
+                staging_capacity,
+                dtype=torch.long,
+                device=device,
+            )
         self._device_attention_op_block_offsets_staging = torch.empty(
             self.num_attention_op_pools,
             staging_capacity,
             2,
             self.max_blocks_per_seq,
             dtype=torch.int32,
-            device=device,
-        )
-        self._device_copy_idx_staging = torch.zeros(
-            staging_capacity,
-            dtype=torch.long,
             device=device,
         )
         self._device_num_contexts = torch.empty((), dtype=torch.int32, device=device)
@@ -1801,11 +2153,19 @@ class KVCacheManagerV2(BaseResourceManager):
         num_contexts: int,
         num_seqs: int,
     ) -> None:
-        device_copy_idx = self._copy_idx_to_device(copy_idx)
-        self._device_kv_cache_block_offsets_input.copy_(
-            self.host_kv_cache_block_offsets,
-            non_blocking=True,
-        )
+        # Preserve the established non-CC full-table upload and GPU gather.
+        if self._page_table_materializer.uses_device_staging:
+            self._page_table_materializer.copy_rows_to_device(
+                self._device_kv_cache_block_offsets_input,
+                copy_idx,
+            )
+            device_copy_idx = self._device_copy_idx_staging
+        else:
+            device_copy_idx = self._copy_idx_to_device(copy_idx)
+            self._device_kv_cache_block_offsets_input.copy_(
+                self.host_kv_cache_block_offsets,
+                non_blocking=True,
+            )
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
             request_ids,
             num_contexts,
@@ -3949,13 +4309,48 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
-        copy_batch_block_offsets_to_device(
+        if self._page_table_materializer.uses_device_expansion:
+            self._page_table_materializer.copy_block_offsets_to(dst_tensor, copy_idx)
+        else:
+            copy_batch_block_offsets_to_device(
+                self.host_kv_cache_block_offsets,
+                dst_tensor,
+                copy_idx,
+                self.index_scales,
+                self.kv_offset,
+                self._stream.cuda_stream,
+            )
+
+    def materialize_block_offsets_snapshot(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        *,
+        host_staging: Optional[torch.Tensor] = None,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Materialize a stable snapshot for an asynchronous consumer.
+
+        A caller that reuses ``host_staging`` must order that reuse after the
+        prior asynchronous consumer has finished reading it.
+        """
+        assert self._page_table_materializer.uses_device_expansion
+        num_blocks = dst_tensor.shape[-1]
+        host_rows = self._page_table_materializer._prepare_host_rows(
+            len(request_ids),
+            num_blocks=num_blocks,
+            out=host_staging,
+        )
+        self.index_mapper.gather_k_block_offsets(
             self.host_kv_cache_block_offsets,
+            host_rows,
+            request_ids,
+            num_blocks,
+        )
+        self._page_table_materializer.copy_gathered_rows_to(
             dst_tensor,
-            copy_idx,
-            self.index_scales,
-            self.kv_offset,
-            self._stream.cuda_stream,
+            host_rows,
+            stream=stream,
         )
 
     @staticmethod

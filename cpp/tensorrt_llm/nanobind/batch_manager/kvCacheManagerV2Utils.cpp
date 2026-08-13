@@ -79,7 +79,7 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         .def("remove_sequence", &IndexMapper::removeSequence)
         .def("get_copy_index", &IndexMapper::getCopyIndex)
         .def("gather_k_block_offsets", &IndexMapper::gatherKBlockOffsets, nb::arg("source"), nb::arg("destination"),
-            nb::arg("request_ids"), nb::arg("num_blocks"))
+            nb::arg("request_ids"), nb::arg("num_blocks"), nb::call_guard<nb::gil_scoped_release>())
         .def("size", &IndexMapper::size)
         .def("num_free_slots", &IndexMapper::numFreeSlots);
 
@@ -133,11 +133,36 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
         "Copy data from device to device using CUDA kernels");
 
+    module.def("gather_base_page_rows", &gatherBasePageRows, nb::arg("source"), nb::arg("destination"),
+        nb::arg("copy_index"), nb::arg("num_blocks"), nb::call_guard<nb::gil_scoped_release>(),
+        "Gather canonical V2 base-page rows into a dense host tensor");
+
+    module.def(
+        "copy_base_page_rows_to_device",
+        [](at::Tensor input, at::Tensor output, SizeType32 numRows, uintptr_t stream)
+        {
+            TLLM_CHECK_WITH_INFO(input.device().is_cpu(), "input must be a CPU tensor");
+            TLLM_CHECK_WITH_INFO(output.device().is_cuda(), "output must be a CUDA tensor");
+            TLLM_CHECK_WITH_INFO(input.scalar_type() == at::kInt && output.scalar_type() == at::kInt,
+                "input and output must contain int32 values");
+            TLLM_CHECK_WITH_INFO(
+                input.is_contiguous() && output.is_contiguous(), "input and output must be contiguous");
+            auto _input = from_torch(input);
+            auto _output = from_torch(output);
+            TLLM_CHECK_WITH_INFO(_input.has_value() && _output.has_value(), "Invalid page-table tensor.");
+            copyBasePageRowsToDevice(
+                *(_input.value()), *(_output.value()), numRows, reinterpret_cast<CUstream>(stream));
+        },
+        nb::arg("input"), nb::arg("output"), nb::arg("num_rows"), nb::arg("stream"),
+        nb::call_guard<nb::gil_scoped_release>(), "Copy dense V2 base-page rows into a 4-D device table");
+
     module.def(
         "copy_batch_block_offsets_to_device",
         [](at::Tensor input, at::Tensor output, at::Tensor copyIndex, at::Tensor indexScales, at::Tensor kvOffset,
             uintptr_t stream)
         {
+            TLLM_CHECK_WITH_INFO(input.is_contiguous(), "input must be contiguous");
+            TLLM_CHECK_WITH_INFO(output.device().is_cuda(), "output must be a CUDA tensor");
             auto _input = from_torch(input);
             auto _output = from_torch(output);
             auto _copyIndex = from_torch(copyIndex);
@@ -152,7 +177,8 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
                 *(_indexScales.value()), *(_kvOffset.value()), reinterpret_cast<CUstream>(stream));
         },
         nb::arg("input"), nb::arg("output"), nb::arg("copy_index"), nb::arg("index_scales"), nb::arg("kv_offset"),
-        nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(), "Copy batch block indices to device");
+        nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>(),
+        "Materialize attention block offsets from V2 base-page indices");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
