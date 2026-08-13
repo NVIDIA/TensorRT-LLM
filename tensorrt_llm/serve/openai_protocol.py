@@ -2088,12 +2088,13 @@ class VideoGenerationRequest(OpenAIBaseModel):
         )
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
-        description=(
-            "Deprecated. A single image or video reference, routed by content "
-            "signature to image-to-video or video-to-video. Kept for backward "
-            "compatibility; prefer the typed ``image_reference`` / "
-            "``video_reference`` fields, which are used instead whenever the "
-            "same-modality typed field is also provided."),
+        description=
+        ("Deprecated. A single image or video reference, routed by content "
+         "signature to image-to-video or video-to-video. Kept for backward "
+         "compatibility; prefer the typed ``image_reference`` / "
+         "``video_reference`` fields, which take precedence — this field is "
+         "ignored whenever a typed ``image_reference`` or ``video_reference`` "
+         "is provided."),
     )
 
     # Resolution

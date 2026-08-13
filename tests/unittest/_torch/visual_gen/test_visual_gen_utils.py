@@ -505,6 +505,19 @@ class TestInputReferenceMaterialization:
         # … and the payload read fails before any file is written, so nothing leaks.
         assert list(tmp_path.iterdir()) == []
 
+    def test_multi_reference_partial_failure_cleans_up(self, tmp_path):
+        # A later item's rejection removes the files earlier items already wrote,
+        # so a rejected multi-reference request leaves nothing on disk.
+        generator = _StubVisualGen()
+        buf = BytesIO()
+        Image.new("RGB", (4, 4)).save(buf, format="PNG")
+        good = base64.b64encode(buf.getvalue()).decode()
+        bad = base64.b64encode(b"neither an image nor a video").decode()
+        request = VideoGenerationRequest(prompt="x", image_reference=[good, bad])
+        with pytest.raises(ValueError, match="not a recognized image"):
+            parse_visual_gen_params(request, "vid-11", generator, media_storage_path=str(tmp_path))
+        assert list(tmp_path.iterdir()) == []
+
 
 class TestMediaBytesProbes:
     """The in-memory signature probes the serve boundary routes on."""

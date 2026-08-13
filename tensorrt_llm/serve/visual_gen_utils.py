@@ -20,6 +20,8 @@ from tensorrt_llm.serve.openai_protocol import (
 )
 
 if TYPE_CHECKING:
+    from fastapi import UploadFile
+
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -197,15 +199,27 @@ def _build_reference_list(value, *, modality: str, id: str, media_storage_path: 
 
     raw_items = value if isinstance(value, list) else [value]
     refs = []
-    for i, item in enumerate(raw_items):
-        payload, role = _reference_payload_and_role(item)
-        ref_path = _materialize_reference(
-            payload,
-            modality=modality,
-            ref_id=f"{id}_{modality}_ref_{i}",
-            media_storage_path=media_storage_path,
-        )
-        refs.append(MediaRef(content=ref_path, role=role))
+    created_paths: list[str] = []
+    try:
+        for i, item in enumerate(raw_items):
+            payload, role = _reference_payload_and_role(item)
+            ref_path = _materialize_reference(
+                payload,
+                modality=modality,
+                ref_id=f"{id}_{modality}_ref_{i}",
+                media_storage_path=media_storage_path,
+            )
+            created_paths.append(ref_path)
+            refs.append(MediaRef(content=ref_path, role=role))
+    except Exception:
+        # A later item failed; remove the files earlier items already wrote so
+        # a rejected multi-reference request leaves nothing on disk.
+        for path in created_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise
     return refs
 
 
@@ -423,7 +437,11 @@ def cleanup_materialized_conditioning_inputs(value: Any) -> None:
             logger.warning("Failed to remove temporary image edit input %r: %s", path, exc)
 
 def _apply_deprecated_input_reference(
-    input_reference, params, *, id: str, media_storage_path: Optional[str]
+    input_reference: str | UploadFile | None,
+    params: VisualGenParams,
+    *,
+    id: str,
+    media_storage_path: str | None,
 ) -> None:
     """Back-compat for the deprecated single ``input_reference``.
 
