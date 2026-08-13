@@ -81,15 +81,17 @@ def test_async_video_generation(
             },
         }
 
-        # Add input reference if provided (TI2V mode)
+        # Add input reference if provided (TI2V mode). Keep the create call
+        # inside the file's context so the handle closes once the request is sent.
         if image_reference:
             if not Path(image_reference).exists():
                 print(f"\n❌ Error: Input reference image not found: {image_reference}")
                 return False
-            create_params["image_reference"] = open(image_reference, "rb")
-
-        # Create video generation job
-        job = client.videos.create(**create_params)
+            with open(image_reference, "rb") as ref_file:
+                create_params["image_reference"] = ref_file
+                job = client.videos.create(**create_params)
+        else:
+            job = client.videos.create(**create_params)
 
         print("Video generation started: \n", job.model_dump_json(indent=2))
 
