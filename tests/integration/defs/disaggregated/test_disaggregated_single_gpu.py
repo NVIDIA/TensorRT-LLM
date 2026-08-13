@@ -998,8 +998,10 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
         KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
         for _ in range(2)
     ]
+    # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
+        for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
@@ -1156,8 +1158,10 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
         KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
         for _ in range(2)
     ]
+    # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
+        for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]

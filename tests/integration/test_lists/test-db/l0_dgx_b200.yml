@@ -17,7 +17,6 @@ l0_dgx_b200:
   tests:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync[cpp]
   # ------------- KV Cache V2 Scheduler IT (multi-GPU) ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens
@@ -117,8 +116,10 @@ l0_dgx_b200:
       orchestrator: ray
   tests:
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
-    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part0"
-    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part1"
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_fp8[Qwen3/Qwen3-8B-Qwen3/Qwen3-8B-FP8]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_fp8[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B-FP8]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_fp8[Qwen3/Qwen3-8B-Qwen3/Qwen3-8B-FP8]
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_fp8[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B-FP8]
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part2"
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part3"
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part4"
@@ -131,6 +132,7 @@ l0_dgx_b200:
     - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0]
     - examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2]
     - examples/test_ray.py::test_ray_disaggregated_serving[tp2]
+    - examples/test_ray.py::test_ray_disaggregated_serving_python[tp2]
 - condition:
     ranges:
       system_gpu_count:
@@ -219,7 +221,6 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
-  - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_async_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_pipeline_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_wan_tp.py

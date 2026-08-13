@@ -104,7 +104,11 @@ DEFAULT_TIMEOUT = 10800
 # per-test pytest kill both saves GPU-hours and leaves a classifiable failure
 # in the CI log. The disagg bound is larger because its /health only answers
 # once EVERY ctx/gen worker has finished model load + autotune + warmup.
-AGG_SERVER_READY_TIMEOUT = 1800
+# 1800 proved too tight for the largest agg cases: gb300 DeepSeek-V4-Pro
+# ctx_only (con4301) needs ~2000s of model load + autotune before /health
+# answers, so it failed readiness while the server was still coming up
+# (nvbugs/6517846). Raised to match the disagg bound.
+AGG_SERVER_READY_TIMEOUT = 3600
 DISAGG_SERVER_READY_TIMEOUT = 3600
 # GEN workers normally reap within seconds after benchmark_status is written.
 # Keep this well below the whole-test timeout so a stuck multi-node srun cannot

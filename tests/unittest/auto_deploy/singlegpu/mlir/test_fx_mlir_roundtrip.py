@@ -159,6 +159,7 @@ def _build_precise_to_dtype_mlir_module():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_mlir_to_fx_propagates_single_output_fused_getitem_meta():
     import operator
 
@@ -192,6 +193,7 @@ def test_mlir_to_fx_propagates_single_output_fused_getitem_meta():
     assert getitem_nodes[0].meta["val"].dtype == fake_val.dtype
 
 
+@pytest.mark.cpu_only
 def test_mlir_to_fx_synthesizes_precise_op_meta_from_result_type():
     graph = torch.fx.Graph()
     x = graph.placeholder("x")

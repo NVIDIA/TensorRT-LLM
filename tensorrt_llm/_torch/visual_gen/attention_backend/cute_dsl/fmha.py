@@ -263,12 +263,8 @@ def cute_dsl_fmha_fwd(
     elif scale_v_channels is not None:
         raise ValueError("scale_v_channels is only supported by MXFP8 and NVFP4 kernels.")
 
-    # The kernel hard-codes dense strides in its CuTe layout (fmha.py:447-461) and ignores the
-    # input tensor's actual strides, so non-dense inputs (e.g. `qkv.split(...)` views) would
-    # be read at wrong offsets. .contiguous() is a no-op when the tensor is already dense.
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("Q, K, and V must be contiguous before the CuTe DSL launch boundary.")
     if not o.is_contiguous():
         raise ValueError("Output tensor `o` must be contiguous (writes happen in place).")
     if lse is not None and not lse.is_contiguous():
@@ -709,6 +705,13 @@ class CuTeDSLAttention(AttentionBackend):
         skip_softmax_threshold_scale = self.skip_softmax_threshold_scale
         if skip_softmax_threshold_scale is not None and skip_softmax_threshold_scale <= 0.0:
             skip_softmax_threshold_scale = None
+
+        # Materialize packed-QKV views on the compiled side of the CuTe DSL graph break so
+        # TorchInductor can emit one copy kernel per tensor instead of four TensorIterator
+        # launches for each large strided view.
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
 
         cute_dsl_fmha_fwd(
             q,
