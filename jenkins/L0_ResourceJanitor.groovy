@@ -31,15 +31,22 @@
 // / pods are largely self-reaped by the kubernetes plugin, so they are a later
 // extension (see reapOrphanedNodes stub).
 //
+// SAME-INSTANCE MODEL: CI SLURM jobs are launched from per-instance Jenkins
+// servers, not from a central one, and cross-instance API auth is not set up. So
+// this job runs per-instance (one cron per Jenkins instance) and checks each
+// job's owner build via the in-process Jenkins Groovy API (isOwnerBuildRunning);
+// a build URL belonging to a *different* instance is left for that instance's
+// janitor. Using the in-process API (rather than an HTTP call) means there is no
+// shell command and thus no way for an attacker-influenceable job comment to
+// inject anything, and no credential to manage.
+//
 // SAFETY MODEL (fail safe, never reap a live build's resource):
 //   * DRY_RUN defaults to true -- prints what it *would* reap, changes nothing.
 //   * Only ever considers resources carrying OUR owner tag (OWNER_TAG_KEY); a job
 //     with no CI owner tag is never touched.
-//   * Reaps only when the owner build is *confirmed not running*. If the
-//     owner-alive check errors or is inconclusive, the resource is LEFT (assume
-//     alive).
-//   * STALE_MINUTES grace period on top of that, so a job whose build just
-//     started (or whose API status lags) is not reaped.
+//   * Reaps only when the owner build is *confirmed not running* on THIS instance.
+//     Any parse error, unknown build, or other-instance URL leaves the job.
+//   * STALE_MINUTES grace period; an unparsable elapsed value leaves the job.
 //   * Per-cluster best-effort: one cluster's failure never aborts the others.
 //
 // COMPANION (same change set): SLURM submission in L0_Test.groovy stamps the owner
@@ -50,12 +57,13 @@
 // candidate (safe).
 //
 // INFRA-TODO (fill in with the team before enabling non-dry-run):
-//   * Jenkins job config: schedule (cron), which Jenkins instance(s) it runs on.
-//   * Agent pod must have SLURM login-node SSH access + the svc_tensorrt creds
-//     that CloudManager.withSlurmFrontendFailover expects (same as L0_Test SLURM
+//   * Jenkins job config: schedule (cron) on each instance; "Pipeline script from
+//     SCM" so `checkout scm` works in the bootstrap stage below.
+//   * Work-pod must have an ssh client + the svc_tensorrt creds that
+//     CloudManager.withSlurmFrontendFailover expects (same as L0_Test SLURM
 //     dispatchers).
-//   * Cross-instance owner-build lookup auth (multi-server); see isOwnerBuildRunning.
-//   * Confirm squeue field/comment format on the target Slurm version.
+//   * Confirm squeue field format (%k comment, %M elapsed) on the target Slurm
+//     version, and the bootstrap git image availability.
 // =============================================================================
 
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
@@ -64,45 +72,99 @@ import com.nvidia.bloom.CloudManager
 import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.Utils
 
-// Structured owner tag carried in each CI SLURM job's --comment. The companion
-// submission change writes "trtllm-ci-owner=<BUILD_URL>" (co-existing with any
-// other comment payload, ';'-separated); this job parses <BUILD_URL> back out and
-// queries "<BUILD_URL>api/json?tree=building" to decide whether the owner is alive.
+// Structured owner tag carried in each CI SLURM job's --comment. L0_Test writes
+// "trtllm-ci-owner=<BUILD_URL>" (co-existing with any other comment payload,
+// ';'-separated); this job parses <BUILD_URL> back out and checks the build.
 OWNER_TAG_KEY = "trtllm-ci-owner"
 
 // SLURM account the CI jobs run under; only this user's jobs are ever considered.
 SLURM_CI_USER = "svc_tensorrt"
 
-// Janitor pod image: must have curl + an ssh client, since it queries the Jenkins
-// API and reaches the SLURM login nodes over ssh (via CloudManager). Reuse a
-// TRT-LLM CI image + its pull secret rather than a bare alpine (no curl/ssh).
-// INFRA-TODO: confirm this image + secret match the SLURM dispatcher pool.
-DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
+// K8s secret for pulling the work-pod image from artifactory.nvidia.com.
 ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
-// Owner build URLs come from job comments (attacker-influenceable), so before use
-// they are validated against this Jenkins host allowlist + a conservative charset,
-// AND passed to curl via an environment variable rather than interpolated into the
-// shell -- a crafted comment cannot inject shell code into the janitor pod.
-// INFRA-TODO: confirm the full set of Jenkins hosts (multi-server).
-JENKINS_HOST_ALLOWLIST = ["prod.blsm.nvidia.com"]
+// Small git-capable image used only by the bootstrap stage to check out the repo
+// and read the CI image tag from jenkins/current_image_tags.properties, so the
+// work-pod image is not hardcoded here (single source of truth is the properties
+// file). INFRA-TODO: confirm this image is available via the mirror.
+BOOTSTRAP_IMAGE = "urm.nvidia.com/docker/alpine/git:latest"
 
-// True only for a plain https Jenkins build URL on an allowed host whose path uses
-// a shell-safe charset (no metacharacters). Defense-in-depth over env-var passing.
+// True if the owner Jenkins build is still running, via the in-process Jenkins
+// API (no HTTP, no credentials, no shell). Only same-instance builds are checked:
+// a build URL on another instance (or that can't be parsed) returns true so it is
+// left for that instance's janitor. FAIL SAFE: any error / unknown item returns
+// true (treat as alive). A build that no longer exists returns false (reapable).
 @NonCPS
-boolean isAllowedJenkinsBuildUrl(String url) {
-    if (!url) {
-        return false
+boolean isOwnerBuildRunning(String buildUrl) {
+    if (!buildUrl) {
+        return true
     }
-    def m = (url =~ /^https:\/\/([A-Za-z0-9.-]+)\/[A-Za-z0-9._~:\/%-]*$/)
-    return m.matches() && JENKINS_HOST_ALLOWLIST.contains(m.group(1))
+    try {
+        def jenkins = Jenkins.instance
+        def rootUrl = jenkins?.rootUrl
+        if (!rootUrl || !buildUrl.startsWith(rootUrl)) {
+            return true   // another instance's build (or unknown) -- not ours
+        }
+        // "<root>/job/A/job/B/123/" -> jobFullName "A/B", build number 123.
+        def rel = buildUrl.substring(rootUrl.length()).replaceAll('/+$', '')
+        def flat = rel.replaceAll('(^|/)job/', '/').replaceAll('^/+', '')
+        def segs = flat.split('/')
+        if (segs.length < 2 || !segs[-1].isInteger()) {
+            return true
+        }
+        def job = jenkins.getItemByFullName(segs[0..-2].join('/'))
+        if (job == null) {
+            return true   // unknown job -- fail safe
+        }
+        def build = job.getBuildByNumber(segs[-1].toInteger())
+        if (build == null) {
+            return false  // build no longer exists -> owner is gone -> reapable
+        }
+        return build.isBuilding()
+    } catch (Exception ignored) {
+        return true       // fail safe -- never reap on an ambiguous check
+    }
 }
 
-def createKubernetesPodConfig()
+// Minimal pod for the bootstrap stage (checkout + read image tag).
+def createBootstrapPodConfig()
 {
-    // A small CPU pod that can reach the SLURM login nodes. Mirrors the SLURM
-    // dispatcher pods so CloudManager.withSlurmFrontendFailover has what it needs.
-    // INFRA-TODO: confirm image/creds/network match the SLURM dispatcher pool.
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_amd_linux:jdk17"
+    return [
+        cloud: "kubernetes-cpu",
+        namespace: "sw-tensorrt",
+        yaml: """
+            apiVersion: v1
+            kind: Pod
+            spec:
+                qosClass: Guaranteed
+                nodeSelector:
+                  nvidia.com/node_type: builder
+                  kubernetes.io/os: linux
+                containers:
+                  - name: trt-llm
+                    image: ${BOOTSTRAP_IMAGE}
+                    command: ['cat']
+                    tty: true
+                    resources:
+                      requests: { cpu: '1', memory: 1Gi, ephemeral-storage: 5Gi }
+                      limits:   { cpu: '1', memory: 1Gi, ephemeral-storage: 5Gi }
+                    imagePullPolicy: Always
+                  - name: jnlp
+                    image: ${jnlpImage}
+                    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
+                    resources:
+                      requests: { cpu: '1', memory: 1Gi, ephemeral-storage: 5Gi }
+                      limits:   { cpu: '1', memory: 1Gi, ephemeral-storage: 5Gi }
+        """.stripIndent(),
+    ]
+}
+
+// Work pod: reaches the SLURM login nodes over ssh (CloudManager). Image is read
+// from current_image_tags.properties by the bootstrap stage rather than hardcoded.
+// INFRA-TODO: confirm image/creds/network match the SLURM dispatcher pool.
+def createKubernetesPodConfig(image)
+{
     def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_amd_linux:jdk17"
     return [
         cloud: "kubernetes-cpu",
@@ -119,7 +181,7 @@ def createKubernetesPodConfig()
                   kubernetes.io/os: linux
                 containers:
                   - name: trt-llm
-                    image: ${DOCKER_IMAGE}
+                    image: ${image}
                     command: ['cat']
                     tty: true
                     resources:
@@ -130,51 +192,10 @@ def createKubernetesPodConfig()
                     image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
-                      requests: { cpu: '1', memory: 2Gi, ephemeral-storage: 5Gi }
-                      limits:   { cpu: '1', memory: 2Gi, ephemeral-storage: 5Gi }
+                      requests: { cpu: '1', memory: 2Gi, ephemeral-storage: 25Gi }
+                      limits:   { cpu: '1', memory: 2Gi, ephemeral-storage: 25Gi }
         """.stripIndent(),
     ]
-}
-
-// True if the owner Jenkins build is still running. FAIL SAFE: any error or
-// ambiguity returns true (treat as alive) so we never reap a live build's job.
-// INFRA-TODO: cross-instance auth -- derive the right API token credential from
-// the build URL's instance (see trtllm_utils.appendBuildDescription for the
-// instance->credential derivation pattern) instead of a single token.
-boolean isOwnerBuildRunning(pipeline, String buildUrl) {
-    if (!buildUrl) {
-        return true
-    }
-    if (!isAllowedJenkinsBuildUrl(buildUrl)) {
-        pipeline.echo "[JANITOR] owner tag is not an allowed Jenkins build URL; leaving job (not reaping)."
-        return true   // fail safe -- never reap on an untrusted / garbled owner tag
-    }
-    try {
-        // credentialsId placeholder -- see INFRA-TODO above.
-        return pipeline.withCredentials([pipeline.usernamePassword(
-                credentialsId: 'TOP_1_TOKEN', usernameVariable: 'J_USER', passwordVariable: 'J_TOKEN')]) {
-            // Pass the (validated) URL via the environment and reference it quoted in
-            // a single-quoted script -- the comment-sourced value is never interpolated
-            // into the shell command text, so it cannot inject even if validation is
-            // ever loosened. Bounded timeouts keep a stalled controller from blocking
-            // the whole serial scan; || true keeps a timeout fail-safe (inconclusive).
-            return pipeline.withEnv(["OWNER_BUILD_URL=${buildUrl}"]) {
-                def json = pipeline.sh(
-                    script: 'curl -sf --connect-timeout 10 --max-time 30 ' +
-                            '-u "${J_USER}:${J_TOKEN}" "${OWNER_BUILD_URL}api/json?tree=building" || true',
-                    returnStdout: true).trim()
-                if (!json) {
-                    pipeline.echo "[JANITOR] owner-alive check inconclusive; assuming RUNNING (leave)."
-                    return true
-                }
-                // Reap only on an explicit building:false.
-                return !(json =~ /"building"\s*:\s*false/)
-            }
-        }
-    } catch (Exception e) {
-        pipeline.echo "[JANITOR] owner-alive check failed (${e}); assuming RUNNING (leave)."
-        return true
-    }
 }
 
 // Parse the owner BUILD_URL out of a SLURM job comment, or null if the job carries
@@ -194,13 +215,13 @@ def reapOrphanedSlurmJobsOnCluster(pipeline, String clusterName, def cluster, bo
     def summary = [cluster: clusterName, scanned: 0, orphans: 0, reaped: 0]
     try {
         CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
-            // %i=jobid, %k=comment, %M=elapsed. -h: no header. Only our CI user.
-            // INFRA-TODO: confirm %k carries the full comment on this Slurm version.
+            // -r expands array jobs to one identifier per line (so %i is a concrete
+            // id, not a compressed "123_[1-4]"). %i=jobid, %k=comment, %M=elapsed.
             // No `|| true`: a squeue / controller failure must surface to the
             // per-cluster handler below (logged as a failed scan) rather than look
             // like "no jobs" and silently skip reaping.
             def raw = Utils.exec(pipeline,
-                script: Utils.sshUserCmd(remote, "\"squeue -u ${SLURM_CI_USER} -h -o '%i|%k|%M'\""),
+                script: Utils.sshUserCmd(remote, "\"squeue -u ${SLURM_CI_USER} -h -r -o '%i|%k|%M'\""),
                 returnStdout: true).trim()
 
             raw.readLines().each { line ->
@@ -211,8 +232,9 @@ def reapOrphanedSlurmJobsOnCluster(pipeline, String clusterName, def cluster, bo
                 summary.scanned++
                 def jobId = parts[0].trim()
                 // jobId is SLURM-sourced (%i), not from the comment, but validate it
-                // before interpolating into scancel.
-                if (!(jobId ==~ /\d+(?:_\d+)?/)) {
+                // before interpolating into scancel. Accept an array element ("_")
+                // or a heterogeneous-job component ("+").
+                if (!(jobId ==~ /\d+(?:[_+]\d+)?/)) {
                     pipeline.echo "[JANITOR] ${clusterName}: skipping unexpected job id '${jobId}'."
                     return
                 }
@@ -230,8 +252,8 @@ def reapOrphanedSlurmJobsOnCluster(pipeline, String clusterName, def cluster, bo
                 if (ageMin < staleMinutes) {
                     return   // grace period -- too young to reap
                 }
-                if (isOwnerBuildRunning(pipeline, ownerUrl)) {
-                    return   // owner alive (or check inconclusive) -- leave it
+                if (isOwnerBuildRunning(ownerUrl)) {
+                    return   // owner alive / other instance / inconclusive -- leave it
                 }
                 summary.orphans++
                 if (dryRun) {
@@ -290,9 +312,7 @@ def reapOrphanedNodes(pipeline, boolean dryRun) {
 }
 
 pipeline {
-    agent {
-        kubernetes createKubernetesPodConfig()
-    }
+    agent none
     options {
         timestamps()
         // A single long-running instance is pointless; keep runs short and bounded.
@@ -311,22 +331,35 @@ pipeline {
     stages {
         stage("Reap orphaned SLURM jobs") {
             steps {
-                container("trt-llm") {
-                    script {
-                        boolean dryRun = params.DRY_RUN
-                        int staleMinutes
-                        try {
-                            staleMinutes = (params.STALE_MINUTES ?: '120').toInteger()
-                        } catch (NumberFormatException nfe) {
-                            echo "[JANITOR] invalid STALE_MINUTES='${params.STALE_MINUTES}'; defaulting to 120."
-                            staleMinutes = 120
-                        }
-                        if (staleMinutes < 0) {
-                            echo "[JANITOR] STALE_MINUTES ${staleMinutes} is negative; clamping to 0 (no negative grace)."
-                            staleMinutes = 0
-                        }
-                        def summaries = []
+                script {
+                    boolean dryRun = params.DRY_RUN
+                    int staleMinutes
+                    try {
+                        staleMinutes = (params.STALE_MINUTES ?: '120').toInteger()
+                    } catch (NumberFormatException nfe) {
+                        echo "[JANITOR] invalid STALE_MINUTES='${params.STALE_MINUTES}'; defaulting to 120."
+                        staleMinutes = 120
+                    }
+                    if (staleMinutes < 0) {
+                        echo "[JANITOR] STALE_MINUTES ${staleMinutes} is negative; clamping to 0 (no negative grace)."
+                        staleMinutes = 0
+                    }
 
+                    // Read the work-pod image from the repo (single source of truth:
+                    // jenkins/current_image_tags.properties) instead of hardcoding it.
+                    def podImage
+                    trtllm_utils.launchKubernetesPod(this, createBootstrapPodConfig(), "trt-llm") {
+                        checkout scm
+                        podImage = readProperties(file: 'jenkins/current_image_tags.properties',
+                                                  interpolate: true)['LLM_DOCKER_IMAGE']
+                    }
+                    if (!podImage) {
+                        error "[JANITOR] could not resolve LLM_DOCKER_IMAGE from current_image_tags.properties."
+                    }
+                    echo "[JANITOR] work-pod image: ${podImage}"
+
+                    def summaries = []
+                    trtllm_utils.launchKubernetesPod(this, createKubernetesPodConfig(podImage), "trt-llm") {
                         def clusters = SlurmConfig.clusterConfig.findAll { name, cfg ->
                             params.CLUSTER == 'all' || params.CLUSTER == name
                         }
@@ -335,15 +368,14 @@ pipeline {
                         clusters.each { clusterName, cluster ->
                             summaries << reapOrphanedSlurmJobsOnCluster(this, clusterName, cluster, dryRun, staleMinutes)
                         }
-
                         reapOrphanedNodes(this, dryRun)
-
-                        def totalOrphans = summaries.sum { it.orphans } ?: 0
-                        def totalReaped  = summaries.sum { it.reaped }  ?: 0
-                        echo "[JANITOR] done. orphans found=${totalOrphans}, reaped=${totalReaped} " +
-                             "(dryRun=${dryRun}). Per-cluster: ${summaries}"
-                        currentBuild.description = "orphans=${totalOrphans} reaped=${totalReaped} dryRun=${dryRun}"
                     }
+
+                    def totalOrphans = summaries.sum { it.orphans } ?: 0
+                    def totalReaped  = summaries.sum { it.reaped }  ?: 0
+                    echo "[JANITOR] done. orphans found=${totalOrphans}, reaped=${totalReaped} " +
+                         "(dryRun=${dryRun}). Per-cluster: ${summaries}"
+                    currentBuild.description = "orphans=${totalOrphans} reaped=${totalReaped} dryRun=${dryRun}"
                 }
             }
         }

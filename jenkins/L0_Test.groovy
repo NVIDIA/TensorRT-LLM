@@ -2014,7 +2014,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // trailing idle-GPU-exemption payload.
                 def slurmCommentPayload = "${SLURM_OWNER_TAG_KEY}=${env.BUILD_URL}"
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
-                    slurmCommentPayload += ";${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}"
+                    // Space after ';' to match the idle-GPU-exemption payload format.
+                    // The janitor parser stops the owner URL at ';' or whitespace, so
+                    // this stays compatible.
+                    slurmCommentPayload += "; ${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}"
                 }
                 def exemptionComment = "--comment='${slurmCommentPayload}'"
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName))
