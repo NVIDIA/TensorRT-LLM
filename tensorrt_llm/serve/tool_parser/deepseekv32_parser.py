@@ -65,8 +65,7 @@ class DeepSeekV32Parser(BaseToolParser):
 
     _eos_token = "<｜end▁of▁sentence｜>"  # nosec B105
 
-    # Shortest prefix of an invoke header that ordinary text cannot reproduce by
-    # accident; everything after it is the arbitrary function name.
+    # Invoke header up to the function name, which is arbitrary text.
     _INVOKE_HEADER_PREFIX = '<｜DSML｜invoke name="'  # nosec B105
 
     def __init__(self):
@@ -171,16 +170,10 @@ class DeepSeekV32Parser(BaseToolParser):
         self._buffer += new_text
         current_text = self._buffer
 
-        # An invoke header counts as a tool call once its opening quote is in, since
-        # the function name that follows is arbitrary text. Matching the bare
-        # "<｜DSML｜invoke" prefix instead would also match ordinary text that merely
-        # starts like the token, such as "<｜DSML｜invokeality".
         has_tool_call = self.bot_token in current_text or self._INVOKE_HEADER_PREFIX in current_text
 
         # Hold the buffer back only while its tail could still complete into one of
-        # the DSML delimiters. Testing whether a marker appears anywhere instead
-        # would keep the buffer forever once ordinary text diverges from a delimiter,
-        # for example "<｜DSML｜function" followed by "ality".
+        # the DSML delimiters.
         partial_tokens = [
             self.bot_token,
             self._INVOKE_HEADER_PREFIX,
@@ -193,14 +186,10 @@ class DeepSeekV32Parser(BaseToolParser):
         )
 
         if not has_tool_call and not ends_with_partial_token:
-            # The guard above withholds the whole buffer, so the buffer is what has
-            # to be emitted once it clears; returning only the latest delta would
-            # drop everything withheld by an earlier increment.
             normal_text = current_text
             self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
-                if e_token in normal_text:
-                    normal_text = normal_text.replace(e_token, "")
+                normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text)
 
         if not hasattr(self, "_tool_indices"):

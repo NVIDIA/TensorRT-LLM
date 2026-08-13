@@ -101,8 +101,6 @@ class DeepSeekV3Parser(BaseToolParser):
         has_tool_call = self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
 
         if not has_tool_call:
-            # The buffer, not just the latest delta, is what is being withheld, so
-            # the partial-token check and the emitted text must both be the buffer.
             if any(
                 self._ends_with_partial_token(current_text, b_token)
                 for b_token in [self.bot_token, "<｜tool▁call▁begin｜>"]
@@ -111,8 +109,7 @@ class DeepSeekV3Parser(BaseToolParser):
             normal_text = current_text
             self._buffer = ""
             for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
-                if e_token in normal_text:
-                    normal_text = normal_text.replace(e_token, "")
+                normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text)
 
         if not hasattr(self, "_tool_indices"):
