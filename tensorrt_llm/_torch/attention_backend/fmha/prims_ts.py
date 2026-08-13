@@ -36,6 +36,9 @@ from tensorrt_llm.quantization.mode import QuantMode
 from .phased import FmhaParams, PhasedFmha
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention_backend.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+    )
     from tensorrt_llm._torch.attention_backend.trtllm import (
         TrtllmAttention,
         TrtllmAttentionMetadata,
@@ -82,6 +85,14 @@ def _run_prims_mla_decode(*args, **kwargs) -> torch.Tensor:
     return prims_ts_batch_decode_with_kv_cache_mla(*args, **kwargs)
 
 
+def _create_prims_mla_decode_wrapper() -> "BatchMLADecodePagedTSWrapper":
+    from tensorrt_llm._torch.attention_backend.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+    )
+
+    return BatchMLADecodePagedTSWrapper()
+
+
 class PrimsTSFmha(PhasedFmha):
     """Blackwell task-scheduled paged context and decode FMHA library."""
 
@@ -104,6 +115,9 @@ class PrimsTSFmha(PhasedFmha):
         # CUDA graphs retain raw workspace pointers. Keep superseded buffers
         # alive if a later request needs a larger allocation.
         self._retained_prims_workspaces: list[torch.Tensor] = []
+        self._retained_metadata_buffers: list[tuple[torch.Tensor, ...]] = []
+        self._mla_decode_wrapper: Optional["BatchMLADecodePagedTSWrapper"] = None
+        self._mla_decode_wrapper_plan_key: Optional[tuple[object, ...]] = None
 
     def _get_total_num_blocks(
         self,
@@ -539,6 +553,21 @@ class PrimsTSFmha(PhasedFmha):
             raise RuntimeError(
                 "PrimTS metadata buffers must be allocated before CUDA graph capture."
             )
+        if (
+            self._page_indices_buffer is not None
+            and self._fixed_indptr_buffer is not None
+            and self._sequence_lengths_buffer is not None
+        ):
+            # Captured copies and kernel nodes retain these addresses. A replay
+            # still updates the old destinations, so keeping the allocations
+            # alive preserves both pointer validity and live metadata values.
+            self._retained_metadata_buffers.append(
+                (
+                    self._page_indices_buffer,
+                    self._fixed_indptr_buffer,
+                    self._sequence_lengths_buffer,
+                )
+            )
         self._page_indices_buffer = torch.empty(
             (row_capacity, column_capacity), dtype=torch.int32, device=device
         )
@@ -578,8 +607,10 @@ class PrimsTSFmha(PhasedFmha):
         self,
         sequence_lengths: torch.Tensor,
         batch_size: int,
+        *,
+        copy_to_stable_storage: bool = False,
     ) -> torch.Tensor:
-        """Return live MLA lengths with the 16-byte alignment PrimTS requires."""
+        """Return live MLA lengths with the storage guarantees PrimTS requires."""
         if sequence_lengths.dtype != torch.int32:
             raise RuntimeError(
                 f"PrimTS expects int32 sequence lengths, got {sequence_lengths.dtype}."
@@ -590,7 +621,7 @@ class PrimsTSFmha(PhasedFmha):
                 f"{sequence_lengths.numel()} entries."
             )
         active_sequence_lengths = sequence_lengths[:batch_size]
-        if active_sequence_lengths.data_ptr() % 16 == 0:
+        if not copy_to_stable_storage and active_sequence_lengths.data_ptr() % 16 == 0:
             return active_sequence_lengths
 
         buffer = self._sequence_lengths_buffer
@@ -605,6 +636,67 @@ class PrimsTSFmha(PhasedFmha):
         if aligned_sequence_lengths.data_ptr() % 16 != 0:
             raise RuntimeError("PrimTS sequence-length storage is not 16-byte aligned.")
         return aligned_sequence_lengths
+
+    def _get_or_plan_mla_decode_wrapper(
+        self,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        page_size: int,
+        max_seq_len_q: int,
+        max_kv_len: int,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+        mask_type: str,
+    ) -> "BatchMLADecodePagedTSWrapper":
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("PrimTS eager MLA wrapper cannot run during CUDA graph capture.")
+        plan_key = (
+            block_tables.device,
+            block_tables.data_ptr(),
+            seq_lens.data_ptr(),
+            int(block_tables.shape[0]),
+            int(block_tables.shape[1]),
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            page_size,
+            max_seq_len_q,
+            max_kv_len,
+            q_dtype,
+            kv_dtype,
+            output_dtype,
+            mask_type,
+        )
+        wrapper = self._mla_decode_wrapper
+        if wrapper is not None and plan_key == self._mla_decode_wrapper_plan_key:
+            return wrapper
+        if wrapper is None:
+            wrapper = _create_prims_mla_decode_wrapper()
+        # plan() reads seq_lens with tolist(), synchronizing the current stream.
+        # That orders any prior run before the wrapper replaces its private
+        # scratch and metadata views. Concurrent launches remain unsupported.
+        wrapper.plan(
+            block_tables,
+            seq_lens,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            page_size,
+            max_seq_len_q=max_seq_len_q,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
+            o_data_type=output_dtype,
+            mask_type=mask_type,
+            max_kv_len=max_kv_len,
+        )
+        self._mla_decode_wrapper = wrapper
+        self._mla_decode_wrapper_plan_key = plan_key
+        return wrapper
 
     def _get_prims_workspace(self) -> torch.Tensor:
         workspace = self._prims_workspace
@@ -683,6 +775,23 @@ class PrimsTSFmha(PhasedFmha):
 
         if not has_generation:
             return
+
+        # The reusable eager MLA wrapper owns its workspace until CUDA graphs
+        # need the raw API. Switch permanently to the caller-owned raw
+        # workspace at that point so later graph-ineligible eager batches do
+        # not retain a second per-layer MLA scratch allocation.
+        is_cuda_graph = bool(getattr(metadata, "is_cuda_graph", False))
+        if self.attn.is_mla_enable:
+            if is_cuda_graph and self._mla_decode_wrapper is not None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "PrimTS MLA must switch to its raw workspace before CUDA graph capture."
+                    )
+                torch.cuda.current_stream(q.device).synchronize()
+                self._mla_decode_wrapper = None
+                self._mla_decode_wrapper_plan_key = None
+            if not is_cuda_graph and self._prims_workspace is None:
+                return
 
         batch_size = int(metadata.num_generations)
         num_gen_tokens = (
@@ -1121,25 +1230,55 @@ class PrimsTSFmha(PhasedFmha):
         bmm1_scale = 1.0 / (
             attn.q_scaling * math.sqrt(int(attn.qk_nope_head_dim) + int(attn.qk_rope_head_dim))
         )
+        mask_type = self._get_prims_mask_type(params.fwd)
+        if bool(getattr(meta, "is_cuda_graph", False)) or self._prims_workspace is not None:
+            seq_lens = self._get_mla_sequence_lengths(
+                params.sequence_lengths,
+                batch_size,
+            )
+            _run_prims_mla_decode(
+                query,
+                kv_cache,
+                self._get_prims_workspace(),
+                int(attn.kv_lora_rank),
+                int(attn.qk_rope_head_dim),
+                dense_block_tables,
+                seq_lens,
+                max_seq_len,
+                max_seq_len_q=seq_len_q,
+                out=output,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=1.0,
+                mask_type=mask_type,
+                out_dtype=output.dtype,
+            )
+            return
+
         seq_lens = self._get_mla_sequence_lengths(
             params.sequence_lengths,
             batch_size,
+            copy_to_stable_storage=True,
         )
-        _run_prims_mla_decode(
-            query,
-            kv_cache,
-            self._get_prims_workspace(),
-            int(attn.kv_lora_rank),
-            int(attn.qk_rope_head_dim),
+        wrapper = self._get_or_plan_mla_decode_wrapper(
             dense_block_tables,
             seq_lens,
-            max_seq_len,
+            num_heads=attn.num_heads,
+            kv_lora_rank=int(attn.kv_lora_rank),
+            qk_rope_head_dim=int(attn.qk_rope_head_dim),
+            page_size=params.tokens_per_block,
             max_seq_len_q=seq_len_q,
+            max_kv_len=max_seq_len,
+            q_dtype=query.dtype,
+            kv_dtype=kv_cache.dtype,
+            output_dtype=output.dtype,
+            mask_type=mask_type,
+        )
+        wrapper.run(
+            query,
+            kv_cache,
             out=output,
             bmm1_scale=bmm1_scale,
             bmm2_scale=1.0,
-            mask_type=self._get_prims_mask_type(params.fwd),
-            out_dtype=output.dtype,
         )
 
 

@@ -946,8 +946,222 @@ def test_generation_launcher_receives_v2_bound_and_stable_native_csr(
     get_page_index_upper_bound.assert_called_once()
 
 
-def test_mla_launcher_receives_v2_bound_and_dense_page_table(
+def _get_test_mla_wrapper(
+    fmha: PrimsTSFmha,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    mask_type: str = "causal",
+) -> object:
+    return fmha._get_or_plan_mla_decode_wrapper(
+        block_tables,
+        seq_lens,
+        num_heads=4,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        page_size=32,
+        max_seq_len_q=1,
+        max_kv_len=96,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
+        mask_type=mask_type,
+    )
+
+
+def test_mla_eager_wrapper_plans_once_and_reads_live_staged_metadata(
     monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
+    fmha = PrimsTSFmha(attn)
+    kv_cache = torch.empty((20, 1, 32, 576), dtype=torch.bfloat16)
+    block_tables = torch.tensor(
+        [
+            [[0, 1, 2], [10, 11, 12]],
+            [[3, 4, 5], [13, 14, 15]],
+        ],
+        dtype=torch.int32,
+    )
+    build_metadata = Mock(return_value=(kv_cache, block_tables, None))
+    raw_launcher = Mock()
+    wrapper = Mock()
+    wrapper_factory = Mock(return_value=wrapper)
+    monkeypatch.setattr(
+        prims_ts_module.thop,
+        "build_trtllm_gen_kv_cache_metadata",
+        build_metadata,
+    )
+    monkeypatch.setattr(prims_ts_module, "_run_prims_mla_decode", raw_launcher)
+    monkeypatch.setattr(
+        prims_ts_module,
+        "_create_prims_mla_decode_wrapper",
+        wrapper_factory,
+    )
+
+    metadata = SimpleNamespace(
+        is_cuda_graph=False,
+        beam_width=1,
+        kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
+        host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
+        host_kv_cache_pool_mapping=torch.tensor([[0, 0]], dtype=torch.int32),
+    )
+    output = torch.empty((2, attn.num_heads, 512), dtype=torch.bfloat16)
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.generation_only,
+        attention_window_size=64,
+        is_fused_qkv=True,
+    )
+    sequence_lengths = torch.tensor([33, 64], dtype=torch.int32)
+    assert sequence_lengths.data_ptr() % 16 == 0
+    params = FmhaParams(
+        attn=attn,
+        meta=metadata,
+        fwd=forward_args,
+        workspace=torch.empty(0, dtype=torch.uint8),
+        qkv_input=torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16),
+        context_buf=output,
+        sequence_lengths=sequence_lengths,
+        input_seq_length=1,
+        max_past_kv_length=64,
+        max_attention_window_size=64,
+        cyclic_attention_window_size=64,
+        num_tokens=2,
+        seq_offset=2,
+        tokens_per_block=32,
+        kv_factor=1,
+        total_num_blocks=20,
+        num_requests=2,
+    )
+
+    fmha.run_mla_generation(params)
+
+    raw_launcher.assert_not_called()
+    wrapper_factory.assert_called_once_with()
+    wrapper.plan.assert_called_once()
+    plan_args = wrapper.plan.call_args.args
+    plan_kwargs = wrapper.plan.call_args.kwargs
+    assert plan_args[0].data_ptr() == fmha._page_indices_buffer.data_ptr()
+    torch.testing.assert_close(
+        plan_args[0],
+        torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32),
+    )
+    assert plan_args[1].data_ptr() == fmha._sequence_lengths_buffer.data_ptr()
+    assert plan_args[1].data_ptr() != sequence_lengths.data_ptr()
+    torch.testing.assert_close(plan_args[1], sequence_lengths)
+    assert plan_args[2:] == (attn.num_heads, 512, 64, 32)
+    assert plan_kwargs == {
+        "max_seq_len_q": 1,
+        "q_data_type": torch.bfloat16,
+        "kv_data_type": torch.bfloat16,
+        "o_data_type": torch.bfloat16,
+        "mask_type": "causal",
+        "max_kv_len": 96,
+    }
+    wrapper.run.assert_called_once()
+    run_args = wrapper.run.call_args.args
+    run_kwargs = wrapper.run.call_args.kwargs
+    assert run_args[0].shape == (2, 1, attn.num_heads, 576)
+    assert run_args[0].data_ptr() == params.qkv_input.data_ptr()
+    assert run_args[1] is kv_cache
+    assert run_kwargs["out"].shape == (2, 1, attn.num_heads, 512)
+    assert run_kwargs["out"].data_ptr() == output.data_ptr()
+    assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(128 + 64))
+    assert run_kwargs["bmm2_scale"] == 1.0
+
+    block_tables[:, 0].add_(20)
+    sequence_lengths.add_(1)
+    fmha.run_mla_generation(params)
+
+    wrapper_factory.assert_called_once_with()
+    wrapper.plan.assert_called_once()
+    assert wrapper.run.call_count == 2
+    torch.testing.assert_close(
+        plan_args[0],
+        torch.tensor([[20, 21, 22], [23, 24, 25]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(plan_args[1], torch.tensor([34, 65], dtype=torch.int32))
+    assert fmha._mla_decode_wrapper is wrapper
+    assert fmha._mla_decode_wrapper_plan_key is not None
+
+
+def test_mla_wrapper_replans_on_metadata_pointers_and_plan_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    fmha = PrimsTSFmha(_Attention(head_dim=576, is_mla=True, num_heads=4))
+    wrapper = Mock()
+    wrapper_factory = Mock(return_value=wrapper)
+    monkeypatch.setattr(
+        prims_ts_module,
+        "_create_prims_mla_decode_wrapper",
+        wrapper_factory,
+    )
+    block_tables = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32)
+    seq_lens = torch.tensor([33, 64], dtype=torch.int32)
+
+    first = _get_test_mla_wrapper(fmha, block_tables, seq_lens)
+    cached_first = _get_test_mla_wrapper(fmha, block_tables, seq_lens)
+    block_pointer_miss = _get_test_mla_wrapper(fmha, block_tables.clone(), seq_lens)
+    seq_pointer_miss = _get_test_mla_wrapper(fmha, block_tables, seq_lens.clone())
+    signature_miss = _get_test_mla_wrapper(
+        fmha,
+        block_tables,
+        seq_lens,
+        mask_type="dense",
+    )
+    alternating_key_miss = _get_test_mla_wrapper(fmha, block_tables, seq_lens)
+
+    assert all(
+        result is wrapper
+        for result in (
+            first,
+            cached_first,
+            block_pointer_miss,
+            seq_pointer_miss,
+            signature_miss,
+            alternating_key_miss,
+        )
+    )
+    wrapper_factory.assert_called_once_with()
+    assert wrapper.plan.call_count == 5
+    assert fmha._mla_decode_wrapper is wrapper
+
+
+def test_mla_wrapper_helper_rejects_capture_even_for_cached_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capturing = False
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: capturing,
+    )
+    wrapper = Mock()
+    wrapper_factory = Mock(return_value=wrapper)
+    monkeypatch.setattr(
+        prims_ts_module,
+        "_create_prims_mla_decode_wrapper",
+        wrapper_factory,
+    )
+    fmha = PrimsTSFmha(_Attention(head_dim=576, is_mla=True, num_heads=4))
+    block_tables = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+    seq_lens = torch.tensor([33], dtype=torch.int32)
+    _get_test_mla_wrapper(fmha, block_tables, seq_lens)
+    capturing = True
+
+    with pytest.raises(RuntimeError, match="cannot run during CUDA graph capture"):
+        _get_test_mla_wrapper(fmha, block_tables, seq_lens)
+
+    wrapper_factory.assert_called_once_with()
+    wrapper.plan.assert_called_once()
+
+
+@pytest.mark.parametrize("is_cuda_graph", [False, True], ids=["eager-after-graph", "cuda-graph"])
+def test_mla_raw_launcher_receives_v2_bound_after_raw_workspace_is_created(
+    monkeypatch: pytest.MonkeyPatch,
+    is_cuda_graph: bool,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
@@ -964,15 +1178,22 @@ def test_mla_launcher_receives_v2_bound_and_dense_page_table(
     )
     build_metadata = Mock(return_value=(kv_cache, block_tables, None))
     launcher = Mock()
+    wrapper_factory = Mock()
     monkeypatch.setattr(
         prims_ts_module.thop,
         "build_trtllm_gen_kv_cache_metadata",
         build_metadata,
     )
     monkeypatch.setattr(prims_ts_module, "_run_prims_mla_decode", launcher)
+    monkeypatch.setattr(
+        prims_ts_module,
+        "_create_prims_mla_decode_wrapper",
+        wrapper_factory,
+    )
 
     get_page_index_upper_bound = Mock(return_value=20)
     metadata = SimpleNamespace(
+        is_cuda_graph=is_cuda_graph,
         beam_width=1,
         kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
         host_kv_cache_pool_pointers=torch.tensor([1234], dtype=torch.int64),
@@ -1014,6 +1235,7 @@ def test_mla_launcher_receives_v2_bound_and_dense_page_table(
     fmha.run_mla_generation(params)
 
     launcher.assert_called_once()
+    wrapper_factory.assert_not_called()
     args = launcher.call_args.args
     kwargs = launcher.call_args.kwargs
     assert args[0].shape == (2, 1, attn.num_heads, 576)
@@ -1040,6 +1262,108 @@ def test_mla_launcher_receives_v2_bound_and_dense_page_table(
     assert builder_args[11] == 2
     assert builder_args[12] == torch.bfloat16
     get_page_index_upper_bound.assert_called_once()
+
+
+@pytest.mark.parametrize("is_cuda_graph", [False, True], ids=["eager", "cuda-graph"])
+def test_mla_raw_workspace_is_only_allocated_for_cuda_graph_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    is_cuda_graph: bool,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    workspace_size = Mock(return_value=48)
+    monkeypatch.setattr(
+        prims_ts_module,
+        "_get_prims_mla_workspace_size",
+        workspace_size,
+    )
+    attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
+    fmha = PrimsTSFmha(attn)
+    fmha._multi_processor_count = 1
+    q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        is_cuda_graph=is_cuda_graph,
+        kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
+        max_num_requests=2,
+        num_contexts=0,
+        num_generations=2,
+        num_ctx_tokens=0,
+        tokens_per_block=32,
+        kv_lens_runtime=torch.tensor([33, 64], dtype=torch.int32),
+    )
+    output = torch.empty((2, attn.num_heads * 512), dtype=torch.bfloat16)
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.generation_only,
+        attention_window_size=96,
+    )
+
+    fmha.prepare_workspace(
+        q,
+        None,
+        None,
+        metadata,
+        forward_args,
+        torch.empty(0, dtype=torch.uint8),
+    )
+
+    if is_cuda_graph:
+        workspace_size.assert_called_once()
+        assert fmha._get_prims_workspace().numel() == 48
+    else:
+        workspace_size.assert_not_called()
+        assert fmha._prims_workspace is None
+
+
+def test_mla_graph_workspace_transition_releases_eager_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    stream = Mock()
+    monkeypatch.setattr(torch.cuda, "current_stream", Mock(return_value=stream))
+    workspace_size = Mock(return_value=48)
+    monkeypatch.setattr(
+        prims_ts_module,
+        "_get_prims_mla_workspace_size",
+        workspace_size,
+    )
+    attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
+    fmha = PrimsTSFmha(attn)
+    fmha._multi_processor_count = 1
+    fmha._mla_decode_wrapper = Mock()
+    fmha._mla_decode_wrapper_plan_key = ("eager",)
+    q = torch.empty((2, attn.num_heads * 576), dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        is_cuda_graph=True,
+        kv_cache_block_offsets=torch.empty((2, 2, 3), dtype=torch.int32),
+        max_num_requests=2,
+        num_contexts=0,
+        num_generations=2,
+        num_ctx_tokens=0,
+        tokens_per_block=32,
+        kv_lens_runtime=torch.tensor([33, 64], dtype=torch.int32),
+    )
+    output = torch.empty((2, attn.num_heads * 512), dtype=torch.bfloat16)
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.generation_only,
+        attention_window_size=96,
+    )
+    workspace = torch.empty(0, dtype=torch.uint8)
+
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+
+    stream.synchronize.assert_called_once_with()
+    assert fmha._mla_decode_wrapper is None
+    assert fmha._mla_decode_wrapper_plan_key is None
+    raw_workspace = fmha._get_prims_workspace()
+    assert raw_workspace.numel() == 48
+
+    metadata.is_cuda_graph = False
+    fmha.prepare_workspace(q, None, None, metadata, forward_args, workspace)
+
+    assert fmha._get_prims_workspace() is raw_workspace
+    assert fmha._retained_prims_workspaces == []
+    assert workspace_size.call_count == 2
 
 
 def test_workspace_growth_retains_graph_visible_buffer(
@@ -1147,6 +1471,42 @@ def test_metadata_buffers_cannot_grow_during_capture(
         match="PrimTS metadata buffers must be allocated before CUDA graph capture",
     ):
         fmha._ensure_metadata_buffers(torch.device("cpu"), 2, 4)
+
+
+def test_metadata_buffer_growth_retains_graph_visible_allocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    fmha = PrimsTSFmha(_Attention())
+    fmha._ensure_metadata_buffers(torch.device("cpu"), 2, 4)
+    original_buffers = (
+        fmha._page_indices_buffer,
+        fmha._fixed_indptr_buffer,
+        fmha._sequence_lengths_buffer,
+    )
+
+    fmha._ensure_metadata_buffers(torch.device("cpu"), 3, 4)
+    fmha._ensure_metadata_buffers(torch.device("cpu"), 3, 4)
+
+    assert len(fmha._retained_metadata_buffers) == 1
+    assert all(
+        retained is original
+        for retained, original in zip(
+            fmha._retained_metadata_buffers[0], original_buffers, strict=True
+        )
+    )
+    assert all(
+        current is not original
+        for current, original in zip(
+            (
+                fmha._page_indices_buffer,
+                fmha._fixed_indptr_buffer,
+                fmha._sequence_lengths_buffer,
+            ),
+            original_buffers,
+            strict=True,
+        )
+    )
 
 
 def test_phased_forward_routes_mixed_batch_to_context_and_generation(

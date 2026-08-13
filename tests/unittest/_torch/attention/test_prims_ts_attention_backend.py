@@ -15,7 +15,13 @@
 
 import pytest
 import torch
-from backend_case import BackendCase, generate_inputs, run_backend, run_case
+from backend_case import (
+    BackendCase,
+    generate_inputs,
+    generate_mla_gen_inputs,
+    run_backend,
+    run_case,
+)
 from utils.util import isSM100Family
 
 pytestmark = pytest.mark.skipif(
@@ -188,6 +194,64 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
     )
 
     run_case(case)
+
+
+def test_prims_ts_mla_cuda_graph_replay_refreshes_query_latent_and_page_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+    case = BackendCase(
+        **_DEEPSEEK_V3_LITE_MLA,
+        seq_lens=[1, 1],
+        num_cached_tokens=[64, 96],
+        num_contexts=0,
+        use_kv_cache_manager_v2=True,
+    )
+    inputs = generate_mla_gen_inputs(case, seed=0)
+    replay_inputs = generate_mla_gen_inputs(case, seed=1)
+    replay_inputs["cached_latent"] = inputs["cached_latent"]
+    golden = run_backend(
+        case,
+        "VANILLA",
+        replay_inputs,
+        kv_dtype=case.compute_dtype,
+        kv_layout="NHD",
+    )
+
+    def swap_requests_before_replay(metadata, static_inputs) -> None:
+        query = static_inputs["q"]
+        query.copy_(replay_inputs["fused_q"].flip(0))
+        static_inputs["q_pe"].copy_(replay_inputs["q_pe"].flip(0))
+
+        # MLA cache appends use capture-time physical destinations. Keep the
+        # latent rows in place while swapping the live page-table lookup.
+        replay_latent = replay_inputs["latent_cache"]
+        static_inputs["latent_cache"].copy_(replay_latent)
+        # The harness precomputes cache expectations as views of this tensor.
+        inputs["latent_cache"].copy_(replay_latent)
+
+        block_offsets = metadata.kv_cache_block_offsets
+        block_offsets.copy_(block_offsets.flip(1).clone())
+
+        kv_lens = metadata.kv_lens_cuda_runtime
+        kv_lens.copy_(kv_lens.flip(0).clone())
+
+    actual = run_backend(
+        case,
+        "TRTLLM",
+        inputs,
+        kv_dtype=case.compute_dtype,
+        cuda_graph=True,
+        kv_layout="HND",
+        before_cuda_graph_replay=swap_requests_before_replay,
+    )
+
+    torch.testing.assert_close(
+        actual,
+        golden.flip(0),
+        atol=3e-2,
+        rtol=3e-3,
+    )
 
 
 def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:

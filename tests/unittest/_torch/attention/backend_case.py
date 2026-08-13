@@ -456,7 +456,13 @@ def _assert_cache_contains_new_tokens(
 
 
 def _run_mla_gen_backend(
-    case, backend, inputs, *, kv_layout: str, cuda_graph=False
+    case,
+    backend,
+    inputs,
+    *,
+    kv_layout: str,
+    cuda_graph=False,
+    before_cuda_graph_replay=None,
 ) -> torch.Tensor:
     """Run one backend's absorbed-MLA generation; return [nnz_q, heads*kv_lora].
 
@@ -489,14 +495,14 @@ def _run_mla_gen_backend(
     latent_cache = inputs["latent_cache"]
     expected_latents = _split_packed_tokens(latent_cache, case.seq_lens)
 
-    def _forward(metadata, q, q_pe):
+    def _forward(metadata, q, q_pe, live_latent_cache):
         out = attn.forward(
             q,
             None,
             None,
             metadata,
             forward_args=AttentionForwardArgs(
-                latent_cache=latent_cache,
+                latent_cache=live_latent_cache,
                 q_pe=q_pe,
                 attention_input_type=AttentionInputType.generation_only,
                 # The harness feeds a pre-RoPE'd fused_q, so skip the RoPE step;
@@ -529,8 +535,14 @@ def _run_mla_gen_backend(
                 case,
                 mgr,
                 _create_metadata,
-                {"q": fused_q, "q_pe": q_pe},
-                lambda md, bufs: _forward(md, bufs["q"], bufs["q_pe"]),
+                {"q": fused_q, "q_pe": q_pe, "latent_cache": latent_cache},
+                lambda md, bufs: _forward(
+                    md,
+                    bufs["q"],
+                    bufs["q_pe"],
+                    bufs["latent_cache"],
+                ),
+                before_replay=before_cuda_graph_replay,
             )
             _assert_cache_contains_new_tokens(
                 mgr,
@@ -545,7 +557,7 @@ def _run_mla_gen_backend(
             return out
         metadata = _create_metadata(AttentionCls, case, mgr)
         metadata.prepare()
-        out = _forward(metadata, fused_q, q_pe)[: case.nnz_q].contiguous()
+        out = _forward(metadata, fused_q, q_pe, latent_cache)[: case.nnz_q].contiguous()
         _assert_cache_contains_new_tokens(
             mgr,
             0,
@@ -888,7 +900,12 @@ def run_backend(
         if case.is_context_only:
             return _run_mla_context_backend(case, backend, inputs, kv_layout=kv_layout)
         return _run_mla_gen_backend(
-            case, backend, inputs, kv_layout=kv_layout, cuda_graph=cuda_graph
+            case,
+            backend,
+            inputs,
+            kv_layout=kv_layout,
+            cuda_graph=cuda_graph,
+            before_cuda_graph_replay=before_cuda_graph_replay,
         )
 
     AttentionCls = get_attention_backend(backend)
