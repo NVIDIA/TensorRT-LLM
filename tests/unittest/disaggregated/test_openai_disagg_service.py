@@ -232,6 +232,23 @@ def test_get_gen_request_uses_ctx_response_prompt_token_ids_for_chat():
     assert gen_request.prompt_token_ids == ctx_prompt_token_ids
     assert gen_request.disaggregated_params.request_type == "generation_only"
     assert gen_request.conversation_params.conversation_id == "conv-chat"
+    wire_request = gen_request.model_dump(exclude_unset=True)
+    assert "conversation_id" not in wire_request["disaggregated_params"]
+
+
+def test_get_ctx_request_uses_only_conversation_params_on_wire():
+    service = _make_service("context_first")
+    request = CompletionRequest(
+        model="test-model",
+        prompt="hello",
+        conversation_params=ConversationParams(conversation_id="conv-completion"),
+    )
+
+    ctx_request = service._get_ctx_request(request, 42)
+
+    wire_request = ctx_request.model_dump(exclude_unset=True)
+    assert wire_request["conversation_params"]["conversation_id"] == "conv-completion"
+    assert "conversation_id" not in wire_request["disaggregated_params"]
 
 
 @pytest.mark.asyncio

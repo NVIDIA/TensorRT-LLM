@@ -186,7 +186,7 @@ def test_extract_conversation_id_preserves_body_conversation_params():
     )
 
     assert request.conversation_params.conversation_id == "body-id"
-    assert request.disaggregated_params.conversation_id is None
+    assert not hasattr(request.disaggregated_params, "conversation_id")
 
 
 def test_extract_conversation_id_populates_conversation_params_with_existing_disaggregated_params():
@@ -202,7 +202,7 @@ def test_extract_conversation_id_populates_conversation_params_with_existing_dis
     )
 
     assert request.conversation_params.conversation_id == "multi-turn-session-id"
-    assert request.disaggregated_params.conversation_id is None
+    assert not hasattr(request.disaggregated_params, "conversation_id")
 
 
 def test_disagg_config_allows_request_chat_template_opt_in():
