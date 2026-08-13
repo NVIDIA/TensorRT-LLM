@@ -14,7 +14,7 @@ layout against an unfused reference built from the HF checkpoint's split
   ``None`` (the two activation code paths);
 * the row-concat convention is required: swapping the halves breaks
   the numerics (mutation control).
-* direct MoE-TP selects combined reduction for the shared and routed partials.
+* shared-expert sharding and reduction follow the selected parallel mode.
 """
 
 from types import SimpleNamespace
@@ -186,22 +186,27 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
 
 
 @pytest.mark.parametrize(
-    "attention_dp,tp_size,has_routed_comm",
+    "attention_dp,tp_size,rank,has_routed_comm,expected_shared_tp,expected_shared_rank,expected_reduce",
     [
-        (True, 2, True),
-        (False, 1, False),
-        (False, 2, False),
-        (False, 2, True),
+        (True, 8, 7, True, 1, 0, False),
+        (False, 1, 0, False, 1, 0, False),
+        (False, 8, 7, False, 8, 7, False),
+        (False, 8, 7, True, 8, 7, True),
     ],
-    ids=["attention_dp", "single_rank", "combined_tp", "routed_comm"],
+    ids=["attention_dp", "single_rank", "direct_tp", "routed_comm"],
 )
-def test_kimi_k3_moe_output_matches_reference_across_parallel_modes(
+def test_kimi_k3_shared_expert_parallel_construction(
     monkeypatch,
     attention_dp,
     tp_size,
+    rank,
     has_routed_comm,
+    expected_shared_tp,
+    expected_shared_rank,
+    expected_reduce,
 ):
-    """Every parallel mode produces the same complete block output."""
+    """Shared experts are replicated or sharded for the selected parallel mode."""
+    from tensorrt_llm._torch import distributed
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.modules.fused_moe import ConfigurableMoE
@@ -211,10 +216,6 @@ def test_kimi_k3_moe_output_matches_reference_across_parallel_modes(
     class _FakeAllReduce(nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
-            self.peer_contribution = None
-
-        def forward(self, value):
-            return value + self.peer_contribution
 
     class _FakeMoE(ConfigurableMoE):
         def __init__(self):
@@ -223,55 +224,36 @@ def test_kimi_k3_moe_output_matches_reference_across_parallel_modes(
             self.comm = object() if has_routed_comm else None
             self.layer_load_balancer = None
             self.all_reduce = _FakeAllReduce()
-            self.returns_complete_output = has_routed_comm or attention_dp or tp_size == 1
-
-        def forward(self, hidden_states, router_logits, all_rank_num_tokens=None):
-            scale = 11 if self.returns_complete_output else 7
-            return hidden_states * scale
-
-    class _FakeSharedExperts(nn.Module):
-        def __init__(self, *, config, overridden_tp_size, reduce_output, **kwargs):
-            super().__init__()
-            self.is_sharded = config.mapping.tp_size > 1 and overridden_tp_size != 1
-            self.reduce_output = reduce_output
-
-        def forward(self, hidden_states):
-            if not self.is_sharded or self.reduce_output:
-                return hidden_states * 5
-            return hidden_states * 2
 
     fake_moe = _FakeMoE()
 
     monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
     monkeypatch.setattr(modeling_kimi_linear, "create_moe", lambda **_: fake_moe)
-    monkeypatch.setattr(modeling_kimi_linear, "GatedMLP", _FakeSharedExperts)
+    monkeypatch.setattr(distributed, "AllReduce", _FakeAllReduce)
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
 
     mapping = Mapping(
         world_size=tp_size,
-        rank=0,
+        rank=rank,
         tp_size=tp_size,
         enable_attention_dp=attention_dp,
     )
     model_config = ModelConfig(mapping=mapping, quant_config=QuantConfig())
     config = _runtime_config()
-    config.hidden_size = config.routed_expert_hidden_size = 4
     runtime = modeling_kimi_linear.KimiK3MoERuntime(model_config, config, layer_idx=1)
-    runtime.routed_expert_down_proj = nn.Identity()
-    runtime.routed_expert_norm = nn.Identity()
-    runtime.routed_expert_up_proj = nn.Identity()
-    with torch.no_grad():
-        runtime.gate.weight.zero_()
-        runtime.gate.e_score_correction_bias.zero_()
 
-    hidden_states = torch.arange(1, 9, dtype=torch.bfloat16).reshape(2, 4)
-    fake_moe.all_reduce.peer_contribution = torch.cat(
-        (hidden_states * 3, hidden_states * 4), dim=-1
+    shared = runtime.shared_experts
+    assert isinstance(shared, GatedMLP)
+    assert shared.gate_up_proj.tp_size == expected_shared_tp
+    assert shared.gate_up_proj.tp_rank == expected_shared_rank
+    assert shared.down_proj.tp_size == expected_shared_tp
+    assert shared.down_proj.tp_rank == expected_shared_rank
+    assert shared.down_proj.reduce_output is expected_reduce
+    local_intermediate = (
+        config.moe_intermediate_size * config.num_shared_experts // expected_shared_tp
     )
-
-    actual = runtime(hidden_states)
-    expected = hidden_states * 16
-    torch.testing.assert_close(actual, expected)
+    assert shared.gate_up_proj.weight.shape == (2 * local_intermediate, config.hidden_size)
+    assert shared.down_proj.weight.shape == (config.hidden_size, local_intermediate)
 
 
 @pytest.mark.parametrize(
