@@ -26,9 +26,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 from utils.util import check_accuracy
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_kimi_linear import (
+    _K3_MOE_EP_ENV,
+    _K3_MOE_TP_ENV,
+    KimiK3MoERuntime,
+)
 from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
+from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
+    _MEGA_MOE_SYMM_BUFFER_CACHE,
+)
 from tensorrt_llm._torch.modules.kimi_k3_moe import KimiK3SparseMoeBlock
 from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import (
     is_native_situ_supported,
@@ -37,11 +47,33 @@ from tensorrt_llm._torch.modules.kimi_k3_moe._moe_kernels import (
 )
 from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
+from tensorrt_llm._utils import get_free_port
+from tensorrt_llm.mapping import Mapping
 
 situ_supported = pytest.mark.skipif(
     not is_native_situ_supported(),
     reason="native SiTU cubins require SM100/SM103 (Blackwell)",
 )
+
+
+@pytest.fixture
+def _single_rank_nccl_process_group(monkeypatch):
+    if dist.is_initialized():
+        yield
+        return
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", str(get_free_port()))
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    torch.cuda.set_device(0)
+    dist.init_process_group(backend="nccl", rank=0, world_size=1)
+    try:
+        yield
+    finally:
+        _MEGA_MOE_SYMM_BUFFER_CACHE.clear()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 @dataclasses.dataclass
@@ -419,8 +451,6 @@ def test_fused_forward_without_weights_raises():
 
 
 def test_mapping_records_moe_tp_ep_user_specified():
-    from tensorrt_llm.mapping import Mapping
-
     # Auto default: -1 sentinels resolve to (moe_tp=tp, moe_ep=1) but must
     # NOT be flagged as a user request.
     auto = Mapping(world_size=8, tp_size=8)
@@ -437,13 +467,6 @@ def test_mapping_records_moe_tp_ep_user_specified():
 
 
 def test_kimi_k3_moe_split_selection(monkeypatch):
-    from tensorrt_llm._torch.models.modeling_kimi_linear import (
-        _K3_MOE_EP_ENV,
-        _K3_MOE_TP_ENV,
-        KimiK3MoERuntime,
-    )
-    from tensorrt_llm.mapping import Mapping
-
     monkeypatch.delenv(_K3_MOE_TP_ENV, raising=False)
     monkeypatch.delenv(_K3_MOE_EP_ENV, raising=False)
 
@@ -464,6 +487,65 @@ def test_kimi_k3_moe_split_selection(monkeypatch):
     monkeypatch.delenv(_K3_MOE_TP_ENV)
     monkeypatch.setenv(_K3_MOE_EP_ENV, "2")
     assert KimiK3MoERuntime._select_moe_tp_ep(auto) == (4, 2)
+
+
+@pytest.mark.parametrize("backend", ["TRTLLM", "MEGAMOE_DEEPGEMM"])
+def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        moe_backend=backend,
+    )
+
+    routed_model_config = KimiK3MoERuntime._routed_moe_model_config(model_config)
+
+    assert routed_model_config.moe_backend == backend
+    assert model_config.moe_backend == backend
+
+
+@pytest.mark.parametrize(
+    "backend,expected_moe_max_num_tokens",
+    [
+        pytest.param("TRTLLM", 33024, id="trtllm"),
+        pytest.param("MEGAMOE_DEEPGEMM", 131072, id="megamoe"),
+    ],
+)
+def test_kimi_k3_routed_config_scopes_megamoe_capacity(backend, expected_moe_max_num_tokens):
+    model_config = ModelConfig(
+        mapping=Mapping(
+            world_size=16,
+            rank=0,
+            tp_size=16,
+            moe_ep_size=16,
+            enable_attention_dp=True,
+        ),
+        max_num_tokens=8192,
+        moe_max_num_tokens=33024,
+        moe_backend=backend,
+    )
+
+    routed_model_config = KimiK3MoERuntime._routed_moe_model_config(model_config)
+
+    assert routed_model_config.moe_max_num_tokens == expected_moe_max_num_tokens
+    assert model_config.moe_max_num_tokens == 33024
+
+
+def test_kimi_k3_routed_config_rejects_backend_without_situ_support():
+    model_config = ModelConfig(
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        moe_backend="CUTLASS",
+    )
+
+    with pytest.raises(ValueError, match="SiTU routed experts only support"):
+        KimiK3MoERuntime._routed_moe_model_config(model_config)
+
+    assert model_config.moe_backend == "CUTLASS"
+
+
+@pytest.mark.parametrize(
+    "architecture", ["KimiK3ForConditionalGeneration", "KimiLinearForCausalLM"]
+)
+def test_kimi_k3_moe_auto_backend_defaults_to_trtllm(architecture):
+    assert ModelConfig.resolve_moe_backend("AUTO", architecture) == "TRTLLM"
 
 
 # ---------------------------------------------------------------------------
@@ -496,18 +578,20 @@ def _make_packed_expert_bank(num_experts, intermediate, hidden, seed=101):
 
     bank = []
     for _ in range(num_experts):
-        bank.append({
-            "w1": nibbles(intermediate, hidden // 2),
-            "w1_sf": scales(intermediate, hidden // 32),
-            "w3": nibbles(intermediate, hidden // 2),
-            "w3_sf": scales(intermediate, hidden // 32),
-            "w2": nibbles(hidden, intermediate // 2),
-            "w2_sf": scales(hidden, intermediate // 32),
-        })
+        bank.append(
+            {
+                "w1": nibbles(intermediate, hidden // 2),
+                "w1_sf": scales(intermediate, hidden // 32),
+                "w3": nibbles(intermediate, hidden // 2),
+                "w3_sf": scales(intermediate, hidden // 32),
+                "w2": nibbles(hidden, intermediate // 2),
+                "w2_sf": scales(hidden, intermediate // 32),
+            }
+        )
     return bank
 
 
-def _make_test_gate(num_experts=_TP_EXPERTS, seed=71):
+def _make_test_gate(num_experts=_TP_EXPERTS, top_k=_TP_TOPK, seed=71):
     """One deterministically-initialized gate SHARED by all modules under
     comparison: the fused routing kernel applies the gate's
     e_score_correction_bias per module, so a per-module `torch.empty`
@@ -516,27 +600,29 @@ def _make_test_gate(num_experts=_TP_EXPERTS, seed=71):
     cfg = _K3Config(
         hidden_size=_TP_HIDDEN,
         num_experts=num_experts,
-        num_experts_per_token=min(_TP_TOPK, num_experts),
+        num_experts_per_token=min(top_k, num_experts),
     )
     gate = KimiK3MoEGate(cfg)
     gen = torch.Generator().manual_seed(seed)
     with torch.no_grad():
-        gate.weight.copy_(
-            torch.randn(gate.weight.shape, generator=gen,
-                        dtype=torch.float32) * 0.05)
+        gate.weight.copy_(torch.randn(gate.weight.shape, generator=gen, dtype=torch.float32) * 0.05)
         gate.e_score_correction_bias.copy_(
-            torch.randn(gate.e_score_correction_bias.shape, generator=gen,
-                        dtype=torch.float32) * 0.1)
+            torch.randn(gate.e_score_correction_bias.shape, generator=gen, dtype=torch.float32)
+            * 0.1
+        )
     return gate.cuda()
 
 
-def _make_routed_moe(intermediate_size, gate, num_experts=_TP_EXPERTS):
+def _make_routed_moe(
+    intermediate_size,
+    gate,
+    num_experts=_TP_EXPERTS,
+    moe_backend="TRTLLM",
+):
     """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.fused_moe import ConfigurableMoE, create_moe
-    from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     pretrained_config = PretrainedConfig()
@@ -544,12 +630,14 @@ def _make_routed_moe(intermediate_size, gate, num_experts=_TP_EXPERTS):
     pretrained_config.hidden_size = _TP_HIDDEN
     pretrained_config.intermediate_size = intermediate_size
     pretrained_config.torch_dtype = torch.bfloat16
+    pretrained_config.activation_situ_beta = 4.0
+    pretrained_config.activation_situ_linear_beta = 25.0
     model_config = ModelConfig(
         pretrained_config=pretrained_config,
         mapping=Mapping(),
-        moe_backend="TRTLLM",
+        moe_backend=moe_backend,
     )
-    moe = create_moe(
+    moe_kwargs = dict(
         routing_method=gate.routing_method,
         num_experts=num_experts,
         hidden_size=_TP_HIDDEN,
@@ -559,11 +647,15 @@ def _make_routed_moe(intermediate_size, gate, num_experts=_TP_EXPERTS):
         model_config=model_config,
         override_quant_config=QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8),
         layer_idx=0,
-        trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-        trtllm_gen_activation_alpha=4.0,
-        trtllm_gen_activation_beta=25.0,
         communication_method=None,
-    ).cuda()
+    )
+    if moe_backend == "TRTLLM":
+        moe_kwargs.update(
+            trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
+            trtllm_gen_activation_alpha=4.0,
+            trtllm_gen_activation_beta=25.0,
+        )
+    moe = create_moe(**moe_kwargs).cuda()
     assert isinstance(moe, ConfigurableMoE)
     return moe
 
@@ -577,29 +669,47 @@ def _load_bank(moe, bank, tp_size=1, tp_rank=0):
     shard-sized parameters.
     """
     backend = moe.backend
-    proxy = SimpleNamespace(
-        expert_size_per_partition=backend.expert_size_per_partition,
-        initial_local_expert_ids=backend.initial_local_expert_ids,
-        scaling_vector_size=backend.scaling_vector_size,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        w3_w1_weight=backend.w3_w1_weight,
-        w2_weight=backend.w2_weight,
-        w3_w1_weight_scale=backend.w3_w1_weight_scale,
-        w2_weight_scale=backend.w2_weight_scale,
-    )
-    for expert_id, tensors in enumerate(bank):
-        backend.quant_method.load_packed_mxfp4_expert(
-            proxy,
-            global_expert_id=expert_id,
-            local_slot_id=expert_id,
-            w1_weight=tensors["w1"],
-            w1_weight_scale=tensors["w1_sf"],
-            w2_weight=tensors["w2"],
-            w2_weight_scale=tensors["w2_sf"],
-            w3_weight=tensors["w3"],
-            w3_weight_scale=tensors["w3_sf"],
-        )
+    if hasattr(backend.quant_method, "load_packed_mxfp4_expert"):
+        loader_module = backend
+        if hasattr(backend, "scaling_vector_size"):
+            loader_module = SimpleNamespace(
+                expert_size_per_partition=backend.expert_size_per_partition,
+                initial_local_expert_ids=backend.initial_local_expert_ids,
+                scaling_vector_size=backend.scaling_vector_size,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                w3_w1_weight=backend.w3_w1_weight,
+                w2_weight=backend.w2_weight,
+                w3_w1_weight_scale=backend.w3_w1_weight_scale,
+                w2_weight_scale=backend.w2_weight_scale,
+            )
+        for expert_id, tensors in enumerate(bank):
+            backend.quant_method.load_packed_mxfp4_expert(
+                loader_module,
+                global_expert_id=expert_id,
+                local_slot_id=expert_id,
+                w1_weight=tensors["w1"],
+                w1_weight_scale=tensors["w1_sf"],
+                w2_weight=tensors["w2"],
+                w2_weight_scale=tensors["w2_sf"],
+                w3_weight=tensors["w3"],
+                w3_weight_scale=tensors["w3_sf"],
+            )
+    else:
+        weights = {}
+        for expert_id, tensors in enumerate(bank):
+            prefix = f"{expert_id}."
+            weights.update(
+                {
+                    prefix + "w1.weight": tensors["w1"],
+                    prefix + "w1.weight_scale": tensors["w1_sf"],
+                    prefix + "w2.weight": tensors["w2"],
+                    prefix + "w2.weight_scale": tensors["w2_sf"],
+                    prefix + "w3.weight": tensors["w3"],
+                    prefix + "w3.weight_scale": tensors["w3_sf"],
+                }
+            )
+        backend.load_weights([weights])
     backend._weights_transformed = False
     moe.post_load_weights()
     return moe
@@ -626,23 +736,24 @@ def test_tp_shard_loader_matches_manual_slice(tp_size):
         rows = slice(tp_rank * ipp, (tp_rank + 1) * ipp)
         cols_packed = slice(tp_rank * (ipp // 2), (tp_rank + 1) * (ipp // 2))
         cols_sf = slice(tp_rank * (ipp // 32), (tp_rank + 1) * (ipp // 32))
-        manual_bank = [{
-            "w1": e["w1"][rows].contiguous(),
-            "w1_sf": e["w1_sf"][rows].contiguous(),
-            "w3": e["w3"][rows].contiguous(),
-            "w3_sf": e["w3_sf"][rows].contiguous(),
-            "w2": e["w2"][:, cols_packed].contiguous(),
-            "w2_sf": e["w2_sf"][:, cols_sf].contiguous(),
-        } for e in bank]
+        manual_bank = [
+            {
+                "w1": e["w1"][rows].contiguous(),
+                "w1_sf": e["w1_sf"][rows].contiguous(),
+                "w3": e["w3"][rows].contiguous(),
+                "w3_sf": e["w3_sf"][rows].contiguous(),
+                "w2": e["w2"][:, cols_packed].contiguous(),
+                "w2_sf": e["w2_sf"][:, cols_sf].contiguous(),
+            }
+            for e in bank
+        ]
         via_manual = _make_routed_moe(ipp, gate, num_experts=num_experts)
         _load_bank(via_manual, manual_bank)
 
-        for name in ("w3_w1_weight", "w2_weight", "w3_w1_weight_scale",
-                     "w2_weight_scale"):
+        for name in ("w3_w1_weight", "w2_weight", "w3_w1_weight_scale", "w2_weight_scale"):
             a = getattr(via_shard.backend, name).data
             b = getattr(via_manual.backend, name).data
-            assert torch.equal(a, b), (
-                f"{name} mismatch for tp_size={tp_size} tp_rank={tp_rank}")
+            assert torch.equal(a, b), f"{name} mismatch for tp_size={tp_size} tp_rank={tp_rank}"
 
 
 @situ_supported
@@ -663,14 +774,12 @@ def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
     _load_bank(whole, bank)
 
     torch.manual_seed(3)
-    x = torch.randn(
-        num_tokens, _TP_HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.5
+    x = torch.randn(num_tokens, _TP_HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.5
     router_logits = gate.compute_logits(x)
 
     out_whole = whole.forward(x, router_logits, all_rank_num_tokens=None)
 
-    partial_sum = torch.zeros(num_tokens, _TP_HIDDEN, dtype=torch.float32,
-                              device="cuda")
+    partial_sum = torch.zeros(num_tokens, _TP_HIDDEN, dtype=torch.float32, device="cuda")
     for tp_rank in range(tp_size):
         shard = _make_routed_moe(ipp, gate)
         _load_bank(shard, bank, tp_size=tp_size, tp_rank=tp_rank)
@@ -679,5 +788,70 @@ def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
         del shard
         torch.cuda.empty_cache()
 
-    check_accuracy(partial_sum.to(torch.bfloat16), out_whole,
-                   atol=0.08, rtol=0.08, percent=0.98)
+    check_accuracy(partial_sum.to(torch.bfloat16), out_whole, atol=0.08, rtol=0.08, percent=0.98)
+
+
+@situ_supported
+@pytest.mark.parametrize("num_tokens", [1, 16, 128], ids=lambda n: f"tokens{n}")
+@pytest.mark.parametrize(
+    "num_experts,top_k",
+    [
+        pytest.param(8, 1, id="experts8-top1"),
+        pytest.param(8, 2, id="experts8-top2"),
+        pytest.param(32, 16, id="experts32-top16"),
+    ],
+)
+def test_megamoe_deepgemm_situ_matches_trtllm_gen(
+    num_tokens, num_experts, top_k, _single_rank_nccl_process_group
+):
+    """Compare SiTU kernels with identical packed MXFP4 weights and routing.
+
+    MegaMoE folds routing weights into the FC1 activation before its MXFP8
+    requantization, while TRTLLM-Gen combines after the expert output. The
+    quantized graphs therefore need semantic, rather than elementwise,
+    parity: high cosine similarity and bounded relative L2 error.
+    """
+    bank = _make_packed_expert_bank(num_experts, _TP_INTERMEDIATE, _TP_HIDDEN)
+    gate = _make_test_gate(num_experts=num_experts, top_k=top_k)
+
+    trtllm_gen = _load_bank(
+        _make_routed_moe(_TP_INTERMEDIATE, gate, num_experts=num_experts),
+        bank,
+    )
+    mega_moe = _load_bank(
+        _make_routed_moe(
+            _TP_INTERMEDIATE,
+            gate,
+            num_experts=num_experts,
+            moe_backend="MEGAMOE_DEEPGEMM",
+        ),
+        bank,
+    )
+
+    torch.manual_seed(37)
+    x = torch.randn(num_tokens, _TP_HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.5
+    router_logits = gate.compute_logits(x)
+
+    with torch.inference_mode():
+        trtllm_gen_output = trtllm_gen(x, router_logits)
+        mega_moe_output = mega_moe(x, router_logits)
+
+    assert torch.isfinite(mega_moe_output).all()
+    diff = (mega_moe_output.float() - trtllm_gen_output.float()).abs()
+    ref = trtllm_gen_output.float()
+    cosine = torch.nn.functional.cosine_similarity(
+        mega_moe_output.float().flatten(),
+        ref.flatten(),
+        dim=0,
+    )
+    relative_l2 = torch.linalg.vector_norm(diff) / torch.linalg.vector_norm(ref)
+    print(
+        f"M={num_tokens}, experts={num_experts}, top_k={top_k}: "
+        f"cosine={cosine.item():.8f}, "
+        f"relative_l2={relative_l2.item():.8f}, "
+        f"mean_abs={diff.mean().item():.8f}, "
+        f"p99_abs={torch.quantile(diff, 0.99).item():.8f}, "
+        f"max_abs={diff.max().item():.8f}"
+    )
+    assert cosine > 0.998
+    assert relative_l2 < 0.06
