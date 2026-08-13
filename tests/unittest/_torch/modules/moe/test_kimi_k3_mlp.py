@@ -185,6 +185,57 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
     torch.testing.assert_close(gated(x), reference(x), rtol=1.6e-2, atol=1e-3)
 
 
+@requires_cuda
+def test_create_moe_keeps_all_reduce_for_external_tp_reduction():
+    """``reduce_results=False`` keeps the wrapper's direct-TP collective."""
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate
+    from tensorrt_llm._torch.modules.fused_moe import ConfigurableMoE, create_moe
+    from tensorrt_llm._torch.utils import ActType_TrtllmGen
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+
+    config = _runtime_config()
+    pretrained_config = PretrainedConfig()
+    pretrained_config.num_experts = config.num_experts
+    pretrained_config.hidden_size = config.routed_expert_hidden_size
+    pretrained_config.intermediate_size = config.moe_intermediate_size
+    pretrained_config.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained_config,
+        mapping=Mapping(
+            world_size=2,
+            rank=0,
+            tp_size=2,
+            moe_tp_size=2,
+            moe_ep_size=1,
+        ),
+        moe_backend="TRTLLM",
+    )
+    gate = KimiK3MoEGate(config)
+    moe = create_moe(
+        routing_method=gate.routing_method,
+        num_experts=config.num_experts,
+        hidden_size=config.routed_expert_hidden_size,
+        intermediate_size=config.moe_intermediate_size,
+        dtype=torch.bfloat16,
+        reduce_results=False,
+        model_config=model_config,
+        override_quant_config=QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8),
+        layer_idx=1,
+        trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
+        trtllm_gen_activation_alpha=config.activation_situ_beta,
+        trtllm_gen_activation_beta=config.activation_situ_linear_beta,
+        communication_method=None,
+    )
+
+    assert isinstance(moe, ConfigurableMoE)
+    assert not moe.reduce_results
+    assert moe.all_reduce is not None
+
+
 @pytest.mark.parametrize(
     "attention_dp,tp_size,has_routed_comm,expected_shared_tp,expected_shared_reduce,expected_combined_ar",
     [
@@ -221,7 +272,7 @@ def test_kimi_k3_shared_expert_reduction_mode(
     fake_moe.backend = SimpleNamespace(initial_local_expert_ids=[0, 1, 2, 3])
     fake_moe.comm = object() if has_routed_comm else None
     fake_moe.layer_load_balancer = None
-    fake_moe.all_reduce = _FakeAllReduce() if not attention_dp and tp_size > 1 else None
+    fake_moe.all_reduce = _FakeAllReduce()
 
     monkeypatch.setattr(modeling_kimi_linear, "create_moe", lambda **_: fake_moe)
     monkeypatch.setattr(modeling_kimi_linear, "AllReduce", _FakeAllReduce)

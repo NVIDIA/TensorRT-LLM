@@ -68,6 +68,16 @@ def test_situ_and_mul_strided_rows():
 
 
 @requires_cuda
+def test_situ_and_mul_rejects_strided_columns():
+    """The kernel does not accept a non-contiguous packed dimension."""
+    full = torch.randn(8, 1024, dtype=torch.bfloat16, device="cuda")
+    x = full[:, ::2]
+
+    with pytest.raises(ValueError, match="contiguous last dimension"):
+        torch.ops.trtllm.situ_and_mul(x, 4.0, 25.0)
+
+
+@requires_cuda
 @pytest.mark.parametrize("situ_beta,situ_linear_beta", _BETAS, ids=_BETA_IDS)
 def test_kimi_k3_mlp_fused_activation_matches_eager(situ_beta, situ_linear_beta):
     device = torch.device("cuda")

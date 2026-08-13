@@ -921,9 +921,14 @@ class KimiK3MoERuntime(nn.Module):
         # all-reduce. Communication-backed MoE already returns a complete
         # routed result, so GatedMLP must reduce only its shared partial.
         use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
-        self._use_combined_all_reduce = (
-            use_shared_tp and routed_comm is None and self.routed_experts.all_reduce is not None
-        )
+        needs_routed_all_reduce = use_shared_tp and routed_comm is None
+        routed_all_reduce = self.routed_experts.all_reduce
+        if needs_routed_all_reduce and routed_all_reduce is None:
+            raise RuntimeError(
+                "Kimi K3 direct MoE tensor parallelism requires the "
+                "ConfigurableMoE all-reduce even when reduce_results=False."
+            )
+        self._use_combined_all_reduce = needs_routed_all_reduce
         self.shared_experts = GatedMLP(
             hidden_size=cfg.hidden_size,
             intermediate_size=shared_intermediate,
@@ -959,13 +964,12 @@ class KimiK3MoERuntime(nn.Module):
             hidden_size=self.moe_hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
 
-    def _routed_up_projection(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(
-            self.routed_expert_up_proj, nn.Linear
-        ):
-            return self.routed_expert_up_proj(hidden_states)
+    @staticmethod
+    def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
+        if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(projection, nn.Linear):
+            return projection(hidden_states)
         return torch.ops.trtllm.dsv3_fused_a_gemm_op(
-            hidden_states, self.routed_expert_up_proj.weight.t(), None, None
+            hidden_states, projection.weight.t(), None, None
         )
 
     @staticmethod
@@ -1077,7 +1081,7 @@ class KimiK3MoERuntime(nn.Module):
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         router_logits = self.gate.compute_logits(hidden_states)
-        moe_all_reduce = self.routed_experts.all_reduce
+        moe_all_reduce = self.routed_experts.all_reduce if self._use_combined_all_reduce else None
 
         def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
@@ -1090,14 +1094,7 @@ class KimiK3MoERuntime(nn.Module):
             # replaced the projection module, call it directly: its weight is
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
             # is already a single fused GEMM (fp8_swap_ab_gemm).
-            if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(
-                self.routed_expert_down_proj, nn.Linear
-            ):
-                routed_in = self.routed_expert_down_proj(hidden_states)
-            else:
-                routed_in = torch.ops.trtllm.dsv3_fused_a_gemm_op(
-                    hidden_states, self.routed_expert_down_proj.weight.t(), None, None
-                )
+            routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
             y = self.routed_experts(
                 routed_in,
                 router_logits,
@@ -1105,13 +1102,9 @@ class KimiK3MoERuntime(nn.Module):
             )
             if self._use_combined_all_reduce:
                 return y
-            # EP partial latent sums must be completed before the nonlinear
-            # latent norm. Communication-backed paths combine internally;
-            # direct TP paths use the wrapper's AllReduce explicitly.
-            if self.routed_experts.comm is None and moe_all_reduce is not None:
-                y = moe_all_reduce(y)
+            # Communication-backed paths return a complete routed result.
             y = self.routed_expert_norm(y)
-            return self._routed_up_projection(y)
+            return self._routed_projection(y, self.routed_expert_up_proj)
 
         # Shared experts depend only on the block input, so overlap their GEMMs
         # with the routed dispatch/expert/combine chain. Multi-stream engages
@@ -1136,7 +1129,7 @@ class KimiK3MoERuntime(nn.Module):
             # The column split is a strided view; FlashInfer RMSNorm expects
             # a dense last dimension.
             routed_latent = self.routed_expert_norm(routed_latent.contiguous())
-            routed_out = self._routed_up_projection(routed_latent)
+            routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         return routed_out + shared_out
 
 

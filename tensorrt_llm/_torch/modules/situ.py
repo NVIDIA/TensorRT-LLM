@@ -87,6 +87,8 @@ def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: Optional[float] = No
     b, n = x.shape
 
     assert n % 2 == 0
+    if x.stride(1) != 1:
+        raise ValueError("situ_and_mul requires a contiguous last dimension")
     d = n // 2
     output = torch.empty((b, d), dtype=x.dtype, device=x.device)
 
