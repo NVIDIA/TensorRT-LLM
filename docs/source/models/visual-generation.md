@@ -82,7 +82,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
 
-[^9]: GlmImage currently supports single-GPU text-to-image with BF16 parity vs `diffusers` (cosine >= 0.99 on the full transformer). FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints. Image-to-image conditioning, sequence/CFG parallelism, parallel VAE, and caching (TeaCache / Cache-DiT) are not yet supported.
+[^9]: GlmImage currently supports single-GPU text-to-image with BF16 parity vs `diffusers` (cosine >= 0.999 on the full transformer). FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints. Image-to-image conditioning, sequence/CFG parallelism, parallel VAE, and caching (TeaCache / Cache-DiT) are not yet supported.
 
 ## Quick Start
 
