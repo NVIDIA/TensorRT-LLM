@@ -604,7 +604,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return dict(COSMOS3_EXTRA_SPECS)
 
     @property
-    def ref_slot_specs(self):
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
         return {
             # image (I2V) and video (V2V) are both optional; Cosmos3 also runs
             # T2V with neither.

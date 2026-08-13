@@ -405,7 +405,7 @@ class WanImageToVideoPipeline(BasePipeline):
         return get_wan_extra_param_specs(self.is_wan22_14b)
 
     @property
-    def ref_slot_specs(self):
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
         # I2V first frame (required) + optional last frame for interpolation.
         return {
             "image_reference": RefSlotSpec(

@@ -425,7 +425,7 @@ class WanPipeline(BasePipeline):
         return get_wan_extra_param_specs(self.is_wan22_14b)
 
     @property
-    def ref_slot_specs(self):
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
         # Optional single conditioning image (first frame); T2V when absent.
         return {
             "image_reference": RefSlotSpec(

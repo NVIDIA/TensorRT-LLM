@@ -254,7 +254,7 @@ class QwenImageLayeredPipeline(BasePipeline):
         }
 
     @property
-    def ref_slot_specs(self):
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
         return {
             "image_reference": RefSlotSpec(
                 modality="image",

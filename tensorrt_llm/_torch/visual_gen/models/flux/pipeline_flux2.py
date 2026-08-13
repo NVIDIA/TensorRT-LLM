@@ -371,7 +371,7 @@ class Flux2Pipeline(BasePipeline):
         }
 
     @property
-    def ref_slot_specs(self):
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
         # Optional reference image(s): "reference" role, count 0..N (multi-subject);
         # FLUX.2 also runs plain text-to-image with none.
         return {
