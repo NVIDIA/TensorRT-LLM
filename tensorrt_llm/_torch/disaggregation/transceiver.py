@@ -193,6 +193,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._transfer_worker.populate_instance_and_rank_info(
             endpoints=endpoints, layer_num_per_pp=layer_num_per_pp
         )
+        instance_rank_infos = cast(
+            list,
+            self._dist.allgather(self._transfer_worker.rank_info.to_bytes()),
+        )
+        self._transfer_worker.publish_instance_rank_infos(instance_rank_infos)
         logger.info(f"transfer worker ctx_server_endpoints: {endpoints}")
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self._context_info_endpoint: {self._context_info_endpoint}")

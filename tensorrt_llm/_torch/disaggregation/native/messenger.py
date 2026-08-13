@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from abc import ABC, abstractmethod
 from threading import Event, Lock, Thread
 from typing import Callable, Optional
@@ -30,9 +45,10 @@ class MessengerInterface(ABC):
         ...
 
     @abstractmethod
-    def receive(self) -> list[bytes]:
+    def receive(self, timeout_ms: Optional[int] = None) -> list[bytes]:
         """
         Receive messages.
+        :param timeout_ms: Optional maximum time to wait in milliseconds.
         :return: List of byte messages received.
         """
         ...
@@ -123,7 +139,11 @@ class ZMQMessenger(MessengerInterface):
         else:
             self._socket.send_multipart(messages)
 
-    def receive(self) -> list[bytes]:
+    def receive(self, timeout_ms: Optional[int] = None) -> list[bytes]:
+        if timeout_ms is not None and not self._socket.poll(timeout_ms, zmq.POLLIN):
+            raise TimeoutError(
+                f"Timed out after {timeout_ms} ms waiting for a message from {self.endpoint}"
+            )
         return self._socket.recv_multipart()
 
     def start_listener(

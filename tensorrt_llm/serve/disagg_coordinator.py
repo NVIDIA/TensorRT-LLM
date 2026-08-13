@@ -160,7 +160,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
         # in-process HTTP server, its routes are mounted on the coordinator app.
         self._cluster_storage: Optional[ClusterStorage] = (
             create_cluster_storage(
-                config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name
+                config.disagg_cluster_config.cluster_uri,
+                config.disagg_cluster_config.cluster_name,
             )
             if config.disagg_cluster_config
             else None
@@ -177,6 +178,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._ctx_client: Optional[OpenAIClient] = None
         self._gen_client: Optional[OpenAIClient] = None
         self._disagg_cluster_manager: Optional[DisaggClusterManager] = None
+        self._preconnect_completed = False
+        self._preconnected_pairs: set[tuple[str, str]] = set()
+        self._preconnect_lock = asyncio.Lock()
+        self._desired_workers: dict[tuple[ServerRole, str], str] = {}
+        self._worker_onboarding_tasks: dict[tuple[ServerRole, str], asyncio.Task] = {}
+        self._initial_preconnect_task: Optional[asyncio.Task] = None
 
     @property
     def ctx_router(self) -> Router:
@@ -286,6 +293,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 self._gen_router, ServerRole.GENERATION, self._config.max_retries
             )
 
+        self._preconnect_completed = False
+        self._preconnected_pairs.clear()
+        self._desired_workers.clear()
+
         if self._config.disagg_cluster_config and self._cluster_storage:
             logger.info("Starting disagg cluster manager")
             self._disagg_cluster_manager = DisaggClusterManager(
@@ -294,6 +305,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
             await self._disagg_cluster_manager.start()
             await self._disagg_cluster_manager.watch_workers(on_event=self._on_worker_event)
             logger.info("Disagg cluster manager started")
+            self._schedule_initial_preconnect()
         else:
             if self._metadata_server and self._metadata_config:
                 logger.info("Starting server monitoring via metadata service")
@@ -304,8 +316,21 @@ class DisaggCoordinatorService(DisaggCoordinator):
                     self._metadata_config.refresh_interval
                 )
             await self._wait_for_all_servers_ready()
+            await self._attempt_preconnect_pairs(
+                self._all_routable_pairs(), "initial static topology"
+            )
+            self._preconnect_completed = True
 
     async def stop(self) -> None:
+        background_tasks = list(self._worker_onboarding_tasks.values())
+        self._worker_onboarding_tasks.clear()
+        if self._initial_preconnect_task is not None:
+            background_tasks.append(self._initial_preconnect_task)
+            self._initial_preconnect_task = None
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
         reservations = list(self._reservation_tasks.values())
         self._reservation_tasks.clear()
         for reservation in reservations:
@@ -320,11 +345,13 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def is_ready(self) -> bool:
         if self._disagg_cluster_manager:
-            return await self._disagg_cluster_manager.is_ready_with_router(
-                self._ctx_router.num_prepared_servers,
-                self._gen_router.num_prepared_servers,
+            return self._preconnect_completed and (
+                await self._disagg_cluster_manager.is_ready_with_router(
+                    self._ctx_router.num_prepared_servers,
+                    self._gen_router.num_prepared_servers,
+                )
             )
-        return True
+        return self._preconnect_completed
 
     async def cluster_info(self) -> Dict[str, Any]:
         info = {
@@ -335,7 +362,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
             },
         }
         routing_key_configs = {}
-        for role, router in (("context", self._ctx_router), ("generation", self._gen_router)):
+        for role, router in (
+            ("context", self._ctx_router),
+            ("generation", self._gen_router),
+        ):
             if isinstance(router, KvCacheAwareRouter):
                 config = router.routing_key_config()
                 if config is not None:
@@ -379,7 +409,242 @@ class DisaggCoordinatorService(DisaggCoordinator):
         except asyncio.TimeoutError:
             raise TimeoutError("Timeout waiting for context and generation servers to be ready")
 
+    @staticmethod
+    def _rank_info_endpoint(server_info: dict) -> Optional[str]:
+        """Extract the Python/NIXL rank-info endpoint from cached worker metadata."""
+        disaggregated_params = server_info.get("disaggregated_params", {})
+        endpoint = disaggregated_params.get("ctx_info_endpoint")
+        if isinstance(endpoint, list):
+            endpoint = endpoint[0] if endpoint else None
+        return endpoint if isinstance(endpoint, str) and endpoint else None
+
+    def _all_routable_pairs(self) -> list[tuple[str, str]]:
+        return [
+            (context_server, generation_server)
+            for context_server in self._ctx_router.servers
+            for generation_server in self._gen_router.servers
+        ]
+
+    def _pairs_for_new_server(self, role: ServerRole, server: str) -> list[tuple[str, str]]:
+        if role == ServerRole.CONTEXT:
+            return [(server, generation_server) for generation_server in self._gen_router.servers]
+        if role == ServerRole.GENERATION:
+            return [(context_server, server) for context_server in self._ctx_router.servers]
+        return []
+
+    async def _preconnect_pair(self, context_server: str, generation_server: str) -> bool:
+        """Preconnect one instance pair, or skip it when Python/NIXL metadata is unavailable."""
+        context_endpoint = self._rank_info_endpoint(
+            self._ctx_router.get_server_info(context_server)
+        )
+        generation_endpoint = self._rank_info_endpoint(
+            self._gen_router.get_server_info(generation_server)
+        )
+        if context_endpoint is None or generation_endpoint is None:
+            logger.info(
+                f"Skipping disaggregated preconnect for {context_server} -> "
+                f"{generation_server}: Python/NIXL rank-info endpoint is unavailable"
+            )
+            return False
+
+        from tensorrt_llm._torch.disaggregation.native.transfer import preconnect_instances
+
+        logger.info(
+            f"Preconnecting disaggregated context server {context_server} "
+            f"to generation server {generation_server}"
+        )
+        await asyncio.to_thread(preconnect_instances, context_endpoint, generation_endpoint)
+        return True
+
+    def _is_current_pair(self, pair: tuple[str, str]) -> bool:
+        """Check that both endpoints are still routable or desired by service discovery."""
+        context_server, generation_server = pair
+        context_current = (
+            context_server in self._ctx_router.servers
+            or (
+                ServerRole.CONTEXT,
+                context_server,
+            )
+            in self._desired_workers
+        )
+        generation_current = (
+            generation_server in self._gen_router.servers
+            or (
+                ServerRole.GENERATION,
+                generation_server,
+            )
+            in self._desired_workers
+        )
+        return context_current and generation_current
+
+    async def _preconnect_pairs(self, pairs: list[tuple[str, str]]) -> None:
+        """Settle pending pair attempts, record current successes, then aggregate failures."""
+        pending_pairs = sorted(set(pairs) - self._preconnected_pairs)
+        if not pending_pairs:
+            return
+        started = time.monotonic()
+        results = await asyncio.gather(
+            *(self._preconnect_pair(context, generation) for context, generation in pending_pairs),
+            return_exceptions=True,
+        )
+        established_pairs = {pair for pair, result in zip(pending_pairs, results) if result is True}
+        current_pairs = {pair for pair in established_pairs if self._is_current_pair(pair)}
+        self._preconnected_pairs.update(current_pairs)
+        failures = [result for result in results if isinstance(result, BaseException)]
+        established = sum(result is True for result in results)
+        skipped = sum(result is False for result in results)
+        logger.info(
+            f"Disaggregated preconnect: {established} established, "
+            f"{skipped} skipped, {len(failures)} failed of "
+            f"{len(pending_pairs)} pending instance pairs "
+            f"in {time.monotonic() - started:.3f} seconds"
+        )
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} of {len(pending_pairs)} instance pairs failed; "
+                f"first error: {failures[0]}"
+            )
+
+    async def _attempt_preconnect_pairs(self, pairs: list[tuple[str, str]], phase: str) -> bool:
+        """Run preconnect as a fail-open optimization for one lifecycle phase."""
+        try:
+            await self._preconnect_pairs(pairs)
+            return True
+        except Exception as error:
+            logger.error(
+                f"Disaggregated preconnect failed during {phase}; "
+                f"falling back to lazy request-time registration: {error}"
+            )
+            return False
+
+    async def _maybe_complete_initial_preconnect(self) -> None:
+        """Gate initial readiness until a stable discovered topology attempts preconnect."""
+        if self._preconnect_completed or self._disagg_cluster_manager is None:
+            return
+        async with self._preconnect_lock:
+            while not self._preconnect_completed:
+                if not await self._disagg_cluster_manager.is_ready_with_router(
+                    self._ctx_router.num_prepared_servers,
+                    self._gen_router.num_prepared_servers,
+                ):
+                    await asyncio.sleep(self._health_check_interval_secs)
+                    continue
+                topology = (
+                    tuple(self._ctx_router.servers),
+                    tuple(self._gen_router.servers),
+                )
+                await self._attempt_preconnect_pairs(
+                    self._all_routable_pairs(), "initial discovered topology"
+                )
+                if not await self._disagg_cluster_manager.is_ready_with_router(
+                    self._ctx_router.num_prepared_servers,
+                    self._gen_router.num_prepared_servers,
+                ):
+                    await asyncio.sleep(self._health_check_interval_secs)
+                    continue
+                current_topology = (
+                    tuple(self._ctx_router.servers),
+                    tuple(self._gen_router.servers),
+                )
+                if current_topology != topology:
+                    continue
+                # Preconnect is an optimization.  A bounded control-plane
+                # failure deliberately falls back to request-time registration.
+                self._preconnect_completed = True
+
+    def _schedule_initial_preconnect(self) -> None:
+        if self._preconnect_completed or self._disagg_cluster_manager is None:
+            return
+        if self._initial_preconnect_task is not None and not self._initial_preconnect_task.done():
+            return
+        task = asyncio.create_task(self._maybe_complete_initial_preconnect())
+        self._initial_preconnect_task = task
+
+        def clear_initial_task(done_task: asyncio.Task) -> None:
+            if not done_task.cancelled() and done_task.exception() is not None:
+                logger.error(
+                    f"Initial disaggregated preconnect task failed: {done_task.exception()}"
+                )
+            if self._initial_preconnect_task is done_task:
+                self._initial_preconnect_task = None
+
+        task.add_done_callback(clear_initial_task)
+
+    def _forget_preconnected_server(self, server: str) -> None:
+        self._preconnected_pairs = {pair for pair in self._preconnected_pairs if server not in pair}
+
+    def _worker_is_current(self, key: tuple[ServerRole, str], worker_id: str) -> bool:
+        return self._desired_workers.get(key) == worker_id
+
+    async def _onboard_worker(self, worker_info: WorkerInfo, worker_addr: str) -> None:
+        """Prepare, preconnect, and promote a worker only while its ID remains current."""
+        key = (worker_info.role, worker_addr)
+        router = self._ctx_router if worker_info.role == ServerRole.CONTEXT else self._gen_router
+        try:
+            if worker_addr in router.servers:
+                return
+            if not await router.prepare_server(worker_addr):
+                logger.warning(f"Worker {worker_addr} was not added because preparation failed")
+                return
+            if not self._worker_is_current(key, worker_info.worker_id):
+                await router.discard_prepared_server(worker_addr)
+                return
+
+            if self._preconnect_completed:
+                async with self._preconnect_lock:
+                    if not self._worker_is_current(key, worker_info.worker_id):
+                        await router.discard_prepared_server(worker_addr)
+                        return
+                    await self._attempt_preconnect_pairs(
+                        self._pairs_for_new_server(worker_info.role, worker_addr),
+                        f"onboarding worker {worker_addr}",
+                    )
+                    if not self._worker_is_current(key, worker_info.worker_id):
+                        await router.discard_prepared_server(worker_addr)
+                        return
+                    added = await router.add_server(worker_addr)
+            else:
+                added = False
+                if self._worker_is_current(key, worker_info.worker_id):
+                    added = await router.add_server(worker_addr)
+            if added and not self._worker_is_current(key, worker_info.worker_id):
+                await router.remove_server(worker_addr)
+                await router.discard_prepared_server(worker_addr)
+                return
+            self._schedule_initial_preconnect()
+        except asyncio.CancelledError:
+            desired_worker_id = self._desired_workers.get(key)
+            if (
+                desired_worker_id in (None, worker_info.worker_id)
+                and worker_addr not in router.servers
+            ):
+                await router.discard_prepared_server(worker_addr)
+            raise
+        except Exception as error:
+            logger.error(f"Failed to onboard worker {worker_addr}: {error}")
+            desired_worker_id = self._desired_workers.get(key)
+            if (
+                desired_worker_id in (None, worker_info.worker_id)
+                and worker_addr not in router.servers
+            ):
+                await router.discard_prepared_server(worker_addr)
+
+    def _schedule_worker_onboarding(self, worker_info: WorkerInfo, worker_addr: str) -> None:
+        key = (worker_info.role, worker_addr)
+        previous = self._worker_onboarding_tasks.get(key)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        task = asyncio.create_task(self._onboard_worker(worker_info, worker_addr))
+        self._worker_onboarding_tasks[key] = task
+
+        def clear_onboarding_task(done_task: asyncio.Task) -> None:
+            if self._worker_onboarding_tasks.get(key) is done_task:
+                self._worker_onboarding_tasks.pop(key, None)
+
+        task.add_done_callback(clear_onboarding_task)
+
     async def _on_worker_event(self, worker_info: WorkerInfo, event_type: WatchEventType):
+        """Apply discovery events while cold preconnect runs in background tasks."""
         router_map = {
             ServerRole.CONTEXT: self._ctx_router,
             ServerRole.GENERATION: self._gen_router,
@@ -388,9 +653,25 @@ class DisaggCoordinatorService(DisaggCoordinator):
         try:
             router = router_map[worker_info.role]
             if event_type == WatchEventType.SET:
-                await router.add_server(worker_addr)
+                key = (worker_info.role, worker_addr)
+                self._desired_workers[key] = worker_info.worker_id
+                self._schedule_worker_onboarding(worker_info, worker_addr)
             elif event_type == WatchEventType.DELETE:
+                key = (worker_info.role, worker_addr)
+                desired_worker_id = self._desired_workers.get(key)
+                if desired_worker_id is not None and desired_worker_id != worker_info.worker_id:
+                    logger.info(
+                        f"Ignoring stale DELETE for worker {worker_info.worker_id} at "
+                        f"{worker_addr}; current worker is {desired_worker_id}"
+                    )
+                    return
+                self._desired_workers.pop(key, None)
+                onboarding_task = self._worker_onboarding_tasks.pop(key, None)
+                if onboarding_task is not None:
+                    onboarding_task.cancel()
                 await router.remove_server(worker_addr)
+                await router.discard_prepared_server(worker_addr)
+                self._forget_preconnected_server(worker_addr)
             logger.info(f"Worker {event_type.name} event: {worker_info.worker_id}, {worker_addr}")
         except KeyError:
             logger.error(
@@ -612,7 +893,10 @@ class CoordinatorClient(DisaggCoordinator):
 
     def _sync_delegating_router_configs(self, info: Dict[str, Any]) -> None:
         configs = info.get("routing_key_configs", {})
-        for role, router in (("context", self._ctx_router), ("generation", self._gen_router)):
+        for role, router in (
+            ("context", self._ctx_router),
+            ("generation", self._gen_router),
+        ):
             config = configs.get(role)
             local = getattr(router, "_local", None)
             if config is not None and isinstance(local, KvCacheAwareRouter):
