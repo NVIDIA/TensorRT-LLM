@@ -447,6 +447,9 @@ class AutoTunerProfilingCache:
 
     def __init__(self):
         self.cache: Dict[Tuple, Tuple] = dict()
+        # Monotonically identifies cache contents for lightweight derived
+        # caches that need to reject stale selections after clear/load/merge.
+        self.generation = 0
 
         # Track which ops use which distributed strategy
         # Maps custom_op name -> DistributedTuningStrategy
@@ -466,6 +469,7 @@ class AutoTunerProfilingCache:
 
     def __setitem__(self, cache_key: Tuple, value: Tuple) -> None:
         self.cache[cache_key] = value
+        self.generation += 1
 
     def __getitem__(self, cache_key: Tuple) -> Tuple:
         return self.cache[cache_key]
@@ -477,6 +481,7 @@ class AutoTunerProfilingCache:
         self.cache.clear()
         self.independent_op.clear()
         self.excluded_op.clear()
+        self.generation += 1
 
     def fallback_entry(self) -> Tuple:
         # runner_id = 0, tactic = -1
@@ -537,6 +542,8 @@ class AutoTunerProfilingCache:
 
     def merge_cache_data(self, cache_data: Dict[Tuple, Tuple]):
         self.cache.update(cache_data)
+        if cache_data:
+            self.generation += 1
 
     def get_specific_custom_op(self, custom_op: str) -> Dict[Tuple, Tuple]:
         return {k: v for k, v in self.cache.items() if k[0] == custom_op}
@@ -750,6 +757,8 @@ class AutoTunerProfilingCache:
                     f"[AutoTuner] Loaded {len(rank_cache)} rank-specific cache entries for rank {rank}"
                 )
 
+            self.generation += 1
+
             logger.info(
                 f"[AutoTuner] Successfully loaded cache from {file_path} using JSON format (total {len(self.cache)} entries)"
             )
@@ -960,6 +969,11 @@ class AutoTuner:
         if cls._instance is None:
             cls._instance = AutoTuner()
         return cls._instance
+
+    @property
+    def is_capturing_tactics(self) -> bool:
+        """Whether a tactic capture or replay context is active."""
+        return self._active_capture is not None
 
     class TacticsCapture:
         """Object returned by capture() that can be iterated to get all tactic combinations.

@@ -598,6 +598,10 @@ def _fp4_conv_run(
     N, Cx, D, H, Wd = x.shape
     if Cx != C:
         raise ValueError(f"FP4 Conv3d expected {C} input channels, got {Cx}")
+    if Cp % 64 != 0 or (Cp > 256 and Cp % 256 != 0):
+        raise ValueError(f"FP4 Conv3d received unsupported padded input channels: {Cp}")
+    if Op % 8 != 0:
+        raise ValueError(f"FP4 Conv3d received misaligned padded output channels: {Op}")
     if Cp != Cx:  # zero-pad in-channels to a kernel-valid count
         x = torch.cat([x, x.new_zeros((N, Cp - Cx, D, H, Wd))], dim=1)
     Z, P, Q = compute_zpq((D, H, Wd), (T, R, S), stride, pad, pad, dil)
@@ -726,7 +730,6 @@ def _fp4_conv_run(
 
     out, _ = run_tuned_fp4_conv(
         signature=(
-            x.device.index,
             cta_tile_k,
             tuple(stride),
             tuple(pad),
