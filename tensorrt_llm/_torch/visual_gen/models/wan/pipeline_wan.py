@@ -37,7 +37,10 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_default_params,
     get_wan_extra_param_specs,
 )
-from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import (
+    retrieve_latents,
+    wan_attn_metadata_kwargs,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -554,6 +557,25 @@ class WanPipeline(BasePipeline):
         last_model_used = [None]
         _vsa_step_counter = [0]
 
+        # Create attention metadata
+        denoise_batch = self.denoise_batch_size(latents, guidance_scale=guidance_scale)
+        attn_metadata_high = wan_attn_metadata_kwargs(
+            self.transformer,
+            hidden_states=latents,
+            encoder_hidden_states=prompt_embeds,
+            batch_size=denoise_batch,
+        )
+        attn_metadata_low = (
+            None
+            if self.transformer_2 is None
+            else wan_attn_metadata_kwargs(
+                self.transformer_2,
+                hidden_states=latents,
+                encoder_hidden_states=prompt_embeds,
+                batch_size=denoise_batch,
+            )
+        )
+
         def forward_fn(
             latents,
             extra_stream_latents,
@@ -587,6 +609,8 @@ class WanPipeline(BasePipeline):
             else:
                 current_model = self.transformer
 
+            sites = attn_metadata_high if current_model is self.transformer else attn_metadata_low
+
             # Build per-patch 2D timestep for Wan 2.2 TI2V-5B
             if self.is_wan22_5b:
                 _, ph, pw = self.transformer.config.patch_size
@@ -615,12 +639,14 @@ class WanPipeline(BasePipeline):
                 with set_vsa_forward_context(vsa_metadata):
                     return current_model(
                         hidden_states=latents,
+                        **sites,
                         timestep=timestep / self.scheduler.config.num_train_timesteps,
                         encoder_hidden_states=encoder_hidden_states,
                     )
 
             return current_model(
                 hidden_states=latents,
+                **sites,
                 timestep=timestep / self.scheduler.config.num_train_timesteps,
                 encoder_hidden_states=encoder_hidden_states,
             )

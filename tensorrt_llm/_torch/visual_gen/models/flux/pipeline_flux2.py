@@ -521,7 +521,17 @@ class Flux2Pipeline(BasePipeline):
                 [latents.shape[0]], guidance_scale, device=self.device, dtype=torch.float32
             )
 
+        # Create attention metadata
+        attn_metadata_sites = self.transformer.create_attn_metadata(
+            batch_size=latents.shape[0],
+            text_seq_len=prompt_embeds.shape[1],
+            # forward_fn concatenates the reference-image latents onto the noise.
+            image_seq_len=latents.shape[1]
+            + (0 if image_latents is None else image_latents.shape[1]),
+        )
+
         # Denoising loop using forward_fn callback (WAN pattern)
+
         def forward_fn(
             latents,
             extra_stream_latents,
@@ -539,6 +549,7 @@ class Flux2Pipeline(BasePipeline):
 
             noise_pred = self.transformer(
                 hidden_states=transformer_latents,
+                attn_metadata=attn_metadata_sites["self"],
                 encoder_hidden_states=encoder_hidden_states,
                 timestep=timestep / 1000,  # FLUX.2 expects normalized timesteps
                 img_ids=transformer_latent_ids,

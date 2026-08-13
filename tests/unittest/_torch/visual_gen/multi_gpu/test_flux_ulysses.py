@@ -26,16 +26,15 @@ try:
     import sys
     from pathlib import Path
 
-    from tensorrt_llm._torch.visual_gen.config import (
-        DiffusionModelConfig,
-        create_attention_metadata_state,
-    )
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _visual_gen_dist_utils import spawn_with_retry
+    from attn_metadata_utils import flux_attn_metadata
 
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig
@@ -163,9 +162,6 @@ def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
-        attention_metadata_state=(
-            create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
-        ),
         skip_create_weights_in_init=False,
     )
     config.mapping = vgm.to_llm_mapping()
@@ -229,6 +225,7 @@ def _logic_flux1_ulysses_forward(rank, world_size):
     with torch.no_grad():
         output = model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             pooled_projections=pooled_projections,
             timestep=timestep,
@@ -288,6 +285,7 @@ def _logic_flux1_ulysses_vs_single_gpu(rank, world_size):
     with torch.no_grad():
         ref_output = ref_model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(ref_model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             pooled_projections=pooled_projections,
             timestep=timestep,
@@ -296,6 +294,7 @@ def _logic_flux1_ulysses_vs_single_gpu(rank, world_size):
         )
         ulysses_output = ulysses_model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(ulysses_model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             pooled_projections=pooled_projections,
             timestep=timestep,
@@ -349,6 +348,7 @@ def _logic_flux2_ulysses_forward(rank, world_size):
     with torch.no_grad():
         output = model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             timestep=timestep,
             img_ids=img_ids,
@@ -404,6 +404,7 @@ def _logic_flux2_ulysses_vs_single_gpu(rank, world_size):
     with torch.no_grad():
         ref_output = ref_model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(ref_model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             timestep=timestep,
             img_ids=img_ids,
@@ -411,6 +412,7 @@ def _logic_flux2_ulysses_vs_single_gpu(rank, world_size):
         )
         ulysses_output = ulysses_model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(ulysses_model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             timestep=timestep,
             img_ids=img_ids,
@@ -477,6 +479,7 @@ def _logic_flux2_ulysses_trtllm_vs_vanilla(rank, world_size):
     with torch.no_grad():
         vanilla_output = vanilla_model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(vanilla_model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             timestep=timestep,
             img_ids=img_ids,
@@ -484,6 +487,7 @@ def _logic_flux2_ulysses_trtllm_vs_vanilla(rank, world_size):
         )
         trtllm_output = trtllm_model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(trtllm_model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             timestep=timestep,
             img_ids=img_ids,

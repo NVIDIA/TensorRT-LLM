@@ -11,6 +11,7 @@ import unittest
 
 import pytest
 import torch
+from attn_metadata_utils import ltx2_attn_metadata
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm.mapping import Mapping
@@ -45,6 +46,11 @@ AUDIO_VIDEO_CONFIG = dict(
     audio_positional_embedding_max_pos=[4],
     av_ca_timestep_scale_multiplier=1,
 )
+
+
+def _sites(model, video=None, audio=None, text_cache=None):
+    """LTX-2's per-site attention metadata for a direct LTXModel.forward call."""
+    return ltx2_attn_metadata(model, video, audio, text_cache)
 
 
 def _create_model_config(backend: str = "VANILLA") -> DiffusionModelConfig:
@@ -235,7 +241,12 @@ class TestLTX2VideoOnlyModel(unittest.TestCase):
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=None, text_cache=text_cache)
+            video_out, audio_out = model(
+                video=video_modality,
+                audio=None,
+                text_cache=text_cache,
+                attn_metadata=_sites(model, video_modality, None, text_cache),
+            )
 
         self.assertIsNotNone(video_out)
         self.assertIsNone(audio_out)
@@ -354,7 +365,10 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
 
         with torch.no_grad():
             video_out, audio_out = model(
-                video=video_modality, audio=audio_modality, text_cache=text_cache
+                video=video_modality,
+                audio=audio_modality,
+                text_cache=text_cache,
+                attn_metadata=_sites(model, video_modality, audio_modality, text_cache),
             )
 
         self.assertIsNotNone(video_out)
@@ -419,7 +433,12 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=None, text_cache=text_cache)
+            video_out, audio_out = model(
+                video=video_modality,
+                audio=None,
+                text_cache=text_cache,
+                attn_metadata=_sites(model, video_modality, None, text_cache),
+            )
 
         self.assertIsNotNone(video_out)
         self.assertIsNone(audio_out)
@@ -559,7 +578,10 @@ class TestLTX2NVFP4ForwardSmoke(unittest.TestCase):
         try:
             with torch.no_grad():
                 video_out, audio_out = model(
-                    video=video_modality, audio=audio_modality, text_cache=text_cache
+                    video=video_modality,
+                    audio=audio_modality,
+                    text_cache=text_cache,
+                    attn_metadata=_sites(model, video_modality, audio_modality, text_cache),
                 )
         finally:
             for h in handles:
@@ -828,7 +850,12 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
             dtype=dtype,
         )
         with torch.no_grad():
-            eager_v, eager_a = model(video=video_mod, audio=audio_mod, text_cache=text_cache)
+            eager_v, eager_a = model(
+                video=video_mod,
+                audio=audio_mod,
+                text_cache=text_cache,
+                attn_metadata=_sites(model, video_mod, audio_mod, text_cache),
+            )
         eager_v = eager_v.clone()
         eager_a = eager_a.clone()
 
@@ -841,7 +868,12 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         torch.manual_seed(100)
         video_mod, audio_mod = _make_modalities(0.5)
         with torch.no_grad():
-            graph_v1, graph_a1 = model(video=video_mod, audio=audio_mod, text_cache=text_cache)
+            graph_v1, graph_a1 = model(
+                video=video_mod,
+                audio=audio_mod,
+                text_cache=text_cache,
+                attn_metadata=_sites(model, video_mod, audio_mod, text_cache),
+            )
 
         self.assertTrue(
             torch.equal(eager_v, graph_v1),
@@ -859,7 +891,12 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         # Eager baseline for new inputs (same static — context/PE don't change)
         model.forward = original_forward
         with torch.no_grad():
-            eager_v2, eager_a2 = model(video=video_mod2, audio=audio_mod2, text_cache=text_cache)
+            eager_v2, eager_a2 = model(
+                video=video_mod2,
+                audio=audio_mod2,
+                text_cache=text_cache,
+                attn_metadata=_sites(model, video_mod2, audio_mod2, text_cache),
+            )
         eager_v2 = eager_v2.clone()
         eager_a2 = eager_a2.clone()
 
@@ -868,7 +905,12 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         torch.manual_seed(200)
         video_mod2, audio_mod2 = _make_modalities(0.3)
         with torch.no_grad():
-            graph_v2, graph_a2 = model(video=video_mod2, audio=audio_mod2, text_cache=text_cache)
+            graph_v2, graph_a2 = model(
+                video=video_mod2,
+                audio=audio_mod2,
+                text_cache=text_cache,
+                attn_metadata=_sites(model, video_mod2, audio_mod2, text_cache),
+            )
 
         self.assertTrue(
             torch.equal(eager_v2, graph_v2),
@@ -953,11 +995,21 @@ class TestLTX2TextCache(unittest.TestCase):
             # -- Part 1: deterministic — same inputs + same cache → same output --
             torch.manual_seed(200)
             v_mod, a_mod = make_mods(0.5, v_ctx_A, a_ctx_A)
-            v_out1, a_out1 = model(video=v_mod, audio=a_mod, text_cache=static_A)
+            v_out1, a_out1 = model(
+                video=v_mod,
+                audio=a_mod,
+                text_cache=static_A,
+                attn_metadata=_sites(model, v_mod, a_mod, static_A),
+            )
 
             torch.manual_seed(200)
             v_mod, a_mod = make_mods(0.5, v_ctx_A, a_ctx_A)
-            v_out2, a_out2 = model(video=v_mod, audio=a_mod, text_cache=static_A)
+            v_out2, a_out2 = model(
+                video=v_mod,
+                audio=a_mod,
+                text_cache=static_A,
+                attn_metadata=_sites(model, v_mod, a_mod, static_A),
+            )
 
         self.assertTrue(
             torch.equal(v_out1, v_out2),
@@ -979,7 +1031,12 @@ class TestLTX2TextCache(unittest.TestCase):
                 audio_positions=a_pos,
                 dtype=dtype,
             )
-            v_B, _ = model(video=v_mod_B, audio=a_mod_B, text_cache=static_B)
+            v_B, _ = model(
+                video=v_mod_B,
+                audio=a_mod_B,
+                text_cache=static_B,
+                attn_metadata=_sites(model, v_mod_B, a_mod_B, static_B),
+            )
 
         self.assertFalse(torch.equal(v_out1, v_B), "Different context must differ")
 
@@ -987,11 +1044,21 @@ class TestLTX2TextCache(unittest.TestCase):
             # -- Part 3: reuse static across steps --
             torch.manual_seed(300)
             v_mod1, a_mod1 = make_mods(0.8, v_ctx_A, a_ctx_A)
-            v_step1, _ = model(video=v_mod1, audio=a_mod1, text_cache=static_A)
+            v_step1, _ = model(
+                video=v_mod1,
+                audio=a_mod1,
+                text_cache=static_A,
+                attn_metadata=_sites(model, v_mod1, a_mod1, static_A),
+            )
 
             torch.manual_seed(400)
             v_mod2, a_mod2 = make_mods(0.5, v_ctx_A, a_ctx_A)
-            v_step2, _ = model(video=v_mod2, audio=a_mod2, text_cache=static_A)
+            v_step2, _ = model(
+                video=v_mod2,
+                audio=a_mod2,
+                text_cache=static_A,
+                attn_metadata=_sites(model, v_mod2, a_mod2, static_A),
+            )
 
         # Different timestep/latent → different output
         self.assertFalse(torch.equal(v_step1, v_step2), "Steps should differ")
@@ -1069,7 +1136,12 @@ class TestLTX2CacheDiTWrapperPassthrough(unittest.TestCase):
         # Baseline: direct path (no wrappers)
         with torch.no_grad():
             v_mod, a_mod = make_mods()
-            v_direct, a_direct = model(video=v_mod, audio=a_mod, text_cache=static)
+            v_direct, a_direct = model(
+                video=v_mod,
+                audio=a_mod,
+                text_cache=static,
+                attn_metadata=_sites(model, v_mod, a_mod, static),
+            )
         v_direct = v_direct.clone()
         a_direct = a_direct.clone()
 
@@ -1083,7 +1155,12 @@ class TestLTX2CacheDiTWrapperPassthrough(unittest.TestCase):
         try:
             with torch.no_grad():
                 v_mod, a_mod = make_mods()
-                v_wrap, a_wrap = model(video=v_mod, audio=a_mod, text_cache=static)
+                v_wrap, a_wrap = model(
+                    video=v_mod,
+                    audio=a_mod,
+                    text_cache=static,
+                    attn_metadata=_sites(model, v_mod, a_mod, static),
+                )
         finally:
             model.transformer_blocks = nn.ModuleList(original_blocks)
             del model._uses_cache_dit

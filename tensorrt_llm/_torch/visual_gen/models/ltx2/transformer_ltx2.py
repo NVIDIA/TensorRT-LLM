@@ -21,7 +21,7 @@ import fnmatch
 import os
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as torch_dist
@@ -29,11 +29,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
+from tensorrt_llm._torch.visual_gen.attention_backend.metadata import make_diffusion_attn_metadata
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
     UlyssesAttention,
+    get_ulysses_seq_lens,
     wrap_parallel_attention,
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
@@ -76,6 +79,31 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # LTX2Attention: TRT-LLM Linear + RMSNorm + attention backend + LTX-2 RoPE
 # ---------------------------------------------------------------------------
+
+
+def _ltx2_enable_sp(
+    vgm,
+    *,
+    enable_sequence_parallel: bool,
+    is_cross_attn: bool,
+) -> bool:
+    """Whether an LTX-2 attention site is wrapped for sequence parallelism.
+
+    ``vgm`` is the model's :class:`VisualGenMapping`, or ``None``.
+
+    Cross-attn supports Ulysses, and distributed Attention2D only WITH Ulysses
+    on top (the AV dispatch keys the seq-sharded K/V path off the Ulysses
+    wrapper); under ring CP or attn2d-without-ulysses we disable wrappers and
+    fall back to the plain backend + all-gather in the AV cross-attn forward
+    path. Read by ``LTX2Attention.__init__`` when it wraps, and by
+    ``BasicAVTransformerBlock.create_attn_metadata`` when it sizes the sites.
+    """
+    if not is_cross_attn:
+        return enable_sequence_parallel
+    ulysses_size = vgm.ulysses_size if vgm is not None else 1
+    cp_size = vgm.cp_size if vgm is not None else 1
+    attn2d_active = vgm is not None and vgm.attn2d_row_size * vgm.attn2d_col_size > 1
+    return enable_sequence_parallel and (cp_size == 1 or (attn2d_active and ulysses_size > 1))
 
 
 class LTX2Attention(Attention):
@@ -134,20 +162,12 @@ class LTX2Attention(Attention):
         else:
             qkv_mode = QKVMode.FUSE_QKV
 
-        # Caller opts in via enable_sequence_parallel. Cross-attn supports
-        # Ulysses, and distributed Attention2D only WITH Ulysses on top (the AV
-        # dispatch keys the seq-sharded K/V path off the Ulysses wrapper); under
-        # ring CP or attn2d-without-ulysses we disable wrappers and fall back to
-        # the plain backend + all-gather in the AV cross-attn forward path.
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
-        cp_size = vgm.cp_size if vgm is not None else 1
-        attn2d_active = vgm is not None and vgm.attn2d_row_size * vgm.attn2d_col_size > 1
-        if self._is_cross_attn:
-            enable_sp = enable_sequence_parallel and (
-                cp_size == 1 or (attn2d_active and ulysses_size > 1)
-            )
-        else:
-            enable_sp = enable_sequence_parallel
+        enable_sp = _ltx2_enable_sp(
+            vgm,
+            enable_sequence_parallel=enable_sequence_parallel,
+            is_cross_attn=self._is_cross_attn,
+        )
 
         # Map LTX RoPE type to the fused-kernel INTERLEAVE template parameter:
         #   INTERLEAVED → pair (2i, 2i+1) pattern   → kernel INTERLEAVE=true
@@ -169,6 +189,7 @@ class LTX2Attention(Attention):
             module_name=module_name,
             enable_sequence_parallel=enable_sp,
             async_ulysses=self._use_async_ulysses,
+            is_cross=self._is_cross_attn,
         )
 
         # Validate Ulysses head divisibility (from main).
@@ -218,7 +239,6 @@ class LTX2Attention(Attention):
                 quant_config=self.quant_config,
                 dtype=self.dtype,
                 attention_config=config.attention,
-                attention_metadata_state=config.attention_metadata_state,
                 sparse_params=self.sparse_params,
             )
             self._attn_stage2 = wrap_parallel_attention(
@@ -328,6 +348,7 @@ class LTX2Attention(Attention):
     def forward(
         self,
         x: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         context: torch.Tensor | None = None,
         pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -374,7 +395,7 @@ class LTX2Attention(Attention):
             and pre_projected_kv is None
             and hasattr(self.attn, "forward_async")
         ):
-            return self.forward_async(x, freqs=pe, timestep=timestep)
+            return self.forward_async(x, attn_metadata, freqs=pe, timestep=timestep)
 
         # Fused gate: prod uses fused kernels (head_dim ∈ {64, 128}); mini-config
         # tests (head_dim=32) fall to naive ops.
@@ -448,7 +469,7 @@ class LTX2Attention(Attention):
         attn_kwargs = {}
         if key_padding_mask is not None:
             attn_kwargs["key_padding_mask"] = key_padding_mask
-        out = self._attn_impl(q, k, v, timestep=timestep, **attn_kwargs)
+        out = self._attn_impl(q, k, v, attn_metadata, timestep=timestep, **attn_kwargs)
 
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
@@ -463,6 +484,7 @@ class LTX2Attention(Attention):
     def forward_async(
         self,
         q_input: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         freqs: tuple[torch.Tensor, torch.Tensor] | None = None,
         kv_input: torch.Tensor | None = None,
         kv_freqs: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -553,7 +575,12 @@ class LTX2Attention(Attention):
 
         issue_order = ("v", "q", "k") if self_attn else ("q", "k", "v")
         out_4d = self.attn.forward_async(
-            compute_q, compute_k, compute_v, issue_order=issue_order, timestep=timestep
+            compute_q,
+            compute_k,
+            compute_v,
+            issue_order=issue_order,
+            attn_metadata=attn_metadata,
+            timestep=timestep,
         )
 
         # LTX-2 gated-attention scaling in 4D before to_out (gate on the Q input).
@@ -640,6 +667,7 @@ class BasicAVTransformerBlock(nn.Module):
         # can run cross-attention all-gathers independently.  Head-divisibility
         # is checked once at the root model — skip num_heads here.
         vgm = config.visual_gen_mapping if config is not None else None
+        self._vgm = vgm
         self._sharder = SequenceSharder.from_vgm(vgm)
         self._sharder_s2 = stage2_sharder if stage2_sharder is not None else self._sharder
         self._active_sharder = self._sharder
@@ -920,10 +948,123 @@ class BasicAVTransformerBlock(nn.Module):
 
     # -- Forward -------------------------------------------------------------
 
+    def create_attn_metadata(
+        self,
+        metadata_cls,
+        *,
+        batch_size: int,
+        video_seq: int,
+        audio_seq_full: int,
+        text_kv_video_len: int = 0,
+        text_kv_audio_len: int = 0,
+        ulysses_size: Optional[int] = None,
+    ) -> Dict[str, AttentionMetadata]:
+        """Attention metadata for this block's six sites.
+
+        Lives on the block because every predicate it needs -- the audio shard
+        mode, the active sharder, and the per-site sequence-parallel flags --
+        is block state, and because it has to stay in step with ``forward``
+        right below. ``LTXModel.create_attn_metadata`` calls this on block 0;
+        blocks are homogeneous.
+
+        Each site is sized for what the kernel sees: the lengths below are the
+        ones the attention modules are called with, mapped through
+        :func:`get_ulysses_seq_lens` with the same flags the module was
+        built with, so the wrappers never have to rewrite the metadata.
+
+        Args:
+            metadata_cls: Concrete metadata type for the active backend.
+            video_seq: Video tokens this rank holds (already sharded).
+            audio_seq_full: Audio tokens across all ranks, including the
+                Ulysses padding ``configure_audio_ulysses`` appended.
+            ulysses_size: Active Ulysses degree, when the active stack was
+                wrapped with an explicit group (stage 2) rather than the
+                mapping's. ``None`` uses the mapping's.
+        """
+        size = self._active_sharder.size if self._active_sharder.is_active else 1
+        mode = self._audio_shard_mode
+        # FULL shards the audio sequence too; CONDITIONAL and NONE keep it whole.
+        audio_seq = audio_seq_full // size if mode == AudioShardMode.FULL else audio_seq_full
+
+        vgm = self._vgm
+
+        def site(q_seq_lens, kv_seq_lens=None, *, enable_sequence_parallel, is_cross_attn):
+            q, kv = get_ulysses_seq_lens(
+                q_seq_lens,
+                q_seq_lens if kv_seq_lens is None else kv_seq_lens,
+                visual_gen_mapping=vgm,
+                enable_sequence_parallel=_ltx2_enable_sp(
+                    vgm,
+                    enable_sequence_parallel=enable_sequence_parallel,
+                    is_cross_attn=is_cross_attn,
+                ),
+                ulysses_size=ulysses_size,
+            )
+            return make_diffusion_attn_metadata(
+                metadata_cls,
+                batch_size=batch_size,
+                q_seq_lens=q,
+                kv_seq_lens=None if kv == q and kv_seq_lens is None else kv,
+            )
+
+        sites: Dict[str, AttentionMetadata] = {}
+        if video_seq:
+            # attn1: enable_sequence_parallel=True.
+            sites["video_self"] = site(
+                video_seq, enable_sequence_parallel=True, is_cross_attn=False
+            )
+            if text_kv_video_len:
+                # attn2: enable_sequence_parallel=False.
+                sites["video_text_cross"] = site(
+                    video_seq,
+                    text_kv_video_len,
+                    enable_sequence_parallel=False,
+                    is_cross_attn=True,
+                )
+        if audio_seq:
+            # audio_attn1: enable_sequence_parallel = not CONDITIONAL, i.e. FULL.
+            sites["audio_self"] = site(
+                audio_seq,
+                enable_sequence_parallel=(mode == AudioShardMode.FULL),
+                is_cross_attn=False,
+            )
+            if text_kv_audio_len:
+                # audio_attn2: enable_sequence_parallel=False.
+                sites["audio_text_cross"] = site(
+                    audio_seq,
+                    text_kv_audio_len,
+                    enable_sequence_parallel=False,
+                    is_cross_attn=True,
+                )
+
+        if video_seq and audio_seq:
+            # a2v: video queries against audio K/V, which is all-gathered
+            # under FULL, so the KV length is the full audio length either way.
+            # audio_to_video_attn: enable_sequence_parallel=False.
+            sites["audio_to_video"] = site(
+                video_seq,
+                audio_seq_full,
+                enable_sequence_parallel=False,
+                is_cross_attn=True,
+            )
+            # v2a: CONDITIONAL slices audio to this rank here, and the video
+            # K/V is all-gathered when no Ulysses wrapper does it.
+            v2a_q = audio_seq_full // size if mode == AudioShardMode.CONDITIONAL else audio_seq
+            v2a_kv = video_seq
+            v2a_sp = _ltx2_enable_sp(vgm, enable_sequence_parallel=True, is_cross_attn=True)
+            if not v2a_sp and self._active_sharder.is_active:
+                v2a_kv = video_seq * size
+            # video_to_audio_attn: enable_sequence_parallel=True.
+            sites["video_to_audio"] = site(
+                v2a_q, v2a_kv, enable_sequence_parallel=True, is_cross_attn=True
+            )
+        return sites
+
     def forward(
         self,
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
+        attn_metadata: Dict[str, AttentionMetadata],
         perturbations=None,
         text_kv_video: tuple[torch.Tensor, torch.Tensor] | None = None,
         text_kv_audio: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -931,9 +1072,17 @@ class BasicAVTransformerBlock(nn.Module):
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward with optional perturbation masking for STG.
 
+        LTX-2 is a mixed-stream block with six attention sites -- video and audio
+        self-attention, video/audio text cross-attention, and bidirectional
+        audio<->video cross-attention -- each with its own Q/KV lengths. Rather
+        than one shared metadata object thrashing between them, each site pulls
+        its own metadata out of ``attn_metadata`` by site name.
+
         Args:
             perturbations: Optional ``BatchedPerturbationConfig`` that masks
                 attention outputs for selected blocks/modalities.
+            attn_metadata: One prepared metadata object per attention site,
+                keyed by the names :meth:`create_attn_metadata` returns.
             text_kv_video: Pre-projected (K, V) for video text cross-attention.
                 Required when the video stream runs cross-attn — built by
                 ``LTXModel.prepare_text_cache``.
@@ -992,7 +1141,10 @@ class BasicAVTransformerBlock(nn.Module):
                     fp4_input_scale=get_nvfp4_self_attn_input_scale(self.attn1),
                 )
                 v_attn_raw = self.attn1(
-                    norm_vx, pe=video.positional_embeddings, timestep=video.timesteps
+                    norm_vx,
+                    attn_metadata["video_self"],
+                    pe=video.positional_embeddings,
+                    timestep=video.timesteps,
                 )
                 if has_perturbations and perturbations.any_in_batch(
                     PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
@@ -1016,6 +1168,7 @@ class BasicAVTransformerBlock(nn.Module):
                 attn2_q_input = rms_norm(vx, eps=self.norm_eps)
             text_v_attn_raw = self.attn2(
                 attn2_q_input,
+                attn_metadata["video_text_cross"],
                 context=video.context,
                 pre_projected_kv=text_kv_video,
                 timestep=video.timesteps,
@@ -1047,6 +1200,7 @@ class BasicAVTransformerBlock(nn.Module):
                 )
                 a_attn_raw = self.audio_attn1(
                     norm_ax,
+                    attn_metadata["audio_self"],
                     pe=audio.positional_embeddings,
                     key_padding_mask=audio.audio_padding_mask,
                     timestep=audio.timesteps,
@@ -1072,6 +1226,7 @@ class BasicAVTransformerBlock(nn.Module):
                 audio_attn2_q_input = rms_norm(ax, eps=self.norm_eps)
             text_a_attn_raw = self.audio_attn2(
                 audio_attn2_q_input,
+                attn_metadata["audio_text_cross"],
                 context=audio.context,
                 pre_projected_kv=text_kv_audio,
                 timestep=audio.timesteps,
@@ -1230,6 +1385,7 @@ class BasicAVTransformerBlock(nn.Module):
 
                 a2v_attn_raw = self.audio_to_video_attn(
                     vx_scaled_a2v,
+                    attn_metadata["audio_to_video"],
                     pre_projected_kv=(k_a2v, v_a2v),
                     pe=video.cross_positional_embeddings,
                     key_padding_mask=audio.audio_padding_mask,
@@ -1264,6 +1420,7 @@ class BasicAVTransformerBlock(nn.Module):
                     if self._async_ulysses and self.video_to_audio_attn.is_ulysses:
                         out_local = self.video_to_audio_attn.forward_async(
                             q_input=ax_v2a_local,
+                            attn_metadata=attn_metadata["video_to_audio"],
                             freqs=a_cross_pe,
                             kv_input=vx_scaled_v2a,
                             kv_freqs=video.cross_positional_embeddings,
@@ -1284,6 +1441,7 @@ class BasicAVTransformerBlock(nn.Module):
                             v_v2a = self._sp_all_gather(v_v2a)
                         out_local = self.video_to_audio_attn(
                             ax_v2a_local,
+                            attn_metadata["video_to_audio"],
                             pre_projected_kv=(k_v2a, v_v2a),
                             pe=a_cross_pe,
                             timestep=audio.timesteps,
@@ -1296,6 +1454,7 @@ class BasicAVTransformerBlock(nn.Module):
                     # padded audio Q stripped on exit by LTXModel.forward).
                     v2a_attn_raw = self.video_to_audio_attn.forward_async(
                         q_input=ax_scaled_v2a,
+                        attn_metadata=attn_metadata["video_to_audio"],
                         freqs=audio.cross_positional_embeddings,
                         kv_input=vx_scaled_v2a,
                         kv_freqs=video.cross_positional_embeddings,
@@ -1318,6 +1477,7 @@ class BasicAVTransformerBlock(nn.Module):
 
                     v2a_attn_raw = self.video_to_audio_attn(
                         ax_scaled_v2a,
+                        attn_metadata["video_to_audio"],
                         pre_projected_kv=(k_v2a, v_v2a),
                         pe=audio.cross_positional_embeddings,
                         timestep=audio.timesteps,
@@ -2216,6 +2376,64 @@ class LTXModel(BaseDiffusionModel):
             audio_kv=a_kv,
         )
 
+    def create_attn_metadata(
+        self,
+        *,
+        batch_size: int,
+        video_seq_len: int = 0,
+        audio_seq_len: int = 0,
+        text_cache: TextCache,
+    ) -> Dict[str, AttentionMetadata]:
+        """Attention metadata for this model's sites, one object per site.
+
+        Takes plain lengths rather than the ``Modality`` bundles ``forward``
+        receives, so a pipeline can build this once before its denoise loop --
+        the per-step bundles carry per-step timesteps, but the lengths are fixed.
+        Building it outside the loop is also what keeps it out of the
+        CUDA-graph-captured region, where ``prepare()``'s pinned-memory staging
+        would raise.
+
+        Mirrors the length arithmetic ``forward`` performs: audio is padded to a
+        multiple of the Ulysses size, then video (always) and audio (under
+        ``AudioShardMode.FULL``) are sequence-sharded. Per-site derivation lives
+        on the block, next to the code that consumes it.
+
+        Sites for a modality that a given pass does not run are harmless: the
+        block only looks up the ones its active path needs, and the graph key
+        already separates passes by modality presence.
+
+        Args:
+            batch_size: Sequences per forward.
+            video_seq_len: Unsharded video tokens, or 0 for audio-only models.
+            audio_seq_len: Unsharded, unpadded audio tokens, or 0 when absent.
+        """
+        size = self._active_sharder.size if self._active_sharder.is_active else 1
+
+        video_seq = video_seq_len // size
+        audio_seq_full = audio_seq_len + self._audio_pad if audio_seq_len else 0
+
+        def _kv_len(per_block_kv):
+            # text_cache.{video,audio}_kv is a per-block list of (K, V).
+            if not per_block_kv:
+                return 0
+            return per_block_kv[0][0].shape[1]
+
+        # The stage-2 stack is wrapped with its own Ulysses group, whose degree
+        # is unrelated to the mapping's; the blocks size their sites from it.
+        ulysses_size = None
+        if self._active_topology == "stage2" and self._stage2_groups is not None:
+            ulysses_size = torch_dist.get_world_size(group=self._stage2_groups.ulysses_group)
+
+        return self.transformer_blocks[0].create_attn_metadata(
+            self.attn_backend_metadata_cls,
+            batch_size=batch_size,
+            video_seq=video_seq,
+            audio_seq_full=audio_seq_full,
+            text_kv_video_len=_kv_len(text_cache.video_kv),
+            text_kv_audio_len=_kv_len(text_cache.audio_kv),
+            ulysses_size=ulysses_size,
+        )
+
     def forward(
         self,
         video: Modality | None,
@@ -2223,6 +2441,7 @@ class LTXModel(BaseDiffusionModel):
         perturbations=None,
         *,
         text_cache: TextCache,
+        attn_metadata: Dict[str, AttentionMetadata],
         timestep: torch.Tensor | None = None,
         step_index=None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -2232,6 +2451,10 @@ class LTXModel(BaseDiffusionModel):
             video: Video modality input (or None).
             audio: Audio modality input (or None).
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
+            attn_metadata: One prepared metadata object per attention site.
+                LTX-2 has six sites with distinct Q/KV lengths; each block looks
+                up the one it needs by name. Built by the pipeline from
+                :meth:`create_attn_metadata`.
             text_cache: Pre-computed step-invariant outputs from ``prepare_text_cache()``.
                 Always required — callers must invoke ``prepare_text_cache()`` first.
             timestep: Normalized denoising-time coordinate in ``[0, 1]``.
@@ -2332,6 +2555,7 @@ class LTXModel(BaseDiffusionModel):
                     vx,
                     ax,
                     perturbations=perturbations,
+                    attn_metadata=attn_metadata,
                     step_index=step_index,
                 )
                 if video_args is not None and vx is not None:
@@ -2346,6 +2570,7 @@ class LTXModel(BaseDiffusionModel):
                     perturbations=perturbations,
                     text_kv_video=v_kv[i] if v_kv else None,
                     text_kv_audio=a_kv[i] if a_kv else None,
+                    attn_metadata=attn_metadata,
                     step_index=step_index,
                 )
 

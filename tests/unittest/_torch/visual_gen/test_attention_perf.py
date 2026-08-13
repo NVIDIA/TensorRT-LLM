@@ -35,6 +35,7 @@ from typing import Dict, Optional, Tuple
 
 import pytest
 import torch
+from attn_metadata_utils import make_attn_metadata
 
 from tensorrt_llm._torch.visual_gen.attention_backend import (
     VSAMetadataBuilder,
@@ -49,10 +50,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
     _flash_attn_fwd_import_error as _fa4_import_error,
 )
-from tensorrt_llm._torch.visual_gen.config import (
-    DiffusionModelConfig,
-    create_attention_metadata_state,
-)
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
@@ -212,9 +210,6 @@ def create_model_config(
         ),
         skip_create_weights_in_init=False,
     )
-    config.attention_metadata_state = (
-        create_attention_metadata_state() if attn_backend == "TRTLLM" else None
-    )
     return config
 
 
@@ -361,9 +356,9 @@ class WanAttentionPerformanceBenchmark:
             attn_backend=backend,
             quant_attention_config=quant_attention_config,
         )
-        model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=config).to(
-            self.device
-        )
+        model = Attention(
+            hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, is_cross=True, config=config
+        ).to(self.device)
         model.eval()
         return model
 
@@ -427,7 +422,13 @@ class WanAttentionPerformanceBenchmark:
             # Warmup
             with torch.no_grad():
                 for _ in range(self.warmup_iterations):
-                    _ = model(hidden_states, encoder_hidden_states=encoder_hidden_states)
+                    _ = model(
+                        hidden_states,
+                        make_attn_metadata(
+                            model.attn_backend, hidden_states, encoder_hidden_states
+                        ),
+                        encoder_hidden_states=encoder_hidden_states,
+                    )
 
             if self.device.type == "cuda":
                 torch.cuda.synchronize()
@@ -437,7 +438,13 @@ class WanAttentionPerformanceBenchmark:
             with torch.no_grad():
                 for i in range(self.benchmark_iterations):
                     with cuda_timer(self.device) as get_time:
-                        _ = model(hidden_states, encoder_hidden_states=encoder_hidden_states)
+                        _ = model(
+                            hidden_states,
+                            make_attn_metadata(
+                                model.attn_backend, hidden_states, encoder_hidden_states
+                            ),
+                            encoder_hidden_states=encoder_hidden_states,
+                        )
                     times.append(get_time())
 
             times_tensor = torch.tensor(times)
@@ -545,7 +552,12 @@ class WanAttentionPerformanceBenchmark:
                 )
                 kwargs = {"gate_compress": gate_compress} if gate_compress is not None else {}
                 with ctx:
-                    return model(hidden_states, freqs=freqs, **kwargs)
+                    return model(
+                        hidden_states,
+                        make_attn_metadata(model.attn_backend, hidden_states),
+                        freqs=freqs,
+                        **kwargs,
+                    )
 
             # Warmup
             with nvtx_range(f"warmup_{backend}"):
@@ -742,7 +754,11 @@ class WanAttentionPerformanceBenchmark:
 
                 # Warmup
                 with torch.no_grad():
-                    _ = model(hidden_states, freqs=freqs)
+                    _ = model(
+                        hidden_states,
+                        make_attn_metadata(model.attn_backend, hidden_states),
+                        freqs=freqs,
+                    )
 
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
@@ -750,7 +766,11 @@ class WanAttentionPerformanceBenchmark:
                 # Forward pass
                 with nvtx_range(f"memory_test_{backend}"):
                     with torch.no_grad():
-                        _ = model(hidden_states, freqs=freqs)
+                        _ = model(
+                            hidden_states,
+                            make_attn_metadata(model.attn_backend, hidden_states),
+                            freqs=freqs,
+                        )
 
                 torch.cuda.synchronize()
 

@@ -41,7 +41,9 @@ try:
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _visual_gen_dist_utils import spawn_with_retry
+    from attn_metadata_utils import cosmos3_attn_metadata_kwargs
 
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -424,6 +426,7 @@ def _forward(
     with torch.inference_mode():
         return model(
             hidden_states=hs,
+            **cosmos3_attn_metadata_kwargs(model, hs, text_mask, video_shape),
             timestep=ts / _NUM_TRAIN_TIMESTEPS,
             raw_timestep=ts,
             text_ids=text_ids,
@@ -451,6 +454,7 @@ def _forward_with_audio(
     with torch.inference_mode():
         out = model(
             hidden_states=hs,
+            **cosmos3_attn_metadata_kwargs(model, hs, text_mask, video_shape, audio_latents),
             timestep=ts / _NUM_TRAIN_TIMESTEPS,
             raw_timestep=ts,
             text_ids=text_ids,

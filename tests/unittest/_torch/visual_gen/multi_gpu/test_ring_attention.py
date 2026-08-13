@@ -56,7 +56,9 @@ try:
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _visual_gen_dist_utils import spawn_with_retry
+    from attn_metadata_utils import make_backend_attn_metadata
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -212,7 +214,7 @@ def _logic_ring_forward(rank, world_size):
     k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
 
-    output = attn(q, k, v, batch_size=batch)
+    output = attn(q, k, v, attn_metadata=make_backend_attn_metadata(attn, q, k), batch_size=batch)
     assert output.shape == q.shape, f"Rank {rank}: expected {q.shape}, got {output.shape}"
     assert torch.isfinite(output).all(), f"Rank {rank}: non-finite output"
 
@@ -239,7 +241,13 @@ def _logic_ring_vs_standard(rank, world_size):
 
     inner = _LSEVanillaAttention(num_heads=num_heads, head_dim=head_dim)
     attn = RingAttention(inner, ring_pg)
-    ring_out = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    ring_out = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     scale = 1.0 / math.sqrt(head_dim)
     q_std = q_full.transpose(1, 2).float()
@@ -271,7 +279,14 @@ def _logic_ring_invalid_mask(rank, world_size):
     v = torch.randn(2, 8, 8, 64, device=device)
 
     with pytest.raises(NotImplementedError, match="only supports FULL attention mask"):
-        attn(q, k, v, batch_size=2, attention_mask=PredefinedAttentionMask.CAUSAL)
+        attn(
+            q,
+            k,
+            v,
+            attn_metadata=make_backend_attn_metadata(attn, q, k),
+            batch_size=2,
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+        )
 
 
 def _logic_ring_fa4_vs_standard(rank, world_size):
@@ -300,7 +315,13 @@ def _logic_ring_fa4_vs_standard(rank, world_size):
     k_shard = k_full[:, lo:hi].contiguous()
     v_shard = v_full[:, lo:hi].contiguous()
 
-    ring_out = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    ring_out = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     scale = 1.0 / math.sqrt(head_dim)
     ref = (
@@ -346,7 +367,7 @@ def _logic_ring_ulysses_forward(rank, world_size):
     k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
     v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
 
-    output = attn(q, k, v, batch_size=batch)
+    output = attn(q, k, v, attn_metadata=make_backend_attn_metadata(attn, q, k), batch_size=batch)
     assert output.shape == q.shape, f"Rank {rank}: expected {q.shape}, got {output.shape}"
     assert torch.isfinite(output).all(), f"Rank {rank}: non-finite output"
 
@@ -375,7 +396,13 @@ def _logic_ring_ulysses_vs_standard(rank, world_size):
 
     inner = _LSEVanillaAttention(num_heads=num_heads // ulysses_size, head_dim=head_dim)
     attn = UlyssesAttention(RingAttention(inner, ring_pg), uly_pg)
-    combo_out = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    combo_out = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     scale = 1.0 / math.sqrt(head_dim)
     ref = (
@@ -425,7 +452,13 @@ def _logic_ring_ulysses_fa4_vs_standard(rank, world_size):
     k_shard = k_full[:, lo:hi].contiguous()
     v_shard = v_full[:, lo:hi].contiguous()
 
-    combo_out = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    combo_out = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     scale = 1.0 / math.sqrt(head_dim)
     ref = (

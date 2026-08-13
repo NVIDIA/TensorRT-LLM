@@ -13,6 +13,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Import new integrated versions
+from attn_metadata_utils import make_attn_metadata
+
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
 # ============================================================================
@@ -27,13 +30,8 @@ from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
-from tensorrt_llm._torch.visual_gen.config import (
-    DiffusionModelConfig,
-    create_attention_metadata_state,
-)
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-# Import new integrated versions
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
@@ -158,9 +156,6 @@ def create_model_config(
         ),
         skip_create_weights_in_init=skip_create_weights_in_init,
     )
-    config.attention_metadata_state = (
-        create_attention_metadata_state() if attn_backend == "TRTLLM" else None
-    )
     if visual_gen_mapping is not None:
         config.visual_gen_mapping = visual_gen_mapping
     return config
@@ -194,6 +189,7 @@ def _make_cross_attention_with_mapping(
         skip_create_weights_in_init=True,
     )
     return Attention(
+        is_cross=True,
         hidden_size=hidden_size,
         num_attention_heads=num_heads,
         head_dim=head_dim,
@@ -277,11 +273,11 @@ def generate_rope_embeddings(
 
 
 @pytest.mark.cpu_only
-class TestSeparateQkvSequenceParallelGuard:
-    def test_ring_with_separate_qkv_raises(self):
+class TestCrossAttentionSequenceParallelGuard:
+    def test_ring_with_cross_attention_raises(self):
         vgm = VisualGenMapping(world_size=2, rank=0, ring_size=2)
 
-        with pytest.raises(ValueError, match="SEPARATE_QKV cross-attention does not support"):
+        with pytest.raises(ValueError, match="Cross-attention does not support Ring"):
             _make_cross_attention_with_mapping(vgm, enable_sequence_parallel=True)
 
     def test_ring_with_sequence_parallel_disabled_allowed(self):
@@ -300,11 +296,20 @@ class TestSeparateQkvSequenceParallelGuard:
         assert isinstance(attn.attn, VanillaAttention)
 
 
-def _build_sage_routed_attention(qkv_mode: QKVMode):
-    """Build a TRTLLM-SAGE-configured Attention for backend-routing checks."""
-    quant_cfg = QuantAttentionConfig(
-        qk_dtype="int8", q_block_size=1, k_block_size=16, v_block_size=1
-    )
+_SAGE_DEFAULT = object()
+
+
+def _build_sage_routed_attention(
+    qkv_mode: QKVMode,
+    *,
+    quant_cfg: "QuantAttentionConfig | None" = _SAGE_DEFAULT,
+    is_cross: bool = False,
+):
+    """Build a TRTLLM-configured Attention for backend-routing checks."""
+    if quant_cfg is _SAGE_DEFAULT:
+        quant_cfg = QuantAttentionConfig(
+            qk_dtype="int8", q_block_size=1, k_block_size=16, v_block_size=1
+        )
     config = create_model_config(
         hidden_size=512,
         num_heads=4,
@@ -319,6 +324,7 @@ def _build_sage_routed_attention(qkv_mode: QKVMode):
         head_dim=128,
         qkv_mode=qkv_mode,
         config=config,
+        is_cross=is_cross,
     )
     return attn, quant_cfg
 
@@ -331,10 +337,25 @@ class TestSageAttentionBackendRouting:
         assert attn.attn.quant_attention_config == quant_cfg
         assert not attn.attn.support_fused_qkv()
 
-    def test_cross_attention_with_sage_config_falls_back_to_vanilla(self):
-        attn, _ = _build_sage_routed_attention(QKVMode.SEPARATE_QKV)
+    def test_cross_attention_uses_trtllm_sage_backend(self):
+        # Sage's separate-Q/K/V layout is the one TRTLLM path serving a cross site.
+        attn, quant_cfg = _build_sage_routed_attention(QKVMode.SEPARATE_QKV, is_cross=True)
+        assert attn.attn_backend == "TRTLLM"
+        assert isinstance(attn.attn, TrtllmAttention)
+        assert attn.attn.quant_attention_config == quant_cfg
+
+    def test_cross_attention_without_sage_falls_back_to_vanilla(self):
+        # Plain TRTLLM expects packed QKV, which unequal Q/KV lengths rule out.
+        attn, _ = _build_sage_routed_attention(QKVMode.SEPARATE_QKV, quant_cfg=None, is_cross=True)
         assert attn.attn_backend == "VANILLA"
         assert isinstance(attn.attn, VanillaAttention)
+
+    def test_projection_layout_does_not_affect_backend_choice(self):
+        # The backend sees the same three tensors either way, so a SEPARATE_QKV
+        # self-attention site routes exactly like a FUSE_QKV one.
+        fused, _ = _build_sage_routed_attention(QKVMode.FUSE_QKV)
+        separate, _ = _build_sage_routed_attention(QKVMode.SEPARATE_QKV)
+        assert separate.attn_backend == fused.attn_backend == "TRTLLM"
 
 
 # ============================================================================
@@ -404,7 +425,11 @@ def test_self_attention_equivalence(
     # Forward pass
     with torch.no_grad():
         out_naive = naive(hidden_states, freqs_cos_HSD, freqs_sin_HSD)
-        out_integrated = integrated(hidden_states, freqs=(freqs_cos_SHD, freqs_sin_SHD))
+        out_integrated = integrated(
+            hidden_states,
+            make_attn_metadata(integrated.attn_backend, hidden_states),
+            freqs=(freqs_cos_SHD, freqs_sin_SHD),
+        )
 
     # Compare (using looser tolerance for bf16)
     max_diff = (out_naive - out_integrated).abs().max().item()
@@ -499,7 +524,11 @@ def test_sage_attention_self_attention(qk_dtype: str, batch_size: int, seq_len: 
     # Forward pass
     with torch.no_grad():
         out_naive = naive(hidden_states, freqs_cos_HSD, freqs_sin_HSD)
-        out_sage = integrated(hidden_states, freqs=(freqs_cos_SHD, freqs_sin_SHD))
+        out_sage = integrated(
+            hidden_states,
+            make_attn_metadata(integrated.attn_backend, hidden_states),
+            freqs=(freqs_cos_SHD, freqs_sin_SHD),
+        )
 
     # --- Assertions ---
 
@@ -599,7 +628,11 @@ def test_cross_attention_equivalence(
     # Forward pass
     with torch.no_grad():
         out_naive = naive(hidden_states, encoder_hidden_states)
-        out_integrated = integrated(hidden_states, encoder_hidden_states)
+        out_integrated = integrated(
+            hidden_states,
+            make_attn_metadata(integrated.attn_backend, hidden_states, encoder_hidden_states),
+            encoder_hidden_states,
+        )
 
     # Compare (using looser tolerance for bf16)
     max_diff = (out_naive - out_integrated).abs().max().item()
@@ -687,8 +720,16 @@ def test_fast_cross_attention_wan_shapes(
     encoder_hidden_states = torch.randn(batch, seq_len_kv, hidden_size, device=device, dtype=dtype)
 
     with torch.no_grad():
-        out_ref = ref(hidden_states, encoder_hidden_states)
-        out_fast = fast_model(hidden_states, encoder_hidden_states)
+        out_ref = ref(
+            hidden_states,
+            make_attn_metadata(ref.attn_backend, hidden_states, encoder_hidden_states),
+            encoder_hidden_states,
+        )
+        out_fast = fast_model(
+            hidden_states,
+            make_attn_metadata(fast_model.attn_backend, hidden_states, encoder_hidden_states),
+            encoder_hidden_states,
+        )
 
     max_diff = (out_ref - out_fast).abs().max().item()
     tol = 1e-2 if quant_attention_config is None else 2e-2
@@ -765,7 +806,10 @@ def test_vsa_self_attention_equivalence_at_sparsity_zero():
         out_naive = s.naive(s.hidden_states, *s.freqs_HSD)
     with torch.no_grad(), set_vsa_forward_context(s.metadata):
         out_vsa = s.integrated(
-            s.hidden_states, freqs=s.freqs_SHD, gate_compress=s.gate_compress_zero
+            s.hidden_states,
+            make_attn_metadata(s.integrated.attn_backend, s.hidden_states),
+            freqs=s.freqs_SHD,
+            gate_compress=s.gate_compress_zero,
         )
 
     assert out_naive.shape == out_vsa.shape, (
@@ -788,7 +832,12 @@ def test_vsa_self_attention_finite(sparsity: float):
     s = _build_vsa_setup(sparsity=sparsity, batch_size=1, seed=0)
 
     with torch.no_grad(), set_vsa_forward_context(s.metadata):
-        out = s.integrated(s.hidden_states, freqs=s.freqs_SHD, gate_compress=s.gate_compress_zero)
+        out = s.integrated(
+            s.hidden_states,
+            make_attn_metadata(s.integrated.attn_backend, s.hidden_states),
+            freqs=s.freqs_SHD,
+            gate_compress=s.gate_compress_zero,
+        )
 
     assert out.shape == s.hidden_states.shape
     nan_count = torch.isnan(out).sum().item()
@@ -851,7 +900,11 @@ def test_trtllm_cached_prepare():
             )
 
             out_naive = naive(hidden_states, freqs_cos_HSD, freqs_sin_HSD)
-            out_integrated = integrated(hidden_states, freqs=(freqs_cos_SHD, freqs_sin_SHD))
+            out_integrated = integrated(
+                hidden_states,
+                make_attn_metadata(integrated.attn_backend, hidden_states),
+                freqs=(freqs_cos_SHD, freqs_sin_SHD),
+            )
 
             # Check this iteration matches naive
             max_diff = (out_naive - out_integrated).abs().max().item()
@@ -942,7 +995,11 @@ def test_trtllm_varying_seq_len():
             )
 
             out_naive = naive(hidden_states, freqs_cos_HSD, freqs_sin_HSD)
-            out_integrated = integrated(hidden_states, freqs=(freqs_cos_SHD, freqs_sin_SHD))
+            out_integrated = integrated(
+                hidden_states,
+                make_attn_metadata(integrated.attn_backend, hidden_states),
+                freqs=(freqs_cos_SHD, freqs_sin_SHD),
+            )
 
             max_diff = (out_naive - out_integrated).abs().max().item()
             is_close = torch.allclose(out_naive, out_integrated, rtol=1e-2, atol=1e-2)

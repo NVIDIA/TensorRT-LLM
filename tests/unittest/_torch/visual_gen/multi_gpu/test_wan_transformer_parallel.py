@@ -51,6 +51,10 @@ try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _visual_gen_dist_utils import spawn_with_retry
 
+    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import (
+        wan_attn_metadata_kwargs,
+    )
+
     from .tp_shard_utils import copy_tp_parameter
 
     MODULES_AVAILABLE = True
@@ -334,11 +338,21 @@ def _logic_wan_transformer_parallel_vs_single_gpu(
     with torch.no_grad():
         ref_output = ref_model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                ref_model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
         )
         dist_output = dist_model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                dist_model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
         )
@@ -397,6 +411,11 @@ def _logic_wan_transformer_parallel_forward_sanity(
     with torch.no_grad():
         output = model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
         )

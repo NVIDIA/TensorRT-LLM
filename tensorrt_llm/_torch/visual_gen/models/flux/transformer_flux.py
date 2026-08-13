@@ -26,10 +26,13 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection as TextProject
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.visual_gen.attention_backend.metadata import make_diffusion_attn_metadata
+from tensorrt_llm._torch.visual_gen.attention_backend.parallel import get_ulysses_seq_lens
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.models.flux.joint_proj import FluxJointAttnMLPProj
@@ -346,6 +349,7 @@ class FluxTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -355,6 +359,7 @@ class FluxTransformerBlock(nn.Module):
             hidden_states: Image tokens (batch, img_seq, dim)
             encoder_hidden_states: Text tokens (batch, txt_seq, dim)
             temb: Timestep embedding (batch, dim)
+            attn_metadata: Attention metadata site for the joint text+image sequence.
             image_rotary_emb: RoPE (cos, sin) tuple
             joint_attention_kwargs: Additional kwargs for attention
 
@@ -375,6 +380,7 @@ class FluxTransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output, context_attn_output = self.attn(
             hidden_states=norm_hidden_states,
+            attn_metadata=attn_metadata,
             encoder_hidden_states=norm_encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
@@ -500,6 +506,7 @@ class FluxSingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -509,6 +516,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states: Image tokens (batch, img_seq, dim)
             encoder_hidden_states: Text tokens (batch, txt_seq, dim)
             temb: Timestep embedding (batch, dim)
+            attn_metadata: Attention metadata site for the joint text+image sequence.
             image_rotary_emb: RoPE (cos, sin) tuple
             joint_attention_kwargs: Additional kwargs for attention
 
@@ -532,6 +540,7 @@ class FluxSingleTransformerBlock(nn.Module):
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
+            attn_metadata=attn_metadata,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
         )
@@ -767,9 +776,40 @@ class FluxTransformer2DModel(BaseDiffusionModel):
                 if is_excluded and getattr(module, "quant_config", None) is not None:
                     module.quant_config = no_quant_config
 
+    def create_attn_metadata(
+        self,
+        *,
+        batch_size: int,
+        text_seq_len: int,
+        image_seq_len: int,
+    ) -> Dict[str, AttentionMetadata]:
+        """Attention metadata for this model's sites, one object per site.
+
+        FLUX has a single attention site: both the dual-stream and single-stream
+        blocks attend over the concatenated text+image sequence.
+        """
+        # forward() shards each stream before concatenating them, so a block
+        # attends over this rank's share of the joint sequence.
+        size = self.sharder.size
+        local_seq_len = text_seq_len // size + image_seq_len // size
+        q_seq_len, kv_seq_len = get_ulysses_seq_lens(
+            local_seq_len,
+            local_seq_len,
+            visual_gen_mapping=self.model_config.visual_gen_mapping,
+        )
+        return {
+            "self": make_diffusion_attn_metadata(
+                self.attn_backend_metadata_cls,
+                batch_size=batch_size,
+                q_seq_lens=q_seq_len,
+                kv_seq_lens=None if kv_seq_len == q_seq_len else kv_seq_len,
+            )
+        }
+
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         encoder_hidden_states: torch.Tensor = None,
         pooled_projections: torch.Tensor = None,
         timestep: torch.Tensor = None,
@@ -783,6 +823,9 @@ class FluxTransformer2DModel(BaseDiffusionModel):
 
         Args:
             hidden_states: Latent image tokens (batch, seq_len, in_channels)
+            attn_metadata: Attention metadata site covering the joint
+                text+image sequence; built by the pipeline from
+                :meth:`create_attn_metadata`.
             encoder_hidden_states: T5 text embeddings (batch, txt_seq_len, joint_attention_dim)
             pooled_projections: CLIP pooled text embeddings (batch, pooled_projection_dim)
             timestep: Normalized timestep tensor in [0, 1], shape (batch,)
@@ -837,6 +880,7 @@ class FluxTransformer2DModel(BaseDiffusionModel):
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
+                attn_metadata=attn_metadata,
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
@@ -847,6 +891,7 @@ class FluxTransformer2DModel(BaseDiffusionModel):
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
+                attn_metadata=attn_metadata,
                 image_rotary_emb=image_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )

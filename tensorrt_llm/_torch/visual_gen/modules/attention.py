@@ -8,7 +8,7 @@ from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ...utils import Fp4QuantizedTensor
-from ..attention_backend.interface import AttentionTensorLayout
+from ..attention_backend.interface import AttentionMetadata, AttentionTensorLayout
 from ..attention_backend.parallel import wrap_parallel_attention
 from ..attention_backend.utils import create_attention
 from ..config import DiffusionModelConfig
@@ -21,7 +21,7 @@ class QKVMode(str, Enum):
     SEPARATE_QKV = "separate"
 
 
-# TODO: torch compile
+# FIXME: does trtllm offer fused routine for this via torch.ops.trtllm?
 def apply_rotary_emb(
     x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
 ) -> torch.Tensor:
@@ -56,7 +56,7 @@ class Attention(nn.Module):
         module_name: Optional[str] = None,
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
-        separate_qkv_is_self_attention: bool = False,
+        is_cross: bool = False,
     ):
         super().__init__()
 
@@ -96,16 +96,32 @@ class Attention(nn.Module):
         cp_size = vgm.cp_size if vgm else 1
         base_backend = config.attention.backend
         _sa_cfg = config.attention.sparse_attention_config
+        _qa_cfg = config.attention.quant_attention_config
         _is_vsa = (
             base_backend == "CUTEDSL"
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         )
 
-        # Cross-attention fallback: TRTLLM and CUTEDSL VSA are self-attn only.
-        if self.qkv_mode == QKVMode.SEPARATE_QKV and (base_backend == "TRTLLM" or _is_vsa):
+        # Routing depends only on `is_cross`; `qkv_mode` describes the
+        # projection before it and has no bearing here.
+        self.is_cross = is_cross
+
+        is_sage = base_backend == "TRTLLM" and _qa_cfg is not None
+
+        if not is_cross:
+            backend_name = base_backend
+        elif base_backend == "TRTLLM":
+            # Plain TRTLLM needs packed QKV, impossible at unequal lengths;
+            # SageAttention's separate-Q/K/V layout is the one that works.
+            backend_name = base_backend if is_sage else "VANILLA"
+        elif _is_vsa:
+            # VSA sparsifies a 3-D video token grid; a separate K/V stream
+            # has no position in it.
             backend_name = "VANILLA"
         else:
+            # VANILLA, FA4 and the CuTe DSL FMHA kernels take Q and K/V of
+            # different lengths directly.
             backend_name = base_backend
 
         if _is_vsa and cp_size > 1:
@@ -113,6 +129,14 @@ class Attention(nn.Module):
                 f"VSA needs the full token sequence per rank, so it is incompatible "
                 f"with context parallelism (Attention2D/Ring, cp_size={cp_size}). Use "
                 f"ulysses or cfg parallelism instead."
+            )
+        if _is_vsa and async_ulysses and ulysses_size > 1:
+            # VSA's per-token gates arrive as forward kwargs, which
+            # `forward_async`'s fixed argument list cannot carry.
+            raise ValueError(
+                "VSA is incompatible with async Ulysses: the gate tensors VSA "
+                "needs cannot be passed through the async projection path. Set "
+                "async_ulysses=False to use VSA."
             )
         self.attn_backend = backend_name
         self.qk_norm = qk_norm
@@ -140,8 +164,6 @@ class Attention(nn.Module):
             and self.quant_config.layer_quant_mode.has_nvfp4()
             and not self.force_dynamic_quantization
         )
-
-        attention_metadata_state = getattr(config, "attention_metadata_state", None)
 
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
@@ -231,21 +253,17 @@ class Attention(nn.Module):
             quant_config=self.quant_config,
             dtype=self.dtype,
             attention_config=config.attention,
-            attention_metadata_state=attention_metadata_state,
             sparse_params=sparse_params,
         )
 
-        if (
-            enable_sequence_parallel
-            and self.qkv_mode == QKVMode.SEPARATE_QKV
-            and not separate_qkv_is_self_attention
-            and vgm is not None
-        ):
+        if enable_sequence_parallel and is_cross and vgm is not None:
             ring_size = vgm.ring_size
             if ring_size > 1:
+                # Ring chunks the K/V stream across ranks and accumulates over
+                # steps, which assumes every rank holds a slice of one sequence.
                 raise ValueError(
-                    "SEPARATE_QKV cross-attention does not support Ring sequence "
-                    "parallelism; use enable_sequence_parallel=False or Ulysses/Attention2D."
+                    "Cross-attention does not support Ring sequence parallelism; "
+                    "use enable_sequence_parallel=False or Ulysses/Attention2D."
                 )
 
         self.attn = wrap_parallel_attention(
@@ -515,6 +533,7 @@ class Attention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -568,7 +587,7 @@ class Attention(nn.Module):
             if kwargs.get(gate_key) is not None:
                 kwargs[gate_key] = _reshape_gate(kwargs[gate_key])
 
-        out = self.attn.forward(q=q, k=k, v=v, **kwargs)
+        out = self.attn.forward(q=q, k=k, v=v, attn_metadata=attn_metadata, **kwargs)
 
         # Flatten back to [B, S, H*D]
         if backend_layout == AttentionTensorLayout.HND:
@@ -579,6 +598,7 @@ class Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor | Fp4QuantizedTensor,
+        attn_metadata: AttentionMetadata,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
@@ -604,7 +624,7 @@ class Attention(nn.Module):
             freqs_cos, freqs_sin = freqs
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
-            out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
+            out = self._attn_impl(q, k, v, attn_metadata, timestep=timestep, **kwargs)
             return self.to_out[0](out)
 
         # Unfused path: separate QK norm → separate RoPE → attention
@@ -623,13 +643,14 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
+        out = self._attn_impl(q, k, v, attn_metadata, timestep=timestep, **kwargs)
         out = self.to_out[0](out)
         return out
 
     def forward_async(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -728,6 +749,8 @@ class Attention(nn.Module):
         def compute_v():
             return self.to_v(qkv_input).view(B, S, KV, D)
 
-        out_4d = self.attn.forward_async(compute_q, compute_k, compute_v, timestep=timestep)
+        out_4d = self.attn.forward_async(
+            compute_q, compute_k, compute_v, attn_metadata=attn_metadata, timestep=timestep
+        )
         b, t = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(b, t, H * D))

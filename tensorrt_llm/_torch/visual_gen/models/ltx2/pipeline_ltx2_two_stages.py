@@ -1716,6 +1716,15 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             dtype=self.dtype,
         )
 
+        # Loop-invariant, and the stage-2 topology was switched before this
+        # call. No guidance here, so the batch is the working latents'.
+        _s2_attn_metadata = self.transformer.create_attn_metadata(
+            batch_size=v_working.shape[0],
+            video_seq_len=v_working.shape[1],
+            audio_seq_len=a_working.shape[1] if a_working is not None else 0,
+            text_cache=_s2_static,
+        )
+
         # stage2_denoise measures ONLY the step loop (upsample, LoRA bind,
         # and text-cache/scheduler prep stay outside the bracket).
         if timer is not None:
@@ -1726,6 +1735,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # drives the profiler windows itself. Without this a numeric range
         # would capture stage 1 only and the trace would silently omit half
         # the denoising.
+
         for i, _ in self._profile_denoise_steps(range(len(sigmas) - 1)):
             with nvtx_range(f"refinement_step {i}"):
                 sigma = sigmas[i]
@@ -1760,6 +1770,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     video=video_mod,
                     audio=audio_mod,
                     text_cache=_s2_static,
+                    attn_metadata=_s2_attn_metadata,
                     step_index=i,
                 )
 

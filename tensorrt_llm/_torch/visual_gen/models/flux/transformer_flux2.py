@@ -24,9 +24,12 @@ import torch.nn as nn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.visual_gen.attention_backend.metadata import make_diffusion_attn_metadata
+from tensorrt_llm._torch.visual_gen.attention_backend.parallel import get_ulysses_seq_lens
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import (
     Flux2ParallelSelfAttention,
@@ -285,6 +288,7 @@ class Flux2TransformerBlock(nn.Module):
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         img_mod: Tuple[Tuple[torch.Tensor, ...], ...],
         txt_mod: Tuple[Tuple[torch.Tensor, ...], ...],
+        attn_metadata: AttentionMetadata,
         timestep: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -292,6 +296,7 @@ class Flux2TransformerBlock(nn.Module):
             hidden_states: Image features [batch, img_seq, dim]
             encoder_hidden_states: Text features [batch, txt_seq, dim]
             image_rotary_emb: Tuple of (freqs_cos, freqs_sin)
+            attn_metadata: Attention metadata site for the joint sequence.
             img_mod: Image modulation ((shift1, scale1, gate1), (shift2, scale2, gate2))
             txt_mod: Text modulation ((shift1, scale1, gate1), (shift2, scale2, gate2))
 
@@ -316,6 +321,7 @@ class Flux2TransformerBlock(nn.Module):
         # Joint attention
         attn_output, encoder_attn_output = self.attn(
             hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
             encoder_hidden_states=encoder_hidden_states,
             image_rotary_emb=image_rotary_emb,
             timestep=timestep,
@@ -399,6 +405,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         mod: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        attn_metadata: AttentionMetadata,
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -406,6 +413,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             hidden_states: [batch, seq, dim]
             image_rotary_emb: Tuple of (freqs_cos, freqs_sin)
             mod: Modulation (shift, scale, gate)
+            attn_metadata: Attention metadata site for the joint sequence.
 
         Returns:
             hidden_states [batch, seq, dim]
@@ -422,6 +430,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         # Parallel attention + MLP
         hidden_states = self.attn(
             hidden_states,
+            attn_metadata,
             image_rotary_emb=image_rotary_emb,
             timestep=timestep,
         )
@@ -684,9 +693,39 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
                 if is_excluded and getattr(module, "quant_config", None) is not None:
                     module.quant_config = no_quant_config
 
+    def create_attn_metadata(
+        self,
+        *,
+        batch_size: int,
+        text_seq_len: int,
+        image_seq_len: int,
+    ) -> Dict[str, AttentionMetadata]:
+        """Attention metadata for this model's sites, one object per site.
+
+        FLUX.2 has a single attention site over the concatenated text+image sequence.
+        """
+        # forward() shards each stream before concatenating them, so a block
+        # attends over this rank's share of the joint sequence.
+        size = self.sharder.size
+        local_seq_len = text_seq_len // size + image_seq_len // size
+        q_seq_len, kv_seq_len = get_ulysses_seq_lens(
+            local_seq_len,
+            local_seq_len,
+            visual_gen_mapping=self.model_config.visual_gen_mapping,
+        )
+        return {
+            "self": make_diffusion_attn_metadata(
+                self.attn_backend_metadata_cls,
+                batch_size=batch_size,
+                q_seq_lens=q_seq_len,
+                kv_seq_lens=None if kv_seq_len == q_seq_len else kv_seq_len,
+            )
+        }
+
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         encoder_hidden_states: torch.Tensor,
         timestep: Optional[torch.Tensor] = None,
         img_ids: Optional[torch.Tensor] = None,
@@ -699,6 +738,8 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
 
         Args:
             hidden_states: Latent image features [batch, img_seq, in_channels]
+            attn_metadata: Attention metadata site covering the joint
+                text+image sequence; built by the pipeline from :meth:`create_attn_metadata`.
             encoder_hidden_states: Text features [batch, txt_seq, joint_attention_dim]
             timestep: Normalized diffusion timestep in [0, 1], shape [batch]
             img_ids: Image position IDs [img_seq, num_axes] or [batch, img_seq, num_axes]
@@ -755,6 +796,7 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
                 image_rotary_emb=image_rotary_emb,
                 img_mod=img_mod,
                 txt_mod=txt_mod,
+                attn_metadata=attn_metadata,
                 timestep=timestep,
             )
 
@@ -767,6 +809,7 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
                 hidden_states=hidden_states,
                 image_rotary_emb=image_rotary_emb,
                 mod=single_mod[0],  # Single tuple of (shift, scale, gate)
+                attn_metadata=attn_metadata,
                 timestep=timestep,
             )
 

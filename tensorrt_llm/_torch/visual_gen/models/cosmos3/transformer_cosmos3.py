@@ -15,19 +15,24 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, TypeVar
+from typing import Dict, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding
 
-from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionMetadata,
+    PredefinedAttentionMask,
+)
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
+from tensorrt_llm._torch.visual_gen.attention_backend.metadata import make_diffusion_attn_metadata
+from tensorrt_llm._torch.visual_gen.attention_backend.parallel import get_ulysses_seq_lens
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -447,6 +452,7 @@ class Cosmos3CausalAttention(Attention):
         hidden_states: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         timestep=None,
     ) -> torch.Tensor:
         batch_size, seq_len = hidden_states.shape[:2]
@@ -475,6 +481,7 @@ class Cosmos3CausalAttention(Attention):
             q,
             k,
             v,
+            attn_metadata,
             attention_mask=PredefinedAttentionMask.CAUSAL,
             timestep=timestep,
         )
@@ -509,11 +516,6 @@ class Cosmos3CrossAttention(Attention):
         layer_idx: int = 0,
         module_name: Optional[str] = None,
     ):
-        original_backend = model_config.attention.backend
-        if model_config.attention.backend == "TRTLLM":
-            # TRTLLM backend is not supported for Cosmos3CrossAttention
-            model_config.attention.backend = "VANILLA"
-
         super().__init__(
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
@@ -527,8 +529,10 @@ class Cosmos3CrossAttention(Attention):
             layer_idx=layer_idx,
             module_name=module_name,
             enable_sequence_parallel=True,
+            # Generation queries attend over [text K/V; generation K/V], so KV
+            # is longer than Q even though the projection is fused.
+            is_cross=True,
         )
-        model_config.attention.backend = original_backend
 
         # Same flavor note as Cosmos3CausalAttention: attention Q/K norms are
         # fp32-weight-multiply in both recipes.
@@ -547,10 +551,17 @@ class Cosmos3CrossAttention(Attention):
         v_und: torch.Tensor,
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         timestep=None,
         real_text_lens: Optional[list[int]] = None,
+        attn_metadata_ragged: Optional[list[AttentionMetadata]] = None,
     ) -> torch.Tensor:
         """
+        This is the Cosmos3 "mixed" attention site: the queries are generation
+        tokens while the keys/values are the concatenation of the text tower's
+        cached K/V and the generation K/V, so ``kv_seqlen != q_seqlen``. The
+        caller passes the matching mixed-site metadata.
+
         Args:
             hidden_states: [B, S_gen, hidden_size] visual tokens
             k_und: [B, S_und, H_kv, D] pre-computed und keys (post-norm, post-RoPE)
@@ -573,6 +584,8 @@ class Cosmos3CrossAttention(Attention):
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
         if real_text_lens is not None and batch_size > 1:
+            # Ragged batch: per-sample KV lengths differ, so these batch-1
+            # calls are not described by the shared site.
             outs = []
             for b in range(batch_size):
                 Lb = int(real_text_lens[b])
@@ -583,6 +596,7 @@ class Cosmos3CrossAttention(Attention):
                         q[b : b + 1],
                         k_all_b,
                         v_all_b,
+                        attn_metadata if attn_metadata_ragged is None else attn_metadata_ragged[b],
                         attention_mask=PredefinedAttentionMask.FULL,
                         timestep=timestep,
                     )
@@ -596,6 +610,7 @@ class Cosmos3CrossAttention(Attention):
                 q,
                 k_all,
                 v_all,
+                attn_metadata,
                 attention_mask=PredefinedAttentionMask.FULL,
                 timestep=timestep,
             )
@@ -671,6 +686,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: AttentionMetadata,
         timestep=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -686,6 +702,7 @@ class Cosmos3UndDecoderLayer(nn.Module):
             hidden_states,
             cos,
             sin,
+            attn_metadata,
             timestep=timestep,
         )
         hidden_states = residual + attn_out
@@ -738,8 +755,10 @@ class Cosmos3GenDecoderLayer(nn.Module):
         k_und: torch.Tensor,
         v_und: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: AttentionMetadata,
         timestep=None,
         real_text_lens: Optional[list[int]] = None,
+        attn_metadata_ragged: Optional[list[AttentionMetadata]] = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -751,8 +770,10 @@ class Cosmos3GenDecoderLayer(nn.Module):
             v_und=v_und,
             freqs_cos=cos,
             freqs_sin=sin,
+            attn_metadata=attn_metadata,
             timestep=timestep,
             real_text_lens=real_text_lens,
+            attn_metadata_ragged=attn_metadata_ragged,
         )
         hidden_states = residual + hidden_states
 
@@ -901,6 +922,7 @@ class Cosmos3LanguageModel(nn.Module):
         text_ids: torch.Tensor,
         text_mask: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: AttentionMetadata,
         timestep=None,
     ) -> list[Tuple[torch.Tensor, torch.Tensor]]:
         """
@@ -919,7 +941,7 @@ class Cosmos3LanguageModel(nn.Module):
         cached_kv: list[Tuple[torch.Tensor, torch.Tensor]] = []
         for layer in self.layers:
             hidden = hidden * mask_3d
-            hidden, k, v = layer(hidden, freqs, timestep=timestep)
+            hidden, k, v = layer(hidden, freqs, attn_metadata, timestep=timestep)
             cached_kv.append((k, v))
 
         return cached_kv
@@ -1200,9 +1222,104 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.cached_kv = None
         self.cached_freqs_gen = None
 
+    def gen_seq_len(self, video_shape: Tuple[int, int, int], num_audio_tokens: int = 0) -> int:
+        """Number of generation tokens the GEN stack attends over.
+
+        Single source of truth for the token arithmetic that ``forward`` does
+        inline: video patches (with H/W padded up to the patch grid), plus the
+        appended audio tokens.
+        """
+        T, H, W = video_shape
+        Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
+        return T * Hp * Wp + num_audio_tokens
+
+    def create_attn_metadata(
+        self,
+        *,
+        batch_size: int,
+        text_seq_len: int,
+        text_lens: list[int],
+        video_shape: Tuple[int, int, int],
+        num_audio_tokens: int = 0,
+    ) -> Dict[str, AttentionMetadata]:
+        """Attention metadata for this model's sites, one object per site.
+
+        Cosmos3 is a mixed-stream model with two sites:
+
+        * ``und``   -- the understanding tower's causal self-attention over ``S_text``.
+        * ``mixed`` -- generation queries over ``S_gen`` against the concatenation
+          of the cached text K/V and the generation K/V, i.e. ``kv_seqlen = S_text + S_gen``.
+
+        Only generation tower supports sequence-parallel, so ``forward`` shards the generation
+        tokens and the cached text K/V, and the wrapper gathers them again.
+        """
+        if not self.audio_gen:
+            num_audio_tokens = 0
+        metadata_cls = self.attn_backend_metadata_cls
+        size = self.sharder.size
+
+        # forward() pads the generation stream up to a multiple of the shard
+        # count before sharding, and keeps a rounded-up slice of the text K/V.
+        s_gen = self.gen_seq_len(video_shape, num_audio_tokens)
+        s_gen_local = (s_gen + (-s_gen) % size) // size
+        s_text_local = self._text_kv_len_sharded(max(text_lens)) // size
+
+        q_mixed_one, _ = get_ulysses_seq_lens(
+            s_gen_local,
+            s_gen_local,
+            visual_gen_mapping=self.model_config.visual_gen_mapping,
+        )
+        q_mixed, kv_mixed = get_ulysses_seq_lens(
+            s_gen_local,
+            s_text_local + s_gen_local,
+            visual_gen_mapping=self.model_config.visual_gen_mapping,
+        )
+
+        # The ragged loop in Cosmos3CrossAttention runs one batch-1 call per
+        # sample, each with its own text length, so it needs its own sites.
+        mixed_ragged = [
+            make_diffusion_attn_metadata(
+                metadata_cls,
+                batch_size=1,
+                q_seq_lens=q_mixed_one,
+                kv_seq_lens=get_ulysses_seq_lens(
+                    s_gen_local,
+                    int(text_len) + s_gen_local,
+                    visual_gen_mapping=self.model_config.visual_gen_mapping,
+                )[1],
+            )
+            for text_len in text_lens
+        ]
+
+        return {
+            "und": make_diffusion_attn_metadata(
+                metadata_cls, batch_size=batch_size, q_seq_lens=text_seq_len
+            ),
+            "mixed_ragged": mixed_ragged,
+            "mixed": make_diffusion_attn_metadata(
+                metadata_cls,
+                batch_size=batch_size,
+                q_seq_lens=q_mixed,
+                kv_seq_lens=kv_mixed,
+            ),
+        }
+
+    def _text_kv_len_sharded(self, max_real_len: int) -> int:
+        """Text K/V length kept per rank when the sequence is sharded.
+
+        Rounds the real text length up to a multiple of the shard count; at most
+        ``size - 1`` extra positions, which are zeroed. Mirrors the slicing in
+        ``forward``.
+        """
+        size = self.sharder.size
+        return int(max_real_len) + (size - int(max_real_len) % size) % size
+
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata_und: AttentionMetadata,
+        attn_metadata_mixed: AttentionMetadata,
+        attn_metadata_mixed_ragged: Optional[list[AttentionMetadata]] = None,
         timestep: Optional[torch.Tensor] = None,
         raw_timestep: Optional[torch.Tensor] = None,
         text_ids: Optional[torch.Tensor] = None,
@@ -1218,6 +1335,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         Args:
             hidden_states: [B, C, T, H, W] noisy latents
+            attn_metadata_und: Metadata for the text tower's causal self-attention.
+            attn_metadata_mixed: Metadata for the generation stack, whose keys mix
+                the cached text K/V with the generation K/V..
             timestep: Normalized diffusion timestep in [0, 1], shape [B].
             raw_timestep: Raw scheduler diffusion timestep, shape [B], used by
                 the Cosmos3 time embedding path.
@@ -1284,6 +1404,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 text_ids,
                 text_mask,
                 freqs_und,
+                attn_metadata_und,
                 timestep=timestep,
             )
             self.cached_freqs_gen = freqs_gen
@@ -1291,8 +1412,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             if self.sharder.is_active:
                 # Round max_real_len up to next multiple of sharder.size.
                 # At most size-1 extra positions, negligible softmax dilution.
-                val = (self.sharder.size - max_real_len % self.sharder.size) % self.sharder.size
-                S_text_shard_total = int(max_real_len) + val
+                S_text_shard_total = self._text_kv_len_sharded(max_real_len)
+                val = S_text_shard_total - int(max_real_len)
 
                 self.cached_kv = []
                 for k, v in cached_kv_full:
@@ -1350,8 +1471,10 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     k_und,
                     v_und,
                     freqs_gen,
+                    attn_metadata_mixed,
                     timestep=timestep,
                     real_text_lens=real_text_lens,
+                    attn_metadata_ragged=attn_metadata_mixed_ragged,
                 )
             else:
                 hidden_gen = layer(
@@ -1359,6 +1482,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     k_und,
                     v_und,
                     freqs_gen,
+                    attn_metadata_mixed,
                     timestep=timestep,
                 )
 

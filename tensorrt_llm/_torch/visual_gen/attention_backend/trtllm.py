@@ -15,165 +15,59 @@
 """
 Diffusion TRTLLM Attention Backend
 
-Wraps TrtllmAttention with simplified metadata for visual generation (diffusion) models.
-Handles the specifics of no-KV-cache operation and fused QKV requirements.
+Wraps TrtllmAttention for visual generation (diffusion) models, handling the
+specifics of no-KV-cache operation and fused QKV requirements.
 """
 
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ...attention_backend.interface import AttentionRuntimeFeatures, PredefinedAttentionMask
+from ...attention_backend.interface import PredefinedAttentionMask
 from ...attention_backend.sparse.skip_softmax import SkipSoftmaxParams
 from ...attention_backend.trtllm import TrtllmAttention as BaseTrtllmAttention
-from ...attention_backend.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
+from ...attention_backend.trtllm import TrtllmAttentionMetadata
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
-class TrtllmAttentionMetadata:
-    """
-    Simplified metadata adapter for diffusion models using TRTLLM backend.
-
-    Lazy initialization with auto-growing capacity:
-    - Metadata created only when capacity needs increase
-    - prepare() called only when seq_lens actually change
-    - Automatically reallocates when batch_size or seq_len exceeds current capacity
-
-    Args:
-        device: Target device for tensors.
-        attention_metadata_state: Mutable model-scoped state shared by all
-            attention layers in one model instance.
-    """
-
-    def __init__(
-        self,
-        device: Optional[torch.device] = None,
-        attention_metadata_state: Optional[dict] = None,
-    ):
-        self.device = device or torch.device("cuda")
-        if attention_metadata_state is None:
-            raise ValueError(
-                "TRTLLM attention requires `attention_metadata_state` to be provided "
-                "by visual-gen config for model-scoped metadata sharing."
-            )
-        self._metadata_state = attention_metadata_state
-
-        # Lazily created BaseTrtllmAttentionMetadata objects. Diffusion blocks
-        # can launch video and audio attention back-to-back with different
-        # sequence lengths, so keep separate metadata buffers per shape instead
-        # of mutating one shared object while kernels may still be in flight.
-        self._metadata_cache = self._metadata_state.setdefault("metadata_cache", {})
-        self._metadata: Optional[BaseTrtllmAttentionMetadata] = None
-
-        # Track prepared state
-        self._cached_seq_lens: Optional[torch.Tensor] = None
-        self._prepared = False
-
-    def _needs_prepare(self, batch_size: int, seq_lens: torch.Tensor) -> bool:
-        """Check if we need to call prepare() (current request seq_lens or shared metadata object seq_lens changed).
-
-        Assumes uniform sequence length per batch; if per-sample lengths vary,
-        we may need to check seq_lens tensor instead.
-
-        In addition, multiple visual gen attention modules share one metadata object.  A
-        different module may have prepared it for another sequence length even
-        when this wrapper's local cached seq_lens are unchanged.
-        """
-        if not self._prepared:
-            return True
-        if self._cached_seq_lens is None:
-            return True
-        if self._cached_seq_lens.shape[0] != batch_size:
-            return True
-        if not torch.equal(self._cached_seq_lens[:batch_size], seq_lens):
-            return True
-
-        metadata = self._metadata
-        if metadata is None:
-            return True
-        if getattr(metadata, "num_contexts", None) != batch_size:
-            return True
-
-        max_seq_len = seq_lens.max().item()
-        if getattr(metadata, "max_seq_len", None) != max_seq_len:
-            return True
-
-        metadata_seq_lens = getattr(metadata, "seq_lens", None)
-        if metadata_seq_lens is None or metadata_seq_lens.shape[0] < batch_size:
-            return True
-        if not torch.equal(metadata_seq_lens[:batch_size].to(seq_lens.device), seq_lens):
-            return True
-
-        return False
-
-    def _create_metadata(self, batch_size: int, max_seq_len: int) -> None:
-        """Create new metadata with given capacity."""
-        self._metadata = BaseTrtllmAttentionMetadata(
-            max_num_requests=batch_size,
-            max_num_tokens=batch_size * max_seq_len,
-            max_num_sequences=batch_size,
-            kv_cache_manager=None,  # No KV cache for diffusion
-            mapping=Mapping(),
-            runtime_features=AttentionRuntimeFeatures(),
+def _check_metadata(
+    attn_metadata: TrtllmAttentionMetadata,
+    batch_size: int,
+    q_seq_len: int,
+    kv_seq_len: int,
+) -> None:
+    """Validate that the metadata describes the tensors it is used with."""
+    if attn_metadata is None:
+        raise ValueError(
+            "TrtllmAttention.forward requires `attn_metadata`. Build it with "
+            "visual_gen.attention_backend.metadata.create_diffusion_attn_metadata() "
+            "and prepare it with prepare_diffusion_attn_metadata()."
         )
-        self._prepared = False  # Reset prepare state on new metadata
 
-    def _select_cached_metadata(self, cached) -> None:
-        self._metadata = cached["metadata"]
-        self._prepared = cached["prepared"]
-        self._cached_seq_lens = cached["seq_lens"]
+    seq_lens = attn_metadata.seq_lens
+    if seq_lens is None:
+        raise ValueError(
+            "`attn_metadata` has no seq_lens; call prepare_diffusion_attn_metadata() "
+            "before the forward pass."
+        )
+    if seq_lens.shape[0] != batch_size:
+        raise ValueError(
+            f"attn_metadata batch_size mismatch: cached {seq_lens.shape[0]} != {batch_size=}."
+        )
 
-    def prepare(
-        self,
-        batch_size: int,
-        seq_lens: Union[int, torch.Tensor],
-    ) -> BaseTrtllmAttentionMetadata:
-        """
-        Prepare metadata for a forward pass.
-
-        Lazy behavior:
-        - Creates metadata only when capacity needs increase
-        - Calls prepare() only when (batch_size, max_seq_len) actually change
-        """
-        if isinstance(seq_lens, int):
-            seq_lens_tensor = torch.full((batch_size,), seq_lens, dtype=torch.int32)
-        else:
-            seq_lens_tensor = seq_lens.to(dtype=torch.int32)
-        max_seq_len = seq_lens_tensor.max().item()
-        # Keep CUDA graph-captured metadata buffers stable per batch/seq-lens shape.
-        cache_key = (batch_size, tuple(int(x) for x in seq_lens_tensor.tolist()))
-
-        cached = self._metadata_cache.get(cache_key)
-        if cached is None:
-            self._create_metadata(batch_size, max_seq_len)
-            cached = {
-                "metadata": self._metadata,
-                "prepared": False,
-                "seq_lens": None,
-            }
-            self._metadata_cache[cache_key] = cached
-
-        self._select_cached_metadata(cached)
-
-        if self._needs_prepare(batch_size, seq_lens_tensor):
-            cached_seq_lens = seq_lens_tensor.clone()
-            self._metadata.seq_lens = cached_seq_lens
-            self._metadata.num_contexts = batch_size
-            self._metadata.max_seq_len = max_seq_len
-            self._metadata.request_ids = list(range(batch_size))
-            self._metadata.prepare()
-
-            # Cache per-shape state without sharing the tensor across entries.
-            cached["prepared"] = True
-            cached["seq_lens"] = cached_seq_lens
-
-            self._select_cached_metadata(cached)
-
-        return self._metadata
+    # `seq_lens` / `seq_lens_kv` are host tensors
+    if bool((seq_lens != q_seq_len).any()):
+        raise ValueError(
+            f"attn_metadata q length mismatch: cached {seq_lens.tolist()} != {q_seq_len=}."
+        )
+    seq_lens_kv = attn_metadata.seq_lens_kv
+    if bool((seq_lens_kv != kv_seq_len).any()):
+        raise ValueError(
+            f"attn_metadata kv length mismatch: cached {seq_lens_kv.tolist()} != {kv_seq_len=}."
+        )
 
 
 class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
@@ -182,10 +76,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
     Handles:
     - Fused QKV requirement for TRTLLM kernel (used when no quant_attention_config is provided)
-    - Metadata creation and preparation
     - No KV cache operation
     - SageAttention per-block QKV quantization (when a quant_attention_config is provided. requires unfused QKV)
     """
+
+    Metadata = TrtllmAttentionMetadata
 
     def __init__(
         self,
@@ -195,10 +90,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
         dtype: Optional[torch.dtype] = None,
-        max_batch_size: int = 16,
-        max_seq_len: int = 4096,
         quant_attention_config: Optional[QuantAttentionConfig] = None,
-        attention_metadata_state: Optional[dict] = None,
         sparse_params: Optional[SkipSoftmaxParams] = None,
     ):
         num_kv_heads = num_kv_heads or num_heads
@@ -216,17 +108,12 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         # TRTLLM expects flat [B*S, H*D] format
         self._preferred_layout = AttentionTensorLayout.NHD
 
-        self.metadata = TrtllmAttentionMetadata(
-            attention_metadata_state=attention_metadata_state,
-        )
-
         self.quant_attention_config = quant_attention_config
 
-    # Needed to work with torch compile cause of attention metadata
-    # make attn metadata as input for it to work
-    @torch.compiler.disable
-    def _prepare_metadata(self, batch_size: int, seq_len: int):
-        return self.metadata.prepare(batch_size, seq_len)
+    @property
+    def requires_metadata(self) -> bool:
+        """TrtllmAttention always needs a metadata as its backends always enables varlen."""
+        return True
 
     @torch.compile
     def _concat_qkv(
@@ -250,14 +137,13 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
-        batch_size: int,
-        seq_len: int,
+        *,
+        attn_metadata: TrtllmAttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
-        seq_len_kv: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
-        Forward pass with automatic metadata handling.
+        Forward pass against caller-supplied attention metadata.
 
         Dimensions are derived from tensor shapes (NHD layout: ``[B, S, H, D]``).
 
@@ -272,19 +158,23 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             q: Query tensor [B, S, H, D] or fused QKV [B, S, H_qkv, D]
             k: Key tensor [B, S_kv, H_kv, D] or None if fused
             v: Value tensor [B, S_kv, H_kv, D] or None if fused
-            batch_size: Batch size
-            seq_len: Sequence length for Q
+            attn_metadata: Prepared metadata for this attention site;
+                must match the actual tensor dimensions.
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
 
         Returns:
             Output tensor [B, S, H*D]
         """
-        kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
-        prepared_metadata = self._prepare_metadata(batch_size, seq_len)
+        batch_size, seq_len, _, _ = q.shape
+        _, kv_seq_len, _, _ = k.shape
+        _check_metadata(attn_metadata, batch_size, seq_len, kv_seq_len)
         timestep = kwargs.pop("timestep", None)
 
-        if self.quant_attention_config is not None:
+        if (
+            self.quant_attention_config is not None
+            and attention_mask == PredefinedAttentionMask.FULL
+        ):
             assert k is not None and v is not None, (
                 "SageAttention requires separate Q, K, V tensors"
             )
@@ -296,7 +186,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 q=q,
                 k=k,
                 v=v,
-                metadata=prepared_metadata,
+                metadata=attn_metadata,
                 attention_mask=attention_mask,
                 timestep=timestep,
                 sage_attn_num_elts_per_blk_q=quant_cfg.q_block_size,
@@ -313,7 +203,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 q=qkv,
                 k=None,
                 v=None,
-                metadata=prepared_metadata,
+                metadata=attn_metadata,
                 attention_mask=attention_mask,
                 timestep=timestep,
             )

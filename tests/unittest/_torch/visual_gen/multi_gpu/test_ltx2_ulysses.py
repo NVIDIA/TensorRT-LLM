@@ -27,10 +27,7 @@ try:
     import sys
     from pathlib import Path
 
-    from tensorrt_llm._torch.visual_gen.config import (
-        DiffusionModelConfig,
-        create_attention_metadata_state,
-    )
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.rope import LTXRopeType
 
@@ -155,9 +152,6 @@ def _make_model_config(
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
-        attention_metadata_state=(
-            create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
-        ),
         parallel=ParallelConfig(ulysses_size=ulysses_size),
         skip_create_weights_in_init=False,
     )
@@ -346,9 +340,6 @@ def _make_model_config_cfg(
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
-        attention_metadata_state=(
-            create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
-        ),
         parallel=ParallelConfig(cfg_size=cfg_size, ulysses_size=ulysses_size),
         skip_create_weights_in_init=False,
     )
@@ -574,7 +565,17 @@ def _logic_ltx2_full_audio_construction(rank, world_size, backend, audio_seq_len
             )
             video_i, audio_i, *_ = _build_inputs(1, 16, (1, 4, 4), audio_seq_len, dtype, device)
             with torch.no_grad():
-                v, a = model(video=video_i, audio=audio_i, text_cache=cache)
+                v, a = model(
+                    video=video_i,
+                    audio=audio_i,
+                    text_cache=cache,
+                    attn_metadata=model.create_attn_metadata(
+                        batch_size=video_i.latent.shape[0],
+                        video_seq_len=video_i.latent.shape[1],
+                        audio_seq_len=audio_i.latent.shape[1],
+                        text_cache=cache,
+                    ),
+                )
             assert v.shape[1] == 16 and a.shape[1] == audio_seq_len
     finally:
         tl._LTX2_AUDIO_CONDITIONAL_SHARD = orig

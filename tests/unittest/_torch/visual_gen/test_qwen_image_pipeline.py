@@ -15,6 +15,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.visual_gen.attention_backend.metadata import make_diffusion_attn_metadata
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
 from tensorrt_llm._torch.visual_gen.profiler import VisualGenProfiler
 
@@ -26,10 +28,20 @@ class _RecordingTransformer(torch.nn.Module):
         self._device_anchor = torch.nn.Parameter(torch.zeros(()))
         self.calls = []
 
+    def create_attn_metadata(self, *, batch_size, text_seq_len, image_seq_len):
+        return {
+            "self": make_diffusion_attn_metadata(
+                AttentionMetadata,
+                batch_size=batch_size,
+                q_seq_lens=text_seq_len + image_seq_len,
+            )
+        }
+
     def forward(
         self,
         *,
         hidden_states,
+        attn_metadata,
         timestep,
         encoder_hidden_states_mask,
         encoder_hidden_states,
@@ -86,7 +98,11 @@ def _pipeline_with_test_doubles():
     pipe.transformer = _RecordingTransformer()
     pipe.scheduler = _RecordingScheduler()
     pipe.pipeline_config = SimpleNamespace(
-        cuda_graph=SimpleNamespace(enable=False), visual_gen_mapping=None
+        cuda_graph=SimpleNamespace(enable=False),
+        visual_gen_mapping=None,
+        # The pipeline allocates attention metadata sites from the configured
+        # backend; see visual_gen/attention_backend/metadata.py.
+        attention=SimpleNamespace(backend="VANILLA"),
     )
     pipe._is_warmup = False
     pipe._profiler = VisualGenProfiler()

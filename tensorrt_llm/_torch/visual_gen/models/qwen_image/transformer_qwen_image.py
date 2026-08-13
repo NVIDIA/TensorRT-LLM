@@ -26,14 +26,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import gelu_tanh, maybe_compile
+from tensorrt_llm._torch.visual_gen.attention_backend.metadata import make_diffusion_attn_metadata
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
     Attention2DAttention,
     RingAttention,
     UlyssesAttention,
+    get_ulysses_seq_lens,
 )
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
@@ -505,7 +508,6 @@ class QwenJointAttention(Attention):
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,
-            separate_qkv_is_self_attention=True,
         )
         self.head_dim = attention_head_dim
         self._supports_key_padding_mask = _supports_qwen_key_padding_mask(
@@ -684,6 +686,7 @@ class QwenJointAttention(Attention):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -702,7 +705,9 @@ class QwenJointAttention(Attention):
             attn_kwargs = {}
             if attention_mask is not None:
                 attn_kwargs["key_padding_mask"] = attention_mask
-            out = self._attn_impl(joint_q, joint_k, joint_v, timestep=timestep, **attn_kwargs)
+            out = self._attn_impl(
+                joint_q, joint_k, joint_v, attn_metadata, timestep=timestep, **attn_kwargs
+            )
         elif self._uses_sequence_parallel_attention:
             raise NotImplementedError(
                 "Padded Qwen-Image prompts require a key-padding-mask-capable "
@@ -832,6 +837,7 @@ class QwenImageTransformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -851,6 +857,7 @@ class QwenImageTransformerBlock(nn.Module):
         img_attn_output, txt_attn_output = self.attn(
             hidden_states=img_modulated,
             encoder_hidden_states=txt_modulated,
+            attn_metadata=attn_metadata,
             image_rotary_emb=image_rotary_emb,
             fused_rotary_emb=fused_rotary_emb,
             attention_mask=attention_mask,
@@ -911,6 +918,23 @@ def _build_joint_attention_mask(
         device=hidden_states.device,
     )
     return torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
+
+
+def qwen_image_attn_metadata(
+    model,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+) -> AttentionMetadata:
+    """The single joint text+image site a Qwen-Image forward needs.
+
+    Shared by the Qwen-Image, Qwen-Image-Edit and Qwen-Image-Layered pipelines,
+    which all call the transformer from several places per denoising step.
+    """
+    return model.create_attn_metadata(
+        batch_size=hidden_states.shape[0],
+        text_seq_len=encoder_hidden_states.shape[1],
+        image_seq_len=hidden_states.shape[1],
+    )["self"]
 
 
 class QwenImageTransformer2DModel(BaseDiffusionModel):
@@ -1267,9 +1291,41 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                         f"weight_scale_dtype={scale_dtype}"
                     ) from exc
 
+    def create_attn_metadata(
+        self,
+        *,
+        batch_size: int,
+        text_seq_len: int,
+        image_seq_len: int,
+    ) -> Dict[str, AttentionMetadata]:
+        """Attention metadata for this model's sites, one object per site.
+
+        Qwen-Image has a single attention site: the joint text+image sequence.
+        """
+        # forward() pads each stream up to a multiple of the shard count and
+        # shards it before concatenating.
+        size = self.sharder.size
+        local_seq_len = (image_seq_len + (-image_seq_len) % size) // size + (
+            text_seq_len + (-text_seq_len) % size
+        ) // size
+        q_seq_len, kv_seq_len = get_ulysses_seq_lens(
+            local_seq_len,
+            local_seq_len,
+            visual_gen_mapping=self.model_config.visual_gen_mapping,
+        )
+        return {
+            "self": make_diffusion_attn_metadata(
+                self.attn_backend_metadata_cls,
+                batch_size=batch_size,
+                q_seq_lens=q_seq_len,
+                kv_seq_lens=None if kv_seq_len == q_seq_len else kv_seq_len,
+            )
+        }
+
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
@@ -1332,6 +1388,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
+                attn_metadata=attn_metadata,
                 image_rotary_emb=image_rotary_emb,
                 fused_rotary_emb=fused_rotary_emb,
                 attention_mask=block_attention_mask,

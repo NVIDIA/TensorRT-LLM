@@ -10,6 +10,7 @@ unpadded K/V. Single-rank, CPU.
 
 import pytest
 import torch
+from attn_metadata_utils import make_backend_attn_metadata
 
 from tensorrt_llm._torch.visual_gen.attention_backend import VanillaAttention
 
@@ -27,7 +28,9 @@ def test_padded_kv_with_mask_matches_unpadded():
     k_valid = torch.randn(B, H_kv, S_kv_valid, d_h)
     v_valid = torch.randn(B, H_kv, S_kv_valid, d_h)
 
-    ref = attn.forward(q=q, k=k_valid, v=v_valid)
+    ref = attn.forward(
+        q=q, k=k_valid, v=v_valid, attn_metadata=make_backend_attn_metadata(attn, q, k_valid)
+    )
 
     # Pad K/V with realistic magnitudes (O(1)). Real audio pad goes through
     # K/V Linear from a zero-latent, so it is bounded by the layer's bias norm.
@@ -36,7 +39,13 @@ def test_padded_kv_with_mask_matches_unpadded():
     mask = torch.zeros(B, S_kv, dtype=torch.bool)
     mask[:, :S_kv_valid] = True
 
-    out = attn.forward(q=q, k=k_padded, v=v_padded, key_padding_mask=mask)
+    out = attn.forward(
+        q=q,
+        k=k_padded,
+        v=v_padded,
+        attn_metadata=make_backend_attn_metadata(attn, q, k_padded),
+        key_padding_mask=mask,
+    )
 
     torch.testing.assert_close(
         out,

@@ -1456,6 +1456,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
 
         # 4. Build forward_fn for the denoise loop
+        #
+
         def forward_fn(
             latent_input,
             extra_stream_latents,
@@ -1471,12 +1473,16 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             """
             current_audio = extra_stream_latents.get("audio") if extra_stream_latents else None
 
+            text_mask = extra_tensors["text_mask"]
             result = self.transformer(
                 hidden_states=latent_input,
+                attn_metadata_und=attn_metadata_sites["und"],
+                attn_metadata_mixed=attn_metadata_sites["mixed"],
+                attn_metadata_mixed_ragged=attn_metadata_sites["mixed_ragged"],
                 timestep=timestep / self.scheduler.config.num_train_timesteps,
                 raw_timestep=timestep,
                 text_ids=extra_tensors["text_ids"],
-                text_mask=extra_tensors["text_mask"],
+                text_mask=text_mask,
                 video_shape=video_shape,
                 fps=frame_rate,
                 noisy_frame_mask=velocity_mask,
@@ -1510,6 +1516,21 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         }
 
         self.transformer.reset_cache()
+
+        # Create attention metadata for understanding and generation towers
+        denoise_batch = self.denoise_batch_size(latents, guidance_scale=guidance_scale)
+        denoise_mask = (
+            torch.cat([uncond_mask, cond_mask], dim=0)
+            if denoise_batch != latents.shape[0]
+            else cond_mask
+        )
+        attn_metadata_sites = self.transformer.create_attn_metadata(
+            batch_size=denoise_batch,
+            text_seq_len=denoise_mask.shape[1],
+            text_lens=denoise_mask.sum(dim=1).tolist(),
+            video_shape=video_shape,
+            num_audio_tokens=(audio_latents.shape[2] if do_audio else 0),
+        )
 
         # 6. Denoise
         timer.mark_denoise_start()

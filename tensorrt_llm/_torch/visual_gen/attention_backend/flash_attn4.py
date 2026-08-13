@@ -24,7 +24,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from ...attention_backend.interface import PredefinedAttentionMask
+from ...attention_backend.interface import AttentionMetadata, PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
 _flash_attn_fwd_import_error = None
@@ -122,6 +122,7 @@ class FlashAttn4Attention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
+        attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
@@ -135,6 +136,7 @@ class FlashAttn4Attention(AttentionBackend):
             q: Query tensor [batch_size, seq_len, num_heads, head_dim]
             k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
+            attn_metadata: Unused; FA4 derives everything from tensor shapes.
             attention_mask: Attention mask type (CAUSAL or FULL)
             key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
                 False = pad. Translated to FA4's ``seqused_k = mask.sum(dim=1)``
@@ -147,6 +149,7 @@ class FlashAttn4Attention(AttentionBackend):
             q,
             k,
             v,
+            attn_metadata=attn_metadata,
             attention_mask=attention_mask,
             key_padding_mask=key_padding_mask,
             **kwargs,
@@ -158,6 +161,8 @@ class FlashAttn4Attention(AttentionBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        *,
+        attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
@@ -171,6 +176,7 @@ class FlashAttn4Attention(AttentionBackend):
                     always in float32. Used for numerically stable combination of
                     partial attention results in Attention2D parallelism.
         """
+        _, _ = attn_metadata, kwargs
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
         seqused_k = None
         if key_padding_mask is not None:
@@ -189,6 +195,11 @@ class FlashAttn4Attention(AttentionBackend):
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
         return output, lse
+
+    @property
+    def requires_metadata(self) -> bool:
+        """Currently FlashAttn4Attention only supports non-varlen batching. No metadata referred."""
+        return False
 
     @classmethod
     def support_lse(cls) -> bool:

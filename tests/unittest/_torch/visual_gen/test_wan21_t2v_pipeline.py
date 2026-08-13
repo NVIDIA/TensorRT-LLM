@@ -33,6 +33,7 @@ import torch.nn.functional as F
 from diffusers import DiffusionPipeline
 
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import wan_attn_metadata_kwargs
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
@@ -600,10 +601,24 @@ class TestWan21T2VPipelineFeatures:
 
         with torch.no_grad():
             out_bf16 = wan21_t2v_bf16.transformer(
-                hidden_states=hs.clone(), timestep=ts, encoder_hidden_states=enc.clone()
+                hidden_states=hs.clone(),
+                **wan_attn_metadata_kwargs(
+                    wan21_t2v_bf16.transformer,
+                    hidden_states=hs,
+                    encoder_hidden_states=enc,
+                ),
+                timestep=ts,
+                encoder_hidden_states=enc.clone(),
             ).float()
             out_quant = quant_pipeline.transformer(
-                hidden_states=hs.clone(), timestep=ts, encoder_hidden_states=enc.clone()
+                hidden_states=hs.clone(),
+                **wan_attn_metadata_kwargs(
+                    quant_pipeline.transformer,
+                    hidden_states=hs,
+                    encoder_hidden_states=enc,
+                ),
+                timestep=ts,
+                encoder_hidden_states=enc.clone(),
             ).float()
 
         assert not torch.isnan(out_bf16).any(), "BF16 output contains NaN"
@@ -634,10 +649,24 @@ class TestWan21T2VPipelineFeatures:
 
         with torch.no_grad():
             out_bf16 = wan21_t2v_bf16.transformer(
-                hidden_states=hs.clone(), timestep=ts, encoder_hidden_states=enc.clone()
+                hidden_states=hs.clone(),
+                **wan_attn_metadata_kwargs(
+                    wan21_t2v_bf16.transformer,
+                    hidden_states=hs,
+                    encoder_hidden_states=enc,
+                ),
+                timestep=ts,
+                encoder_hidden_states=enc.clone(),
             ).float()
             out_nvfp4 = wan21_t2v_nvfp4.transformer(
-                hidden_states=hs.clone(), timestep=ts, encoder_hidden_states=enc.clone()
+                hidden_states=hs.clone(),
+                **wan_attn_metadata_kwargs(
+                    wan21_t2v_nvfp4.transformer,
+                    hidden_states=hs,
+                    encoder_hidden_states=enc,
+                ),
+                timestep=ts,
+                encoder_hidden_states=enc.clone(),
             ).float()
 
         assert not torch.isnan(out_nvfp4).any(), "NVFP4 output contains NaN"

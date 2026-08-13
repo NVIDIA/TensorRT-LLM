@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.modules.linear import (
     Linear,
     TensorParallelMode,
@@ -262,6 +263,7 @@ class FluxJointAttention(Attention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -271,6 +273,7 @@ class FluxJointAttention(Attention):
 
         Args:
             hidden_states: Image tokens [batch, img_seq, dim]
+            attn_metadata: Attention metadata site for this site.
             encoder_hidden_states: Text tokens [batch, txt_seq, dim] (for dual-stream)
             attention_mask: Optional attention mask (unused, for API compat)
             image_rotary_emb: Tuple of (cos, sin) for RoPE
@@ -286,7 +289,7 @@ class FluxJointAttention(Attention):
             hidden_states, encoder_hidden_states, image_rotary_emb
         )
 
-        hidden_states = self._attn_impl(query, key, value, timestep=timestep)
+        hidden_states = self._attn_impl(query, key, value, attn_metadata, timestep=timestep)
         hidden_states = hidden_states.to(query.dtype)
 
         if is_dual_stream:
@@ -630,6 +633,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
@@ -637,6 +641,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         """
         Args:
             hidden_states: [batch, seq, dim]
+            attn_metadata: Attention metadata site for this site.
             attention_mask: Optional attention mask
             image_rotary_emb: Tuple of (freqs_cos, freqs_sin)
 
@@ -646,7 +651,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         if self._can_project_hidden_mlp_with_cute_dsl():
             qkv = self.to_qkv_mlp_proj.qkv_proj(hidden_states)
             q, k, v = self._apply_norm_rope(qkv, image_rotary_emb)
-            attn_out = self._attn_impl(q, k, v, timestep=timestep)
+            attn_out = self._attn_impl(q, k, v, attn_metadata, timestep=timestep)
             attn_out = attn_out.to(q.dtype)
             mlp_out = self._project_hidden_mlp_with_cute_dsl(hidden_states)
             return self._combine_split_projection(attn_out, mlp_out)
@@ -656,7 +661,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         q, k, v = self._apply_norm_rope(qkv, image_rotary_emb)
 
-        attn_out = self._attn_impl(q, k, v, timestep=timestep)
+        attn_out = self._attn_impl(q, k, v, attn_metadata, timestep=timestep)
         attn_out = attn_out.to(q.dtype)
 
         # Parallel MLP path (reshape to 2D for Triton kernel, then back)

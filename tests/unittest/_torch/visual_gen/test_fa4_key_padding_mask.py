@@ -15,6 +15,7 @@ Requires CUDA (FA4 is GPU-only).
 
 import pytest
 import torch
+from attn_metadata_utils import make_backend_attn_metadata
 
 try:
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
@@ -48,10 +49,21 @@ def _run_self_attn(B, S_real, S_pad, H, d_h, dtype=torch.bfloat16):
     fa4 = FlashAttn4Attention(num_heads=H, head_dim=d_h, num_kv_heads=H)
 
     # FA4 path with seqused_k (q_full = k_full = v_full = x_full padded; only valid prefix attends).
-    out_padded = fa4.forward(q=x_full, k=x_full, v=x_full, key_padding_mask=mask)
+    out_padded = fa4.forward(
+        q=x_full,
+        k=x_full,
+        v=x_full,
+        attn_metadata=make_backend_attn_metadata(fa4, x_full, x_full),
+        key_padding_mask=mask,
+    )
 
     # Reference: FA4 on unpadded inputs only (Q seq = K seq = S_real).
-    out_ref = fa4.forward(q=x_valid, k=x_valid, v=x_valid)
+    out_ref = fa4.forward(
+        q=x_valid,
+        k=x_valid,
+        v=x_valid,
+        attn_metadata=make_backend_attn_metadata(fa4, x_valid, x_valid),
+    )
 
     # Only the valid Q rows must match; pad Q rows are stripped downstream by
     # the caller and are not part of the contract.
@@ -76,8 +88,16 @@ def _run_cross_attn(B, S_q, S_real_kv, S_pad_kv, H, d_h, dtype=torch.bfloat16):
 
     fa4 = FlashAttn4Attention(num_heads=H, head_dim=d_h, num_kv_heads=H)
 
-    out_padded = fa4.forward(q=q, k=k_full, v=v_full, key_padding_mask=mask)
-    out_ref = fa4.forward(q=q, k=k_valid, v=v_valid)
+    out_padded = fa4.forward(
+        q=q,
+        k=k_full,
+        v=v_full,
+        attn_metadata=make_backend_attn_metadata(fa4, q, k_full),
+        key_padding_mask=mask,
+    )
+    out_ref = fa4.forward(
+        q=q, k=k_valid, v=v_valid, attn_metadata=make_backend_attn_metadata(fa4, q, k_valid)
+    )
     return out_padded, out_ref
 
 
@@ -124,8 +144,20 @@ def test_self_attn_pad_junk_values_dont_affect_valid_output():
     x_a = torch.cat([x_valid, pad_a], dim=1)
     x_b = torch.cat([x_valid, pad_b], dim=1)
 
-    out_a = fa4.forward(q=x_a, k=x_a, v=x_a, key_padding_mask=mask)
-    out_b = fa4.forward(q=x_b, k=x_b, v=x_b, key_padding_mask=mask)
+    out_a = fa4.forward(
+        q=x_a,
+        k=x_a,
+        v=x_a,
+        attn_metadata=make_backend_attn_metadata(fa4, x_a, x_a),
+        key_padding_mask=mask,
+    )
+    out_b = fa4.forward(
+        q=x_b,
+        k=x_b,
+        v=x_b,
+        attn_metadata=make_backend_attn_metadata(fa4, x_b, x_b),
+        key_padding_mask=mask,
+    )
 
     # Q[:S_real] sees the same K/V[:S_real]; mask zeros K/V[S_real:] contribution.
     # Only the valid Q rows are part of the contract.

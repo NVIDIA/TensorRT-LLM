@@ -140,7 +140,8 @@ class UlyssesAttention(AttentionBackend):
         Forward pass with Ulysses sequence parallelism.
 
         q/k/v: [B, S/P, H, D] each.  All other arguments are forwarded
-        transparently to the inner backend via ``**kwargs``.
+        transparently to the inner backend via ``**kwargs``, including
+        ``attn_metadata``, which is re-targeted to the post-all-to-all lengths.
         """
         # Catches upstream floor-division bugs (e.g. num_heads // ulysses_size when
         # num_heads % ulysses_size != 0) before they corrupt the all-to-all.
@@ -315,7 +316,7 @@ class UlyssesAttention(AttentionBackend):
                 `("q", "k", "v")` to issue the small audio-Q first. Order is
                 correctness-neutral (`_join_async` syncs all recv bufs).
             **attn_kwargs : forwarded to the wrapped inner attention backend
-                (mask, scale, etc.).
+                (mask, scale, ``attn_metadata``, etc.).
 
         Returns:
             output tensor in the caller's sharded layout `[B, S/P, H, D]`.
@@ -550,6 +551,8 @@ class Attention2DAttention(AttentionBackend):
         Forward pass with Attention2D sequence parallelism.
 
         q: [B, S_q/P, H_q, D].  k/v: [B, S_kv/P, H_kv, D].
+
+        ``attn_metadata`` rides through ``**kwargs`` and is re-targeted to the full lengths.
         """
         B, shard_seq_q, H_q, D = q.shape
         _, shard_seq_kv, H_kv, D_kv = k.shape
@@ -839,6 +842,10 @@ class RingAttention(AttentionBackend):
         return out
 
     @property
+    def requires_metadata(self) -> bool:
+        return self.inner.requires_metadata
+
+    @property
     def preferred_layout(self) -> AttentionTensorLayout:
         return self._preferred_layout
 
@@ -849,6 +856,42 @@ class RingAttention(AttentionBackend):
     @classmethod
     def support_lse(cls) -> bool:
         return False
+
+
+def get_ulysses_seq_lens(
+    q_seq_len: int,
+    kv_seq_len: int,
+    *,
+    visual_gen_mapping: Optional["VisualGenMapping"] = None,
+    enable_sequence_parallel: bool = True,
+    use_ulysses: bool = True,
+    ulysses_size: Optional[int] = None,
+) -> tuple[int, int]:
+    """Computes how sharded seqlen transforms to seqlen seen by the inner attention backend.
+
+    - Ulysses preprocessing is all2all: both local lengths scale by the Ulysses group size.
+    - Attention2D gathers Q along the row fiber and K/V along the column
+      fiber, so the two local lengths scale by different factors.
+    - Ring is the identity: every step feeds one local K/V chunk.
+
+    Args:
+        ulysses_size: Overrides the mapping's Ulysses degree.
+    """
+    if not enable_sequence_parallel or visual_gen_mapping is None:
+        return q_seq_len, kv_seq_len
+
+    vgm = visual_gen_mapping
+    q_factor, kv_factor = 1, 1
+
+    if vgm.attn2d_row_size * vgm.attn2d_col_size > 1:
+        q_factor, kv_factor = vgm.attn2d_row_size, vgm.attn2d_col_size
+
+    ulysses = vgm.ulysses_size if ulysses_size is None else ulysses_size
+    if use_ulysses and ulysses > 1:
+        q_factor *= ulysses
+        kv_factor *= ulysses
+
+    return q_seq_len * q_factor, kv_seq_len * kv_factor
 
 
 def wrap_parallel_attention(

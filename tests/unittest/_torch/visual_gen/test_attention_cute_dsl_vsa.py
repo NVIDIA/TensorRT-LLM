@@ -30,10 +30,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend import (
     VSAMetadataBuilder,
 )
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
-from tensorrt_llm._torch.visual_gen.config import (
-    DiffusionModelConfig,
-    create_attention_metadata_state,
-)
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,
@@ -91,22 +88,19 @@ def _make_config(
         attention=AttentionConfig(backend=backend, sparse_attention_config=sparse_attention_config),
         skip_create_weights_in_init=False,
     )
-    config.attention_metadata_state = (
-        create_attention_metadata_state() if backend == "TRTLLM" else None
-    )
     return config
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
 def test_vsa_falls_back_to_vanilla_for_cross_attention():
-    """Cross-attention (SEPARATE_QKV) falls back to VANILLA — it has no cube structure."""
+    """Cross-attention falls back to VANILLA — it has no cube structure."""
     device = torch.device("cuda")
     dtype = torch.bfloat16
     cfg = _make_config(
         hidden_size=64, num_heads=4, head_dim=16, backend="CUTEDSL", vsa_sparsity=0.5
     )
     cross_attn = (
-        Attention(64, 4, qkv_mode=QKVMode.SEPARATE_QKV, config=cfg)
+        Attention(64, 4, qkv_mode=QKVMode.SEPARATE_QKV, is_cross=True, config=cfg)
         .to(device=device, dtype=dtype)
         .eval()
     )

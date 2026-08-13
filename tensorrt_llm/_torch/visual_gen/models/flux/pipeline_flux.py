@@ -357,7 +357,13 @@ class FluxPipeline(BasePipeline):
                 [latents.shape[0]], guidance_scale, device=self.device, dtype=torch.float32
             )
 
-        # Denoising loop
+        # Create attention metadata
+        attn_metadata_sites = self.transformer.create_attn_metadata(
+            batch_size=latents.shape[0],
+            text_seq_len=prompt_embeds.shape[1],
+            image_seq_len=latents.shape[1],
+        )
+
         def forward_fn(
             latents,
             extra_stream_latents,
@@ -369,6 +375,7 @@ class FluxPipeline(BasePipeline):
             """Forward function for FLUX transformer."""
             return self.transformer(
                 hidden_states=latents,
+                attn_metadata=attn_metadata_sites["self"],
                 encoder_hidden_states=encoder_hidden_states,
                 pooled_projections=pooled_prompt_embeds,
                 timestep=timestep / 1000,  # FLUX expects normalized timesteps

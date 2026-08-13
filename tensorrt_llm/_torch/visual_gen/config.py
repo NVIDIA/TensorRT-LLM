@@ -71,11 +71,6 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
     return components
 
 
-def create_attention_metadata_state() -> Dict[str, Any]:
-    """Create model-scoped attention metadata state for TRTLLM visual-gen backend."""
-    return {"metadata_cache": {}}
-
-
 def _model_config_value(value: Any, *, deep_copy: bool = True) -> Any:
     """Return a value for a per-component DiffusionModelConfig."""
     if value is None:
@@ -119,7 +114,6 @@ class DiffusionModelConfig(_VisualGenConfigBase):
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
-    attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
 
@@ -184,7 +178,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
-    attention_metadata_state: Optional[Dict[str, Any]] = None
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
     cache: Optional[CacheConfig] = None
 
@@ -247,7 +240,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             torch_compile=_model_config_value(self.torch_compile),
             cuda_graph=_model_config_value(self.cuda_graph),
             attention=_model_config_value(self.attention),
-            attention_metadata_state=_model_config_value(self.attention_metadata_state),
             parallel=_model_config_value(self.parallel),
             cache=_model_config_value(self.cache),
             enable_layerwise_nvtx_marker=_model_config_value(self.enable_layerwise_nvtx_marker),
@@ -608,10 +600,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
             NVFP4LinearMethod.use_tunable_quantize = True
 
-        attention_metadata_state = (
-            create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
-        )
-
         pipeline_config = cls(
             quant_config=quant_config,
             quant_config_dict=quant_config_dict,
@@ -622,7 +610,6 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             torch_compile=torch_compile_cfg,
             cuda_graph=cuda_graph_cfg,
             attention=attention_cfg,
-            attention_metadata_state=attention_metadata_state,
             parallel=parallel_cfg,
             cache=cache_cfg,
             enable_layerwise_nvtx_marker=enable_layerwise_nvtx_marker,

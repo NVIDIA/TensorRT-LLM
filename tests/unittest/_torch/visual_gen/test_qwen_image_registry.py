@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from attn_metadata_utils import make_attn_metadata
 
 from tensorrt_llm._torch.modules.linear import (
     FP8QDQLinearMethod,
@@ -412,6 +413,11 @@ def test_transformer_forward_sanity(with_text_mask):
     with torch.inference_mode():
         output = model(
             hidden_states=hidden_states,
+            attn_metadata=make_attn_metadata(
+                model.model_config.attention.backend,
+                hidden_states,
+                q_seq_len=hidden_states.shape[1] + encoder_hidden_states.shape[1],
+            ),
             encoder_hidden_states=encoder_hidden_states,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             timestep=torch.tensor([0.5], device=device, dtype=dtype),

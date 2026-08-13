@@ -42,6 +42,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
     VisualGenArgs,
 )
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import wan_attn_metadata_kwargs
 from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -284,6 +285,11 @@ class TestWanUnit:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
+                **wan_attn_metadata_kwargs(
+                    model,
+                    hidden_states=hs,
+                    encoder_hidden_states=enc,
+                ),
                 timestep=_normalize_wan_timestep(ts),
                 encoder_hidden_states=enc,
             )
@@ -335,6 +341,11 @@ class TestWanUnit:
             )[0].float()
             trt_out = trtllm(
                 hidden_states=hs,
+                **wan_attn_metadata_kwargs(
+                    trtllm,
+                    hidden_states=hs,
+                    encoder_hidden_states=enc,
+                ),
                 timestep=_normalize_wan_timestep(ts),
                 encoder_hidden_states=enc,
             ).float()
@@ -393,6 +404,11 @@ class TestWanT2VTransformerCorrectness:
 
             our_out = our_model(
                 hidden_states=hidden_states,
+                **wan_attn_metadata_kwargs(
+                    our_model,
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                ),
                 timestep=_normalize_wan_timestep(timestep),
                 encoder_hidden_states=encoder_hidden_states,
             )
@@ -469,6 +485,12 @@ class TestWanI2VTransformerCorrectness:
 
             our_out = our_model(
                 hidden_states=hidden_states,
+                **wan_attn_metadata_kwargs(
+                    our_model,
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_image=image_embeds,
+                ),
                 timestep=_normalize_wan_timestep(timestep),
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds,
