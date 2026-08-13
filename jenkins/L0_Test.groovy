@@ -5859,8 +5859,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     // Doc build is pure CPU work (checkout + wheel install + doxygen/sphinx
     // `make html` + upload); it never touches a GPU, so run it on the CPU
-    // "build" pod instead of pinning an a10 tester. Mirrors the CPU-only
-    // agent-flow job below.
+    // "build" pod. Mirrors the CPU-only agent-flow job below.
     docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     docBuildConfigs = [
         "CPU-Build_Docs": [docBuildSpec, {

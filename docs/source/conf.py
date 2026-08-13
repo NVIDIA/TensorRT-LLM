@@ -201,7 +201,9 @@ def setup(app):
     except ImportError as e:
         msg = f"tensorrt_llm not importable, API docs would be incomplete: {e}"
         if require_import:
-            raise RuntimeError(msg) from e
+            raise RuntimeError(
+                "tensorrt_llm not importable, API docs would be incomplete"
+            ) from e
         print(f"Warning: {msg}; skipping tag_llm_params")
 
     app.add_role('tag', tag_role)
