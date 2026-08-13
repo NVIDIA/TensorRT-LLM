@@ -719,6 +719,7 @@ def test_default_profile_qualifies_real_tiny_llama_tp2_rank_lifecycle(
 ) -> None:
     monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
     monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
+    monkeypatch.setattr(modeling_llama_mod, "AllReduce", _AllReduceStub)
     case = PostTransformQualificationCase(
         profile_id="llama-for-causal-lm-target-v1",
         model_factory=lambda: _tiny_llama_model(
