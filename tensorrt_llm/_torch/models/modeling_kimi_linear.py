@@ -2076,7 +2076,7 @@ class KimiKDARuntime(nn.Module):
 
 
 class KimiMLARuntime(nn.Module):
-    """Owns K3 MLA head padding, TP sharding, and output reduction."""
+    """Owns K3 MLA TP sharding and output reduction."""
 
     def __init__(
         self,
@@ -2097,35 +2097,23 @@ class KimiMLARuntime(nn.Module):
             )
         )
         self.layer_idx = layer_idx
-        # The trtllm-gen MLA generation kernels group query heads per CTA and
-        # require numHeadsQ divisible by the group size (a power of two, up
-        # to 128). K3's 96 query heads are unsupported, so pad to the next
-        # power of two (128) with zero weights: padded heads produce exactly
-        # zero output (their kv_b_proj "v_absorb" rows are zero), so the
-        # numerics are unchanged at ~33% extra MLA-layer q compute.
-        self.num_real_heads = cfg.num_attention_heads
-        padded_heads = 1
-        while padded_heads < self.num_real_heads:
-            padded_heads *= 2
-        self.num_padded_heads = padded_heads
         # Attention-family TP semantics (DeepSeek MLA pattern, mla.py):
-        # replicated under attention-DP, head-sharded otherwise. Pad
-        # FIRST, then divide, so every rank gets a power-of-two head
-        # count (128/16 = 8; sharding the real 96 would give 6/rank and
-        # break the generation-FMHA per-CTA head grouping). q_b/kv_b/g
-        # column-shard and o_proj row-shards by padded head range; ranks
-        # holding only padded heads contribute exact zeros. The latent KV
-        # cache and both *_a_proj down-projections stay replicated — with
-        # a single latent KV head the TP ranks hold duplicated KV cache,
-        # exactly like DeepSeek MLA under TP (attention-DP dedups it).
+        # replicated under attention-DP, head-sharded otherwise. Keep K3's
+        # real 96 query heads: DEP uses 96 heads, while TEP16 and TEP8 use 6
+        # and 12 heads per rank. These shapes use the CuTe DSL MLA backend.
+        # q_b/kv_b/g column-shard and o_proj row-shards by the real head
+        # range. The latent KV cache and both *_a_proj down-projections stay
+        # replicated, exactly like DeepSeek MLA under TP (attention-DP
+        # deduplicates it).
+        num_heads = cfg.num_attention_heads
         self._mla_tp_size = (
             mapping.tp_size
             if (mapping is not None and not mapping.enable_attention_dp and mapping.tp_size > 1)
             else 1
         )
         self._mla_tp_rank = mapping.tp_rank if self._mla_tp_size > 1 else 0
-        assert padded_heads % self._mla_tp_size == 0, (
-            f"padded MLA heads {padded_heads} not divisible by tp_size {self._mla_tp_size}"
+        assert num_heads % self._mla_tp_size == 0, (
+            f"MLA heads {num_heads} not divisible by tp_size {self._mla_tp_size}"
         )
         self._o_allreduce = (
             AllReduce(mapping=mapping, strategy=allreduce_strategy, dtype=torch.bfloat16)
@@ -2134,7 +2122,7 @@ class KimiMLARuntime(nn.Module):
         )
         self.mixer = KimiK3MLAAttention(
             hidden_size=cfg.hidden_size,
-            num_heads=padded_heads // self._mla_tp_size,
+            num_heads=num_heads // self._mla_tp_size,
             q_lora_rank=cfg.q_lora_rank,
             kv_lora_rank=cfg.kv_lora_rank,
             qk_nope_head_dim=cfg.qk_nope_head_dim,
@@ -2639,6 +2627,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             if not getattr(layer, "is_kda", True)
         ]
         mla_kv_b_mixers = {id(mixer.kv_b_proj.weight): mixer for mixer in mla_mixers}
+        mla_head_shard_axes = {}
+        for mixer in mla_mixers:
+            mla_head_shard_axes[id(mixer.q_b_proj.weight)] = 0
+            mla_head_shard_axes[id(mixer.o_proj.weight)] = 1
+            g_proj = getattr(mixer, "g_proj", None)
+            if g_proj is not None:
+                mla_head_shard_axes[id(g_proj.weight)] = 0
 
         device = next(self.parameters()).device
 
@@ -2654,8 +2649,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 kda_tp_size = layer.self_attn._kda_tp_size
                 kda_tp_rank = layer.self_attn._kda_tp_rank
                 break
-        # MLA head-shard (attention-DP off): rank slice of the zero-padded
-        # 128-head layout (pad before divide).
+        # MLA head-shard (attention-DP off): rank slice of the real 96-head
+        # layout.
         mla_tp_size, mla_tp_rank = 1, 0
         for layer in self.model.layers:
             if not getattr(layer, "is_kda", True):
@@ -2723,14 +2718,39 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         )
                     src = src[: param.numel()]
             if src.shape != param.shape:
+                # MLA head-shard (attention-DP off): q_b/g_proj shard their
+                # head-major output rows and o_proj shards its head-major
+                # input columns. KV-B uses the dedicated head-aware loader
+                # above. Identify these tensors by parameter identity so the
+                # similarly shaped KDA projections cannot capture them.
+                mla_shard_axis = mla_head_shard_axes.get(id(param))
+                if mla_tp_size > 1 and mla_shard_axis is not None:
+                    if (
+                        src.dim() == param.dim()
+                        and src.shape[mla_shard_axis] == param.shape[mla_shard_axis] * mla_tp_size
+                        and all(
+                            src.shape[axis] == param.shape[axis]
+                            for axis in range(src.dim())
+                            if axis != mla_shard_axis
+                        )
+                    ):
+                        shard_size = param.shape[mla_shard_axis]
+                        shard_start = mla_tp_rank * shard_size
+                        shard = src.narrow(mla_shard_axis, shard_start, shard_size)
+                        param.data.copy_(shard.to(param.dtype))
+                        return
+                    raise ValueError(
+                        f"{name}: checkpoint shape {tuple(src.shape)} does not "
+                        f"form {mla_tp_size} equal MLA head shards for param "
+                        f"shape {tuple(param.shape)} on axis {mla_shard_axis}"
+                    )
                 # KDA head-shard (attention-DP off): every mismatching KDA
                 # tensor is head-major with the checkpoint exactly
                 # kda_tp_size times larger on one axis — q/k/v/g/f_b
                 # projections, b_proj, dt_bias, and the depthwise conv
                 # weights on dim 0 (rows), o_proj on dim 1 (columns).
-                # MLA layers never produce a x-tp_size ratio (their
-                # mismatches are the padding branches below), so shape
-                # ratios alone identify the KDA slices.
+                # MLA head-sharded projections were handled by parameter
+                # identity above, so shape ratios identify the KDA slices.
                 if kda_tp_size > 1 and ".self_attn." in name:
                     if (
                         src.shape[0] == param.shape[0] * kda_tp_size
@@ -2748,41 +2768,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         s = param.shape[1]
                         lo = kda_tp_rank * s
                         param.data.copy_(src[:, lo : lo + s].to(param.dtype))
-                        return
-                # MLA head-shard (attention-DP off): the checkpoint holds
-                # the real 96 heads; the param holds this rank's slice of
-                # the zero-PADDED 128-head layout (pad before divide, so
-                # per-rank counts stay a power of two). Head-major output
-                # rows for q_b/g_proj and input columns for o_proj. KV-B has
-                # a dedicated head-aware loader above. A rank whose padded
-                # range lies beyond the real heads gets zeros. KDA layers
-                # never reach here: their identically named g/o projections
-                # match the exact-ratio branch above.
-                if mla_tp_size > 1 and ".self_attn." in name:
-                    if (
-                        name.endswith((".q_b_proj.weight", ".g_proj.weight"))
-                        and src.shape[1:] == param.shape[1:]
-                        and src.shape[0] < param.shape[0] * mla_tp_size
-                    ):
-                        s = param.shape[0]
-                        lo = mla_tp_rank * s
-                        param.data.zero_()
-                        n = max(0, min(src.shape[0] - lo, s))
-                        if n > 0:
-                            param.data[:n].copy_(src[lo : lo + n].to(param.dtype))
-                        return
-                    if (
-                        name.endswith(".o_proj.weight")
-                        and src.dim() == 2
-                        and src.shape[0] == param.shape[0]
-                        and src.shape[1] < param.shape[1] * mla_tp_size
-                    ):
-                        s = param.shape[1]
-                        lo = mla_tp_rank * s
-                        param.data.zero_()
-                        n = max(0, min(src.shape[1] - lo, s))
-                        if n > 0:
-                            param.data[:, :n].copy_(src[:, lo : lo + n].to(param.dtype))
                         return
                 # Shared-expert TP (direct MoE path): the module holds a
                 # 1/tp shard of the FFN dim — column shard for gate/up
@@ -2810,30 +2795,6 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                         lo = (model_tp_rank % shard_count) * param.shape[1]
                         param.data.copy_(src[:, lo : lo + param.shape[1]].to(param.dtype))
                         return
-                # MLA head padding (96 -> 128 query heads, see
-                # KimiMLARuntime): pad the head-major output rows
-                # (q_b_proj / g_proj) or the head-major input columns
-                # (o_proj) with zeros. KV-B is handled above. KDA layers'
-                # identically named projections match exactly and never take
-                # this path.
-                if (
-                    ".self_attn." in name
-                    and name.endswith((".q_b_proj.weight", ".g_proj.weight"))
-                    and src.shape[1:] == param.shape[1:]
-                    and src.shape[0] < param.shape[0]
-                ):
-                    param.data.zero_()
-                    param.data[: src.shape[0]].copy_(src.to(param.dtype))
-                    return
-                if (
-                    ".self_attn." in name
-                    and name.endswith(".o_proj.weight")
-                    and src.shape[0] == param.shape[0]
-                    and src.shape[1] < param.shape[1]
-                ):
-                    param.data.zero_()
-                    param.data[:, : src.shape[1]].copy_(src.to(param.dtype))
-                    return
                 raise ValueError(
                     f"{name}: checkpoint shape "
                     f"{tuple(src.shape)} != param shape "
