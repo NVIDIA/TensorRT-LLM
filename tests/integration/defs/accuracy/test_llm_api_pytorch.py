@@ -7860,8 +7860,8 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                                  use_msa,
                                  cuda_graph,
                                  gen_tp_size=2,
-                                 ctx_ep_size=1,
-                                 gen_ep_size=1,
+                                 ctx_ep_size=2,
+                                 gen_ep_size=2,
                                  enable_cpp_nixl_bounce=False):
         """Disaggregated arm of test_nvfp4_eagle3.
 
@@ -7869,16 +7869,16 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
         crossing the disaggregated transceiver. The existing arm is context
         TP2 -> generation TP2 on one 4-GPU node. The dedicated bounce test
         calls this helper with context TEP2 -> generation TP4 and C++ NIXL
-        bounce to exercise head remapping. Both use NIXL, context piecewise CUDA graphs, and
-        block reuse on the context server. ``attention_dp`` selects the
-        generation flavor: True is the AgentX-submission shape (attention-DP
-        generation), False the TEP production-candidate shape. Values that are workload-tuned
-        (1M-context sizes) or GPU-generation-tuned (memory fractions) are
-        CI-adjusted and called out inline. Accuracy is asserted through the
-        router; the drafter's KV rides the shared logical blocks, so a
-        corrupted or dropped drafter cache collapses accuracy. Acceptance
-        stats stay with the aggregated arm, which exercises the same view
-        code.
+        bounce to exercise head remapping. Both use NIXL, context piecewise
+        CUDA graphs, and block reuse on the context server. ``attention_dp``
+        selects the generation flavor: True is the AgentX-submission shape
+        (attention-DP generation), False the TEP production-candidate shape.
+        Values that are workload-tuned (1M-context sizes) or GPU-generation-
+        tuned (memory fractions) are CI-adjusted and called out inline.
+        Accuracy is asserted through the router; the drafter's KV rides the
+        shared logical blocks, so a corrupted or dropped drafter cache
+        collapses accuracy. Acceptance stats stay with the aggregated arm,
+        which exercises the same view code.
         """
         if not (overlap_scheduler and cuda_graph and use_msa):
             pytest.skip("the disagg arm pins the production serving shape "
@@ -8006,11 +8006,12 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 # heuristic gates so engagement is
                 # deterministic.
                 "TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT": "1",
+                # BounceConfig::fromEnv accepts binary size suffixes.
                 "TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES": "1MB",
                 # Capture the C++ sender-side marker
                 # used below to reject silent direct-
                 # NIXL fallback.
-                "TLLM_LOG_LEVEL": "DEBUG",
+                "TLLM_LOG_LEVEL_BY_MODULE": "debug:executor",
             } if enable_cpp_nixl_bounce else None,
                 assert_worker_log_contains="bounce path engaged"
                 if enable_cpp_nixl_bounce else None,

@@ -559,14 +559,20 @@ def launch_disaggregated_llm(
                     pass  # process already gone
 
             if body_succeeded and assert_worker_log_contains is not None:
-                logs = []
+                logs = {}
                 for path in worker_log_paths:
                     with open(path) as f:
-                        logs.append(f.read())
-                assert any(assert_worker_log_contains in log for log in logs), (
-                    f"expected marker {assert_worker_log_contains!r} in a "
-                    f"CTX or GEN worker log, but it was absent from "
-                    f"{worker_log_paths}")
+                        logs[path] = f.read()
+                if not any(assert_worker_log_contains in log
+                           for log in logs.values()):
+                    log_tails = "".join(
+                        f"\n--- {os.path.basename(path)} (last 100 lines) ---\n"
+                        + "\n".join(log.splitlines()[-100:])
+                        for path, log in logs.items())
+                    pytest.fail(
+                        f"expected marker {assert_worker_log_contains!r} in a "
+                        f"CTX or GEN worker log, but it was absent. Worker "
+                        f"log tails:{log_tails}")
 
 
 def run_parallel_test(model_name: str,
