@@ -955,6 +955,8 @@ disable_error_code = [
     # fragile WAR. Suppress redundant-cast for the sampler module until the casts are
     # audited and the annotations tightened, rather than churn the source.
     "redundant-cast",
+    # temperature is typed as float but set to None in the greedy case (sampler_strategy.py).
+    "assignment",
 ]
 
 [[tool.mypy.overrides]]
