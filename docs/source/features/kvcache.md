@@ -208,6 +208,73 @@ The property ```copy_on_partial_reuse``` specifies whether a block should be cop
 
 Property ```max_attention_window``` specifies the maximum attention window size for each layer in the model as a list of integer values. If the length of this list is less than number of layers, the list is repeated as many times as necessary. For instance, if the model has only full attention layers and maximum sequence length is 4096, you can specify this as ```max_attention_window = [4096]```. If the first layer is full attention, the second layer is limited attention with window size 256 and then this repeats for the remaining layers, you specify this as ```max_attention_window = [4096,256]```. This means first layer is full attention, second layer is limited attention, third layer is full attention, fourth layer is limited attention and so on.
 
+### KV Cache Events
+
+KV cache events report block **stored**, **removed**, **created** and **updated** operations
+so an external KV-cache-aware router (for example NVIDIA Dynamo) can route a request to the
+engine that already holds its prefix. Two delivery paths are available.
+
+#### Buffered path (default)
+
+Set ```event_buffer_max_size``` to a positive integer and ```enable_block_reuse``` to True.
+Events are buffered per rank, gathered onto rank 0 under attention data parallelism, and
+pulled per iteration through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`,
+or over the `/kv_cache_events` endpoint of `trtllm-serve`.
+
+#### Streaming path (prototype)
+
+Configured with ```kv_cache_config.kv_events_config```. Each rank encodes its own events and
+publishes them directly over a ZeroMQ `PUB` socket from a background thread, so there is no
+rank-0 gather and no per-iteration pull.
+
+```python
+from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
+
+kv_cache_config = KvCacheConfig(
+    enable_block_reuse=True,
+    kv_events_config=KVEventsConfig(
+        enable_kv_cache_events=True,
+        endpoint="tcp://*:5557",
+        replay_endpoint="tcp://*:5657",
+    ),
+)
+```
+
+**Constraints.** The streaming path requires KV cache manager V2 running on its Python
+backend (`TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`); the default `cpp` backend cannot
+consume the Python event sink and raises an error naming this variable. Pipeline
+parallelism and context parallelism are rejected. Events are not published for draft
+models or during KV-cache-size estimation. When streaming is enabled the buffered pull API
+returns an empty list rather than raising.
+
+**Endpoint convention.** Every attention-DP rank binds `base_port + rank`, so `N` ranks
+occupy `[base_port, base_port + N - 1]`. Co-located engines — for example disaggregated
+prefill and decode on one host — must use base ports at least `N` apart, and
+```replay_endpoint``` follows the same convention, so its base port must also be at least
+`N` away from ```endpoint```'s. Only ranks sharing a host can collide, so `N` here is the
+number of ranks per host; a multi-node deployment reuses the same port numbers on each
+node. Overlapping ranges are rejected at startup. For `ipc://` and `inproc://` endpoints,
+which have no port, each rank appends a `_dp<rank>` suffix instead.
+
+**Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
+an 8-byte big-endian sequence number, and a msgpack payload
+`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key —
+`BlockStored`, `BlockRemoved` or `AllBlocksCleared` — carrying int64 block hashes derived
+from the V2 radix block keys. This is the format documented for custom router backends; it
+differs from vLLM's positional-array encoding of the individual events, though the batch
+envelope is positional in both.
+
+**Delivery guarantees.** Delivery is best effort, but loss is observable. Every accepted
+batch reserves a sequence number up front, so a batch dropped by a full publisher queue
+(```max_queue_size```) or by a failed send leaves a hole in the sequence. Subscribers must
+treat any gap as lost KV-cache state and resynchronize rather than assuming continuity.
+
+**Replay.** If ```replay_endpoint``` is set, the publisher also binds a `ROUTER` socket. A
+subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and
+receives each retained batch as `[delimiter, topic, seq, payload]`, terminated by a sentinel
+with an empty payload. Only the last ```buffer_steps``` batches are retained, so a replay
+can legitimately start above the requested sequence — that too is a gap.
+
 ### Deprecated Properties
 
 Property ```use_uvm``` has been deprecated and will be removed in a future release.

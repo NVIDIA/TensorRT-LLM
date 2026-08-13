@@ -3749,7 +3749,10 @@ class KVEventsConfig(StrictBaseModel):
         default=None,
         min_length=1,
         description=
-        "Optional base ZeroMQ endpoint used to replay KV cache events.")
+        "Optional base ZeroMQ endpoint used to replay KV cache events. Ranks apply "
+        "the same base_port+rank convention as `endpoint`, so with N attention-DP "
+        "ranks per host the two base ports must be at least N apart or a rank's replay "
+        "bind collides with another rank's publish bind on that host.")
     buffer_steps: int = Field(
         default=10_000,
         gt=0,
