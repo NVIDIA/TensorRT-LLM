@@ -3812,6 +3812,12 @@ class PyExecutor:
         # ranks remain aligned and may safely poll context progress.
         if (not uses_async_gen_transfer
                 and not self._is_disagg_gen_only_no_context_benchmark()):
+            # A single-rank CTX worker cannot diverge on a collective. Reap
+            # completed sends while it is idle so their pinned KV blocks can
+            # be reused by the next context requests.
+            if (is_idle and self._dist_size(self.dist, "world_size") == 1 and
+                    self.async_transfer_manager.has_any_inflight_requests()):
+                self._check_disagg_ctx_cache_transfer_status(0)
             return
 
         local_need_gen_check = (uses_async_gen_transfer and local_needs_progress
