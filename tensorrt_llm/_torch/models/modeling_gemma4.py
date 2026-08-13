@@ -29,7 +29,7 @@ from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -329,11 +329,10 @@ class Gemma4Attention(QKNormRoPEAttention):
             # the rotate split, matching HF's rotate_half(head_dim//2) pairing.
             self.rotary_emb.head_dim = layer_head_dim
 
-        # trtllm-gen does not provide SM120/SM121 kernels. FlashInfer FA2
-        # supports Gemma4 H256/H512, sliding-window attention, and FP8 KV cache
-        # on these architectures. Keep the existing trtllm-gen routing on all
-        # other architectures.
-        self.attn.flashinfer_backend = "fa2" if get_sm_version() in (120, 121) else "trtllm-gen"
+        # trtllm-gen FMHA kernels are available only on datacenter Blackwell.
+        # Use FlashInfer FA2 on other architectures, including SM120/SM121;
+        # multimodal custom masks then use FlashInfer's native mask planning.
+        self.attn.flashinfer_backend = "trtllm-gen" if is_sm_100f() else "fa2"
 
         # KV shared layers: use target layer's index for KV cache access
         # so the attention backend reads from the target layer's cache slot.
