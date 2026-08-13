@@ -141,7 +141,10 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
     should_warmup,
 ):
     metadata = SimpleNamespace(
-        sparse_metadata_params=SimpleNamespace(enable_heuristic_topk=enable_heuristic),
+        sparse_metadata_params=SimpleNamespace(
+            enable_heuristic_topk=enable_heuristic,
+            index_topk=384,
+        ),
         use_cute_dsl_topk=use_cute_dsl,
         num_sparse_topk=512,
         kv_cache_manager=SimpleNamespace(),
@@ -163,7 +166,7 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
 
     if should_warmup:
         cute_dsl_radix.assert_called_once_with(
-            top_k=512,
+            top_k=384,
             num_cols=32768,
             next_n=next_n,
             dtype=torch.float32,
@@ -291,18 +294,43 @@ def test_indexer_post_load_weights_caches_fused_weight():
 
 
 @skip_pre_hopper
-def test_indexer_configures_one_top_k_module():
+@pytest.mark.parametrize(
+    "use_cute_dsl,enable_heuristic,expected_decode",
+    [
+        (False, False, TopKImplementation.CUDA_RADIX),
+        (True, False, TopKImplementation.CUTE_DSL_RADIX),
+        (False, True, TopKImplementation.CUDA_GVR),
+        (True, True, TopKImplementation.CUTE_DSL_GVR),
+    ],
+)
+def test_indexer_configures_one_top_k_module(
+    use_cute_dsl,
+    enable_heuristic,
+    expected_decode,
+):
     sparse_config = DeepSeekSparseAttentionConfig(
         index_head_dim=128,
         index_n_heads=32,
         index_topk=128,
+        use_cute_dsl_topk=use_cute_dsl,
+        enable_heuristic_topk=enable_heuristic,
     )
 
-    indexer = create_indexer(sparse_config)
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.IS_CUTLASS_DSL_AVAILABLE",
+            True,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.get_sm_version",
+            return_value=100,
+        ),
+    ):
+        indexer = create_indexer(sparse_config)
 
     assert isinstance(indexer.top_k, TopK)
     assert indexer.top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
-    assert indexer.top_k.decode_implementation == TopKImplementation.CUDA_RADIX
+    assert indexer.top_k.decode_implementation == expected_decode
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
@@ -794,6 +822,7 @@ def _create_mock_metadata(
             self.num_contexts = num_contexts
             self.num_generations = num_generations
             self._num_seqs = num_contexts + num_generations
+            self.max_num_sequences = batch_size
             self.max_draft_tokens = max_draft_tokens
             self.num_sparse_topk = index_topk
             self.enable_indexer_skip = enable_indexer_skip
@@ -3369,6 +3398,11 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
     Indexer.prepare(metadata_skip)
     indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
     metadata_skip.indexer_prefill_chunks = None
+    indexer.top_k = TopK(
+        index_topk,
+        prefill_implementation=TopKImplementation.CUDA_RADIX,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+    )
 
     try:
         topk_indices_skip = indexer.sparse_attn_indexer(
@@ -3376,6 +3410,12 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
         )
     except Exception as e:
         raise RuntimeError(f"Indexer skip not available: {e}")
+
+    last_rows = torch.cumsum(metadata_skip.seq_lens[:batch_size], dim=0) - 1
+    torch.testing.assert_close(
+        indexer.top_k._gvr_prior_indices[:batch_size],
+        topk_indices_skip[last_rows],
+    )
 
     # Validation
     ## Custom vs fallback

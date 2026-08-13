@@ -310,7 +310,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             sparse_params.enable_heuristic_topk and get_sm_version() >= 100
         ):
             return
-        if self.kv_cache_manager is None or not self.num_sparse_topk:
+        if self.kv_cache_manager is None:
+            return
+        top_k = getattr(sparse_params, "index_topk", None)
+        if not top_k:
             return
         if self._indexer_compress_ratio > 1 and next_n > 1:
             return
@@ -322,7 +325,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             return
 
         warmup_cute_dsl_radix_topk_decode(
-            top_k=int(self.num_sparse_topk),
+            top_k=int(top_k),
             num_cols=int(self.get_indexer_max_seq_len()),
             next_n=next_n,
             dtype=_INDEXER_LOGITS_DTYPE,

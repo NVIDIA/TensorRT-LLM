@@ -1517,8 +1517,8 @@ class Indexer(nn.Module):
                 :num_ctx_tokens, :
             ]
 
-        # Chunked prefill is final only after its TP all-gathers; update GVR prior once here.
-        if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
+        # Update GVR state after chunk all-gathers or the dense-index copy.
+        if has_prefill:
             self.top_k.update_gvr_prior_from_prefill(
                 topk_indices_buffer[:num_ctx_tokens],
                 metadata.seq_lens[:num_contexts],
@@ -1716,6 +1716,7 @@ class Indexer(nn.Module):
                 next_n=next_n,
                 radix_indices=metadata.radix_aux_indices,
                 radix_values=metadata.radix_aux_logits,
+                request_capacity=metadata.max_num_sequences,
             )
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:

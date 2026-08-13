@@ -76,6 +76,7 @@ class TopK(nn.Module):
         next_n: int = 1,
         radix_indices: torch.Tensor | None = None,
         radix_values: torch.Tensor | None = None,
+        request_capacity: int | None = None,
     ) -> torch.Tensor:
         """Write prefill or decode Top-K indices into ``output_indices``."""
         if is_prefill:
@@ -91,6 +92,7 @@ class TopK(nn.Module):
             next_n,
             radix_indices,
             radix_values,
+            request_capacity,
         )
 
     def _forward_prefill(
@@ -129,6 +131,7 @@ class TopK(nn.Module):
         next_n: int,
         radix_indices: torch.Tensor | None,
         radix_values: torch.Tensor | None,
+        request_capacity: int | None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
@@ -141,6 +144,7 @@ class TopK(nn.Module):
                 next_n,
                 radix_indices,
                 radix_values,
+                request_capacity,
             )
 
         return self._forward_decode_radix(
@@ -198,9 +202,12 @@ class TopK(nn.Module):
         next_n: int,
         radix_indices: torch.Tensor | None,
         radix_values: torch.Tensor | None,
+        request_capacity: int | None,
     ) -> torch.Tensor:
         row_capacity = radix_indices.shape[0] if radix_indices is not None else scores.shape[0]
-        request_capacity = max(sequence_lengths.shape[0], row_capacity // next_n)
+        request_capacity = request_capacity or max(
+            sequence_lengths.shape[0], row_capacity // next_n
+        )
         self._ensure_gvr_buffers(scores, request_capacity, row_capacity)
 
         num_requests = sequence_lengths.shape[0]
@@ -250,8 +257,28 @@ class TopK(nn.Module):
         last_rows = (torch.cumsum(request_lengths, dim=0) - 1).to(dtype=torch.long)
         num_requests = request_lengths.shape[0]
         required_rows = request_offset + num_requests
-        if self._gvr_prior_indices.shape[0] < required_rows:
-            prior_indices = self._gvr_prior_indices.new_zeros((required_rows, self.top_k))
+        needs_resize = (
+            self._gvr_prior_indices.shape[0] < required_rows
+            or self._gvr_prior_indices.device != output_indices.device
+        )
+        if needs_resize:
+            decode_initialized = (
+                self._cuda_gvr_scratch.numel() > 0
+                if self.decode_implementation == TopKImplementation.CUDA_GVR
+                else self._gvr_row_order.numel() > 0
+            )
+            if decode_initialized or (
+                output_indices.is_cuda and torch.cuda.is_current_stream_capturing()
+            ):
+                raise RuntimeError(
+                    "GVR prior indices cannot be resized after decode initialization"
+                )
+            prior_capacity = max(required_rows, self._gvr_prior_indices.shape[0])
+            prior_indices = torch.zeros(
+                (prior_capacity, self.top_k),
+                dtype=torch.int32,
+                device=output_indices.device,
+            )
             prior_indices[: self._gvr_prior_indices.shape[0]].copy_(self._gvr_prior_indices)
             self._gvr_prior_indices = prior_indices
         self._gvr_prior_indices[request_offset : request_offset + num_requests].copy_(
@@ -264,22 +291,52 @@ class TopK(nn.Module):
         request_capacity: int,
         row_capacity: int,
     ) -> None:
-        """Grow persistent GVR buffers before CUDA Graph capture."""
-        if self._gvr_prior_indices.shape[0] < request_capacity:
-            prior_indices = self._gvr_prior_indices.new_zeros((request_capacity, self.top_k))
+        """Initialize fixed-address GVR buffers before CUDA Graph capture."""
+        needs_prior = (
+            self._gvr_prior_indices.shape[0] < request_capacity
+            or self._gvr_prior_indices.device != scores.device
+        )
+        needs_scratch = self.decode_implementation == TopKImplementation.CUDA_GVR and (
+            self._cuda_gvr_scratch.dtype != scores.dtype
+            or self._cuda_gvr_scratch.device != scores.device
+            or self._cuda_gvr_scratch.shape[0] < row_capacity
+        )
+        needs_row_order = self.decode_implementation == TopKImplementation.CUTE_DSL_GVR and (
+            self._gvr_row_order.device != scores.device
+            or self._gvr_row_order.shape[0] < request_capacity
+        )
+        needs_resize = needs_prior or needs_scratch or needs_row_order
+        decode_initialized = (
+            self._cuda_gvr_scratch.numel() > 0
+            if self.decode_implementation == TopKImplementation.CUDA_GVR
+            else self._gvr_row_order.numel() > 0
+        )
+        if needs_resize and (
+            decode_initialized or (scores.is_cuda and torch.cuda.is_current_stream_capturing())
+        ):
+            raise RuntimeError("GVR buffers cannot be resized after decode initialization")
+
+        if needs_prior:
+            prior_capacity = max(request_capacity, self._gvr_prior_indices.shape[0])
+            prior_indices = torch.zeros(
+                (prior_capacity, self.top_k),
+                dtype=torch.int32,
+                device=scores.device,
+            )
             prior_indices[: self._gvr_prior_indices.shape[0]].copy_(self._gvr_prior_indices)
             self._gvr_prior_indices = prior_indices
 
         if self.decode_implementation == TopKImplementation.CUDA_GVR:
-            if (
-                self._cuda_gvr_scratch.dtype != scores.dtype
-                or self._cuda_gvr_scratch.shape[0] < row_capacity
-            ):
+            if needs_scratch:
                 self._cuda_gvr_scratch = scores.new_empty((row_capacity, self.top_k))
             return
 
-        if self._gvr_row_order.shape[0] < request_capacity:
-            self._gvr_row_order = self._gvr_row_order.new_empty((request_capacity,))
+        if needs_row_order:
+            self._gvr_row_order = torch.empty(
+                (request_capacity,),
+                dtype=torch.int32,
+                device=scores.device,
+            )
         if self._num_sms == 0:
             self._num_sms = (
                 torch.cuda.get_device_properties(scores.device).multi_processor_count

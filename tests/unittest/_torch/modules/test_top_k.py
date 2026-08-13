@@ -4,6 +4,7 @@
 
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
@@ -248,3 +249,78 @@ def test_cuda_gvr_owns_scratch_and_updates_prior(monkeypatch) -> None:
     assert runtime_call.kwargs["pre_idx"].data_ptr() == top_k._gvr_prior_indices.data_ptr()
     assert runtime_call.kwargs["heuristic_scratch"].data_ptr() == top_k._cuda_gvr_scratch.data_ptr()
     assert top_k._gvr_prior_indices.tolist() == [[3, 1], [0, 0]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_gvr_buffers_use_scores_device_and_keep_addresses(monkeypatch) -> None:
+    decode = Mock(side_effect=lambda *args, **kwargs: args[2].zero_())
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUDA_GVR)
+    scores = torch.randn(2, 8, device="cuda")
+    lengths = torch.tensor([8, 8], dtype=torch.int32, device="cuda")
+    output = torch.empty(2, 2, dtype=torch.int32, device="cuda")
+    radix_indices = torch.empty(2, 10, 2, dtype=torch.int32, device="cuda")
+    radix_values = torch.empty(2, 10, 2, device="cuda")
+
+    pointers = None
+    for _ in range(2):
+        top_k(
+            scores,
+            output,
+            is_prefill=False,
+            sequence_lengths=lengths,
+            scan_lengths=lengths,
+            radix_indices=radix_indices,
+            radix_values=radix_values,
+            request_capacity=2,
+        )
+        current_pointers = (
+            top_k._gvr_prior_indices.data_ptr(),
+            top_k._cuda_gvr_scratch.data_ptr(),
+        )
+        if pointers is None:
+            pointers = current_pointers
+        else:
+            assert current_pointers == pointers
+        assert top_k._gvr_prior_indices.device == scores.device
+        assert top_k._cuda_gvr_scratch.device == scores.device
+
+
+def test_unsupported_prefill_implementation_raises() -> None:
+    top_k = TopK(1, prefill_implementation=TopKImplementation.CUTE_DSL_RADIX)
+
+    with pytest.raises(NotImplementedError, match="does not support prefill Top-K"):
+        top_k(
+            torch.ones(1, 1),
+            torch.empty(1, 1, dtype=torch.int32),
+            is_prefill=True,
+            row_starts=torch.zeros(1, dtype=torch.int32),
+            row_ends=torch.ones(1, dtype=torch.int32),
+        )
+
+
+def test_gvr_buffers_cannot_grow_after_decode_initialization(monkeypatch) -> None:
+    decode = Mock(side_effect=lambda *args, **kwargs: args[2].zero_())
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
+    top_k = TopK(2, decode_implementation=TopKImplementation.CUDA_GVR)
+    scores = torch.randn(1, 8)
+    lengths = torch.tensor([8], dtype=torch.int32)
+
+    top_k(
+        scores,
+        torch.empty(1, 2, dtype=torch.int32),
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+        request_capacity=1,
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be resized"):
+        top_k(
+            scores,
+            torch.empty(1, 2, dtype=torch.int32),
+            is_prefill=False,
+            sequence_lengths=lengths,
+            scan_lengths=lengths,
+            request_capacity=2,
+        )
