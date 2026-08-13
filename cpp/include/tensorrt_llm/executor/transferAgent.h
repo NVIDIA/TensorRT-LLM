@@ -251,9 +251,8 @@ struct VramRegionMeta
     size_t chunkSize; ///< 0 = cudaMalloc (no split), >0 = VMM chunk size
 };
 
-// `AgentDesc` represents the unique identifier for reading and writing to the agent.
-// By accessing this identifier, the backend can establish the correct connection.
-// It also carries VMM region metadata so that remote agents can split at chunk boundaries.
+// `AgentDesc` carries the backend metadata needed to connect to an agent, plus optional
+// backend-independent metadata used by higher-level transfer paths.
 class AgentDesc final
 {
 public:
@@ -262,9 +261,10 @@ public:
     {
     }
 
-    AgentDesc(std::string backendAgentDesc, std::vector<VramRegionMeta> vramRegions)
+    AgentDesc(std::string backendAgentDesc, std::vector<VramRegionMeta> vramRegions, std::string bounceHandshake = {})
         : mBackendAgentDesc{std::move(backendAgentDesc)}
         , mVramRegions{std::move(vramRegions)}
+        , mBounceHandshake{std::move(bounceHandshake)}
     {
     }
 
@@ -278,7 +278,18 @@ public:
         return mVramRegions;
     }
 
-    /// Serialize the entire AgentDesc (backend blob + VMM regions) into an opaque string.
+    /// Optional NIXL-bounce capability handshake advertised by this agent.
+    /// An opaque blob encoded/decoded by bounce::encodeHandshake/decodeHandshake: wire version,
+    /// control-channel kind + endpoint, and effective region-size limits. It is empty when bounce is
+    /// disabled. A caller must exchange the complete serialized AgentDesc, rather than only
+    /// getBackendAgentDesc(), for the peer to receive this handshake.
+    [[nodiscard]] std::string const& getBounceHandshake() const noexcept
+    {
+        return mBounceHandshake;
+    }
+
+    /// Serialize the entire AgentDesc (backend blob + VMM regions + bounce handshake) into an
+    /// opaque string.
     [[nodiscard]] std::string serialize() const;
 
     /// Deserialize an opaque string back into an AgentDesc.
@@ -287,6 +298,7 @@ public:
 private:
     std::string mBackendAgentDesc;
     std::vector<VramRegionMeta> mVramRegions;
+    std::string mBounceHandshake;
 };
 
 // `TransferOp` is an enumeration that represents the types of transfer operations.
@@ -416,8 +428,8 @@ public:
     /// @return The descriptor of the local agent.
     virtual AgentDesc getLocalAgentDesc() = 0;
 
-    /// @brief Fetch the descriptor of the local agent.
-    /// @return The descriptor of the local agent.
+    /// @brief Fetch the backend-specific connection information for the local agent.
+    /// @return The local connection information. Optional AgentDesc metadata is not included.
     virtual ConnectionInfoType getLocalConnectionInfo() = 0;
 
     /// @brief Initiate the transfer by submitting the request.

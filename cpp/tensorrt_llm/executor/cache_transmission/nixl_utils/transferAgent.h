@@ -28,6 +28,14 @@
 namespace tensorrt_llm::executor::kv_cache
 {
 
+namespace bounce
+{
+// Pimpl holding the bounce v2 transport + its pools/engine/channel. Defined only in the .cpp
+// (and only when built with TLLM_BOUNCE_V2 / ENABLE_UCX); the member below is always present so
+// the NixlTransferAgent layout is identical across all translation units.
+struct NixlBounceState;
+} // namespace bounce
+
 struct NixlHelper
 {
     [[nodiscard]] static nixl_mem_t convert(MemoryType type);
@@ -113,7 +121,23 @@ public:
 
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
+    /// Whether the bounce v2 transport is active on this agent (built + enabled + init succeeded).
+    /// Programmatic alternative to grepping logs (deployment checks and tests).
+    [[nodiscard]] bool isBounceEnabled() const noexcept
+    {
+        return mBounce != nullptr;
+    }
+
+    /// Number of transfer requests routed to the bounce fast path so far.
+    [[nodiscard]] std::uint64_t getBounceSubmitCount() const noexcept
+    {
+        return mBounceSubmitCount.load(std::memory_order_relaxed);
+    }
+
 private:
+    /// Counts requests admitted by shouldUseBounce (see getBounceSubmitCount).
+    std::atomic<std::uint64_t> mBounceSubmitCount{0};
+
     // shared_ptr so outstanding NixlTransferStatus (via weak_ptr) can detect agent reset.
     std::shared_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};
@@ -135,6 +159,15 @@ private:
     /// Remote VMM region info (from loadRemoteAgent). Keyed by {agentName → {addr → info}}.
     /// Per-agent maps because different remote agents may have overlapping virtual addresses.
     std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
+
+    /// Bounce v2 transport (opt-in via TRTLLM_NIXL_BOUNCE_ENABLE). Null unless enabled & built;
+    /// when null the agent behaves exactly as before. See bounce/DESIGN.md.
+    std::unique_ptr<bounce::NixlBounceState> mBounce;
+
+    /// Lazily create the bounce transport (ctor, before any metadata exchange) when enabled.
+    void maybeInitBounce();
+    /// Heuristic gate: is this request eligible for the bounce fast path?
+    [[nodiscard]] bool shouldUseBounce(TransferRequest const& request) const;
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent
