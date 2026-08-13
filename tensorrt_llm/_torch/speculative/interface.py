@@ -599,10 +599,6 @@ class SpecMetadata:
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
-    # Whether top-k/top-p/temperature are globally disabled for the current batch.
-    skip_temperature: bool = False
-    skip_top_k: bool = False
-    skip_top_p: bool = False
     # Pre-computed top_k_max scalar (CPU-side) to avoid CUDA-graph-incompatible
     # dynamic boolean tensor indexing inside verify_dynamic_tree_rejection_from_logits_out.
     top_k_max: int = 0
@@ -812,10 +808,7 @@ class SpecMetadata:
                 top_p=top_p,
                 use_beam_search=False)
 
-            use_temperature = (not is_greedy
-                               and temperature not in (None, 0, 1))
             use_top_k = not is_greedy and top_k is not None and top_k > 0
-            use_top_p = not is_greedy and top_p is not None and top_p < 1.0
 
             normalized_temperature = (DISABLE_TEMP_VAL
                                       if is_greedy or temperature is None
@@ -828,17 +821,11 @@ class SpecMetadata:
                 normalized_temperature,
                 normalized_top_k,
                 normalized_top_p,
-                use_temperature,
-                use_top_k,
-                use_top_p,
                 is_greedy,
             )
 
         # Phase 1: collect per-request flags and normalized values.
         per_request_normalized: list[tuple[float, int, float, int]] = []
-        temperature_enabled = False
-        top_k_enabled = False
-        top_p_enabled = False
         has_non_greedy_requests = False
         per_request_slot_ids: list[int] = []
 
@@ -855,9 +842,6 @@ class SpecMetadata:
                 temp_val,
                 tk_val,
                 tp_val,
-                use_temperature,
-                use_top_k,
-                use_top_p,
                 is_greedy,
             ) = _normalize_request_sampling_params(
                 temperature=temp_val,
@@ -865,9 +849,6 @@ class SpecMetadata:
                 top_p=tp_val,
             )
 
-            temperature_enabled |= use_temperature
-            top_k_enabled |= use_top_k
-            top_p_enabled |= use_top_p
             has_non_greedy_requests |= not is_greedy
 
             per_request_normalized.append(
@@ -881,13 +862,10 @@ class SpecMetadata:
                 request.py_seq_slot if request.
                 py_seq_slot is not None else self.dummy_slot_row)
 
-        self.skip_temperature = not temperature_enabled
-        self.skip_top_k = not top_k_enabled
-        self.skip_top_p = not top_p_enabled
         # Used in the CUDA graph key to pick the argmax / advanced variant.
-        # All-greedy iff EVERY request is greedy. Derived from per-request
-        # greediness, not from the skip_* filter flags (a non-greedy request may
-        # enable no filter, e.g. temperature=1.0 with top_k/top_p unset).
+        # All-greedy iff EVERY request is greedy -- note a non-greedy request
+        # may still enable no filter (e.g. temperature=1.0 with top_k/top_p
+        # unset), so this cannot be derived from which filters are in use.
         self.is_all_greedy_sample = not has_non_greedy_requests
 
         # Warmup-time override: force the advanced-sampling path so the CUDA
@@ -895,9 +873,6 @@ class SpecMetadata:
         # warmup requests carry no sampling params, so substitute synthetic
         # non-greedy scalars to populate the GPU buffers.
         if getattr(self, '_force_non_greedy_for_capture', False):
-            self.skip_temperature = False
-            self.skip_top_k = False
-            self.skip_top_p = False
             self.is_all_greedy_sample = False
             per_request_normalized = [
                 (0.7, 50, 0.9, num_tokens)
@@ -1745,15 +1720,13 @@ class SpecWorkerBase(nn.Module, ABC):
             gen_end = num_contexts + num_gen_logits
 
             temperatures = spec_metadata.temperatures[gen_start:gen_end]
-            # Pass None instead of an all-disabled tensor so the C++ op can short-circuit
-            # on a host-side check rather than a `.item<bool>()` sync, which would break
-            # CUDA graph capture.
-            top_ks = (None if spec_metadata.skip_top_k else
-                      spec_metadata.top_ks[gen_start:gen_end])
-            top_ps = (None if spec_metadata.skip_top_p else
-                      spec_metadata.top_ps[gen_start:gen_end])
+            # A filter the mode disables becomes None, which lets the C++ op
+            # short-circuit on a host-side check rather than an
+            # `.item<bool>()` sync that would break CUDA graph capture.
             top_ks, top_ps = resolve_advanced_sampling_filters(
-                spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+                spec_metadata.advanced_sampling_mode,
+                spec_metadata.top_ks[gen_start:gen_end],
+                spec_metadata.top_ps[gen_start:gen_end])
 
             target_probs_flat = compute_probs_from_logits(
                 gen_logits, temperatures, top_ks, top_ps)
