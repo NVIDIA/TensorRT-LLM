@@ -19,7 +19,9 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/heuristicTopKDecode.h"
+#include "tensorrt_llm/kernels/indexerTopKHist.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
 #include <algorithm>
 #include <cfloat>
@@ -894,6 +896,39 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 {
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
+
+    // ------------------------------------------------------------------------
+    // Optional ported coarse-histogram selection-only decode top-k (env-gated).
+    // TRTLLM_DSA_TOPK_HIST=1 routes fp32 decode through the ported
+    // TopKCluster<8> / Register4 / Streaming small-batch kernel when the shape
+    // is supported (topK in {512,1024,2048}, unit inner stride, compressRatio in
+    // {1,4}). Output is drop-in compatible with the stock split/merge path: int32
+    // local indices, width topK, -1 padded. When the env is UNSET this block is a
+    // no-op and the behavior below is byte-identical to stock.
+    // ------------------------------------------------------------------------
+    {
+        static std::once_flag sHistOnceFlag;
+        static bool sHistEnabled = false;
+        std::call_once(sHistOnceFlag,
+            []()
+            {
+                char const* env = std::getenv("TRTLLM_DSA_TOPK_HIST");
+                sHistEnabled = (env != nullptr && env[0] == '1');
+                if (sHistEnabled)
+                {
+                    // One-time arming notice (also the signal the unit test asserts on).
+                    TLLM_LOG_INFO(
+                        "TRTLLM_DSA_TOPK_HIST=1: routing supported fp32 DSA indexer decode "
+                        "top-k through the ported coarse-histogram kernel.");
+                }
+            });
+        if (sHistEnabled && stride1 == 1 && indexerTopKDecodeHistSupported(numRows, topK, stride1, compressRatio))
+        {
+            invokeIndexerTopKDecodeHist(logits, seqLens, indices, numRows, numColumns, stride0, next_n, topK,
+                compressRatio, tensorrt_llm::common::getEnvEnablePDL(), stream);
+            return;
+        }
+    }
 
     // ========================================================================
     // Small-N dispatch axis.
