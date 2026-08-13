@@ -53,7 +53,13 @@ parser.add_argument(
 parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
 parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
-parser.add_argument("--moe-backend-for-prefill", type=str, choices=["CUTLASS", "DEEPGEMM"])
+# No choices= here, for the same reason --moe-backend above has none: both values reach
+# the same Runner(moe_backend=...) and end up in MoeConfig.backend, whose Literal is the
+# authoritative list and rejects anything invalid with a clear pydantic error. A second
+# list here can only drift from that one, and it did -- it accepted two of the eleven
+# values MoeConfig allows, excluding TRTLLM and CUTEDSL, both of which this file's own
+# runner.py names as supported in replace_routing_method_ctx.
+parser.add_argument("--moe-backend-for-prefill", type=str)
 parser.add_argument("--moe-max-num-tokens", type=int)
 group = parser.add_mutually_exclusive_group()
 group.add_argument(
