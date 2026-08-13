@@ -99,6 +99,13 @@ if TYPE_CHECKING:
 _UNBOUNDED_STATS_MAX_LEN = -1
 
 
+class _ADPForwardIntent(IntEnum):
+    # MAX reduction gives context precedence when ADP ranks have mixed work.
+    NONE = 0
+    GENERATION = 1
+    CONTEXT = 2
+
+
 def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
@@ -585,8 +592,12 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
-        self._enable_dsv4_adp_dummy_fixes = getattr(
-            model_engine, "_enable_dsv4_adp_dummy_fixes", False)
+        self._enable_adp_dummy_fixes = getattr(model_engine,
+                                               "_enable_adp_dummy_fixes", False)
+        self._enable_scheduler_aware_adp_dummy = getattr(
+            model_engine, "_enable_scheduler_aware_adp_dummy", False)
+        self._enable_non_overlap_adp_forward_intent = getattr(
+            model_engine, "_enable_non_overlap_adp_forward_intent", False)
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
@@ -743,8 +754,8 @@ class PyExecutor:
         # lifted to _handle_kv_transfer_timeouts_synced / _flush_iter_stats_synced.
         self._pending_timed_out_requests: List[LlmRequest] = []
         self._pending_iter_stats_dict: Optional[Dict] = None
-        # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
-        # updated from observed request types.
+        # Legacy ADP dummy role for overlap and PP fallback paths. The generic
+        # non-overlap path derives its role from fresh per-iteration intent.
         self._adp_dummy_is_gen: bool = True
         # Dummy allocated by the current scheduling iteration. It is committed
         # to the normal forward/termination lifecycle only after every ADP rank
@@ -5383,7 +5394,8 @@ class PyExecutor:
             all_new_flat = [
                 req for reqs in all_ranks_new_requests.values() for req in reqs
             ]
-            self._update_adp_dummy_role(all_new_flat)
+            if not self._enable_non_overlap_adp_forward_intent:
+                self._update_adp_dummy_role(all_new_flat)
 
             # Update per-rank counter for DP
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
@@ -6268,31 +6280,56 @@ class PyExecutor:
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
-        The non-PP DeepSeek-V4 disaggregated ADP path mirrors the decoder
-        scheduler's state window [CONTEXT_INIT, GENERATION_TO_COMPLETE). This
-        covers generation-first context requests below the lower bound and
-        terminal requests at the upper bound. Other configurations retain the
-        established ADP behavior; PP eligibility remains follow-up scope.
+        The non-PP disaggregated ADP path uses the scheduler's state-
+        eligibility contract. This keeps decoder-only and encoder-decoder
+        boundaries and special exclusions aligned without duplicating them
+        here. PP eligibility remains follow-up scope.
 
         Returns:
             The number of active requests eligible for scheduling.
         """
-        if (not self._enable_dsv4_adp_dummy_fixes
+        if (not self._enable_scheduler_aware_adp_dummy
                 or self.kv_cache_transceiver is None):
             if self.kv_cache_transceiver is None:
                 return len(self.active_requests)
 
+            # PP intentionally preserves its established ADP padding behavior
+            # until its dummy lifecycle is generalized. Keep this fallback on
+            # semantic request properties so enum reordering cannot silently
+            # change which transfer states it excludes.
             return sum(
                 1 for req in self.active_requests
                 if not (req.is_disagg_generation_init_state
                         or req.is_disagg_generation_transmission_in_progress))
 
-        schedule_from_value = LlmRequestState.CONTEXT_INIT.value
-        to_complete_value = LlmRequestState.GENERATION_TO_COMPLETE.value
+        return sum(1 for req in self.active_requests
+                   if self.scheduler.is_request_in_schedulable_state(req))
 
-        return sum(
-            1 for req in self.active_requests
-            if schedule_from_value <= req.state_value < to_complete_value)
+    def _get_non_overlap_adp_forward_intent(
+            self) -> tuple[int, _ADPForwardIntent]:
+        """Return local eligible-real count and fresh TP-wide forward role.
+
+        This runs before capacity scheduling so the result is forward intent,
+        not a guarantee that every eligible request will be admitted. The
+        post-schedule queue vote commits or rolls back the tentative dummy.
+        """
+        local_schedulable_count = 0
+        local_intent = _ADPForwardIntent.NONE
+        for request in self.active_requests:
+            if (request.is_attention_dp_dummy or
+                    not self.scheduler.is_request_in_schedulable_state(request)
+                ):
+                continue
+
+            local_schedulable_count += 1
+            if request.is_encoder_init_state or request.is_context_init_state:
+                local_intent = _ADPForwardIntent.CONTEXT
+            elif local_intent == _ADPForwardIntent.NONE:
+                local_intent = _ADPForwardIntent.GENERATION
+
+        global_intent = self.dist.tp_allreduce(int(local_intent),
+                                               op=ReduceOp.MAX)
+        return local_schedulable_count, _ADPForwardIntent(global_intent)
 
     def _has_adp_dummy_kv_capacity(self,
                                    token_nums: Optional[List[int]]) -> bool:
@@ -6406,8 +6443,18 @@ class PyExecutor:
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
             return
 
-        needs_dummy = (expected_num_active_requests > 0
-                       and num_active_request == 0)
+        if (self._enable_non_overlap_adp_forward_intent
+                and self.kv_cache_transceiver is not None):
+            num_active_request, global_intent = (
+                self._get_non_overlap_adp_forward_intent())
+            if global_intent != _ADPForwardIntent.NONE:
+                self._adp_dummy_is_gen = (
+                    global_intent == _ADPForwardIntent.GENERATION)
+            needs_dummy = (global_intent != _ADPForwardIntent.NONE
+                           and num_active_request == 0)
+        else:
+            needs_dummy = (expected_num_active_requests > 0
+                           and num_active_request == 0)
         if not needs_dummy:
             return
 
@@ -6440,7 +6487,7 @@ class PyExecutor:
                 key="attention_dp_dummy_insufficient_kv_capacity")
             return
 
-        if (not self._enable_dsv4_adp_dummy_fixes
+        if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
@@ -6475,9 +6522,8 @@ class PyExecutor:
         except OutOfPagesError:
             dummy_requests = None
         if not dummy_requests:
-            logger.warning(
-                "Cannot allocate DeepSeek-V4 ADP pad dummy; rank schedules "
-                "an empty batch and the fleet will retry.")
+            logger.warning("Cannot allocate ADP pad dummy; rank schedules "
+                           "an empty batch and the fleet will retry.")
             return
 
         dummy_request = dummy_requests[0]
