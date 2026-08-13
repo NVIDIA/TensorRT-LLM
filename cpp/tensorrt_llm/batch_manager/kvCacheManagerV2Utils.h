@@ -103,6 +103,13 @@ CUresult copyHostToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks
 CUresult copyDeviceToHost(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
 CUresult copyDeviceToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
 
+//! Gathers canonical base-page rows selected by copyIndex into a dense host tensor.
+void gatherBasePageRows(
+    at::Tensor const& source, at::Tensor destination, at::Tensor const& copyIndex, SizeType32 numBlocks);
+
+//! Copies plane-0 base-page rows between contiguous 4-D host and device tables.
+void copyBasePageRowsToDevice(ITensor const& input, ITensor& output, SizeType32 numRows, CUstream stream);
+
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
     ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;
 
