@@ -3,23 +3,28 @@ import os as _os
 import defs.cpp.cpp_common as _cpp
 import pytest
 
+_TEST_GROUP_DIRS = {
+    "executor_bounce": "executor/bounce",
+}
+
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
 @pytest.mark.parametrize("test_group", [
-    "batch_manager", "common", "executor", "kernels", "layers", "runtime",
-    "thop"
+    "batch_manager", "common", "executor", "executor_bounce", "kernels",
+    "layers", "runtime", "thop"
 ])
 def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
 
     xml_name = f"results-unit-tests-{test_group}.xml"
+    test_group_dir = _TEST_GROUP_DIRS.get(test_group, test_group)
 
     # Discover and run the actual gtests
     ctest_command = [
         "ctest",
         "--output-on-failure",
         "--test-dir",
-        f"{build_dir}/tests/unit_tests/{test_group}",
+        f"{build_dir}/tests/unit_tests/{test_group_dir}",
         "--output-junit",
         f"{build_dir}/{xml_name}",
     ]
