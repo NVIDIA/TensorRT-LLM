@@ -48,3 +48,20 @@ target_sources(gatherScatterKernelTest
 # GPU test: shared data-arena alloc / address mapping / shutdown.
 add_gtest(bounceArenaTest bounceArenaTest.cpp)
 target_sources(bounceArenaTest PRIVATE ${BOUNCE_DIR}/BounceArena.cpp)
+
+# ---- Control-plane unit test — needs only zmq (+ the fetched cppzmq header),
+# no NIXL. ZMQ_FOUND is reused by the real-NIXL block below. ----
+find_package(PkgConfig)
+if(PKG_CONFIG_FOUND)
+  pkg_check_modules(ZMQ libzmq)
+endif()
+if(ZMQ_FOUND AND EXISTS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+  add_gtest(zmqControlChannelTest zmqControlChannelTest.cpp)
+  target_sources(
+    zmqControlChannelTest PRIVATE ${BOUNCE_DIR}/ZmqControlChannel.cpp
+                                  ${BOUNCE_DIR}/BounceMessage.cpp)
+  target_include_directories(
+    zmqControlChannelTest PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
+                                  ${ZMQ_INCLUDE_DIRS})
+  target_link_libraries(zmqControlChannelTest PRIVATE ${ZMQ_LIBRARIES})
+endif()
