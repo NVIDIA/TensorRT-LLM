@@ -358,6 +358,10 @@ llm_perf_core:
 
 # 10c: B200, B300 test cases
 - condition:
+    wildcards:
+      gpu:
+      - 'b200*'
+      - 'b300*'
     ranges:
       system_gpu_count:
         gte: 8
