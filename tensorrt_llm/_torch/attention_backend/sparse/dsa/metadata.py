@@ -152,6 +152,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.use_cute_dsl_topk = (
             sparse_metadata_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
         )
+        self.enable_gvr_topk = (
+            sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
+        )
         capture_graph = self.is_cuda_graph
         # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
         # metadata params carry the model-specific compression ratios.
@@ -312,7 +315,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             return
         if self.kv_cache_manager is None:
             return
-        top_k = getattr(sparse_params, "index_topk", None)
+        top_k = self.sparse_mla_topk
         if not top_k:
             return
         if self._indexer_compress_ratio > 1 and next_n > 1:
@@ -515,37 +518,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             pin_memory=prefer_pinned(),
         )
 
-    def _create_radix_aux_buffers(self, capture_graph=False):
-        # Persistent scratch for Radix-split-work indexer path (blocks_per_row > 1).
-        # Mirrors the fix the Heuristic path applied: per-call th::empty inside
-        # indexer_topk_decode produces stale pointers under CUDA Graph replay when
-        # the caching allocator is perturbed by chunked prefill at high CONC.
-        # Sized to the worst case kMaxBlocksPerRowDecode=10 from
-        # cpp/tensorrt_llm/kernels/indexerTopK.cu, times the max number of
-        # generation rows (num_seqs * (1 + max_draft_tokens)); the cpp op aborts
-        # if this is smaller than num_rows*blocks_per_row*index_topk. Allocated
-        # unconditionally: even with enable_heuristic_topk=True the dispatcher can
-        # fall back to Radix when canUseHeuristic returns False (small numColumns,
-        # etc.). MUST be re-created whenever max_draft_tokens changes (see
-        # update_spec_dec_param) or it is left too small once MTP raises the
-        # generation-row count.
-        _radix_max_blocks_per_row = 10
-        _radix_max_gen_tokens = self.max_num_sequences * (1 + self.max_draft_tokens)
-        self.radix_aux_indices = self.get_empty(
-            self.cuda_graph_buffers,
-            (_radix_max_gen_tokens, _radix_max_blocks_per_row, self.num_sparse_topk),
-            cache_name="radix_aux_indices",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.radix_aux_logits = self.get_empty(
-            self.cuda_graph_buffers,
-            (_radix_max_gen_tokens, _radix_max_blocks_per_row, self.num_sparse_topk),
-            cache_name="radix_aux_logits",
-            dtype=torch.float32,
-            capture_graph=capture_graph,
-        )
-
     def create_buffers_for_indexer(self, capture_graph=False):
         sparse_metadata_params = self.sparse_metadata_params
         if not isinstance(sparse_metadata_params, DSAMetadataParams):
@@ -742,11 +714,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 device="cpu",
                 pin_memory=prefer_pinned(),
             )
-        # Persistent scratch for the Radix-split-work indexer path. Re-created
-        # in update_spec_dec_param when max_draft_tokens changes so it stays
-        # large enough for the MTP generation-row count.
-        self._create_radix_aux_buffers(capture_graph=capture_graph)
-
+        if self.enable_gvr_topk:
+            self.gvr_prior_indices = self.get_empty(
+                self.cuda_graph_buffers,
+                (
+                    self.kv_cache_manager.num_local_layers,
+                    self.max_num_sequences,
+                    self.num_sparse_topk,
+                ),
+                cache_name="gvr_prior_indices",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            self.gvr_prior_indices.zero_()
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
@@ -854,13 +834,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
             self.create_expanded_buffers(capture_graph=capture_graph)
-            # The Radix-split-work scratch (radix_aux_*) is sized the same way
-            # (num_seqs * (1 + max_draft_tokens) rows) and is allocated
-            # unconditionally, so it must be resized here too -- otherwise the
-            # cpp indexer_topk_decode op aborts once MTP raises max_draft_tokens
-            # ("radix_aux_* must hold at least num_rows*blocks_per_row*index_topk
-            # elements").
-            self._create_radix_aux_buffers(capture_graph=capture_graph)
 
     def _update_indexer_k_cache_block_offsets(self) -> torch.Tensor:
         """Refresh INDEX_KEY offsets and return their physical pool slots."""

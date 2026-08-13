@@ -1354,6 +1354,10 @@ class Indexer(nn.Module):
         num_tokens = metadata.num_tokens
 
         num_gen_tokens = num_tokens - num_ctx_tokens
+        gvr_prior_indices = None
+        if self._enable_heuristic_topk:
+            local_layer = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
+            gvr_prior_indices = metadata.gvr_prior_indices[local_layer]
         if is_generation is None:
             has_prefill = num_contexts > 0
             has_decode = num_generations > 0
@@ -1522,6 +1526,7 @@ class Indexer(nn.Module):
             self.top_k.update_gvr_prior_from_prefill(
                 topk_indices_buffer[:num_ctx_tokens],
                 metadata.seq_lens[:num_contexts],
+                gvr_prior_indices,
                 request_offset=num_generations,
             )
 
@@ -1714,15 +1719,28 @@ class Indexer(nn.Module):
                 sequence_lengths=gen_kv_lens_cuda,
                 scan_lengths=scan_lengths,
                 next_n=next_n,
-                radix_indices=metadata.radix_aux_indices,
-                radix_values=metadata.radix_aux_logits,
-                request_capacity=metadata.max_num_sequences,
+                gvr_prior_indices=(
+                    gvr_prior_indices[:num_generations] if gvr_prior_indices is not None else None
+                ),
             )
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
             # Fill topk_indices_buffer with pre-defined dense topk indices
             topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
                 metadata.topk_indices_buffer[num_ctx_tokens:num_tokens, :]
+            )
+
+        if (
+            gvr_prior_indices is not None
+            and has_decode
+            and (reuse_topk or metadata.skip_indexer_for_gen_reqs)
+        ):
+            next_n = num_gen_tokens // num_generations
+            # Keep bypassed decode results as the next GVR prior; MTP reuse holds the accepted row.
+            gvr_prior_indices[:num_generations].copy_(
+                topk_indices_buffer[token_offset : token_offset + num_gen_tokens][
+                    next_n - 1 :: next_n
+                ]
             )
 
         if self.mtp_index_share and metadata.in_mtp_draft_loop and not reuse_topk:

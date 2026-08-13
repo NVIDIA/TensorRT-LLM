@@ -143,10 +143,10 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
     metadata = SimpleNamespace(
         sparse_metadata_params=SimpleNamespace(
             enable_heuristic_topk=enable_heuristic,
-            index_topk=384,
         ),
         use_cute_dsl_topk=use_cute_dsl,
         num_sparse_topk=512,
+        sparse_mla_topk=384,
         kv_cache_manager=SimpleNamespace(),
         _indexer_compress_ratio=compress_ratio,
         get_indexer_max_seq_len=Mock(return_value=32768),
@@ -202,11 +202,11 @@ def test_shared_topk_lifecycle():
     metadata.kv_cache_manager = SimpleNamespace(max_blocks_per_seq=2)
     metadata.enable_context_mla_with_cached_kv = False
     metadata.enable_indexer_skip = False
+    metadata.enable_gvr_topk = False
     metadata.get_empty = Mock(
         side_effect=lambda _, shape, **kwargs: torch.empty(tuple(shape), dtype=kwargs["dtype"])
     )
     metadata._create_kv_lens_2d_buffer = Mock()
-    metadata._create_radix_aux_buffers = Mock()
     metadata.create_expanded_buffers = Mock()
 
     with patch(
@@ -3081,14 +3081,6 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
             max_draft_tokens=md,
         )
         Indexer.prepare(meta0)
-        # indexer_topk_decode needs caller-owned radix aux buffers for small gen batches.
-        _radix_bp = 10
-        meta0.radix_aux_indices = torch.zeros(
-            (step0_tokens, _radix_bp, index_topk), device="cuda", dtype=torch.int32
-        )
-        meta0.radix_aux_logits = torch.zeros(
-            (step0_tokens, _radix_bp, index_topk), device="cuda", dtype=torch.float32
-        )
     else:  # context: first gen round -- step 0 runs the context/prefill path.
         step0_tokens = kv_lens.sum().item()
         meta0 = _create_mock_metadata(
@@ -3403,6 +3395,12 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
         prefill_implementation=TopKImplementation.CUDA_RADIX,
         decode_implementation=TopKImplementation.CUTE_DSL_GVR,
     )
+    indexer._enable_heuristic_topk = True
+    metadata_skip.gvr_prior_indices = torch.zeros(
+        (cache_manager.num_local_layers, batch_size, index_topk),
+        device="cuda",
+        dtype=torch.int32,
+    )
 
     try:
         topk_indices_skip = indexer.sparse_attn_indexer(
@@ -3412,8 +3410,9 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
         raise RuntimeError(f"Indexer skip not available: {e}")
 
     last_rows = torch.cumsum(metadata_skip.seq_lens[:batch_size], dim=0) - 1
+    local_layer = cache_manager.layer_offsets[layer_idx]
     torch.testing.assert_close(
-        indexer.top_k._gvr_prior_indices[:batch_size],
+        metadata_skip.gvr_prior_indices[local_layer, :batch_size],
         topk_indices_skip[last_rows],
     )
 
