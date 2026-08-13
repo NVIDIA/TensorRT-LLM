@@ -293,11 +293,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
             total_blocks = (req.prompt_len + tpb - 1) // tpb
-            if block_ids.size > total_blocks:
-                block_ids = block_ids[:total_blocks]
             window_size = lg.sliding_window_size
 
             if window_size is not None:
+                # SWA block lists are ordered from the oldest valid prompt
+                # block to the speculative scratch tail. Remove the
+                # uninitialized scratch blocks before trimming stale prompt
+                # blocks; otherwise a boundary-crossing draft allocation can
+                # make us retain scratch and discard initialized prompt KV.
+                allocated_blocks = (
+                    req.prompt_len + self._kv_cache_manager.num_extra_kv_tokens + tpb - 1
+                ) // tpb
+                scratch_blocks = max(0, allocated_blocks - total_blocks)
+                if scratch_blocks > 0:
+                    assert req.py_beam_width == 1, (
+                        "speculative scratch blocks require beam_width == 1"
+                    )
+                    block_ids = (
+                        block_ids[:-scratch_blocks]
+                        if scratch_blocks < block_ids.size
+                        else np.array([], dtype=np.int64)
+                    )
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = max(0, total_blocks - stale_end)
@@ -307,7 +323,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # stale region (those blocks were already pruned, no extra skip).
                 cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
             else:
-                total_blocks = (req.prompt_len + tpb - 1) // tpb
+                if block_ids.size > total_blocks:
+                    block_ids = block_ids[:total_blocks]
                 expected_valid = total_blocks
                 cache_skip = cached_per_lg[idx] // tpb
 
