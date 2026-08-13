@@ -651,6 +651,29 @@ def test_collect_llm_api_config_captures_transceiver_runtime_categorical():
         assert meta["capture_succeeded"] is True
 
 
+def test_collect_llm_api_config_captures_agent_buffer_enable():
+    """agent_buffer_enable capture covers every state.
+
+    A plain Optional[bool] value field: True, False, and unset/None must all be
+    captured as-is.
+    """
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+
+    for enable in (True, False, None):
+        args = TorchLlmArgs(
+            model="/customer/private/Llama",
+            skip_tokenizer_init=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", agent_buffer_enable=enable
+            ),
+        )
+
+        config, meta = _loads_payloads(args)
+
+        assert config["cache_transceiver_config.agent_buffer_enable"] == enable
+        assert meta["capture_succeeded"] is True
+
+
 def test_collect_llm_api_config_redacts_out_of_allowlist_categorical_str():
     """An out-of-allowlist value on a categorical bare-str field is dropped.
 

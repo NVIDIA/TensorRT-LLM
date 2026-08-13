@@ -91,6 +91,7 @@ class NixlTransferAgent(BaseTransferAgent):
         num_threads: int = 1,
         rank: int | None = None,
         world_size: int | None = None,
+        agent_buffer_enable: bool | None = None,
         **kwargs,
     ):
         """
@@ -100,7 +101,14 @@ class NixlTransferAgent(BaseTransferAgent):
         :param num_workers: Specify number of threads for the supported multi-threaded backends.
         :param rank: Process rank, used only to keep the shared agent interface consistent.
         :param world_size: Process count, used only to keep the shared agent interface consistent.
+        :param agent_buffer_enable: Accepted for interface consistency; the Python nixl-library
+            agent has no staging-buffer (bounce) support, so an explicit True is ignored with a
+            warning.
         """
+        if agent_buffer_enable:
+            logger.warning(
+                "agent_buffer_enable is not supported by the Python nixl-library agent; ignoring"
+            )
         if (rank is None) != (world_size is None):
             raise ValueError("rank and world_size must be specified together")
         if rank is not None:

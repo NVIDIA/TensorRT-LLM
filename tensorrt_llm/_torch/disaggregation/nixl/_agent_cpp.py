@@ -84,6 +84,7 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         enable_telemetry: bool = False,
         rank: int | None = None,
         world_size: int | None = None,
+        agent_buffer_enable: bool | None = None,
         **kwargs,
     ):
         backend_params = kwargs
@@ -116,6 +117,7 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             backend_params=backend_params,
             rank=rank,
             world_size=world_size,
+            agent_buffer_enable=agent_buffer_enable,
         )
         self._cpp_agent = CppNixlTransferAgent(config)
         self.name = name
