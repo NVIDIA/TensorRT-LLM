@@ -16,6 +16,8 @@
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 
 class TestTelemetryConfigLocation:
     """Verify TelemetryConfig and UsageContext live in tensorrt_llm.usage.config."""

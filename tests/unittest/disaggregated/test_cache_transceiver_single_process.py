@@ -25,6 +25,9 @@ import threading
 import uuid
 from types import SimpleNamespace
 
+# Do not inherit a NIC pin from the host: the selected interface may not exist
+# in the test container and would prevent the NIXL agent from initializing.
+os.environ.pop("UCX_NET_DEVICES", None)
 # Exclude UCX IB transport (avoid NIXL setup hangs without IB) and gdr_copy
 # (avoid SIGSEGV at process exit from UCX rcache cleanup; gdr_copy disabled
 # falls back to cuda_ipc / cuda_copy without affecting correctness).
@@ -326,6 +329,7 @@ def _create_cache_manager(
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
     enable_indexer_k_cache: bool = False,
+    indexer_k_cache_layer_mask: list[bool] | None = None,
 ) -> "KVCacheManager | KVCacheManagerV2":
     """Create a KVCacheManager (V1) or KVCacheManagerV2 for the given mapping."""
     assert not (enable_indexer_k_cache and use_v2), "DSA indexer K cache is V1-only"
@@ -398,6 +402,7 @@ def _create_cache_manager(
             enable_indexer_k_cache=enable_indexer_k_cache,
             indexer_k_cache_quant_block_size=128,
             indexer_k_cache_index_head_dim=INDEXER_HEAD_DIM if enable_indexer_k_cache else 0,
+            indexer_k_cache_layer_mask=indexer_k_cache_layer_mask,
         )
 
 
@@ -411,7 +416,8 @@ def _create_managers_for_instance(
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
     enable_indexer_k_cache: bool = False,
-) -> List:
+    indexer_k_cache_layer_mask: list[bool] | None = None,
+) -> list[KVCacheManager | KVCacheManagerV2]:
     """Create cache managers for all ranks in an instance."""
     managers = []
     for pp_rank in range(pp):
@@ -433,6 +439,7 @@ def _create_managers_for_instance(
                     num_layers,
                     max_batch_size,
                     enable_indexer_k_cache,
+                    indexer_k_cache_layer_mask,
                 )
             )
     return managers
@@ -447,7 +454,7 @@ def _init_pool_data_v1(
     is_mla: bool,
     fill_random: bool = True,
     seed_base: int = 1000,
-):
+) -> None:
     """Initialize pool data for V1 managers."""
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     for rank, mgr in enumerate(managers):
@@ -468,6 +475,9 @@ def _init_pool_data_v1(
             pool_tensor.zero_()
 
         if getattr(mgr, "enable_indexer_k_cache", False):
+            local_mask = mgr.indexer_k_cache_local_layer_mask
+            if local_mask is not None and not any(local_mask):
+                continue
             # DSA indexer K is TP-replicated: seed by PP stage only so every
             # TP rank of a stage holds identical bytes.
             indexer_pool = mgr.impl.get_indexer_k_cache_pool().view(torch.uint8)
@@ -865,7 +875,16 @@ def verify_all_requests(
             )
 
 
-def _get_indexer_block_data(mgr, request_id, layer_idx, num_layers, pp, tp, enable_dp, req_idx):
+def _get_indexer_block_data(
+    managers: list[KVCacheManager],
+    request_id: int,
+    layer_idx: int,
+    num_layers: int,
+    pp: int,
+    tp: int,
+    enable_dp: bool,
+    req_idx: int,
+) -> torch.Tensor | None:
     """Per-request indexer-K bytes for one global layer on the owning rank.
 
     Indexer K is TP-replicated, so any TP rank of the layer's PP stage works;
@@ -873,21 +892,26 @@ def _get_indexer_block_data(mgr, request_id, layer_idx, num_layers, pp, tp, enab
     """
     pp_rank = _pp_rank_of_layer(layer_idx, num_layers, pp)
     tp_rank = req_idx % tp if enable_dp else 0
-    owner = mgr[pp_rank * tp + tp_rank]
+    owner = managers[pp_rank * tp + tp_rank]
     block_indices = owner.get_batch_cache_indices([request_id], layer_idx)[0]
     valid = [idx for idx in block_indices if idx >= 0]
     if not valid:
         return None
     local_layer = layer_idx - _pp_layer_start(pp_rank, num_layers, pp)
+    local_mask = owner.indexer_k_cache_local_layer_mask
+    if local_mask is not None and not local_mask[local_layer]:
+        return None
     # Pool shape: (numBlocks, numLayers, kvFactor, blockSize), dtype uint8.
     pool = owner.impl.get_indexer_k_cache_pool().view(torch.uint8)
-    return pool[valid, local_layer]
+    pool_layer = owner.impl.get_indexer_k_cache_pool_layer_idx(local_layer)
+    assert pool_layer >= 0
+    return pool[valid, pool_layer]
 
 
 def _verify_indexer_k_all_requests(
     request_lengths: List[int],
-    ctx_managers: List,
-    gen_managers: List,
+    ctx_managers: list[KVCacheManager],
+    gen_managers: list[KVCacheManager],
     ctx_tp: int,
     ctx_pp: int,
     gen_tp: int,
@@ -897,7 +921,7 @@ def _verify_indexer_k_all_requests(
     ctx_request_ids: List[int],
     gen_request_ids: List[int],
     num_layers: int,
-):
+) -> None:
     """Compare the transferred DSA indexer K bytes for every request/layer."""
     for req_idx, _req_len in enumerate(request_lengths):
         for layer_idx in range(num_layers):
@@ -921,7 +945,11 @@ def _verify_indexer_k_all_requests(
                 gen_enable_dp,
                 req_idx,
             )
-            if ctx_data is None or gen_data is None:
+            assert (ctx_data is None) == (gen_data is None), (
+                f"Indexer ownership mismatch at req={req_idx} layer={layer_idx}: "
+                f"ctx_present={ctx_data is not None} gen_present={gen_data is not None}"
+            )
+            if ctx_data is None:
                 continue
             assert ctx_data.shape == gen_data.shape, (
                 f"Indexer shape mismatch at req={req_idx} layer={layer_idx}: "
@@ -952,7 +980,8 @@ def run_transfer_test(
     num_layers: int = NUM_LAYERS,
     request_lengths: Optional[List[int]] = None,
     enable_indexer_k_cache: bool = False,
-):
+    indexer_k_cache_layer_mask: list[bool] | None = None,
+) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2."""
     if request_lengths is None:
         request_lengths = REQUEST_LENGTHS
@@ -971,6 +1000,7 @@ def run_transfer_test(
         num_layers,
         max_batch_size,
         enable_indexer_k_cache,
+        indexer_k_cache_layer_mask,
     )
     gen_managers = _create_managers_for_instance(
         gen_tp,
@@ -982,6 +1012,7 @@ def run_transfer_test(
         num_layers,
         max_batch_size,
         enable_indexer_k_cache,
+        indexer_k_cache_layer_mask,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
@@ -1490,6 +1521,29 @@ def test_cache_transceiver_v1_dsa_indexer(
         is_mla=True,
         use_v2=False,
         enable_indexer_k_cache=True,
+    )
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp() -> None:
+    """Transfer a masked DSA indexer cache from CTX PP2 to GEN PP1.
+
+    CTX rank 0 is fully masked while rank 1 owns both indexer rows. This
+    exercises the real ``KvCacheTransceiverV2`` path where the representative
+    sender page table has no REPLICATED view but the receiver does.
+    """
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=2,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=True,
+        use_v2=False,
+        request_lengths=[30],
+        enable_indexer_k_cache=True,
+        indexer_k_cache_layer_mask=[False, False, True, True],
     )
 
 

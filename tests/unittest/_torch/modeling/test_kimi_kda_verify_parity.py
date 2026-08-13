@@ -59,6 +59,10 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     w = lin["short_conv_kernel_size"]
 
     runtime = KimiKDARuntime(cfg, layer_idx=0).to(device)
+    # dt_bias is torch.empty at construction and only filled by
+    # load_weights(); with random weights it holds heap garbage, and a
+    # NaN/Inf bit pattern poisons both paths identically (nvbug 6599150).
+    torch.nn.init.normal_(runtime.mixer.dt_bias, std=0.1)
     slots = batch + 2  # non-trivial slot mapping
     cache = _LayerCache(slots, 3 * dim, w, h, lin["head_dim"], lin["head_dim"], t_steps, device)
     slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)

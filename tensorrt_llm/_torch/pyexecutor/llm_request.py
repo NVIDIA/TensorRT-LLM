@@ -868,6 +868,38 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             else:
                 self._py_embedding_bias_1d = self.embedding_bias
 
+    def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
+        """Beam width of the current (or next) decoding step.
+
+        Mirrors the C++ binding for Variable-Beam-Width-Search, clamping the
+        decoding-iteration index with the array's own length so that decoding
+        past the end of the array holds its last width.
+
+        The C++ implementation used to clamp with the global
+        kMaxBeamWidthArrayLength constant instead, reading past the end of
+        the user array and returning arbitrary widths; that is fixed in
+        llmRequest.cpp and the two now agree. This override is kept because
+        the C++ method is neither virtual nor trampolined, so Python callers
+        would otherwise bind to whatever libtensorrt_llm.so happens to
+        provide -- including a prebuilt one from before that fix, against
+        which the mismatch starves the request in the micro-batch scheduler
+        and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
+        pins the agreement.
+
+        An empty array (``[]`` or ``[[]]``) falls through to the base
+        implementation rather than indexing it, matching the two emptiness
+        guards the C++ side checks before reading element 0.
+        """
+        beam_width_array = self.sampling_config.beam_width_array
+        if beam_width_array:
+            if isinstance(beam_width_array[0], (list, tuple)):
+                beam_width_array = beam_width_array[0]
+        if beam_width_array:
+            iteration = self.decoding_iter + (1 if for_next_iteration else 0)
+            index = max(min(iteration, len(beam_width_array)) - 1, 0)
+            return int(beam_width_array[index])
+        return super().get_beam_width_by_iter(for_next_iteration)
+
     def set_exclude_last_generation_logits(
             self, exclude_last_generation_logits: bool):
         self.py_result.set_exclude_last_generation_logits(

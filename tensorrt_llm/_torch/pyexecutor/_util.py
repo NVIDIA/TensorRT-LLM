@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
@@ -72,6 +72,9 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
+
+if TYPE_CHECKING:
+    import transformers
 
 GB = 1 << 30
 
@@ -2016,6 +2019,29 @@ def _get_mamba_cache_layer_masks(
     )
 
 
+# The V1 hybrid managers select the convolution-state layout by model_type;
+# MambaHybridCacheManagerV2 takes the layout by name and rejects model_type.
+_CONV_STATE_LAYOUT_BY_MODEL_TYPE = {
+    "nemotron_hybrid": "x_b_c",
+    "qwen3_next": "q_k_v",
+}
+
+
+def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
+                              model_type: str) -> dict:
+    """Constructor kwarg selecting the conv-state layout for a hybrid manager.
+
+    Keeps the V1-vs-V2 dispatch in one place: a manager branch that forgets it
+    would previously get V2's silent "x_b_c" default (the Kimi K3 bug fixed in
+    this change).
+    """
+    if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+        return {
+            "conv_state_layout": _CONV_STATE_LAYOUT_BY_MODEL_TYPE[model_type]
+        }
+    return {"model_type": model_type}
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2223,6 +2249,10 @@ def _create_kv_cache_manager(
             if is_kda_mtp_verify_available():
                 kimi_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
+        # KDA's conv state is a [Q | K | V] concatenation whose three sections
+        # have identical width, i.e. the qwen3_next section layout.
+        kimi_extra_kwargs.update(
+            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
@@ -2250,9 +2280,6 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            # Reuse the qwen3_next [Q | K | V] conv-state section layout;
-            # all three KDA sections have identical width.
-            model_type="qwen3_next",
             **kimi_extra_kwargs,
             **manager_extra_kwargs,
         )
@@ -2366,10 +2393,8 @@ def _create_kv_cache_manager(
                                          and mamba_params.mamba_ssm_cache_dtype
                                          == torch.float16)
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            mamba_manager_extra_kwargs["conv_state_layout"] = "x_b_c"
-        else:
-            mamba_manager_extra_kwargs["model_type"] = "nemotron_hybrid"
+        mamba_manager_extra_kwargs.update(
+            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -2475,10 +2500,8 @@ def _create_kv_cache_manager(
                     ("ENABLED" if use_replay else "DISABLED"))
 
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            mamba_manager_extra_kwargs["conv_state_layout"] = "q_k_v"
-        else:
-            mamba_manager_extra_kwargs["model_type"] = "qwen3_next"
+        mamba_manager_extra_kwargs.update(
+            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -2598,6 +2621,7 @@ def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    pretrained_config: Optional["transformers.PretrainedConfig"] = None,
 ) -> Optional[KVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
@@ -2619,6 +2643,7 @@ def create_kv_cache_compression_manager(
             config,
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            pretrained_config=pretrained_config,
         )
 
     logger.warning(
@@ -2649,17 +2674,28 @@ def compute_max_num_sequences(mapping: Mapping,
     return max_batch_size * num_micro_batches
 
 
-# Model types whose disaggregated attention-DP path has been measured against
-# the ADP dummy fixes. The gate stays an explicit list rather than a capability
-# check (``enable_attention_dp and kv_cache_transceiver is not None``) so that
-# each entry is added only after its disagg ADP behavior has been exercised.
-_ADP_DUMMY_FIX_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
+def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
+    """Enable transactional ADP dummy handling while PP remains follow-up."""
+    return not mapping.has_pp()
 
 
-def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
-                                       mapping: Mapping) -> bool:
-    """Gate the ADP dummy fixes while PP remains follow-up scope."""
-    return model_type in _ADP_DUMMY_FIX_MODEL_TYPES and not mapping.has_pp()
+_VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
+
+
+def should_enable_scheduler_aware_adp_dummy(
+        model_type: Optional[str], mapping: Mapping,
+        disable_overlap_scheduler: bool) -> bool:
+    """Enable scheduler-aware padding for validated lifecycle configurations."""
+    return (should_enable_adp_dummy_fixes(mapping)
+            and (disable_overlap_scheduler
+                 or model_type in _VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES))
+
+
+def should_enable_non_overlap_adp_forward_intent(
+        mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
+    """Enable fresh cross-rank dummy intent for the generic non-overlap path."""
+    return (should_enable_adp_dummy_fixes(mapping)
+            and disable_overlap_scheduler)
 
 
 def should_enable_disagg_adp_overlap_headroom(
@@ -2891,6 +2927,7 @@ def create_py_executor_instance(
             kv_cache_compression_config,
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            pretrained_config=model_engine.model.model_config.pretrained_config,
         )
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
@@ -3001,8 +3038,12 @@ def create_py_executor_instance(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
 
-        mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                               ctx_chunk_config)
+        mb_scheduler = BindMicroBatchScheduler(
+            max_batch_size,
+            max_num_tokens,
+            ctx_chunk_config,
+            no_schedule_until_state=no_schedule_until_state,
+        )
 
         reorder_policy_config = llm_args.reorder_policy_config
         if reorder_policy_config is not None:
