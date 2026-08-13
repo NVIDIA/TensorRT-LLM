@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""gRPC Request Manager for TensorRT-LLM.
+"""Request manager for the TensorRT-LLM SMG gRPC adapter.
 
 Manages request lifecycle for gRPC requests, converting between protobuf
 and TensorRT-LLM types. Designed for high-performance communication with
@@ -35,7 +35,7 @@ from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
-from . import trtllm_service_pb2 as pb2
+from .bindings import trtllm_service_pb2 as pb2
 
 
 class GrpcRequestManager:
@@ -211,8 +211,18 @@ class GrpcRequestManager:
 
             # Try to get tokenizer info
             if hasattr(self.llm, "tokenizer") and self.llm.tokenizer is not None:
-                if hasattr(self.llm.tokenizer, "vocab_size"):
-                    config["vocab_size"] = self.llm.tokenizer.vocab_size
+                # TransformersTokenizer wraps the HF tokenizer without
+                # overriding vocab_size, so the wrapper attribute resolves to
+                # PreTrainedTokenizerBase's abstract property (raises
+                # NotImplementedError). Read from the inner tokenizer.
+                tokenizer = self.llm.tokenizer
+                inner_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+                try:
+                    vocab_size = inner_tokenizer.vocab_size
+                except (AttributeError, NotImplementedError):
+                    vocab_size = None
+                if vocab_size:
+                    config["vocab_size"] = int(vocab_size)
 
             # Try to get max context length from various sources
             if hasattr(self.llm, "args") and self.llm.args is not None:
