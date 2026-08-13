@@ -276,6 +276,27 @@ class _Built(NamedTuple):
     snapshot: object
 
 
+def _prefetched_workers_alive(session: object) -> bool:
+    """Whether every recorded worker is still the process spawned for this pool.
+
+    ``MpiPoolSession(wait_shutdown=True)`` records a complete set of
+    ``(pid, start_time)`` identities before a pool can be published. Checking
+    both values rejects workers that exited after publication without
+    mistaking a recycled PID for the original process.
+    """
+    identities = getattr(session, "_worker_identities", ())
+    if len(identities) != getattr(session, "n_workers", None):
+        return False
+    mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
+    process_start_time = getattr(mpi_session, "_process_start_time", None)
+    if process_start_time is None:
+        return False
+    return all(
+        start_time is not None and process_start_time(pid) == start_time
+        for pid, start_time in identities
+    )
+
+
 class SessionPrefetcher:
     def __init__(self):
         self._lock = threading.Lock()
@@ -496,6 +517,19 @@ class SessionPrefetcher:
         # recreate the same concurrent-bootstrap contention.
         built = self._drain()
         if built is None:
+            return None
+        if not _prefetched_workers_alive(built.session):
+            # A worker may die after the background build publishes its pool.
+            # Never hand that unusable executor to the next test: its queued
+            # initialization task would have no worker and can wait until the
+            # outer pytest timeout. The dead world cannot be joined, so
+            # abandon it before the synchronous fallback.
+            self.stats["pools_discarded_dead"] += 1
+            print(
+                "[session-prefetch] discarding prefetched pool with dead worker",
+                flush=True,
+            )
+            built.session.abandon()
             return None
         if built.spec == spec and built.snapshot == _spawn_snapshot():
             # An instant handover is safe against the previous worker's GPU
