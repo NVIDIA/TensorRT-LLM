@@ -1492,6 +1492,8 @@ class PyTorchModelEngine(ModelEngine):
         # warmup. No-op on non-DSA models.
         self._warmup_dg_paged_mqa_logits_metadata()
         log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
+        self._warmup_cute_dsl_radix_topk()
+        log_mem_snapshot("warmup/after_cute_dsl_radix_topk")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
             # fragmentation at runtime.
@@ -1506,13 +1508,6 @@ class PyTorchModelEngine(ModelEngine):
         # fails every step and padded batches silently run eager.
         self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
-
-    def _warmup_sparse_top_k(self) -> None:
-        """Pre-compile CuTe DSL radix variants before model warmup."""
-        from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
-
-        if isinstance(self.attn_metadata, DSAtrtllmAttentionMetadata):
-            self.attn_metadata.warmup_top_k(1 + self.original_max_draft_len)
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for

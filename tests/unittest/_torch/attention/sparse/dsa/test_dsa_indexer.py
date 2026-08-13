@@ -133,7 +133,7 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
         (False, False, 100, 1, 1, False),
     ],
 )
-def test_metadata_warmup_top_k_only_precompiles_cute_dsl_radix(
+def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
     enable_heuristic,
     use_cute_dsl,
     sm_version,
@@ -145,6 +145,7 @@ def test_metadata_warmup_top_k_only_precompiles_cute_dsl_radix(
         sparse_metadata_params=SimpleNamespace(enable_heuristic_topk=enable_heuristic),
         use_cute_dsl_topk=use_cute_dsl,
         num_sparse_topk=512,
+        kv_cache_manager=SimpleNamespace(),
         _indexer_compress_ratio=compress_ratio,
         get_indexer_max_seq_len=Mock(return_value=32768),
         num_sms=148,
@@ -159,7 +160,7 @@ def test_metadata_warmup_top_k_only_precompiles_cute_dsl_radix(
             "tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops.warmup_cute_dsl_radix_topk_decode"
         ) as cute_dsl_radix,
     ):
-        DSAtrtllmAttentionMetadata.warmup_top_k(metadata, next_n)
+        DSAtrtllmAttentionMetadata.warmup_cute_dsl_radix_topk(metadata, next_n)
 
     if should_warmup:
         cute_dsl_radix.assert_called_once_with(

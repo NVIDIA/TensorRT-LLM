@@ -31,6 +31,10 @@ from .params import DSAMetadataParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 
+# Indexer MQA-logits are currently always fp32. The dtype is part of the
+# CuTe DSL Top-K compile key, so warmup must use the runtime dtype.
+_INDEXER_LOGITS_DTYPE = torch.float32
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
@@ -299,24 +303,29 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             return self.kv_cache_manager.max_seq_len
         return max(1, self.kv_cache_manager.max_seq_len // self._indexer_compress_ratio)
 
-    def warmup_top_k(self, next_n: int) -> None:
+    def warmup_cute_dsl_radix_topk(self, next_n: int) -> None:
         """Pre-compile CuTe DSL radix variants not covered by engine warmup."""
         sparse_params = self.sparse_metadata_params
-        if (
-            not self.use_cute_dsl_topk
-            or (self._indexer_compress_ratio > 1 and next_n > 1)
-            or (sparse_params.enable_heuristic_topk and get_sm_version() >= 100)
+        if not self.use_cute_dsl_topk or (
+            sparse_params.enable_heuristic_topk and get_sm_version() >= 100
         ):
             return
-        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-            warmup_cute_dsl_radix_topk_decode,
-        )
+        if self.kv_cache_manager is None or not self.num_sparse_topk:
+            return
+        if self._indexer_compress_ratio > 1 and next_n > 1:
+            return
+        try:
+            from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+                warmup_cute_dsl_radix_topk_decode,
+            )
+        except ImportError:
+            return
 
         warmup_cute_dsl_radix_topk_decode(
-            top_k=self.num_sparse_topk,
-            num_cols=self.get_indexer_max_seq_len(),
+            top_k=int(self.num_sparse_topk),
+            num_cols=int(self.get_indexer_max_seq_len()),
             next_n=next_n,
-            dtype=torch.float32,
+            dtype=_INDEXER_LOGITS_DTYPE,
             num_sms=self.num_sms,
         )
 
