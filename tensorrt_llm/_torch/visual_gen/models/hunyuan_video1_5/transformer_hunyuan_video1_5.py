@@ -954,7 +954,7 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: torch.Tensor,
         timestep_r: Optional[torch.Tensor] = None,
         encoder_hidden_states_2: Optional[torch.Tensor] = None,
         encoder_attention_mask_2: Optional[torch.Tensor] = None,
@@ -1180,16 +1180,6 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
 
     def post_load_weights(self) -> None:
         """Call post_load_weights on all Linear modules and convert embedders to target dtype."""
-        # Convert time_text_embed components to target dtype
-        target_dtype = self.model_config.torch_dtype
-        if hasattr(self, "time_text_embed"):
-            if hasattr(self.time_text_embed, "timestep_embedder"):
-                self.time_text_embed.timestep_embedder.to(target_dtype)
-            if hasattr(self.time_text_embed, "text_embedder"):
-                self.time_text_embed.text_embedder.to(target_dtype)
-            if hasattr(self.time_text_embed, "guidance_embedder"):
-                self.time_text_embed.guidance_embedder.to(target_dtype)
-
         # Finalize per-module weights and normalize dtypes to the compute dtype.
         compute_dtype = self.config.dtype
         quantized_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)

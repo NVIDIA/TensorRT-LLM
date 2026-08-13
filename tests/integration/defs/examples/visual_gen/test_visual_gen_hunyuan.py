@@ -142,6 +142,8 @@ def test_hunyuan_t2v_example(_visual_gen_deps, llm_root, llm_venv):
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "hunyuan_example")
     os.makedirs(out_dir, exist_ok=True)
     output_path = os.path.join(out_dir, "hunyuan_t2v_output.mp4")
+    if os.path.exists(output_path):
+        os.remove(output_path)
 
     script_path = os.path.join(llm_root, "examples", "visual_gen", "models", "hunyuan_t2v.py")
     config_path = os.path.join(

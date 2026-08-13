@@ -65,7 +65,7 @@ def format_text_input(prompt: List[str], system_message: str) -> List[Dict[str, 
 
 
 # Copied from HF
-def extract_glyph_texts(prompt: str) -> List[str]:
+def extract_glyph_texts(prompt: str) -> Optional[str]:
     """
     Extract glyph texts from prompt using regex pattern.
 
@@ -73,7 +73,7 @@ def extract_glyph_texts(prompt: str) -> List[str]:
         prompt: Input prompt string
 
     Returns:
-        List of extracted glyph texts
+        Formatted glyph text string, or None if the prompt has no quoted text
     """
     pattern = r"\"(.*?)\"|“(.*?)”"
     matches = re.findall(pattern, prompt)
@@ -572,7 +572,7 @@ class HunyuanVideo15Pipeline(BasePipeline):
         seed: int,
         height: int,
         width: int,
-        negative_prompt: Union[str, List[str]] = None,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
         num_frames: int = 121,
         num_inference_steps: int = 50,
         num_videos_per_prompt: int = 1,
@@ -633,7 +633,7 @@ class HunyuanVideo15Pipeline(BasePipeline):
         )
 
         # 2. Guidance
-        do_cfg = self.guider._enabled and self.guider.num_conditions > 1
+        do_cfg = self.guider.num_conditions > 1
         if do_cfg:
             (
                 negative_prompt_embeds,
