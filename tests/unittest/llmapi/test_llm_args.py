@@ -735,10 +735,10 @@ class TestKvCacheManagerV2AutoResolution:
         """Models preferring V2 and the Python transceiver keep V2 on NIXL.
 
         Both sentinels start at 'auto'; production resolves the transceiver
-        runtime first, then the KV cache manager. Models absent from this
-        list: MiniMax-M2 silently resolves to V1 on this route (its
+        runtime first, then the KV cache manager. MiniMax-M2 is absent from
+        this list: it silently resolves to V1 on this route (its
         disaggregated serving is unvalidated -- the missing preference is
-        deliberate); GLM 5.2 prefers the C++ transceiver for now.
+        deliberate).
         """
         from tensorrt_llm._torch.models.modeling_utils import \
             get_registered_model_class
@@ -746,6 +746,7 @@ class TestKvCacheManagerV2AutoResolution:
         architectures = (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
             "MistralLarge3ForCausalLM",
             "GptOssForCausalLM",
             "KimiK25ForConditionalGeneration",
