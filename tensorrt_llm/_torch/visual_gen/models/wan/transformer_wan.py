@@ -628,12 +628,6 @@ class WanBlock(nn.Module):
             key_img = self.add_k_proj(encoder_hidden_states_img)
             value_img = self.add_v_proj(encoder_hidden_states_img)
             key_img = self.norm_added_k(key_img)
-            if attn_metadata_cross_image is None:
-                raise ValueError(
-                    "WAN I2V image cross-attention requires attn_metadata_cross_image; "
-                    "the pipeline must include the 'cross_image' site when "
-                    "encoder_hidden_states_image is provided."
-                )
             attn_img_output = self.attn2._attn_impl(
                 q,
                 key_img,
@@ -865,6 +859,13 @@ class WanTransformer3DModel(BaseDiffusionModel):
         # Mirrors WanBlock.forward: with an image stream the encoder state is
         # [image; text] and the text tail is a fixed length.
         s_text = self.TEXT_CONTEXT_LENGTH if has_image else encoder_hidden_states.shape[1]
+
+        if not self.attn_requires_metadata:
+            return {
+                "self": None,
+                "cross_text": None,
+                **({"cross_image": None} if has_image else {}),
+            }
 
         q_self, kv_self = get_ulysses_seq_lens(s_video, s_video, visual_gen_mapping=vgm)
         sites = {

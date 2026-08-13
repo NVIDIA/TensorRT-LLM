@@ -1519,11 +1519,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # Create attention metadata for understanding and generation towers
         denoise_batch = self.denoise_batch_size(latents, guidance_scale=guidance_scale)
-        denoise_mask = (
-            torch.cat([uncond_mask, cond_mask], dim=0)
-            if denoise_batch != latents.shape[0]
-            else cond_mask
-        )
+        if denoise_batch != latents.shape[0]:
+            # Sequential CFG stacks both branches into one batch.
+            denoise_mask = torch.cat([uncond_mask, cond_mask], dim=0)
+        else:
+            # One CFG at a time.
+            vgm = self.pipeline_config.visual_gen_mapping
+            is_conditional = vgm.is_cfg_conditional if vgm is not None else True
+            denoise_mask = cond_mask if is_conditional else uncond_mask
         attn_metadata_sites = self.transformer.create_attn_metadata(
             batch_size=denoise_batch,
             text_seq_len=denoise_mask.shape[1],

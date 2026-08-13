@@ -274,6 +274,11 @@ class Attention(nn.Module):
             async_ulysses=use_ulysses and async_ulysses,
         )
 
+    @property
+    def requires_metadata(self) -> bool:
+        """Whether the selected backend needs prepared metadata to run."""
+        return self.attn.requires_metadata
+
     @staticmethod
     def _qualified_module_name(
         component_name: Optional[str],

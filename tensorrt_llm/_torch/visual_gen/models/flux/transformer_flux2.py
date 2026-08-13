@@ -704,6 +704,9 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
 
         FLUX.2 has a single attention site over the concatenated text+image sequence.
         """
+        if not self.attn_requires_metadata:
+            return {"self": None}
+
         # forward() shards each stream before concatenating them, so a block
         # attends over this rank's share of the joint sequence.
         size = self.sharder.size

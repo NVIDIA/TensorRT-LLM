@@ -867,7 +867,11 @@ def _forward_ready_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
             latent_channel_size=4,
             reset_cache=lambda: None,
             device=torch.device("cpu"),
-            create_attn_metadata=lambda **kwargs: {},
+            create_attn_metadata=lambda **kwargs: {
+                "und": None,
+                "mixed": None,
+                "mixed_ragged": None,
+            },
         ),
         vae_scale_factor_temporal=4,
         vae_scale_factor_spatial=16,

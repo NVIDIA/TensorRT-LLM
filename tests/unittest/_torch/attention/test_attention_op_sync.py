@@ -70,6 +70,8 @@ _THOP_KWARG_SOURCE_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     "host_context_lengths": ("metadata", ("prompt_lens_cpu_runtime",)),
     "host_past_key_value_lengths": ("metadata", ("kv_lens_runtime",)),
     "host_request_types": ("metadata", ("host_request_types_runtime",)),
+    # thop's `is_cross` selects the cache-backed KV layout, narrower than `metadata.is_cross`
+    "is_cross": ("metadata", ("is_cross_with_kv_cache",)),
     "sequence_length": ("metadata", ("kv_lens_cuda_runtime",)),
     "spec_decoding_target_max_draft_tokens": (
         "metadata",

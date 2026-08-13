@@ -32,6 +32,7 @@ from tensorrt_llm.logger import logger
 
 from .defaults import get_fastwan_default_params
 from .pipeline_wan import WanPipeline
+from .pipeline_wan_utils import wan_attn_metadata_kwargs
 
 
 @register_pipeline(
@@ -164,12 +165,18 @@ class WanDMDPipeline(WanPipeline):
         nf = latents.shape[2]
         nh = latents.shape[3] // ph
         nw = latents.shape[4] // pw
+        # Attention metadata: DMD runs one guidance-free pass per step at a fixed shape.
+        attn_metadata_sites = wan_attn_metadata_kwargs(
+            self.transformer, hidden_states=latents, encoder_hidden_states=prompt_embeds
+        )
+
         start = time.time()
         for i, t in self._profile_denoise_steps(timesteps):
             t_tensor = torch.full((latents.shape[0], nf * nh * nw), float(t), device=latents.device)
 
             pred_noise = self.transformer(
                 hidden_states=latents,
+                **attn_metadata_sites,
                 timestep=t_tensor / self.NUM_TRAIN_TIMESTEPS,
                 encoder_hidden_states=prompt_embeds,
             )

@@ -14,7 +14,7 @@
 # limitations under the License.
 """Base classes for VisualGen model components."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn as nn
@@ -29,22 +29,29 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner
 
 
-def _attn_metadata_shape_key(*args, **kwargs):
+def _collect_attn_metadata(name: str, value: Any, sites: dict[str, AttentionMetadata]) -> None:
+    """Flatten a metadata argument into ``sites``, keyed by its position."""
+    if isinstance(value, AttentionMetadata):
+        sites[name] = value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _collect_attn_metadata(f"{name}.{key}", item, sites)
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _collect_attn_metadata(f"{name}[{index}]", item, sites)
+
+
+def _attn_metadata_shape_key(*args: Any, **kwargs: Any) -> Optional[tuple]:
     """CUDA graph key from every ``attn_metadata*`` keyword, or ``None`` if absent.
 
-    Accepts a single site or a dict of them; the tensor-shape key cannot see
-    metadata, so sites of differing length must not share a graph.
+    Accepts a single site, or a dict or list of them (Cosmos3 passes a per-sample
+    list); the tensor-shape key cannot see metadata, so sites of differing length
+    must not share a graph.
     """
     sites: dict[str, AttentionMetadata] = {}
     for name, value in kwargs.items():
-        if not name.startswith("attn_metadata"):
-            continue
-        if isinstance(value, AttentionMetadata):
-            sites[name] = value
-        elif isinstance(value, dict):
-            sites.update(
-                {f"{name}.{k}": v for k, v in value.items() if isinstance(v, AttentionMetadata)}
-            )
+        if name.startswith("attn_metadata"):
+            _collect_attn_metadata(name, value, sites)
 
     key = []
     for name in sorted(sites):
@@ -76,7 +83,20 @@ class BaseDiffusionModel(nn.Module):
         """Metadata type this component's attention backend expects."""
         return get_visual_gen_attention_backend(self.model_config.attention.backend).Metadata
 
-    def forward(self, *args, timestep: torch.Tensor | None = None, **kwargs):
+    @property
+    def attn_requires_metadata(self) -> bool:
+        """Whether any attention site in this model needs prepared metadata."""
+        from tensorrt_llm._torch.visual_gen.modules.attention import Attention
+
+        return any(m.requires_metadata for m in self.modules() if isinstance(m, Attention))
+
+    def create_attn_metadata(self, **kwargs) -> dict[str, AttentionMetadata]:
+        """Build one prepared metadata object per attention site."""
+        raise NotImplementedError(
+            "Diffusion model subclasses must implement create_attn_metadata()."
+        )
+
+    def forward(self, *args: Any, timestep: torch.Tensor | None = None, **kwargs: Any) -> Any:
         """Run the diffusion transformer.
 
         Concrete VisualGen models own their full forward signatures. This base

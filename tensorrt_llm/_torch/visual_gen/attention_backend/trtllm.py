@@ -42,9 +42,8 @@ def _check_metadata(
     """Validate that the metadata describes the tensors it is used with."""
     if attn_metadata is None:
         raise ValueError(
-            "TrtllmAttention.forward requires `attn_metadata`. Build it with "
-            "visual_gen.attention_backend.metadata.create_diffusion_attn_metadata() "
-            "and prepare it with prepare_diffusion_attn_metadata()."
+            "TrtllmAttention.forward requires `attn_metadata`, but this site got "
+            "None. Build it for this site in the model's create_attn_metadata()."
         )
 
     seq_lens = attn_metadata.seq_lens
@@ -166,8 +165,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         Returns:
             Output tensor [B, S, H*D]
         """
-        batch_size, seq_len, _, _ = q.shape
-        _, kv_seq_len, _, _ = k.shape
+        batch_size, seq_len = q.shape[0], q.shape[1]
+        kv_seq_len = seq_len if k is None else k.shape[1]
         _check_metadata(attn_metadata, batch_size, seq_len, kv_seq_len)
         timestep = kwargs.pop("timestep", None)
 
