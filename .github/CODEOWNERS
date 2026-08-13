@@ -118,7 +118,7 @@
 /tensorrt_llm/commands/utils.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/grpc @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/grpc/openengine @NVIDIA/trt-llm-runtime-devs @tanmayv25
+/tensorrt_llm/grpc/openengine @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-dynamo-devs
 /tensorrt_llm/inputs @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/llmapi @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/llmapi/mm_encoder.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-models-devs
@@ -147,7 +147,7 @@
 /tests/unittest/_torch/speculative @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/speculative_hw_agnostic @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/executor @NVIDIA/trt-llm-runtime-devs
-/tests/unittest/grpc/openengine @NVIDIA/trt-llm-runtime-devs @tanmayv25
+/tests/unittest/grpc/openengine @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-dynamo-devs
 /tests/unittest/inputs @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/llmapi @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/llmapi/apps/*multimodal* @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-models-devs
