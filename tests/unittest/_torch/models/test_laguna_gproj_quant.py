@@ -33,7 +33,7 @@ LAYER_IDX = 3
 G_PROJ = f"model.layers.{LAYER_IDX}.self_attn.g_proj"
 
 
-def _model_config(exclude_modules):
+def _model_config(exclude_modules: list[str]) -> SimpleNamespace:
     quant_config = QuantConfig(
         quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
         kv_cache_quant_algo=QuantAlgo.FP8,
@@ -55,7 +55,7 @@ def _model_config(exclude_modules):
         r"re:.*\.self_attn\.g_proj$",
     ],
 )
-def test_excluded_g_proj_is_not_quantised(pattern):
+def test_excluded_g_proj_is_not_quantised(pattern: str) -> None:
     resolved = g_proj_quant_config(_model_config([pattern, "lm_head"]), LAYER_IDX)
 
     assert resolved.quant_algo is None, f"{pattern!r} did not exclude g_proj"
@@ -63,7 +63,7 @@ def test_excluded_g_proj_is_not_quantised(pattern):
     assert resolved.kv_cache_quant_algo == QuantAlgo.FP8
 
 
-def test_unexcluded_g_proj_keeps_the_model_quant_config():
+def test_unexcluded_g_proj_keeps_the_model_quant_config() -> None:
     """Control: a checkpoint that does quantise g_proj is left alone."""
     model_config = _model_config(["lm_head", "model.layers.9.self_attn.g_proj"])
 
@@ -73,13 +73,13 @@ def test_unexcluded_g_proj_keeps_the_model_quant_config():
     assert resolved.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
 
 
-def test_unquantised_model_is_passed_through():
+def test_unquantised_model_is_passed_through() -> None:
     model_config = SimpleNamespace(get_quant_config=lambda name=None: None)
 
     assert g_proj_quant_config(model_config, LAYER_IDX) is None
 
 
-def test_missing_layer_idx_does_not_match_a_literal_none():
+def test_missing_layer_idx_does_not_match_a_literal_none() -> None:
     """layer_idx is Optional; without the guard the name would render as
     "model.layers.None.self_attn.g_proj" and silently match nothing."""
     model_config = _model_config(["model.layers.None.self_attn.g_proj"])

@@ -33,10 +33,12 @@ l0_cpu:
   - unittest/_torch/modeling
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/models/test_laguna_gproj_quant.py
   - unittest/_torch/modules
   - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
+  - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/thop/parallel_hw_agnostic
