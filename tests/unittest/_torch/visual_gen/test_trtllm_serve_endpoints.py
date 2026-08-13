@@ -217,6 +217,8 @@ class MockVisualGen:
         # reject legitimate width/height/num_frames/... requests;
         # ``extra_param_specs`` lists a single known key so tests can
         # exercise both the accept-known and reject-unknown paths.
+        from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+
         self.executor = SimpleNamespace(
             default_generation_params={
                 "height": 64,
@@ -230,7 +232,14 @@ class MockVisualGen:
             extra_param_specs=extra_param_specs
             or {"stg_scale": ExtraParamSchema(type="float", default=1.0)},
             supports_image_edit=supports_image_edit,
-            ref_slot_specs={},
+            ref_slot_specs={
+                "image_reference": RefSlotSpec(
+                    modality="image", roles=[RoleSpec(role="first_frame", min=0, max=1)]
+                ),
+                "video_reference": RefSlotSpec(
+                    modality="video", roles=[RoleSpec(role="reference", min=0, max=1)]
+                ),
+            },
         )
 
     def _maybe_batch(self, tensor, n):

@@ -286,8 +286,10 @@ def validate_visual_gen_params(
     # ``.roles`` (a list of role specs with ``.role`` / ``.min`` / ``.max``).
     # role is required only when a modality declares more than one role;
     # otherwise the single declared role is inferred. Reference fields are
-    # already normalized to ``list[*Ref]`` by the field validators.
-    if ref_slot_specs:
+    # already normalized to ``list[*Ref]`` by the field validators. An empty
+    # (but non-None) mapping means the pipeline declares no slots, so any
+    # reference the client sent is rejected; only ``None`` skips validation.
+    if ref_slot_specs is not None:
         for field in ("image_reference", "video_reference", "audio_reference"):
             refs = getattr(params, field, None) or []
             spec = ref_slot_specs.get(field)

@@ -984,6 +984,21 @@ class TestRequestValidation:
         with pytest.raises(ValueError, match=r"video_reference.*not accepted"):
             run(VisualGenParams(video_reference="v.mp4"), optional)
 
+    def test_empty_ref_slot_specs_rejects_references(self):
+        """An empty (non-None) ref_slot_specs means the pipeline declares no
+        slots, so a reference is rejected; only ``None`` skips validation."""
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def run(params, spec):
+            validate_visual_gen_params(
+                params, declared_defaults=None, extra_param_specs={}, ref_slot_specs=spec
+            )
+
+        with pytest.raises(ValueError, match="not accepted"):
+            run(VisualGenParams(image_reference="a.png"), {})
+        run(VisualGenParams(image_reference="a.png"), None)  # None -> skipped
+        run(VisualGenParams(), {})  # no reference -> allowed
+
     def test_none_fields_not_flagged(self):
         """Fields left as None should never trigger unsupported-field errors."""
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
