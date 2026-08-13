@@ -69,8 +69,18 @@ echo "[fat_build] pip site-packages location:"
 python3 -c "import site; print(site.getsitepackages())"
 echo "[fat_build] Installing requirements-dev.txt..."
 pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-dev.txt
+# Keep this list in sync with the non-fat-sqsh install paths (slurm_install.sh and
+# the !isFatSqsh branch in L0_Test.groovy); anything they install must be baked in
+# here too, or fat-sqsh jobs run against a smaller environment than everyone else.
+echo "[fat_build] Installing requirements-grpc-smg.txt..."
+pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-grpc-smg.txt
+echo "[fat_build] Installing requirements-openengine.txt..."
+pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-openengine.txt
 echo "[fat_build] Installing trtllm wheel..."
 pip3 install --no-user --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
+# Baked in even though the non-fat paths let the test fixtures install it on
+# demand: the media-deps fixture returns early when cv2 already imports, so
+# pre-installing here costs the GPU job nothing and saves it a pip round trip.
 echo "[fat_build] Installing opencv-python-headless..."
 pip3 install --no-user --retries 10 opencv-python-headless
 echo "[fat_build] Installed TensorRT-LLM version:"
