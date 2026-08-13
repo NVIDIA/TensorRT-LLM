@@ -602,6 +602,17 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
+        # Disable iter logs for long-running cases to reduce storage.
+        {
+            'patterns': [
+                'nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32',
+                'deepseek_r1_0528_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:8000,1000-reqs:20000-ep:8-gpus:8',
+                'deepseek_r1_0528_fp4-bench-pytorch-float4-maxbs:1000-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:20000-ep:4-gpus:4',
+            ],
+            'config': {
+                'print_iter_log': False,
+            }
+        },
     ]
 
     # Apply pattern-based configurations on top of base config
