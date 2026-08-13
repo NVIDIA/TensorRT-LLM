@@ -43,6 +43,7 @@ jobs:
         uses: actions/github-script@v8
         env:
           DRY_RUN: ${{ inputs.dry_run }}
+          LIVE: ${{ vars.STALE_PR_CLEANUP_LIVE }}
         with:
           script: |
             const PING_AFTER_DAYS = 120;
@@ -57,9 +58,15 @@ jobs:
             const BOT_LOGIN = 'github-actions[bot]';
             const CONFLICT_WARNING_ACTION = 'conflict-warning';
             const DAY_IN_MS = 24 * 60 * 60 * 1000;
+            // Manual dispatches honor the `dry_run` input. Every other trigger,
+            // including the daily schedule, stays in dry-run mode until the
+            // `STALE_PR_CLEANUP_LIVE` repository variable is set to `true`, so
+            // enabling the workflow never starts commenting or closing on its
+            // own.
             const dryRun =
-              context.eventName === 'workflow_dispatch' &&
-              process.env.DRY_RUN === 'true';
+              context.eventName === 'workflow_dispatch'
+                ? process.env.DRY_RUN === 'true'
+                : process.env.LIVE !== 'true';
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const now = Date.now();
@@ -346,7 +353,6 @@ jobs:
             let skipCount = 0;
             const candidates = [];
             let cursor = null;
-            let reachedFreshPullRequest = false;
             let runtimeLimitWarningEmitted = false;
 
             function reachedRuntimeLimit() {
@@ -363,6 +369,12 @@ jobs:
               return true;
             }
 
+            // Scan every page and filter locally. GitHub applies `orderBy` on
+            // this connection loosely, so `updatedAt` is not monotonic across
+            // the returned nodes: a recently updated pull request can appear
+            // ahead of a long-idle one. Stopping at the first fresh node would
+            // therefore drop most candidates. The listing itself is cheap
+            // (100 pull requests per query), so the full walk is affordable.
             do {
               if (reachedRuntimeLimit()) {
                 break;
@@ -377,17 +389,15 @@ jobs:
               for (const candidate of connection.nodes) {
                 const candidateIdleDays =
                   (now - Date.parse(candidate.updatedAt)) / DAY_IN_MS;
-                if (candidateIdleDays <= CLOSE_AFTER_WARNING_DAYS) {
-                  reachedFreshPullRequest = true;
-                  break;
+                if (candidateIdleDays > CLOSE_AFTER_WARNING_DAYS) {
+                  candidates.push(candidate.number);
                 }
-                candidates.push(candidate.number);
               }
 
               cursor = connection.pageInfo.hasNextPage
                 ? connection.pageInfo.endCursor
                 : null;
-            } while (cursor && !reachedFreshPullRequest);
+            } while (cursor);
 
             for (const candidateNumber of candidates) {
               if (actionCount >= MAX_ACTIONS_PER_RUN) {
