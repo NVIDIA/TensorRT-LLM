@@ -127,7 +127,7 @@ For CI or ephemeral-node workflows that only need a wheel, add `--out-of-tree` t
 python3 scripts/build_wheel.py --build_root /tmp/trtllm-build --out-of-tree --use_ccache -a "90-real"
 ```
 
-In this mode the generated FMHA kernel sources and the configured `version.h` go to the build tree (via the `TRTLLM_FMHA_GEN_DIR` and `TRTLLM_VERSION_H_INCLUDE_DIR` CMake variables), and the wheel is assembled from a staging copy of the Python package under `<build_root>/package`, landing in `<build_root>/dist` by default. Submodules and git-lfs content must be materialized before the build (the usual `git submodule update --init --recursive`), since the build will not modify the checkout. Editable-install workflows (`--skip_building_wheel`, `--linking_install_binary`, `--install`) are incompatible with `--out-of-tree`: they import compiled artifacts from the checkout by design.
+In this mode the generated FMHA kernel sources and the configured `version.h` go to the build tree (via the `TRTLLM_FMHA_GEN_DIR` and `TRTLLM_VERSION_H_INCLUDE_DIR` CMake variables), and the wheel is assembled from a staging copy of the Python package under `<build_root>/package`, landing in `<build_root>/dist` by default. Submodules and git-lfs content must be materialized before the build (the usual `git submodule update --init --recursive`), since the build will not modify the checkout. Editable-install workflows (`--skip_building_wheel`, `--linking_install_binary`, `--install`) are incompatible with `--out-of-tree`: they import compiled artifacts from the checkout by design. `--version-override` is also incompatible, since it edits `tensorrt_llm/version.py` in the checkout.
 
 ### Python-only build (no C++ compilation)
 

@@ -1485,7 +1485,8 @@ def add_arguments(parser: ArgumentParser):
         "staging copy of the Python package (default wheel output: "
         "<build_root>/dist). Requires --build_root; the checkout may be "
         "mounted read-only. Incompatible with editable-install workflows "
-        "(--skip_building_wheel, --linking_install_binary, --install).")
+        "(--skip_building_wheel, --linking_install_binary, --install) and "
+        "with --version-override (it edits tensorrt_llm/version.py in place).")
     parser.add_argument(
         "--build_dir",
         type=Path,
