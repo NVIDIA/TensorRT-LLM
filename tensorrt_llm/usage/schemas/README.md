@@ -156,6 +156,12 @@ Terminal fields are deliberately bounded and categorical. Exception messages,
 stack traces, commands, paths, model identifiers, and configuration text are
 not collected.
 
+V1 signal coverage is boundary-specific. The generic CLI boundary observes
+Ctrl+C/SIGINT, while Uvicorn serving and explicitly instrumented disaggregated
+boundaries observe both SIGINT and SIGTERM. A default SIGTERM delivered to
+another CLI, such as `trtllm-bench` or `trtllm-eval`, may terminate the process
+before it can send a terminal report.
+
 ## Type Reference
 
 | Type | JSON type | Constraints |
