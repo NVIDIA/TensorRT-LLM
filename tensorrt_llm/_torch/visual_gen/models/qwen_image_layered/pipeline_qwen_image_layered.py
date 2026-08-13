@@ -740,7 +740,7 @@ class QwenImageLayeredPipeline(BasePipeline):
 
         refs = req.params.image_reference
         return self.forward(
-            image=refs[0].image if refs else None,
+            image=refs[0].content if refs else None,
             prompt=prompts,
             negative_prompt=negative,
             height=req.params.height,
