@@ -288,6 +288,8 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
             numRetries: 1,
         )?.trim()
         pipeline.echo(tailOut ?: "")
+    } catch (InterruptedException e) {
+        throw e
     } catch (Exception tailEx) {
         pipeline.echo("Ignorable warning: could not tail ${remotePath} on ${remote.host}: ${tailEx.message}")
     }
