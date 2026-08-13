@@ -17,7 +17,7 @@
 
 Usage:
     python ltx2.py
-    python ltx2.py --visual_gen_args ../configs/ltx2.yaml
+    python ltx2.py --visual_gen_args ../configs/ltx2-t2v-fp8-1gpu.yaml
 """
 
 import argparse
