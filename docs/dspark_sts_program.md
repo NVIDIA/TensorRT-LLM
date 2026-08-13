@@ -933,6 +933,15 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 
 **disagg 冻结 bug 判别链**:D2(去 overlay)= **ZOMBIE(20253 步)→ overlay 28 文件无罪**;D3(ctx 去 spec)= ctx 崩 v2 `dangling rawref` → 该路不通,反证 trap 4,ctx-spec 修复方向无罪;D4(旧镜像 b8bc42c3ae × ctx tp4 无 spec × 冻结组合 poetry/lbs64/benchmark_serving)在队——健康则回归区间锁定 b8bc42c3ae→faf2c60935 两构建之间,冻结则配置组合(客户端/streaming/lbs)定罪。
 
+## 【08-12 17:30】AA slo20 战役(laliao 侧):ragged path 生产形态验证通过;冻结案结案=短 ISL;slo20 表 v1 出炉
+
+- **冻结案结案**:D7b(主线运行时×fp8×我 cell 仍冻)+ D9(PR HEAD 新编译 sqsh 仍冻)+ AA(39k ISL 同栈同码健康)→ **触发条件 = 短 ISL(64)× DSpark disagg gen**(浅 KV 角落,与 ctx 侧 SparseAttnTopK 短 ISL 断言同族)。修复挂上游清单;所有真实负载(≥1k ISL)不受影响。
+- **AA slo20 生产形态 ragged 验证 ✅**(aa-master 流水线 fork:slo20 keys × nvfp4 DSpark5 × AA 轨迹客户端 × PR HEAD sqsh):58,144 步 97% ragged、**trim_ratio 0.50**、verify_len 全谱 {1:335k, 2:700k, 3:100k, 4:19k, 5:212k}、accept 2.17、graph 零 miss、154 轨迹完成;客户端 p50 146.8 vs notrim 冒烟 131.2 tok/s(+11.9%,rep=1 方向信号,不作数)。
+- **slo20 SPS 表 v1**(pin{2..5}×conc{32,80},--from-iter-log,28 cells):fixed 15.6ms、α(64/rank)=3.9ms、θ 单调(20→4.0 … 256→26.6 … 384→34.3ms)。几何坑入册:**幂次 bs 网格下 pin 比值 {3,4,5} 互不相连,pin5(比值 6)是连接器**——阶梯没有 pin5 拟合必炸 SweepGeometryError。
+- **reuse 纪律**(AA 负载 reuse=true 是产品行为):终局 A/B 每臂独立冷启动 job + settle 240s + 计量 ≥900s 暖稳态、同 seed 对称升温;SPS 采集豁免(按步形状分箱,缓存温度只改箱填充速度)。
+- 流水线坑五连修入册:helpers 全量拷贝、OUT_DIR 自挂载、ctx 模板 MTP spec 块换 DSpark(KeyError 'weight';TRTLLM moe 装 nvfp4 无罪)、表路径需显式挂载(AA 无整卷 /lustre)、STS 采集配置不得带 enable_ragged_verify(验证器要求 ragged 必须有表)。
+- 在飞:STS v2 采集;下一棒 = 拟温度 → 三臂冷启动矩阵(notrim vs scheduled@新表裸sigmoid vs scheduled@新表+STS)。
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
