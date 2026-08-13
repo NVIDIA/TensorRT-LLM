@@ -200,7 +200,6 @@ def _make_forward_only_engine(
     engine = object.__new__(PyTorchModelEngine)
     engine.model = SimpleNamespace(
         extra_attrs={},
-        modules=lambda: [],
         model_config=SimpleNamespace(pretrained_config=SimpleNamespace(
             rope_scaling=None)))
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER

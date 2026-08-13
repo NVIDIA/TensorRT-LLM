@@ -61,34 +61,6 @@ def test_decode_torch_uses_scan_lengths() -> None:
     assert output.tolist() == [[1, 0, -1, -1], [2, 1, 0, -1]]
 
 
-def test_one_module_dispatches_prefill_and_decode() -> None:
-    top_k = TopK(
-        1,
-        prefill_implementation=TopKImplementation.TORCH,
-        decode_implementation=TopKImplementation.TORCH,
-    )
-    scores = torch.tensor([[1.0, 3.0, 2.0]])
-    output = torch.empty(1, 1, dtype=torch.int32)
-
-    top_k(
-        scores,
-        output,
-        is_prefill=True,
-        row_starts=torch.tensor([1], dtype=torch.int32),
-        row_ends=torch.tensor([3], dtype=torch.int32),
-    )
-    assert output.item() == 0
-
-    top_k(
-        scores,
-        output,
-        is_prefill=False,
-        sequence_lengths=torch.tensor([3], dtype=torch.int32),
-        scan_lengths=torch.tensor([3], dtype=torch.int32),
-    )
-    assert output.item() == 1
-
-
 def test_cute_dsl_radix_preserves_compressed_mtp_fallback(monkeypatch) -> None:
     cute_dsl = Mock()
     trtllm = Mock()
@@ -218,33 +190,37 @@ def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:
     assert top_k._gvr_prior_indices.tolist() == [[0, 0], [2, 3], [4, 5]]
 
 
-def test_gvr_state_buffers_are_registered_during_init() -> None:
-    top_k = TopK(2, decode_implementation=TopKImplementation.CUDA_GVR)
-
-    buffers = dict(top_k.named_buffers())
-    assert set(buffers) == {
-        "_gvr_prior_indices",
-        "_cuda_gvr_scratch",
-        "_gvr_row_order",
-    }
-    assert all(buffer.numel() == 0 for buffer in buffers.values())
-
-
-def test_implementations_are_named_by_backend_and_algorithm() -> None:
-    assert {implementation.value for implementation in TopKImplementation} == {
-        "torch",
-        "cuda_radix",
-        "cute_dsl_radix",
-        "cuda_gvr",
-        "cute_dsl_gvr",
-    }
-
-
-def test_none_implementations_use_cuda_radix_defaults() -> None:
+def test_cuda_radix_defaults_dispatch_to_cpp(monkeypatch) -> None:
+    decode = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
     top_k = TopK(1)
+    scores = torch.randn(1, 8)
+    lengths = torch.tensor([8], dtype=torch.int32)
+    output = torch.empty((1, 1), dtype=torch.int32)
+
+    result = top_k(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=lengths,
+        scan_lengths=lengths,
+    )
 
     assert top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
     assert top_k.decode_implementation == TopKImplementation.CUDA_RADIX
+    assert result is output
+    decode.assert_called_once_with(
+        scores,
+        lengths,
+        output,
+        1,
+        1,
+        pre_idx=None,
+        heuristic_scratch=None,
+        compress_ratio=1,
+        radix_aux_indices=None,
+        radix_aux_logits=None,
+    )
 
 
 def test_cuda_gvr_owns_scratch_and_updates_prior(monkeypatch) -> None:

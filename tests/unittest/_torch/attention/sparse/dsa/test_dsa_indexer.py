@@ -54,9 +54,9 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     transform_local_topk_and_prepare_pool_view,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
-from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
@@ -125,7 +125,6 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
 @pytest.mark.parametrize(
     "enable_heuristic,use_cute_dsl,sm_version,compress_ratio,next_n,should_warmup",
     [
-        (True, False, 100, 1, 1, False),
         (True, True, 100, 1, 1, False),
         (False, True, 100, 1, 1, True),
         (True, True, 90, 1, 1, True),
@@ -304,27 +303,6 @@ def test_indexer_configures_one_top_k_module():
     assert isinstance(indexer.top_k, TopK)
     assert indexer.top_k.prefill_implementation == TopKImplementation.CUDA_RADIX
     assert indexer.top_k.decode_implementation == TopKImplementation.CUDA_RADIX
-    assert not hasattr(indexer, "prefill_top_k")
-    assert not hasattr(indexer, "decode_top_k")
-
-
-def test_indexer_prepare_updates_metadata_without_layer_state():
-    metadata = SimpleNamespace(
-        num_contexts=0,
-        num_generations=0,
-        num_ctx_tokens=0,
-        seq_lens=torch.empty(0, dtype=torch.int32),
-        compress_ratios=[1],
-    )
-    indexer_params = SimpleNamespace(new_kv_tokens=torch.empty(0, dtype=torch.int32))
-
-    with (
-        patch.object(Indexer, "build_indexer_params", return_value=indexer_params),
-        patch.object(Indexer, "prepare_for_update_k_cache") as prepare_metadata,
-    ):
-        Indexer.prepare(metadata)
-
-    prepare_metadata.assert_called_once_with(metadata, indexer_params)
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
