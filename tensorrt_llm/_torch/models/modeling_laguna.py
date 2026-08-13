@@ -32,6 +32,7 @@ from ..attention_backend.interface import (
     RopeParams,
 )
 from ..distributed import AllReduce, AllReduceParams
+from ..model_config import ModelConfig
 from ..modules.attention import _helix_cp_allgather_input, _helix_cp_output_projection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -227,7 +228,9 @@ class LagunaMoE(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def g_proj_quant_config(model_config, layer_idx: Optional[int]) -> Optional[QuantConfig]:
+def g_proj_quant_config(
+    model_config: ModelConfig[PretrainedConfig], layer_idx: Optional[int]
+) -> Optional[QuantConfig]:
     """Resolve g_proj's quant config, dropping it if the checkpoint excludes it.
 
     g_proj's output dim is the head count, not a multiple of the FP8 block

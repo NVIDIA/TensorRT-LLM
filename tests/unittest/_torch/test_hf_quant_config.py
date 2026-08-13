@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import pytest
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -64,7 +66,7 @@ def test_load_hf_quant_config_parses_nvfp4_with_kv_cache_scheme():
     assert set(quant_config.exclude_modules) == {gate_exclude, "lm_head"}
 
 
-def _fp8_block_scales_config(**overrides):
+def _fp8_block_scales_config(**overrides: Any) -> dict[str, Any]:
     config = {
         "quant_method": "fp8",
         "activation_scheme": "dynamic",
@@ -74,7 +76,7 @@ def _fp8_block_scales_config(**overrides):
     return config
 
 
-def test_fp8_block_scales_honours_ignored_layers():
+def test_fp8_block_scales_honours_ignored_layers() -> None:
     """vLLM/AutoFP8-style "fp8" configs record BF16 layers as "ignored_layers".
 
     These checkpoints carry no "modules_to_not_convert" at all, so before this
@@ -93,7 +95,7 @@ def test_fp8_block_scales_honours_ignored_layers():
     assert "*kv_b_proj*" in quant_config.exclude_modules
 
 
-def test_fp8_block_scales_merges_both_exclusion_keys():
+def test_fp8_block_scales_merges_both_exclusion_keys() -> None:
     """Both keys are honoured, and an entry named twice appears once.
 
     Producers commonly write the same module under both keys, and one of the
@@ -117,7 +119,7 @@ def test_fp8_block_scales_merges_both_exclusion_keys():
     assert len(excluded) == len(set(excluded))
 
 
-def test_fp8_block_scales_without_exclusions_keeps_defaults():
+def test_fp8_block_scales_without_exclusions_keeps_defaults() -> None:
     quant_config, _ = ModelConfig.load_hf_quant_config(
         _fp8_block_scales_config(), moe_backend="CUTLASS"
     )
@@ -125,7 +127,7 @@ def test_fp8_block_scales_without_exclusions_keeps_defaults():
     assert quant_config.exclude_modules == ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
 
 
-def test_compressed_tensors_honours_ignore_key():
+def test_compressed_tensors_honours_ignore_key() -> None:
     """Characterization: compressed-tensors keeps its "ignore" list.
 
     update_quant_config_from_compressed_tensors already merged "ignore", so
@@ -145,7 +147,7 @@ def test_compressed_tensors_honours_ignore_key():
         assert entry in quant_config.exclude_modules, f"{entry!r} was dropped"
 
 
-def test_ignore_and_ignored_layers_are_both_merged():
+def test_ignore_and_ignored_layers_are_both_merged() -> None:
     """A config carrying both spellings keeps both, de-duplicated."""
     hf_quant_config = _fp8_block_scales_config(
         ignored_layers=["model.layers.3.self_attn.g_proj", "lm_head"],
