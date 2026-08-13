@@ -386,7 +386,8 @@ std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) cons
 
 AgentConnectionManager::AgentConnectionManager(
     std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers, CacheState cacheState,
-    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState)
+    std::string const& backendType, std::optional<CacheState::RnnCacheState> rnnCacheState,
+    std::optional<bool> agentBufferEnable)
     : mCacheState(std::move(cacheState))
     , mRnnCacheState(std::move(rnnCacheState))
     , mCacheTransBufferManagers(std::move(cacheTransBufferManagers))
@@ -425,6 +426,7 @@ AgentConnectionManager::AgentConnectionManager(
     BaseAgentConfig config{mAgentName, true, false, true};
     config.rank = mRank;
     config.worldSize = mWorldSize;
+    config.agentBufferEnable = agentBufferEnable;
     m_Agent = makeTransferAgent(backendType, &config);
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
     mBufferKinds.reserve(mCacheTransBufferManagers.size());

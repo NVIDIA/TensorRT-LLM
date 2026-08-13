@@ -4578,7 +4578,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
+        "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver. Mutually exclusive with agent_buffer_enable."
     )
 
     enable_pipelined_transfer: bool = Field(
@@ -4590,6 +4590,24 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "peers, beam_width=1, no bounce buffer or Mamba/hybrid cache, and block "
         "reuse disabled or set to all_reusable. Invalid static settings fail at "
         "startup; per-request constraints reject the request.")
+
+    agent_buffer_enable: Optional[bool] = Field(
+        default=None,
+        description=
+        "Enable the transfer agent's staging-buffer (bounce) fast path, which gathers a request's "
+        "scattered KV blocks into a pre-registered arena and transfers them in pipelined chunks. "
+        "Currently implemented by the NIXL agent. Unset (default) falls back to the "
+        "TRTLLM_NIXL_BOUNCE_ENABLE environment variable; an explicit value overrides it. Expert "
+        "tuning knobs stay on the TRTLLM_NIXL_BOUNCE_* environment variables. Mutually exclusive "
+        "with kv_cache_bounce_size_mb.")
+
+    @model_validator(mode='after')
+    def validate_bounce_exclusive(self) -> 'CacheTransceiverConfig':
+        if self.agent_buffer_enable and self.kv_cache_bounce_size_mb > 0:
+            raise ValueError(
+                "agent_buffer_enable and kv_cache_bounce_size_mb are mutually "
+                "exclusive bounce implementations; enable only one.")
+        return self
 
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
@@ -4613,7 +4631,8 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
             kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
             kv_transfer_sender_future_timeout_ms=self.
             kv_transfer_sender_future_timeout_ms,
-            kv_transfer_poll_interval_ms=self.kv_transfer_poll_interval_ms)
+            kv_transfer_poll_interval_ms=self.kv_transfer_poll_interval_ms,
+            agent_buffer_enable=self.agent_buffer_enable)
 
 
 @dataclass

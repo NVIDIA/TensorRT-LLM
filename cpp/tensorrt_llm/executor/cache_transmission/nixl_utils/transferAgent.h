@@ -165,7 +165,9 @@ private:
     std::unique_ptr<bounce::NixlBounceState> mBounce;
 
     /// Lazily create the bounce transport (ctor, before any metadata exchange) when enabled.
-    void maybeInitBounce();
+    /// @param agentBufferEnable explicit enable/disable from BaseAgentConfig; unset falls back to
+    /// the TRTLLM_NIXL_BOUNCE_ENABLE environment variable.
+    void maybeInitBounce(std::optional<bool> agentBufferEnable);
     /// Heuristic gate: is this request eligible for the bounce fast path?
     [[nodiscard]] bool shouldUseBounce(TransferRequest const& request) const;
 };

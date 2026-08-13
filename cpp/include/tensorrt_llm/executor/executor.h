@@ -1281,7 +1281,8 @@ public:
     explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
         std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
         std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt,
-        std::optional<int> kvTransferPollIntervalMs = kDefaultKvTransferPollIntervalMs);
+        std::optional<int> kvTransferPollIntervalMs = kDefaultKvTransferPollIntervalMs,
+        std::optional<bool> agentBufferEnable = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
@@ -1289,12 +1290,14 @@ public:
     void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
     void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
     void setKvTransferPollIntervalMs(std::optional<int> kvTransferPollIntervalMs);
+    void setAgentBufferEnable(std::optional<bool> agentBufferEnable);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
     [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
     [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
     [[nodiscard]] std::optional<int> getKvTransferPollIntervalMs() const;
+    [[nodiscard]] std::optional<bool> getAgentBufferEnable() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1309,6 +1312,10 @@ private:
     // @brief Bounded wait interval in milliseconds for polling KV transfer progress when active transfers block
     // disaggregated admission.
     std::optional<int> mKvTransferPollIntervalMs;
+    // @brief Enable the transfer agent's staging-buffer (bounce) fast path, currently implemented
+    // by the NIXL agent. Unset falls back to the TRTLLM_NIXL_BOUNCE_ENABLE environment variable; an
+    // explicit value overrides it.
+    std::optional<bool> mAgentBufferEnable;
 };
 
 struct KVCacheCreatedData

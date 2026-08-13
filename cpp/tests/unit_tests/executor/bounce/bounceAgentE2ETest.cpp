@@ -160,6 +160,39 @@ void clearBounceEnv()
 }
 } // namespace
 
+// BaseAgentConfig::agentBufferEnable (from CacheTransceiverConfig's agent_buffer_enable) overrides
+// the TRTLLM_NIXL_BOUNCE_ENABLE environment variable in both directions; unset keeps env behavior.
+TEST(BounceAgentE2E, AgentBufferEnableConfigOverridesEnv)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    setBounceEnv();
+    auto makeAgent = [](char const* name, std::optional<bool> agentBufferEnable)
+    {
+        kvc::BaseAgentConfig cfg{name, true, false, true};
+        cfg.agentBufferEnable = agentBufferEnable;
+        return std::make_unique<kvc::NixlTransferAgent>(cfg);
+    };
+    try
+    {
+        // Env says on: explicit false wins; unset follows the env.
+        EXPECT_FALSE(makeAgent("cfgOffAgent", false)->isBounceEnabled());
+        EXPECT_TRUE(makeAgent("cfgUnsetAgent", std::nullopt)->isBounceEnabled());
+        // Env says off: explicit true wins.
+        setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "0", 1);
+        EXPECT_TRUE(makeAgent("cfgOnAgent", true)->isBounceEnabled());
+        EXPECT_FALSE(makeAgent("cfgUnsetAgent2", std::nullopt)->isBounceEnabled());
+    }
+    catch (std::exception const& e)
+    {
+        clearBounceEnv();
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
+    }
+    clearBounceEnv();
+}
+
 TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
 {
     if (!hasCuda())

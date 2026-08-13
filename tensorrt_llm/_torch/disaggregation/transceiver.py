@@ -136,6 +136,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
                 # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
                 bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
+                # Transfer-agent staging-buffer (bounce v2); mutually exclusive with `bounce`
+                # (enforced by CacheTransceiverConfig validation).
+                agent_buffer_enable=cache_transceiver_config.agent_buffer_enable,
             )
         )
         logger.info(

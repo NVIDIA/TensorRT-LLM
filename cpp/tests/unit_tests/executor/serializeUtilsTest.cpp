@@ -965,7 +965,8 @@ TEST(SerializeUtilsTest, MethodReturnType)
 TEST(SerializeUtilsTest, CacheTransceiverConfig)
 {
     texec::CacheTransceiverConfig cacheTransceiverConfig(
-        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024, 100, 1000);
+        tensorrt_llm::executor::CacheTransceiverConfig::BackendType::UCX, 1024, 100, 1000,
+        texec::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs, true);
     auto cacheTransceiverConfig2 = serializeDeserialize(cacheTransceiverConfig);
     EXPECT_EQ(cacheTransceiverConfig.getBackendType(), cacheTransceiverConfig2.getBackendType());
     EXPECT_EQ(cacheTransceiverConfig.getMaxTokensInBuffer(), cacheTransceiverConfig2.getMaxTokensInBuffer());
@@ -974,6 +975,7 @@ TEST(SerializeUtilsTest, CacheTransceiverConfig)
         cacheTransceiverConfig2.getKvTransferSenderFutureTimeoutMs());
     EXPECT_EQ(
         cacheTransceiverConfig.getKvTransferPollIntervalMs(), cacheTransceiverConfig2.getKvTransferPollIntervalMs());
+    EXPECT_EQ(cacheTransceiverConfig.getAgentBufferEnable(), cacheTransceiverConfig2.getAgentBufferEnable());
 }
 
 TEST(SerializeUtilsTest, BlockKeyBasic)

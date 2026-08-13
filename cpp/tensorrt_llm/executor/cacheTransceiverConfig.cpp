@@ -23,11 +23,13 @@ namespace tensorrt_llm::executor
 
 CacheTransceiverConfig::CacheTransceiverConfig(std::optional<BackendType> backendType,
     std::optional<size_t> maxNumTokens, std::optional<int> kvTransferTimeoutMs,
-    std::optional<int> kvTransferSenderFutureTimeoutMs, std::optional<int> kvTransferPollIntervalMs)
+    std::optional<int> kvTransferSenderFutureTimeoutMs, std::optional<int> kvTransferPollIntervalMs,
+    std::optional<bool> agentBufferEnable)
     : mBackendType(backendType)
     , mMaxTokensInBuffer(maxNumTokens)
     , mKvTransferTimeoutMs(kvTransferTimeoutMs)
     , mKvTransferSenderFutureTimeoutMs(kvTransferSenderFutureTimeoutMs)
+    , mAgentBufferEnable(agentBufferEnable)
 {
     setKvTransferPollIntervalMs(kvTransferPollIntervalMs);
 }
@@ -37,7 +39,8 @@ bool CacheTransceiverConfig::operator==(CacheTransceiverConfig const& other) con
     return mMaxTokensInBuffer == other.mMaxTokensInBuffer && mBackendType == other.mBackendType
         && mKvTransferTimeoutMs == other.mKvTransferTimeoutMs
         && mKvTransferSenderFutureTimeoutMs == other.mKvTransferSenderFutureTimeoutMs
-        && mKvTransferPollIntervalMs == other.mKvTransferPollIntervalMs;
+        && mKvTransferPollIntervalMs == other.mKvTransferPollIntervalMs
+        && mAgentBufferEnable == other.mAgentBufferEnable;
 }
 
 void CacheTransceiverConfig::setBackendType(std::optional<BackendType> backendType)
@@ -100,5 +103,15 @@ std::optional<int> CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs() 
 std::optional<int> CacheTransceiverConfig::getKvTransferPollIntervalMs() const
 {
     return mKvTransferPollIntervalMs;
+}
+
+void CacheTransceiverConfig::setAgentBufferEnable(std::optional<bool> agentBufferEnable)
+{
+    mAgentBufferEnable = agentBufferEnable;
+}
+
+std::optional<bool> CacheTransceiverConfig::getAgentBufferEnable() const
+{
+    return mAgentBufferEnable;
 }
 } // namespace tensorrt_llm::executor

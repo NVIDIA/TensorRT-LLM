@@ -199,15 +199,15 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
             [](kvc::BaseAgentConfig* self, std::string name, bool use_prog_thread, bool multi_thread,
                 bool use_listen_thread, bool enable_telemetry,
                 std::unordered_map<std::string, std::string> backend_params, std::optional<int> rank,
-                std::optional<int> world_size)
+                std::optional<int> world_size, std::optional<bool> agent_buffer_enable)
             {
                 new (self) kvc::BaseAgentConfig{std::move(name), use_prog_thread, multi_thread, use_listen_thread,
-                    enable_telemetry, std::move(backend_params), rank, world_size};
+                    enable_telemetry, std::move(backend_params), rank, world_size, agent_buffer_enable};
             },
             nb::arg("name"), nb::arg("use_prog_thread") = true, nb::arg("multi_thread") = false,
             nb::arg("use_listen_thread") = false, nb::arg("enable_telemetry") = false,
             nb::arg("backend_params") = std::unordered_map<std::string, std::string>{}, nb::arg("rank") = std::nullopt,
-            nb::arg("world_size") = std::nullopt)
+            nb::arg("world_size") = std::nullopt, nb::arg("agent_buffer_enable") = std::nullopt)
         .def_rw("name", &kvc::BaseAgentConfig::mName)
         .def_rw("use_prog_thread", &kvc::BaseAgentConfig::useProgThread)
         .def_rw("multi_thread", &kvc::BaseAgentConfig::multiThread)
@@ -215,7 +215,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def_rw("enable_telemetry", &kvc::BaseAgentConfig::enableTelemetry)
         .def_rw("backend_params", &kvc::BaseAgentConfig::backendParams)
         .def_rw("rank", &kvc::BaseAgentConfig::rank)
-        .def_rw("world_size", &kvc::BaseAgentConfig::worldSize);
+        .def_rw("world_size", &kvc::BaseAgentConfig::worldSize)
+        .def_rw("agent_buffer_enable", &kvc::BaseAgentConfig::agentBufferEnable);
 
     // BaseTransferAgent class (abstract base)
     // All transfer-engine operations release the GIL: they may block on NIXL /

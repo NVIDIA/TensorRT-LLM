@@ -146,6 +146,13 @@
       "path": "batch_wait_timeout_ms"
     },
     {
+      "allowed_values": [],
+      "annotation": "Optional[bool]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.agent_buffer_enable"
+    },
+    {
       "allowed_values": [
         "DEFAULT",
         "UCX",

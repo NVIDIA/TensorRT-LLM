@@ -663,16 +663,18 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         auto rnnState
             = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
-        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState, "nixl", rnnState);
+        mManager
+            = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(mCacheTransBufferManagerPtrs,
+                *mCacheState, "nixl", rnnState, mCacheTransceiverConfig->getAgentBufferEnable());
         TLLM_LOG_INFO("NIXL Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MOONCAKE)
     {
         auto rnnState
             = mCacheState->hasRnnConfig() ? std::make_optional(mCacheState->getRnnCacheState()) : std::nullopt;
-        mManager = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(
-            mCacheTransBufferManagerPtrs, *mCacheState, "mooncake", rnnState);
+        mManager
+            = std::make_unique<tensorrt_llm::executor::kv_cache::AgentConnectionManager>(mCacheTransBufferManagerPtrs,
+                *mCacheState, "mooncake", rnnState, mCacheTransceiverConfig->getAgentBufferEnable());
         TLLM_LOG_INFO("MOONCAKE Connection Manager created");
     }
     else if (backendType.value() == executor::CacheTransceiverConfig::BackendType::MPI)
