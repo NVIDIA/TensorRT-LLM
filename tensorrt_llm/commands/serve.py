@@ -420,31 +420,24 @@ def _init_multi_frontend_mode(llm_args: dict,
 
 
 # How often an attached frontend re-checks that its launcher is still its
-# parent. One getppid() per second is unmeasurable next to serving work, and
-# it is also the worst-case delay before an orphaned frontend releases the
-# shared port -- short enough that a client retrying a failed request finds
-# the group gone rather than a frontend that answers but cannot generate.
+# parent, and so the worst-case delay before an orphan releases the shared
+# port. One getppid() per second is unmeasurable next to serving work.
 _LAUNCHER_POLL_INTERVAL_SECONDS = 1.0
 
 
 def _wait_for_launcher_exit(launcher_pid: int) -> bool:
     """Block until the launcher is gone; True once that is certain.
 
-    Polls ``os.getppid()``. While the launcher lives it is this process's
-    parent, because it forked us; the moment it dies the kernel reparents
-    us to init (or to the nearest subreaper) and getppid() changes, never
-    to change back. That holds however the launcher dies, SIGKILL
-    included, where no user-space cleanup runs at all. Unlike
-    ``os.kill(launcher_pid, 0)`` it cannot be fooled by pid reuse: the
-    answer comes from our own parent link, not from whoever holds that pid
-    now.
+    Polls ``os.getppid()``: it changes exactly once, when the kernel
+    reparents us on the launcher's death, and never changes back -- true
+    however it dies, SIGKILL included. Unlike ``os.kill(pid, 0)`` it cannot
+    be fooled by pid reuse, since the answer comes from our own parent link.
 
-    Returns False without waiting when ``launcher_pid`` is not a pid we
-    could ever be reparented *away* from -- 1 in particular is both a
-    plausible launcher pid inside a container and the value reparenting
-    produces, so a change can never be observed. Only a definite answer
-    may kill this process, and the caller does exactly that, so guessing
-    would mean killing a perfectly healthy frontend.
+    Returns False without waiting for a ``launcher_pid`` we could never be
+    reparented *away* from (1 is both a plausible in-container launcher pid
+    and the value reparenting produces, so no change is observable). The
+    caller kills this process on a True, so guessing would kill a healthy
+    frontend.
     """
     if launcher_pid <= 1:
         logger.warning(
@@ -460,23 +453,20 @@ def _wait_for_launcher_exit(launcher_pid: int) -> bool:
 def _watch_launcher_liveness(launcher_pid: int) -> None:
     """Exit this attached frontend when the launcher process goes away.
 
-    An orphaned frontend still holds the shared SO_REUSEPORT port, so it
-    would keep accepting connections that it can never serve -- the engine
-    it proxies belongs to the launcher. The launcher's own `finally` is not
-    reachable when it is killed by a signal (uvicorn re-raises SIGTERM/SIGINT
-    after restoring the default handler, so neither `finally` nor `atexit`
-    runs), hence this independent watchdog.
+    An orphan still holds the shared SO_REUSEPORT port and would accept
+    connections it can never serve, since the engine it proxies belongs to
+    the launcher. The launcher's own `finally` is unreachable when a signal
+    kills it (uvicorn re-raises SIGTERM/SIGINT after restoring the default
+    handler, so neither `finally` nor `atexit` runs), hence this watchdog.
 
-    Note this deliberately does *not* use PR_SET_PDEATHSIG: that fires when
-    the creating *thread* exits, not the parent process, and the frontends
-    are spawned from the engine-init thread, which exits as soon as startup
-    finishes. It would kill every child on a healthy start.
+    Deliberately not PR_SET_PDEATHSIG: that fires when the creating *thread*
+    exits, and these are spawned from the engine-init thread, which exits as
+    soon as startup finishes -- it would kill every child on a healthy start.
 
-    ``launcher_pid`` is the launcher's own pid, passed down through the
-    environment rather than read here as ``os.getppid()``: a launcher that
-    died before this thread started has already been reparented away from,
-    so comparing against the value it recorded catches that case on the
-    first poll instead of leaving an orphan behind.
+    ``launcher_pid`` comes from the environment rather than ``os.getppid()``
+    here: a launcher that died before this thread started has already been
+    reparented away from, so comparing against the recorded value catches
+    that on the first poll instead of leaving an orphan.
     """
 
     def _watch() -> None:
@@ -718,14 +708,11 @@ def launch_server(
                     f"{backend} is not a known backend, check help for available options.",
                     param_hint="backend")
 
-            # From here on the engine is live but no reference to it has
-            # reached the caller yet. If anything below raises, `build_frontend`
-            # propagates and `server` stays None in serve_with_lifecycle, so its
-            # `on_startup_failure` hook is skipped (lifecycle.py's
-            # `if server is not None` guard) and the attached-frontend path
-            # never gets a server either. The only teardown left would be the
-            # LLM atexit hook — the unbounded interpreter-shutdown path this
-            # lifecycle exists to avoid. Shut the engine down here instead.
+            # The engine is live but no reference has reached the caller yet,
+            # so if anything below raises, `server` stays None in
+            # serve_with_lifecycle and its on_startup_failure hook is skipped.
+            # The only teardown left would be the LLM atexit hook -- the
+            # unbounded interpreter-shutdown path this lifecycle avoids.
             try:
                 if multi_frontend.is_launcher:
                     _spawn_attached_frontends(llm, multi_frontend.num_frontends,
@@ -752,12 +739,9 @@ def launch_server(
                 try:
                     llm.shutdown()
                 except Exception as shutdown_error:
-                    # Never let the cleanup failure become the headline. This
-                    # is the teardown this PR elsewhere treats as capable of
-                    # wedging, so it can plausibly raise; if it replaced the
-                    # original error the real cause would survive only as
-                    # __context__. Same masking-avoidance discipline as
-                    # serve_with_lifecycle's abort path.
+                    # Never let cleanup become the headline: this teardown can
+                    # wedge, and if it replaced the original error the real
+                    # cause would survive only as __context__.
                     logger.error(
                         "Engine shutdown after a failed frontend build did "
                         f"not complete cleanly: {shutdown_error!r}")
@@ -770,12 +754,10 @@ def launch_server(
 
         try:
             if multi_frontend.is_attached_frontend:
-                # Attached frontends must not join the SO_REUSEPORT group
-                # until they are ready. While the group starts up the
-                # launcher is the only listener, which is what keeps
-                # /health's answer deterministic: were a still-initializing
-                # sibling also listening, the kernel could route a probe to
-                # it and return 503 long after the group went READY.
+                # Attached frontends join the SO_REUSEPORT group only once
+                # ready, so the launcher is the sole listener during startup.
+                # Otherwise the kernel could route a probe to a still-
+                # initializing sibling and return 503 after the group is READY.
                 # Build first, signal READY, then listen.
                 _watch_launcher_liveness_from_env()
                 server = build_frontend()

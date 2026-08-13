@@ -820,15 +820,13 @@ def test_startup_failure_never_runs_two_engine_teardowns(monkeypatch):
     """The window that a bounded, off-loop teardown opened.
 
     When on_ready fails after a successful attach, uvicorn's shutdown already
-    drives the delegate lifespan's teardown. If an out-of-band teardown also
-    runs, both execute BaseLLM.shutdown() -- which takes no lock, so both see
-    a non-None executor -- and drive ZeroMqQueue.close() from two threads,
-    which the executor proxy documents as not ZMQ-safe (observed in the wild
-    as a permanent hang in zmq_ctx_term).
+    drives the delegate's teardown. A second, out-of-band one would run
+    BaseLLM.shutdown() concurrently -- it takes no lock, so both see a
+    non-None executor -- driving ZeroMqQueue.close() from two threads, which
+    is not ZMQ-safe (seen in the wild as a permanent zmq_ctx_term hang).
 
-    The abort bound is squeezed below the teardown duration so that, if the
-    teardown were abandonable mid-flight, the second one would start on top
-    of it.
+    The abort bound is squeezed below the teardown duration so a mid-flight
+    abandonment would let the second start on top of the first.
     """
     monkeypatch.setattr(lifecycle_mod, "_ABORT_SHUTDOWN_TIMEOUT_SECONDS", 0.5)
 
@@ -1331,13 +1329,11 @@ def test_cooperative_delegate_shutdown_is_bounded(monkeypatch):
 # --------------------------------------------------------------------------
 # The shared test harness must survive the new contract.
 #
-# RemoteOpenAIServer polls /health until it returns 200. Before this feature a
-# still-starting server refused the connection, so every poll raised and the
-# deadline (which lived only on the exception path) was enforced. Now the
-# server answers 503 instead, so the deadline has to be enforced on the
-# non-exception path too -- otherwise a hung engine initialization, the exact
-# failure this feature exists to make visible, would spin the harness forever
-# and leak the trtllm-serve child.
+# RemoteOpenAIServer polls /health until it returns 200. A still-starting
+# server used to refuse the connection, so every poll raised and the deadline
+# -- which lived only on the exception path -- was enforced. It now answers
+# 503, so the deadline must be enforced on the non-exception path too, or a
+# hung init would spin the harness forever and leak the trtllm-serve child.
 # --------------------------------------------------------------------------
 
 
@@ -1479,14 +1475,11 @@ def fake_multi_frontend_llm(monkeypatch):
 
 # Two stand-in frontends, deliberately different.
 #
-# The heavy one calls the *real* child-side watchdog, so the shipped
-# _watch_launcher_liveness_from_env and its call site are genuinely covered;
-# it costs a full `import tensorrt_llm` (seconds and gigabytes), so exactly
-# one test uses it.
-#
-# The light one imports nothing and is used where the property under test
-# belongs to the *launcher* side -- whether spawned children outlive the
-# thread that created them -- and the child is only required to stay alive.
+# The heavy one exercises the *real* child-side watchdog, so the shipped
+# _watch_launcher_liveness_from_env is genuinely covered. It costs a full
+# `import tensorrt_llm`, so exactly one test uses it. The light one imports
+# nothing and serves the launcher-side properties, where the child only has
+# to stay alive.
 HEAVY_FRONTEND_SRC = """
 import os, sys, time
 sys.path.insert(0, {trtllm_parent!r})
@@ -1517,16 +1510,14 @@ def heavy_frontend_src(after_arming: str = "") -> str:
 def test_frontends_survive_the_spawning_thread_exiting(monkeypatch):
     """The regression that PR_SET_PDEATHSIG introduced.
 
-    PR_SET_PDEATHSIG fires when the *creating thread* exits, not when the
-    parent process dies. Frontends are spawned from ``build_frontend`` on the
-    ``trtllm_engine_init`` daemon thread, which exits as soon as startup
-    finishes -- so an armed PDEATHSIG killed every child immediately after a
-    perfectly healthy start, silently degrading num_serve_frontends=K to 1.
+    PR_SET_PDEATHSIG fires when the *creating thread* exits, not the parent
+    process. Frontends are spawned on the ``trtllm_engine_init`` daemon
+    thread, which exits as soon as startup finishes, so an armed PDEATHSIG
+    killed every child after a healthy start -- silently degrading
+    num_serve_frontends=K to 1.
 
-    The property is entirely on the launcher side (what
-    _spawn_attached_frontends does to its children), so a light stand-in
-    child is enough here; the real child-side watchdog is covered by
-    test_frontend_exits_when_the_launcher_is_killed.
+    Launcher-side only, so a light stand-in child suffices; the child-side
+    watchdog is covered by test_frontend_exits_when_the_launcher_is_killed.
     """
     from tensorrt_llm.commands import serve as serve_mod
 

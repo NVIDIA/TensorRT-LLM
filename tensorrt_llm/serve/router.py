@@ -178,12 +178,10 @@ class KvCacheAwareServerState(ServerState):
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
                 f"{self._base_url}/kv_cache_events") as response:
-            # Same reason as _fetch_server_info: a still-initializing worker
-            # now answers 503 STARTING instead of refusing the connection, so
-            # an unchecked .json() would hand a STARTING body to
-            # update_with_events and fail deep inside the event loop with a
-            # shape error rather than at the source. poll_and_update() logs
-            # and moves on, so raising here just defers the poll.
+            # As in _fetch_server_info: without this a STARTING body reaches
+            # update_with_events and fails as a shape error deep in the event
+            # walk. poll_and_update() logs and moves on, so raising just
+            # defers the poll.
             response.raise_for_status()
             events_raw = await response.json()
         return events_raw
@@ -402,17 +400,12 @@ class Router(ABC):
             url = self._ensure_url(server)
             async with self.session.get(f"{url}/server_info",
                                         timeout=timeout) as response:
-                # Check the status before parsing. Until this PR a server that
-                # was still initializing refused the connection, so this call
-                # raised and _prepare_server() retried later. Now the socket
-                # listens through startup and answers 503 STARTING, so an
-                # unchecked .json() would parse the STARTING body and
-                # _prepare_server() would cache it as the worker's real
-                # server_info -- permanently, because _prepared_ready_servers
-                # is only discarded on removal, and prepare_servers() runs
-                # BEFORE _wait_for_all_servers_ready() in
-                # disagg_coordinator.start(). Raising keeps the old
-                # retry-until-actually-ready behaviour.
+                # A still-initializing worker now answers 503 instead of
+                # refusing the connection, so an unchecked .json() would cache
+                # the STARTING body as the worker's server_info -- permanently,
+                # since _prepared_ready_servers is only dropped on removal and
+                # prepare_servers() runs before _wait_for_all_servers_ready().
+                # Raising restores the old retry-until-ready behaviour.
                 response.raise_for_status()
                 return await response.json()
         except Exception as e:

@@ -426,29 +426,20 @@ class OpenAIServer(_VideoRoutesMixin):
                     "url": self.binding_addr
                 }
                 # TODO: add more metadata
-                # Register with ETCD using the existing key format.
-                #
-                # Off the event loop: this lifespan now runs while the socket
-                # is already listening and answering STARTING probes (see
-                # serve/lifecycle.py). A slow or unreachable etcd would block
-                # the loop, so /health would be accepted and never answered --
-                # the "third ambiguous state" the lifecycle contract exists to
-                # remove, and strictly worse than the connection-refused it
-                # replaced. Before that change this ran before uvicorn
-                # listened, so the blocking was invisible.
+                # Off the loop: this lifespan now runs while the socket is
+                # already answering STARTING probes (see serve/lifecycle.py),
+                # so a slow etcd would leave /health accepted and never
+                # answered -- the third ambiguous state that contract removes.
                 await asyncio.to_thread(self.metadata_server.put,
                                         f"trtllm/{self.generator.llm_id}",
                                         metadata)
                 logger.info(f"trtllm/{self.generator.llm_id} is registered")
 
             if self.disagg_cluster_config:
-                # Deliberately ON the event loop, unlike the etcd put above.
-                # HttpClusterStorageClient.__init__ constructs an
-                # aiohttp.ClientSession, which binds to the running loop at
-                # construction; building it on a worker thread leaves it bound
-                # to no loop and every later request fails. It is also not the
-                # kind of call that needs offloading -- the constructor only
-                # builds objects, it does not dial the backend.
+                # ON the loop, unlike the etcd put above: this constructs an
+                # aiohttp.ClientSession, which binds to the running loop, so
+                # building it on a worker thread breaks every later request.
+                # It also does not dial the backend, so it need not be off-loop.
                 self.disagg_cluster_storage = create_cluster_storage_client(
                     self.disagg_cluster_config.cluster_uri,
                     self.disagg_cluster_config.cluster_name)
@@ -525,21 +516,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self.disagg_cluster_worker.deregister_worker()
             if self.resource_governor is not None:
                 self.resource_governor.close()
-            # Deliberately inline on the event loop, despite being slow and
-            # synchronous.
-            #
-            # Blocking the loop means no asyncio timer can fire while this
-            # runs, so the teardown is never abandoned half-done: it either
-            # completes or was never entered, and callers can tell which.
-            # On a worker thread it would instead keep running after its
-            # caller gave up, uncancellable, while that caller concludes the
-            # engine still needs tearing down -- and BaseLLM.shutdown() takes
-            # no lock, so the two would drive ZeroMqQueue.close() from
-            # different threads, which is not ZMQ-safe.
-            #
-            # The cost is real: /health and every open connection stall for
-            # the duration of the shutdown. That is accepted here because the
-            # process is on its way out either way.
+            # Deliberately inline on the loop despite being slow: blocking it
+            # means no asyncio timer can fire, so this teardown is never
+            # abandoned half-done. Off-loop it would keep running after its
+            # caller gave up, and BaseLLM.shutdown() takes no lock, so the two
+            # would drive ZeroMqQueue.close() from different threads -- not
+            # ZMQ-safe. Cost: /health and open connections stall until it
+            # finishes, accepted because the process is exiting anyway.
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
