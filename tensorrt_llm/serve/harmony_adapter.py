@@ -1977,16 +1977,22 @@ def _create_usage_info(num_prompt_tokens,
 
 
 def maybe_transform_reasoning_effort(
-    reasoning_effort: ReasoningEffort | Literal["low", "medium", "high"] | None
+    reasoning_effort: ReasoningEffort
+    | Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+    | None
 ) -> ReasoningEffort | None:
     str_to_effort = {
         "low": ReasoningEffort.LOW,
         "medium": ReasoningEffort.MEDIUM,
         "high": ReasoningEffort.HIGH,
-        # Levels other model families use. Harmony has no "off" rung, so
-        # 'none' falls through to unspecified rather than raising a KeyError
-        # on a request that is merely aimed at a different model.
+        # Levels other model families use, mapped to the nearest rung Harmony
+        # has. 'xhigh' and 'max' both sit above 'high' and Harmony's ladder
+        # stops there, so both saturate rather than drop to unspecified.
+        "xhigh": ReasoningEffort.HIGH,
         "max": ReasoningEffort.HIGH,
+        # 'none' and 'minimal' are deliberately absent: Harmony has no "off"
+        # rung, so they fall through to unspecified rather than raising a
+        # KeyError on a request merely aimed at a different model.
     }
     if reasoning_effort and not isinstance(reasoning_effort, ReasoningEffort):
         return str_to_effort.get(reasoning_effort)
