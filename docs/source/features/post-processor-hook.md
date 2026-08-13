@@ -190,16 +190,9 @@ form — so keying state on `chunk.request_id` is sufficient to keep concurrent 
 
 The hook's unit and end-to-end tests double as runnable usage examples:
 
-These developer tests are not included in TensorRT-LLM release containers. Follow the
-[build-from-source workflow](../installation/build-from-source.md), then install the test dependencies:
-
-```bash
-python3 -m pip install -r requirements-dev.txt
-```
-
 ```bash
 # Unit tests for the hook contract (rewrite / suppress / terminate, per-request state, loader)
-python3 -m pytest tests/unittest/executor/test_postprocessor_hook.py -v
+pytest tests/unittest/executor/test_postprocessor_hook.py -v
 ```
 
 - End-to-end serving tests across endpoints, streaming modes, and worker-pool settings:
