@@ -1517,9 +1517,9 @@ class Indexer(nn.Module):
                 :num_ctx_tokens, :
             ]
 
-        # Seed GVR state after the active generation slots.
+        # Chunked prefill is final only after its TP all-gathers; update GVR prior once here.
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
-            self.top_k.seed_from_prefill(
+            self.top_k.update_gvr_prior_from_prefill(
                 topk_indices_buffer[:num_ctx_tokens],
                 metadata.seq_lens[:num_contexts],
                 request_offset=num_generations,

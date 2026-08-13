@@ -1508,7 +1508,7 @@ class PyTorchModelEngine(ModelEngine):
         log_mem_snapshot("warmup/after_preallocate_padding_dummies")
 
     def _warmup_sparse_top_k(self) -> None:
-        """Warm up DSA Top-K kernels before any model forward or graph capture."""
+        """Pre-compile CuTe DSL radix variants before model warmup."""
         from ..attention_backend.sparse.dsa import DSAtrtllmAttentionMetadata
 
         if isinstance(self.attn_metadata, DSAtrtllmAttentionMetadata):

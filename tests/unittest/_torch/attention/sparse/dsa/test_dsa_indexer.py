@@ -123,23 +123,23 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
 
 
 @pytest.mark.parametrize(
-    "enable_heuristic,use_cute_dsl,sm_version,compress_ratio,next_n,expected",
+    "enable_heuristic,use_cute_dsl,sm_version,compress_ratio,next_n,should_warmup",
     [
-        (True, False, 100, 1, 1, "cuda_gvr"),
-        (True, True, 100, 1, 1, None),
-        (False, True, 100, 1, 1, "cute_dsl_radix"),
-        (True, True, 90, 1, 1, "cute_dsl_radix"),
-        (False, True, 100, 4, 2, None),
-        (False, False, 100, 1, 1, None),
+        (True, False, 100, 1, 1, False),
+        (True, True, 100, 1, 1, False),
+        (False, True, 100, 1, 1, True),
+        (True, True, 90, 1, 1, True),
+        (False, True, 100, 4, 2, False),
+        (False, False, 100, 1, 1, False),
     ],
 )
-def test_metadata_warmup_top_k_dispatches_configured_implementation(
+def test_metadata_warmup_top_k_only_precompiles_cute_dsl_radix(
     enable_heuristic,
     use_cute_dsl,
     sm_version,
     compress_ratio,
     next_n,
-    expected,
+    should_warmup,
 ):
     metadata = SimpleNamespace(
         sparse_metadata_params=SimpleNamespace(enable_heuristic_topk=enable_heuristic),
@@ -156,19 +156,12 @@ def test_metadata_warmup_top_k_dispatches_configured_implementation(
             return_value=sm_version,
         ),
         patch(
-            "tensorrt_llm._torch.custom_ops.cpp_custom_ops.warmup_cuda_gvr_topk_decode"
-        ) as cuda_gvr,
-        patch(
             "tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops.warmup_cute_dsl_radix_topk_decode"
         ) as cute_dsl_radix,
     ):
         DSAtrtllmAttentionMetadata.warmup_top_k(metadata, next_n)
 
-    if expected == "cuda_gvr":
-        cuda_gvr.assert_called_once_with(top_k=512)
-    else:
-        cuda_gvr.assert_not_called()
-    if expected == "cute_dsl_radix":
+    if should_warmup:
         cute_dsl_radix.assert_called_once_with(
             top_k=512,
             num_cols=32768,

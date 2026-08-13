@@ -205,11 +205,11 @@ def test_gvr_prepares_row_order_at_threshold(monkeypatch) -> None:
     assert row_order.tolist() == [2, 0, 3, 1]
 
 
-def test_seed_from_prefill_uses_last_request_rows() -> None:
+def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:
     top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
     prefill_indices = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.int32)
 
-    top_k.seed_from_prefill(
+    top_k.update_gvr_prior_from_prefill(
         prefill_indices,
         torch.tensor([2, 1], dtype=torch.int32),
         request_offset=1,
@@ -228,45 +228,6 @@ def test_gvr_state_buffers_are_registered_during_init() -> None:
         "_gvr_row_order",
     }
     assert all(buffer.numel() == 0 for buffer in buffers.values())
-
-
-def test_cuda_gvr_warmup_calls_cpp_op(monkeypatch) -> None:
-    from tensorrt_llm._torch.custom_ops import cpp_custom_ops
-
-    decode = Mock()
-    synchronize = Mock()
-    torch_empty = torch.empty
-    torch_tensor = torch.tensor
-    torch_zeros = torch.zeros
-    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
-    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
-    monkeypatch.setattr(
-        torch,
-        "empty",
-        lambda shape, *, dtype, device: torch_empty(shape, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        torch,
-        "tensor",
-        lambda data, *, dtype, device: torch_tensor(data, dtype=dtype),
-    )
-    monkeypatch.setattr(
-        torch,
-        "zeros",
-        lambda shape, *, dtype, device: torch_zeros(shape, dtype=dtype),
-    )
-
-    cpp_custom_ops.warmup_cuda_gvr_topk_decode(top_k=512)
-
-    args = decode.call_args.args
-    kwargs = decode.call_args.kwargs
-    assert args[0].shape == (1, 4096)
-    assert args[2].shape == (1, 512)
-    assert kwargs["pre_idx"].shape == (1, 512)
-    assert kwargs["heuristic_scratch"].shape == (1, 512)
-    assert kwargs["radix_aux_indices"].shape == (1, 10, 512)
-    assert kwargs["radix_aux_logits"].shape == (1, 10, 512)
-    synchronize.assert_called_once_with()
 
 
 def test_implementations_are_named_by_backend_and_algorithm() -> None:

@@ -300,19 +300,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         return max(1, self.kv_cache_manager.max_seq_len // self._indexer_compress_ratio)
 
     def warmup_top_k(self, next_n: int) -> None:
-        """Warm up the configured decode Top-K implementation."""
+        """Pre-compile CuTe DSL radix variants not covered by engine warmup."""
         sparse_params = self.sparse_metadata_params
-        use_gvr = sparse_params.enable_heuristic_topk and get_sm_version() >= 100
-        if use_gvr:
-            if self.use_cute_dsl_topk:
-                # The regular eager attention warmup compiles CuTe DSL GVR.
-                return
-            from tensorrt_llm._torch.custom_ops.cpp_custom_ops import warmup_cuda_gvr_topk_decode
-
-            warmup_cuda_gvr_topk_decode(top_k=self.num_sparse_topk)
-            return
-
-        if not self.use_cute_dsl_topk or (self._indexer_compress_ratio > 1 and next_n > 1):
+        if (
+            not self.use_cute_dsl_topk
+            or (self._indexer_compress_ratio > 1 and next_n > 1)
+            or (sparse_params.enable_heuristic_topk and get_sm_version() >= 100)
+        ):
             return
         from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
             warmup_cute_dsl_radix_topk_decode,

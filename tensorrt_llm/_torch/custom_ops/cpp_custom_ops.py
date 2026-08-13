@@ -1609,38 +1609,3 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
-
-
-def warmup_cuda_gvr_topk_decode(top_k: int = 2048) -> None:
-    """Initialize CUDA GVR before CUDA Graph capture.
-
-    The first dispatcher call queries and caches device SM and L2 attributes.
-    """
-    num_columns = 4096
-    max_blocks_per_row = 10
-    device = torch.device("cuda")
-    logits = torch.zeros((1, num_columns), dtype=torch.float32, device=device)
-    sequence_lengths = torch.tensor([num_columns],
-                                    dtype=torch.int32,
-                                    device=device)
-    output_indices = torch.empty((1, top_k), dtype=torch.int32, device=device)
-    prior_indices = torch.zeros((1, top_k), dtype=torch.int32, device=device)
-    scratch_values = torch.empty((1, top_k), dtype=torch.float32, device=device)
-    radix_indices = torch.empty((1, max_blocks_per_row, top_k),
-                                dtype=torch.int32,
-                                device=device)
-    radix_values = torch.empty((1, max_blocks_per_row, top_k),
-                               dtype=torch.float32,
-                               device=device)
-    torch.ops.trtllm.indexer_topk_decode(
-        logits,
-        sequence_lengths,
-        output_indices,
-        1,
-        top_k,
-        pre_idx=prior_indices,
-        heuristic_scratch=scratch_values,
-        radix_aux_indices=radix_indices,
-        radix_aux_logits=radix_values,
-    )
-    torch.cuda.synchronize()
