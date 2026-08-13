@@ -504,6 +504,13 @@ class SpeculativeDecodingMode(IntEnum):
         return SpeculativeDecodingMode[name.upper()]
 
 
+# Philox seed for requests that did not set ``SamplingParams.seed``. Fixed
+# rather than advanced per step so a run is reproducible: a request's stream is
+# separated from other rows' by the kernel's per-row subsequence and from its
+# own earlier steps by the offset, which leaves the seed free to be a constant.
+DEFAULT_SAMPLING_SEED = 42
+
+
 @dataclass
 class SpecMetadata:
     """
@@ -623,6 +630,27 @@ class SpecMetadata:
     # answer and let one skip a fill another view invalidated.
     _sampling_params_signature: list = field(
         default_factory=lambda: [None, None], repr=False)
+    # Per-row Philox state for user-specified ``SamplingParams.seed``, laid out
+    # to match the logits rows the sampling kernels consume.
+    #
+    # ``request_seeds`` carries the request's own seed (the engine-wide seed
+    # for unseeded requests). ``request_offsets`` carries its decoding
+    # iteration, which is what advances the stream between steps: with a fixed
+    # user seed the offset is the only thing that changes, and taking it from
+    # the request's own progress -- rather than a global step counter -- keeps
+    # a seeded request reproducible regardless of which batch it lands in.
+    #
+    # NB: the pinned flashinfer reads only element 0 of each tensor, separating
+    # rows by blockIdx.x, so these per-row values are carried end-to-end but
+    # not yet honored per request. See
+    # https://github.com/flashinfer-ai/flashinfer/pull/2345.
+    request_seeds: Optional[torch.Tensor] = None
+    request_offsets: Optional[torch.Tensor] = None
+    # The same state expanded to one entry per logits row, mirroring the
+    # temperatures / top_ks / top_ps layout, for the sampling calls that
+    # consume rows rather than requests.
+    seeds: Optional[torch.Tensor] = None
+    offsets: Optional[torch.Tensor] = None
     # Whether to use sampling parameters when sampling draft tokens.
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
@@ -667,6 +695,86 @@ class SpecMetadata:
 
     def __post_init__(self):
         pass
+
+    def _populate_request_rng_state(
+            self, requests: list["LlmRequest"],
+            per_request_normalized: list[tuple[float, int, float,
+                                               int]]) -> None:
+        """Fill the Philox seed/offset buffers for this batch.
+
+        A request's seed is fixed for its lifetime, so the offset is what has
+        to advance between steps -- otherwise every step of a seeded request
+        would draw the same numbers. Taking it from the request's own decoding
+        iteration, rather than a global step counter, is what ties the stream
+        to how far that request has decoded instead of to when it was
+        scheduled.
+
+        Both layouts are produced: ``request_*`` with one entry per request,
+        and ``seeds`` / ``offsets`` expanded to one entry per logits row (the
+        temperatures / top_ks / top_ps layout), because the sampling calls
+        take one or the other.
+
+        A request that specified no seed gets ``DEFAULT_SAMPLING_SEED``. Its
+        stream is then separated from the other rows' by the kernel's per-row
+        subsequence and from its own earlier steps by the offset, so unseeded
+        requests still sample independently -- just reproducibly.
+        """
+        from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import \
+            request_random_seed
+
+        request_seeds = [
+            seed if (seed := request_random_seed(request)) is not None else
+            DEFAULT_SAMPLING_SEED for request in requests
+        ]
+        # Base of this step's Philox offset window. Each decoding iteration
+        # owns max_draft_len + 1 consecutive offsets: the target sampler (or
+        # the rejection kernel, which is its alternative) takes the first, and
+        # draft step i takes base + 1 + i. Sizing the window by the static
+        # max_draft_len rather than the runtime one keeps a step's offsets
+        # disjoint from its neighbours' even when the draft length shrinks.
+        window = self.max_draft_len + 1
+        request_offsets = [
+            request.py_decoding_iter * window for request in requests
+        ]
+        num_tokens_per_request = [n for *_, n in per_request_normalized]
+
+        flat_seeds: list[int] = []
+        flat_offsets: list[int] = []
+        for seed, offset, num_tokens in zip(request_seeds, request_offsets,
+                                            num_tokens_per_request):
+            flat_seeds.extend(seed for _ in range(num_tokens))
+            flat_offsets.extend(offset for _ in range(num_tokens))
+
+        if (self.request_seeds is None
+                or self.request_seeds.numel() < self.max_num_requests):
+            self.request_seeds = torch.zeros(self.max_num_requests,
+                                             dtype=torch.int64,
+                                             device='cuda')
+            self.request_offsets = torch.zeros(self.max_num_requests,
+                                               dtype=torch.int64,
+                                               device='cuda')
+        if self.seeds is None or self.seeds.numel() < len(flat_seeds):
+            # Match the per-token buffers' capacity so a later batch with more
+            # rows does not reallocate mid-stream.
+            capacity = max(
+                len(flat_seeds),
+                self.temperatures.numel()
+                if self.temperatures is not None else 0)
+            self.seeds = torch.zeros(capacity, dtype=torch.int64, device='cuda')
+            self.offsets = torch.zeros(capacity,
+                                       dtype=torch.int64,
+                                       device='cuda')
+
+        def _upload(dst: torch.Tensor, values: list[int]) -> None:
+            dst[:len(values)].copy_(torch.tensor(values,
+                                                 dtype=torch.int64,
+                                                 pin_memory=prefer_pinned()),
+                                    non_blocking=True)
+
+        _upload(self.request_seeds, request_seeds)
+        _upload(self.request_offsets, request_offsets)
+        _upload(self.seeds, flat_seeds)
+        _upload(self.offsets, flat_offsets)
 
     def prepare_rejection_sampling_buffers(self):
         """
@@ -991,6 +1099,8 @@ class SpecMetadata:
                                              dtype=torch.float32,
                                              device='cuda')
 
+        self._populate_request_rng_state(requests, per_request_normalized)
+
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
         # draft-sampler time to scatter draft probs by slot.
@@ -1150,8 +1260,6 @@ class SpecWorkerBase(nn.Module, ABC):
             raise ImportError(
                 "Speculative decoding requires flashinfer>=0.6.4, please install "
                 "the version pinned in requirements.txt.")
-        self.seed: Optional[torch.Tensor] = None
-        self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
         # Static draft->target vocab offset map, cached once the draft model is
         # loaded (see set_draft_model). None when draft and target share a vocab.
@@ -1644,18 +1752,24 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ks = spec_metadata.request_top_ks[:batch_size]
         top_ps = spec_metadata.request_top_ps[:batch_size]
 
-        self._update_advance_draft_sampling_seed(logits.device)
         eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
             spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+        # One row per request here, matching the request_* slices above.
+        # Slot 0 of the step's offset window belongs to the target sampler, so
+        # draft step i takes 1 + i. Callers that do not pass a draft_step run
+        # this sampler once per step and take the first draft slot.
+        seed, offset = self._rng_state_per_request(spec_metadata,
+                                                   end=batch_size,
+                                                   step_offset=1 +
+                                                   (draft_step or 0))
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             draft_tokens, probs = (
-                sampling_batch_spec_dec_one_model_for_rejection(
-                    logits,
-                    temperatures,
-                    eff_top_ks,
-                    eff_top_ps,
-                    seed=self.seed,
-                    offset=self.offset))
+                sampling_batch_spec_dec_one_model_for_rejection(logits,
+                                                                temperatures,
+                                                                eff_top_ks,
+                                                                eff_top_ps,
+                                                                seed=seed,
+                                                                offset=offset))
             # Scatter probs into the slot-indexed buffer so each request's data
             # lands at its stable py_seq_slot row regardless of batch shifts.
             assert spec_metadata.batch_slot_ids is not None, (
@@ -1671,8 +1785,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                                  temperatures,
                                                  eff_top_ks,
                                                  eff_top_ps,
-                                                 seed=self.seed,
-                                                 offset=self.offset)
+                                                 seed=seed,
+                                                 offset=offset)
 
         return draft_tokens.type(torch.int32)
 
@@ -1877,22 +1991,17 @@ class SpecWorkerBase(nn.Module, ABC):
 
             full_draft_tokens = draft_tokens.to(torch.int32).contiguous()
 
-            if self.seed is None:
-                self.seed = torch.tensor([0], dtype=torch.int64, device=device)
-            if self.offset is None:
-                self.offset = torch.tensor([0],
-                                           dtype=torch.int64,
-                                           device=device)
-            self.seed += 1
-            self.seed %= 2**31
+            # One entry per gen request; slot 0 of the step's offset window.
+            seed, offset = self._rng_state_per_request(spec_metadata,
+                                                       num_contexts, batch_size)
 
             gen_accepted, gen_num_accepted = rejection_sampling_one_model(
                 draft_probs=full_draft_probs,
                 draft_token_ids=full_draft_tokens,
                 target_probs=target_probs,
                 deterministic=True,
-                seed=self.seed,
-                offset=self.offset,
+                seed=seed,
+                offset=offset,
             )
 
             if self.force_num_accepted_tokens != 0.0:
@@ -1913,15 +2022,50 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata=spec_metadata)
         return accepted_tokens, num_accepted_tokens
 
-    def _update_advance_draft_sampling_seed(self, device):
-        """Increment the draft sampler's RNG seed for this draft-sampling call
-        (lazily initializing the seed/offset tensors on first use), so each call
-        samples with a fresh, deterministic seed."""
-        if self.seed is None:
-            self.seed = torch.tensor([0], dtype=torch.int64, device=device)
-            self.offset = torch.tensor([0], dtype=torch.int64, device=device)
-        self.seed += 1
-        self.seed %= (2**31)
+    def _rng_state_per_request(
+        self,
+        spec_metadata: SpecMetadata,
+        start: int = 0,
+        end: Optional[int] = None,
+        repeat: int = 1,
+        step_offset: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Philox (seed, offset) laid out one entry per request row.
+
+        ``start`` / ``end`` select the request subset the caller samples (e.g.
+        the gen slice); ``repeat`` expands each request to the ``K`` rows a
+        block sampler flattens it into.
+
+        ``step_offset`` picks a slot inside this decoding step's offset window
+        (see ``_populate_request_rng_state``). The target sampler and the
+        rejection kernel leave it at 0; the draft loop passes ``1 +
+        draft_step`` so each of its launches draws a distinct stream -- with a
+        fixed user seed the offset is the only thing separating them, since
+        every draft launch restarts the kernel's per-row subsequence at 0.
+
+        """
+        seeds = spec_metadata.request_seeds[start:end]
+        offsets = spec_metadata.request_offsets[start:end]
+        if step_offset:
+            offsets = offsets + step_offset
+        if repeat > 1:
+            seeds = seeds.repeat_interleave(repeat)
+            offsets = offsets.repeat_interleave(repeat)
+        return seeds, offsets
+
+    def _rng_state_per_token(
+        self,
+        spec_metadata: SpecMetadata,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Philox (seed, offset) laid out one entry per logits row.
+
+        Mirrors how ``temperatures`` / ``top_ks`` / ``top_ps`` are sliced at
+        the same call sites.
+        """
+        return spec_metadata.seeds[:
+                                   num_tokens], spec_metadata.offsets[:
+                                                                      num_tokens]
 
     def _draft_sampler_greedy(self, logits: torch.Tensor):
         """
@@ -2049,20 +2193,26 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ps = spec_metadata.request_top_ps[
             num_contexts:batch_size].repeat_interleave(K)
 
-        self._update_advance_draft_sampling_seed(gen_logits.device)
         flat_logits = gen_logits.reshape(num_gens * K, vocab)
         eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
             spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+        # A block sampler emits all K draft positions in one launch, so the
+        # kernel's per-row subsequence already separates them and they share
+        # the first draft slot of the step's offset window.
+        seed, offset = self._rng_state_per_request(spec_metadata,
+                                                   num_contexts,
+                                                   batch_size,
+                                                   repeat=K,
+                                                   step_offset=1)
 
         if getattr(spec_metadata, "use_rejection_sampling", False):
             flat_tokens, flat_probs = (
-                sampling_batch_spec_dec_one_model_for_rejection(
-                    flat_logits,
-                    temps,
-                    eff_top_ks,
-                    eff_top_ps,
-                    seed=self.seed,
-                    offset=self.offset))
+                sampling_batch_spec_dec_one_model_for_rejection(flat_logits,
+                                                                temps,
+                                                                eff_top_ks,
+                                                                eff_top_ps,
+                                                                seed=seed,
+                                                                offset=offset))
             # Scatter the K prob rows per gen request into its stable slot row.
             if spec_metadata.draft_probs is not None:
                 assert spec_metadata.batch_slot_ids is not None, (
@@ -2078,8 +2228,8 @@ class SpecWorkerBase(nn.Module, ABC):
                                                 temps,
                                                 eff_top_ks,
                                                 eff_top_ps,
-                                                seed=self.seed,
-                                                offset=self.offset)
+                                                seed=seed,
+                                                offset=offset)
 
         return flat_tokens.reshape(num_gens, K).type(torch.int32)
 
@@ -2320,25 +2470,17 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
 
-            # Lazily initialize seed/offset tensors on correct device
-            if self.seed is None:
-                self.seed = torch.tensor([0],
-                                         dtype=torch.int64,
-                                         device=logits.device)
-                self.offset = torch.tensor([0],
-                                           dtype=torch.int64,
-                                           device=logits.device)
-            self.seed += 1
-            self.seed %= (2**31)
-
             eff_top_ks, eff_top_ps = resolve_advanced_sampling_filters(
                 spec_metadata.advanced_sampling_mode, top_ks, top_ps)
+            # One row per logits row here, the same slice the per-token
+            # sampling params above use.
+            seed, offset = self._rng_state_per_token(spec_metadata, num_tokens)
             sampled_tokens = sample_from_logits_op(logits,
                                                    temperatures,
                                                    eff_top_ks,
                                                    eff_top_ps,
-                                                   seed=self.seed,
-                                                   offset=self.offset)
+                                                   seed=seed,
+                                                   offset=offset)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 
