@@ -448,6 +448,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             acceptance_length = _compute_acceptance_length(llm)
+            print(f"[AL] test_eagle acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
                 "TestLlama3_1_8BInstruct::test_eagle3",
                 acceptance_length,
@@ -2996,6 +2997,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp,
                  enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp,
                  enable_iter_perf_stats=check_acceptance,
+                 max_stats_len=-1,
                  speculative_config=mtp_config) as llm:
 
             assert llm.args.moe_config.backend == moe_backend
@@ -3022,8 +3024,10 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                 ]
                 assert spec_iters, \
                     "No iterations with speculative decoding stats"
-                acceptance_length = sum(s['acceptanceLength']
-                                        for s in spec_iters) / len(spec_iters)
+                accepted = sum(s["numAcceptedTokens"] for s in spec_iters)
+                reqs = sum(s["numRequestsWithDraftTokens"] for s in spec_iters)
+                acceptance_length = (accepted + reqs) / reqs
+
                 assert acceptance_length >= 1.5, (
                     f"MTP acceptance length {acceptance_length:.2f} < 1.5: "
                     "draft tokens are likely wrong in the ADP + LM-head-TP "
