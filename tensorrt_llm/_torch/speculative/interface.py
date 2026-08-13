@@ -634,11 +634,12 @@ class SpecMetadata:
     # to match the logits rows the sampling kernels consume.
     #
     # ``request_seeds`` carries the request's own seed (the engine-wide seed
-    # for unseeded requests). ``request_offsets`` carries its decoding
-    # iteration, which is what advances the stream between steps: with a fixed
-    # user seed the offset is the only thing that changes, and taking it from
-    # the request's own progress -- rather than a global step counter -- keeps
-    # a seeded request reproducible regardless of which batch it lands in.
+    # for unseeded requests). ``request_offsets`` carries how far that
+    # request's stream has advanced, which is what separates one step from the
+    # next: with a fixed user seed the offset is the only thing that changes,
+    # and taking it from the request's own progress -- rather than a global
+    # step counter -- keeps a seeded request reproducible regardless of which
+    # batch it lands in.
     #
     # NB: the pinned flashinfer reads only element 0 of each tensor, separating
     # rows by blockIdx.x, so these per-row values are carried end-to-end but
@@ -646,6 +647,26 @@ class SpecMetadata:
     # https://github.com/flashinfer-ai/flashinfer/pull/2345.
     request_seeds: Optional[torch.Tensor] = None
     request_offsets: Optional[torch.Tensor] = None
+    # Per-slot count of RNG windows already handed out, keyed by py_seq_slot.
+    #
+    # This deliberately does NOT read request.py_decoding_iter: the overlap
+    # scheduler runs _forward_step (where this is populated) before the
+    # previous batch's _update_requests, which is what increments that field.
+    # A request appearing in adjacent batches would therefore be seen at the
+    # same iteration twice and replay the same offset window. Counting the
+    # windows we hand out keeps the stream advancing once per sampling pass
+    # under either scheduler.
+    #
+    # Held in a dict so create_cuda_graph_metadata's copy.copy keeps graph and
+    # eager views sharing one counter; keyed by slot rather than batch position
+    # because batch composition shifts between iterations. Bounded by the slot
+    # pool, which SeqSlotManager frees and reuses on request completion.
+    #
+    # The counter is not reset when a slot is reused, so a new request on a
+    # recycled slot starts partway into its stream. That is still a disjoint
+    # region of it, so sampling stays correct; the cost is that a seeded
+    # request reproduces bit-exactly only for a given slot history.
+    _rng_window_counter: dict = field(default_factory=dict)
     # The same state expanded to one entry per logits row, mirroring the
     # temperatures / top_ks / top_ps layout, for the sampling calls that
     # consume rows rather than requests.
@@ -704,10 +725,9 @@ class SpecMetadata:
 
         A request's seed is fixed for its lifetime, so the offset is what has
         to advance between steps -- otherwise every step of a seeded request
-        would draw the same numbers. Taking it from the request's own decoding
-        iteration, rather than a global step counter, is what ties the stream
-        to how far that request has decoded instead of to when it was
-        scheduled.
+        would draw the same numbers. Taking it from the request's own window
+        counter, rather than a global step counter, is what ties the stream to
+        how far that request has decoded instead of to when it was scheduled.
 
         Both layouts are produced: ``request_*`` with one entry per request,
         and ``seeds`` / ``offsets`` expanded to one entry per logits row (the
@@ -726,16 +746,25 @@ class SpecMetadata:
             seed if (seed := request_random_seed(request)) is not None else
             DEFAULT_SAMPLING_SEED for request in requests
         ]
-        # Base of this step's Philox offset window. Each decoding iteration
-        # owns max_draft_len + 1 consecutive offsets: the target sampler (or
-        # the rejection kernel, which is its alternative) takes the first, and
+        # Base of this step's Philox offset window. Each sampling pass owns
+        # max_draft_len + 1 consecutive offsets: the target sampler (or the
+        # rejection kernel, which is its alternative) takes the first, and
         # draft step i takes base + 1 + i. Sizing the window by the static
         # max_draft_len rather than the runtime one keeps a step's offsets
         # disjoint from its neighbours' even when the draft length shrinks.
+        #
+        # The window index comes from _rng_window_counter, not from
+        # py_decoding_iter, which is still stale here under the overlap
+        # scheduler (see the field's comment).
         window = self.max_draft_len + 1
-        request_offsets = [
-            request.py_decoding_iter * window for request in requests
-        ]
+        request_offsets = []
+        for request in requests:
+            slot = request.py_seq_slot
+            # Dummy/padding requests (no slot) never have their output kept,
+            # so they share one counter rather than perturbing a real slot's.
+            step = self._rng_window_counter.get(slot, 0)
+            self._rng_window_counter[slot] = step + 1
+            request_offsets.append(step * window)
         num_tokens_per_request = [n for *_, n in per_request_normalized]
 
         flat_seeds: list[int] = []
@@ -745,12 +774,17 @@ class SpecMetadata:
             flat_seeds.extend(seed for _ in range(num_tokens))
             flat_offsets.extend(offset for _ in range(num_tokens))
 
+        # Size by the actual request count as well as max_num_requests: CUDA
+        # graph warmup can pass max_batch_size > max_num_requests, and this
+        # runs before the all-greedy early return that shields the other
+        # per-request copies below.
+        required_requests = max(self.max_num_requests, len(requests))
         if (self.request_seeds is None
-                or self.request_seeds.numel() < self.max_num_requests):
-            self.request_seeds = torch.zeros(self.max_num_requests,
+                or self.request_seeds.numel() < required_requests):
+            self.request_seeds = torch.zeros(required_requests,
                                              dtype=torch.int64,
                                              device='cuda')
-            self.request_offsets = torch.zeros(self.max_num_requests,
+            self.request_offsets = torch.zeros(required_requests,
                                                dtype=torch.int64,
                                                device='cuda')
         if self.seeds is None or self.seeds.numel() < len(flat_seeds):
