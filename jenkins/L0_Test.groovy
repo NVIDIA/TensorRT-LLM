@@ -5632,6 +5632,16 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         8,
         2
     )
+    // 2 Nodes: ctx1 (1 node, 4 GPUs) + gen1 (1 node, 4 GPUs) = 8 GPUs
+    // Nemotron-3-Ultra-550B-A55B disagg-E2E latency point (conc 1, TEP4 mtp5).
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
+        1,
+        8,
+        2
+    )
     // 3 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge",
@@ -5645,7 +5655,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        3,
+        4,
         12,
         3
     )
@@ -5684,6 +5694,18 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         8,
         36,
         9
+    )
+    // 17 Nodes: ctx1 (1 node, 4 GPUs) + gen8 (8 servers x 2 nodes, 8 GPUs each = 64 GPUs) = 68 GPUs
+    // Nemotron-3-Ultra-550B-A55B disagg-E2E throughput point (conc 9832, DEP8 mtp3).
+    // NOTE: largest perf-sanity disagg stage to date (prior max 56 GPUs / 14 nodes on GB300);
+    //       confirm gb200-flex can allocate 17 nodes before enabling in CI.
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-68_GPUs-17_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN8-NODE2-GPU8-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen8_node2_gpu8",
+        1,
+        68,
+        17
     )
     // GB300 PerfSanity post-merge aggregated
     // 2 Nodes
