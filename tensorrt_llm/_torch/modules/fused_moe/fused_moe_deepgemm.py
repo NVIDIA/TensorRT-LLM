@@ -28,6 +28,8 @@ from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
+from .impl_contract import (MoEInputRequirement, MoERunContext,
+                            MoEStaticCapability)
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
@@ -715,6 +717,25 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
+    # Restated rather than inherited from CutlassFusedMoE: this backend does
+    # not fuse routed-expert LoRA, and the exact-class comparison this field
+    # replaces already answered False here.
+    capabilities = MoEStaticCapability(supports_moe_lora=False)
+
+    # ``routing_scales_dtype`` is repeated from CutlassFusedMoE because setting
+    # any field here replaces the parent's object wholesale.
+    input_requirement = MoEInputRequirement(
+        routing_scales_dtype=torch.float32,
+        requires_run_moe_workspace=True,
+    )
+
+    def supports_moe_output_in_alltoall_workspace(self):
+        # Overrides the CutlassFusedMoE "True": run_moe emits into its own
+        # workspace buffers and never writes a caller-supplied output tensor,
+        # so a workspace-backed buffer would be left unfilled while combine()
+        # read from it.
+        return False
+
     @classmethod
     def can_implement(
         cls,
@@ -930,11 +951,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
-        workspace: dict = None,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with DeepGemm backend.
@@ -943,13 +962,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         quantization with DeepGemm backend.
 
         Args:
-            # Standard MoE interface parameters:
-            x: Input hidden states (unquantized for DeepGemm)
-            token_selected_experts: Expert IDs [num_tokens, top_k]. If EPLB is enabled,
-                                    this represents expert slots [num_tokens, top_k] instead.
-            token_final_scales: Final scaling factors for each token
-            x_sf: Input scale factors (should be None for DeepGemm)
-            workspace: Workspace dictionary containing buffers for intermediate results
+            ctx: Run context; ``x`` is unquantized and ``x_sf`` must be None.
+            workspace: Buffers for intermediate results, allocated once per
+                      chunk by the scheduler so the aux stream can reuse them.
                       Required keys: 'workspace_0', 'workspace_1', 'workspace_sf'
 
         Returns:
@@ -957,6 +972,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
         Note: Similar to CuteDslFusedMoE.run_moe_fp8_block_scales (fused_moe_cute_dsl.py:360-434)
         """
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
         assert self.has_deepseek_fp8_block_scales
         assert x_sf is None
         assert workspace is not None, "workspace is required for DeepGemm backend"

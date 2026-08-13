@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""KimiK3SparseMoeBlock — in-tree Kimi K3 sparse MoE module.
+"""KimiK3SparseMoeBlock — test-only Kimi K3 sparse MoE reference.
 
-Structural mirror of HF ``KimiSparseMoeBlock`` at
-``modeling_kimi.py:806-918`` end to end:
+Used by ``test_kimi_k3_situ_moe.py`` as the HF-parity reference for the
+native SiTU kernel path; the serving runtime (``KimiK3MoERuntime`` in
+``modeling_kimi_linear.py``) does not use it. Structural mirror of HF
+``KimiSparseMoeBlock`` at ``modeling_kimi.py:806-918`` end to end:
 
 * :class:`KimiK3MoEGate` for routing (see :mod:`kimi_k3_moe_gate`).
 * :class:`KimiK3RoutedExpertBank` — per-expert MXFP4-packed
@@ -46,17 +48,26 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 import torch
-from torch import nn
-
-from ._mlp import KimiK3MLP, KimiK3RMSNorm, NonSituActivation, SituAndMul
-from ._moe_kernels import (
+from _torch.modules.moe.kimi_k3_ref_moe._moe_kernels import (
     assert_native_situ_supported,
     invoke_native_situ_moe,
     make_situ_alpha_beta,
     pack_routed_expert_weights,
 )
-from ._mxfp4 import DEFAULT_GROUP_SIZE, dequantize_last_dim_mxfp4, quantize_last_dim_mxfp4
-from .kimi_k3_moe_gate import KimiK3MoEGate
+from _torch.modules.moe.kimi_k3_ref_moe._mxfp4 import (
+    DEFAULT_GROUP_SIZE,
+    dequantize_last_dim_mxfp4,
+    quantize_last_dim_mxfp4,
+)
+from torch import nn
+
+from tensorrt_llm._torch.modules.kimi_k3_moe._mlp import (
+    KimiK3MLP,
+    KimiK3RMSNorm,
+    NonSituActivation,
+    SituAndMul,
+)
+from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 
 
 class KimiK3RoutedExpertBank(nn.Module):

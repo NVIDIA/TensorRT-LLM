@@ -957,6 +957,7 @@ def main():
         # of the real worker steps; enable policy and timeouts come from
         # precheck_config (single owner).
         pcfg = _import_precheck_config(llm_src)
+        precheck_enabled = pcfg.precheck_enabled(config)
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
                 config,
@@ -967,16 +968,16 @@ def main():
                     hardware_config.get("gpus_per_ctx_server", 0) or 0,
                     hardware_config.get("gpus_per_gen_server", 0) or 0,
                 ),
+                llm_models_root=args.llm_models_root if precheck_enabled else None,
             )
         )
 
         # Add srun args for disagg
         srun_args_lines.extend(
-            [
-                "--container-env=DISAGG_SERVING_TYPE",
-                "--container-env=pytestCommand",
-            ]
+            ["--container-env=DISAGG_SERVING_TYPE", "--container-env=pytestCommand"]
         )
+        if precheck_enabled:
+            srun_args_lines.append("--container-env=LLM_MODELS_ROOT")
     else:
         worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{tllm_profile_start_stop}' "

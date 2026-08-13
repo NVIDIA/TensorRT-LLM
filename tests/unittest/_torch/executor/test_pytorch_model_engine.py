@@ -694,6 +694,62 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         self.assertEqual(actual_key, compatible_key)
 
+    def test_graph_key_includes_peft_cache_dtype(self) -> None:
+        runner = Mock()
+        runner.config = SimpleNamespace(is_draft_model=False)
+        runner._get_seq_len_mode.return_value = False
+        request = _make_request_stub(7)
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+
+        model_dtype_key = CUDAGraphRunner.get_graph_key(
+            runner, batch, peft_cache_data_type=torch.bfloat16)
+        fp8_key = CUDAGraphRunner.get_graph_key(
+            runner, batch, peft_cache_data_type=torch.float8_e4m3fn)
+
+        self.assertNotEqual(model_dtype_key, fp8_key)
+        self.assertEqual(
+            model_dtype_key._replace(peft_cache_data_type=None),
+            fp8_key._replace(peft_cache_data_type=None),
+        )
+
+    def test_graph_dtype_change_falls_back_to_eager(self) -> None:
+        runner = Mock()
+        runner.enabled = True
+        runner.config = SimpleNamespace(
+            enable_attention_dp=False,
+            use_mrope=False,
+        )
+        model_dtype_key = KeyType(batch_size=1,
+                                  draft_len=0,
+                                  is_first_draft=False,
+                                  peft_cache_data_type=torch.bfloat16)
+        fp8_key = KeyType(batch_size=1,
+                          draft_len=0,
+                          is_first_draft=False,
+                          peft_cache_data_type=torch.float8_e4m3fn)
+        runner.get_graph_key.return_value = fp8_key
+        runner.graph_metadata = {model_dtype_key: object()}
+        runner._capture_allowed = False
+        runner._is_mixed_encoder_decoder_batch.return_value = False
+        runner._can_run_cuda_graph_batch.return_value = True
+        request = _make_request_stub(7)
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.cuda_graph_runner.ExpertStatistic.should_record",
+                return_value=False):
+            result = CUDAGraphRunner.maybe_get_cuda_graph(
+                runner,
+                batch,
+                enable_spec_decode=False,
+                attn_metadata=object(),
+                peft_cache_data_type=torch.float8_e4m3fn,
+            )
+
+        self.assertEqual(result, (None, None, None))
+
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
         runner.enabled = True
@@ -734,7 +790,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             )
 
         runner.get_graph_key.assert_called_once_with(batch, None, None, None,
-                                                     promoted_ids)
+                                                     promoted_ids, None)
         self.assertEqual(result,
                          (graph_attn_metadata, graph_spec_metadata, key))
 
@@ -1591,6 +1647,49 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             runner.graphs.clear()
             for dummy in runner.padding_dummy_requests.values():
                 kv_cache_manager.free_resources(dummy)
+            kv_cache_manager.shutdown()
+
+    def test_release_padding_dummy_covers_every_manager(self):
+        # A padding dummy's request ID is spread across several managers, so
+        # releasing only the main KV cache manager leaves the others holding
+        # it — and re-creation reuses the same ID.
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        spec_manager = Mock()
+        cross_manager = Mock()
+        resource_manager = ResourceManager({
+            ResourceManagerType.KV_CACHE_MANAGER:
+            kv_cache_manager,
+            ResourceManagerType.SPEC_RESOURCE_MANAGER:
+            spec_manager,
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER:
+            cross_manager,
+        })
+
+        runner = model_engine.cuda_graph_runner
+        try:
+            self.assertIsNotNone(
+                runner._get_or_create_padding_dummy(resource_manager, 0))
+            dummy = runner.padding_dummy_requests[0]
+
+            self.assertTrue(runner.release_padding_dummy(resource_manager, 0))
+
+            # Dropped from the runner so the lazy path re-creates it...
+            self.assertEqual({}, runner.padding_dummy_requests)
+            # ...and the spec resource manager slot is released too, not just
+            # the main KV cache manager.
+            spec_manager.free_resources.assert_called_once_with(dummy)
+            # The cross-KV manager is only involved for encoder-decoder, which
+            # this engine is not.
+            self.assertFalse(runner.is_encoder_decoder)
+            cross_manager.free_resources.assert_not_called()
+
+            # Releasing again is a no-op rather than a double free.
+            self.assertFalse(runner.release_padding_dummy(resource_manager, 0))
+            spec_manager.free_resources.assert_called_once()
+        finally:
+            for dummy in runner.padding_dummy_requests.values():
+                kv_cache_manager.free_resources(dummy)
+            runner.padding_dummy_requests.clear()
             kv_cache_manager.shutdown()
 
     def test_layerwise_nvtx_marker(self):

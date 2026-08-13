@@ -66,6 +66,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
+    _cpp_introspection,
     _introspection,
     _KVCache,
     exact_div,
@@ -1080,11 +1081,23 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._get_event_layer_group_ids(),
             )
 
+        # Both backends build layer_grouping on demand, and the layer order
+        # within a group is not part of its contract. Cache a stable physical-
+        # layout representative for each role from the public pool descriptors.
         self.num_pools = len(self.impl.layer_grouping)
-        # num_pools is the physical pool count owned by the KV cache manager.
-        # With SWA scratch reuse, scratch slot IDs are only valid with
-        # per-layer page indices, so the attention op sees one virtual pool per
-        # local layer while the underlying manager can still group layers.
+        self._pool_layer_ids_by_role: Dict[Tuple[int, DataRole], LayerId] = {}
+        for pool_group in self.impl.pool_group_descs:
+            for variant in pool_group.slot_desc.variants:
+                pool_id = int(variant.layer_group_id)
+                for coalesced in variant.coalesced_buffers:
+                    for buffer_id in coalesced.buffer_ids:
+                        self._pool_layer_ids_by_role.setdefault(
+                            (pool_id, buffer_id.role), buffer_id.layer_id
+                        )
+        # num_pools is the logical layer-group count. With SWA scratch reuse,
+        # scratch slot IDs are only valid with per-layer page indices, so the
+        # attention op sees one virtual pool per local layer while the
+        # underlying manager can still group layers.
         if self.enable_swa_scratch_reuse:
             self.num_attention_op_pools = self.num_local_layers
         else:
@@ -1228,8 +1241,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache_pool_mapping_list.append([int(layer_id), 0])
         else:
             for pool_id in range(self.num_pools):
-                layer_id = self.impl.layer_grouping[pool_id][0]
                 role_a, _ = self._get_pool_roles(pool_id)
+                layer_id = self._pool_layer_ids_by_role[(pool_id, role_a)]
                 key_base_addr = self.impl.get_mem_pool_base_address(
                     layer_id, role_a, PageIndexMode.SHARED
                 )
@@ -1342,8 +1355,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
         )
         for pool_id in range(self.num_pools):
-            layer_id = self.impl.layer_grouping[pool_id][0]
             role_a, role_b = self._get_pool_roles(pool_id)
+            layer_id = self._pool_layer_ids_by_role[(pool_id, role_a)]
             self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, role_a)
             if role_b is not None:
                 self.kv_offset[pool_id] = exact_div(
@@ -2313,7 +2326,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
-                all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+                all_tokens = self._reuse_token_source(req)
                 # Last token cannot be recovered, so we don't include it in
                 # the input tokens to look up for the block that can be reused.
                 if self.enable_block_reuse:
@@ -2499,6 +2512,13 @@ class KVCacheManagerV2(BaseResourceManager):
                         cache_salt=req.cache_salt,
                         is_dummy=req.is_dummy,
                     )
+                    if kv_cache is None:
+                        # Saturated IndexMapper (e.g. slots held by disagg
+                        # generation transfers in flight): skip mirroring this
+                        # request for now; it is retried next iteration once
+                        # slots free up, before the request runs any spec-dec
+                        # forward that needs the mirror.
+                        continue
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -2539,6 +2559,18 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
                     )
 
+    def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
+        """Beam-0 tokens for block reuse, in the form the active backend consumes.
+
+        The C++ backend ingests a zero-copy int32 view (get_tokens_view) — no per-token
+        PyLong allocation. The pure-Python backend cannot consume a numpy array, so it gets
+        a plain list (get_tokens), preserving pre-optimization behavior. ``_cpp_introspection``
+        is None exactly when the Python backend is active.
+        """
+        if _cpp_introspection is not None:
+            return req.get_tokens_view(DEFAULT_BEAM_INDEX)
+        return req.get_tokens(DEFAULT_BEAM_INDEX)
+
     def _augment_tokens_for_block_reuse(
         self, tokens: Sequence[int], req: LlmRequest, start: int = 0, end: int | None = None
     ) -> Sequence[TokenIdExt]:
@@ -2570,7 +2602,11 @@ class KVCacheManagerV2(BaseResourceManager):
         ):
             return tokens[chunk_start:chunk_end] if is_sliced else tokens
 
-        result: list[TokenIdExt] = list(tokens[chunk_start:chunk_end])
+        # Multimodal path: materialize a Python-int list (digest bytes get spliced in below),
+        # which flows through the per-element binding fallback. tokens may be a zero-copy numpy
+        # int32 view (get_tokens_view) — use tolist() so elements are Python ints, not np.int32.
+        chunk = tokens[chunk_start:chunk_end]
+        result: list[TokenIdExt] = chunk.tolist() if hasattr(chunk, "tolist") else list(chunk)
         run_metadata = _resolve_multimodal_run_metadata(req)
         if run_metadata is not None:
             return _augment_tokens_with_mm_run_metadata(
@@ -3193,7 +3229,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if request.context_current_position > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
-                request.get_tokens(DEFAULT_BEAM_INDEX),
+                self._reuse_token_source(request),
                 request,
                 start=kv_cache.num_committed_tokens,
                 end=request.context_current_position,
@@ -3729,7 +3765,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # is NOT registered in kv_cache_map / IndexMapper.
         success = True
         for req in requests:
-            all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+            all_tokens = self._reuse_token_source(req)
             tokens = self._augment_tokens_for_block_reuse(all_tokens, req, end=len(all_tokens) - 1)
             # Use the same salt derivation as _create_kv_cache so the transient
             # cache hits the same radix-tree blocks.

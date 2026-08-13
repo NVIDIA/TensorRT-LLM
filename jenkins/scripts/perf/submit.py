@@ -649,6 +649,57 @@ def get_test_output_dir(script_prefix_lines, test_case_name):
     return os.path.join(output_dir, test_case_name) if test_case_name else output_dir
 
 
+class _PytestCommandEnvMissing(ValueError):
+    """A valid pytestCommand does not provide the requested leading variable."""
+
+
+def extract_pytest_command_env(script_prefix_lines, name):
+    """Read a leading environment assignment from the exported pytest command."""
+    line = next((ln for ln in script_prefix_lines if "export pytestCommand=" in ln), None)
+    if line is None:
+        raise ValueError("launch prefix does not export pytestCommand")
+    try:
+        outer_tokens = shlex.split(line)
+    except ValueError as e:
+        raise ValueError(f"cannot parse exported pytestCommand: {e}") from e
+    command_assignment = next(
+        (token for token in outer_tokens if token.startswith("pytestCommand=")), None
+    )
+    if command_assignment is None:
+        raise ValueError("launch prefix has a malformed pytestCommand export")
+    command = command_assignment.partition("=")[2]
+    try:
+        command_tokens = shlex.split(command)
+    except ValueError as e:
+        raise ValueError(f"cannot parse pytestCommand payload: {e}") from e
+    for token in command_tokens:
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            break
+        key, value = token.split("=", 1)
+        if key == name:
+            return value
+    raise _PytestCommandEnvMissing(
+        f"pytestCommand does not set leading environment variable {name}"
+    )
+
+
+def _resolve_llm_models_root(script_prefix_lines):
+    """Resolve the precheck model root from pytestCommand or the submitter env."""
+    try:
+        return extract_pytest_command_env(script_prefix_lines, "LLM_MODELS_ROOT")
+    except _PytestCommandEnvMissing as e:
+        fallback = os.environ.get("LLM_MODELS_ROOT")
+        if fallback:
+            return fallback
+        # Fail closed when the precheck is enabled: without the model root it
+        # cannot reproduce serving's KV shape and model-specific defaults, so
+        # disabling the gate here would silently run an unvalidated workload.
+        raise ValueError(
+            f"{e}; LLM_MODELS_ROOT is also absent from the submitter environment "
+            "(pytestCommand is assembled by getPytestBaseCommandLine in L0_Test.groovy)"
+        ) from e
+
+
 def remove_whitespace_lines(lines):
     return [line.strip() for line in lines if line.strip()]
 
@@ -852,6 +903,10 @@ def main():
         # Enable/kill-switch policy and timeouts live in precheck_config
         # (single owner, shared with the local flow).
         pcfg = _import_precheck_config(args.llm_src)
+        precheck_enabled = pcfg.precheck_enabled(config)
+        llm_models_root = (
+            _resolve_llm_models_root(script_prefix_lines) if precheck_enabled else None
+        )
         script_prefix_lines.extend(
             pcfg.precheck_prefix_lines(
                 config,
@@ -863,14 +918,14 @@ def main():
                     hardware_config["gpus_per_gen_server"],
                 ),
                 stage_name=args.stage_name,
+                llm_models_root=llm_models_root,
             )
         )
         srun_args_lines.extend(
-            [
-                "--container-env=DISAGG_SERVING_TYPE",
-                "--container-env=pytestCommand",
-            ]
+            ["--container-env=DISAGG_SERVING_TYPE", "--container-env=pytestCommand"]
         )
+        if precheck_enabled:
+            srun_args_lines.append("--container-env=LLM_MODELS_ROOT")
 
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)
     script_prefix = "\n".join(script_prefix_lines)

@@ -26,7 +26,7 @@ import builtins
 import random
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -43,6 +43,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSABackendForwardArgs,
     DSACacheManager,
+    DSACacheManagerV2,
     DSATrtllmAttention,
     DSAtrtllmAttentionMetadata,
     Indexer,
@@ -50,20 +51,25 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     _select_indexer_compress_ratio,
     compute_cu_seqlen_kv_bounds_with_cache,
     split_prefill_chunks,
+    transform_local_topk_and_prepare_pool_view,
 )
+from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.bindings.executor import KvCacheConfig as BindingKvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.llm_args import (
     DeepSeekSparseAttentionConfig,
     DeepSeekV4SparseAttentionConfig,
+    KvCacheConfig,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
@@ -250,8 +256,10 @@ def create_dsa_cache_manager(
     num_layers: int = 1,
     indexer_k_dtype: str = "fp8",
     index_topk: int = 2048,
+    use_kv_cache_manager_v2: bool = False,
+    pretrained_config=None,
 ):
-    """Helper to create a DSACacheManager for testing."""
+    """Helper to create a DSA cache manager for testing."""
 
     sparse_attn_config = DeepSeekSparseAttentionConfig(
         index_head_dim=head_dim,
@@ -261,7 +269,8 @@ def create_dsa_cache_manager(
     )
 
     # Create KV cache config
-    kv_cache_config = KvCacheConfig(
+    kv_cache_config_cls = KvCacheConfig if use_kv_cache_manager_v2 else BindingKvCacheConfig
+    kv_cache_config = kv_cache_config_cls(
         enable_block_reuse=False,
         max_tokens=max_seq_len * batch_size,
     )
@@ -271,7 +280,8 @@ def create_dsa_cache_manager(
 
     # Create cache manager
     # Use SELFKONLY for DSA (similar to MLA usage in _util.py)
-    cache_manager = DSACacheManager(
+    cache_manager_cls = DSACacheManagerV2 if use_kv_cache_manager_v2 else DSACacheManager
+    cache_manager = cache_manager_cls(
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELFKONLY,
         num_layers=num_layers,
@@ -283,9 +293,106 @@ def create_dsa_cache_manager(
         mapping=mapping,
         dtype=DataType.HALF,
         sparse_attention_config=sparse_attn_config,
+        pretrained_config=pretrained_config,
     )
 
     return cache_manager, sparse_attn_config
+
+
+def test_transform_local_topk_uses_v2_page_mapping():
+    """Use the V2 pool scale and offset when flattening DSA indices."""
+    cache_manager = SimpleNamespace(
+        _primary_pool_page_index_params=[(3, 1)],
+        get_primary_pool_page_index_params=None,
+    )
+    cache_manager.get_primary_pool_page_index_params = MethodType(
+        DSACacheManagerV2.get_primary_pool_page_index_params,
+        cache_manager,
+    )
+    req_idx = torch.tensor([0], dtype=torch.int32)
+    block_table = torch.tensor([[3, 7]], dtype=torch.int32)
+    topk_indices = torch.tensor([[6]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        kv_cache_manager=cache_manager,
+        _ensure_pool_view_cached=Mock(),
+        _cached_block_table_ctx=block_table,
+        _cached_req_idx_ctx=req_idx,
+        _cached_tokens_per_block=4,
+        _cached_pool_view=torch.empty(0),
+    )
+    expected_indices = torch.tensor([[90]], dtype=torch.int32)
+
+    with patch(
+        "torch.ops.trtllm.convert_req_index_to_global",
+        return_value=expected_indices,
+    ) as convert:
+        actual, _ = transform_local_topk_and_prepare_pool_view(topk_indices, metadata, layer_idx=0)
+
+    torch.testing.assert_close(actual, expected_indices)
+    convert.assert_called_once_with(req_idx, block_table, topk_indices, 4, 1, 12, 1)
+
+
+def test_dsa_cache_manager_v2_respects_shared_indexer_layer_mask():
+    """V2 registers INDEX_KEY storage only for layers that own an indexer."""
+    num_layers = 3
+    head_dim = 128
+    tokens_per_block = 16
+    pretrained_config = SimpleNamespace(
+        num_hidden_layers=num_layers,
+        index_topk_pattern=["F", "S", "F"],
+    )
+    sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=head_dim)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(),
+        sparse_attention_config=sparse_config,
+    )
+    assert (
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(use_kv_cache_manager_v2=True),
+        )
+        is DSACacheManagerV2
+    )
+
+    cache_manager, _ = create_dsa_cache_manager(
+        batch_size=2,
+        head_dim=head_dim,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=64,
+        num_layers=num_layers,
+        use_kv_cache_manager_v2=True,
+        pretrained_config=pretrained_config,
+    )
+
+    try:
+        assert cache_manager.indexer_k_cache_local_layer_mask == [True, False, True]
+        assert cache_manager.indexer_k_cache_page_scale == 2
+        assert cache_manager.get_indexer_k_cache_buffers(0).shape == (
+            cache_manager.blocks_in_primary_pool * cache_manager.indexer_k_cache_page_scale,
+            tokens_per_block,
+            1,
+            head_dim + 4,
+        )
+
+        indexer_bytes_per_token = head_dim + 4
+        has_indexer_buffers = []
+        for local_layer_idx in range(num_layers):
+            layer_config = cache_manager.kv_cache_manager_py_config.layers[local_layer_idx]
+            has_indexer_buffers.append(
+                any(buffer.role == Role.INDEX_KEY for buffer in layer_config.buffers)
+            )
+        assert has_indexer_buffers == [True, False, True]
+
+        key_bytes = sum(
+            cache_manager.get_layer_bytes_per_token(local_layer_idx, Role.KEY)
+            for local_layer_idx in range(num_layers)
+        )
+        expected_cache_bytes = key_bytes + 2 * indexer_bytes_per_token
+        assert cache_manager.get_cache_bytes_per_token() == expected_cache_bytes
+        with pytest.raises(AssertionError, match="shared-indexer layer"):
+            cache_manager.get_indexer_k_cache_buffers(1)
+    finally:
+        cache_manager.shutdown()
 
 
 def create_indexer(sparse_attn_config, layer_idx=0):
@@ -316,7 +423,9 @@ def create_indexer(sparse_attn_config, layer_idx=0):
     mla_params = MLAParams(sparse_params.index_head_dim)
 
     # Mock RotaryEmbedding since we're only testing cache management, not rope functionality
-    with patch("tensorrt_llm._torch.attention_backend.sparse.dsa.RotaryEmbedding") as mock_rope:
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.indexer.RotaryEmbedding"
+    ) as mock_rope:
         # Create a mock instance with a simple forward method
         mock_rope_instance = Mock()
         mock_rope_instance.forward = Mock(side_effect=lambda pos_ids, tensors: tensors)
@@ -2244,6 +2353,7 @@ def test_compute_cu_seqlen_bounds_with_cache_compressed_kv():
     ],
     ids=["small_single", "small_multi", "large_chunked", "mixed", "exact_size", "non_zero_start"],
 )
+@pytest.mark.cpu_only
 def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx, expected_specs):
     """
     Test split_prefill_chunks covering:
@@ -3282,6 +3392,9 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
     )
 
     Indexer.prepare(metadata)
+    if not enable_indexer_skip:
+        assert metadata.slot_mapping_fp8_fullkv is not metadata.slot_mapping_fp8
+        assert metadata.slot_mapping_scale_fullkv is not metadata.slot_mapping_scale
     indexer._update_k_cache(k_fp8, k_scale, metadata)
 
     # Test custom kernel
@@ -3386,6 +3499,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         )
 
 
+@pytest.mark.cpu_only
 class TestPrepareRestoreAttnMetadataForDraftReplay:
     """Tests for prepare_attn_metadata_for_draft_replay and
     restore_attn_metadata_after_draft_replay."""
@@ -3394,6 +3508,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
     def _make_mock_metadata():
         """Create a mock attention metadata object with KV cache block offsets."""
         meta = Mock()
+        meta.enable_flash_mla = False
         meta.kv_cache_manager = Mock(name="target_kv_cache_manager")
         meta.kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.host_kv_cache_block_offsets = torch.tensor([10, 20, 30])
@@ -3403,29 +3518,29 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
     @staticmethod
     def _make_mock_draft_manager():
         """Create a mock draft KV cache manager with host block offsets."""
-        mgr = Mock(name="draft_kv_cache_manager")
-        mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
-        return mgr
+        return SimpleNamespace(host_kv_cache_block_offsets=torch.tensor([100, 200, 300]))
 
     def test_prepare_swaps_and_restore_recovers(self):
         """Test that prepare swaps KV manager and restore recovers original state."""
-        from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
-
         meta = self._make_mock_metadata()
         mgr = self._make_mock_draft_manager()
+        # DeepSeek-V4 metadata inherits DSA metadata, while its manager exposes
+        # index_head_dim without implementing DSA's full page-mapping contract.
+        mgr.index_head_dim = 128
+        mgr.get_pool_block_indices = Mock()
+        mgr.indexer_k_cache_page_scale = 1
         original_kv_mgr = meta.kv_cache_manager
         original_offsets = meta.kv_cache_block_offsets.clone()
         original_host_offsets = meta.host_kv_cache_block_offsets.clone()
 
+        def is_attn_metadata(obj, cls):
+            if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
+                return obj is meta
+            return builtins.isinstance(obj, cls)
+
         with patch(
             "tensorrt_llm._torch.speculative.interface.isinstance",
-            side_effect=lambda obj, cls: (
-                obj is meta
-                if cls is TrtllmAttentionMetadata
-                else False
-                if cls.__name__ == "DSAtrtllmAttentionMetadata"
-                else builtins.isinstance(obj, cls)
-            ),
+            side_effect=is_attn_metadata,
         ):
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
@@ -3439,6 +3554,57 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         assert meta.kv_cache_manager is original_kv_mgr
         torch.testing.assert_close(meta.kv_cache_block_offsets, original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets, original_host_offsets)
+
+    def test_native_dsa_replay_swaps_and_restores_buffers(self):
+        """Switch native DSA metadata to draft buffers and restore it."""
+        meta = self._make_mock_metadata()
+        mgr = object.__new__(DSACacheManagerV2)
+        mgr.host_kv_cache_block_offsets = torch.tensor([100, 200, 300])
+        meta.enable_context_mla_with_cached_kv = False
+        meta._invalidate_pool_view_cache = Mock()
+        buffer_pairs = {
+            "host_indexer_k_cache_block_offsets": "host_draft_indexer_k_cache_block_offsets",
+            "indexer_k_cache_block_offsets": "draft_indexer_k_cache_block_offsets",
+            "host_slot_mapping_fp8": "host_draft_slot_mapping_fp8",
+            "host_slot_mapping_scale": "host_draft_slot_mapping_scale",
+            "slot_mapping_fp8": "draft_slot_mapping_fp8",
+            "slot_mapping_scale": "draft_slot_mapping_scale",
+            "block_table": "draft_block_table",
+            "block_table_expanded": "draft_block_table_expanded",
+            "host_block_table_expanded": "host_draft_block_table_expanded",
+        }
+        target_buffers = {}
+        draft_buffers = {}
+        for target_name, draft_name in buffer_pairs.items():
+            target_buffers[target_name] = object()
+            draft_buffers[target_name] = object()
+            setattr(meta, target_name, target_buffers[target_name])
+            setattr(meta, draft_name, draft_buffers[target_name])
+        del meta.slot_mapping_fp8_fullkv
+        del meta.slot_mapping_scale_fullkv
+
+        def is_attn_metadata(obj, cls):
+            if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
+                return obj is meta
+            return builtins.isinstance(obj, cls)
+
+        with (
+            patch(
+                "tensorrt_llm._torch.speculative.interface.isinstance",
+                side_effect=is_attn_metadata,
+            ),
+            patch(
+                "tensorrt_llm._torch.speculative.interface.torch.cuda.is_current_stream_capturing",
+                return_value=True,
+            ),
+        ):
+            saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
+
+        assert "saved_dsa_state" in saved
+        assert meta.slot_mapping_fp8 is draft_buffers["slot_mapping_fp8"]
+        restore_attn_metadata_after_draft_replay(meta, saved)
+        assert meta.slot_mapping_fp8 is target_buffers["slot_mapping_fp8"]
+        assert meta.slot_mapping_fp8_fullkv is target_buffers["slot_mapping_fp8"]
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")

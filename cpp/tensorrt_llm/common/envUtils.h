@@ -149,8 +149,6 @@ size_t getEnvMemSizeForKVCacheTransferBuffer();
 
 bool getEnvKVCachePoolUseFabricMemory();
 
-uint16_t getEnvNixlPort();
-
 // Whether to disable coalescing of contiguous NIXL transfer descriptors (coalescing is on by default).
 bool getEnvNixlDisableCoalesce();
 

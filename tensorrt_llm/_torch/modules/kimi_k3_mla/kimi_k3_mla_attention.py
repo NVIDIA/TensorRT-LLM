@@ -228,14 +228,15 @@ class KimiK3MLAAttention(MLA):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        attn_out = self.create_output(
-            hidden_states,
-            attn_metadata.num_contexts,
-        )
+        # _create_outputs() rather than create_output(): the base implementation
+        # takes a list so a sparse-attention backend can append its own buffers,
+        # and it routes through the sparse hooks when they are installed. The
+        # dense path this module uses is element 0.
+        attn_outputs = self._create_outputs(hidden_states, attn_metadata)
         super().forward_impl(
             None,
             hidden_states,
             attn_metadata,
-            output=attn_out,
+            attn_output=attn_outputs,
         )
-        return self._apply_output_gate_and_o_proj(hidden_states, attn_out)
+        return self._apply_output_gate_and_o_proj(hidden_states, attn_outputs[0])

@@ -7837,9 +7837,11 @@ class GvrTopKKernel:
     # policy as a pure function colocated with the kernel (single source of
     # truth), and ``launch`` is a thin variant-cache wrapper so direct-drive
     # users (tests, benchmarks) get the same shapes production would pick.
-    # The production custom op keeps its own equivalent inline policy for
-    # now; unifying it onto ``pick_config`` is a call-site change deferred
-    # to the dispatch-guard follow-up PR.
+    # The production custom op delegates here (``pick_cluster_size`` /
+    # ``pick_tuning``) — one policy, two shells. Intentional shell
+    # divergence: on a 32B-misaligned logits pointer the production runner
+    # ASSERTS (contract violation), while ``launch`` silently downgrades to
+    # 128-bit loads (dev convenience for ad-hoc tensors).
 
     _NUM_SMS: Optional[int] = None
     _LAUNCH_CACHE: dict = {}
@@ -7853,6 +7855,80 @@ class GvrTopKKernel:
                 torch.cuda.current_device()
             ).multi_processor_count
         return GvrTopKKernel._NUM_SMS
+
+    @staticmethod
+    def pick_cluster_size(num_rows: int, n_row: int, num_sms: int) -> int:
+        """Cluster-size policy: N < 64K -> 1 (sync unrecouped); tiny grid
+        at large N -> 8; single-wave -> 4/2; multi-wave -> 1 (row
+        parallelism already saturates the SMs; per-row splitting is pure
+        overhead past one wave)."""
+        if n_row < 65536:
+            return 1
+        if num_rows <= 4 and n_row >= 131072:
+            return 8
+        if num_rows * 4 <= num_sms:
+            return 4
+        if num_rows * 2 <= num_sms:
+            return 2
+        return 1
+
+    @staticmethod
+    def pick_tuning(
+        torch_dtype,
+        num_rows: int,
+        n_per_cta: int,
+        num_sms: int,
+        graph_capture: bool,
+    ) -> dict:
+        """T / V / min_blocks_per_mp / warp-reduce policy at a given
+        per-CTA row width (cluster split already applied).
+
+        ``graph_capture``: raise the half-prec T=1024 bar so a small
+        capture-N does not pin T=1024 onto small-N replays.
+        Returns ``num_threads``, ``use_256bit_load``,
+        ``min_blocks_per_mp``, ``enable_warp_parallel_reduce``.
+        """
+        import torch  # local: keep the module importable without torch
+
+        is_fp32 = torch_dtype == torch.float32
+        # T=1024 needs a 1 CTA/SM grid AND enough per-CTA vec work.
+        n_thresh_t = 131072 if (graph_capture and not is_fp32) else 65536
+        num_threads = 1024 if (num_rows <= num_sms and n_per_cta >= n_thresh_t) else 512
+        # V=256-bit only helps fp32 at large N; half-prec cvt doubles reg
+        # pressure. Requires a 32B-aligned contiguous tensor (see the
+        # shell-divergence note above).
+        use_256bit_load = is_fp32 and n_per_cta >= 16384
+        enable_warp_parallel_reduce = num_threads == 1024
+
+        # min_blocks_per_mp: reg-vs-occupancy tiers (fp32 wants ~70 regs
+        # for 4-LDG ILP -> mb<=2; half-prec fits 40 regs -> mb=3 packs
+        # 3 CTA/SM when rows oversubscribe the device).
+        vec_bits = 256 if use_256bit_load else 128
+        vec_w = vec_bits // (32 if is_fp32 else 16)
+        n_vec_iters = max(1, n_per_cta // (num_threads * vec_w))
+        if is_fp32:
+            if n_vec_iters < 4:
+                min_blocks_per_mp = 0
+            elif num_rows <= num_sms:
+                min_blocks_per_mp = 1
+            elif num_sms * 2 < num_rows <= num_sms * 3 and n_per_cta <= 32768:
+                min_blocks_per_mp = 3
+            else:
+                min_blocks_per_mp = 2
+        else:
+            if num_rows > num_sms:
+                min_blocks_per_mp = 3
+            elif n_vec_iters < 4:
+                min_blocks_per_mp = 0
+            else:
+                min_blocks_per_mp = 1
+
+        return dict(
+            num_threads=num_threads,
+            use_256bit_load=use_256bit_load,
+            min_blocks_per_mp=min_blocks_per_mp,
+            enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+        )
 
     @staticmethod
     def pick_config(
@@ -7884,77 +7960,27 @@ class GvrTopKKernel:
         ``num_threads``, ``use_256bit_load``, ``min_blocks_per_mp``,
         ``enable_warp_parallel_reduce``.
         """
-        import torch  # local: keep the module importable without torch
-
         if num_sms is None:
             num_sms = GvrTopKKernel._device_num_sms()
         n_row = max_seq_len if max_seq_len is not None else num_candidates
-        is_fp32 = torch_dtype == torch.float32
-
-        # cluster_size: B200 SXM5 synth-data tuning (matches the custom
-        # op's auto-pick): N < 64K -> 1 (sync unrecouped); tiny grid at
-        # large N -> 8; single-wave -> 4/2; multi-wave -> 1.
-        if n_row < 65536:
-            cluster_size = 1
-        elif has_block_max and n_row >= 200_000:
+        if has_block_max and n_row >= 200_000:
             # Block-skip requires cs == 1 with a large per-CTA slice
             # (splitting shrinks each CTA's slice below the skip
             # break-even and disables rung tightening). Below 200k the
             # wrapper drops block_max anyway (skip_min_n gate) and the
             # stock picks apply.
             cluster_size = 1
-        elif num_rows <= 4 and n_row >= 131072:
-            cluster_size = 8
-        elif num_rows * 4 <= num_sms:
-            cluster_size = 4
-        elif num_rows * 2 <= num_sms:
-            cluster_size = 2
         else:
-            cluster_size = 1
-
-        # Cluster CTAs split the row, so tuning targets per-CTA work.
-        n_per_cta = n_row // cluster_size
-        # T=1024 needs 1 CTA/SM grid AND enough per-CTA vec work. Under
-        # graph capture, raise the half-prec bar so a small capture-N
-        # doesn't force T=1024 on small-N replays.
-        n_thresh_t = 131072 if (max_seq_len is not None and not is_fp32) else 65536
-        num_threads = 1024 if (num_rows <= num_sms and n_per_cta >= n_thresh_t) else 512
-        # V=256-bit only helps fp32 at large N; half-prec cvt doubles reg
-        # pressure. Caller must hand a 32B-aligned contiguous tensor
-        # (``launch`` downgrades on misalignment).
-        use_256bit_load = is_fp32 and n_per_cta >= 16384
-        enable_warp_parallel_reduce = num_threads == 1024
-
-        # min_blocks_per_mp: reg-vs-occupancy 3-tier (fp32 wants ~70 regs
-        # for 4-LDG ILP -> mb<=2; half-prec fits 40 regs -> mb=3 packs
-        # 3 CTA/SM when rows oversubscribe the device).
-        vec_bits = 256 if use_256bit_load else 128
-        vec_w = vec_bits // (32 if is_fp32 else 16)
-        n_vec_iters = max(1, n_per_cta // (num_threads * vec_w))
-        if is_fp32:
-            if n_vec_iters < 4:
-                min_blocks_per_mp = 0
-            elif num_rows <= num_sms:
-                min_blocks_per_mp = 1
-            elif num_sms * 2 < num_rows <= num_sms * 3 and n_per_cta <= 32768:
-                min_blocks_per_mp = 3
-            else:
-                min_blocks_per_mp = 2
-        else:
-            if num_rows > num_sms:
-                min_blocks_per_mp = 3
-            elif n_vec_iters < 4:
-                min_blocks_per_mp = 0
-            else:
-                min_blocks_per_mp = 1
-
-        return dict(
-            cluster_size=cluster_size,
-            num_threads=num_threads,
-            use_256bit_load=use_256bit_load,
-            min_blocks_per_mp=min_blocks_per_mp,
-            enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+            cluster_size = GvrTopKKernel.pick_cluster_size(num_rows, n_row, num_sms)
+        cfg = GvrTopKKernel.pick_tuning(
+            torch_dtype,
+            num_rows,
+            n_row // cluster_size,
+            num_sms,
+            graph_capture=max_seq_len is not None,
         )
+        cfg["cluster_size"] = cluster_size
+        return cfg
 
     @classmethod
     def launch(

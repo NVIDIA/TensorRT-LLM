@@ -15,7 +15,7 @@
 import copy
 import dataclasses
 import os
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
 
@@ -73,6 +73,9 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
+if TYPE_CHECKING:
+    import transformers
+
 GB = 1 << 30
 
 
@@ -129,6 +132,7 @@ def get_kv_cache_manager_cls(
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
+    use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
     if is_hybrid_linear(config):
         # Degenerate case: model is flagged as hybrid but the config has zero
         # mamba layers. Fall through to the standard non-hybrid routes.
@@ -136,7 +140,8 @@ def get_kv_cache_manager_cls(
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KV cache manager without mamba caching")
             if sparse_attn_config is not None:
-                return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+                return get_sparse_attn_kv_cache_manager(
+                    sparse_attn_config, use_kv_cache_manager_v2=use_v2)
             return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
         if (sparse_attn_config is not None
@@ -149,8 +154,6 @@ def get_kv_cache_manager_cls(
         has_additional_snapshots = bool(
             state_config.additional_snapshot_offsets_from_start
             or state_config.additional_snapshot_offsets_from_end)
-        use_v2 = kv_cache_config.use_kv_cache_manager_v2 is True
-
         if has_additional_snapshots and not use_v2:
             raise ValueError("Mamba additional snapshot offsets require "
                              "use_kv_cache_manager_v2=True; V1 supports only "
@@ -262,7 +265,8 @@ def get_kv_cache_manager_cls(
                 "yet model retained recurrent-state snapshots.")
         return MambaHybridCacheManagerV2
     elif sparse_attn_config is not None:
-        return get_sparse_attn_kv_cache_manager(sparse_attn_config)
+        return get_sparse_attn_kv_cache_manager(sparse_attn_config,
+                                                use_kv_cache_manager_v2=use_v2)
     else:
         return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
 
@@ -586,7 +590,7 @@ class KvCacheCreator:
             kv_cache_config,
             is_disagg=self._is_disagg,
             cache_transceiver_config=self._cache_transceiver_config)
-        cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+        cls = self._validate_or_fallback_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
         if is_hybrid_linear(model_config.pretrained_config):
             logger.info_once(
@@ -604,7 +608,7 @@ class KvCacheCreator:
                     f"when using non-V2 Mamba cache manager {cls.__name__}")
         return cls
 
-    def _fallback_if_unsupported_kv_cache_manager_v2(
+    def _validate_or_fallback_kv_cache_manager_v2(
             self,
             kv_cache_manager_cls,
             model_config: ModelConfig,
@@ -619,25 +623,26 @@ class KvCacheCreator:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
+            sparse_attn_config = model_config.sparse_attention_config
+            if (sparse_attn_config is not None
+                    and sparse_attn_config.algorithm == "dsa"
+                    and self._mapping.cp_config.get("cp_type") == CpType.STAR):
+                incompat.append("STAR context parallelism")
             if incompat:
                 incompat_str = ", ".join(incompat)
-                # Some models are structurally bound to V2 and cannot fall
-                # back to V1 without producing wrong outputs:
-                #   * Sparse-attention models (e.g. MiniMax-M3) need V2's
-                #     per-layer split-pool to allocate the per-sparse-layer
-                #     INDEX_KEY pool with a different stride than the main
-                #     K/V pool. V1's unified pool cannot represent that.
-                #   * Gemma4 hybrid uses per-layer head_dim that V1 would
-                #     coerce to ``max(head_dim)``, changing per-layer KV
-                #     byte sizes — correctness bug, not just efficiency.
-                sparse_attn_config = model_config.sparse_attention_config
+                # Never silently replace a sparse V2 manager with V1. Some
+                # sparse models require V2 structurally; for models such as DSA
+                # that support both managers, fallback would ignore the user's
+                # explicit manager selection.
                 if sparse_attn_config is not None:
                     raise NotImplementedError(
-                        f"Sparse-attention models "
-                        f"(algorithm={sparse_attn_config.algorithm!r}) require "
-                        f"KVCacheManagerV2, which is not yet supported with "
-                        f"{incompat_str}. Disable these KvCacheConfig features "
-                        f"to run sparse-attention models.")
+                        f"KVCacheManagerV2 for sparse-attention models "
+                        f"(algorithm={sparse_attn_config.algorithm!r}) is not "
+                        f"supported with "
+                        f"{incompat_str}. Disable the incompatible features to "
+                        f"run sparse-attention models.")
+                # Gemma4 hybrid uses per-layer head_dim that V1 would coerce to
+                # ``max(head_dim)``, changing per-layer KV byte sizes.
                 if is_gemma4_hybrid(config):
                     raise NotImplementedError(
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
@@ -649,7 +654,7 @@ class KvCacheCreator:
                         f"{incompat_str}; CppMambaHybridCacheManager does not "
                         "provide a compatible fallback. Use max_beam_width=1 "
                         "and disable the KV connector.")
-                # Plain V2 (explicitly enabled or selected by a model default):
+                # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
                 logger.warning(
@@ -1440,7 +1445,7 @@ class KvCacheCreator:
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
-        draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
+        draft_kv_cache_manager_cls = self._validate_or_fallback_kv_cache_manager_v2(
             draft_kv_cache_manager_cls, effective_draft_config, draft_kv_config)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
@@ -2014,6 +2019,29 @@ def _get_mamba_cache_layer_masks(
     )
 
 
+# The V1 hybrid managers select the convolution-state layout by model_type;
+# MambaHybridCacheManagerV2 takes the layout by name and rejects model_type.
+_CONV_STATE_LAYOUT_BY_MODEL_TYPE = {
+    "nemotron_hybrid": "x_b_c",
+    "qwen3_next": "q_k_v",
+}
+
+
+def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
+                              model_type: str) -> dict:
+    """Constructor kwarg selecting the conv-state layout for a hybrid manager.
+
+    Keeps the V1-vs-V2 dispatch in one place: a manager branch that forgets it
+    would previously get V2's silent "x_b_c" default (the Kimi K3 bug fixed in
+    this change).
+    """
+    if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+        return {
+            "conv_state_layout": _CONV_STATE_LAYOUT_BY_MODEL_TYPE[model_type]
+        }
+    return {"model_type": model_type}
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2221,6 +2249,10 @@ def _create_kv_cache_manager(
             if is_kda_mtp_verify_available():
                 kimi_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
+        # KDA's conv state is a [Q | K | V] concatenation whose three sections
+        # have identical width, i.e. the qwen3_next section layout.
+        kimi_extra_kwargs.update(
+            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
@@ -2248,9 +2280,6 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            # Reuse the qwen3_next [Q | K | V] conv-state section layout;
-            # all three KDA sections have identical width.
-            model_type="qwen3_next",
             **kimi_extra_kwargs,
             **manager_extra_kwargs,
         )
@@ -2364,10 +2393,8 @@ def _create_kv_cache_manager(
                                          and mamba_params.mamba_ssm_cache_dtype
                                          == torch.float16)
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            mamba_manager_extra_kwargs["conv_state_layout"] = "x_b_c"
-        else:
-            mamba_manager_extra_kwargs["model_type"] = "nemotron_hybrid"
+        mamba_manager_extra_kwargs.update(
+            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -2473,10 +2500,8 @@ def _create_kv_cache_manager(
                     ("ENABLED" if use_replay else "DISABLED"))
 
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            mamba_manager_extra_kwargs["conv_state_layout"] = "q_k_v"
-        else:
-            mamba_manager_extra_kwargs["model_type"] = "qwen3_next"
+        mamba_manager_extra_kwargs.update(
+            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -2554,6 +2579,16 @@ def _create_kv_cache_manager(
     # via cache_layer_idx — shared layers use target layer's index for
     # get_buffers(). No layer_offsets remapping needed here.
 
+    # Propagate the finalized chunked-prefill flag so KVCacheManager.fit_token_budget
+    # only shrinks context chunks when the attention backend can consume a
+    # partial context chunk. The flag is read from attn_runtime_features, which
+    # py_executor_creator finalizes (including the SM-version /
+    # attention-backend overrides) before build_managers runs.
+    if isinstance(kv_cache_manager,
+                  KVCacheManager) and model_engine is not None:
+        kv_cache_manager.enable_chunked_prefill = bool(
+            model_engine.attn_runtime_features.chunked_prefill)
+
     return kv_cache_manager
 
 
@@ -2586,6 +2621,7 @@ def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
+    pretrained_config: Optional["transformers.PretrainedConfig"] = None,
 ) -> Optional[KVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
@@ -2607,6 +2643,7 @@ def create_kv_cache_compression_manager(
             config,
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            pretrained_config=pretrained_config,
         )
 
     logger.warning(
@@ -2623,12 +2660,11 @@ def compute_max_num_sequences(mapping: Mapping,
                               enable_overlap_headroom: bool = False) -> int:
     """Size the sequence-slot pool (and the sampler state it indexes).
 
-    ``enable_overlap_headroom`` is intentionally opt-in. DeepSeek-V4 needs a
-    second non-PP slot set because the V2 scheduler can backfill seats before
-    the overlap scheduler releases the previous iteration's terminal slots.
-    Other models retain their established sizing until that behavior is
-    validated independently. Pipeline parallelism already sizes the pool by
-    ``pp_size``.
+    ``enable_overlap_headroom`` is intentionally opt-in. Disaggregated
+    attention-DP needs a second non-PP slot set because the V2 scheduler can
+    backfill seats before the overlap scheduler releases the previous
+    iteration's terminal slots. Pipeline parallelism already sizes the pool
+    by ``pp_size``.
     """
     if mapping.has_pp():
         num_micro_batches = mapping.pp_size
@@ -2638,33 +2674,38 @@ def compute_max_num_sequences(mapping: Mapping,
     return max_batch_size * num_micro_batches
 
 
-# Model types whose disaggregated attention-DP path has been measured against
-# the ADP dummy fixes. The gate stays an explicit list rather than a capability
-# check (``enable_attention_dp and kv_cache_transceiver is not None``) so that
-# each entry is added only after its disagg ADP behavior has been exercised.
-_ADP_DUMMY_FIX_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
+def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
+    """Enable transactional ADP dummy handling while PP remains follow-up."""
+    return not mapping.has_pp()
 
 
-def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
-                                       mapping: Mapping) -> bool:
-    """Gate the ADP dummy fixes while PP remains follow-up scope."""
-    return model_type in _ADP_DUMMY_FIX_MODEL_TYPES and not mapping.has_pp()
+_VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES = ("deepseek_v4", "qwen3_5_moe")
 
 
-def should_enable_dsv4_overlap_headroom(
-        model_type: Optional[str], spec_config: Optional[SpeculativeConfig],
+def should_enable_scheduler_aware_adp_dummy(
+        model_type: Optional[str], mapping: Mapping,
+        disable_overlap_scheduler: bool) -> bool:
+    """Enable scheduler-aware padding for validated lifecycle configurations."""
+    return (should_enable_adp_dummy_fixes(mapping)
+            and (disable_overlap_scheduler
+                 or model_type in _VALIDATED_OVERLAP_ADP_DUMMY_MODEL_TYPES))
+
+
+def should_enable_non_overlap_adp_forward_intent(
         mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
-    """Gate extra sequence slots to the validated DSv4 MTP overlap path.
+    """Enable fresh cross-rank dummy intent for the generic non-overlap path."""
+    return (should_enable_adp_dummy_fixes(mapping)
+            and disable_overlap_scheduler)
 
-    Deliberately NOT routed through ``should_enable_dsv4_adp_dummy_fixes``.
-    That gate now covers more model types, while this one doubles
-    ``max_num_sequences`` (see ``compute_max_num_sequences``) and therefore
-    changes the memory envelope; it must stay pinned to the one path it was
-    measured on.
-    """
-    return (model_type == "deepseek_v4" and not mapping.has_pp()
-            and spec_config is not None
-            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+
+def should_enable_disagg_adp_overlap_headroom(
+        mapping: Mapping,
+        cache_transceiver_config: Optional[CacheTransceiverConfig],
+        disable_overlap_scheduler: bool) -> bool:
+    """Gate extra sequence slots to non-PP disaggregated attention-DP."""
+    is_disagg = (cache_transceiver_config is not None
+                 and cache_transceiver_config.backend is not None)
+    return (mapping.enable_attention_dp and is_disagg and not mapping.has_pp()
             and not disable_overlap_scheduler)
 
 
@@ -2724,9 +2765,13 @@ def create_py_executor_instance(
         # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
 
+        initial_lora_data_type = None
         if len(lora_config.lora_dir) == 1:
             # Route to appropriate loader based on checkpoint source
-            load_torch_lora(lora_config)
+            configured_lora_data_type = load_torch_lora(lora_config)
+            if (configured_lora_data_type == torch.float8_e4m3fn
+                    and torch.cuda.get_device_capability() == (9, 0)):
+                initial_lora_data_type = configured_lora_data_type
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -2858,6 +2903,7 @@ def create_py_executor_instance(
             world_config=world_config,
             execution_stream=execution_stream,
             lora_target_modules=target_modules,
+            initial_data_type=initial_lora_data_type,
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
@@ -2881,6 +2927,7 @@ def create_py_executor_instance(
             kv_cache_compression_config,
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            pretrained_config=model_engine.model.model_config.pretrained_config,
         )
         if compression_manager is not None:
             resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
@@ -2991,8 +3038,12 @@ def create_py_executor_instance(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
 
-        mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
-                                               ctx_chunk_config)
+        mb_scheduler = BindMicroBatchScheduler(
+            max_batch_size,
+            max_num_tokens,
+            ctx_chunk_config,
+            no_schedule_until_state=no_schedule_until_state,
+        )
 
         reorder_policy_config = llm_args.reorder_policy_config
         if reorder_policy_config is not None:
