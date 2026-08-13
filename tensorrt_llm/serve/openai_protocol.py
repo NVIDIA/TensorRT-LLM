@@ -2086,6 +2086,15 @@ class VideoGenerationRequest(OpenAIBaseModel):
              "a single audio file. Accepted only by models that declare an audio "
              "reference slot."),
         )
+    input_reference: Optional[Union[str, UploadFile]] = Field(
+        default=None,
+        description=(
+            "Deprecated. A single image or video reference, routed by content "
+            "signature to image-to-video or video-to-video. Kept for backward "
+            "compatibility; prefer the typed ``image_reference`` / "
+            "``video_reference`` fields, which are used instead whenever the "
+            "same-modality typed field is also provided."),
+    )
 
     # Resolution
     size: Optional[str] = Field(default=None, pattern=r"^(\d+x\d+|auto)$")

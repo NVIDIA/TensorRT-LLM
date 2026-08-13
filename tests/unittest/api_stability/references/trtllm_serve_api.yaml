@@ -1489,6 +1489,12 @@ models:
         default: null
         status: prototype
         required: false
+      input_reference:
+        kind: extension
+        type: Optional[Union[str, UploadFile]]
+        default: null
+        status: deprecated
+        required: false
       size:
         kind: extension
         type: Optional[str]

@@ -365,6 +365,46 @@ class TestInputReferenceMaterialization:
         with pytest.raises(ValueError, match="media_storage_path"):
             parse_visual_gen_params(request, "vid-9", generator, media_storage_path=None)
 
+    def test_deprecated_input_reference_routes_by_sniff(self, tmp_path):
+        # The deprecated single input_reference is sniff-routed to the typed slot.
+        generator = _StubVisualGen()
+        buf = BytesIO()
+        Image.new("RGB", (4, 4)).save(buf, format="PNG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode()
+        vid_b64 = base64.b64encode(self._mp4_bytes()).decode()
+
+        p = parse_visual_gen_params(
+            VideoGenerationRequest(prompt="x", input_reference=img_b64),
+            "vid-i",
+            generator,
+            media_storage_path=str(tmp_path),
+        )
+        assert len(p.image_reference) == 1 and p.video_reference is None
+
+        p = parse_visual_gen_params(
+            VideoGenerationRequest(prompt="x", input_reference=vid_b64),
+            "vid-v",
+            generator,
+            media_storage_path=str(tmp_path),
+        )
+        assert len(p.video_reference) == 1 and p.image_reference is None
+
+    def test_input_reference_ignored_when_typed_reference_set(self, tmp_path):
+        # A typed reference takes precedence; the deprecated input_reference is dropped.
+        generator = _StubVisualGen()
+        buf = BytesIO()
+        Image.new("RGB", (4, 4)).save(buf, format="PNG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode()
+        vid_b64 = base64.b64encode(self._mp4_bytes()).decode()
+        p = parse_visual_gen_params(
+            VideoGenerationRequest(prompt="x", image_reference=img_b64, input_reference=vid_b64),
+            "vid-x",
+            generator,
+            media_storage_path=str(tmp_path),
+        )
+        assert len(p.image_reference) == 1
+        assert p.video_reference is None  # input_reference video dropped
+
     def test_base64_video_reference_written_to_disk(self, tmp_path):
         # The JSON/base64 path carries video even though it has no content-type
         # or filename; modality is declared by the field name.

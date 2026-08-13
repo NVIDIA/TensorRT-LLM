@@ -422,6 +422,46 @@ def cleanup_materialized_conditioning_inputs(value: Any) -> None:
         except OSError as exc:
             logger.warning("Failed to remove temporary image edit input %r: %s", path, exc)
 
+def _apply_deprecated_input_reference(
+    input_reference, params, *, id: str, media_storage_path: Optional[str]
+) -> None:
+    """Back-compat for the deprecated single ``input_reference``.
+
+    Sniff-routes the payload to ``image_reference`` (image) or ``video_reference``
+    (video), preserving the pre-typed-fields behavior. Ignored when a typed
+    image/video reference is already set — the typed fields take precedence.
+    """
+    if input_reference is None:
+        return
+    logger.warning("'input_reference' is deprecated; use 'image_reference' / 'video_reference'.")
+    if params.image_reference or params.video_reference:
+        return
+    from tensorrt_llm.visual_gen.params import MediaRef
+
+    payload, _ = _reference_payload_and_role(input_reference)
+    kind = sniff_media_kind(payload)
+    if kind == "image":
+        path = _materialize_reference(
+            payload,
+            modality="image",
+            ref_id=f"{id}_input_ref",
+            media_storage_path=media_storage_path,
+        )
+        params.image_reference = [MediaRef(content=path)]
+    elif kind == "video":
+        path = _materialize_reference(
+            payload,
+            modality="video",
+            ref_id=f"{id}_input_ref",
+            media_storage_path=media_storage_path,
+        )
+        params.video_reference = [MediaRef(content=path)]
+    else:
+        raise ValueError(
+            "input_reference is not a recognized media container; supported "
+            "inputs are PNG/JPEG images and MP4/AVI video."
+        )
+
 
 def parse_visual_gen_params(
     request: ImageGenerationRequest | ImageEditRequest | VideoGenerationRequest,
@@ -529,6 +569,9 @@ def parse_visual_gen_params(
         )
         if audio_refs:
             params.audio_reference = audio_refs
+        _apply_deprecated_input_reference(
+            request.input_reference, params, id=id, media_storage_path=media_storage_path
+        )
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _decode_inline_media(request.extra_params, generator.extra_param_specs)

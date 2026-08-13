@@ -174,6 +174,8 @@ curl http://localhost:8000/v1/videos -H 'content-type: application/json' -d '{
 
 FLUX.2 and Qwen-Image-Edit accept multiple reference images as a list on the same `image_reference` field through the Python API.
 
+A single `input_reference` field (deprecated) is still accepted on the serve video endpoints for backward compatibility; it is routed by content signature to image-to-video or video-to-video, and is ignored when a typed `image_reference` / `video_reference` is also provided. Prefer the typed fields.
+
 ## Optimizations
 
 ### Quantization
