@@ -26,6 +26,7 @@ Design Goals:
 4. Support autotune and tactic capture testing
 """
 
+import importlib
 import itertools
 import logging
 import os
@@ -542,6 +543,34 @@ def test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config():
     assert activation == "swiglu"
     assert situ_beta is None
     assert situ_linear_beta is None
+
+
+def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
+    create_moe_module = importlib.import_module("tensorrt_llm._torch.modules.fused_moe.create_moe")
+    configurable_moe = MagicMock(return_value=object())
+    monkeypatch.setattr(create_moe_module, "ConfigurableMoE", configurable_moe)
+    monkeypatch.setattr(
+        create_moe_module,
+        "resolve_moe_cls",
+        MagicMock(return_value=MegaMoEDeepGemm),
+    )
+
+    result = create_moe_module.create_moe(
+        routing_method=MagicMock(),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        model_config=ModelConfig(),
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert result is configurable_moe.return_value
+    assert configurable_moe.call_args.kwargs["activation"] == "situ"
+    assert configurable_moe.call_args.kwargs["situ_beta"] == 4.0
+    assert configurable_moe.call_args.kwargs["situ_linear_beta"] == 25.0
 
 
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():

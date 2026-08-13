@@ -6679,13 +6679,16 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
                     f"{value.dtype}.")
 
         loaded_slots = module._packed_mxfp4_loaded_slots
-        if local_slot_id in loaded_slots:
-            raise ValueError(
-                f"Packed MXFP4 local slot {local_slot_id} was loaded twice.")
-        if not loaded_slots:
-            # Raw weights are about to change, so any DG-derived tensors left
-            # from an earlier load must not survive into transform_weights.
-            self._clear_transformed_weight_cache(module)
+        with _PACKED_MXFP4_SLOT_CLAIM_LOCK:
+            if local_slot_id in loaded_slots:
+                raise ValueError(
+                    f"Packed MXFP4 local slot {local_slot_id} was loaded twice."
+                )
+            if not loaded_slots:
+                # Raw weights are about to change, so any DG-derived tensors left
+                # from an earlier load must not survive into transform_weights.
+                self._clear_transformed_weight_cache(module)
+            loaded_slots.add(local_slot_id)
 
         dst_w3_w1_weight = module.w3_w1_weight.data
         dst_w3_w1_weight_scale = module.w3_w1_weight_scale.data
@@ -6729,7 +6732,6 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
             non_blocking=True,
         )
 
-        loaded_slots.add(local_slot_id)
         # transform_weights asserts this; the streaming path never reaches
         # load_weights, which is where it would otherwise be set.
         module._weights_loaded = True
