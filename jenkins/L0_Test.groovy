@@ -32,6 +32,7 @@ import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 import trtllm.FailureClassifier
+import trtllm.ContextDeath
 import trtllm.exceptions.InfraFailure
 import trtllm.exceptions.PipelineInterruption
 import trtllm.exceptions.TrtllmCiException
@@ -814,108 +815,138 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 // A SLURM stage runs inside a K8s dispatcher pod that ssh-drives the job on the
 // login node. If that pod dies mid-run (eviction, container error, agent
 // offline), the in-pod cleanup can no longer reach the controller, so the SLURM
-// job and any Jenkins agent node leak. slurmResourceRegistry records the live
-// resources per stage -- the dispatcher pod spec (from the pod wrapper) and the
-// SLURM job / Jenkins node identity (from the stage body, re-registered per
-// inner attempt). Deregistering after a successful cleanup clears only the
-// per-attempt job/node identity and keeps the stage-level podSpec, so a *later*
-// attempt's dispatcher-pod death can still be reconciled off-pod (the pod spec
-// is registered once, before the inner retry loop). Only serializable
-// primitives are stored (no SlurmCluster/Throwable) so pipeline persistence is
-// unaffected; the cluster is rebuilt from clusterName. Plain maps: pipeline
-// Groovy runs single-threaded under CPS (parallel branches interleave at step
-// boundaries, never execute Groovy concurrently) and each stage writes its own
-// key, so no concurrent map corruption -- and the Jenkins script sandbox forbids
-// `new ConcurrentHashMap`. Keyed by stageName.
-@Field def slurmResourceRegistry = [:]
+// job and any Jenkins agent node leak. State + reconciliation live in the shared
+// `resourceLedger` (trtllm-jenkins-shared-lib). Each SLURM stage registers two
+// sibling entries -- "<stage>/dispatcher-pod" (the pod spec, from the pod
+// wrapper) and "<stage>/slurm" (the per-attempt SLURM job / Jenkins node, from
+// the stage body) -- so freeing the job/node after a successful in-pod cleanup
+// (markReclaimed) never disturbs the pod spec a *later* attempt's off-pod
+// reconciliation needs. The ledger stores only serializable primitives (it
+// rejects anything else) so pipeline persistence is unaffected; the SlurmCluster
+// is rebuilt from clusterName at reconcile time. The functions below are thin
+// SLURM-specific adapters over that generic ledger.
+//
+// Shared-library contract used below (trtllm-jenkins-shared-lib), documented here
+// for equivalence with the pre-shared inlined finalizer this replaced:
+//   * ContextDeath.isContextDeath(e) -- true when the flattened cause + suppressed
+//     chain contains a dispatcher-pod-death signal: "pod failed (reason:", "pod
+//     just failed", "pod failed because container terminated", "unable to create
+//     live filepath". Same pattern set the inlined isDispatcherPodFailure matched,
+//     now also traversing suppressed exceptions' own cause chains.
+//   * register(id, type, fields, ownerBuildTag) -- merges non-null fields into the
+//     id's entry; stores serializable primitives only (rejects anything else); a
+//     `fields` map may not overwrite the reserved id/type/ownerBuildTag keys.
+//   * markReclaimed(id) -- drops the entry (idempotent).
+//   * get(id) -- a deep-copied snapshot of the entry, or null.
+//   * reconcile(pipeline, select, reclaim) -- for each live entry matching
+//     select(entry), runs reclaim(pipeline, entry): deregisters entries whose
+//     reclaim returns truthy; leaves live those returning falsy or throwing (a
+//     throw is logged, never propagated). This is the equivalence backbone --
+//     "reconcile off-pod, deregister on success, leave for the sweep on failure."
 
+// Register a live SLURM resource. The pod wrapper passes a podSpec (recorded
+// under "<stage>/dispatcher-pod"); the stage body passes the SLURM job / Jenkins
+// node identity (recorded under "<stage>/slurm"). Keyed separately so they are
+// reclaimed independently. Absent fields are skipped by the ledger.
 void registerSlurmResource(String stageName, Map fields) {
     if (!stageName) {
         return
     }
-    def entry = slurmResourceRegistry.get(stageName)
-    if (entry == null) {
-        entry = [:]
-        slurmResourceRegistry.put(stageName, entry)
+    if (fields.containsKey('podSpec')) {
+        resourceLedger.register(id: "${stageName}/dispatcher-pod", type: 'k8sDispatcherPod',
+            fields: [podSpec: fields.podSpec, containerName: fields.containerName],
+            ownerBuildTag: env.BUILD_TAG)
+    } else {
+        resourceLedger.register(id: "${stageName}/slurm",
+            type: fields.usedSbatch ? 'slurmJob' : 'slurmNode',
+            fields: [clusterName: fields.clusterName, nodeName: fields.nodeName,
+                     jobUID: fields.jobUID, slurmJobId: fields.slurmJobId, usedSbatch: fields.usedSbatch],
+            ownerBuildTag: env.BUILD_TAG)
     }
-    // Skip absent fields. Writers for a given stage run sequentially (pod
-    // wrapper, then stage body), so no merge race.
-    fields.each { k, v -> if (v != null) { entry.put(k, v) } }
 }
 
 // Called once an attempt's resources are actually torn down: drop the per-attempt
-// job/node identity but keep the stage's podSpec (needed to launch a cleanup pod
-// for a later attempt). An entry left with only a podSpec is inert -- finalize
-// and the post-build sweep both skip entries with no job/node.
+// SLURM job/node entry. The stage's dispatcher-pod entry is a separate id and is
+// left intact (a later attempt's off-pod reconciliation still needs its pod spec).
 void deregisterSlurmResource(String stageName) {
     if (!stageName) {
         return
     }
-    def entry = slurmResourceRegistry.get(stageName)
-    if (entry != null) {
-        ["clusterName", "jobUID", "nodeName", "slurmJobId", "usedSbatch"].each { entry.remove(it) }
-    }
+    resourceLedger.markReclaimed("${stageName}/slurm")
 }
 
-// Reconcile one orphaned SLURM entry off the (dead) dispatcher pod: launch a
-// fresh short-lived pod and run the normal cleanup from there (scancel the job,
-// clean the workspace, and -- agent path -- drop the leaked Jenkins node), then
-// deregister. Best-effort: a finalizer failure is logged and the entry is left
-// for the post-build sweep to retry; it never masks the stage's own failure.
-def finalizeSlurmResourceEntry(pipeline, String stageName, def entry, def podSpecOverride = null) {
-    if (entry == null) {
-        return
+// Reclaim one orphaned SLURM entry off the (dead) dispatcher pod: launch a fresh
+// short-lived pod and run the normal cleanup from there (scancel the job, clean
+// the workspace, and -- agent path -- drop the leaked Jenkins node). Returns true
+// when the entry is reconciled (so resourceLedger deregisters it) and false when
+// it cannot be (left for the post-build sweep / manual cleanup). The pod spec and
+// container come from the sibling "<stage>/dispatcher-pod" entry; an in-catch
+// caller may pass podSpecOverride to use the failing attempt's spec directly.
+// Best-effort: a launch/cleanup failure is logged and the entry left live; it
+// never masks the stage's own failure. Used as the reclaim body for both the
+// in-catch finalize and the post-build sweep.
+def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
+    // The ledger is shared build-wide; only SLURM job/node entries are
+    // reconcilable here. Never touch (or deregister) another subsystem's entry a
+    // selector might pass in -- return false to leave it live and untouched.
+    if (entry.type != 'slurmJob' && entry.type != 'slurmNode') {
+        return false
     }
     // Pod died before any job/node was provisioned: nothing to reconcile.
     if (!entry.jobUID && !entry.nodeName) {
-        deregisterSlurmResource(stageName)
-        return
+        return true
     }
-    def podSpec = podSpecOverride ?: entry.podSpec
+    def podEntry = resourceLedger.get(((entry.id ?: "") as String).replaceFirst(/\/slurm$/, "/dispatcher-pod"))
+    def podSpec = podSpecOverride ?: podEntry?.podSpec
+    def containerName = podEntry?.containerName ?: "trt-llm"
     def cluster = entry.clusterName ? SlurmConfig.clusterConfig[entry.clusterName] : null
     if (!podSpec || !cluster) {
-        echo "[SLURM-FINALIZER] ${stageName}: cannot reconcile off-pod (missing pod spec or unknown cluster " +
+        echo "[SLURM-FINALIZER] ${entry.id}: cannot reconcile off-pod (missing pod spec or unknown cluster " +
              "'${entry.clusterName}'); SLURM job=${entry.slurmJobId ?: entry.jobUID ?: 'unknown'} " +
              "node=${entry.nodeName ?: 'n/a'} may need manual cleanup."
-        return
+        return false
     }
     try {
-        echo "[SLURM-FINALIZER] ${stageName}: reconciling orphaned SLURM resources off-pod " +
+        echo "[SLURM-FINALIZER] ${entry.id}: reconciling orphaned SLURM resources off-pod " +
              "(job=${entry.slurmJobId ?: entry.jobUID}, node=${entry.nodeName ?: 'n/a'})."
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, entry.containerName ?: "trt-llm", {
+        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, {
             if (entry.usedSbatch) {
                 cleanUpSlurmResources(pipeline, cluster, entry.clusterName, entry.jobUID)
             } else {
                 cleanUpNodeResources(pipeline, cluster, entry.clusterName, entry.nodeName, entry.slurmJobId)
             }
         })
-        deregisterSlurmResource(stageName)
-        echo "[SLURM-FINALIZER] ${stageName}: off-pod reconciliation complete."
+        echo "[SLURM-FINALIZER] ${entry.id}: off-pod reconciliation complete."
+        return true
     } catch (Exception e) {
-        echo "[SLURM-FINALIZER] ${stageName}: off-pod reconciliation failed (${e.toString()}); leaving entry for post-build sweep."
+        echo "[SLURM-FINALIZER] ${entry.id}: off-pod reconciliation failed (${e.toString()}); leaving entry for post-build sweep."
+        return false
     }
 }
 
+// Reconcile this stage's orphaned SLURM job/node off-pod (in-catch, on a detected
+// dispatcher-pod death). podSpecOverride is the failing attempt's pod spec so
+// reconciliation never depends on the sibling entry surviving.
 def finalizeOrphanedSlurmResource(pipeline, String stageName, def podSpecOverride = null) {
-    finalizeSlurmResourceEntry(pipeline, stageName, slurmResourceRegistry.get(stageName), podSpecOverride)
-}
-
-// Post-build backstop: reconcile any SLURM resources still registered at the end
-// of the build (a dispatcher-pod death whose in-catch finalize also failed, or a
-// failure mode the catch never saw). Runs off-pod from a fresh cleanup pod.
-def sweepOrphanedSlurmResources(pipeline) {
-    def orphans = slurmResourceRegistry.keySet().collect { it }.findAll {
-        def e = slurmResourceRegistry.get(it)
-        e != null && (e.jobUID || e.nodeName)
-    }
-    if (orphans.isEmpty()) {
+    if (!stageName) {
         return
     }
-    echo "[SLURM-FINALIZER] post-build sweep: ${orphans.size()} SLURM resource(s) were not cleaned up " +
-         "in-stage; reconciling off-pod: ${orphans.join(', ')}"
-    orphans.each { sName ->
-        finalizeSlurmResourceEntry(pipeline, sName, slurmResourceRegistry.get(sName))
-    }
+    resourceLedger.reconcile(pipeline,
+        { it.id == "${stageName}/slurm" },
+        { p, entry -> reconcileSlurmResource(p, entry, podSpecOverride) })
+}
+
+// Post-build backstop: reconcile any SLURM job/node still registered at the end of
+// the build (a dispatcher-pod death whose in-catch finalize also failed, or a
+// failure mode the catch never saw). Runs off-pod from a fresh cleanup pod; inert
+// dispatcher-pod-only entries are skipped by the selector.
+def sweepOrphanedSlurmResources(pipeline) {
+    // Scope to this subsystem's SLURM job/node entries: the ledger is shared
+    // build-wide, so filter by type as well as a live job/node handle rather than
+    // passing any entry that merely happens to carry a jobUID/nodeName field.
+    resourceLedger.reconcile(pipeline,
+        { (it.type == 'slurmJob' || it.type == 'slurmNode') && (it.jobUID || it.nodeName) },
+        { p, entry -> reconcileSlurmResource(p, entry) })
 }
 
 // Authoritative timeout signal: ask the SLURM controller (via sacct on the
@@ -2397,18 +2428,14 @@ def cbtsResizeSplits(configs) {
 // agent otherwise going offline. Retrying inside such a pod is futile (every
 // step runs on the dead agent and fails immediately) and its in-pod cleanup can
 // no longer reach the SLURM controller, so callers stop retrying in place and
-// reconcile the orphaned SLURM job / Jenkins node off-pod. Matches the flattened
-// cause chain so the signal is still recognized when wrapped by the cleanup's
-// AbortException (e.g. "Error during clean up SLURM resources: ... marked
-// offline: Pod failed (Reason: Evicted ...)").
+// reconcile the orphaned SLURM job / Jenkins node off-pod. Delegates to the shared
+// ContextDeath.isContextDeath, which matches the same pattern set the inlined
+// version used (see the contract block above) across the flattened cause chain --
+// so the signal is still recognized when wrapped by the cleanup's AbortException
+// (e.g. "Error during clean up SLURM resources: ... marked offline: Pod failed
+// (Reason: Evicted ...)") -- and additionally traverses suppressed causes.
 boolean isDispatcherPodFailure(Throwable e) {
-    def text = FailureClassifier.flattenThrowable(e).collect { it.toString() }.join(" ").toLowerCase()
-    return [
-        "pod failed (reason:",
-        "pod just failed",
-        "pod failed because container terminated",
-        "unable to create live filepath",
-    ].any { text.contains(it) }
+    return ContextDeath.isContextDeath(e)
 }
 
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
@@ -5189,11 +5216,16 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
         while (true) {
             launchAttempt++
             Map attemptPlacementContext = [runnerStarted: false]
+            // Declared above the try so the catch can reference it when reconciling
+            // a dispatcher-pod death: Groovy block-scopes a try-local `def`, so a
+            // declaration inside the try is not visible in the catch (it would
+            // resolve as an undefined property and throw MissingPropertyException).
+            def attemptPodSpec = null
             try {
                 if (launchAttempt > 1 && !avoidedKubernetesHostNodes.isEmpty()) {
                     echo "[INFRA-RETRY] ${stageName}: relaunching pod (attempt ${launchAttempt}), avoiding prior host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
                 }
-                def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+                attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
                 if (slurmDispatcher) {
                     // Record the dispatcher pod spec so the off-pod finalizer/sweep can
                     // launch a fresh cleanup pod if this pod dies mid-run.

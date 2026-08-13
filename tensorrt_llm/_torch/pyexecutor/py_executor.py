@@ -99,6 +99,13 @@ if TYPE_CHECKING:
 _UNBOUNDED_STATS_MAX_LEN = -1
 
 
+class _ADPForwardIntent(IntEnum):
+    # MAX reduction gives context precedence when ADP ranks have mixed work.
+    NONE = 0
+    GENERATION = 1
+    CONTEXT = 2
+
+
 def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
@@ -585,8 +592,12 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
-        self._enable_dsv4_adp_dummy_fixes = getattr(
-            model_engine, "_enable_dsv4_adp_dummy_fixes", False)
+        self._enable_adp_dummy_fixes = getattr(model_engine,
+                                               "_enable_adp_dummy_fixes", False)
+        self._enable_scheduler_aware_adp_dummy = getattr(
+            model_engine, "_enable_scheduler_aware_adp_dummy", False)
+        self._enable_non_overlap_adp_forward_intent = getattr(
+            model_engine, "_enable_non_overlap_adp_forward_intent", False)
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
@@ -743,8 +754,8 @@ class PyExecutor:
         # lifted to _handle_kv_transfer_timeouts_synced / _flush_iter_stats_synced.
         self._pending_timed_out_requests: List[LlmRequest] = []
         self._pending_iter_stats_dict: Optional[Dict] = None
-        # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
-        # updated from observed request types.
+        # Legacy ADP dummy role for overlap and PP fallback paths. The generic
+        # non-overlap path derives its role from fresh per-iteration intent.
         self._adp_dummy_is_gen: bool = True
         # Dummy allocated by the current scheduling iteration. It is committed
         # to the normal forward/termination lifecycle only after every ADP rank
@@ -4581,6 +4592,7 @@ class PyExecutor:
             if mgr.is_request_active(req.py_request_id):
                 mgr.suspend_request(req)
                 paused.append(req)
+        paused_dummies = self._suspend_padding_dummies_for_rebalance(mgr)
 
         try:
             mgr.impl.adjust()
@@ -4589,6 +4601,66 @@ class PyExecutor:
 
         for req in paused:
             mgr.resume_request(req)
+        self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
+
+    def _suspend_padding_dummies_for_rebalance(
+            self, mgr: KVCacheManagerV2) -> List[Tuple[int, LlmRequest]]:
+        """Suspend the CUDA-graph padding dummies before ``adjust()``.
+
+        ``CUDAGraphRunner`` retains one padding dummy per captured draft
+        length, whose KV cache stays ACTIVE across iterations but never
+        appears in ``active_requests`` -- so the suspend loop above never
+        reaches them and ``adjust()`` fails its all-caches-suspended
+        precondition, terminating the executor event loop.
+
+        Suspending is what the precondition actually asks for: it tears
+        down the cache's base-page-index buffers and releases its page
+        locks, which is exactly what makes the pages safe to migrate.  The
+        dummies are deliberately *not* freed -- they are pre-allocated at
+        warmup because re-allocating one from a loaded KV cache can fail
+        and silently drop padded batches to eager mode for the rest of the
+        process lifetime.
+
+        Returns the ``(draft_len, dummy)`` pairs that were suspended.
+        """
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if runner is None:
+            return []
+        suspended: List[Tuple[int, LlmRequest]] = []
+        for draft_len, dummy in runner.padding_dummy_requests.items():
+            if mgr.is_request_active(dummy.py_request_id):
+                mgr.suspend_request(dummy)
+                suspended.append((draft_len, dummy))
+        return suspended
+
+    def _resume_padding_dummies_after_rebalance(
+            self, mgr: KVCacheManagerV2,
+            suspended: List[Tuple[int, LlmRequest]]) -> None:
+        """Resume the padding dummies suspended for ``adjust()``.
+
+        A real request that fails to resume is left suspended for the
+        scheduler to reactivate, but nothing reschedules a padding dummy,
+        and ``_get_or_create_padding_dummy`` returns a cached dummy without
+        checking that its cache is live.  A dummy left suspended would
+        therefore be padded into a batch with a torn-down block table, so
+        one that cannot be resumed is released and dropped from the runner
+        instead, falling back to lazy re-creation on a later padded step.
+
+        The release goes through ``CUDAGraphRunner.release_padding_dummy`` so
+        that every manager the dummy was registered with is covered, not just
+        the main KV cache manager.
+        """
+        runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if runner is None:
+            return
+        for draft_len, dummy in suspended:
+            if mgr.resume_request(dummy):
+                continue
+            logger.warning(
+                "Could not resume the CUDA graph padding dummy request "
+                f"(draft_len={draft_len}) after a KV pool rebalance; "
+                "releasing it and falling back to lazy re-creation.")
+            runner.release_padding_dummy(self.resource_manager, draft_len)
 
     @contextmanager
     def control_action(self,
@@ -5091,11 +5163,57 @@ class PyExecutor:
         # Validate beam width
         sampling_config = request.sampling_config
         if sampling_config is not None:
+            # Requests must run at exactly max_beam_width.
+            #
+            # TorchSampler can sample a narrower request (buffers are allocated
+            # at max_beam_width and it slices to the per-request width), but the
+            # layers around it are not ready: the attention metadata is stamped
+            # with max_beam_width while the generation rows are laid out at the
+            # per-request width, and the scheduler is not beam-width aware, so a
+            # narrower request can be batched with a wider one and fail at
+            # forward time. Keep rejecting until those agree; TRTLLM-14792.
             if sampling_config.beam_width != self.max_beam_width:
                 raise ValueError(
                     f"Request beam width {sampling_config.beam_width} "
-                    f"is not equal to max_beam_width {self.max_beam_width}. This is not supported!"
-                )
+                    f"is not equal to max_beam_width {self.max_beam_width}. "
+                    "This is not supported!")
+
+            # Variable-Beam-Width-Search is only defined for a non-decreasing
+            # array. The documented semantics (see getBeamWidthByIter in
+            # llmRequest.h) only cover widening, ending at the full width, and
+            # both samplers rely on that: the per-step ops write the leading
+            # beam_width_out rows while finalize reads py_beam_width (the
+            # array maximum) of them, so a narrowing array leaves the trailing
+            # rows holding ancestry from an earlier, wider step. The C++
+            # finalize path has the same gap -- it indexes with nBeamWidth
+            # only. Reject rather than emit silently stale beams; narrowing
+            # can be allowed once its semantics are defined (TRTLLM-14792).
+            beam_width_array = sampling_config.beam_width_array
+            if beam_width_array:
+                if isinstance(beam_width_array[0], (list, tuple)):
+                    beam_width_array = beam_width_array[0]
+                if any(b < a
+                       for a, b in zip(beam_width_array, beam_width_array[1:])):
+                    raise ValueError(
+                        f"beam_width_array {list(beam_width_array)} decreases; "
+                        "only non-decreasing arrays are supported for "
+                        "Variable-Beam-Width-Search.")
+
+            # length_penalty is an exponent on the generated length, and the
+            # ranking assumes it only ever shrinks the magnitude of a negative
+            # cum_log_prob. A negative exponent inverts that: dividing by
+            # length**negative multiplies instead, so longer beams score
+            # higher and the beam order is reversed.
+            length_penalty = sampling_config.length_penalty
+            if length_penalty is not None:
+                if isinstance(length_penalty, (list, tuple)):
+                    invalid = [p for p in length_penalty if p < 0]
+                else:
+                    invalid = [length_penalty] if length_penalty < 0 else []
+                if invalid:
+                    raise ValueError(
+                        f"length_penalty {invalid} is negative; only "
+                        "non-negative values are supported.")
 
         # Check token ID ranges
         self._validate_token_id_range(request)
@@ -5276,7 +5394,8 @@ class PyExecutor:
             all_new_flat = [
                 req for reqs in all_ranks_new_requests.values() for req in reqs
             ]
-            self._update_adp_dummy_role(all_new_flat)
+            if not self._enable_non_overlap_adp_forward_intent:
+                self._update_adp_dummy_role(all_new_flat)
 
             # Update per-rank counter for DP
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
@@ -6161,31 +6280,56 @@ class PyExecutor:
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
-        The non-PP DeepSeek-V4 disaggregated ADP path mirrors the decoder
-        scheduler's state window [CONTEXT_INIT, GENERATION_TO_COMPLETE). This
-        covers generation-first context requests below the lower bound and
-        terminal requests at the upper bound. Other configurations retain the
-        established ADP behavior; PP eligibility remains follow-up scope.
+        The non-PP disaggregated ADP path uses the scheduler's state-
+        eligibility contract. This keeps decoder-only and encoder-decoder
+        boundaries and special exclusions aligned without duplicating them
+        here. PP eligibility remains follow-up scope.
 
         Returns:
             The number of active requests eligible for scheduling.
         """
-        if (not self._enable_dsv4_adp_dummy_fixes
+        if (not self._enable_scheduler_aware_adp_dummy
                 or self.kv_cache_transceiver is None):
             if self.kv_cache_transceiver is None:
                 return len(self.active_requests)
 
+            # PP intentionally preserves its established ADP padding behavior
+            # until its dummy lifecycle is generalized. Keep this fallback on
+            # semantic request properties so enum reordering cannot silently
+            # change which transfer states it excludes.
             return sum(
                 1 for req in self.active_requests
                 if not (req.is_disagg_generation_init_state
                         or req.is_disagg_generation_transmission_in_progress))
 
-        schedule_from_value = LlmRequestState.CONTEXT_INIT.value
-        to_complete_value = LlmRequestState.GENERATION_TO_COMPLETE.value
+        return sum(1 for req in self.active_requests
+                   if self.scheduler.is_request_in_schedulable_state(req))
 
-        return sum(
-            1 for req in self.active_requests
-            if schedule_from_value <= req.state_value < to_complete_value)
+    def _get_non_overlap_adp_forward_intent(
+            self) -> tuple[int, _ADPForwardIntent]:
+        """Return local eligible-real count and fresh TP-wide forward role.
+
+        This runs before capacity scheduling so the result is forward intent,
+        not a guarantee that every eligible request will be admitted. The
+        post-schedule queue vote commits or rolls back the tentative dummy.
+        """
+        local_schedulable_count = 0
+        local_intent = _ADPForwardIntent.NONE
+        for request in self.active_requests:
+            if (request.is_attention_dp_dummy or
+                    not self.scheduler.is_request_in_schedulable_state(request)
+                ):
+                continue
+
+            local_schedulable_count += 1
+            if request.is_encoder_init_state or request.is_context_init_state:
+                local_intent = _ADPForwardIntent.CONTEXT
+            elif local_intent == _ADPForwardIntent.NONE:
+                local_intent = _ADPForwardIntent.GENERATION
+
+        global_intent = self.dist.tp_allreduce(int(local_intent),
+                                               op=ReduceOp.MAX)
+        return local_schedulable_count, _ADPForwardIntent(global_intent)
 
     def _has_adp_dummy_kv_capacity(self,
                                    token_nums: Optional[List[int]]) -> bool:
@@ -6299,8 +6443,18 @@ class PyExecutor:
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
             return
 
-        needs_dummy = (expected_num_active_requests > 0
-                       and num_active_request == 0)
+        if (self._enable_non_overlap_adp_forward_intent
+                and self.kv_cache_transceiver is not None):
+            num_active_request, global_intent = (
+                self._get_non_overlap_adp_forward_intent())
+            if global_intent != _ADPForwardIntent.NONE:
+                self._adp_dummy_is_gen = (
+                    global_intent == _ADPForwardIntent.GENERATION)
+            needs_dummy = (global_intent != _ADPForwardIntent.NONE
+                           and num_active_request == 0)
+        else:
+            needs_dummy = (expected_num_active_requests > 0
+                           and num_active_request == 0)
         if not needs_dummy:
             return
 
@@ -6333,7 +6487,7 @@ class PyExecutor:
                 key="attention_dp_dummy_insufficient_kv_capacity")
             return
 
-        if (not self._enable_dsv4_adp_dummy_fixes
+        if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
@@ -6368,9 +6522,8 @@ class PyExecutor:
         except OutOfPagesError:
             dummy_requests = None
         if not dummy_requests:
-            logger.warning(
-                "Cannot allocate DeepSeek-V4 ADP pad dummy; rank schedules "
-                "an empty batch and the fleet will retry.")
+            logger.warning("Cannot allocate ADP pad dummy; rank schedules "
+                           "an empty batch and the fleet will retry.")
             return
 
         dummy_request = dummy_requests[0]
@@ -6572,7 +6725,16 @@ class PyExecutor:
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
-        """Update beam sampler state with context-side first-token data."""
+        """Update beam sampler state with context-side first-token data.
+
+        Seeds this side's beam state from the handoff: the per-beam token, its
+        cumulative log-prob, and an identity cache indirection. A beam whose
+        token is the end id finished during prefill and is latched for harvest
+        so the first CBA step pools it here -- the context server's own pool is
+        not transferred (TRTLLM-14792), which is why its end id is masked for
+        the CBA op so such a token stays in the beam slot and survives the
+        handoff.
+        """
         if beam_width <= 1:
             return True
 
@@ -6647,6 +6809,31 @@ class PyExecutor:
                               device=cum_log_probs.device,
                               dtype=cum_log_probs.dtype)
         cum_log_probs[seq_slot, :beam_width].copy_(values)
+
+        # The handoff carries one token already produced upstream, seeded above
+        # at index prompt_len. No generated-length counter needs seeding to
+        # match: length_penalty normalizes by seq_lens - prompt_lens, which
+        # counts that token because it occupies the first generated slot.
+
+        # A beam whose handed-off token is the end id finished during prefill.
+        # The context server keeps such a token in its beam slot rather than
+        # pooling it (its end id is masked for the CBA op, see
+        # _group_requests_with_metadata), precisely so it survives the handoff
+        # and can be pooled here instead. Raise the harvest latch and the first
+        # CBA step folds the path into this side's pool and frees the slot --
+        # the same route stop words take.
+        end_id = req.py_end_id
+        if end_id is not None and end_id >= 0:
+            finished_beams = [
+                beam_idx for beam_idx in range(beam_width)
+                if first_gen_tokens[beam_idx] == end_id
+            ]
+            if finished_beams:
+                pending_harvest = beam_search_store.pending_harvest
+                pending_harvest[seq_slot,
+                                torch.tensor(finished_beams,
+                                             device=pending_harvest.device,
+                                             dtype=torch.long)] = True
         return True
 
     @staticmethod
@@ -7097,6 +7284,7 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_setup_sampler_step")
+    @torch.inference_mode()
     def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
             return self.sampler.setup_sampler_step(requests)
