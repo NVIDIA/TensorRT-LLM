@@ -574,6 +574,10 @@ class MultimodalScheduler(RequestScheduler):
             scheduler, "micro_batch_scheduler"
         )
 
+    @property
+    def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
+        return self.scheduler.scheduling_state_range
+
     def _total_resident_output_bytes(self, active_requests: RequestList) -> int:
         """Sum per-request resident encoder-output bytes across live states.
 
