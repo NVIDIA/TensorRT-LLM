@@ -2019,6 +2019,29 @@ def _get_mamba_cache_layer_masks(
     )
 
 
+# The V1 hybrid managers select the convolution-state layout by model_type;
+# MambaHybridCacheManagerV2 takes the layout by name and rejects model_type.
+_CONV_STATE_LAYOUT_BY_MODEL_TYPE = {
+    "nemotron_hybrid": "x_b_c",
+    "qwen3_next": "q_k_v",
+}
+
+
+def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
+                              model_type: str) -> dict:
+    """Constructor kwarg selecting the conv-state layout for a hybrid manager.
+
+    Keeps the V1-vs-V2 dispatch in one place: a manager branch that forgets it
+    would previously get V2's silent "x_b_c" default (the Kimi K3 bug fixed in
+    this change).
+    """
+    if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+        return {
+            "conv_state_layout": _CONV_STATE_LAYOUT_BY_MODEL_TYPE[model_type]
+        }
+    return {"model_type": model_type}
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -2226,6 +2249,10 @@ def _create_kv_cache_manager(
             if is_kda_mtp_verify_available():
                 kimi_extra_kwargs["kda_replay_num_spec"] = (
                     spec_config.tokens_per_gen_step - 1)
+        # KDA's conv state is a [Q | K | V] concatenation whose three sections
+        # have identical width, i.e. the qwen3_next section layout.
+        kimi_extra_kwargs.update(
+            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
@@ -2253,9 +2280,6 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            # Reuse the qwen3_next [Q | K | V] conv-state section layout;
-            # all three KDA sections have identical width.
-            model_type="qwen3_next",
             **kimi_extra_kwargs,
             **manager_extra_kwargs,
         )
@@ -2369,10 +2393,8 @@ def _create_kv_cache_manager(
                                          and mamba_params.mamba_ssm_cache_dtype
                                          == torch.float16)
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            mamba_manager_extra_kwargs["conv_state_layout"] = "x_b_c"
-        else:
-            mamba_manager_extra_kwargs["model_type"] = "nemotron_hybrid"
+        mamba_manager_extra_kwargs.update(
+            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -2478,10 +2500,8 @@ def _create_kv_cache_manager(
                     ("ENABLED" if use_replay else "DISABLED"))
 
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
-        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            mamba_manager_extra_kwargs["conv_state_layout"] = "q_k_v"
-        else:
-            mamba_manager_extra_kwargs["model_type"] = "qwen3_next"
+        mamba_manager_extra_kwargs.update(
+            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,

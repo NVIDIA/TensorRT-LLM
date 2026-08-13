@@ -28,6 +28,8 @@ from random import randbytes
 from statistics import median
 from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Sequence, cast, get_type_hints
 
+import pytest
+
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
         DEFAULT_BEAM_INDEX,
@@ -2300,6 +2302,44 @@ class TestSSMSupport(unittest.TestCase):
         kv_cache.resume(cast(CudaStream, stream_holder.handle))
         kv_cache.close()
 
+    def test_ssm_resume_records_intra_device_copy(self) -> None:
+        """The SSM deferred copy on resume is counted in iteration stats.
+
+        First resume of a cache reusing an SSM snapshot copies the snapshot
+        into a private slot; the copy must appear in the SSM life cycle's
+        iteration stats (TRTLLM-15217). Runs against the selected backend, so
+        it checks the default C++ implementation and Python-backend parity.
+        """
+        tokens_per_block = 32
+        cfg = self._make_ssm_config(tokens_per_block=tokens_per_block)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(48)]
+
+        seed = self.manager.create_kv_cache()
+        seed.resume(stream)
+        seed.capacity = tokens_per_block
+        seed.history_length = tokens_per_block
+        seed.commit(prompt[:tokens_per_block], is_end=True)
+        seed.close()
+
+        reused = self.manager.create_kv_cache(input_tokens=prompt, id=101)
+        self.assertEqual(reused.num_committed_tokens, tokens_per_block)
+        reused.commit_pending_stats()
+        # Drop everything recorded so far; only the resume below should count.
+        self.manager.get_and_reset_ssm_snapshot_iteration_stats()
+        self.manager.get_and_reset_iteration_stats()
+
+        self.assertTrue(reused.resume(stream))
+        ssm_life_cycle_id = _introspection.ssm_life_cycle_id(self.manager)
+        assert ssm_life_cycle_id is not None
+        stats = self.manager.get_and_reset_iteration_stats()
+        self.assertIn(ssm_life_cycle_id, stats)
+        self.assertEqual(stats[ssm_life_cycle_id].iter_intra_device_copy_blocks, 1)
+        self.assertGreater(stats[ssm_life_cycle_id].iter_intra_device_copy_bytes, 0)
+        reused.close()
+
     def test_ssm(self) -> None:
         """Inference with SSM layer: prefill 63 tokens, decode 52 tokens."""
         cfg = self._make_ssm_config()
@@ -4499,6 +4539,7 @@ class TestSlotAllocatorShrink(unittest.TestCase):
             allocator.release(s)
 
 
+@pytest.mark.cpu_only
 class TestBlockKeyHashing(unittest.TestCase):
     """Verify Hasher.update produces bit-identical digests to the per-token reference (no GPU needed)."""
 
