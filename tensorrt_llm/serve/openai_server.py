@@ -180,6 +180,30 @@ if _MSGSPEC_ENABLED:
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
+_warned_unresolvable_thinking = False
+
+
+def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
+    """Warn when a generation worker cannot learn the reasoning mode.
+
+    Nothing was rendered here and the context worker relayed no value, so
+    every request on this deployment is parsed in a possibly wrong mode with
+    nothing in the response saying so. Reachable via a rolling upgrade where
+    the context worker predates `resolved_thinking`, a hand-crafted
+    `generation_only` request, or an orchestration path that does not go
+    through `_get_ctx_request`.
+    """
+    global _warned_unresolvable_thinking
+    if _warned_unresolvable_thinking:
+        return
+    _warned_unresolvable_thinking = True
+    logger.warning(
+        f"Reasoning parser {reasoning_parser!r} resolves its mode from the "
+        "rendered prompt, but this request had neither a rendered prompt nor "
+        "a relayed mode from a context worker. Reasoning content will not be "
+        "separated correctly. Check that the context worker is running a "
+        "build that relays 'resolved_thinking'.")
+
 
 def _configure_parser_special_token_decoding(
         sampling_params: SamplingParams, reasoning_parser_name: Optional[str],
@@ -1533,6 +1557,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            # Pre-render, so the mode may be unresolved. Safe because the
+            # boundary lookup reads the parser class attributes, not the
+            # branch `__init__` picked.
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -1584,6 +1611,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     base64.b64decode(request.prompt_token_ids_b64),
                     dtype=np.int32).tolist()
 
+            rendered_prompt = None
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
@@ -1601,6 +1629,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 )
                 prompt, (mm_data, mm_embeddings) = await asyncio.gather(
                     prompt_task, mm_coroutines)
+                if isinstance(prompt, str):
+                    rendered_prompt = prompt
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -1620,6 +1650,31 @@ class OpenAIServer(_VideoRoutesMixin):
                 prompt["mm_processor_kwargs"] = request.mm_processor_kwargs
 
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
+            # Templates that prefill <think>/</think> leave the marker in the
+            # prompt, so the request kwargs alone cannot tell the parser which
+            # mode was rendered. Take it from the prompt instead.
+            if postproc_args.reasoning_parser and (
+                    ReasoningParserFactory.resolves_thinking_from_prompt(
+                        postproc_args.reasoning_parser)):
+                thinking = None
+                if rendered_prompt and request.add_generation_prompt:
+                    thinking = ReasoningParserFactory.resolve_prefilled_thinking(
+                        postproc_args.reasoning_parser, rendered_prompt)
+                if thinking is None and request.disaggregated_params is not None:
+                    # Generation worker: it never rendered, so use the mode the
+                    # context worker resolved and relayed.
+                    thinking = request.disaggregated_params.resolved_thinking
+                    if thinking is None:
+                        _warn_unresolvable_thinking_once(
+                            postproc_args.reasoning_parser)
+                if thinking is not None:
+                    # Both keys, because the parser ORs them: leaving a stale
+                    # `thinking` in place would override what we resolved.
+                    postproc_args.chat_template_kwargs = {
+                        **(request.chat_template_kwargs or {}),
+                        "thinking": thinking,
+                        "enable_thinking": thinking,
+                    }
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
             if conversation and conversation[-1].get(

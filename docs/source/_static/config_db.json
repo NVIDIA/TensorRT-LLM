@@ -37,6 +37,54 @@
       "scenario": "Max Throughput"
     },
     {
+      "command": "trtllm-serve Qwen/Qwen3.8-2.4T-A95B-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.8-low-latency.yaml",
+      "config_filename": "qwen3.8-low-latency.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.8-low-latency.yaml",
+      "config_path": "examples/configs/curated/qwen3.8-low-latency.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.8-low-latency.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "model_display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "model_url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "scenario": "Min Latency (No MTP)"
+    },
+    {
+      "command": "trtllm-serve Qwen/Qwen3.8-2.4T-A95B-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.8-low-latency-mtp3.yaml",
+      "config_filename": "qwen3.8-low-latency-mtp3.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.8-low-latency-mtp3.yaml",
+      "config_path": "examples/configs/curated/qwen3.8-low-latency-mtp3.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.8-low-latency-mtp3.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "model_display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "model_url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "scenario": "Min Latency (MTP3)"
+    },
+    {
+      "command": "cd \"${TRTLLM_DIR}\" && trtllm-serve Qwen/Qwen3.8-2.4T-A95B-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.8-high-throughput.yaml",
+      "config_filename": "qwen3.8-high-throughput.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.8-high-throughput.yaml",
+      "config_path": "examples/configs/curated/qwen3.8-high-throughput.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.8-high-throughput.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "model_display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "model_url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "scenario": "Max Throughput (Static EPLB, No MTP)"
+    },
+    {
+      "command": "cd \"${TRTLLM_DIR}\" && trtllm-serve Qwen/Qwen3.8-2.4T-A95B-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml",
+      "config_filename": "qwen3.8-high-throughput-mtp3.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml",
+      "config_path": "examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "model_display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "model_url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "scenario": "Max Throughput (Static EPLB, MTP3)"
+    },
+    {
       "command": "trtllm-serve nvidia/Qwen3.5-397B-A17B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.5.yaml",
       "config_filename": "qwen3.5.yaml",
       "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.5.yaml",
@@ -4225,6 +4273,10 @@
     "Qwen/Qwen3-Next-80B-A3B-Thinking": {
       "display_name": "Qwen3-Next-80B",
       "url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking"
+    },
+    "Qwen/Qwen3.8-2.4T-A95B-FP8": {
+      "display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8"
     },
     "deepseek-ai/DeepSeek-R1-0528": {
       "display_name": "DeepSeek-R1",
