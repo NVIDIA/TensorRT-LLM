@@ -381,6 +381,7 @@ def test_handler_tracks_overlap_and_commits_speculative_tail() -> None:
     slot = 2
     handler = PenaltyHandler(
         max_num_sequences=3,
+        max_beam_width=1,
         device="cuda",
     )
     history = [3]
@@ -459,6 +460,7 @@ def test_regular_handler_slot_reuse_does_not_leak_penalties() -> None:
     vocab = 16
     handler = PenaltyHandler(
         max_num_sequences=1,
+        max_beam_width=1,
         device="cuda",
     )
     new_tokens = torch.zeros(1, 1, 1, dtype=torch.int32, device="cuda")

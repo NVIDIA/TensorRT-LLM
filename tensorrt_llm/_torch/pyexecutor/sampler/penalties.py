@@ -247,8 +247,8 @@ class PenaltyHandler:
         self,
         *,
         max_num_sequences: int,
+        max_beam_width: int,
         device: torch.device | str,
-        max_beam_width: int = 1,
     ):
         self._max_num_sequences = max_num_sequences
         self._max_beam_width = max_beam_width

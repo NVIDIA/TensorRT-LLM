@@ -196,6 +196,11 @@ modes.
     `repetition_penalty`. Values `<= 0` have no effect, and values larger than the prompt
     are clamped to the prompt length.
 
+  * With beam search the occurrence history is kept per beam rather than per request:
+    each beam is penalized against the tokens on its own path, and whenever a beam
+    continues another one it inherits that beam's history. The prompt seeds every beam
+    alike, so `prompt_ignore_length` applies to all of them equally.
+
 * If `no_repeat_ngram_size = n` is specified, any token that would recreate an `n`-gram already
   present in the sequence (prompt included) is excluded from sampling. `None` or `0` disables
   the restriction.
