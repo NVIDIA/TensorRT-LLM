@@ -773,6 +773,46 @@ def isValidSlurmJobId(def slurmJobID) {
     return slurmJobID && slurmJobID.toString() ==~ /\d+/
 }
 
+// Cache key formula is mirrored in fat_build_sbatch_body.sh (the only writer) and
+// prepare_container.sh; a divergent key misses the cache silently forever.
+// Hashed on the Jenkins controller so no $()/\${} has to survive SSH quoting.
+def computeFatSqshPath(String fatSqshDir, String llmTarfile, String fatBuildScriptLocalPath) {
+    def scriptHash = sh(returnStdout: true, script: "sha256sum ${fatBuildScriptLocalPath} | cut -d' ' -f1 | head -c 8").trim()
+    def hash = sh(returnStdout: true, script: "printf '%s' '${llmTarfile}|${LLM_DOCKER_IMAGE}|${scriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16").trim()
+    return [scriptHash: scriptHash, hash: hash, path: "${fatSqshDir}/fat-${hash}.sqsh"]
+}
+
+// Shared by the SLURM agent and sbatch flows. The fat sqsh cache key hashes the
+// builder script, so both flows must generate byte-identical content.
+def generateFatBuildSbatchScript(Map args) {
+    return """\
+#!/bin/bash
+#SBATCH --output=${args.fatBuildLogPath}
+#SBATCH ${args.fatBuilderArgs}
+export FAT_CONTAINER_DIR="${args.containerDir}"
+export FAT_CONTAINER="${args.container}"
+export FAT_SQSH_DIR="${args.fatSqshDir}"
+export FAT_LLM_TARFILE="${args.llmTarfile}"
+export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
+export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
+export FAT_TAR_NAME="${args.tarName}"
+bash "${args.fatBuildBodyPathNode}"
+""".stripIndent()
+}
+
+def generateFatPrepareScript(Map args) {
+    return """\
+#!/bin/bash
+export FAT_SQSH_DIR="${args.fatSqshDir}"
+export FAT_LLM_TARFILE="${args.llmTarfile}"
+export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
+export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
+export FAT_BUILD_SBATCH_PATH="${args.fatBuildSbatchPathNode}"
+export FAT_BUILD_LOG_TEMPLATE="${args.fatBuildLogPath}"
+bash "${args.prepareBodyPathNode}"
+""".stripIndent()
+}
+
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
@@ -1128,33 +1168,31 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildBodyLocalPath, scriptFatBuildBodyPathNode, true)
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptPrepareBodyLocalPath, scriptPrepareBodyPathNode, true)
 
-                    def scriptFatBuildSbatchContent = """\
-#!/bin/bash
-#SBATCH --output=${fatBuildLogPath}
-#SBATCH ${cluster.fatBuilderArgs}
-export FAT_CONTAINER_DIR="${containerDir}"
-export FAT_CONTAINER="${container}"
-export FAT_SQSH_DIR="${fatSqshDir}"
-export FAT_LLM_TARFILE="${llmTarfile}"
-export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
-export FAT_BUILD_SCRIPT_PATH="${scriptFatBuildPathNode}"
-export FAT_TAR_NAME="${tarName}"
-bash "${scriptFatBuildBodyPathNode}"
-""".stripIndent()
+                    def scriptFatBuildSbatchContent = generateFatBuildSbatchScript(
+                        fatBuildLogPath: fatBuildLogPath,
+                        fatBuilderArgs: cluster.fatBuilderArgs,
+                        containerDir: containerDir,
+                        container: container,
+                        fatSqshDir: fatSqshDir,
+                        llmTarfile: llmTarfile,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        tarName: tarName,
+                        fatBuildBodyPathNode: scriptFatBuildBodyPathNode
+                    )
                     pipeline.writeFile(file: scriptFatBuildSbatchPathLocal, text: scriptFatBuildSbatchContent)
                     Utils.exec(pipeline, script: "echo 'Fat builder sbatch script:' && cat ${scriptFatBuildSbatchPathLocal}")
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildSbatchPathLocal, scriptFatBuildSbatchPathNode, true)
 
-                    def scriptPrepareContent = """\
-#!/bin/bash
-export FAT_SQSH_DIR="${fatSqshDir}"
-export FAT_LLM_TARFILE="${llmTarfile}"
-export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
-export FAT_BUILD_SCRIPT_PATH="${scriptFatBuildPathNode}"
-export FAT_BUILD_SBATCH_PATH="${scriptFatBuildSbatchPathNode}"
-export FAT_BUILD_LOG_TEMPLATE="${fatBuildLogPath}"
-bash "${scriptPrepareBodyPathNode}"
-""".stripIndent()
+                    def scriptPrepareContent = generateFatPrepareScript(
+                        fatSqshDir: fatSqshDir,
+                        llmTarfile: llmTarfile,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
+                        fatBuildLogPath: fatBuildLogPath,
+                        prepareBodyPathNode: scriptPrepareBodyPathNode
+                    )
                     pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
                     Utils.exec(pipeline, script: "echo 'Prepare Container script:' && cat ${scriptPreparePathLocal}")
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptPreparePathLocal, scriptPreparePathNode, true)
@@ -1236,11 +1274,9 @@ bash "${scriptPrepareBodyPathNode}"
                 def containerImageForAgent = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 if (cluster.fatBuilderArgs != null) {
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
-                    // Compute the fat sqsh path entirely on the Jenkins controller to avoid
-                    // SSH quoting issues ($()/\${} expansion in remote bash commands).
-                    def fatBuildScriptHash = sh(returnStdout: true, script: "sha256sum ${scriptFatBuildLocalPath} | cut -d' ' -f1 | head -c 8").trim()
-                    def fatHash = sh(returnStdout: true, script: "printf '%s' '${llmTarfile}|${LLM_DOCKER_IMAGE}|${fatBuildScriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16").trim()
-                    def fatSqshPath = "${fatSqshDir}/fat-${fatHash}.sqsh"
+                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarfile, scriptFatBuildLocalPath)
+                    def fatHash = fatSqsh.hash
+                    def fatSqshPath = fatSqsh.path
                     echo "Fat sqsh check: hash=${fatHash} path=${fatSqshPath}"
                     // Simple SSH check: just test the pre-computed literal path.
                     def fatCheckResult = Utils.exec(
@@ -1962,19 +1998,18 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildBodyLocalPath, scriptFatBuildBodyPathNode, true)
                     Utils.copyFileToRemoteHost(pipeline, remote, scriptPrepareBodyLocalPath, scriptPrepareBodyPathNode, true)
 
-                    def scriptFatBuildSbatchContent = """\
-#!/bin/bash
-#SBATCH --output=${fatBuildLogPath}
-#SBATCH ${cluster.fatBuilderArgs}
-export FAT_CONTAINER_DIR="${containerDir}"
-export FAT_CONTAINER="${container}"
-export FAT_SQSH_DIR="${fatSqshDir}"
-export FAT_LLM_TARFILE="${llmTarfile}"
-export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
-export FAT_BUILD_SCRIPT_PATH="${scriptFatBuildPathNode}"
-export FAT_TAR_NAME="${tarName}"
-bash "${scriptFatBuildBodyPathNode}"
-""".stripIndent()
+                    def scriptFatBuildSbatchContent = generateFatBuildSbatchScript(
+                        fatBuildLogPath: fatBuildLogPath,
+                        fatBuilderArgs: cluster.fatBuilderArgs,
+                        containerDir: containerDir,
+                        container: container,
+                        fatSqshDir: fatSqshDir,
+                        llmTarfile: llmTarfile,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        tarName: tarName,
+                        fatBuildBodyPathNode: scriptFatBuildBodyPathNode
+                    )
                     pipeline.writeFile(file: scriptFatBuildSbatchPathLocal, text: scriptFatBuildSbatchContent)
                     Utils.exec(pipeline, script: "echo \"Fat builder sbatch script: \" && cat ${scriptFatBuildSbatchPathLocal}")
                     Utils.copyFileToRemoteHost(
@@ -2161,11 +2196,10 @@ bash "${scriptFatBuildBodyPathNode}"
                     containerImageArg = "\${enrootImagePath}"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
-                    // Compute fat sqsh path on Jenkins controller (same formula as fat_build_sbatch_body.sh)
-                    // to avoid bash quoting issues in the srunPrologue.
-                    def fatBuildScriptHash = sh(returnStdout: true, script: "sha256sum ${scriptFatBuildLocalPath} | cut -d' ' -f1 | head -c 8").trim()
-                    def fatHash = sh(returnStdout: true, script: "printf '%s' '${llmTarfile}|${LLM_DOCKER_IMAGE}|${fatBuildScriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16").trim()
-                    def fatSqshPath = "${fatSqshDir}/fat-${fatHash}.sqsh"
+                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarfile, scriptFatBuildLocalPath)
+                    def fatBuildScriptHash = fatSqsh.scriptHash
+                    def fatHash = fatSqsh.hash
+                    def fatSqshPath = fatSqsh.path
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
@@ -2430,16 +2464,15 @@ bash "${scriptFatBuildBodyPathNode}"
                 def scriptPrepareContent = "#!/bin/bash\nset -euo pipefail\necho 'No fat sqsh builder configured; skipping Prepare Container.'\n"
                 if (cluster.fatBuilderArgs != null) {
                     def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
-                    scriptPrepareContent = """\
-#!/bin/bash
-export FAT_SQSH_DIR="${fatSqshDir}"
-export FAT_LLM_TARFILE="${llmTarfile}"
-export FAT_LLM_DOCKER_IMAGE="${LLM_DOCKER_IMAGE}"
-export FAT_BUILD_SCRIPT_PATH="${scriptFatBuildPathNode}"
-export FAT_BUILD_SBATCH_PATH="${scriptFatBuildSbatchPathNode}"
-export FAT_BUILD_LOG_TEMPLATE="${fatBuildLogPath}"
-bash "${scriptPrepareBodyPathNode}"
-""".stripIndent()
+                    scriptPrepareContent = generateFatPrepareScript(
+                        fatSqshDir: fatSqshDir,
+                        llmTarfile: llmTarfile,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
+                        fatBuildLogPath: fatBuildLogPath,
+                        prepareBodyPathNode: scriptPrepareBodyPathNode
+                    )
                 }
                 pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
                 Utils.exec(pipeline, script: "echo 'Prepare Container script:' && cat ${scriptPreparePathLocal}")
