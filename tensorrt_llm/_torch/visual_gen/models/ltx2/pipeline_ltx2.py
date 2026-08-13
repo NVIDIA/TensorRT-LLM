@@ -1406,7 +1406,7 @@ class LTX2Pipeline(BasePipeline):
             output_type=extra["output_type"],
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
-            image=refs[0].image if refs else None,
+            image=refs[0].content if refs else None,
             image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],

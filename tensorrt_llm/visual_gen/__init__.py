@@ -56,7 +56,7 @@ if TYPE_CHECKING:
         VisualGenArgs,
     )
     from .output import VisualGenMetrics, VisualGenOutput
-    from .params import AudioRef, ImageRef, VideoRef, VisualGenParams
+    from .params import MediaRef, VisualGenParams
     from .visual_gen import ExtraParamSchema, VisualGen, VisualGenResult
 
 # Public name -> providing module.
@@ -82,9 +82,7 @@ _LAZY_ATTRS = {
     "VisualGenMetrics": "tensorrt_llm.visual_gen.output",
     "VisualGenOutput": "tensorrt_llm.visual_gen.output",
     "VisualGenParams": "tensorrt_llm.visual_gen.params",
-    "ImageRef": "tensorrt_llm.visual_gen.params",
-    "VideoRef": "tensorrt_llm.visual_gen.params",
-    "AudioRef": "tensorrt_llm.visual_gen.params",
+    "MediaRef": "tensorrt_llm.visual_gen.params",
     "QuantConfig": "tensorrt_llm.models.modeling_utils",
 }
 
@@ -117,9 +115,7 @@ __all__ = [
     "VisualGen",
     "VisualGenArgs",
     "VisualGenParams",
-    "ImageRef",
-    "VideoRef",
-    "AudioRef",
+    "MediaRef",
     "VisualGenResult",
     "VisualGenOutput",
     "VisualGenMetrics",

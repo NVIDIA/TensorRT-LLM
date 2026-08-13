@@ -23,7 +23,7 @@ Usage:
 import argparse
 import os
 
-from tensorrt_llm import ImageRef, VisualGen, VisualGenArgs
+from tensorrt_llm import MediaRef, VisualGen, VisualGenArgs
 
 _DEFAULT_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cat_piano.png")
 
@@ -66,7 +66,7 @@ def main():
     # first-frame reference. Wan I2V also accepts a ``last_frame`` role, so the
     # role must be given to disambiguate.
     params = visual_gen.default_params
-    params.image_reference = [ImageRef(image=args.image, role="first_frame")]
+    params.image_reference = [MediaRef(content=args.image, role="first_frame")]
 
     output = visual_gen.generate(
         inputs="A cat presses the piano keys with its paws, soft notes filling the quiet room.",

@@ -352,7 +352,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
             )
         prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
         refs = params.image_reference
-        pil_images = self._load_edit_images([r.image for r in refs] if refs else None)
+        pil_images = self._load_edit_images([r.content for r in refs] if refs else None)
         height = params.height
         width = params.width
         if height is None or width is None:

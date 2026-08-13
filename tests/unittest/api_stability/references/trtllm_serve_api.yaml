@@ -1473,19 +1473,19 @@ models:
         required: false
       image_reference:
         kind: extension
-        type: Optional[Union[str, UploadFile, ImageReferenceItem, List[Union[str, ImageReferenceItem]]]]
+        type: Optional[Union[str, UploadFile, MediaReferenceItem, List[Union[str, MediaReferenceItem]]]]
         default: null
         status: prototype
         required: false
       video_reference:
         kind: extension
-        type: Optional[Union[str, UploadFile, VideoReferenceItem, List[Union[str, VideoReferenceItem]]]]
+        type: Optional[Union[str, UploadFile, MediaReferenceItem, List[Union[str, MediaReferenceItem]]]]
         default: null
         status: prototype
         required: false
       audio_reference:
         kind: extension
-        type: Optional[Union[str, UploadFile, AudioReferenceItem, List[Union[str, AudioReferenceItem]]]]
+        type: Optional[Union[str, UploadFile, MediaReferenceItem, List[Union[str, MediaReferenceItem]]]]
         default: null
         status: prototype
         required: false

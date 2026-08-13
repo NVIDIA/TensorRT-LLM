@@ -387,7 +387,7 @@ class Flux2Pipeline(BasePipeline):
         if not refs:
             return
 
-        reference_images = self._load_reference_images([r.image for r in refs])
+        reference_images = self._load_reference_images([r.content for r in refs])
         condition_images = self._preprocess_reference_images(reference_images)
         req.params.height, req.params.width = self._resolve_target_dimensions(
             req.params.height,
@@ -408,7 +408,7 @@ class Flux2Pipeline(BasePipeline):
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
             num_images_per_prompt=req.params.num_images_per_prompt,
-            image=[r.image for r in refs] if refs else None,
+            image=[r.content for r in refs] if refs else None,
             _condition_images=req.prepared_inputs.get("condition_images"),
         )
 

@@ -105,21 +105,21 @@ class TestVisualGenParamsValidation:
         from tensorrt_llm.visual_gen import VisualGenParams
 
         params = VisualGenParams(image_reference="/path/to/image.png")
-        assert params.image_reference[0].image == "/path/to/image.png"
+        assert params.image_reference[0].content == "/path/to/image.png"
         assert params.image_reference[0].role is None
 
     def test_image_reference_accepts_bytes(self):
         from tensorrt_llm.visual_gen import VisualGenParams
 
         params = VisualGenParams(image_reference=b"\x89PNG")
-        assert params.image_reference[0].image == b"\x89PNG"
+        assert params.image_reference[0].content == b"\x89PNG"
 
     def test_image_reference_accepts_list(self):
         from tensorrt_llm.visual_gen import VisualGenParams
 
         params = VisualGenParams(image_reference=["/path/a.png", b"\x89PNG"])
         assert len(params.image_reference) == 2
-        assert params.image_reference[0].image == "/path/a.png"
+        assert params.image_reference[0].content == "/path/a.png"
 
     def test_model_dump(self):
         from tensorrt_llm.visual_gen import VisualGenParams

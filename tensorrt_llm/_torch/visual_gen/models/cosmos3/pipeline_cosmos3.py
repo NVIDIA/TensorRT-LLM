@@ -759,7 +759,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             return value if field_name in specified else None
 
         refs_v = req.params.video_reference
-        video = refs_v[0].video if refs_v else None
+        video = refs_v[0].content if refs_v else None
         if isinstance(video, str):
             from pathlib import Path
 
@@ -835,7 +835,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
-            image=refs_i[0].image if refs_i else None,
+            image=refs_i[0].content if refs_i else None,
             height=height,
             width=width,
             num_frames=req.params.num_frames,

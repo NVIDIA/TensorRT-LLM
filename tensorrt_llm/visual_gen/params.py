@@ -23,15 +23,17 @@ Role = Literal["reference", "first_frame", "last_frame"]
 
 
 @set_api_status("prototype")
-class ImageRef(StrictBaseModel):
-    """A single image reference carried by ``image_reference``.
+class MediaRef(StrictBaseModel):
+    """A single media reference (image / video / audio).
 
-    ``role`` is required only when the target model can accept the same
-    modality in more than one role (e.g. first + last frame); otherwise the
-    pipeline knows the image's meaning and ``role`` may be omitted.
+    Carried by ``image_reference`` / ``video_reference`` / ``audio_reference``;
+    the field it sits in fixes the modality. ``role`` is required only when the
+    target model accepts that modality in more than one role (e.g. image first +
+    last frame); otherwise the pipeline knows the reference's meaning and
+    ``role`` may be omitted (video/audio are always the single ``reference``).
     """
 
-    image: Union[str, bytes] = Field(
+    content: Union[str, bytes] = Field(
         description="Local path, ``http(s)``/``data:`` URL, or raw bytes."
     )
     role: Optional[Role] = Field(
@@ -39,34 +41,16 @@ class ImageRef(StrictBaseModel):
     )
 
 
-@set_api_status("prototype")
-class VideoRef(StrictBaseModel):
-    """A single video reference carried by ``video_reference`` (always ``reference`` role)."""
+def _normalize_refs(value: Any) -> Optional[list]:
+    """Coerce a reference field to ``list[MediaRef]`` (or ``None``).
 
-    video: Union[str, bytes] = Field(
-        description="Local path, ``http(s)``/``data:`` URL, or raw bytes."
-    )
-
-
-@set_api_status("prototype")
-class AudioRef(StrictBaseModel):
-    """A single audio reference carried by ``audio_reference`` (always ``reference`` role)."""
-
-    audio: Union[str, bytes] = Field(
-        description="Local path, ``http(s)``/``data:`` URL, or raw bytes."
-    )
-
-
-def _normalize_refs(value: Any, ref_cls: type, field: str) -> Optional[list]:
-    """Coerce a reference field to ``list[ref_cls]`` (or ``None``).
-
-    Accepts a bare path/bytes, a single ref object, or a list mixing the two;
-    a bare path/bytes ``x`` becomes ``ref_cls(**{field: x})``.
+    Accepts a bare path/bytes, a single ``MediaRef``, or a list mixing the two;
+    a bare path/bytes ``x`` becomes ``MediaRef(content=x)``.
     """
     if value is None:
         return None
     items = value if isinstance(value, list) else [value]
-    return [x if isinstance(x, ref_cls) else ref_cls(**{field: x}) for x in items]
+    return [x if isinstance(x, MediaRef) else MediaRef(content=x) for x in items]
 
 
 @set_api_status("prototype")
@@ -127,37 +111,27 @@ class VisualGenParams(StrictBaseModel):
 
     # Conditioning inputs
     negative_prompt: Optional[str] = Field(default=None, description="Negative prompt for CFG.")
-    # Per-modality reference inputs. A bare path/bytes, a single ref, or a
-    # list; normalized to ``list[*Ref]``. ``image_reference`` carries an
-    # optional per-item ``role`` (first_frame / last_frame / reference);
-    # video/audio references are always the single ``reference`` role.
-    image_reference: Optional[Union[str, bytes, ImageRef, List[Union[str, bytes, ImageRef]]]] = (
+    # Per-modality reference inputs. A bare path/bytes, a single ``MediaRef``,
+    # or a list; normalized to ``list[MediaRef]``. The field fixes the modality;
+    # ``role`` is only meaningful where a model declares more than one role for
+    # it (e.g. image first_frame / last_frame).
+    image_reference: Optional[Union[str, bytes, MediaRef, List[Union[str, bytes, MediaRef]]]] = (
         Field(
             default=None,
-            description="Reference image(s) for I2V/I2I; normalized to list[ImageRef].",
+            description="Reference image(s) for I2V/I2I; normalized to list[MediaRef].",
         )
     )
-    video_reference: Optional[Union[str, bytes, VideoRef, List[Union[str, bytes, VideoRef]]]] = (
-        Field(default=None, description="Reference video(s) for V2V; normalized to list[VideoRef].")
+    video_reference: Optional[Union[str, bytes, MediaRef, List[Union[str, bytes, MediaRef]]]] = (
+        Field(default=None, description="Reference video(s) for V2V; normalized to list[MediaRef].")
     )
-    audio_reference: Optional[Union[str, bytes, AudioRef, List[Union[str, bytes, AudioRef]]]] = (
-        Field(default=None, description="Reference audio(s); normalized to list[AudioRef].")
+    audio_reference: Optional[Union[str, bytes, MediaRef, List[Union[str, bytes, MediaRef]]]] = (
+        Field(default=None, description="Reference audio(s); normalized to list[MediaRef].")
     )
 
-    @field_validator("image_reference", mode="after")
+    @field_validator("image_reference", "video_reference", "audio_reference", mode="after")
     @classmethod
-    def _norm_image_reference(cls, v):
-        return _normalize_refs(v, ImageRef, "image")
-
-    @field_validator("video_reference", mode="after")
-    @classmethod
-    def _norm_video_reference(cls, v):
-        return _normalize_refs(v, VideoRef, "video")
-
-    @field_validator("audio_reference", mode="after")
-    @classmethod
-    def _norm_audio_reference(cls, v):
-        return _normalize_refs(v, AudioRef, "audio")
+    def _norm_refs(cls, v):
+        return _normalize_refs(v)
 
     # Per-prompt multiplier
     num_images_per_prompt: int = Field(default=1, description="Number of images per prompt.")

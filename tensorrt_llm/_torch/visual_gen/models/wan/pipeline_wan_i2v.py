@@ -427,8 +427,8 @@ class WanImageToVideoPipeline(BasePipeline):
         if first is None:
             raise ValueError("I2V pipeline requires a first_frame image_reference")
         last = by_role.get("last_frame")
-        image = first.image
-        last_image = last.image if last is not None else None
+        image = first.content
+        last_image = last.content if last is not None else None
         extra = req.params.extra_params or {}
 
         return self.forward(

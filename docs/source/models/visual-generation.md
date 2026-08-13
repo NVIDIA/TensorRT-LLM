@@ -150,13 +150,13 @@ curl http://localhost:8000/v1/videos -F "prompt=continue the scene" -F "video_re
 When a model accepts the same modality in more than one role — Wan 2.1 I2V takes a first frame and an optional last frame — the `role` is required to disambiguate:
 
 ```python
-from tensorrt_llm import VisualGen, ImageRef  # VideoRef and AudioRef are also exported
+from tensorrt_llm import VisualGen, MediaRef
 
 vg = VisualGen(model="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers")
 params = vg.default_params
 params.image_reference = [
-    ImageRef(image="start.png", role="first_frame"),
-    ImageRef(image="end.png", role="last_frame"),  # optional
+    MediaRef(content="start.png", role="first_frame"),
+    MediaRef(content="end.png", role="last_frame"),  # optional
 ]
 ```
 
@@ -166,8 +166,8 @@ A JSON serve request carries the role and lists; a multipart upload is limited t
 curl http://localhost:8000/v1/videos -H 'content-type: application/json' -d '{
   "prompt": "the subject comes alive",
   "image_reference": [
-    {"image": "<base64>", "role": "first_frame"},
-    {"image": "<base64>", "role": "last_frame"}
+    {"content": "<base64>", "role": "first_frame"},
+    {"content": "<base64>", "role": "last_frame"}
   ]
 }'
 ```

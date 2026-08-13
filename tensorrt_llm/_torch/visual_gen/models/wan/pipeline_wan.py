@@ -439,7 +439,7 @@ class WanPipeline(BasePipeline):
         extra = req.params.extra_params or {}
         # Wan 2.2 TI2V-5B takes one conditioning image if provided
         refs = req.params.image_reference
-        image = refs[0].image if refs else None
+        image = refs[0].content if refs else None
 
         return self.forward(
             prompt=req.prompt,

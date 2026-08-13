@@ -279,7 +279,7 @@ class TestInputReferenceMaterialization:
             request, "vid-1", generator, media_storage_path=str(tmp_path)
         )
         assert len(params.image_reference) == 1
-        ref_path = params.image_reference[0].image
+        ref_path = params.image_reference[0].content
         assert str(ref_path).endswith("vid-1_image_ref_0")
         # The decoded image is identical to what we passed in.
         with open(ref_path, "rb") as f:
@@ -292,13 +292,13 @@ class TestInputReferenceMaterialization:
         Image.new("RGB", (4, 4)).save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
         request = VideoGenerationRequest(
-            prompt="x", image_reference=[b64, {"image": b64, "role": "last_frame"}]
+            prompt="x", image_reference=[b64, {"content": b64, "role": "last_frame"}]
         )
         params = parse_visual_gen_params(
             request, "vid-r", generator, media_storage_path=str(tmp_path)
         )
         assert [r.role for r in params.image_reference] == [None, "last_frame"]
-        paths = [r.image for r in params.image_reference]
+        paths = [r.content for r in params.image_reference]
         assert len(set(paths)) == 2  # unique file per index
 
     def test_missing_media_storage_path_raises(self):
@@ -338,7 +338,7 @@ class TestInputReferenceMaterialization:
             request, "vid-avi", generator, media_storage_path=str(tmp_path)
         )
         assert params.image_reference is None
-        assert Path(params.video_reference[0].video).read_bytes() == payload
+        assert Path(params.video_reference[0].content).read_bytes() == payload
 
     def test_multipart_mp4_video_reference_written_to_disk(self, tmp_path):
         generator = _StubVisualGen()
@@ -352,7 +352,7 @@ class TestInputReferenceMaterialization:
         # decodes video; the worker demuxes/NVDEC-decodes the conditioning
         # window from the stored file.
         assert params.image_reference is None
-        vpath = params.video_reference[0].video
+        vpath = params.video_reference[0].content
         assert str(vpath).endswith("vid-3_video_ref_0")
         assert Path(vpath).read_bytes() == payload
 
@@ -376,7 +376,7 @@ class TestInputReferenceMaterialization:
             request, "vid-4", generator, media_storage_path=str(tmp_path)
         )
         assert params.image_reference is None
-        assert Path(params.video_reference[0].video).read_bytes() == payload
+        assert Path(params.video_reference[0].content).read_bytes() == payload
 
     def test_video_reference_survives_real_specs(self, tmp_path):
         """With the real cosmos3 specs loaded, the encoded payload is persisted
@@ -391,7 +391,7 @@ class TestInputReferenceMaterialization:
         params = parse_visual_gen_params(
             request, "vid-10", generator, media_storage_path=str(tmp_path)
         )
-        assert Path(params.video_reference[0].video).read_bytes() == payload
+        assert Path(params.video_reference[0].content).read_bytes() == payload
 
     def test_multipart_image_reference_written_to_disk(self, tmp_path):
         # JPEG upload routed by field name to image_reference. The stored file
@@ -407,7 +407,7 @@ class TestInputReferenceMaterialization:
             request, "vid-5", generator, media_storage_path=str(tmp_path)
         )
         assert params.extra_params is None
-        assert str(params.image_reference[0].image).endswith("vid-5_image_ref_0")
+        assert str(params.image_reference[0].content).endswith("vid-5_image_ref_0")
 
     def test_wrong_modality_content_raises(self, tmp_path):
         # The field name declares modality; mismatched content is a client error.
@@ -602,7 +602,7 @@ class TestMediaBytesProbes:
         params = parse_visual_gen_params(
             request, "vid-12", generator, media_storage_path=str(tmp_path)
         )
-        assert Path(params.image_reference[0].image).read_bytes() == truncated
+        assert Path(params.image_reference[0].content).read_bytes() == truncated
 
 
 # =============================================================================

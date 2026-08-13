@@ -2011,38 +2011,25 @@ class ImageGenerationResponse(OpenAIBaseModel):
     size: Optional[str] = None
 
 
-class ImageReferenceItem(OpenAIBaseModel):
-    """One image reference for conditioning (mirrors ``ImageRef``).
+class MediaReferenceItem(OpenAIBaseModel):
+    """One media reference (image / video / audio) for conditioning (mirrors ``MediaRef``).
 
-    ``image`` carries base64-encoded bytes, optionally as a ``data:`` URI.
-    ``role`` is required only for models that accept more than one image
-    role (e.g. Wan first/last frame); single-role models infer it.
+    ``content`` carries base64-encoded bytes, optionally as a ``data:`` URI. The
+    request field it sits in (``image_reference`` / ``video_reference`` /
+    ``audio_reference``) fixes the modality. ``role`` is required only for models
+    that accept more than one role for that modality (e.g. image first/last
+    frame); single-role models infer it.
     """
 
-    image: str = Field(
-        description="Base64-encoded image bytes, optionally as a ``data:`` URI."
+    content: str = Field(
+        description="Base64-encoded media bytes, optionally as a ``data:`` URI."
     )
     role: Optional[str] = Field(
         default=None,
-        description=(
-            "Reference role (e.g. 'reference', 'first_frame', 'last_frame'). "
-            "Required only when the model accepts multiple image roles."),
-    )
-
-
-class VideoReferenceItem(OpenAIBaseModel):
-    """One video reference for conditioning (mirrors ``VideoRef``)."""
-
-    video: str = Field(
-        description="Base64-encoded video bytes, optionally as a ``data:`` URI."
-    )
-
-
-class AudioReferenceItem(OpenAIBaseModel):
-    """One audio reference for conditioning (mirrors ``AudioRef``)."""
-
-    audio: str = Field(
-        description="Base64-encoded audio bytes, optionally as a ``data:`` URI."
+        description=
+        ("Reference role (e.g. 'reference', 'first_frame', 'last_frame'). "
+         "Required only when the model accepts multiple roles for the modality."
+         ),
     )
 
 
@@ -2070,32 +2057,32 @@ class VideoGenerationRequest(OpenAIBaseModel):
                                 ge=0,
                                 description="Random seed for reproducibility.")
     image_reference: Optional[Union[
-        str, UploadFile, ImageReferenceItem,
-        List[Union[str, ImageReferenceItem]]]] = Field(
+        str, UploadFile, MediaReferenceItem,
+        List[Union[str, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Image reference(s) conditioning generation (e.g. image-to-video "
-             "first frame). JSON sends base64 bytes, an ``{image, role}`` "
+             "first frame). JSON sends base64 bytes, a ``{content, role}`` "
              "object, or a list of them; multipart uploads a single image file. "
              "PNG or JPEG only — HEIF/AVIF are not supported."),
         )
     video_reference: Optional[Union[
-        str, UploadFile, VideoReferenceItem,
-        List[Union[str, VideoReferenceItem]]]] = Field(
+        str, UploadFile, MediaReferenceItem,
+        List[Union[str, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Video reference(s) conditioning generation (video-to-video). JSON "
-             "sends base64 bytes, a ``{video}`` object, or a list of them; "
+             "sends base64 bytes, a ``{content}`` object, or a list of them; "
              "multipart uploads a single video file. MP4 or AVI, with H.264 the "
              "tested codec and others best-effort."),
         )
     audio_reference: Optional[Union[
-        str, UploadFile, AudioReferenceItem,
-        List[Union[str, AudioReferenceItem]]]] = Field(
+        str, UploadFile, MediaReferenceItem,
+        List[Union[str, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Audio reference(s) conditioning generation. JSON sends base64 "
-             "bytes, an ``{audio}`` object, or a list of them; multipart uploads "
+             "bytes, a ``{content}`` object, or a list of them; multipart uploads "
              "a single audio file. Accepted only by models that declare an audio "
              "reference slot."),
         )

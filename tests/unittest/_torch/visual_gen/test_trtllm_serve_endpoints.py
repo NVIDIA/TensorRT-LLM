@@ -1589,9 +1589,9 @@ class TestVideoGenerationSync:
         assert len(resp.content) > 0
 
         # image_reference is written to media storage and passed through as a
-        # typed ImageRef carrying the filesystem path.
+        # MediaRef carrying the filesystem path.
         params = video_client.mock_gen.last_params
-        ref_path = params.image_reference[0].image
+        ref_path = params.image_reference[0].content
         assert isinstance(ref_path, str)
         assert ref_path.endswith("_image_ref_0")
         assert os.path.exists(ref_path)
@@ -1616,11 +1616,11 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # Video conditioning arrives as a typed VideoRef holding a stored path;
+        # Video conditioning arrives as a MediaRef holding a stored path;
         # no image_reference is set, and the encoded bytes are byte-identical.
         params = video_client.mock_gen.last_params
         assert params.image_reference is None
-        assert Path(params.video_reference[0].video).read_bytes() == payload
+        assert Path(params.video_reference[0].content).read_bytes() == payload
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
         """Content matching no image or video container signature is rejected
