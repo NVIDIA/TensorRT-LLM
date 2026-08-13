@@ -42,7 +42,7 @@ def _cleanup_mpi_env():
 
 HUNYUAN_VIDEO_1_5_PATH = "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v"
 
-PROMPT = "A dinosaur walking through the jungle"
+PROMPT = "A cat sitting on a sunny windowsill watching birds outside."
 NEGATIVE_PROMPT = ""
 HEIGHT = 256
 WIDTH = 256

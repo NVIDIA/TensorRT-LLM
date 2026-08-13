@@ -186,7 +186,7 @@ class TestHunyuanVideo15Transformer(unittest.TestCase):
             output = output["sample"]
 
         # Note: With random weights, NaN can occur. For unit tests, we only check shape.
-        # Full numerical correctness is tested in TestFluxHuggingFaceComparison.
+        # Full numerical correctness is tested in TestHunyuanVideo15HuggingFaceComparison.
         self.assertEqual(output.shape, hidden_states.shape)
 
 

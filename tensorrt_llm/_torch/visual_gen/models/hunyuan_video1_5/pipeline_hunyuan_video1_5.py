@@ -562,6 +562,7 @@ class HunyuanVideo15Pipeline(BasePipeline):
             num_frames=req.params.num_frames,
             num_inference_steps=req.params.num_inference_steps,
             num_videos_per_prompt=req.params.num_images_per_prompt,
+            frame_rate=req.params.frame_rate,
         )
 
     @torch.inference_mode()
@@ -575,6 +576,7 @@ class HunyuanVideo15Pipeline(BasePipeline):
         num_frames: int = 121,
         num_inference_steps: int = 50,
         num_videos_per_prompt: int = 1,
+        frame_rate: Optional[float] = None,
         sigmas: Optional[List[float]] = None,
         output_type: Optional[str] = "np",
         prompt_embeds: Optional[torch.Tensor] = None,
@@ -738,7 +740,7 @@ class HunyuanVideo15Pipeline(BasePipeline):
         timer.mark_post_start()
 
         # 6. Decode
-        logger.info("Decoding image...")
+        logger.info("Decoding video...")
         decode_start = time.time()
 
         if output_type != "latent":
@@ -747,11 +749,16 @@ class HunyuanVideo15Pipeline(BasePipeline):
             video = latents
 
         if self.rank == 0:
-            logger.info(f"Image decoded in {time.time() - decode_start:.2f}s")
+            logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
+        # Direct forward() callers (warmup, tests) bypass the executor's
+        # default merging, so resolve the declared default here too.
+        if frame_rate is None:
+            frame_rate = self.default_generation_params["frame_rate"]
+
         timer.mark_end()
-        return timer.fill(PipelineOutput(video=video, frame_rate=24.0))
+        return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
 
     def load_weights(self, weights: dict) -> None:
         """Load transformer weights."""

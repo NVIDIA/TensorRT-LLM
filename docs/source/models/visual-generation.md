@@ -66,7 +66,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
-| **HunyuanVideo 1.5** [^6] | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
+| **HunyuanVideo 1.5** [^8] | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
@@ -80,7 +80,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 [^7]: `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` — a distilled version of Wan2.2-TI2V-5B with 3 denoising steps. CFG parallelism, TeaCache, and Cache-DiT are not applicable.
 
-[^6]: HunyuanVideo 1.5 currently supports single-GPU text-to-video with BF16 parity vs `diffusers` (cosine >= 0.99 on the full transformer). FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints. Image-to-video, sequence/CFG parallelism, parallel VAE, and caching (TeaCache / Cache-DiT) are not yet supported.
+[^8]: HunyuanVideo 1.5 currently supports single-GPU text-to-video with BF16 parity vs `diffusers` (cosine >= 0.99 on the full transformer). FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints. Image-to-video, sequence/CFG parallelism, parallel VAE, and caching (TeaCache / Cache-DiT) are not yet supported.
 
 ## Quick Start
 

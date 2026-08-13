@@ -324,7 +324,7 @@ class HunyuanVideo15IndividualTokenRefinerBlock(torch.nn.Module):
         self,
         num_attention_heads: int,
         attention_head_dim: int,
-        mlp_width_ratio: str = 4.0,
+        mlp_width_ratio: float = 4.0,
         mlp_drop_rate: float = 0.0,
         attention_bias: bool = True,
         model_config: Optional[DiffusionModelConfig] = None,
@@ -409,7 +409,7 @@ class HunyuanVideo15IndividualTokenRefiner(torch.nn.Module):
         hidden_states: torch.Tensor,
         temb: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> torch.Tensor:
         # The VisualGen attention backend masks padded keys via a [B, S]
         # key_padding_mask (valid query rows then attend only to valid keys,
         # matching the diffusers 2D mask for the tokens kept downstream).
@@ -510,6 +510,7 @@ class HunyuanVideo15Attention(Attention):
         dtype: Optional[torch.dtype] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
+        qk_norm: bool = True,
     ):
         config = config or DiffusionModelConfig()
         super().__init__(
@@ -519,7 +520,7 @@ class HunyuanVideo15Attention(Attention):
             config=config,
             qk_norm_mode="per_head",
             qkv_mode=QKVMode.FUSE_QKV,
-            qk_norm=True,
+            qk_norm=qk_norm,
         )
 
         self.heads = num_attention_heads
@@ -639,9 +640,11 @@ class HunyuanVideo15Attention(Attention):
             value = torch.cat([value, encoder_value], dim=1)
 
         batch_size, seq_len, *_ = query.shape
-        key_padding_mask = torch.nn.functional.pad(
-            attention_mask, (seq_len - attention_mask.shape[1], 0), value=True
-        ).bool()
+        key_padding_mask = None
+        if attention_mask is not None:
+            key_padding_mask = torch.nn.functional.pad(
+                attention_mask, (seq_len - attention_mask.shape[1], 0), value=True
+            ).bool()
 
         hidden_states = self._attn_impl(query, key, value, key_padding_mask=key_padding_mask)
 
@@ -653,10 +656,10 @@ class HunyuanVideo15Attention(Attention):
                 hidden_states[:, : -encoder_hidden_states.shape[1]],
                 hidden_states[:, -encoder_hidden_states.shape[1] :],
             )
-
-            hidden_states = self.to_out[0](hidden_states)
-            hidden_states = self.to_out[1](hidden_states)
             encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+
+        hidden_states = self.to_out[0](hidden_states)
+        hidden_states = self.to_out[1](hidden_states)
 
         return hidden_states, encoder_hidden_states
 
@@ -672,7 +675,7 @@ class HunyuanVideo15TransformerBlock(torch.nn.Module):
         dtype: Optional[torch.dtype] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx=0,
-        qk_norm: str = "rms_norm",
+        qk_norm: bool = True,
     ) -> None:
         super().__init__()
 
@@ -682,7 +685,7 @@ class HunyuanVideo15TransformerBlock(torch.nn.Module):
         self.norm1_context = HunyuanVideo15AdaLayerNormZero(hidden_size, model_config=config)
 
         self.attn = HunyuanVideo15Attention(
-            dim, num_attention_heads, attention_head_dim, eps, dtype, config, layer_idx
+            dim, num_attention_heads, attention_head_dim, eps, dtype, config, layer_idx, qk_norm
         )
 
         self.norm2 = torch.nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -760,10 +763,10 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
-        num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 48)
-        self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
-
         pretrained_config = model_config.pretrained_config
+
+        num_attention_heads = getattr(pretrained_config, "num_attention_heads", 16)
+        self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_attention_heads)
 
         dtype = model_config.torch_dtype
         quant_config = model_config.quant_config
@@ -807,7 +810,6 @@ class HunyuanVideo15Transformer3DModel(BaseDiffusionModel):
         vision_projection = getattr(pretrained_config, "vision_projection", "linear")
         vision_states_dim = getattr(pretrained_config, "vision_states_dim", 1152)
 
-        num_attention_heads = getattr(pretrained_config, "num_attention_heads", 16)
         attention_head_dim = getattr(pretrained_config, "attention_head_dim", 128)
         image_embed_dim = getattr(pretrained_config, "image_embed_dim", 1152)
         num_refiner_layers = getattr(pretrained_config, "num_refiner_layers", 2)
