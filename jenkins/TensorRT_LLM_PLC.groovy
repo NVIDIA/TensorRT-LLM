@@ -217,6 +217,8 @@ def generateLockFiles(llmRepo, ref)
             echo "Running from specific commit '${ref}', skipping lock file push to branch"
         } else if (params.repoUrlKey == "github_fork") {
             echo "Running against a fork repo, skipping lock file push to branch"
+        } else if (params.scanMode == 'release') {
+            echo "Running in release mode, skipping lock file push to branch"
         } else {
             sh "git status"
             sh "git add security_scanning/"
