@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import gc
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -66,6 +70,24 @@ class Scenario:
 
 
 class TestQwenMoe(unittest.TestCase):
+
+    @staticmethod
+    def _release_cuda_memory():
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # The A30 suite runs every Qwen modeling test in one process. Clear
+        # cyclic model references left by earlier classes before allocating
+        # both the HF and TensorRT-LLM models used by these comparisons.
+        cls._release_cuda_memory()
+
+    def tearDown(self):
+        # Do not leave either model alive for the next parameterized case.
+        self._release_cuda_memory()
+        super().tearDown()
 
     @parameterized.expand([None, "FP8", "NVFP4"])
     def test_qwen_moe_sanity(self, quant_algo):
