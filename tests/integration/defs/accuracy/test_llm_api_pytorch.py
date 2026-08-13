@@ -3390,6 +3390,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend, disable_skip_indexer,
                             enable_heuristic_topk, use_cute_dsl_topk):
+        extra_llm_args = {}
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
@@ -3402,6 +3403,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+            # Cap max_seq_len based on the evaluation task (NVBug 6476233).
+            extra_llm_args["max_seq_len"] = 8192
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -3442,7 +3445,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
-                 sparse_attention_config=dsa_config) as llm:
+                 sparse_attention_config=dsa_config,
+                 **extra_llm_args) as llm:
 
             # GPQA Diamond takes too long to run, we enable it only for fp8kv.
             if fp8kv:
