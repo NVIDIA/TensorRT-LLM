@@ -231,6 +231,7 @@ def test_mpi_pool_propagates_explicit_workspace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     explicit = str(tmp_path / "explicit")
+    monkeypatch.setenv(_FLASHINFER_ISOLATION_ENV, "1")
     monkeypatch.setenv(_FLASHINFER_WORKSPACE_ENV, explicit)
     session = mpi_session.MpiPoolSession(n_workers=2)
     try:
