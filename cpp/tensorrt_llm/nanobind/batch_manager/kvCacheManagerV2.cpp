@@ -1526,9 +1526,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("cuda_stream") = nb::none())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
         .def(
-            "offload", [](kv::KvCache& self, int target) { return self.offload(kv::CacheLevel{target}); },
-            nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
-        .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())

@@ -2165,6 +2165,9 @@ class TestSSMSupport(unittest.TestCase):
         host_quota: int | None = None,
         num_attn_layers: int = 2,
         num_ssm_layers: int = 2,
+        attn_buffer_size: int = 8192,
+        ssm_buffer_size: int = 8192,
+        max_util_for_resume: float = 0.97,
         window_size: SlidingWindowSize = None,
         commit_min_snapshot: bool = True,
         enable_partial_reuse: bool = False,
@@ -2176,8 +2179,8 @@ class TestSSMSupport(unittest.TestCase):
                 AttentionLayerConfig(
                     layer_id=LayerId(lid),
                     buffers=[
-                        BufferConfig(role=DataRole("key"), size=8192),
-                        BufferConfig(role=DataRole("value"), size=8192),
+                        BufferConfig(role=DataRole("key"), size=attn_buffer_size),
+                        BufferConfig(role=DataRole("value"), size=attn_buffer_size),
                     ],
                     sliding_window_size=window_size,
                 )
@@ -2188,7 +2191,7 @@ class TestSSMSupport(unittest.TestCase):
                 SsmLayerConfig(
                     layer_id=LayerId(lid),
                     buffers=[
-                        BufferConfig(role=DataRole("ssm_state"), size=8192),
+                        BufferConfig(role=DataRole("ssm_state"), size=ssm_buffer_size),
                     ],
                 )
             )
@@ -2200,6 +2203,7 @@ class TestSSMSupport(unittest.TestCase):
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
             layers=layers,
+            max_util_for_resume=max_util_for_resume,
             enable_partial_reuse=enable_partial_reuse,
             commit_min_snapshot=commit_min_snapshot,
         )
@@ -2236,10 +2240,17 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(initial_slot, resumed_slot, "SSM slot unchanged after suspend/resume")
         kv_cache.close()
 
-    def test_offload_and_resume_preserves_hybrid_state(self) -> None:
-        """Suspending can offload attention and recurrent state together."""
+    def test_suspend_and_resume_preserves_evicted_recurrent_state(self) -> None:
+        """The manager can evict suspended recurrent state under GPU pressure."""
         host_level = CacheLevel(1)
-        cfg = self._make_ssm_config(host_quota=32 << 20)
+        cfg = self._make_ssm_config(
+            host_quota=32 << 20,
+            num_attn_layers=1,
+            num_ssm_layers=1,
+            attn_buffer_size=64 << 10,
+            ssm_buffer_size=1 << 20,
+            max_util_for_resume=1.0,
+        )
         self.manager = KVCacheManager(cfg)
         engine = FakeEngine(cfg)
         kv_cache = self.manager.create_kv_cache()
@@ -2253,14 +2264,32 @@ class TestSSMSupport(unittest.TestCase):
         engine.execute([Step(kv_cache, history, [])], stream)
 
         kv_cache.suspend()
-        counts_before, _ = _introspection.active_page_stats(kv_cache)
-        self.assertGreater(counts_before[GPU_LEVEL], 0)
-        self.assertEqual(counts_before[host_level], 0)
+        counts_suspended, unscheduled_evictable = _introspection.active_page_stats(kv_cache)
+        self.assertEqual(counts_suspended[GPU_LEVEL], 3)
+        self.assertEqual(counts_suspended[host_level], 0)
+        self.assertEqual(unscheduled_evictable[GPU_LEVEL], 0)
 
-        self.assertTrue(kv_cache.offload(host_level))
-        counts_offloaded, _ = _introspection.active_page_stats(kv_cache)
-        self.assertEqual(counts_offloaded[GPU_LEVEL], 0)
-        self.assertEqual(counts_offloaded[host_level], sum(counts_before))
+        # Fill the smaller recurrent-state pool with active requests. The last
+        # allocation forces StorageManager to choose the suspended SSM page as
+        # an eviction victim and migrate it to the host tier. Callers only use
+        # suspend(); neither the scheduler nor runtime selects a cache level.
+        num_pressure_caches = min(
+            stat.total for stat in _introspection.storage_statistics(self.manager, GPU_LEVEL)
+        )
+        pressure_caches = []
+        for _ in range(num_pressure_caches):
+            pressure_cache = self.manager.create_kv_cache()
+            self.assertTrue(pressure_cache.resume(stream))
+            pressure_cache.stop_committing()
+            self.assertTrue(pressure_cache.resize(1, 1))
+            pressure_caches.append(pressure_cache)
+
+        counts_evicted, _ = _introspection.active_page_stats(kv_cache)
+        self.assertEqual(counts_evicted[GPU_LEVEL], 2)
+        self.assertEqual(counts_evicted[host_level], 1)
+
+        for pressure_cache in pressure_caches:
+            pressure_cache.close()
 
         self.assertTrue(kv_cache.resume(stream))
         engine.execute([Step(kv_cache, [], history)], stream)

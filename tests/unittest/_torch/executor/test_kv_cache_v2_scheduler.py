@@ -486,7 +486,7 @@ class TestKVCacheFailuresGen:
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0, 1]
         assert ids(out.paused_requests) == [99]
-        mgr.suspend_request.assert_called_once_with(victim, offload=True)
+        mgr.suspend_request.assert_called_once_with(victim)
 
     def test_gen_alloc_fails_evict_insufficient(self):
         """gen fails, evict victim, retry still fails → self-evict."""
@@ -786,7 +786,7 @@ class TestEviction:
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), victim]
         sched.schedule_request(reqs, set())
-        mgr.suspend_request.assert_called_once_with(victim, offload=True)
+        mgr.suspend_request.assert_called_once_with(victim)
 
     def test_eviction_clears_request_runtime_state(self):
         mgr = make_kv_cache_manager(

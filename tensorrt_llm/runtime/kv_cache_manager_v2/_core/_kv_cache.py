@@ -1159,6 +1159,9 @@ class _KVCache:
                     self.set_base_page_index_buf(beam_idx, lc, None)
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         with self._record_event():  # used by _SharedPageLock.__del__
+            # Releasing the final lock registers held pages with the storage
+            # eviction controller. StorageManager alone decides whether cache
+            # pressure requires moving them to the next tier.
             for ordinal, beam_idx, lc_idx in self._active_pages():
                 beam_block = (
                     self._block(ordinal, beam_idx)
@@ -1389,52 +1392,6 @@ class _KVCache:
         self._status = self.Status.ACTIVE
         return True
 
-    def offload(self, target: CacheLevel) -> bool:
-        """Best-effort offload of active pages to ``target``.
-
-        The cache must be suspended. All active pages in faster tiers are
-        migrated, including attention pages and recurrent SSM/conv state.
-        Pages already at ``target`` or in a slower tier are left in place.
-        """
-        assert self.status == self.Status.SUSPENDED
-        storage = self.manager._storage
-        num_tiers = storage.num_cache_levels
-        assert GPU_LEVEL < target < num_tiers
-
-        all_pages = make_typed(
-            lambda _: make_typed(lambda _: list[Page](), num_tiers), storage.num_pool_groups
-        )
-        counted_pages: set[int] = set()
-        for ordinal, beam_idx, lc_idx in self._active_pages():
-            holder = self._page(ordinal, beam_idx, lc_idx)
-            if holder is None:
-                continue
-            page = expect_type(_PageHolder, holder).page
-            page_id = id(page)
-            # A page can be shared by multiple beams or requests. After this
-            # cache is suspended, a still-locked page belongs to another active
-            # request and must remain resident on GPU.
-            if (
-                page_id in counted_pages
-                or page.status == PageStatus.LOCKED
-                or page.cache_level >= target
-            ):
-                continue
-            counted_pages.add(page_id)
-            pg_idx = storage.get_pool_group_index(lc_idx)
-            all_pages[pg_idx][page.cache_level].append(page)
-
-        try:
-            storage.prefetch(
-                target,
-                all_pages,
-                self._record_migrated_slots,
-                self._record_dropped_pages,
-            )
-        except (OutOfMemoryError, OutOfPagesError):
-            return False
-        return True
-
     def prefetch(self, target: CacheLevel) -> bool:
         """Best-effort prefetch active pages to the target cache level.
 
@@ -1473,13 +1430,8 @@ class _KVCache:
             all_pages[pg_idx][lvl].append(page)
 
         try:
-            storage.prefetch(
-                target,
-                all_pages,
-                self._record_migrated_slots,
-                self._record_dropped_pages,
-            )
-        except (OutOfMemoryError, OutOfPagesError):
+            storage.prefetch(target, all_pages)
+        except OutOfPagesError:
             return False
         return True
 

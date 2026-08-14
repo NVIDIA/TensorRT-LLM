@@ -1064,13 +1064,11 @@ class StorageManager:
         self,
         dst_lvl: CacheLevel,
         pages: TypedIndexList[PoolGroupIndex, TypedIndexList[CacheLevel, list[Page]]],
-        migration_recorder: MigrationRecorder | None = None,
-        drop_recorder: DropRecorder | None = None,
     ) -> None:
         """Dispatch page migration to the destination cache level.
 
         Args:
-            dst_lvl: Destination cache level.
+            dst_lvl: Destination cache level for pages currently in lower tiers.
             pages: Pages grouped by pool group and current cache level.
 
         Raises:
@@ -1081,30 +1079,22 @@ class StorageManager:
         try:
             for pg_idx, pg_pages in typed_enumerate(pages):
                 for lvl, lvl_pages in typed_enumerate(pg_pages):
+                    assert lvl >= dst_lvl or not lvl_pages
                     for p in lvl_pages:
-                        assert p.cache_level == lvl
                         if p.scheduled_for_eviction:
                             self.exclude_from_eviction(p)
                             scheduled.append(p)
                         elif self.is_evictable(p, dst_lvl):
                             scheduled.append(p)
+                        assert lvl >= dst_lvl
                         if lvl == dst_lvl:
                             continue
                         num_slots[pg_idx] += 1
-            self.prepare_free_slots(dst_lvl, num_slots, migration_recorder, drop_recorder)
+            self.prepare_free_slots(dst_lvl, num_slots)
             for pg_idx, pg_tasks in typed_enumerate(pages):
-                for lvl in typed_range(self.num_cache_levels):
-                    if lvl == dst_lvl:
-                        continue
+                for lvl in typed_range(CacheLevel(dst_lvl + 1), self.num_cache_levels):
                     lvl_tasks = pg_tasks[lvl]
-                    self._batched_migrate(
-                        pg_idx,
-                        dst_lvl,
-                        lvl,
-                        lvl_tasks,
-                        True,
-                        migration_recorder=migration_recorder,
-                    )
+                    self._batched_migrate(pg_idx, dst_lvl, lvl, lvl_tasks, True)
         finally:
             for p in scheduled:
                 self.schedule_for_eviction(p)

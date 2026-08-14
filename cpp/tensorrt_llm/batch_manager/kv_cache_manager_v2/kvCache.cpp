@@ -547,65 +547,9 @@ bool KvCache::prefetch(CacheLevel target)
 
     try
     {
-        MigrationRecorder const migrationRecorder
-            = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
-                  CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
-        DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
-        { _recordDroppedPages(pages, cacheLevel); };
-        storageMgr.prefetch(target, allPages, migrationRecorder, dropRecorder);
+        storageMgr.prefetch(target, allPages);
     }
     catch (OutOfPagesError const&)
-    {
-        return false;
-    }
-    catch (OutOfMemoryError const&)
-    {
-        return false;
-    }
-    return true;
-}
-
-bool KvCache::offload(CacheLevel target)
-{
-    TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
-    auto& storageMgr = mManager->storage();
-    CacheLevel const numTiers = storageMgr.numCacheLevels();
-    TLLM_CHECK_DEBUG(kGpuLevel < target && target < numTiers);
-
-    PoolGroupIndex const numPoolGroups = storageMgr.numPoolGroups();
-    TypedVec<PoolGroupIndex, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> allPages(
-        numPoolGroups, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>(numTiers));
-
-    std::unordered_set<Page*> countedPages;
-    for (auto const& activePage : _activePages())
-    {
-        auto page = _page(activePage.ordinal, activePage.beamIdx, activePage.lcId);
-        // A page can be shared by multiple beams or requests. After this cache
-        // is suspended, a still-locked page belongs to another active request
-        // and must remain resident on GPU.
-        if (!page || page->status() == PageStatus::LOCKED || page->cacheLevel >= target
-            || !countedPages.insert(page.get()).second)
-        {
-            continue;
-        }
-        auto const pgIdx = storageMgr.getPoolGroupIndex(activePage.lcId);
-        allPages.at(pgIdx).at(page->cacheLevel).push_back(std::move(page));
-    }
-
-    try
-    {
-        MigrationRecorder const migrationRecorder
-            = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
-                  CacheLevel dstLevel) { _recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
-        DropRecorder const dropRecorder = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
-        { _recordDroppedPages(pages, cacheLevel); };
-        storageMgr.prefetch(target, allPages, migrationRecorder, dropRecorder);
-    }
-    catch (OutOfPagesError const&)
-    {
-        return false;
-    }
-    catch (OutOfMemoryError const&)
     {
         return false;
     }
@@ -631,7 +575,9 @@ void KvCache::suspend()
         auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
 
         // Convert SharedPageLocks → PageHolders for active (non-stale) pages only.
-        // Mirrors Python: for ordinal, beam_idx, lc_idx in self._active_pages()
+        // Releasing the final lock registers held pages with StorageManager's
+        // eviction controller. StorageManager alone decides whether pressure
+        // requires migrating them to the next cache tier.
         for (auto const& ap : _activePages())
         {
             auto& bp = (ap.lcId != ssmLcId) ? mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId]

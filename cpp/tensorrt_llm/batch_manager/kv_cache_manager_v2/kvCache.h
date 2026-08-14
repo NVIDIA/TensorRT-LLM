@@ -185,7 +185,8 @@ public:
     // Returns false if utilization too high or out of memory.
     bool resume(std::optional<CUstream> stream = std::nullopt);
 
-    // Suspend: detach from CUDA stream, unlock pages → PageHolder.
+    // Suspend: detach from CUDA stream and unlock pages. The storage manager
+    // owns any subsequent cache-tier placement decisions.
     void suspend();
 
     // Close: release all blocks back to KvCacheManager.
@@ -197,9 +198,6 @@ public:
 
     // Best-effort prefetch active pages to the target cache level.
     bool prefetch(CacheLevel target);
-
-    // Best-effort offload of active pages in faster tiers to the target level.
-    bool offload(CacheLevel target);
 
     // ---- Capacity / history ------------------------------------------------
 

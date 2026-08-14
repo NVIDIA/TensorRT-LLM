@@ -938,7 +938,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         target_capacity = req_tokens + cross_kv_cache_manager.num_extra_kv_tokens
         if not kv_cache.resize(max(kv_cache.capacity, target_capacity)):
             if req.is_first_context_chunk:
-                cross_kv_cache_manager.suspend_request(req, offload=True)
+                cross_kv_cache_manager.suspend_request(req)
             return False
 
         return True
@@ -1029,9 +1029,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         fail if it needs to load a different adapter into a full cache.
         """
         self._clear_request_runtime_state(req)
-        self.kv_cache_manager.suspend_request(req, offload=True)
+        self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
-            self.draft_kv_cache_manager.suspend_request(req, offload=True)
+            self.draft_kv_cache_manager.suspend_request(req)
 
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
