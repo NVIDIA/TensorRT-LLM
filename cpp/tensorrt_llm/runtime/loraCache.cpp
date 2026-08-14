@@ -519,6 +519,14 @@ void LoraCache::setDataType(tensorrt_llm::DataType dataType)
 
 void LoraCache::setDataTypeCoordinated(LoraCache& other, tensorrt_llm::DataType dataType)
 {
+    if (&other == this)
+    {
+        // Locking mPagesMutex/mCacheMutex twice via the same std::scoped_lock call below would
+        // be undefined behavior (self-deadlock) for a non-recursive std::mutex.
+        setDataType(dataType);
+        return;
+    }
+
     std::scoped_lock lock(mPagesMutex, mCacheMutex, other.mPagesMutex, other.mCacheMutex);
     setDataTypeLocked(dataType);
     other.setDataTypeLocked(dataType);
