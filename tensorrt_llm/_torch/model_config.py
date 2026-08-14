@@ -90,31 +90,42 @@ def _release_lock_ignoring_infra_errors(lock: "filelock.BaseFileLock") -> None:
     """Release ``lock``, downgrading broken-lock-infra errors to a warning.
 
     NFS can return ENOLCK/ESTALE from the unlock ``flock`` call itself (e.g.
-    lock-daemon exhaustion when many ranks start simultaneously). The config
-    load the lock protected has already completed at release time, so
-    crashing the process here would fail an otherwise healthy executor.
+    lock-daemon exhaustion when many ranks start simultaneously). The work the
+    lock protected has already completed at release time, so crashing the
+    process here would fail an otherwise healthy executor.
     """
     try:
         lock.release()
     except (PermissionError, OSError) as e:
         if not _is_lock_infra_error(e):
             raise
-        logger.warning(f"config lock release failed ({e}), continuing")
+        logger.warning(f"HF remote-code lock release failed ({e}), continuing")
 
 
 @contextlib.contextmanager
-def config_file_lock(timeout: int = 10):
+def hf_remote_code_lock(timeout: int = 10):
     """
-    Context manager for file locking when loading pretrained configs.
+    Serialize loads of HuggingFace ``trust_remote_code`` files across processes.
 
-    This prevents race conditions when multiple processes try to download/load
-    the same model configuration simultaneously.
+    ``transformers.dynamic_module_utils.get_cached_module_file`` publishes a
+    checkpoint's .py files into the shared ``HF_MODULES_CACHE`` with a plain
+    ``shutil.copy``, which truncates the destination before writing it. That
+    copy takes no lock at all, and the ``threading.Lock`` transformers holds
+    over the subsequent import does not span processes. So a rank can import a
+    file another rank is still writing and observe it as empty: the module
+    loads, but the class it should define is missing.
+
+    Every caller must share this one lock instead of defining its own:
+    ``AutoTokenizer`` and ``AutoProcessor`` internally call
+    ``AutoConfig.from_pretrained``, so config and processor loads write
+    overlapping sets of files into the same directory.
 
     Args:
         timeout: Maximum time to wait for lock acquisition in seconds
     """
-    # Use a single global lock file in HF cache directory to serialize loads.
-    lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
+    # One lock file inside the cache directory it guards, so that every rank
+    # sharing that cache contends on the same file.
+    lock_path = Path(HF_MODULES_CACHE) / "hf_remote_code.lock"
     lock = filelock.FileLock(str(lock_path), timeout=timeout)
 
     # Guard only acquisition so caller-body exceptions propagate (single-yield).
@@ -124,7 +135,7 @@ def config_file_lock(timeout: int = 10):
         # Contention, not broken infra: a tempdir lock can't serialize against
         # the holder, so degrade to no lock instead of crashing the process.
         logger.warning(
-            f"could not acquire config lock within {timeout}s, proceeding without lock"
+            f"could not acquire HF remote-code lock within {timeout}s, proceeding without lock"
         )
         yield
     except (PermissionError, OSError) as e:
@@ -133,13 +144,14 @@ def config_file_lock(timeout: int = 10):
             raise
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        tmp_lock = filelock.FileLock(str(tmp_dir / "_remote_code.lock"),
+        tmp_lock = filelock.FileLock(str(tmp_dir / "hf_remote_code.lock"),
                                      timeout=timeout)
         try:
             tmp_lock.acquire(timeout=timeout)
         except (PermissionError, OSError, filelock.Timeout):
             logger.warning(
-                "tempdir config lock unavailable, proceeding without lock")
+                "tempdir HF remote-code lock unavailable, proceeding without lock"
+            )
             yield
         else:
             try:
@@ -952,7 +964,7 @@ class ModelConfig(Generic[TConfig]):
 
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
-        with config_file_lock():
+        with hf_remote_code_lock():
             # When handling the case where model_format is TLLM_ENGINE
             # send cyclic requests to the NONE URL.
             if checkpoint_dir is not None:

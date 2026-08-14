@@ -1117,7 +1117,8 @@ def create_input_processor(
     Returns:
         An InputProcessor implementation (model-specific if registered; otherwise DefaultInputProcessor).
     """
-    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.model_config import (ModelConfig,
+                                                  hf_remote_code_lock)
     from tensorrt_llm._torch.models import get_model_architecture
 
     config = None
@@ -1157,11 +1158,19 @@ def create_input_processor(
             logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
-            return input_processor_cls(model_path_or_dir,
-                                       config,
-                                       tokenizer,
-                                       trust_remote_code=trust_remote_code,
-                                       **kwargs)
+            # Input processors build an AutoTokenizer/AutoProcessor with
+            # trust_remote_code; doing so copies the checkpoint's .py files
+            # into the shared HF module cache non-atomically. Serialize the
+            # construction so no rank imports a file another rank is still
+            # writing and fails with "module ... has no attribute ...".
+            # The default timeout is sized for a config load, while building a
+            # tokenizer and processor costs ~1s per rank and ranks queue up.
+            with hf_remote_code_lock(timeout=20):
+                return input_processor_cls(model_path_or_dir,
+                                           config,
+                                           tokenizer,
+                                           trust_remote_code=trust_remote_code,
+                                           **kwargs)
 
     return DefaultInputProcessor(None, None, tokenizer)
 
