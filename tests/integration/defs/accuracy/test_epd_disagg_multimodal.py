@@ -290,8 +290,10 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     ) -> None:
         """Run VideoMME shard through a model-specific llmapi E/PD config."""
         import faulthandler
+        import subprocess
         import sys
         import tempfile
+        import textwrap
         from pathlib import Path
 
         # Pass an OS-level file (not sys.stderr) to faulthandler so the
@@ -313,10 +315,98 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
             file=sys.__stderr__,
             flush=True,
         )
+
+        # ==== NVBUG-6327718 full-coverage hang instrumentation ====
+        # Every knob below is an existing in-tree mechanism, so this only
+        # wires them together — nothing new to install in the CI container.
+        # Artifacts land under --output-dir, which pytest packs into the
+        # results tarball that CI uploads to urm.
+        dump_dir = crash_dir / f"hang_dumps_rep{_repeat:03d}"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        # A sitecustomize.py runs at the top of every Python child process
+        # that has this directory on PYTHONPATH — including the
+        # mpi4py.futures.server workers spawned by MpiPoolSession. It gives
+        # each worker its own faulthandler file + re-dup'd stderr, so the
+        # fatal message from a silent worker crash (currently swallowed by
+        # pytest --capture=fd) lands in a real file.
+        sitecustomize_dir = crash_dir / f"sitecustomize_rep{_repeat:03d}"
+        sitecustomize_dir.mkdir(parents=True, exist_ok=True)
+        (sitecustomize_dir / "sitecustomize.py").write_text(
+            textwrap.dedent("""\
+            import os, sys, faulthandler, signal, pathlib
+            _dd = pathlib.Path(os.environ.get(
+                "TLLM_HANG_DUMP_DIR", "/tmp/tllm_hang_dumps"))
+            _dd.mkdir(parents=True, exist_ok=True)
+            _pid = os.getpid()
+            _exe = pathlib.Path(sys.argv[0] if sys.argv else "python").name
+            _fh = open(_dd / f"faulthandler_{_exe}_{_pid}.log",
+                       "a", buffering=1)
+            faulthandler.enable(file=_fh, all_threads=True)
+            faulthandler.dump_traceback_later(60, repeat=True, file=_fh)
+            try:
+                faulthandler.register(signal.SIGUSR1, file=_fh,
+                                      all_threads=True, chain=False)
+            except Exception:
+                pass
+            _err = open(_dd / f"stderr_{_exe}_{_pid}.log", "a", buffering=1)
+            os.dup2(_err.fileno(), 2)
+        """)
+        )
+
+        # In-tree debug knobs, propagated to MPI workers via LLM.env_overrides:
+        #   TRTLLM_WORKER_PRINT_STACKS_PERIOD -> executor/worker.py:180
+        #     (periodic all-threads dump inside every MPI worker)
+        #   TLLM_LLMAPI_ZMQ_DEBUG             -> executor/ipc.py:79
+        #     (log every ZMQ send/recv on the proxy sockets)
+        #   TLLM_TRACE_EXECUTOR_LOOP          -> py_executor.py:1039
+        #     (trace one line per executor forward step)
+        #   TORCH_NCCL_DUMP_ON_TIMEOUT et al  -> upstream torch/NCCL
+        #     (dumps NCCL communicator state on collective timeout)
+        debug_env = {
+            "TLLM_HANG_DUMP_DIR": str(dump_dir),
+            "PYTHONPATH": str(sitecustomize_dir) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+            "TRTLLM_WORKER_PRINT_STACKS_PERIOD": "60",
+            "TLLM_LLMAPI_ZMQ_DEBUG": "1",
+            "TLLM_TRACE_EXECUTOR_LOOP": "1",
+            "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
+            "TORCH_NCCL_TRACE_BUFFER_SIZE": "20000",
+            "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": str(dump_dir / "nccl_dump"),
+            "NCCL_DEBUG_SUBSYS": "INIT,COLL,GRAPH",
+            "PYTHONFAULTHANDLER": "1",
+        }
+        os.environ.update(debug_env)
+
+        # Best-effort py-spy install for native stack capture. The CI container
+        # has SYS_ADMIN + seccomp=unconfined (jenkins/L0_Test.groovy:1280) so
+        # ptrace works if py-spy is on PATH. Silent failure is fine — the
+        # sitecustomize bootstrap above covers the Python-side signal already.
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--user", "--quiet", "py-spy"],
+                timeout=60,
+                check=False,
+            )
+        except Exception:
+            pass
+
+        # variant.encoder_config / pd_config are frozen dataclass mappings;
+        # overlay env_overrides here so both LLM instances widen the debug
+        # env into their MPI workers (worker.py:198 applies env_overrides
+        # after MPI_Init, which caches the OS env at import time).
+        encoder_config = {**variant.encoder_config, "env_overrides": debug_env}
+        pd_config = {**variant.pd_config, "env_overrides": debug_env}
+        # ==== end NVBUG-6327718 instrumentation ====
+
         faulthandler.enable(file=crash_log_file, all_threads=True)
         faulthandler.dump_traceback_later(60, repeat=True, file=crash_log_file)
         try:
-            with self._launch_epd(variant) as llm:
+            with launch_multimodal_encoder_pd_llm(
+                encoder_config,
+                pd_config,
+                variant.model_path,
+                max_workers=variant.max_workers,
+            ) as llm:
                 self._run_videomme(llm, variant)
         finally:
             faulthandler.cancel_dump_traceback_later()
