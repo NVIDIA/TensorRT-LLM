@@ -66,7 +66,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
-| **HunyuanVideo 1.5** [^8] | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
+| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 
