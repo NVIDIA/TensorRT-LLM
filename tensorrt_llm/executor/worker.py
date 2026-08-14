@@ -352,6 +352,8 @@ def worker_main(
         identities_msg = (worker_process_identities_signal, None,
                           worker_process_identities)
         if not worker_init_status_queue.notify_with_retry(identities_msg):
+            # The failed status queue cannot report its own failure. Let this
+            # escape through the MPI future so the proxy can observe it.
             raise RuntimeError(
                 "Failed to deliver worker process identities to proxy")
 

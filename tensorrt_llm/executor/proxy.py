@@ -692,7 +692,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                     self._register_worker_processes(status)
                 return status
 
-            if self._check_mpi_workers():
+            if (self._check_mpi_workers() or self._check_remote_worker_death()):
                 error = self._fatal_error or RuntimeError(
                     "MPI worker exited unexpectedly")
                 message = f"Executor worker died during initialization: {error}"

@@ -174,6 +174,36 @@ def test_worker_death_before_ready_is_reported_from_registered_identity():
     proxy.pre_shutdown.assert_called_once_with()
 
 
+def test_remote_worker_death_before_ready_is_reported():
+    """Remote worker death must be polled before the error monitor starts."""
+    error = RuntimeError("remote worker died")
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = _Mock()
+    proxy.mpi_session.check_worker_error.return_value = error
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([])
+    proxy._worker_process_monitor = _Mock()
+    proxy._worker_process_monitor.find_dead_worker.return_value = None
+    proxy.mpi_futures = []
+    proxy._fatal_error = None
+    proxy._error_queue = _queue.Queue()
+    proxy.doing_shutdown = False
+    proxy.pre_shutdown = _Mock()
+    proxy._handle_background_error = _Mock(
+        side_effect=AssertionError("wait loop continued after remote worker death")
+    )
+
+    with pytest.raises(RuntimeError, match="remote worker died"):
+        proxy._wait_for_executor_workers_ready()
+
+    proxy.mpi_session.check_worker_error.assert_called_once_with()
+    assert proxy.worker_init_status_queue.acks == []
+    assert proxy.mpi_futures == []
+    assert proxy._fatal_error is error
+    proxy.pre_shutdown.assert_called_once_with()
+    proxy._handle_background_error.assert_not_called()
+
+
 def test_worker_identities_are_registered_once_before_ready():
     identity = WorkerProcessIdentity(
         rank=0, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
@@ -224,9 +254,11 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
             return [identity]
 
     class _FakeInitStatusQueue:
+        succeeds = True
+
         def notify_with_retry(self, message):
             events.append(("notify", message[0]))
-            return True
+            return self.succeeds
 
     class _FailingWorker:
         def __init__(self, *args, **kwargs):
@@ -267,6 +299,26 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
     assert events[:2] == [
         ("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
         ("construct", None),
+    ]
+
+    events.clear()
+    init_status_queue.succeeds = False
+    with pytest.raises(
+        RuntimeError, match="Failed to deliver worker process identities to proxy"
+    ):
+        worker_module.worker_main(
+            engine=object(),
+            worker_queues=worker_queues,
+            log_level=worker_module.logger.level,
+            worker_cls=_FailingWorker,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+            worker_process_identities_signal=(
+                GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL
+            ),
+        )
+
+    assert events == [
+        ("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)
     ]
 
 
