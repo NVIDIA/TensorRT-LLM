@@ -32,7 +32,11 @@ from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
 from tensorrt_llm.serve.visual_gen_metrics import build_visual_gen_timing_headers
-from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
+from tensorrt_llm.serve.visual_gen_utils import (
+    VIDEO_STORE,
+    cleanup_reference_files,
+    parse_visual_gen_params,
+)
 
 if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
@@ -104,6 +108,9 @@ class _VideoRoutesMixin:
         - JSON: Send VideoGenerationRequest as application/json
         - Multipart: Send form fields + optional image_reference / video_reference file
         """
+        # Assigned before the try so the ``finally`` can always clean up any
+        # reference inputs materialized for this request id.
+        video_id = f"video_{uuid.uuid4().hex}"
         try:
             # Client-side ValueErrors from content-type parsing, request
             # translation, encoder-format preflight, parameter validation,
@@ -113,7 +120,6 @@ class _VideoRoutesMixin:
             try:
                 # Parse request based on content-type
                 request = await self._parse_video_generation_request(raw_request)
-                video_id = f"video_{uuid.uuid4().hex}"
                 params = parse_visual_gen_params(
                     request,
                     video_id,
@@ -225,6 +231,11 @@ class _VideoRoutesMixin:
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+        finally:
+            # References are input-only; the pipeline has consumed them by now,
+            # so remove them (success or failure) — conditioned requests must not
+            # accumulate materialized inputs in media storage.
+            cleanup_reference_files(str(self.media_storage_path), video_id)
 
     async def _parse_video_generation_request(
         self,
@@ -322,11 +333,14 @@ class _VideoRoutesMixin:
         - JSON: Send VideoGenerationRequest as application/json
         - Multipart: Send form fields + optional image_reference / video_reference file
         """
+        # Assigned before the try so the ``finally`` can clean up references
+        # materialized for this request if no background task takes ownership.
+        video_id = f"video_{uuid.uuid4().hex}"
+        task_started = False
         try:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
 
-            video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(
                 request, video_id, self.generator, media_storage_path=str(self.media_storage_path)
             )
@@ -372,6 +386,8 @@ class _VideoRoutesMixin:
                 )
             )
             self.video_gen_tasks[video_id] = task
+            # The background task now owns reference cleanup (its ``finally``).
+            task_started = True
             task.add_done_callback(lambda t, vid=video_id: self._on_video_task_done(vid, t))
 
             return JSONResponse(content=video_job.model_dump(), status_code=202)
@@ -388,6 +404,11 @@ class _VideoRoutesMixin:
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+        finally:
+            if not task_started:
+                # Failed before the background task was scheduled — nothing else
+                # will clean these up.
+                cleanup_reference_files(str(self.media_storage_path), video_id)
 
     async def _generate_video_background(
         self,
@@ -459,6 +480,11 @@ class _VideoRoutesMixin:
                 job.completed_at = int(time.time())
                 job.error = str(e)
                 await VIDEO_STORE.upsert(video_id, job)
+        finally:
+            # References are input-only; remove them once generation has run,
+            # failed, or been cancelled. Runs on CancelledError too, so a delete
+            # that cancels an in-flight job still reclaims the inputs.
+            cleanup_reference_files(str(self.media_storage_path), video_id)
 
     async def list_videos(self, raw_request: Request) -> Response:
         """List all generated videos.
