@@ -2189,14 +2189,35 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # the failure classifier. The pipeline reads sbatch_output.txt
                     # back on failure (readSlurmSubmitOutput) and folds it into the
                     # exception it throws.
-                    sbatch_rc=0
-                    sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
-                    printf '%s\\n' "\${sbatch_output}"
-                    printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
-                    if [ "\${sbatch_rc}" -ne 0 ]; then
+                    #
+                    # Control-plane failover backoff: during a slurmctld failover the
+                    # backup controller rejects submissions with "Slurm backup
+                    # controller in standby mode" until it promotes, which takes up to
+                    # SlurmctldTimeout (upstream default 120s) plus takeover time. The
+                    # rejection is instant and burns no partition walltime, so retrying
+                    # it here -- every 30s, up to ~5min, inside this one stage attempt
+                    # -- rides out the window without touching the expensive
+                    # stage-level SLURM retry budget. Any other sbatch failure still
+                    # fails immediately.
+                    sbatch_max_attempts=11
+                    sbatch_attempt=1
+                    while true; do
+                        sbatch_rc=0
+                        sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
+                        printf '%s\\n' "\${sbatch_output}"
+                        printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
+                        if [ "\${sbatch_rc}" -eq 0 ]; then
+                            break
+                        fi
+                        if [ "\${sbatch_attempt}" -lt "\${sbatch_max_attempts}" ] && printf '%s' "\${sbatch_output}" | grep -qi 'Slurm backup controller in standby mode'; then
+                            echo "sbatch rejected by a standby controller (attempt \${sbatch_attempt} of \${sbatch_max_attempts}); retrying in 30s."
+                            sbatch_attempt=\$((sbatch_attempt + 1))
+                            sleep 30
+                            continue
+                        fi
                         echo "Error: Slurm job submission failed with exit code \${sbatch_rc}."
                         exit "\${sbatch_rc}"
-                    fi
+                    done
                     jobId=\$(printf '%s\\n' "\${sbatch_output}" | awk '/Submitted batch job/ {print \$4; exit}')
                     if [ -z "\$jobId" ]; then
                         echo "Error: Slurm job submission failed, no job ID returned."
