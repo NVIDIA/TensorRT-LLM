@@ -864,7 +864,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
     def _(input: torch.Tensor,
-          use_r128c4_layout: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+          use_r128c4_layout: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape[0], input.shape[1]
         num_n_blocks = (k + 127) // 128
         num_packed_sf_k = (num_n_blocks + 3) // 4

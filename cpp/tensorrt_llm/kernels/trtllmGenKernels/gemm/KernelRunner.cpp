@@ -40,7 +40,12 @@ static GemmInterface::ModuleCache globalTrtllmGenGemmModuleCache;
 
 constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
 {
-    if (gpuSM == 103)
+    if (gpuSM == 107)
+    {
+        // Only the SM100-family cubins are binary compatible with SM107.
+        return kernelSM == SmVersion::Sm100f;
+    }
+    else if (gpuSM == 103)
     {
         return kernelSM == SmVersion::Sm103a || kernelSM == SmVersion::Sm100f;
     }

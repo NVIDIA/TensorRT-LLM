@@ -146,11 +146,10 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
 
 // Fused 1x128 FP8 quantize + UE8M0 packing (SM100 only).
 //
-// By default, returns K32-addressable scale slots in the standard R128c4
-// layout: [ceil(M/128), ceil(K/128), 32, 4, 4]. Quantization remains K128,
-// so each UE8M0 scale is replicated into four adjacent K32 slots. The legacy
-// deep_gemm MN-major packed layout remains available while that consumer still
-// requires it.
+// Returns the legacy deep_gemm MN-major packed int32 scales (K % 16 == 0) by
+// default. useR128c4Layout opts into K32-addressable slots in the standard
+// R128c4 layout (K % 128 == 0); quantization stays K128, so each UE8M0 scale is
+// replicated into four adjacent K32 slots.
 std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor const& self, bool useR128c4Layout)
 {
     CHECK_TH_CUDA(self);
@@ -271,7 +270,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("fp8_quantize_1x128(Tensor input, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("fp8_batched_quantize_1x128_permute102(Tensor input) -> (Tensor, Tensor)");
-    m.def("fp8_quantize_1x128_packed_ue8m0(Tensor input, bool use_r128c4_layout=True) -> (Tensor, Tensor)");
+    m.def("fp8_quantize_1x128_packed_ue8m0(Tensor input, bool use_r128c4_layout=False) -> (Tensor, Tensor)");
     m.def("fp8_quantize_1x128_cutedsl_ue8m0(Tensor input) -> (Tensor, Tensor)");
 }
 

@@ -1789,12 +1789,10 @@ _USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
     """Dispatch FP8 1x128 quantization to CUDA or Triton kernel.
 
-    When the CUDA path is selected on SM100 and ``TRTLLM_FUSED_FP8_QUANT_PACK=1``
-    is set, the fused ``fp8_quantize_1x128_packed_ue8m0`` op is used and the
-    follow-on ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped:
-    this caller explicitly requests the legacy packed-UE8M0 (int32) layout
-    deep_gemm expects, so its internal layout transform falls into the
-    pre-packed branch. The op's default output layout is standard R128c4.
+    On SM100 with ``TRTLLM_FUSED_FP8_QUANT_PACK=1``, the fused
+    ``fp8_quantize_1x128_packed_ue8m0`` op already emits the legacy packed-UE8M0
+    (int32) layout deep_gemm expects, so the follow-on
+    ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped.
     """
     TACTIC_TRITON = 1
     if tactic == TACTIC_TRITON:
@@ -1803,8 +1801,7 @@ def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
             a_sf.transpose(0, 1))
         return a, a_sf
     if _USE_FUSED_FP8_QUANT_PACK and get_sm_version() >= 100:
-        # deep_gemm still consumes its legacy MN-major packed SF layout. The
-        # custom op defaults to standard R128c4 for new consumers.
+        # Legacy MN-major packed layout, requested explicitly.
         a, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input, False)
         return a, a_sf
     a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
