@@ -665,6 +665,36 @@ def cosmos3_pipeline():
 @pytest.mark.integration
 @pytest.mark.cosmos3_t2v
 @pytest.mark.high_cuda_memory
+class TestCosmos3VaeBackend:
+    """Cosmos3 must load the native ``WanVAE``, not the diffusers class.
+
+    Cosmos3 ships the Wan2.2 VAE (``_name_or_path`` in ``vae/config.json`` is
+    ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``), so both implementations load the same
+    weights. The native one is measurably faster and shards better -- on a B300
+    at 720p/189f the 720p decode is 4,839 ms vs 6,070 ms single-GPU, and 835 ms
+    vs 1,196 ms across 8 GPUs (72% vs 63% parallel efficiency).
+    """
+
+    def test_loads_native_wan_vae(self, cosmos3_pipeline):
+        from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
+
+        assert isinstance(cosmos3_pipeline.vae, WanVAE), (
+            f"Cosmos3 loaded {type(cosmos3_pipeline.vae).__name__}; expected the native "
+            "WanVAE via load_wan_vae(). Set TRTLLM_USE_DIFFUSER_VAE=1 to opt back out."
+        )
+
+    def test_native_vae_exposes_cosmos3_config_fields(self, cosmos3_pipeline):
+        """``_decode_latents`` branches on these; missing ones mis-normalise latents."""
+        cfg = cosmos3_pipeline.vae.config
+        assert hasattr(cfg, "latents_mean") and hasattr(cfg, "latents_std")
+        assert len(cfg.latents_mean) == cosmos3_pipeline.vae.config.z_dim
+        assert cfg.scale_factor_spatial == cosmos3_pipeline.vae_scale_factor_spatial
+        assert cfg.scale_factor_temporal == cosmos3_pipeline.vae_scale_factor_temporal
+
+
+@pytest.mark.integration
+@pytest.mark.cosmos3_t2v
+@pytest.mark.high_cuda_memory
 class TestCosmos3T2V:
     def test_t2v_smoke(self, cosmos3_pipeline):
         result = _run_forward(cosmos3_pipeline, image=None, num_frames=NUM_FRAMES)

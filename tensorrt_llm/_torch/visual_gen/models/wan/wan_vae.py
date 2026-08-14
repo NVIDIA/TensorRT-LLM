@@ -624,12 +624,27 @@ class WanResidualDownBlock(nn.Module):
         down_flag: bool = False,
     ):
         super().__init__()
-        self.avg_shortcut = AvgDown3D(
-            in_dim,
-            out_dim,
-            factor_t=2 if temperal_downsample else 1,
-            factor_s=2 if down_flag else 1,
-        )
+        factor_t = 2 if temperal_downsample else 1
+        factor_s = 2 if down_flag else 1
+        if factor_t == 1 and factor_s == 1 and in_dim == out_dim:
+            # Final encoder level: nothing is folded in time or space and the
+            # width is unchanged, so AvgDown3D's reshape/permute/mean is a
+            # bitwise identity -- but it still pays a permute and a full-tensor
+            # .contiguous() copy of the widest activation on every forward.
+            #
+            # Only the transform is skipped; the residual add below stays.
+            # Dropping that would remove this level's skip connection and
+            # silently change the network the checkpoint was trained as.
+            # AvgDown3D holds no parameters or buffers, so this does not alter
+            # state_dict keys and checkpoints still load with strict=True.
+            self.avg_shortcut = nn.Identity()
+        else:
+            self.avg_shortcut = AvgDown3D(
+                in_dim,
+                out_dim,
+                factor_t=factor_t,
+                factor_s=factor_s,
+            )
         resnets = []
         for _ in range(num_res_blocks):
             resnets.append(WanResidualBlock(in_dim, out_dim, dropout))

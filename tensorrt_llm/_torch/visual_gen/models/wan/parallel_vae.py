@@ -38,8 +38,27 @@ TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SIZE = "TLLM_WAN_VAE_DECODE_TEMPORAL_CHUNK_SI
 
 # Keep tuned entries explicit so future sweeps can extend this table by
 # parallel size and tensor dtype without changing the selection policy.
+#
+# The optimum grows with parallel size, because the width split makes each
+# rank's tensors narrower and temporal batching restores the parallelism the
+# split removed. Measured on B300, 720p/189f bf16, median of 5 (ms):
+#
+#   parallel   c=1     c=2     c=4     c=8    c=12    c=16    c=24
+#          1  4917    5033    5480    6021    7228       -       -
+#          2  2867    2779*   2780    2974    3077       -       -
+#          4  1630    1469    1422*   1423    1474       -       -
+#          8  1402     847     768     745*    743     750     777
+#
+# ``parallel_size <= 1`` keeps chunk 1: batching is actively harmful there
+# (+47% at c=12) because a full-width shard already saturates the GPU.
+#
+# At 8 the minimum is flat between 8 and 12 (745 vs 743 ms, inside the ~2 ms
+# run-to-run spread). 8 is chosen: same speed, a third less activation
+# memory, and this table has no resolution term -- the value picked at 720p
+# is also applied at 4K, where activations are ~9x larger.
 _NATIVE_DECODE_CHUNK_SIZES: dict[tuple[int, torch.dtype], int] = {
     (4, torch.bfloat16): 4,
+    (8, torch.bfloat16): 8,
 }
 _DEFAULT_MULTI_GPU_DECODE_CHUNK_SIZE = 2
 
