@@ -19,8 +19,6 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
-#include <mutex>
-
 namespace tr = tensorrt_llm::runtime;
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
@@ -70,14 +68,13 @@ public:
     //! \brief Synchronize internal streams with bufferManager stream.
     //! \details The buffer manager uses the same stream as the prefill and decode kernels. This method ensures that the
     //! internal kernels used for offloading and onboarding will wait for prefill and decode kernels before performing
-    //! any block copies. This method must be called before the first call to KVCacheManager::addSequenceBatch in every
-    //! step. This is a stream-ordering operation; it does not reset raw-slot transfer dependencies.
+    //! any block copies. This method must be called before the first call to
+    //! KVCacheManager::addSequenceBatch in every step.
     void syncWithBufferManager();
 
     //! \brief Synchronize bufferManager stream with internal streams. This method ensures that prefill and decode
     //! kernels for next step will wait for offloading and onboarding work that has already been scheduled. This method
-    //! must be called after the last call to KVCacheManager::addSequenceBatch in every step. This is a stream-ordering
-    //! operation; it does not reset raw-slot transfer dependencies.
+    //! must be called after the last call to KVCacheManager::addSequenceBatch in every step.
     void syncTransfers();
 
     //! \brief Make a target buffer-manager stream wait for already-scheduled onboard copies.
@@ -126,12 +123,8 @@ private:
     runtime::BufferManager mOnboardManager;
     runtime::BufferManager mOffloadManager;
 
-    // Track last read and write events for raw memory slots. Note that it is the pool-qualified memory pool index that
-    // identifies the raw memory blocks involved in I/O, not the block Id. These maps are cross-thread dependency state:
-    // they survive iteration-boundary syncs because the C++ transceiver sender can schedule transfers outside the main
-    // scheduler thread. The mutex is mutable so const observers can lock it before reading these maps without changing
-    // the logical transfer-manager state.
-    mutable std::mutex mPendingTransfersMutex;
+    // Track reads and writes for blocks. Note that it is the pool-qualified memory pool index
+    // that identifies the raw memory blocks involved in I/O, not the block Id.
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingReads;
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingWrites;
     // Reference to parent loopback agent
