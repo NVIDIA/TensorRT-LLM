@@ -226,6 +226,26 @@ def _materialize_reference(
     return ref_path
 
 
+def cleanup_reference_files(media_storage_path: Optional[str], request_id: str) -> None:
+    """Remove the materialized reference inputs for one request.
+
+    References are materialized as ``{request_id}_{modality}_ref_{i}`` (and the
+    deprecated ``{request_id}_input_ref``) under ``media_storage_path``. They are
+    input-only — unneeded once the pipeline has consumed them — so the request
+    owner removes them by the ``request_id`` prefix, covering image/video/audio
+    and the deprecated single reference regardless of count. Output files
+    (``{request_id}_{i}.<ext>``) carry no ``ref`` and are left untouched.
+    Best-effort: already-removed files are ignored.
+    """
+    if media_storage_path is None:
+        return
+    for path in Path(media_storage_path).glob(f"{request_id}_*ref*"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 def _build_reference_list(value, *, modality: str, id: str, media_storage_path: Optional[str]):
     """Materialize an HTTP reference field into a list of ``MediaRef`` objects.
 

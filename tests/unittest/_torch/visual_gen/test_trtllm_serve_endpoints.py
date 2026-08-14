@@ -209,6 +209,9 @@ class MockVisualGen:
         # used by tests to assert forwarded VisualGenParams fields.
         self.last_inputs = None
         self.last_params = None
+        # Snapshot of materialized reference-file contents at generation time,
+        # captured before the route cleans them up. Keyed by stored path.
+        self.last_ref_bytes = {}
         # Stand-in for the coordinator-side executor proxy. The async video
         # route reads ``default_generation_params`` / ``extra_param_specs``
         # directly off this attribute when running synchronous pre-flight
@@ -250,9 +253,21 @@ class MockVisualGen:
 
     # --- VisualGen interface ---
 
+    def _snapshot_refs(self, params) -> None:
+        # Capture materialized reference bytes before the route cleans them up,
+        # so tests can still assert byte-identity after the request finishes.
+        self.last_ref_bytes = {}
+        for field in ("image_reference", "video_reference", "audio_reference"):
+            for ref in getattr(params, field, None) or []:
+                path = getattr(ref, "content", None)
+                if isinstance(path, str) and os.path.exists(path):
+                    with open(path, "rb") as fh:
+                        self.last_ref_bytes[path] = fh.read()
+
     def generate(self, inputs=None, params=None) -> VisualGenOutput:
         self.last_inputs = inputs
         self.last_params = params
+        self._snapshot_refs(params)
         if self._validation_error is not None:
             raise self._validation_error
         if self._generate_error is not None:
@@ -271,6 +286,7 @@ class MockVisualGen:
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
         self.last_inputs = inputs
         self.last_params = params
+        self._snapshot_refs(params)
         if self._validation_error is not None:
             raise self._validation_error
         n = getattr(params, "num_images_per_prompt", 1) if params else 1
@@ -1597,13 +1613,15 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # image_reference is written to media storage and passed through as a
-        # MediaRef carrying the filesystem path.
+        # image_reference is materialized to media storage and passed through as
+        # a MediaRef carrying the filesystem path.
         params = video_client.mock_gen.last_params
         ref_path = params.image_reference[0].content
         assert isinstance(ref_path, str)
         assert ref_path.endswith("_image_ref_0")
-        assert os.path.exists(ref_path)
+        # The materialized reference is input-only and is cleaned up once the
+        # request finishes, so it must not linger in media storage.
+        assert not os.path.exists(ref_path)
 
     def test_sync_video_generation_multipart_with_video_reference(self, video_client):
         """A ``video_reference`` upload is persisted byte-identical (V2V) — the
@@ -1625,11 +1643,15 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # Video conditioning arrives as a MediaRef holding a stored path;
-        # no image_reference is set, and the encoded bytes are byte-identical.
+        # Video conditioning arrives as a MediaRef holding a stored path; no
+        # image_reference is set, and the encoded bytes were persisted
+        # byte-identical (snapshotted at generation time, since the route cleans
+        # the reference up once the request finishes).
         params = video_client.mock_gen.last_params
         assert params.image_reference is None
-        assert Path(params.video_reference[0].content).read_bytes() == payload
+        ref_path = params.video_reference[0].content
+        assert video_client.mock_gen.last_ref_bytes[ref_path] == payload
+        assert not os.path.exists(ref_path)
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
         """Content matching no image or video container signature is rejected

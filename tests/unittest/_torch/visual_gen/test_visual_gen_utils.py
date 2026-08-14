@@ -25,6 +25,7 @@ from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGene
 from tensorrt_llm.serve.visual_gen_utils import (
     _merge_extra_params,
     _warn_if_set_with_no_semantic,
+    cleanup_reference_files,
     parse_visual_gen_params,
 )
 from tensorrt_llm.visual_gen import VisualGenParams
@@ -835,3 +836,26 @@ class TestInlineMediaDecoding:
         request = VideoGenerationRequest(prompt="storm", extra_params={"video": "not!b64!"})
         with pytest.raises(ValueError, match="not valid base64"):
             parse_visual_gen_params(request, "id-bad", self._generator())
+
+
+class TestCleanupReferenceFiles:
+    """The reference-file reclaim helper keyed on the request id prefix."""
+
+    def test_removes_only_this_request_ref_files(self, tmp_path):
+        vid = "video_abc123"
+        (tmp_path / f"{vid}_image_ref_0").write_bytes(b"a")
+        (tmp_path / f"{vid}_video_ref_1").write_bytes(b"b")
+        (tmp_path / f"{vid}_input_ref").write_bytes(b"c")  # deprecated alias
+        (tmp_path / f"{vid}_0.mp4").write_bytes(b"out")  # output — keep
+        (tmp_path / "video_other_image_ref_0").write_bytes(b"d")  # other id — keep
+        cleanup_reference_files(str(tmp_path), vid)
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            f"{vid}_0.mp4",
+            "video_other_image_ref_0",
+        ]
+
+    def test_none_storage_is_noop(self):
+        cleanup_reference_files(None, "video_x")  # no raise
+
+    def test_missing_files_are_ignored(self, tmp_path):
+        cleanup_reference_files(str(tmp_path), "video_absent")  # no raise
