@@ -561,8 +561,12 @@ class GlmImageTransformer2DModel(BaseDiffusionModel):
         super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
-        if vgm is not None and vgm.ulysses_size > 1:
-            raise NotImplementedError(f"GlmImage requires ulysses_size=1, got {vgm.ulysses_size}.")
+        if vgm is not None and (vgm.ulysses_size > 1 or vgm.cp_size > 1):
+            raise NotImplementedError(
+                "GlmImage requires ulysses_size=1, ring_size=1 and attn2d_size=(1, 1); got "
+                f"ulysses_size={vgm.ulysses_size}, ring_size={vgm.ring_size}, "
+                f"attn2d_size=({vgm.attn2d_row_size}, {vgm.attn2d_col_size})."
+            )
 
         pretrained_config = model_config.pretrained_config
 

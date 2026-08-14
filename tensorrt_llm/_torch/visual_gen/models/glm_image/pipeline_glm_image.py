@@ -605,14 +605,12 @@ class GlmImagePipeline(BasePipeline):
 
         Args:
             prompt (`str` or `list[str]`, *optional*):
-                The prompt or prompts to guide the image generation. Must contain shape info in the format '<sop>H
-                W<eop>' where H and W are token dimensions (d32). Example: "A beautiful sunset<sop>36 24<eop>"
-                generates a 1152x768 image.
-            image: Optional condition images for image-to-image generation.
+                The prompt or prompts to guide the image generation.
+            image: Must be `None`; this pipeline is text-to-image.
             height (`int`, *optional*):
-                The height in pixels. If not provided, derived from prompt shape info.
+                The height in pixels, a multiple of 32. Defaults to 1024.
             width (`int`, *optional*):
-                The width in pixels. If not provided, derived from prompt shape info.
+                The width in pixels, a multiple of 32. Defaults to 1024.
             num_inference_steps (`int`, *optional*, defaults to `50`):
                 The number of denoising steps for DiT.
             guidance_scale (`float`, *optional*, defaults to `1.5`):
