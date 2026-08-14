@@ -2577,9 +2577,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX,
                                                  row_max_new, 0)
-        elif cutlass.const_expr(
-            (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
-                or (arch >= Arch.sm_107 and arch <= Arch.sm_107f)):
+        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(64),
                                            redOp=tcgen05.TmemLoadRedOp.MAX),
