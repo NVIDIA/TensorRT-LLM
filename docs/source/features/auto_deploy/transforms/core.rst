@@ -41,7 +41,7 @@ configuration entries to the transform implementation and configuration model.
 Transform Results
 -----------------
 
-.. autoclass:: tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo
+.. autopydantic_model:: tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo
    :members:
    :show-inheritance:
    :no-index:
