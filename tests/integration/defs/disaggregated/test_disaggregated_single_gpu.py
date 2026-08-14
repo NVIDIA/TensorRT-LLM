@@ -46,7 +46,6 @@ def get_ucx_tls():
 if get_sm_version() == 90:
     os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
-
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
     cloudpickle.dumps,

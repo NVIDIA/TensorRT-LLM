@@ -55,7 +55,6 @@ def get_ucx_tls():
 if get_sm_version() == 90:
     os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
 
-
 # Configuration file paths
 EXAMPLES_DIR = "examples/disaggregated"
 CLIENTS_DIR = f"{EXAMPLES_DIR}/clients"
