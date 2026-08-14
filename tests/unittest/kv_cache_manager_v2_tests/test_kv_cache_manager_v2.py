@@ -4447,6 +4447,63 @@ class TestPoolRebalance(TestKVCacheManagerV2):
         self.assertGreater(slots_after[0], slots_before[0], f"{slots_before} -> {slots_after}")
         self.assertLess(slots_after[1], slots_before[1], f"{slots_before} -> {slots_after}")
 
+    def _close_one_cache(self, capacity: int, *, dummy: bool, cache_id: int) -> None:
+        """Create, size and close one KV cache, optionally marked as a dummy.
+
+        Only the close matters here: it is where the auto-tuner samples
+        capacity and history length.
+        """
+        prompt = [self.next_token() for _ in range(self._TOKENS_PER_BLOCK)]
+        kv_cache = self.manager.create_kv_cache(ReuseScope(), prompt, id=cache_id)
+        if dummy:
+            self.manager.mark_stats_excluded(cache_id)
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self.assertTrue(kv_cache.resume(stream))
+            self.assertTrue(kv_cache.resize(capacity, capacity - 1))
+        s.take_finish_event().synchronize()
+        kv_cache.close()
+
+    def test_dummy_kv_caches_do_not_feed_the_tuner(self) -> None:
+        """Stats-excluded caches must not move the target pool ratio.
+
+        Warmup and CUDA-graph padding requests reserve capacity at the model's
+        full declared context rather than at a realistic sequence length, and
+        the tuner averages the *square* of capacity -- so a handful of them
+        dominates the statistic outright and the pools get sized for sequences
+        that never arrive. Those caches are already marked stats-excluded at
+        creation; ``_KVCache.close`` has to honour that.
+        """
+        self.prepare_two_pool_groups()
+
+        # Open the sample-count and cooldown gates but leave the target ratio
+        # alone -- unlike force_rebalance_precondition, which also skews it.
+        # need_adjustment is then driven purely by whether a close moved the
+        # target away from the current ratio.
+        _introspection.set_num_sampled_kv_caches(self.manager, 2001)
+        _introspection.set_last_adjustment_time(self.manager, 0.0)
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "target should still equal the current ratio before any close",
+        )
+
+        big = 64 * self._TOKENS_PER_BLOCK
+        self._close_one_cache(big, dummy=True, cache_id=1)
+        self.assertFalse(
+            self.manager.need_adjustment,
+            "a stats-excluded cache moved the target ratio; dummy requests are "
+            "feeding the auto-tuner",
+        )
+
+        # Control: the same close *without* the exclusion must move the target,
+        # otherwise the assertion above passes for the wrong reason.
+        self._close_one_cache(big, dummy=False, cache_id=2)
+        self.assertTrue(
+            self.manager.need_adjustment,
+            "a real close of the same shape did not move the target either, so "
+            "the check above is vacuous",
+        )
+
     def test_kv_survives_adjust(self) -> None:
         """Committed blocks must still verify after pages migrate between slots."""
         self.prepare_two_pool_groups()

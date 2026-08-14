@@ -560,7 +560,11 @@ void KvCache::close()
     stopCommitting();
     TLLM_CHECK_DEBUG(_checkSanity());
 
-    if (mCapacity > 0)
+    // Dummy/warmup caches are reserved at the model's full declared context, not at a realistic
+    // sequence length, and mAvgSqrCapacity is an RMS -- so a handful of them dominates the
+    // statistic outright and the tuner sizes pools for sequences that never arrive. They are
+    // already tracked as stats-excluded at creation; honour that here too.
+    if (mCapacity > 0 && !mManager->isStatsExcluded(id))
     {
         mAvgCapacity.update(static_cast<double>(mCapacity));
         mManager->updateAvgSqrCapacity(mAvgCapacity.value() * mAvgCapacity.value());
