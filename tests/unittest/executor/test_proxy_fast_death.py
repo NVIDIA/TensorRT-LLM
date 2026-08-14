@@ -303,9 +303,7 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
 
     events.clear()
     init_status_queue.succeeds = False
-    with pytest.raises(
-        RuntimeError, match="Failed to deliver worker process identities to proxy"
-    ):
+    with pytest.raises(RuntimeError, match="Failed to deliver worker process identities to proxy"):
         worker_module.worker_main(
             engine=object(),
             worker_queues=worker_queues,
@@ -317,9 +315,7 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
             ),
         )
 
-    assert events == [
-        ("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)
-    ]
+    assert events == [("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)]
 
 
 def test_result_step_raises_on_engine_dead():
