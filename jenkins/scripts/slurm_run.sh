@@ -106,6 +106,8 @@ else
     pytest_exit_code=$?
 fi
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
+python3 "$llmSrcNode/tests/test_common/s3_output.py" \
+    --drain-spool "$jobWorkspace" || true
 
 # Rank 0: scan the captured log for pytest-timeout banners and append records
 # to timeout_data.jsonl.  All steps are best-effort: a classify failure must

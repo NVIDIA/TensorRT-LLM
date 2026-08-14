@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -99,6 +99,13 @@ void LoraImpl::setGemmConfig()
         mCublasWrapper->setBF16GemmConfig();
     }
 #endif
+#ifdef ENABLE_FP8
+    else if (mType == tensorrt_llm::DataType::kFP8)
+    {
+        // FP8 uses the grouped GEMM path (CUTLASS 3.x), not cuBLAS.
+        // No cuBLAS config needed; this is a no-op.
+    }
+#endif
 }
 
 int64_t getLowRankWorkSpaceSize(int64_t numTokens, int64_t maxLoraModuleNum, int64_t maxLowRank, int64_t typeSize)
@@ -108,7 +115,10 @@ int64_t getLowRankWorkSpaceSize(int64_t numTokens, int64_t maxLoraModuleNum, int
 
 int64_t getGemmParamsWorkSpaceSize(int64_t nbReq)
 {
-    return std::max(getSplitkGroupedGemmParamsWorkSpaceSize(nbReq), getGroupedGemmParamsWorkSpaceSize(nbReq));
+    int64_t size = std::max(getSplitkGroupedGemmParamsWorkSpaceSize(nbReq), getGroupedGemmParamsWorkSpaceSize(nbReq));
+    // The FP8 path (CUTLASS 3.x) needs additional space for cute strides.
+    size = std::max(size, getFp8GroupedGemmParamsWorkSpaceSize(nbReq));
+    return size;
 }
 
 int64_t getSplitkGroupedGemmWorkSpaceSize(
@@ -176,6 +186,15 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
 
     char* useUnifiedGemmChar = std::getenv("LORA_USE_UNIFIED_GEMM");
     bool useUnifiedGemm = (useUnifiedGemmChar == nullptr || std::string(useUnifiedGemmChar) != "OFF");
+
+#ifdef ENABLE_FP8
+    // The cuBLAS wrapper used by the unified GEMM path does not have an fp8 config.
+    // Force the grouped GEMM path for fp8, which uses the CUTLASS 3.x collective API.
+    if (mType == tensorrt_llm::DataType::kFP8)
+    {
+        useUnifiedGemm = false;
+    }
+#endif
 
     for (int loraModuleIdx = 0; loraModuleIdx < mNumLoraModules; loraModuleIdx++)
     {

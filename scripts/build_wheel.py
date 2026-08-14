@@ -33,8 +33,10 @@ from typing import Optional, Sequence
 
 try:
     from packaging.requirements import Requirement
+    from packaging.version import Version
 except (ImportError, ModuleNotFoundError):
     from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.version import Version
 
 build_run = partial(run, shell=True, check=True)
 
@@ -67,14 +69,39 @@ def get_project_dir():
     return Path(__file__).parent.resolve().parent
 
 
+def apply_version_override(project_dir: Path,
+                           version_override: Optional[str]) -> None:
+    """Apply the requested package version before building the wheel."""
+    if not version_override:
+        return
+
+    version_file = project_dir / "tensorrt_llm" / "version.py"
+    version_content = version_file.read_text()
+    version_match = re.search(r'(?m)^__version__ = "([^"]+)"$', version_content)
+    current_version = version_match.group(1)
+
+    resolved_version = version_override
+    if version_override.startswith((".", "+")):
+        resolved_version = current_version
+        if not current_version.endswith(version_override):
+            resolved_version += version_override
+    resolved_version = str(Version(resolved_version))
+    version_file.write_text(
+        version_content.replace(f'__version__ = "{current_version}"',
+                                f'__version__ = "{resolved_version}"', 1))
+
+
 def get_source_dir():
     return get_project_dir() / "cpp"
 
 
-def get_build_dir(build_dir, build_type):
+def get_build_dir(build_dir, build_type, build_root=None):
     if build_dir is None:
-        build_dir = get_source_dir() / ("build" if build_type == "Release" else
-                                        f"build_{build_type}")
+        dir_name = "build" if build_type == "Release" else f"build_{build_type}"
+        if build_root is not None:
+            build_dir = Path(build_root).resolve() / f"cpp-{dir_name}"
+        else:
+            build_dir = get_source_dir() / dir_name
     else:
         build_dir = Path(build_dir).resolve()
     return build_dir
@@ -111,10 +138,9 @@ def sysconfig_scheme(override_vars=None):
     return {key: value.format(**vars_) for key, value in scheme.items()}
 
 
-def create_venv(project_dir: Path):
+def create_venv(venv_prefix: Path):
     py_major = sys.version_info.major
     py_minor = sys.version_info.minor
-    venv_prefix = project_dir / f".venv-{py_major}.{py_minor}"
     print(
         f"-- Using virtual environment at: {venv_prefix} (Python {py_major}.{py_minor})"
     )
@@ -138,13 +164,16 @@ def create_venv(project_dir: Path):
 def setup_venv(project_dir: Path,
                requirements_file: Path,
                no_venv: bool,
-               yes: bool = False) -> tuple[Path, Path]:
+               yes: bool = False,
+               build_root: Optional[Path] = None) -> tuple[Path, Path]:
     """Creates/updates a venv and installs requirements.
 
     Args:
         project_dir: The root directory of the project.
         requirements_file: Path to the requirements file.
         no_venv: Use current Python environment as is.
+        build_root: Directory for out-of-tree build state; when set, the venv
+            is created there instead of inside the checkout.
 
     Returns:
         Tuple[Path, Path]: Paths to the python and conan executables in the venv.
@@ -154,7 +183,12 @@ def setup_venv(project_dir: Path,
         print(f"-- {reason}, using environment {sys.prefix} as is.")
         venv_prefix = Path(sys.prefix)
     else:
-        venv_prefix = create_venv(project_dir)
+        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        if build_root is not None:
+            venv_prefix = build_root / f"venv-{py_version}"
+        else:
+            venv_prefix = project_dir / f".venv-{py_version}"
+        venv_prefix = create_venv(venv_prefix)
 
     scheme = sysconfig_scheme({'base': venv_prefix})
     # Determine venv executable paths
@@ -460,10 +494,19 @@ def generate_python_stubs_windows(venv_python: Path, pkg_dir: Path,
     exit(1)
 
 
-def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
+def build_kv_cache_manager_v2(project_dir,
+                              venv_python,
+                              use_mypyc=False,
+                              build_root=None):
     print("-- Building kv_cache_manager_v2...")
     kv_cache_mgr_dir = project_dir / "tensorrt_llm/runtime/kv_cache_manager_v2"
     runtime_dir = project_dir / "tensorrt_llm/runtime"
+
+    # The produced .so files always land in-place (they are final artifacts);
+    # only the intermediate object files are redirected out of the checkout.
+    build_temp_arg = ""
+    if build_root is not None:
+        build_temp_arg = f' --build-temp "{build_root / "kv_cache_manager_v2-temp"}"'
 
     # Clean up any existing mypyc artifacts in runtime directory to prevent stale inclusion
     # when switching from --mypyc to standard build
@@ -480,7 +523,8 @@ def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
     # Build rawref
     print("-- Building kv_cache_manager_v2 rawref extension...", end=" ")
     rawref_dir = kv_cache_mgr_dir / "rawref"
-    build_run(f'"{venv_python}" setup.py build_ext --inplace', cwd=rawref_dir)
+    build_run(f'"{venv_python}" setup.py build_ext --inplace{build_temp_arg}',
+              cwd=rawref_dir)
     print("Done")
 
     if use_mypyc:
@@ -488,8 +532,9 @@ def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
         print("-- Building kv_cache_manager_v2 mypyc extensions...", end=" ")
         # setup_mypyc.py is in kv_cache_manager_v2 but executed from runtime dir
         setup_mypyc = kv_cache_mgr_dir / "setup_mypyc.py"
-        build_run(f'"{venv_python}" "{setup_mypyc}" build_ext --inplace',
-                  cwd=runtime_dir)
+        build_run(
+            f'"{venv_python}" "{setup_mypyc}" build_ext --inplace{build_temp_arg}',
+            cwd=runtime_dir)
 
         # Verify that the shared library was generated
         if not list(runtime_dir.glob("*__mypyc*.so")):
@@ -503,16 +548,17 @@ def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
 def main(*,
          build_type: str = "Release",
          generator: str = "",
-         build_dir: Path = None,
-         dist_dir: Path = None,
-         cuda_architectures: str = None,
-         job_count: int = None,
+         build_root: Optional[Path] = None,
+         build_dir: Optional[Path] = None,
+         dist_dir: Optional[Path] = None,
+         cuda_architectures: Optional[str] = None,
+         job_count: Optional[int] = None,
          extra_cmake_vars: Sequence[str] = tuple(),
          extra_make_targets: str = "",
-         nccl_root: str = None,
-         nixl_root: str = None,
-         mooncake_root: str = None,
-         internal_cutlass_kernels_root: str = None,
+         nccl_root: Optional[str] = None,
+         nixl_root: Optional[str] = None,
+         mooncake_root: Optional[str] = None,
+         internal_cutlass_kernels_root: Optional[str] = None,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
@@ -533,12 +579,31 @@ def main(*,
          mypyc: bool = False,
          require_dynamic_attributions: bool = False,
          plat_name: Optional[str] = None,
-         yes: bool = False):
+         yes: bool = False,
+         version_override: Optional[str] = None):
 
     if clean:
         clean_wheel = True
 
     project_dir = get_project_dir()
+    apply_version_override(project_dir, version_override)
+
+    # Out-of-tree build state: everything metadata-heavy (venv, wheel
+    # staging, ccache, intermediate objects) goes under build_root, keeping
+    # the checkout free of high-churn I/O (important on network filesystems).
+    # Resolve before chdir so a relative path stays anchored to the caller's
+    # working directory.
+    if build_root is None and os.environ.get("TRTLLM_BUILD_ROOT"):
+        build_root = Path(os.environ["TRTLLM_BUILD_ROOT"])
+    if build_root is not None:
+        build_root = build_root.resolve()
+        build_root.mkdir(parents=True, exist_ok=True)
+        print(f"-- Out-of-tree build state under: {build_root}")
+        # setup.py redirects the setuptools staging tree and *.egg-info
+        # to this directory; an explicit env var set by the user wins.
+        os.environ.setdefault("TRTLLM_WHEEL_STAGING_DIR",
+                              str(build_root / "wheel-staging"))
+
     os.chdir(project_dir)
 
     # Get all submodules and check their folder exists. If not,
@@ -558,7 +623,8 @@ def main(*,
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename,
                                          no_venv,
-                                         yes=yes)
+                                         yes=yes,
+                                         build_root=build_root)
 
     if cuda_architectures is not None:
         if "70-real" in cuda_architectures:
@@ -626,7 +692,7 @@ def main(*,
             raise RuntimeError("Mooncake is not supported on Windows.")
         cmake_def_args.append(f"-DMOONCAKE_ROOT={mooncake_root}")
 
-    build_dir = get_build_dir(build_dir, build_type)
+    build_dir = get_build_dir(build_dir, build_type, build_root)
     first_build = not Path(build_dir, "CMakeFiles").exists()
 
     if clean and build_dir.exists():
@@ -634,6 +700,14 @@ def main(*,
     build_dir.mkdir(parents=True, exist_ok=True)
 
     if use_ccache:
+        if build_root is not None and "CCACHE_DIR" not in os.environ:
+            # Default the cache next to the rest of the out-of-tree build
+            # state. Point CCACHE_DIR at persistent storage instead to keep
+            # compile results across ephemeral nodes/containers.
+            ccache_dir = build_root / "ccache"
+            ccache_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["CCACHE_DIR"] = str(ccache_dir)
+            print(f"-- ccache directory: {ccache_dir}")
         cmake_def_args.append(
             f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"
         )
@@ -704,8 +778,15 @@ def main(*,
 
     with working_directory(build_dir):
         if clean or first_build or configure_cmake or configure_only:
+            # Conan writes a CMakeUserPresets.json convenience file next to
+            # cpp/CMakeLists.txt; with out-of-tree build state it would be
+            # the only build file left in the checkout (and would point at a
+            # possibly ephemeral location), so skip generating it.
+            conan_extra_args = (
+                " -c tools.cmake.cmaketoolchain:user_presets=False"
+                if build_root is not None else "")
             build_run(
-                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}'{conan_extra_args} {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
@@ -1102,7 +1183,10 @@ def main(*,
                         nixl_root is not None or mooncake_root is not None,
                         binding_lib_file_name)
 
-    build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=mypyc)
+    build_kv_cache_manager_v2(project_dir,
+                              venv_python,
+                              use_mypyc=mypyc,
+                              build_root=build_root)
 
     if not skip_building_wheel:
         if dist_dir is None:
@@ -1120,6 +1204,17 @@ def main(*,
             # This breaks the Windows CI/CD pipeline when building
             # and validating python changes in the whl.
             clear_folder(dist_dir)
+            # Without --build_root the setuptools staging tree (build_base)
+            # lives at project_dir/build == dist_dir, so the clear above
+            # already wipes it. With --build_root it moves under
+            # TRTLLM_WHEEL_STAGING_DIR, so clearing dist_dir alone would
+            # leave stale copies of deleted package files there to be
+            # re-packed into the next "clean" wheel. Clear it too.
+            staging_dir = os.environ.get("TRTLLM_WHEEL_STAGING_DIR")
+            if staging_dir:
+                staging_build = Path(staging_dir) / "build"
+                if staging_build.exists():
+                    clear_folder(staging_build)
 
         extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
         plat_name_arg = ""
@@ -1274,11 +1369,21 @@ def add_arguments(parser: ArgumentParser):
         "Directory containing internal_cutlass_kernels sources. If specified, the internal_cutlass_kernels and NVRTC wrapper libraries will be built from source."
     )
     parser.add_argument(
+        "--build_root",
+        type=Path,
+        help=
+        "Directory for all out-of-tree build state (also via TRTLLM_BUILD_ROOT env var). "
+        "When set, the CMake build dir, build venv, wheel staging, intermediate "
+        "objects and (with --use_ccache) the ccache directory default under this "
+        "directory instead of the checkout. Point it at fast local storage (e.g. "
+        "/tmp) when the checkout lives on a network filesystem. Individual "
+        "options like --build_dir and CCACHE_DIR still override their piece.")
+    parser.add_argument(
         "--build_dir",
         type=Path,
         help=
-        "Directory where C++ sources are built (default: cpp/build or cpp/build_<build_type>)"
-    )
+        "Directory where C++ sources are built (default: cpp/build or cpp/build_<build_type>, "
+        "or <build_root>/cpp-build* when --build_root is set)")
     parser.add_argument(
         "--dist_dir",
         type=Path,
@@ -1345,6 +1450,11 @@ def add_arguments(parser: ArgumentParser):
         default=False,
         help=
         "Skip interactive confirmation prompts (useful for non-interactive builds)",
+    )
+    parser.add_argument(
+        "--version-override",
+        help="Package version override. A leading '.' or '+' appends to the "
+        "current version; any other value replaces it.",
     )
 
 

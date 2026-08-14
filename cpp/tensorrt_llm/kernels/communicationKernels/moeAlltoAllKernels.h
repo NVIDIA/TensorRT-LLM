@@ -33,6 +33,9 @@ static constexpr int kRankMaskWords = 2; // uint64 words to hold the active-rank
                                          // (kRankMaskWords * 64 must be >= kMaxRanks)
 static_assert(kRankMaskWords * 64 >= kMaxRanks, "active_rank_mask too small for kMaxRanks");
 
+// Default completion-flag wait budget: 300 s at an assumed 2 GHz clock64 rate.
+static constexpr int64_t kDefaultTimeoutCycles = 300ll * 2000ll * 1000ll * 1000ll;
+
 // Describes a single payload type to be communicated
 struct PayloadDescriptor
 {
@@ -73,6 +76,9 @@ struct DispatchKernelPointers
     // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. The masked kernel
     // rejects inactive route targets and skips their peer counters, stats, and flags.
     uint64_t active_rank_mask[kRankMaskWords];
+
+    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    int64_t timeout_cycles{kDefaultTimeoutCycles};
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -94,6 +100,9 @@ struct CombineKernelPointers
     // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips
     // completion flag writes/waits to/from inactive peers.
     uint64_t active_rank_mask[kRankMaskWords];
+
+    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    int64_t timeout_cycles{kDefaultTimeoutCycles};
 };
 
 // Dispatch phase parameters
@@ -147,9 +156,21 @@ struct MoeA2ADispatchParams
     // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
 
+    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    int64_t timeout_cycles{kDefaultTimeoutCycles};
+
     // CUDA stream
     cudaStream_t stream;
 };
+
+// Resolve the completion-flag wait budget, in clock64() cycles.
+//
+// No collective separates a rank's first-touch JIT/autotune work from its dispatch
+// launch, so this device-side budget is in effect a deadline on the slowest peer's
+// host-side progress. Warmup therefore uses a larger budget than steady state.
+// Overridable via TRTLLM_MOE_A2A_TIMEOUT_SEC / TRTLLM_MOE_A2A_WARMUP_TIMEOUT_SEC.
+// See nvbugs/6482566.
+int64_t moeA2AGetTimeoutCycles(bool is_warmup);
 
 // Dispatch kernels
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
@@ -201,6 +222,9 @@ struct MoeA2ACombineParams
     // The mask is copied by value into kernel arguments. Rank-mask mode must reject
     // CUDA graph replay until generation-scoped invalidation and recapture are available.
     uint64_t active_rank_mask[kRankMaskWords] = {~uint64_t{0}, ~uint64_t{0}};
+
+    // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
+    int64_t timeout_cycles{kDefaultTimeoutCycles};
 
     // CUDA stream
     cudaStream_t stream;

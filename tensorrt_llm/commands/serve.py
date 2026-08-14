@@ -13,8 +13,9 @@ import subprocess  # nosec B404
 import sys
 import time
 import uuid
+from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Sequence, Set
 
 import click
 import torch
@@ -51,18 +52,28 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
-from tensorrt_llm.visual_gen import VisualGen
-from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+if TYPE_CHECKING:
+    # Type-only: the visual_gen tree is imported lazily inside the VisualGen
+    # code paths so plain LLM serving never pays its import cost.
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
 
-# Bound gRPC messages while leaving room for multimodal image payloads.
-_GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
-
 
 def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
+
+
+def _pop_optional_str_config_option(config: dict[str, Any],
+                                    key: str) -> Optional[str]:
+    value = config.pop(key, None)
+    if value is None:
+        return None
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError(f"{key} must be a non-empty string")
 
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
@@ -187,6 +198,7 @@ def get_llm_args(
         custom_tokenizer: Optional[str] = None,
         post_processor_hook: Optional[str] = None,
         backend: str = "pytorch",
+        generation_config: str = _LLM_ARGS_FIELDS["generation_config"].default,
         max_beam_width: int = _LLM_ARGS_FIELDS["max_beam_width"].default,
         max_batch_size: int = _LLM_ARGS_FIELDS["max_batch_size"].default,
         max_num_tokens: int = _LLM_ARGS_FIELDS["max_num_tokens"].default,
@@ -237,6 +249,8 @@ def get_llm_args(
         model,
         "backend":
         backend,
+        "generation_config":
+        generation_config,
         "tokenizer":
         tokenizer,
         "custom_tokenizer":
@@ -529,7 +543,8 @@ def launch_server(
         allow_request_chat_template: bool = False,
         num_input_processor_workers: int = 8,
         num_media_load_workers: int = 8,
-        multi_frontend_enabled: bool = True):
+        multi_frontend_enabled: bool = True,
+        internal_disagg_auth_key: Optional[str] = None):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -605,7 +620,8 @@ def launch_server(
                 chat_template=chat_template,
                 allow_request_chat_template=allow_request_chat_template,
                 input_processor_workers=num_input_processor_workers,
-                media_load_workers=num_media_load_workers)
+                media_load_workers=num_media_load_workers,
+                internal_disagg_auth_key=internal_disagg_auth_key)
             _apply_fastapi_middlewares(server.app, middleware)
 
             # Optionally disable GC (default: not disabled)
@@ -617,129 +633,6 @@ def launch_server(
         finally:
             if frontend_children:
                 _terminate_attached_frontends(frontend_children)
-
-
-def launch_grpc_server(host: str,
-                       port: int,
-                       llm_args: dict,
-                       served_model_name: Optional[str] = None):
-    """
-    Launch a gRPC server for TensorRT-LLM.
-
-    This provides a high-performance gRPC interface designed for external routers
-    (e.g., sgl-router) using pre-tokenized input and raw token ID output.
-
-    Args:
-        host: Host to bind to
-        port: Port to bind to
-        llm_args: Arguments for LLM initialization (from get_llm_args)
-        served_model_name: Custom model name for API responses (defaults to model path)
-    """
-    import grpc
-
-    try:
-        from grpc_reflection.v1alpha import reflection
-        REFLECTION_AVAILABLE = True
-    except ImportError:
-        REFLECTION_AVAILABLE = False
-
-    from tensorrt_llm.grpc import trtllm_service_pb2, trtllm_service_pb2_grpc
-    from tensorrt_llm.grpc.grpc_request_manager import GrpcRequestManager
-    from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
-
-    async def serve_grpc_async():
-        logger.info("Initializing TensorRT-LLM gRPC server...")
-
-        backend = llm_args.get("backend")
-        model_path = served_model_name or llm_args.get("model", "")
-
-        if backend == "pytorch":
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == "_autodeploy":
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
-
-        logger.info("Model loaded successfully")
-
-        # Create request manager
-        request_manager = GrpcRequestManager(llm)
-
-        # Create servicer
-        servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
-
-        # Create gRPC server
-        server = grpc.aio.server(
-            options=[
-                ("grpc.max_send_message_length",
-                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
-                ("grpc.max_receive_message_length",
-                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
-                ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
-                ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
-                ("grpc.keepalive_permit_without_calls", True),
-                ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
-            ], )
-
-        # Add servicer to server
-        trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(
-            servicer, server)
-
-        # Enable reflection for grpcurl and other tools
-        if REFLECTION_AVAILABLE:
-            service_names = (
-                trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
-                full_name,
-                reflection.SERVICE_NAME,
-            )
-            reflection.enable_server_reflection(service_names, server)
-            logger.info("gRPC reflection enabled")
-
-        # Bind to address
-        address = f"{host}:{port}"
-        server.add_insecure_port(address)
-
-        # Start server
-        await server.start()
-        logger.info(f"TensorRT-LLM gRPC server started on {address}")
-        logger.info("Server is ready to accept requests")
-
-        # Handle shutdown signals
-        loop = asyncio.get_running_loop()
-        stop_event = asyncio.Event()
-
-        def signal_handler():
-            logger.info("Received shutdown signal")
-            stop_event.set()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, signal_handler)
-
-        # Serve until shutdown signal
-        try:
-            await stop_event.wait()
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-        finally:
-            logger.info("Shutting down TensorRT-LLM gRPC server...")
-
-            # Stop gRPC server
-            await server.stop(grace=5.0)
-            logger.info("gRPC server stopped")
-
-            # Shutdown LLM
-            if hasattr(llm, "shutdown"):
-                llm.shutdown()
-            logger.info("LLM engine stopped")
-
-            logger.info("Shutdown complete")
-
-    uvloop.run(serve_grpc_async())
 
 
 def launch_mm_encoder_server(
@@ -868,7 +761,7 @@ def launch_visual_gen_server(
         host: str,
         port: int,
         model: str,
-        visual_gen_args: Optional[VisualGenArgs] = None,
+        visual_gen_args: Optional["VisualGenArgs"] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         middleware: Sequence[str] = (),
 ):
@@ -886,6 +779,7 @@ def launch_visual_gen_server(
     # races the same port and all but one die EADDRINUSE. VisualGen() on a
     # worker rank never returns (sys.exit in __init__).
     from tensorrt_llm._torch.visual_gen.executor import _detect_external_launch
+    from tensorrt_llm.visual_gen import VisualGen
     ext = _detect_external_launch()
     if ext is not None and ext[0] != 0:
         VisualGen(model=model, args=visual_gen_args)
@@ -975,8 +869,17 @@ def launch_visual_gen_server(
     "--backend",
     type=click.Choice(["pytorch", "_autodeploy"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend.",
-    status="beta")
+    help="The backend to use to serve the model. Default is pytorch backend. "
+    "Note: the '_autodeploy' backend is deprecated and will be discontinued "
+    "in a future release; please use the 'pytorch' backend instead.",
+    status="deprecated")
+@stability_option(
+    "--generation-config",
+    type=click.Choice(["auto", "trtllm"]),
+    default=_LLM_ARGS_FIELDS["generation_config"].default,
+    help="Sampling defaults source. 'auto' loads supported values from the "
+    "model's generation_config.json; 'trtllm' uses TRT-LLM defaults.",
+    status="prototype")
 @stability_option("--custom_module_dirs",
                   type=click.Path(exists=True,
                                   readable=True,
@@ -1226,7 +1129,8 @@ def launch_visual_gen_server(
     is_flag=True,
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
-    "gRPC server accepts pre-tokenized requests and returns raw token IDs.",
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs. "
+    "Requires the tensorrt_llm[grpc-smg] extra.",
     status="prototype")
 @stability_option(
     "--served_model_name",
@@ -1265,10 +1169,11 @@ def launch_visual_gen_server(
     status="prototype")
 def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           post_processor_hook: Optional[str], host: str, port: int,
-          log_level: str, backend: str, max_beam_width: int,
-          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-          tensor_parallel_size: int, pipeline_parallel_size: int,
-          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+          log_level: str, backend: str, generation_config: str,
+          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
+          max_seq_len: int, tensor_parallel_size: int,
+          pipeline_parallel_size: int, context_parallel_size: int,
+          moe_expert_parallel_size: Optional[int],
           moe_cluster_parallel_size: Optional[int],
           gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
           kv_cache_dtype: str, num_postprocess_workers: int,
@@ -1292,6 +1197,13 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    if backend == "_autodeploy":
+        logger.warning(
+            "The '_autodeploy' backend is deprecated and will be discontinued in a "
+            "future release. No new features or models will be added. Please migrate "
+            "to the 'pytorch' backend. See "
+            "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
 
     if moe_cluster_parallel_size is not None:
         logger.warning(
@@ -1355,6 +1267,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             custom_tokenizer=custom_tokenizer,
             post_processor_hook=post_processor_hook,
             backend=backend,
+            generation_config=generation_config,
             max_beam_width=max_beam_width,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1395,6 +1308,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
+        internal_disagg_auth_key = _pop_optional_str_config_option(
+            llm_args_extra_dict, "internal_request_auth_key")
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
@@ -1449,6 +1364,8 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 "allow_request_chat_template":
                 allow_request_chat_template
                 if allow_request_chat_template else None,
+                "internal_request_auth_key":
+                internal_disagg_auth_key,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1462,10 +1379,18 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            launch_grpc_server(host,
-                               port,
-                               llm_args,
-                               served_model_name=served_model_name)
+            if find_spec("smg_grpc_proto") is None:
+                raise ValueError(
+                    "gRPC serving with the SMG protocol requires the optional "
+                    "'smg-grpc-proto' package. Install it with: "
+                    'pip install "tensorrt_llm[grpc-smg]"')
+
+            from tensorrt_llm.grpc.smg.server import launch_smg_server
+
+            launch_smg_server(host,
+                              port,
+                              llm_args,
+                              served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
@@ -1482,9 +1407,12 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
                 num_input_processor_workers=num_input_processor_workers,
-                num_media_load_workers=num_media_load_workers)
+                num_media_load_workers=num_media_load_workers,
+                internal_disagg_auth_key=internal_disagg_auth_key)
 
     def _serve_visual_gen():
+        from tensorrt_llm.visual_gen.args import VisualGenArgs
+
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
                                   if visual_gen_args is not None else None)
 
@@ -2078,7 +2006,12 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     #    ZMQ ingest server, started once here).
     def _client_factory(router, role, max_retries=1):
         from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-        return OpenAIHttpClient(router, role, request_timeout, max_retries)
+        return OpenAIHttpClient(
+            router,
+            role,
+            request_timeout,
+            max_retries,
+            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key)
 
     coordinator = DisaggCoordinatorService(
         disagg_cfg,
@@ -2090,9 +2023,11 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
 
     async def _serve_and_monitor():
         server_task = asyncio.create_task(
-            CoordinatorServer(coordinator)(public_host,
-                                           coord_port,
-                                           uds=coord_uds))
+            CoordinatorServer(coordinator)(
+                public_host,
+                coord_port,
+                uds=coord_uds,
+                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
 
         async def _monitor_fleet():
             while True:
@@ -2350,13 +2285,21 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
 
-    launch_server(
-        host=server_cfg.hostname,
-        port=server_cfg.port,
-        llm_args=llm_args,
-        allow_request_chat_template=disagg_config.allow_request_chat_template,
+    launch_kwargs = {
+        "allow_request_chat_template":
+        disagg_config.allow_request_chat_template,
         # Disagg ctx/gen MPI workers must not enter multi-frontend mode.
-        multi_frontend_enabled=False)
+        "multi_frontend_enabled": False,
+    }
+    internal_disagg_auth_key = getattr(disagg_config,
+                                       "internal_request_auth_key", None)
+    if internal_disagg_auth_key is not None:
+        launch_kwargs["internal_disagg_auth_key"] = internal_disagg_auth_key
+
+    launch_server(host=server_cfg.hostname,
+                  port=server_cfg.port,
+                  llm_args=llm_args,
+                  **launch_kwargs)
 
 
 def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,

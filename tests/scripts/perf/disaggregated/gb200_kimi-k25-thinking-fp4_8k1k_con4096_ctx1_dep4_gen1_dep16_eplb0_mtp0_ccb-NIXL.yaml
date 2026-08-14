@@ -74,7 +74,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     trust_remote_code: true
     num_postprocess_workers: 4
     stream_interval: 20
@@ -99,5 +99,5 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 16384
       backend: NIXL
-    disable_overlap_scheduler: true
+    disable_overlap_scheduler: false
     trust_remote_code: true

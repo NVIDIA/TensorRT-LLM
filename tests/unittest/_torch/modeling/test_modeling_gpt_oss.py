@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import os
 import shutil
@@ -18,7 +21,10 @@ from tensorrt_llm._torch.models.modeling_gpt_oss import GptOssForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import \
     KvCacheConfig as BindingsKvCacheConfig
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
+from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
+                                 KvCacheConfig, MoeConfig)
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import _resolve_kv_cache_manager_v2_auto
 from tensorrt_llm.mapping import Mapping
 
 configs = """
@@ -49,6 +55,33 @@ configs = """
 
 def test_gpt_oss_prefers_python_transceiver() -> None:
     assert GptOssForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
+
+
+def _resolve_gpt_oss_kv_cache_manager_v2(**llm_args_kwargs) -> bool:
+    """Resolve the GPT-OSS preference through the model-loading path."""
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model", **llm_args_kwargs)
+    return _resolve_kv_cache_manager_v2_auto(llm_args, GptOssForCausalLM)
+
+
+def test_gpt_oss_model_preference_selects_v2():
+    """GPT-OSS is VSWA, so "auto" resolves to KVCacheManagerV2."""
+    assert _resolve_gpt_oss_kv_cache_manager_v2() is True
+
+
+@pytest.mark.parametrize("user_setting", [False, True])
+def test_gpt_oss_explicit_setting_wins(user_setting):
+    """An explicit user value is never overridden by the model preference."""
+    assert _resolve_gpt_oss_kv_cache_manager_v2(kv_cache_config=KvCacheConfig(
+        use_kv_cache_manager_v2=user_setting)) is user_setting
+
+
+def test_gpt_oss_one_model_eagle3_keeps_v2():
+    """One-model Eagle3 shares the target engine, so V2 still applies."""
+    assert _resolve_gpt_oss_kv_cache_manager_v2(
+        speculative_config=Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model="/tmp/dummy_eagle_model",
+            eagle3_one_model=True)) is True
 
 
 def dump_config_json(dst_dir):

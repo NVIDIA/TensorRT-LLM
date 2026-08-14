@@ -35,6 +35,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType
+from ..impl_contract import MoERunContext
 from ..interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
 from ..quantization import (
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
@@ -651,13 +652,9 @@ class MegaMoEDeepGemm(MoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
+        ctx: MoERunContext,
         *,
-        output_dtype: Optional[torch.dtype] = None,
-        **unused_kwargs,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """Run the fused kernel with either BF16 or pre-quantized activations.
 
@@ -665,9 +662,12 @@ class MegaMoEDeepGemm(MoE):
         FP8+SF+topk SymmBuffer fields in one custom op. The fallback path
         keeps the original ``quantize_input`` + copy contract.
         """
-        assert not unused_kwargs, (
-            f"MegaMoEDeepGemm.run_moe got unexpected kwargs: {sorted(unused_kwargs)}"
-        )
+        del workspace  # The SymmBuffer is this backend's own workspace.
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
         dg = self._dg
