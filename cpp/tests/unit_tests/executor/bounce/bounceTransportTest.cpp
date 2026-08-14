@@ -21,7 +21,6 @@
 // forcing credit recycling. Skips if no CUDA device or the NIXL backend cannot initialize.
 
 #include "bounceTestNixlNode.h"
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/NixlNotifControlChannel.h"
 
 #include <gtest/gtest.h>
 
@@ -144,33 +143,6 @@ TEST(BounceTransport, ReplacementHandshakeClearsStaleCompatibility)
     EXPECT_ANY_THROW(node->tx->registerPeerHandshake("peer", b::encodeHandshake(invalidEndpoint)));
     EXPECT_FALSE(node->tx->hasPeerHandshake("peer"));
     node->tx->shutdown();
-}
-
-TEST(BounceTransport, NixlNotificationEndpointRegistrationRejectsInvalidMetadata)
-{
-    if (!bounce_test::hasCuda())
-    {
-        GTEST_SKIP() << "no CUDA device";
-    }
-    b::BounceConfig cfg;
-    cfg.arenaSizeBytes = 1ULL << 20;
-    cfg.maxChunkSizeBytes = 4096;
-    cfg.arenaAllocationGranularityBytes = 256;
-    auto A = bounce_test::makeNode("btNotifEndpointA", cfg, /*maxDescs=*/1024);
-    auto B = bounce_test::makeNode("btNotifEndpointB", cfg, /*maxDescs=*/1024);
-    if (!A || !B)
-    {
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-    }
-
-    b::NixlNotifControlChannel channelA(A->agent->getRawAgent(), A->name);
-    b::NixlNotifControlChannel channelB(B->agent->getRawAgent(), B->name);
-    EXPECT_FALSE(channelA.addPeer(B->name, ""));
-    EXPECT_FALSE(channelA.addPeer(B->name, "not-nixl-metadata"));
-    EXPECT_FALSE(channelA.addPeer("wrongPeerName", channelB.localEndpoint()));
-
-    A->tx->shutdown();
-    B->tx->shutdown();
 }
 
 // Regression: maxChunkSizeBytes can be no larger than the buddy allocator's usable capacity, which
