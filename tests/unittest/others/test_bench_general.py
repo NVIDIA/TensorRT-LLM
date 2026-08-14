@@ -32,5 +32,8 @@ def test_get_settings_reports_installed_version() -> None:
         "gpus_per_node": 8,
         "backend": "pytorch",
     }
-    settings = get_settings(params, SimpleNamespace(), model="dummy-model", model_path=None)
+    settings = get_settings(params,
+                            SimpleNamespace(max_isl=512),
+                            model="dummy-model",
+                            model_path=None)
     assert settings["sw_version"] == __version__
