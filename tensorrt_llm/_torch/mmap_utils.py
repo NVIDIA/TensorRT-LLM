@@ -12,14 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-memory ``mmap``/``madvise`` helpers for file-backed page cache.
+"""Host-memory `mmap`/`madvise` helpers for file-backed page cache.
 
 These utilities either advise the OS to drop the physical pages backing
 read-only file-backed mmap regions (e.g. safetensors shards) so the resident
 file cache cannot grow unbounded during weight load on host-memory-constrained
 nodes, or conversely fault a file's pages into the page cache ahead of use
-(``populate_file_pages``). Callers must establish that a tensor is file-backed
-before using ``advise_tensor_pageout``.
+(`populate_file_pages`). Callers must establish that a tensor is file-backed
+before using `advise_tensor_pageout`.
 """
 
 import ctypes
@@ -99,28 +99,28 @@ def populate_file_pages(
 ) -> int:
     """Fault a file's pages into the OS page cache without copying to user space.
 
-    Maps the file read-only and issues ``madvise(MADV_POPULATE_READ)`` over it in
-    ``window_bytes`` windows. Windowing keeps per-call ``mmap_lock`` hold times
-    short, so concurrent ``mmap``/``munmap`` callers in the process are not stalled
+    Maps the file read-only and issues `madvise(MADV_POPULATE_READ)` over it in
+    `window_bytes` windows. Windowing keeps per-call `mmap_lock` hold times
+    short, so concurrent `mmap`/`munmap` callers in the process are not stalled
     behind one long populate, and gives callers progress granularity via
-    ``on_window(num_bytes)``. ``window_bytes`` must be a positive multiple of the
-    page size (raises ``ValueError`` otherwise): a zero window would never advance,
+    `on_window(num_bytes)`. `window_bytes` must be a positive multiple of the
+    page size (raises `ValueError` otherwise): a zero window would never advance,
     and an unaligned one would fail from the second window on with an error that is
     indistinguishable from an unsupported kernel.
 
-    Both the mapping and the advice are issued through ``ctypes`` rather than the
-    built-in ``mmap`` module deliberately. Population blocks for the duration of
-    the underlying file read, and ``mmap.mmap.madvise`` holds the GIL for the whole
-    call while ``ctypes`` releases it, so the built-in method would serialize
+    Both the mapping and the advice are issued through `ctypes` rather than the
+    built-in `mmap` module deliberately. Population blocks for the duration of
+    the underlying file read, and `mmap.mmap.madvise` holds the GIL for the whole
+    call while `ctypes` releases it, so the built-in method would serialize
     concurrent populating threads (measured on a cold file: a background thread ran
-    ~500x slower during an ``mmap.madvise`` populate than during the ``ctypes``
-    equivalent). The GIL-free ``madvise`` in turn needs the mapping's base address,
-    which is why the mapping also comes from ``libc``: a read-only ``mmap.mmap``
-    never exposes its address (``ctypes.*.from_buffer`` requires a writable
+    ~500x slower during an `mmap.madvise` populate than during the `ctypes`
+    equivalent). The GIL-free `madvise` in turn needs the mapping's base address,
+    which is why the mapping also comes from `libc`: a read-only `mmap.mmap`
+    never exposes its address (`ctypes.*.from_buffer` requires a writable
     buffer), and mapping writable/private just to extract one would reintroduce
     the class of copy-on-write anonymous pages this populate exists to avoid.
 
-    Returns the number of bytes populated. ``MADV_POPULATE_READ`` requires
+    Returns the number of bytes populated. `MADV_POPULATE_READ` requires
     Linux >= 5.14 and an mmap-capable filesystem; when unsupported (or on any other
     failure) population stops early -- typically returning 0 -- and the caller is
     expected to warm the remaining bytes by other means.
