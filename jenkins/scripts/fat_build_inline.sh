@@ -57,7 +57,7 @@ cat > "$WORK_DIR/install.sh" << INSTALL_EOF
 set -euo pipefail
 cd /tmp
 echo "[fat_build] Downloading $TAR_NAME..."
-wget -nv "$LLM_TARFILE_URL"
+wget -nv --tries=5 --retry-connrefused --waitretry=30 --timeout=300 "$LLM_TARFILE_URL"
 tar -zxf "$TAR_NAME"
 rm -f "$TAR_NAME"
 echo "[fat_build] Python/pip versions:"
