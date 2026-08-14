@@ -3735,49 +3735,50 @@ def runInfraDryRunInPreparedWorkspace(pipeline, String llmSrc, String stageName)
     def coverageConfigFile = "${llmSrc}/infra_dry_run.coveragerc"
 
     sh "rm -rf ${outputPath} && mkdir -p ${outputPath} && : > ${waivesFile} && : > ${coverageConfigFile}"
-    def testDBList = renderTestDB(
-        pipeline,
-        INFRA_DRY_RUN_TEST_CONTEXT,
-        llmSrc,
-        stageName,
-    )
-    def preprocessedLists = processShardTestList(
-        llmSrc,
-        testDBList,
-        1,
-        1,
-        false,
-    )
-    if (preprocessedLists.regularCount < 1) {
-        error "No infrastructure dry-run benchmark was selected for ${stageName}"
-    }
-
-    def extraArgs = []
-    if (ENABLE_UPLOAD_TEST_RESULTS) {
-        def uploadPath = UPLOAD_PATH.replaceFirst("sw-tensorrt-generic/llm-artifacts/LLM/", "")
-        extraArgs += [
-            "--capture=fd",
-            "--s3-upload-path=${uploadPath}/${stageName}",
-            "--s3-upload-mode=deferred",
-        ]
-    }
-    def pytestCommand = getPytestBaseCommandLine(
-        llmSrc,
-        stageName,
-        waivesFile,
-        false,
-        outputPath,
-        coverageConfigFile,
-        "",
-        extraArgs,
-    )
-    pytestCommand += [
-        "--test-list=${preprocessedLists.regular}",
-    ]
-
-    // The synthetic benchmark still uses the standard defs/conftest.py reporting
-    // hooks, but it must not require the TRT-LLM product wheel just to collect.
+    // Test-list preprocessing performs a pytest --collect-only pass before the
+    // final pytest invocation. Both passes load defs/conftest.py, so keep the
+    // dry-run import guard active for the entire prepared-workspace flow.
     withEnv(["stageName=${stageName}", "TRTLLM_INFRA_DRY_RUN=true"]) {
+        def testDBList = renderTestDB(
+            pipeline,
+            INFRA_DRY_RUN_TEST_CONTEXT,
+            llmSrc,
+            stageName,
+        )
+        def preprocessedLists = processShardTestList(
+            llmSrc,
+            testDBList,
+            1,
+            1,
+            false,
+        )
+        if (preprocessedLists.regularCount < 1) {
+            error "No infrastructure dry-run benchmark was selected for ${stageName}"
+        }
+
+        def extraArgs = []
+        if (ENABLE_UPLOAD_TEST_RESULTS) {
+            def uploadPath = UPLOAD_PATH.replaceFirst("sw-tensorrt-generic/llm-artifacts/LLM/", "")
+            extraArgs += [
+                "--capture=fd",
+                "--s3-upload-path=${uploadPath}/${stageName}",
+                "--s3-upload-mode=deferred",
+            ]
+        }
+        def pytestCommand = getPytestBaseCommandLine(
+            llmSrc,
+            stageName,
+            waivesFile,
+            false,
+            outputPath,
+            coverageConfigFile,
+            "",
+            extraArgs,
+        )
+        pytestCommand += [
+            "--test-list=${preprocessedLists.regular}",
+        ]
+
         withCredentials([
             string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
