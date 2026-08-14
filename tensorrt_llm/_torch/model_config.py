@@ -632,7 +632,7 @@ class ModelConfig(Generic[TConfig]):
     @staticmethod
     def _read_checkpoint_module_names(
             checkpoint_dir: Optional[str]) -> Optional[List[str]]:
-        """Read the module names, in checkpoint (HF) namespace, of every stored tensor.
+        """Read checkpoint-namespace module names for every stored tensor.
 
         compressed-tensors ``config_groups`` select modules with regexes, so
         resolving a multi-group (mixed-precision) checkpoint into per-layer
@@ -648,14 +648,34 @@ class ModelConfig(Generic[TConfig]):
         if checkpoint_dir is None:
             return None
 
-        checkpoint_path = Path(checkpoint_dir)
-        index_path = checkpoint_path / "model.safetensors.index.json"
         tensor_names = []
-        if index_path.exists():
+        checkpoint_path = Path(checkpoint_dir)
+        if checkpoint_path.is_dir():
+            index_path = checkpoint_path / "model.safetensors.index.json"
+            shard_paths = sorted(checkpoint_path.glob("*.safetensors"))
+        else:
+            try:
+                cached_index = transformers.utils.hub.cached_file(
+                    checkpoint_dir, "model.safetensors.index.json")
+            except OSError:
+                cached_index = None
+            index_path = Path(
+                cached_index) if cached_index is not None else None
+            shard_paths = []
+            if index_path is None:
+                try:
+                    cached_shard = transformers.utils.hub.cached_file(
+                        checkpoint_dir, "model.safetensors")
+                except OSError:
+                    cached_shard = None
+                if cached_shard is not None:
+                    shard_paths.append(Path(cached_shard))
+
+        if index_path is not None and index_path.exists():
             with open(index_path) as f:
                 tensor_names = list(json.load(f).get("weight_map", {}))
         else:
-            for shard in sorted(checkpoint_path.glob("*.safetensors")):
+            for shard in shard_paths:
                 tensor_names.extend(ModelConfig._read_safetensors_header(shard))
 
         # Drop the parameter name ("weight", "weight_packed", ...) and the

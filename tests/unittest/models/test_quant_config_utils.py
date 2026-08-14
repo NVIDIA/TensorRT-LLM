@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+from unittest.mock import patch
+
 import pytest
 
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.models.quant_config_utils import update_quant_config_from_compressed_tensors
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -603,3 +607,59 @@ def test_update_quant_config_from_compressed_tensors_rejects_empty_config_groups
                 "config_groups": {},
             },
         )
+
+
+def test_read_checkpoint_module_names_from_local_index(tmp_path):
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.mlp.gate_proj.weight_packed": "model-1.safetensors",
+                    "model.layers.0.mlp.gate_proj.weight_scale": "model-1.safetensors",
+                    "lm_head.weight": "model-2.safetensors",
+                }
+            }
+        )
+    )
+
+    assert ModelConfig._read_checkpoint_module_names(str(tmp_path)) == [
+        "model.layers.0.mlp.gate_proj",
+        "lm_head",
+    ]
+
+
+def test_read_checkpoint_module_names_resolves_hub_index(tmp_path):
+    index_path = tmp_path / "model.safetensors.index.json"
+    index_path.write_text(
+        json.dumps({"weight_map": {"model.layers.0.self_attn.q_proj.weight": "model.safetensors"}})
+    )
+
+    with patch(
+        "tensorrt_llm._torch.model_config.transformers.utils.hub.cached_file",
+        return_value=str(index_path),
+    ) as cached_file:
+        module_names = ModelConfig._read_checkpoint_module_names("org/model")
+
+    cached_file.assert_called_once_with("org/model", "model.safetensors.index.json")
+    assert module_names == ["model.layers.0.self_attn.q_proj"]
+
+
+def test_model_config_builds_layer_map_for_compressed_tensors(tmp_path):
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    f"{module_name}.weight": "model.safetensors"
+                    for module_name in _QWEN38_MODULE_NAMES
+                }
+            }
+        )
+    )
+
+    quant_config, layer_quant_configs = ModelConfig.load_hf_quant_config(
+        _qwen38_dense_config(), "AUTO", checkpoint_dir=str(tmp_path)
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert layer_quant_configs["lm_head"].quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
