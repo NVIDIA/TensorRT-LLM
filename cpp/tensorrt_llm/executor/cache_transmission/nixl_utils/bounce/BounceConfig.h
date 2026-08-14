@@ -35,7 +35,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 struct BounceConfig
 {
     bool enabled{false};                                     // TRTLLM_NIXL_BOUNCE_ENABLE
-    std::size_t arenaSizeBytes{256ULL << 20};                // TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES
+    std::size_t arenaSizeBytes{512ULL << 20};                // TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES
     std::size_t arenaAllocationGranularityBytes{1ULL << 20}; // TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES
     std::size_t maxChunkSizeBytes{32ULL << 20};              // TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES
     std::uint32_t maxInflightChunksPerRequest{8};            // TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST
