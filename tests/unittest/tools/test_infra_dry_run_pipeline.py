@@ -27,6 +27,7 @@ SLURM_RUN = (REPO_ROOT / "jenkins" / "scripts" / "slurm_run.sh").read_text()
 SLURM_INSTALL_PATH = REPO_ROOT / "jenkins" / "scripts" / "slurm_install.sh"
 CHECK_TEST_LIST = (REPO_ROOT / "scripts" / "check_test_list.py").read_text()
 BENCHMARK_PATH = REPO_ROOT / "tests" / "integration" / "defs" / "test_infra_dry_run_benchmark.py"
+CONFTEST = (REPO_ROOT / "tests" / "integration" / "defs" / "conftest.py").read_text()
 DRY_RUN_DB_PATH = (
     REPO_ROOT / "tests" / "integration" / "test_lists" / "test-db" / "infra_dry_run.yml"
 )
@@ -102,7 +103,9 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         for call in ("renderTestDB(", "processShardTestList(", "getPytestBaseCommandLine("):
             self.assertIn(call, prepared)
         self.assertIn("--test-list=${preprocessedLists.regular}", prepared)
-        self.assertIn('withEnv(["stageName=${stageName}"])', prepared)
+        self.assertIn(
+            'withEnv(["stageName=${stageName}", "TRTLLM_INFRA_DRY_RUN=true"])', prepared
+        )
         self.assertNotIn("test_infra_dry_run_benchmark.py", prepared)
         self.assertLess(docs.index("if (isInfraDryRun())"), docs.index("make html"))
         conditional_properties = _conditional_workflow_properties(prepared)
@@ -130,6 +133,19 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             body.index("runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)"),
         )
         self.assertLess(body.index("if (isInfraDryRun())"), body.index("pip3 install -e"))
+
+    def test_dry_run_conftest_does_not_require_product_bindings(self):
+        dry_guard = '_INFRA_DRY_RUN = os.environ.get("TRTLLM_INFRA_DRY_RUN", "").lower() == "true"'
+        self.assertIn(dry_guard, CONFTEST)
+        guard_start = CONFTEST.index(dry_guard)
+        normal_import = CONFTEST.index(
+            "from tensorrt_llm.bindings import ipc_nvls_supported", guard_start
+        )
+        fallback = CONFTEST[guard_start:normal_import]
+        self.assertIn("def ipc_nvls_supported():", fallback)
+        self.assertIn("def get_mpi_world_size():", fallback)
+        self.assertIn("else:", fallback)
+        self.assertNotIn("from .perf.gpu_clock_lock import GPUClockLock", fallback)
 
     def test_slurm_keeps_only_dry_gates_needed_by_the_standard_runner(self):
         body = _function_body(L0_TEST, "runLLMTestlistWithSbatch", "runLLMTestlistOnSlurm")
