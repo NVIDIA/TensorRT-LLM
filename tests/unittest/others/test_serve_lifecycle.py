@@ -49,7 +49,7 @@ from tensorrt_llm.llmapi.mpi_session import split_mpi_env
 from tensorrt_llm.serve import lifecycle as lifecycle_mod
 from tensorrt_llm.serve.lifecycle import (
     SERVER_STATE_HEADER,
-    ServerLifecycle,
+    ReadinessGate,
     ServerState,
     _build_off_event_loop,
     serve_with_lifecycle,
@@ -379,7 +379,7 @@ def test_lifespan_startup_completes_without_an_engine():
     """Uvicorn only listens after startup completes, so it must not block."""
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         assert lifecycle.state is ServerState.STARTING
         driver = await run_lifespan_startup(lifecycle)
         assert (await driver.shutdown())["type"] == "lifespan.shutdown.complete"
@@ -411,7 +411,7 @@ def test_every_route_is_503_while_starting(path, method):
     """503, never 404 and never a half-initialized handler."""
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         status, headers, body = await call_app(lifecycle, path, method)
         assert status == 503
         assert headers[SERVER_STATE_HEADER] == ServerState.STARTING.value
@@ -425,14 +425,15 @@ def test_every_route_is_503_while_starting(path, method):
 
 def test_attach_flips_to_ready_and_delegates():
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         await run_lifespan_startup(lifecycle)
 
         status, _, _ = await call_app(lifecycle)
         assert status == 503
 
         server = FakeServer()
-        await lifecycle.attach(server.app)
+        lifecycle._app = server.app
+        lifecycle.open()
 
         assert lifecycle.state is ServerState.READY
         status, _, body = await call_app(lifecycle)
@@ -446,7 +447,7 @@ def test_delegate_lifespan_startup_failure_propagates():
     """A delegate whose lifespan fails must not be installed as READY."""
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         await run_lifespan_startup(lifecycle)
 
         async def broken_app(scope, receive, send):
@@ -455,7 +456,8 @@ def test_delegate_lifespan_startup_failure_propagates():
             await send({"type": "lifespan.startup.failed", "message": "boom"})
 
         with pytest.raises(RuntimeError, match="failed to start"):
-            await lifecycle.attach(broken_app)
+            lifecycle._app = broken_app
+            lifecycle.open()
         assert lifecycle.state is ServerState.STARTING
 
     run_scenario(scenario)
@@ -465,7 +467,7 @@ def test_delegate_lifespan_shutdown_runs_on_outer_shutdown():
     """The delegate owns engine teardown; it must still be reached."""
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         driver = await run_lifespan_startup(lifecycle)
         shut_down = asyncio.Event()
 
@@ -737,7 +739,7 @@ def test_websocket_upgrade_is_refused_cleanly_while_starting():
     """
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         scope = {
             "type": "websocket",
             "asgi": {"version": "3.0"},
@@ -770,7 +772,7 @@ def test_websocket_aborted_mid_handshake_is_left_alone():
     """
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         scope = {
             "type": "websocket",
             "asgi": {"version": "3.0"},
@@ -1096,7 +1098,7 @@ def test_failed_attach_still_routes_shutdown_into_the_delegate():
     """attach() registers the delegate lifespan *before* awaiting startup."""
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         driver = await run_lifespan_startup(lifecycle)
         shutdown_seen = asyncio.Event()
 
@@ -1135,7 +1137,7 @@ def test_normal_shutdown_cancels_a_lifespan_that_will_not_finish(monkeypatch):
     monkeypatch.setattr(lifecycle_mod, "_DELEGATE_SHUTDOWN_TIMEOUT_SECONDS", 0.5)
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         driver = await run_lifespan_startup(lifecycle)
 
         async def never_finishes(scope, receive, send):
@@ -1161,7 +1163,7 @@ def test_finish_delegate_lifespan_is_false_when_nothing_was_attached():
     """No delegate means no delegate teardown, so the caller owns it."""
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         assert await lifecycle.finish_delegate_lifespan() is False
 
     run_scenario(scenario)
@@ -1253,7 +1255,7 @@ def test_abandon_is_bounded_against_a_lifespan_that_swallows_cancellation(monkey
     monkeypatch.setattr(lifecycle_mod, "_ABANDON_TIMEOUT_SECONDS", 1.0)
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         await run_lifespan_startup(lifecycle)
 
         async with attached_lifespan_that_swallows_cancellation(lifecycle) as task:
@@ -1286,7 +1288,7 @@ def test_finish_delegate_lifespan_propagates_caller_cancellation(monkeypatch):
     monkeypatch.setattr(lifecycle_mod, "_ABANDON_TIMEOUT_SECONDS", 30.0)
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         await run_lifespan_startup(lifecycle)
 
         async with attached_lifespan_that_swallows_cancellation(lifecycle):
@@ -1306,7 +1308,7 @@ def test_cooperative_delegate_shutdown_is_bounded(monkeypatch):
     monkeypatch.setattr(lifecycle_mod, "_DELEGATE_SHUTDOWN_TIMEOUT_SECONDS", 1.0)
 
     async def scenario():
-        lifecycle = ServerLifecycle()
+        lifecycle = ReadinessGate(_NullApp())
         driver = await run_lifespan_startup(lifecycle)
 
         async def never_finishes(scope, receive, send):
@@ -1335,6 +1337,20 @@ def test_cooperative_delegate_shutdown_is_bounded(monkeypatch):
 # 503, so the deadline must be enforced on the non-exception path too, or a
 # hung init would spin the harness forever and leak the trtllm-serve child.
 # --------------------------------------------------------------------------
+
+
+class _NullApp:
+    """Stand-in delegate for a gate under test before a real app exists."""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            while True:
+                msg = await receive()
+                if msg["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif msg["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
 
 
 class _StartingForeverHandler(BaseHTTPRequestHandler):

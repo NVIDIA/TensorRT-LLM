@@ -686,6 +686,67 @@ def launch_server(
         # failure in between leaks the child processes.
         frontend_children = []
 
+        def build_skeleton() -> OpenAIServer:
+            """Build an engine-less server whose app uvicorn can serve now.
+
+            Middleware must be installed here: Starlette refuses
+            add_middleware once an application has started, and under the
+            lifecycle contract the app starts before the engine exists. The
+            perf-metrics flags therefore come from llm_args -- a plain dict
+            available before the engine is built -- rather than generator.args.
+            """
+            expose = bool(llm_args.get("return_perf_metrics", False))
+            server = OpenAIServer(
+                generator=None,
+                model=model,
+                tool_parser=tool_parser,
+                server_role=server_role,
+                metadata_server_cfg=metadata_server_cfg,
+                disagg_cluster_config=disagg_cluster_config,
+                multimodal_server_config=multimodal_server_config,
+                chat_template=chat_template,
+                allow_request_chat_template=allow_request_chat_template,
+                input_processor_workers=num_input_processor_workers,
+                media_load_workers=num_media_load_workers,
+                internal_disagg_auth_key=internal_disagg_auth_key,
+                expose_perf_metrics=expose,
+                collect_perf_metrics=expose
+                or llm_args.get("perf_metrics_output_dir") is not None)
+            _apply_fastapi_middlewares(server.app, middleware)
+            return server
+
+        def build_engine():
+            """Blocking engine construction; runs off the event loop."""
+            if backend == 'pytorch':
+                llm_args.pop("build_config", None)
+                llm = PyTorchLLM(**llm_args)
+            elif backend == '_autodeploy':
+                from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+
+                # AutoDeploy does not support build_config
+                llm_args.pop("build_config", None)
+                llm = AutoDeployLLM(**llm_args)
+            else:
+                raise click.BadParameter(
+                    f"{backend} is not a known backend, check help for available options.",
+                    param_hint="backend")
+            try:
+                if multi_frontend.is_launcher:
+                    _spawn_attached_frontends(llm, multi_frontend.num_frontends,
+                                              frontend_children)
+            except BaseException:
+                # BaseException, not Exception: a KeyboardInterrupt or a
+                # CancelledError leaks the engine just as surely as a
+                # TypeError would.
+                try:
+                    llm.shutdown()
+                except Exception as shutdown_error:
+                    logger.error(
+                        "Engine shutdown after a failed frontend spawn did "
+                        f"not complete cleanly: {shutdown_error!r}")
+                raise
+            return llm
+
         def build_frontend() -> OpenAIServer:
             """Do every blocking startup step and return the ready server.
 
@@ -771,7 +832,8 @@ def launch_server(
                         host=host,
                         port=port,
                         sockets=[s],
-                        build=build_frontend,
+                        build_skeleton=build_skeleton,
+                        build_engine=build_engine,
                         timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
                         on_ready=lambda srv: srv.register_with_disagg_cluster(),
                         on_startup_failure=lambda srv: srv.shutdown_generator(),
