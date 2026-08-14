@@ -1323,6 +1323,34 @@ def test_attention_keeps_every_head_and_channel_under_attention_dp(no_collective
     assert attn.v_sconv.channels == kv_dim == attn.v_sconv.channels_full
 
 
+def test_the_backend_gets_this_layer_s_own_attention_scalars(no_collectives):
+    """The compute lives in InklingTritonAttention.forward_inkling, which reads
+    sm_scale / rel_extent / window_left off itself -- so InklingAttention has to
+    put them there (create_attention() takes a fixed kwarg list, with no
+    passthrough for model-specific values).
+
+    Both layer families are checked because the two differ and getting one wrong
+    does not raise: a local layer that inherited a global layer's window_left=-1
+    would silently attend outside its sliding window and produce plausible,
+    wrong text. The tiny config pins layer 0 local and layer 1 global.
+    """
+    _, local = _tiny_attention(adp=False, layer_idx=0)
+    _, glob = _tiny_attention(adp=False, layer_idx=1)
+
+    for module in (local, glob):
+        assert module.attn.sm_scale == module.sm_scale
+        assert module.attn.rel_extent == module.rel_extent
+        assert module.attn.window_left == module.window_left
+        # The moved code indexes the KV cache with the backend's layer_idx, and
+        # KVCacheManagerV2 expects the GLOBAL index there.
+        assert module.attn.layer_idx == module.layer_idx
+
+    # And the two layers really do disagree, or the loop above proves nothing.
+    assert local.window_left >= 0, "layer 0 should be a sliding-window layer"
+    assert glob.window_left == -1, "layer 1 should be full causal"
+    assert local.rel_extent != glob.rel_extent
+
+
 def test_attention_still_shards_heads_and_channels_without_attention_dp(no_collectives):
     """Regression guard: pure TP is what every Inkling accuracy run to date
     measured, and the ADP change must not have moved it."""
