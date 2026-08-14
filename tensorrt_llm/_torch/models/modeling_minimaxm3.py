@@ -170,12 +170,12 @@ def _validate_sparse_attention_runtime_config(
     such as MSA requiring SM100, are validated by the backend itself.
     """
     sparse_config = model_config.sparse_attention_config
-    if getattr(sparse_config, "algorithm", None) != "minimax_m3":
+    if sparse_config is None or sparse_config.algorithm != "minimax_m3":
         raise ValueError(
             "MiniMax-M3 requires sparse_attention_config.algorithm='minimax_m3' "
             "to create its KV-cache manager and prepare attn_metadata.minimax_m3. "
-            "Set sparse_attention_config:\n  algorithm: minimax_m3 in the LLM "
-            "API configuration."
+            "Set the following in the LLM API configuration:\n"
+            "sparse_attention_config:\n  algorithm: minimax_m3"
         )
 
 

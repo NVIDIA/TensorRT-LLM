@@ -37,6 +37,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3Model,
     _build_swiglu_oai_dense_mlp,
     _minimax_m3_swiglu_oai,
     _strip_language_model_prefix,
@@ -54,7 +55,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM3MoeRoutingMethod,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig
+from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
@@ -69,11 +70,11 @@ _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
 
 @pytest.mark.parametrize(
     "sparse_attention_config",
-    [None, SimpleNamespace(algorithm="rocket")],
+    [None, RocketSparseAttentionConfig()],
 )
 def test_validate_sparse_attention_runtime_config_rejects_wrong_backend(
-    sparse_attention_config,
-):
+    sparse_attention_config: MiniMaxM3SparseAttentionConfig | RocketSparseAttentionConfig | None,
+) -> None:
     model_config = ModelConfig(
         pretrained_config=_make_text_config(),
         sparse_attention_config=sparse_attention_config,
@@ -83,13 +84,23 @@ def test_validate_sparse_attention_runtime_config_rejects_wrong_backend(
         _validate_sparse_attention_runtime_config(model_config)
 
 
-def test_validate_sparse_attention_runtime_config_accepts_minimax_m3():
+def test_validate_sparse_attention_runtime_config_accepts_minimax_m3() -> None:
     model_config = ModelConfig(
         pretrained_config=_make_text_config(),
         sparse_attention_config=MiniMaxM3SparseAttentionConfig(),
     )
 
     _validate_sparse_attention_runtime_config(model_config)
+
+
+def test_model_init_validates_sparse_attention_runtime_config() -> None:
+    model_config = ModelConfig(
+        pretrained_config=_make_text_config(),
+        sparse_attention_config=None,
+    )
+
+    with pytest.raises(ValueError, match="algorithm='minimax_m3'"):
+        MiniMaxM3Model(model_config)
 
 
 def _make_text_config():

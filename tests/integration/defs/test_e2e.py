@@ -1899,8 +1899,11 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
                  marks=skip_pre_blackwell,
                  id='MiniMax-M3'),
 ])
-def test_multi_nodes_eval(model_path, llm_api_config, tp_size, pp_size, ep_size,
-                          eval_task, tmp_path, mmlu_dataset_root):
+def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
+                                                                         Any]],
+                          tp_size: int, pp_size: int, ep_size: int,
+                          eval_task: str, tmp_path: Path,
+                          mmlu_dataset_root: str) -> None:
     mmlu_threshold = 81.5
     model_dir = f"{llm_models_root()}/{model_path}"
     run_cmd = [
