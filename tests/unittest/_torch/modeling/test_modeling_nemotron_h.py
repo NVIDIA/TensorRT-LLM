@@ -18,12 +18,6 @@ def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
     return torch.log(token_probs)
 
 
-def extract_prefill_logprobs(result: RequestOutput) -> torch.Tensor:
-    token_ids = torch.tensor(result.prompt_token_ids[1:])
-    logits = result.context_logits[:-1, :]
-    return get_logprobs(token_ids.cuda(), logits)
-
-
 def extract_decode_logprobs(result: RequestOutput,
                             gen_idx: int = 0) -> torch.Tensor:
     token_ids = torch.tensor(result.outputs[gen_idx].token_ids)
@@ -61,17 +55,32 @@ def create_nemotron_h_llm(model_folder,
     )
 
 
+# Nemotron-H-8B-Base-8K product coverage was pruned (TRTLLM-15100/15101).
+# Keep hybrid-architecture behavior on in-scope Nano-30B successors instead.
+# test_nemotron_h_correctness was not ported: its mcore / initial-impl logprob
+# goldens are 8B-specific. Product accuracy for Nano is covered by GSM8K/MMLU
+# integration tests, which do not replace the CUDA-graph / overlap-scheduler
+# SSM-cache equality checks below.
+_NANO_30B_BF16 = "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+_NANO_30B_FP8 = "NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
+
+
 @pytest.mark.parametrize("mamba_ssm_cache_dtype", [None, "float32"],
                          ids=lambda n: f"mamba_ssm_cache_dtype:{n}")
 @pytest.mark.parametrize("model_folder", [
-    pytest.param("NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    pytest.param(_NANO_30B_BF16,
                  marks=skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)),
-    pytest.param("NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+    pytest.param(_NANO_30B_FP8,
                  marks=skip_gpu_memory_less_than((30 + 1) * 2**30)),
 ])
 def test_nemotron_h_sanity(mamba_ssm_cache_dtype, model_folder):
+    """Hybrid path smoke only: LoadFormat.DUMMY (random weights), no numerics.
+
+    Does not catch CUDA-graph / overlap-scheduler SSM-cache divergence; see
+    test_nemotron_h_cuda_graph_overlap_scheduler for that coverage on Nano.
+    """
     # Skip test if FP8 is not supported on the current architecture.
-    use_fp8 = model_folder == "NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
+    use_fp8 = model_folder == _NANO_30B_FP8
     skip_fp8_pre_ada(use_fp8)
 
     torch.cuda.empty_cache()
@@ -115,3 +124,142 @@ def test_nemotron_h_sanity(mamba_ssm_cache_dtype, model_folder):
         ]
         sampling_params.max_tokens = 1
         nemotron_h.generate(text_prompts_with_completions, sampling_params)
+
+
+@skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)
+def test_nemotron_h_cuda_graph_overlap_scheduler():
+    """Real-weight Nano: CUDA-graph vs eager and overlap on vs off logprobs.
+
+    Re-parametrized from Nemotron-H-8B-Base-8K onto Nano-30B-BF16 so the
+    hybrid SSM-cache behavior under graph replay stays covered after the
+    8B product prune. GSM8K/MMLU do not catch small CG/overlap divergences.
+    """
+    prompts = [
+        "The sky is blue because",
+        "The sum of two and two is",
+        "The largest mammal is the",
+        "The chemical symbol for water is",
+    ]
+
+    # max_tokens=2 keeps the smoke check tight.
+    sampling_config = SamplingParams(max_tokens=2,
+                                     temperature=0.0,
+                                     return_generation_logits=True)
+
+    # Test without cg and overlap scheduler disabled
+    with create_nemotron_h_llm(model_folder=_NANO_30B_BF16,
+                               use_cuda_graph=False,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16) as llm:
+        outputs_no_cg_no_overlap = llm.generate(prompts,
+                                                sampling_params=sampling_config,
+                                                use_tqdm=True)
+
+    # Test with cg and overlap scheduler disabled
+    with create_nemotron_h_llm(model_folder=_NANO_30B_BF16,
+                               use_cuda_graph=True,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16) as llm:
+        outputs_with_cg_no_overlap = llm.generate(
+            prompts, sampling_params=sampling_config, use_tqdm=True)
+
+    # Test with cg and overlap scheduler enabled
+    with create_nemotron_h_llm(model_folder=_NANO_30B_BF16,
+                               use_cuda_graph=True,
+                               disable_overlap_scheduler=False,
+                               max_batch_size=16) as llm:
+        outputs_with_cg_with_overlap = llm.generate(
+            prompts, sampling_params=sampling_config, use_tqdm=True)
+
+    # Verify outputs are consistent
+    for i, (no_cg_no_overlap, with_cg_no_overlap,
+            with_cg_with_overlap) in enumerate(
+                zip(outputs_no_cg_no_overlap, outputs_with_cg_no_overlap,
+                    outputs_with_cg_with_overlap)):
+
+        assert (
+            no_cg_no_overlap.outputs[0].text ==
+            with_cg_no_overlap.outputs[0].text
+        ), f"Prompt {i}: no CG no overlap generated text != with CG no overlap generated text"
+        assert (
+            with_cg_no_overlap.outputs[0].text ==
+            with_cg_with_overlap.outputs[0].text
+        ), f"Prompt {i}: with CG no overlap generated text != with CG with overlap generated text"
+
+        # similar to other unittests comparing with / without CG, compare logits of first generation step (2nd generated token)
+        torch.testing.assert_close(
+            no_cg_no_overlap.outputs[0].generation_logits[1, :],
+            with_cg_no_overlap.outputs[0].generation_logits[1, :],
+            atol=0.2,
+            rtol=0.2,
+            msg=lambda x:
+            f"Prompt {i}: with/without CG (no overlap) logits for first generated step {x}"
+        )
+
+        # compare logprobs of all generated tokens
+        torch.testing.assert_close(
+            extract_decode_logprobs(no_cg_no_overlap),
+            extract_decode_logprobs(with_cg_no_overlap),
+            atol=0.2,
+            rtol=0.2,
+            msg=lambda x:
+            f"Prompt {i}: with/without CG (no overlap) logprobs for all selected tokens {x}"
+        )
+
+        # Similar comparison for with / without overlap scheduler, compare logits of first generation step (2nd generated token)
+        # overlap scheduler should have no effect on all logits - low tolerance
+        torch.testing.assert_close(
+            with_cg_no_overlap.outputs[0].generation_logits[1, :],
+            with_cg_with_overlap.outputs[0].generation_logits[1, :],
+            atol=0.05,
+            rtol=0.05,
+            msg=lambda x:
+            f"Prompt {i}: with/without overlap scheduler (with CG) logits for first generated step {x}"
+        )
+
+        # compare logprobs of all generated tokens
+        torch.testing.assert_close(
+            extract_decode_logprobs(with_cg_no_overlap),
+            extract_decode_logprobs(with_cg_with_overlap),
+            atol=0.05,
+            rtol=0.05,
+            msg=lambda x:
+            f"Prompt {i}: with/without overlap scheduler (with CG) logprobs for all selected tokens {x}"
+        )
+
+
+@skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)
+def test_nemotron_h_chunked_prefill():
+    """Real-weight Nano: non-empty output with chunked prefill on the Mamba path.
+
+    Ported from the pruned 8B coverage onto Nano-30B-BF16 so chunked prefill
+    on hybrid SSM layers stays exercised.
+    """
+    # Long prompts (~100 tokens) to make sure chunked prefill is enabled
+    # (At the time of development, tokens_per_block isn't configurable from the LLM API,
+    # and max_tokens (i.e. chunk size) needs to be a multiple of tokens_per_block)
+    prompts = [
+        "Artificial Intelligence in Healthcare: Artificial intelligence (AI) is transforming healthcare by improving diagnostics, treatment plans, and patient care. AI algorithms can analyze medical images with high accuracy, assist in early disease detection, and personalize treatment plans based on patient data. Additionally, AI-powered chatbots and virtual assistants provide support to patients, enhancing accessibility and efficiency in healthcare services. As AI technology continues to advance, its integration into healthcare systems promises to deliver better outcomes and reduce costs. With continuous research and development, AI in healthcare is poised to",
+        "The Role of Cloud Computing: Cloud computing has revolutionized the way businesses operate by providing scalable, on-demand access to computing resources. This technology allows organizations to store and process data remotely, reducing the need for physical infrastructure and enabling greater flexibility. Cloud services facilitate collaboration, enhance data security, and support the deployment of innovative applications. As businesses increasingly adopt cloud solutions, they benefit from improved efficiency, cost savings, and the ability to rapidly adapt to changing market conditions. Companies leveraging cloud computing are better positioned to",
+        "Advancements in Renewable Energy: Renewable energy technologies, such as solar and wind power, are crucial for addressing climate change and reducing dependence on fossil fuels. Advances in energy storage, grid integration, and efficiency are making renewable energy sources more viable and cost-effective. Innovations in materials science and engineering are also driving the development of next-generation renewable technologies. As global efforts to combat climate change intensify, the continued advancement of renewable energy will play a pivotal role in achieving a sustainable future. Governments and industries are increasingly investing in",
+        "The Importance of Cybersecurity: In today's digital age, cybersecurity has become essential to protect sensitive information and maintain the integrity of systems. With the rise of cyber threats such as hacking, phishing, and ransomware, organizations must implement robust security measures to safeguard their data. Cybersecurity involves a combination of technologies, processes, and practices designed to defend against unauthorized access and attacks. By staying vigilant and updating security protocols, businesses can mitigate risks and ensure the safety of their digital assets. Proactive cybersecurity strategies are crucial in",
+        "The Impact of Artificial Intelligence on Education: Artificial intelligence is reshaping education by providing personalized learning experiences and automating administrative tasks. AI-driven educational tools can adapt to individual student needs, offering tailored feedback and resources to enhance learning outcomes. Additionally, AI can streamline administrative processes, allowing educators to focus more on teaching and student engagement. As AI continues to evolve, its role in education will expand, offering new opportunities for innovation and efficiency. The integration of AI in classrooms promises to revolutionize how students learn and how educators manage their",
+    ]
+    sampling_config = SamplingParams(max_tokens=2, temperature=0.0)
+
+    with create_nemotron_h_llm(model_folder=_NANO_30B_BF16,
+                               use_cuda_graph=False,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16,
+                               enable_chunked_prefill=True,
+                               max_num_tokens=64) as llm:
+        outputs = llm.generate(prompts,
+                               sampling_params=sampling_config,
+                               use_tqdm=True)
+
+    for i, output in enumerate(outputs):
+        # Verify non-empty generation
+        assert len(output.outputs[0].token_ids
+                   ) > 0, f"Prompt {i}: chunked prefill produced empty output"
+        assert len(output.outputs[0].text
+                   ) > 0, f"Prompt {i}: chunked prefill produced empty text"
