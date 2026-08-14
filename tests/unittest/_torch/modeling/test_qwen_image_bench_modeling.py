@@ -52,10 +52,12 @@ def _qwen3_8_dense_vlm_config():
     Qwen/Qwen3.6-27B, and their quantized re-exports): the generic
     `Qwen3_5ForConditionalGeneration` architecture, a composite
     text_config/vision_config, all four vision token ids, and the generic
-    transformers `language_model_only: false` field. Structurally it is
-    indistinguishable from a Qwen-Image-Bench config, which is why detection
-    cannot key on any of these fields.
+    transformers `language_model_only: false` field. Its vision sub-config uses
+    the newer `qwen3_5_vision` model type; Qwen-Image-Bench retains the legacy
+    `qwen3_5` spelling.
     """
+    vision_config = _qwen3_5_vision_config()
+    vision_config["model_type"] = "qwen3_5_vision"
     return {
         "architectures": ["Qwen3_5ForConditionalGeneration"],
         "image_token_id": 248056,
@@ -64,7 +66,7 @@ def _qwen3_8_dense_vlm_config():
         "text_config": _qwen3_5_text_config(),
         "tie_word_embeddings": False,
         "video_token_id": 248057,
-        "vision_config": _qwen3_5_vision_config(),
+        "vision_config": vision_config,
         "vision_end_token_id": 248054,
         "vision_start_token_id": 248053,
     }
@@ -129,17 +131,17 @@ def _qwen3_5_text_config():
     }
 
 
-def test_qwen_image_bench_config_uses_generic_arch_and_normalizes_text(tmp_path):
+def test_qwen_image_bench_config_uses_internal_arch_and_normalizes_text(tmp_path):
     model_dir = tmp_path / "Qwen-Image-Bench"
     model_dir.mkdir()
     _write_qwen_image_bench_config(model_dir)
 
     config = load_pretrained_config(str(model_dir))
 
-    assert config.architectures == ["Qwen3_5ForConditionalGeneration"]
+    assert config.architectures == ["QwenImageBenchForConditionalGeneration"]
     assert config.model_type == "qwen3_5"
     assert config.vision_config.depth == 1
-    assert isinstance(config.text_config, transformers.Qwen3_5TextConfig)
+    assert isinstance(config.text_config, transformers.Qwen3NextConfig)
     assert config.text_config.architectures == ["Qwen3_5ForCausalLM"]
     assert config.text_config.rope_scaling["type"] == "mrope"
     assert config.text_config.rope_scaling["mrope_section"] == [1, 1, 2]
@@ -180,15 +182,10 @@ def test_qwen3_5_generic_composite_config_does_not_use_image_bench_arch(tmp_path
     assert config.text_config.architectures == ["Qwen3_5ForCausalLM"]
 
 
-def test_qwen_image_bench_declared_arch_detected_regardless_of_model_name(tmp_path):
+def test_qwen_image_bench_config_detection_does_not_depend_on_model_name(tmp_path):
     model_dir = tmp_path / "local-checkpoint"
     model_dir.mkdir()
     _write_qwen_image_bench_config(model_dir)
-
-    config_path = model_dir / "config.json"
-    config = json.loads(config_path.read_text())
-    config["architectures"] = ["QwenImageBenchForConditionalGeneration"]
-    config_path.write_text(json.dumps(config))
 
     config = load_pretrained_config(str(model_dir))
 

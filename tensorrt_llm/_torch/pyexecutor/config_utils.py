@@ -415,9 +415,13 @@ _QWEN_IMAGE_BENCH_ARCHITECTURE = "QwenImageBenchForConditionalGeneration"
 
 
 def is_qwen_image_bench_config(config_dict: dict) -> bool:
-    """Return whether the config explicitly requests QwenImageBenchModel."""
+    """Detect Qwen-Image-Bench without matching newer Qwen3.6/3.8 VLMs."""
     architectures = config_dict.get("architectures") or []
-    return architectures[:1] == [_QWEN_IMAGE_BENCH_ARCHITECTURE]
+    vision_config = config_dict.get("vision_config") or {}
+    return (architectures[:1] == [_QWEN_IMAGE_BENCH_ARCHITECTURE]
+            or (config_dict.get("language_model_only") is False
+                and architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
+                and vision_config.get("model_type") == "qwen3_5"))
 
 
 def _resolve_composite_torch_dtype(*config_dicts: dict) -> torch.dtype:
