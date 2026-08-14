@@ -1036,6 +1036,8 @@ class KimiKDARuntime(nn.Module):
                 mixer.g_proj,
             )
             qkvg_weight = self._merge_projection_weights(qkvg_modules)
+            # Eight BF16 outputs occupy 16 bytes, so padding keeps each output row
+            # aligned for vectorized f_b consumption; it is not a kernel requirement.
             bfa_weight = self._merge_projection_weights(
                 (mixer.f_a_proj, mixer.b_proj), pad_rows_to=8
             )
