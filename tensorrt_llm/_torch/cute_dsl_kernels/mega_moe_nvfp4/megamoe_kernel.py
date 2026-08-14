@@ -182,6 +182,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         token_back_mode: Literal["epi_warps", "standalone_warps",
                                  "reuse_dispatch_warps"] = "epi_warps",
         apply_topk_in_fc1: bool = True,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
@@ -254,6 +256,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             token_back_by_dispatch=token_back_by_dispatch,
             apply_topk_in_fc1=apply_topk_in_fc1,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             gate_up_clamp=gate_up_clamp,
             epi_flag_batch=epi_flag_batch,
         )
@@ -889,7 +893,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             f"_padding_{self.token_padding_block}x{self.sf_padding_block}"
             f"_{fc2store}_{inkred}_token_back_by_{token_back}_{apply_topk}"
             f"_fc2out{self.fc2_output_dtype.__name__}_combine{self.combine_format}_sfvec{self.sf_vec_size}"
-            f"_acc{self.acc_dtype.__name__}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
+            f"_acc{self.acc_dtype.__name__}_swiglua{self.swiglu_alpha}"
+            f"_swiglub{self.swiglu_beta}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}")

@@ -331,8 +331,11 @@ def create_moe_backend(
                            ], f"bias not supported in {moe_cls.__name__}."
 
     if swiglu_alpha is not None or swiglu_beta is not None:
-        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE], \
-            f"swiglu_alpha and swiglu_beta are only supported in CutlassFusedMoE, TritonFusedMoE and TRTLLMGenFusedMoE, not in {moe_cls.__name__}."
+        assert moe_cls in [
+            CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE,
+            MegaMoECuteDsl
+        ], \
+            f"swiglu_alpha and swiglu_beta are only supported in CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE and MegaMoECuteDsl, not in {moe_cls.__name__}."
         assert swiglu_alpha is not None and swiglu_beta is not None, \
             "Both swiglu_alpha and swiglu_beta must be provided."
 
@@ -531,6 +534,8 @@ def create_moe_backend(
             megamoe_kwargs["swiglu_limit"] = (swiglu_limit
                                               if swiglu_limit is not None else
                                               swiglu_limit_scalar)
+            megamoe_kwargs["swiglu_alpha"] = swiglu_alpha
+            megamoe_kwargs["swiglu_beta"] = swiglu_beta
         else:
             megamoe_kwargs["swiglu_limit_scalar"] = swiglu_limit_scalar
         return moe_cls(**megamoe_kwargs)

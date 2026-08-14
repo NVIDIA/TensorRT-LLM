@@ -513,7 +513,13 @@ def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch
         method.post_load_weights(DummyModule())
 
 
-def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
+def _make_megamoe_cutedsl_for_ctor_test(
+    *,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
+) -> MegaMoECuteDsl:
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
         moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
@@ -527,7 +533,50 @@ def _make_megamoe_cutedsl_for_ctor_test() -> MegaMoECuteDsl:
         dtype=torch.bfloat16,
         model_config=model_config,
         init_load_balancer=False,
+        activation_type=activation_type,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
     )
+
+
+def test_megamoe_cutedsl_accepts_uniform_minimax_m3_swiglu_bias() -> None:
+    moe = _make_megamoe_cutedsl_for_ctor_test(
+        activation_type=ActivationType.SwigluBias,
+        swiglu_alpha=torch.full((8,), 1.702),
+        swiglu_beta=torch.ones(8),
+        swiglu_limit=torch.full((8,), 7.0),
+    )
+
+    assert moe.swiglu_activation_alpha == pytest.approx(1.702)
+    assert moe.swiglu_activation_beta == pytest.approx(1.0)
+    assert moe.gate_up_clamp == pytest.approx(7.0)
+
+
+@pytest.mark.parametrize("parameter_name", ["swiglu_alpha", "swiglu_beta", "swiglu_limit"])
+def test_megamoe_cutedsl_rejects_nonuniform_swiglu_bias(parameter_name: str) -> None:
+    parameters = {
+        "swiglu_alpha": torch.full((8,), 1.702),
+        "swiglu_beta": torch.ones(8),
+        "swiglu_limit": torch.full((8,), 7.0),
+    }
+    parameters[parameter_name][-1] += 1.0
+
+    with pytest.raises(
+        ValueError, match=rf"uniform .*{parameter_name}|uniform \(per-layer\) {parameter_name}"
+    ):
+        _make_megamoe_cutedsl_for_ctor_test(
+            activation_type=ActivationType.SwigluBias,
+            **parameters,
+        )
+
+
+def test_megamoe_cutedsl_standard_swiglu_keeps_original_activation_path() -> None:
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+
+    assert moe.swiglu_activation_alpha is None
+    assert moe.swiglu_activation_beta is None
+    assert moe.gate_up_clamp is None
 
 
 def test_megamoe_cutedsl_tuning_mode_forces_top_maxt_bucket(
