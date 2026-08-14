@@ -21,6 +21,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import difflib
+import fcntl
 import fnmatch
 import hashlib
 import os
@@ -31,7 +33,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -80,6 +82,18 @@ _VENDOR_FIELDS = {
 
 class VendorError(RuntimeError):
     """A user-actionable vendoring failure."""
+
+
+class _GitCommandError(VendorError):
+    """A Git subprocess failure with its exit status preserved."""
+
+    def __init__(self, message: str, returncode: int) -> None:
+        super().__init__(message)
+        self.returncode = returncode
+
+
+class _PatchApplicationError(VendorError):
+    """A patch cannot be applied to the selected baseline."""
 
 
 class UpstreamUnavailable(VendorError):
@@ -460,18 +474,21 @@ def _load_lock(
     return lock
 
 
-def _save_lock(lock: LockFile) -> None:
+def _serialize_lock(lock: LockFile) -> bytes:
     payload = {
         "schema_version": _SCHEMA_VERSION,
         "vendors": {name: vendor.to_mapping() for name, vendor in sorted(lock.vendors.items())},
     }
-    content = yaml.safe_dump(
+    return yaml.safe_dump(
         payload,
         sort_keys=False,
         default_flow_style=False,
         allow_unicode=True,
     ).encode("utf-8")
-    _atomic_write(lock.path, content)
+
+
+def _save_lock(lock: LockFile) -> None:
+    _atomic_write(lock.path, _serialize_lock(lock))
 
 
 def _save_lock_checked(lock: LockFile, description: str) -> None:
@@ -479,6 +496,44 @@ def _save_lock_checked(lock: LockFile, description: str) -> None:
         _save_lock(lock)
     except (OSError, yaml.YAMLError) as error:
         raise VendorError(f"Failed to save {description}: {error}") from error
+
+
+def _lock_payload_is_visible(lock: LockFile, payload: bytes) -> bool:
+    try:
+        return lock.path.read_bytes() == payload
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def _vendor_state_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
+    resolved = path.resolve()
+    operation_lock = resolved.parent
+    try:
+        if exclusive:
+            operation_lock.mkdir(parents=True, exist_ok=True)
+        elif not operation_lock.is_dir():
+            yield
+            return
+        file_descriptor = os.open(operation_lock, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as error:
+        raise VendorError(
+            f"Could not open vendor operation lock {operation_lock}: {error}"
+        ) from error
+    try:
+        try:
+            lock_mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(file_descriptor, lock_mode)
+        except OSError as error:
+            raise VendorError(
+                f"Could not acquire vendor operation lock {operation_lock}: {error}"
+            ) from error
+        yield
+    finally:
+        try:
+            fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(file_descriptor)
 
 
 def _checked_root_path(root: Path, relative_path: str, description: str) -> Path:
@@ -605,9 +660,28 @@ def _remove_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _cleanup_committed_destination_backup(backup: Path, vendor: Vendor) -> None:
+    if not (backup.exists() or backup.is_symlink()):
+        return
+    try:
+        _remove_path(backup)
+    except OSError as error:
+        print(
+            f"warning: Replaced vendor {vendor.name!r}, but could not remove "
+            f"its backup {backup}: {error}. The replacement is committed; "
+            "delete that backup manually before the next synchronization.",
+            file=sys.stderr,
+        )
+
+
 @contextlib.contextmanager
 def _replace_selected_destination_transaction(
-    lock: LockFile, vendor: Vendor, tree: Mapping[str, FileEntry]
+    lock: LockFile,
+    vendor: Vendor,
+    tree: Mapping[str, FileEntry],
+    *,
+    expected_destination_tree: Mapping[str, FileEntry] | None = None,
+    commit_check: Callable[[], bool] | None = None,
 ) -> Iterator[None]:
     destination = _checked_root_path(
         lock.root, vendor.destination, f"Vendor {vendor.name!r} destination"
@@ -615,7 +689,6 @@ def _replace_selected_destination_transaction(
     backup = destination.parent / f".{destination.name}.vendor-backup"
     staging: Path | None = None
     destination_existed = False
-    replacement_installed = False
     preserve_staging = False
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -640,36 +713,48 @@ def _replace_selected_destination_transaction(
         _write_tree(staging, tree)
         if destination_existed:
             os.replace(destination, backup)
-        try:
-            os.replace(staging, destination)
-        except OSError:
-            if backup.exists() and not destination.exists():
-                os.replace(backup, destination)
-            raise
-        replacement_installed = True
-        try:
-            yield
-        except BaseException as triggering_error:
-            try:
-                if replacement_installed and (destination.exists() or destination.is_symlink()):
-                    os.replace(destination, staging)
-                if destination_existed and (backup.exists() or backup.is_symlink()):
-                    os.replace(backup, destination)
-            except OSError as rollback_error:
-                preserve_staging = True
+        if expected_destination_tree is not None:
+            live_tree = _read_directory_tree(
+                backup if destination_existed else destination, ("**/*",)
+            )
+            if live_tree != dict(expected_destination_tree):
                 raise VendorError(
-                    f"Failed to roll back destination for vendor {vendor.name!r} after "
-                    f"{triggering_error}; recovery data remains at {backup} and {staging}: "
-                    f"{rollback_error}"
-                ) from rollback_error
+                    f"Vendor {vendor.name!r} destination changed while synchronization "
+                    "was in progress; no files were replaced."
+                )
+        os.replace(staging, destination)
+        yield
+    except BaseException as triggering_error:
+        if commit_check is not None and commit_check():
+            _cleanup_committed_destination_backup(backup, vendor)
             raise
-        else:
-            if backup.exists() or backup.is_symlink():
-                _remove_path(backup)
-    except OSError as error:
-        raise VendorError(
-            f"Failed to replace destination for vendor {vendor.name!r}: {error}"
-        ) from error
+        try:
+            if (
+                staging is not None
+                and not (staging.exists() or staging.is_symlink())
+                and (destination.exists() or destination.is_symlink())
+            ):
+                os.replace(destination, staging)
+            if (
+                destination_existed
+                and (backup.exists() or backup.is_symlink())
+                and not (destination.exists() or destination.is_symlink())
+            ):
+                os.replace(backup, destination)
+        except OSError as rollback_error:
+            preserve_staging = True
+            raise VendorError(
+                f"Failed to roll back destination for vendor {vendor.name!r} after "
+                f"{triggering_error}; recovery data remains at {backup} and {staging}: "
+                f"{rollback_error}"
+            ) from rollback_error
+        if isinstance(triggering_error, OSError):
+            raise VendorError(
+                f"Failed to replace destination for vendor {vendor.name!r}: {triggering_error}"
+            ) from triggering_error
+        raise
+    else:
+        _cleanup_committed_destination_backup(backup, vendor)
     finally:
         if (
             staging is not None
@@ -693,21 +778,28 @@ def _replace_selected_destination(
 
 
 @contextlib.contextmanager
-def _atomic_file_replacement(path: Path, content: bytes) -> Iterator[None]:
+def _atomic_file_replacement(
+    path: Path,
+    content: bytes,
+    *,
+    commit_check: Callable[[], bool] | None = None,
+) -> Iterator[None]:
     try:
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise VendorError(f"Generated patch path must be a regular file: {path}.")
         existed = path.exists()
         old_content = path.read_bytes() if existed else None
         old_mode = stat.S_IMODE(path.stat().st_mode) if existed else None
-        _atomic_write(path, content)
     except VendorError:
         raise
     except OSError as error:
         raise VendorError(f"Failed to write generated patch {path}: {error}") from error
     try:
+        _atomic_write(path, content)
         yield
-    except BaseException:
+    except BaseException as triggering_error:
+        if commit_check is not None and commit_check():
+            raise
         try:
             if old_content is None:
                 path.unlink(missing_ok=True)
@@ -717,6 +809,10 @@ def _atomic_file_replacement(path: Path, content: bytes) -> Iterator[None]:
                 path.chmod(old_mode)
         except OSError as error:
             raise VendorError(f"Failed to roll back generated patch {path}: {error}") from error
+        if isinstance(triggering_error, OSError):
+            raise VendorError(
+                f"Failed to write generated patch {path}: {triggering_error}"
+            ) from triggering_error
         raise
 
 
@@ -757,10 +853,15 @@ def _run_git(
         raise ValueError("Git commands with byte input must capture byte output.")
     command = ["git", *[str(argument) for argument in arguments]]
     try:
+        environment = _git_environment(isolated=isolated)
+        if isolated:
+            # Repository discovery checks the ceiling itself, so use the parent to keep a
+            # repository initialized at cwd usable while preventing discovery above cwd.
+            environment["GIT_CEILING_DIRECTORIES"] = str(cwd.resolve().parent)
         result = subprocess.run(
             command,
             cwd=cwd,
-            env=_git_environment(isolated=isolated),
+            env=environment,
             check=True,
             capture_output=True,
             input=input_bytes,
@@ -779,8 +880,9 @@ def _run_git(
             stderr_text = stderr_value.decode("utf-8", errors="replace")
         else:
             stderr_text = stderr_value or ""
-        raise VendorError(
-            f"Git command failed: {' '.join(command)}\n{stderr_text.strip()}"
+        raise _GitCommandError(
+            f"Git command failed: {' '.join(command)}\n{stderr_text.strip()}",
+            error.returncode,
         ) from error
     return result.stdout
 
@@ -893,9 +995,12 @@ def _local_source_tree(vendor: Vendor, repo: Path) -> Tree:
     if not repository.is_dir():
         raise VendorError(f"Local upstream repository does not exist: {repository}.")
     try:
-        _run_git(
-            ["-C", repository, "cat-file", "-e", f"{vendor.commit}^{{commit}}"], cwd=repository
-        )
+        object_type = _run_git(["-C", repository, "cat-file", "-t", vendor.commit], cwd=repository)
+        assert isinstance(object_type, str)
+        if object_type.strip() != "commit":
+            raise VendorError(
+                f"Object {vendor.commit} is {object_type.strip()!r}, not a commit object."
+            )
     except VendorError as error:
         raise VendorError(
             f"Local repository {repository} does not contain locked commit {vendor.commit}."
@@ -929,7 +1034,12 @@ def _remote_repository(vendor: Vendor) -> Iterator[Path]:
                 if ref is None:
                     raise
                 _run_git(["fetch", "--quiet", "origin", ref], cwd=repository)
-            _run_git(["cat-file", "-e", f"{vendor.commit}^{{commit}}"], cwd=repository)
+            object_type = _run_git(["cat-file", "-t", vendor.commit], cwd=repository)
+            assert isinstance(object_type, str)
+            if object_type.strip() != "commit":
+                raise VendorError(
+                    f"Object {vendor.commit} is {object_type.strip()!r}, not a commit object."
+                )
         except VendorError as error:
             raise VendorError(
                 f"Upstream {vendor.url} is reachable but locked commit {vendor.commit} "
@@ -1028,24 +1138,294 @@ def _generate_patch(
     return patch
 
 
+def _merge_file_contents(
+    path: str,
+    base: bytes,
+    downstream: bytes,
+    upstream: bytes,
+) -> bytes:
+    if b"\0" in base or b"\0" in downstream or b"\0" in upstream:
+        raise VendorError(
+            "Downstream compatibility changes conflict with the new upstream binary "
+            f"content at {path!r}."
+        )
+    try:
+        temporary_context = tempfile.TemporaryDirectory(prefix="trtllm-vendor-merge-")
+    except OSError as error:
+        raise VendorError(f"Failed to prepare source merge for {path!r}: {error}") from error
+    with temporary_context as temporary_directory:
+        directory = Path(temporary_directory)
+        base_path = directory / "base"
+        downstream_path = directory / "downstream"
+        upstream_path = directory / "upstream"
+        try:
+            base_path.write_bytes(base)
+            downstream_path.write_bytes(downstream)
+            upstream_path.write_bytes(upstream)
+        except OSError as error:
+            raise VendorError(f"Failed to prepare source merge for {path!r}: {error}") from error
+        try:
+            merged = _run_git(
+                [
+                    "merge-file",
+                    "--stdout",
+                    "--no-diff3",
+                    "-L",
+                    f"downstream/{path}",
+                    "-L",
+                    f"base/{path}",
+                    "-L",
+                    f"upstream/{path}",
+                    downstream_path,
+                    base_path,
+                    upstream_path,
+                ],
+                cwd=directory,
+                capture_bytes=True,
+                isolated=True,
+            )
+        except _GitCommandError as error:
+            if 1 <= error.returncode <= 127:
+                raise VendorError(
+                    "Downstream compatibility changes conflict with the new upstream "
+                    f"revision at {path!r}: {error}"
+                ) from error
+            raise
+    assert isinstance(merged, bytes)
+    return merged
+
+
+def _merge_tree_entry(
+    path: str,
+    base: FileEntry | None,
+    downstream: FileEntry | None,
+    upstream: FileEntry | None,
+) -> FileEntry | None:
+    if downstream == upstream:
+        return downstream
+    if downstream == base:
+        return upstream
+    if upstream == base:
+        return downstream
+    if base is None or downstream is None or upstream is None:
+        raise VendorError(
+            f"Downstream compatibility changes conflict with the new upstream revision at {path!r}."
+        )
+
+    merged_data = _merge_file_contents(
+        path,
+        base.data,
+        downstream.data,
+        upstream.data,
+    )
+    if downstream.executable == upstream.executable:
+        merged_executable = downstream.executable
+    elif downstream.executable == base.executable:
+        merged_executable = upstream.executable
+    elif upstream.executable == base.executable:
+        merged_executable = downstream.executable
+    else:
+        raise VendorError(
+            "Downstream compatibility changes conflict with the new upstream file mode "
+            f"at {path!r}."
+        )
+    return FileEntry(data=merged_data, executable=merged_executable)
+
+
+def _merge_trees(
+    base: Mapping[str, FileEntry],
+    downstream: Mapping[str, FileEntry],
+    upstream: Mapping[str, FileEntry],
+) -> Tree:
+    merged: Tree = {}
+    for path in sorted(set(base) | set(downstream) | set(upstream)):
+        entry = _merge_tree_entry(
+            path,
+            base.get(path),
+            downstream.get(path),
+            upstream.get(path),
+        )
+        if entry is not None:
+            merged[path] = entry
+
+    merged_paths = set(merged)
+    for path in merged:
+        parent = PurePosixPath(path).parent
+        while parent != PurePosixPath("."):
+            parent_text = parent.as_posix()
+            if parent_text in merged_paths:
+                raise VendorError(
+                    "Downstream compatibility changes conflict with the new upstream path "
+                    f"layout at {parent_text!r} and {path!r}."
+                )
+            parent = parent.parent
+    return merged
+
+
 def _apply_patch(
     baseline: Mapping[str, FileEntry],
     patch_path: Path,
     patterns: Sequence[str],
+    *,
+    reverse: bool = False,
+    unidiff_zero: bool = False,
 ) -> Tree:
     with tempfile.TemporaryDirectory(prefix="trtllm-vendor-apply-") as temporary_directory:
         directory = Path(temporary_directory)
         _write_tree(directory, baseline)
+        arguments: list[str | Path] = ["apply", "--binary"]
+        if reverse:
+            arguments.append("--reverse")
+        if unidiff_zero:
+            arguments.append("--unidiff-zero")
         try:
-            _run_git(
-                ["apply", "--check", "--binary", patch_path],
-                cwd=directory,
-                isolated=True,
-            )
-            _run_git(["apply", "--binary", patch_path], cwd=directory, isolated=True)
+            _run_git([*arguments, "--check", patch_path], cwd=directory, isolated=True)
+            _run_git([*arguments, patch_path], cwd=directory, isolated=True)
+        except _GitCommandError as error:
+            direction = "reverse " if reverse else ""
+            error_type = _PatchApplicationError if error.returncode == 1 else VendorError
+            raise error_type(
+                f"Failed to {direction}apply vendor patch {patch_path}: {error}"
+            ) from error
         except VendorError as error:
-            raise VendorError(f"Failed to apply vendor patch {patch_path}: {error}") from error
-        return _read_all_directory_files(directory, patterns)
+            direction = "reverse " if reverse else ""
+            raise VendorError(
+                f"Failed to {direction}apply vendor patch {patch_path}: {error}"
+            ) from error
+        result = _read_all_directory_files(directory, patterns)
+        if reverse and patch_path.stat().st_size > 0 and result == dict(baseline):
+            raise VendorError(
+                f"Reverse-applying vendor patch {patch_path} made no changes; refusing "
+                "to reconstruct an unverified upstream base."
+            )
+        return result
+
+
+def _allows_relaxed_absorption_probe(patch_path: Path) -> bool:
+    try:
+        lines = patch_path.read_bytes().splitlines()
+    except OSError as error:
+        raise VendorError(f"Failed to inspect vendor patch {patch_path}: {error}") from error
+    saw_hunk = False
+    in_hunk = False
+    removed = 0
+    added = 0
+    for line in lines:
+        if line.startswith(b"@@ "):
+            if in_hunk and removed > 0 and added == 0:
+                return False
+            saw_hunk = True
+            in_hunk = True
+            removed = 0
+            added = 0
+        elif in_hunk and line.startswith(b"diff --git "):
+            if removed > 0 and added == 0:
+                return False
+            in_hunk = False
+        elif in_hunk and line.startswith(b"-"):
+            removed += 1
+        elif in_hunk and line.startswith(b"+"):
+            added += 1
+    if in_hunk and removed > 0 and added == 0:
+        return False
+    return saw_hunk
+
+
+def _upstream_contains_downstream_delta_in_base_hunks(
+    base: Mapping[str, FileEntry],
+    downstream: Mapping[str, FileEntry],
+    upstream: Mapping[str, FileEntry],
+) -> bool:
+    for path in sorted(set(base) | set(downstream)):
+        base_entry = base.get(path)
+        downstream_entry = downstream.get(path)
+        if base_entry == downstream_entry:
+            continue
+        upstream_entry = upstream.get(path)
+        if base_entry is None or downstream_entry is None:
+            if upstream_entry != downstream_entry:
+                return False
+            continue
+        if upstream_entry is None:
+            return False
+        if (
+            base_entry.executable != downstream_entry.executable
+            and upstream_entry.executable != downstream_entry.executable
+        ):
+            return False
+        if base_entry.data == downstream_entry.data or upstream_entry.data == downstream_entry.data:
+            continue
+        if (
+            b"\0" in base_entry.data
+            or b"\0" in downstream_entry.data
+            or b"\0" in upstream_entry.data
+        ):
+            return False
+        base_lines = base_entry.data.splitlines(keepends=True)
+        downstream_lines = downstream_entry.data.splitlines(keepends=True)
+        upstream_lines = upstream_entry.data.splitlines(keepends=True)
+        downstream_changes = difflib.SequenceMatcher(
+            None, base_lines, downstream_lines, autojunk=False
+        ).get_opcodes()
+        upstream_changes = difflib.SequenceMatcher(
+            None, base_lines, upstream_lines, autojunk=False
+        ).get_opcodes()
+        for tag, base_start, base_end, downstream_start, downstream_end in downstream_changes:
+            if tag == "equal":
+                continue
+            if downstream_start == downstream_end:
+                return False
+            matching_hunks: list[tuple[int, int]] = []
+            for upstream_change in upstream_changes:
+                (
+                    upstream_tag,
+                    upstream_base_start,
+                    upstream_base_end,
+                    upstream_start,
+                    upstream_end,
+                ) = upstream_change
+                if (
+                    upstream_tag != "equal"
+                    and upstream_base_start == base_start
+                    and upstream_base_end == base_end
+                ):
+                    matching_hunks.append((upstream_start, upstream_end))
+            if len(matching_hunks) != 1:
+                return False
+            upstream_start, upstream_end = matching_hunks[0]
+            expected = downstream_lines[downstream_start:downstream_end]
+            if upstream_lines[upstream_start : upstream_start + len(expected)] != expected:
+                return False
+    return True
+
+
+def _reverse_patch_for_absorption(
+    base: Mapping[str, FileEntry],
+    downstream: Mapping[str, FileEntry],
+    upstream: Mapping[str, FileEntry],
+    patch_path: Path,
+    patterns: Sequence[str],
+) -> tuple[Tree, bool] | None:
+    if not _upstream_contains_downstream_delta_in_base_hunks(base, downstream, upstream):
+        return None
+    try:
+        return _apply_patch(upstream, patch_path, patterns, reverse=True), False
+    except _PatchApplicationError:
+        if not _allows_relaxed_absorption_probe(patch_path):
+            return None
+    try:
+        return (
+            _apply_patch(
+                upstream,
+                patch_path,
+                patterns,
+                reverse=True,
+                unidiff_zero=True,
+            ),
+            True,
+        )
+    except _PatchApplicationError:
+        return None
 
 
 def _normal_tree(lock: LockFile, vendor: Vendor, repo: Path | None) -> Tree:
@@ -1086,13 +1466,30 @@ def _require_vendor(lock: LockFile, name: str) -> Vendor:
     return _select_vendors(lock, name)[0]
 
 
-def _verify_offline(lock: LockFile, vendor: Vendor) -> None:
-    actual = _tree_digest(_current_tree(lock, vendor))
+def _verified_current_tree(lock: LockFile, vendor: Vendor) -> Tree:
+    current, _ = _verified_current_snapshot(lock, vendor)
+    return current
+
+
+def _verified_current_snapshot(lock: LockFile, vendor: Vendor) -> tuple[Tree, Tree]:
+    destination = _checked_root_path(
+        lock.root, vendor.destination, f"Vendor {vendor.name!r} destination"
+    )
+    destination_tree = _read_directory_tree(destination, ("**/*",))
+    current = {
+        path: entry for path, entry in destination_tree.items() if _matches(path, vendor.include)
+    }
+    actual = _tree_digest(current)
     if actual != vendor.digest:
         raise VendorError(
             f"Vendor {vendor.name!r} destination digest mismatch: "
             f"expected {vendor.digest}, got {actual}."
         )
+    return current, destination_tree
+
+
+def _verify_offline(lock: LockFile, vendor: Vendor) -> None:
+    _verified_current_tree(lock, vendor)
 
 
 def _verify_source(lock: LockFile, vendor: Vendor, repo: Path | None) -> None:
@@ -1150,6 +1547,26 @@ def _new_vendor_from_args(args: argparse.Namespace) -> Vendor:
     return _validate_vendor(args.name, value)
 
 
+def _vendor_at_revision(
+    vendor: Vendor,
+    commit: str,
+    *,
+    url: str | None = None,
+    branch: str | None = None,
+    tag: str | None = None,
+) -> Vendor:
+    value = vendor.to_mapping()
+    value["url"] = vendor.url if url is None else url
+    value["commit"] = commit
+    if branch is not None:
+        value["branch"] = branch
+        value.pop("tag", None)
+    elif tag is not None:
+        value["tag"] = tag
+        value.pop("branch", None)
+    return _validate_vendor(vendor.name, value)
+
+
 def _command_create(args: argparse.Namespace) -> None:
     lock = _load_lock(args.lock, allow_missing=True)
     if args.name in lock.vendors:
@@ -1205,15 +1622,134 @@ def _command_create(args: argparse.Namespace) -> None:
 def _command_sync(args: argparse.Namespace) -> None:
     lock = _load_lock(args.lock)
     vendor = _require_vendor(lock, args.name)
-    normal = _normal_tree(lock, vendor, args.repo)
-    digest = _tree_digest(normal)
-    if digest != vendor.digest:
-        raise VendorError(
-            f"Vendor {vendor.name!r} materializes to {digest}, but the lock records {vendor.digest}. "
-            "Refresh the patch or pin instead of silently changing the accepted digest."
+    if args.commit is None:
+        if args.url is not None or args.branch is not None or args.tag is not None:
+            raise VendorError("--url, --branch, and --tag require --commit for sync.")
+        normal = _normal_tree(lock, vendor, args.repo)
+        digest = _tree_digest(normal)
+        if digest != vendor.digest:
+            raise VendorError(
+                f"Vendor {vendor.name!r} materializes to {digest}, but the lock records "
+                f"{vendor.digest}. Refresh the patch or pin instead of silently changing "
+                "the accepted digest."
+            )
+        _replace_selected_destination(lock, vendor, normal)
+        print(f"Synchronized {vendor.name} to {vendor.commit}.")
+        return
+
+    current, accepted_destination = _verified_current_snapshot(lock, vendor)
+    proposed = _vendor_at_revision(
+        vendor,
+        args.commit,
+        url=args.url,
+        branch=args.branch,
+        tag=args.tag,
+    )
+    upstream = _source_tree(proposed, args.repo)
+
+    old_patch_path: Path | None = None
+    new_patch: bytes | None = None
+    if vendor.patch is None:
+        materialized = upstream
+    else:
+        old_patch_path = _checked_root_path(
+            lock.root, vendor.patch, f"Vendor {vendor.name!r} patch"
         )
-    _replace_selected_destination(lock, vendor, normal)
-    print(f"Synchronized {vendor.name} to {vendor.commit}.")
+        # Reconstruct the reviewed old upstream base from the accepted snapshot so a
+        # force-pushed or deleted upstream ref cannot prevent migration.
+        base = _apply_patch(current, old_patch_path, vendor.include, reverse=True)
+        if _apply_patch(base, old_patch_path, vendor.include) != current:
+            raise VendorError(
+                f"Vendor {vendor.name!r} compatibility patch is not reversibly based on "
+                "the locked destination."
+            )
+        absorption = _reverse_patch_for_absorption(
+            base, current, upstream, old_patch_path, vendor.include
+        )
+        if absorption is None:
+            materialized = _merge_trees(base, current, upstream)
+        else:
+            upstream_without_patch, unidiff_zero = absorption
+            if (
+                _apply_patch(
+                    upstream_without_patch,
+                    old_patch_path,
+                    vendor.include,
+                    unidiff_zero=unidiff_zero,
+                )
+                != upstream
+            ):
+                raise VendorError(
+                    f"Vendor {vendor.name!r} compatibility patch did not replay after "
+                    "complete-absorption detection."
+                )
+            materialized = upstream
+        generated_patch = _generate_patch(upstream, materialized)
+        if generated_patch:
+            new_patch = generated_patch
+            proposed.patch = vendor.patch
+            proposed.patch_digest = _patch_digest(generated_patch)
+        else:
+            proposed.patch = None
+            proposed.patch_digest = None
+
+    proposed.digest = _tree_digest(materialized)
+    proposed = _validate_vendor(proposed.name, proposed.to_mapping())
+    lock.vendors[vendor.name] = proposed
+    intended_lock_payload = _serialize_lock(lock)
+
+    lock_save_started = False
+
+    def lock_commit_is_visible() -> bool:
+        return lock_save_started and _lock_payload_is_visible(lock, intended_lock_payload)
+
+    patch_transaction: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
+    if new_patch is not None:
+        assert old_patch_path is not None
+        patch_transaction = _atomic_file_replacement(
+            old_patch_path, new_patch, commit_check=lock_commit_is_visible
+        )
+
+    deferred_save_error: BaseException | None = None
+    with contextlib.ExitStack() as transaction:
+        transaction.enter_context(
+            _replace_selected_destination_transaction(
+                lock,
+                vendor,
+                materialized,
+                expected_destination_tree=accepted_destination,
+                commit_check=lock_commit_is_visible,
+            )
+        )
+        transaction.enter_context(patch_transaction)
+        lock_save_started = True
+        try:
+            _save_lock_checked(lock, f"migrated state for vendor {vendor.name!r}")
+        except BaseException as error:
+            if not _lock_payload_is_visible(lock, intended_lock_payload):
+                raise
+            deferred_save_error = error
+    if deferred_save_error is not None:
+        raise deferred_save_error
+
+    if old_patch_path is not None and proposed.patch is None:
+        try:
+            _sync_directory(lock.path.parent)
+        except OSError as error:
+            raise VendorError(
+                f"Failed to make the migrated lock durable for vendor {vendor.name!r}: {error}"
+            ) from error
+        try:
+            old_patch_path.unlink()
+        except OSError as error:
+            print(
+                f"warning: Migrated vendor {vendor.name!r}, but could not remove its absorbed "
+                f"patch {old_patch_path}: {error}. The lock is committed and valid; this patch "
+                "is now an unreferenced orphan. Delete that file manually.",
+                file=sys.stderr,
+            )
+    state = "patched" if proposed.patch is not None else "exact"
+    print(f"Migrated {vendor.name} to {proposed.commit} ({state}).")
 
 
 def _command_check(args: argparse.Namespace) -> None:
@@ -1429,17 +1965,13 @@ def _command_pin(args: argparse.Namespace) -> None:
     vendor = _require_vendor(lock, args.name)
     repository = args.repo.resolve()
     commit = args.commit or _worktree_head(repository)
-    value = vendor.to_mapping()
-    value["url"] = args.url or vendor.url
-    value["commit"] = commit
-    if args.branch is not None:
-        value["branch"] = args.branch
-        value.pop("tag", None)
-    elif args.tag is not None:
-        value["tag"] = args.tag
-        value.pop("branch", None)
-    value["digest"] = vendor.digest
-    proposed = _validate_vendor(vendor.name, value)
+    proposed = _vendor_at_revision(
+        vendor,
+        commit,
+        url=args.url,
+        branch=args.branch,
+        tag=args.tag,
+    )
     raw = _local_source_tree(proposed, repository)
     current = _current_tree(lock, vendor)
     drop_patch = False
@@ -1514,7 +2046,7 @@ def _add_repo_argument(parser: argparse.ArgumentParser, *, required: bool = Fals
         "--repo",
         type=Path,
         required=required,
-        help="Local Git checkout containing the locked commit; never contacts the lock URL.",
+        help="Local Git checkout containing the required source commit(s); never contacts the vendor URL.",
     )
 
 
@@ -1549,8 +2081,28 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_repo_argument(create)
     create.set_defaults(handler=_command_create)
 
-    sync = commands.add_parser("sync", help="Restore a locked vendor materialization.")
+    sync = commands.add_parser(
+        "sync",
+        help="Restore the locked materialization or migrate to a specified commit.",
+    )
     sync.add_argument("name")
+    sync.add_argument(
+        "--url",
+        help="Record a replacement source URL while migrating; requires --commit.",
+    )
+    sync_reference = sync.add_mutually_exclusive_group()
+    sync_reference.add_argument(
+        "--branch",
+        help="Record the source branch while migrating; requires --commit.",
+    )
+    sync_reference.add_argument(
+        "--tag",
+        help="Record the source tag while migrating; requires --commit.",
+    )
+    sync.add_argument(
+        "--commit",
+        help="Migrate to this immutable full commit instead of restoring the current pin.",
+    )
     _add_repo_argument(sync)
     sync.set_defaults(handler=_command_sync)
 
@@ -1584,7 +2136,10 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_repo_argument(export, required=True)
     export.set_defaults(handler=_command_export)
 
-    pin = commands.add_parser("pin", help="Pin a vendor to a new committed source revision.")
+    pin = commands.add_parser(
+        "pin",
+        help="Finalize a vendor pin after exporting and committing a destination change.",
+    )
     pin.add_argument("name")
     pin.add_argument("--url")
     pin_reference = pin.add_mutually_exclusive_group()
@@ -1609,7 +2164,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.lock != _DEFAULT_LOCK:
         args.lock = args.lock.resolve()
     try:
-        args.handler(args)
+        mutating = args.command in {"create", "sync", "patch", "export", "pin", "remove"}
+        with _vendor_state_lock(args.lock, exclusive=mutating):
+            args.handler(args)
     except VendorError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

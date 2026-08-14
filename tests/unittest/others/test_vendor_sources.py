@@ -23,6 +23,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import ModuleType
@@ -224,6 +225,21 @@ def _load_vendor_sources_module() -> ModuleType:
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _prepare_absorbed_patch_migration(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path, Path, str]:
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    (upstream / _SOURCE / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    absorbed_commit = _commit(upstream, "absorb compatibility patch")
+    return upstream, consumer, lock, destination, patch_path, absorbed_commit
 
 
 def test_atomic_write_syncs_file_before_replacement(
@@ -633,6 +649,43 @@ def test_local_replacement_refs_do_not_change_locked_content(tmp_path: Path) -> 
     assert _vendor_data(lock)["commit"] == first_commit
     _git(upstream, "replace", "-d", first_commit)
     _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+@pytest.mark.parametrize("use_local_checkout", [True, False])
+def test_create_rejects_annotated_tag_object_id(
+    tmp_path: Path,
+    use_local_checkout: bool,
+) -> None:
+    upstream, commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 1\n"})
+    _git(upstream, "tag", "-a", "v1", "-m", "annotated release", commit)
+    tag_object = _git(upstream, "rev-parse", "refs/tags/v1")
+    assert tag_object != commit
+    assert _git(upstream, "cat-file", "-t", tag_object) == "tag"
+    consumer, lock = _make_consumer(tmp_path)
+    arguments: list[str | Path] = [
+        "create",
+        _VENDOR_NAME,
+        "--url",
+        upstream.as_uri(),
+        "--tag",
+        "v1",
+        "--commit",
+        tag_object,
+        "--source",
+        _SOURCE,
+        "--destination",
+        _DESTINATION,
+        "--include",
+        _INCLUDE,
+    ]
+    if use_local_checkout:
+        arguments.extend(["--repo", upstream])
+
+    result = _vendor(consumer, lock, *arguments, check=False)
+
+    _assert_failure(result, "commit")
+    assert not lock.exists()
+    assert not (consumer / _DESTINATION).exists()
 
 
 def test_lock_rejects_duplicate_keys_and_unsafe_paths(tmp_path: Path) -> None:
@@ -1868,3 +1921,1375 @@ def test_pin_interruption_after_lock_save_leaves_valid_lock_and_orphan_patch(
     assert stat.S_IMODE(patch_path.stat().st_mode) == patch_mode
     _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
     _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_migrates_exact_vendor_and_validates_revision_arguments(tmp_path: Path) -> None:
+    upstream, base_commit = _make_upstream(
+        tmp_path,
+        {
+            "kernel.py": "VALUE = 1\n",
+            "obsolete.py": "OBSOLETE = True\n",
+        },
+    )
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    _vendor(
+        consumer,
+        lock,
+        "create",
+        _VENDOR_NAME,
+        "--url",
+        upstream.as_uri(),
+        "--branch",
+        "main",
+        "--commit",
+        base_commit,
+        "--source",
+        _SOURCE,
+        "--destination",
+        _DESTINATION,
+        "--include",
+        _INCLUDE,
+        "--repo",
+        upstream,
+        "--adopt",
+        "exact",
+    )
+    destination = consumer / _DESTINATION
+    assert _vendor_data(lock)["branch"] == "main"
+    original_digest = _vendor_data(lock)["digest"]
+    original_lock = lock.read_bytes()
+    original_destination = _tree_snapshot(destination)
+    replacement_url = (tmp_path / "replacement-upstream.git").as_uri()
+
+    invalid_arguments = [
+        (["--url", replacement_url], "--commit"),
+        (["--branch", "main"], "--commit"),
+        (["--tag", "v2"], "--commit"),
+        (["--commit", "deadbeef"], "full lowercase 40-hex sha"),
+        (
+            ["--commit", base_commit, "--branch", "main", "--tag", "v2"],
+            "not allowed with argument",
+        ),
+    ]
+    for arguments, expected_error in invalid_arguments:
+        result = _vendor(
+            consumer,
+            lock,
+            "sync",
+            _VENDOR_NAME,
+            *arguments,
+            "--repo",
+            upstream,
+            check=False,
+        )
+        _assert_failure(result, expected_error)
+        assert lock.read_bytes() == original_lock
+        assert _tree_snapshot(destination) == original_destination
+
+    (upstream / _SOURCE / "obsolete.py").unlink()
+    _write_files(
+        upstream / _SOURCE,
+        {
+            "kernel.py": "VALUE = 2\n",
+            "new_kernel.py": "NEW_VALUE = 2\n",
+        },
+    )
+    updated_commit = _commit(upstream, "update exact vendor source")
+    _git(upstream, "tag", "v2", updated_commit)
+
+    _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--url",
+        replacement_url,
+        "--tag",
+        "v2",
+        "--commit",
+        updated_commit,
+        "--repo",
+        upstream,
+    )
+
+    vendor = _vendor_data(lock)
+    assert vendor["url"] == replacement_url
+    assert vendor["tag"] == "v2"
+    assert "branch" not in vendor
+    assert vendor["commit"] == updated_commit
+    assert vendor["digest"] != original_digest
+    assert vendor["source"] == _SOURCE
+    assert vendor["destination"] == _DESTINATION
+    assert vendor["include"] == [_INCLUDE]
+    assert "patch" not in vendor
+    assert "patch_digest" not in vendor
+    assert (destination / "kernel.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert (destination / "new_kernel.py").read_text(encoding="utf-8") == "NEW_VALUE = 2\n"
+    assert not (destination / "obsolete.py").exists()
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+    _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--branch",
+        "main",
+        "--commit",
+        updated_commit,
+        "--repo",
+        upstream,
+    )
+    branch_vendor = _vendor_data(lock)
+    assert branch_vendor["branch"] == "main"
+    assert "tag" not in branch_vendor
+
+
+def test_sync_migration_rejects_dirty_destination_without_changes(tmp_path: Path) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 1\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    _create_vendor(consumer, lock, upstream, base_commit, mode="exact")
+    destination = consumer / _DESTINATION
+
+    (upstream / _SOURCE / "kernel.py").write_text("VALUE = 2\n", encoding="utf-8")
+    updated_commit = _commit(upstream, "update upstream source")
+    (destination / "kernel.py").write_text("VALUE = 'pending'\n", encoding="utf-8")
+    dirty_destination = _tree_snapshot(destination)
+    original_lock = lock.read_bytes()
+    original_destination_entries = sorted(path.name for path in destination.parent.iterdir())
+
+    result = _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--commit",
+        updated_commit,
+        "--repo",
+        upstream,
+        check=False,
+    )
+
+    _assert_failure(result, "destination")
+    assert lock.read_bytes() == original_lock
+    assert _tree_snapshot(destination) == dirty_destination
+    assert not (consumer / "3rdparty/vendor_patches/example.patch").exists()
+    assert (
+        sorted(path.name for path in destination.parent.iterdir()) == original_destination_entries
+    )
+
+
+def test_sync_migration_rejects_destination_edit_made_during_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 1\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    _create_vendor(consumer, lock, upstream, base_commit, mode="exact")
+    destination = consumer / _DESTINATION
+    (upstream / _SOURCE / "kernel.py").write_text("VALUE = 2\n", encoding="utf-8")
+    updated_commit = _commit(upstream, "update upstream during migration")
+    original_lock = lock.read_bytes()
+    module = _load_vendor_sources_module()
+    real_source_tree = module._source_tree
+
+    def fetch_then_edit(vendor: object, repository: Path | None) -> object:
+        tree = real_source_tree(vendor, repository)
+        if vendor.commit == updated_commit:
+            (destination / "kernel.py").write_text("VALUE = 'late edit'\n", encoding="utf-8")
+        return tree
+
+    with monkeypatch.context() as edit_during_fetch:
+        edit_during_fetch.setattr(module, "_source_tree", fetch_then_edit)
+        result = module.main(
+            [
+                "--lock",
+                str(lock),
+                "sync",
+                _VENDOR_NAME,
+                "--commit",
+                updated_commit,
+                "--repo",
+                str(upstream),
+            ]
+        )
+
+    assert result == 1
+    assert "changed while synchronization was in progress" in capsys.readouterr().err
+    assert lock.read_bytes() == original_lock
+    assert (destination / "kernel.py").read_text(encoding="utf-8") == "VALUE = 'late edit'\n"
+    assert not list(destination.parent.glob(".example.vendor-*"))
+
+
+def test_sync_migration_preserves_late_unselected_edit_at_destination_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 1\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    notes = destination / "notes.txt"
+    notes.write_text("before migration\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="exact")
+    (upstream / _SOURCE / "kernel.py").write_text("VALUE = 2\n", encoding="utf-8")
+    updated_commit = _commit(upstream, "update upstream before unselected edit")
+    original_lock = lock.read_bytes()
+    backup = destination.parent / ".example.vendor-backup"
+    module = _load_vendor_sources_module()
+    real_replace = os.replace
+
+    def edit_immediately_before_rename(
+        source: str | bytes | Path, target: str | bytes | Path
+    ) -> None:
+        if Path(source) == destination and Path(target) == backup:
+            notes.write_text("late unselected edit\n", encoding="utf-8")
+        real_replace(source, target)
+
+    with monkeypatch.context() as late_edit:
+        late_edit.setattr(module.os, "replace", edit_immediately_before_rename)
+        result = module.main(
+            [
+                "--lock",
+                str(lock),
+                "sync",
+                _VENDOR_NAME,
+                "--commit",
+                updated_commit,
+                "--repo",
+                str(upstream),
+            ]
+        )
+
+    assert result == 1
+    assert "changed while synchronization was in progress" in capsys.readouterr().err
+    assert lock.read_bytes() == original_lock
+    assert (destination / "kernel.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert notes.read_text(encoding="utf-8") == "late unselected edit\n"
+    assert not backup.exists()
+    assert not list(destination.parent.glob(".example.vendor-*"))
+
+
+@pytest.mark.parametrize("interrupt_point", ("backup", "install"))
+def test_sync_migration_restores_destination_after_setup_rename_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_point: str,
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 1\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    _create_vendor(consumer, lock, upstream, base_commit, mode="exact")
+    destination = consumer / _DESTINATION
+    backup = destination.parent / ".example.vendor-backup"
+    original_lock = lock.read_bytes()
+    original_destination = _tree_snapshot(destination)
+    (upstream / _SOURCE / "kernel.py").write_text("VALUE = 2\n", encoding="utf-8")
+    updated_commit = _commit(upstream, f"update before {interrupt_point} interrupt")
+    module = _load_vendor_sources_module()
+    real_replace = os.replace
+    interrupted = False
+
+    def replace_then_interrupt(source: str | bytes | Path, target: str | bytes | Path) -> None:
+        nonlocal interrupted
+        source_path = Path(source)
+        target_path = Path(target)
+        real_replace(source, target)
+        is_target = (
+            interrupt_point == "backup" and source_path == destination and target_path == backup
+        ) or (
+            interrupt_point == "install"
+            and source_path.parent == destination.parent
+            and source_path.name.startswith(".example.vendor-")
+            and target_path == destination
+        )
+        if is_target and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt(f"injected {interrupt_point} rename interruption")
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(module.os, "replace", replace_then_interrupt)
+        with pytest.raises(KeyboardInterrupt, match=f"{interrupt_point} rename interruption"):
+            module.main(
+                [
+                    "--lock",
+                    str(lock),
+                    "sync",
+                    _VENDOR_NAME,
+                    "--commit",
+                    updated_commit,
+                    "--repo",
+                    str(upstream),
+                ]
+            )
+
+    assert interrupted
+    assert lock.read_bytes() == original_lock
+    assert _tree_snapshot(destination) == original_destination
+    assert not list(destination.parent.glob(".example.vendor-*"))
+
+
+def test_atomic_file_replacement_restores_old_generation_after_setup_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_vendor_sources_module()
+    patch_path = tmp_path / "compat.patch"
+    patch_path.write_bytes(b"old patch\n")
+    patch_path.chmod(0o600)
+    real_atomic_write = module._atomic_write
+    interrupted = False
+
+    def write_then_interrupt(path: Path, content: bytes) -> None:
+        nonlocal interrupted
+        real_atomic_write(path, content)
+        if path == patch_path and content == b"new patch\n" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("injected patch replacement interruption")
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(module, "_atomic_write", write_then_interrupt)
+        with pytest.raises(KeyboardInterrupt, match="patch replacement interruption"):
+            with module._atomic_file_replacement(patch_path, b"new patch\n"):
+                pass
+
+    assert interrupted
+    assert patch_path.read_bytes() == b"old patch\n"
+    assert stat.S_IMODE(patch_path.stat().st_mode) == 0o600
+
+
+def test_reverse_patch_reconstruction_rejects_a_nonempty_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_vendor_sources_module()
+    patch_path = tmp_path / "compat.patch"
+    patch_path.write_bytes(b"nonempty patch sentinel\n")
+    baseline = {"compat.py": module.FileEntry(b"MODE = 'trtllm'\n")}
+
+    def successful_noop(*_: object, capture_bytes: bool = False, **__: object) -> bytes | str:
+        return b"" if capture_bytes else ""
+
+    with monkeypatch.context() as no_op_git:
+        no_op_git.setattr(module, "_run_git", successful_noop)
+        with pytest.raises(module.VendorError, match="made no changes"):
+            module._apply_patch(baseline, patch_path, (_INCLUDE,), reverse=True)
+
+
+def test_sync_migration_isolates_patch_application_from_parent_repository(
+    tmp_path: Path,
+) -> None:
+    upstream, base_commit = _make_upstream(
+        tmp_path,
+        {
+            "compat.py": "MODE = 'upstream'\n",
+            "feature.py": "FEATURE = 0\n",
+        },
+    )
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    original_patch = patch_path.read_bytes()
+    _run(["git", "init", "--initial-branch=main", consumer], cwd=tmp_path)
+    nested_tmp = consumer / ".tmp"
+    nested_tmp.mkdir()
+
+    (upstream / _SOURCE / "feature.py").write_text("FEATURE = 1\n", encoding="utf-8")
+    updated_commit = _commit(upstream, "update source outside compatibility patch")
+    _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--commit",
+        updated_commit,
+        "--repo",
+        upstream,
+        env_overrides={"TMPDIR": str(nested_tmp)},
+    )
+
+    vendor = _vendor_data(lock)
+    assert vendor["commit"] == updated_commit
+    assert vendor["patch"] == "3rdparty/vendor_patches/example.patch"
+    assert patch_path.read_bytes() == original_patch
+    assert (destination / "compat.py").read_text(encoding="utf-8") == "MODE = 'trtllm'\n"
+    assert (destination / "feature.py").read_text(encoding="utf-8") == "FEATURE = 1\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_migration_drops_fully_absorbed_patch_with_adjacent_upstream_edit(
+    tmp_path: Path,
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+
+    (upstream / _SOURCE / "compat.py").write_text(
+        "MODE = 'trtllm'\nFEATURE = 1\n", encoding="utf-8"
+    )
+    absorbed_commit = _commit(upstream, "absorb patch next to new upstream source")
+    _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--commit",
+        absorbed_commit,
+        "--repo",
+        upstream,
+    )
+
+    vendor = _vendor_data(lock)
+    assert vendor["commit"] == absorbed_commit
+    assert "patch" not in vendor
+    assert "patch_digest" not in vendor
+    assert not patch_path.exists()
+    assert (destination / "compat.py").read_text(encoding="utf-8") == (
+        "MODE = 'trtllm'\nFEATURE = 1\n"
+    )
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_migration_does_not_treat_a_conflicting_deletion_as_absorbed(
+    tmp_path: Path,
+) -> None:
+    upstream, base_commit = _make_upstream(
+        tmp_path, {"compat.py": "REMOVE_DOWNSTREAM = True\nKEEP = True\n"}
+    )
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("KEEP = True\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    original_lock = lock.read_bytes()
+    original_destination = _tree_snapshot(destination)
+    original_patch = patch_path.read_bytes()
+
+    (upstream / _SOURCE / "compat.py").write_text(
+        "UPSTREAM_REPLACEMENT = True\nKEEP = True\n", encoding="utf-8"
+    )
+    conflicting_commit = _commit(upstream, "replace the line deleted downstream")
+    result = _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--commit",
+        conflicting_commit,
+        "--repo",
+        upstream,
+        check=False,
+    )
+
+    _assert_failure(result, "conflict")
+    assert lock.read_bytes() == original_lock
+    assert _tree_snapshot(destination) == original_destination
+    assert patch_path.read_bytes() == original_patch
+
+
+@pytest.mark.parametrize(
+    "upstream_source",
+    (
+        "MODE = 'new-upstream'\nFEATURE = 1\nMODE = 'trtllm'\n",
+        "MODE = 'trtllm'\nMODE = 'upstream'\n",
+    ),
+)
+def test_sync_migration_does_not_absorb_relocated_duplicate_content(
+    tmp_path: Path,
+    upstream_source: str,
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    original_lock = lock.read_bytes()
+    original_destination = _tree_snapshot(destination)
+    original_patch = patch_path.read_bytes()
+
+    (upstream / _SOURCE / "compat.py").write_text(upstream_source, encoding="utf-8")
+    conflicting_commit = _commit(upstream, "relocate duplicated downstream content")
+    result = _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--commit",
+        conflicting_commit,
+        "--repo",
+        upstream,
+        check=False,
+    )
+
+    _assert_failure(result, "conflict")
+    assert lock.read_bytes() == original_lock
+    assert _tree_snapshot(destination) == original_destination
+    assert patch_path.read_bytes() == original_patch
+
+
+def test_sync_migration_rebases_and_drops_absorbed_patch(tmp_path: Path) -> None:
+    upstream, base_commit = _make_upstream(
+        tmp_path,
+        {
+            "a.py": "A = 0\n",
+            "b.py": "B = 0\n",
+            "feature.py": "FEATURE = 0\n",
+        },
+    )
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    _write_files(destination, {"a.py": "A = 1\n", "b.py": "B = 1\n"})
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    original_patch = patch_path.read_bytes()
+
+    (upstream / _SOURCE / "feature.py").write_text("FEATURE = 1\n", encoding="utf-8")
+    unrelated_commit = _commit(upstream, "update unrelated upstream source")
+    _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--branch",
+        "main",
+        "--commit",
+        unrelated_commit,
+        "--repo",
+        upstream,
+    )
+    unrelated_vendor = _vendor_data(lock)
+    assert unrelated_vendor["branch"] == "main"
+    assert unrelated_vendor["commit"] == unrelated_commit
+    assert unrelated_vendor["patch"] == "3rdparty/vendor_patches/example.patch"
+    assert patch_path.read_bytes() == original_patch
+    assert (destination / "a.py").read_text(encoding="utf-8") == "A = 1\n"
+    assert (destination / "b.py").read_text(encoding="utf-8") == "B = 1\n"
+    assert (destination / "feature.py").read_text(encoding="utf-8") == "FEATURE = 1\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+    (upstream / _SOURCE / "a.py").write_text("A = 1\n", encoding="utf-8")
+    partial_commit = _commit(upstream, "absorb compatibility change A")
+    _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--commit",
+        partial_commit,
+        "--repo",
+        upstream,
+    )
+    partial_vendor = _vendor_data(lock)
+    partial_patch = patch_path.read_bytes()
+    assert partial_vendor["commit"] == partial_commit
+    assert partial_vendor["patch_digest"] == f"sha256:{hashlib.sha256(partial_patch).hexdigest()}"
+    assert b"diff --git a/a.py b/a.py" not in partial_patch
+    assert b"diff --git a/b.py b/b.py" in partial_patch
+    assert (destination / "a.py").read_text(encoding="utf-8") == "A = 1\n"
+    assert (destination / "b.py").read_text(encoding="utf-8") == "B = 1\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+    (upstream / _SOURCE / "b.py").write_text("B = 1\n", encoding="utf-8")
+    absorbed_commit = _commit(upstream, "absorb compatibility change B")
+    _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--commit",
+        absorbed_commit,
+        "--repo",
+        upstream,
+    )
+    exact_vendor = _vendor_data(lock)
+    assert exact_vendor["commit"] == absorbed_commit
+    assert exact_vendor["branch"] == "main"
+    assert "patch" not in exact_vendor
+    assert "patch_digest" not in exact_vendor
+    assert not patch_path.exists()
+    assert (destination / "a.py").read_text(encoding="utf-8") == "A = 1\n"
+    assert (destination / "b.py").read_text(encoding="utf-8") == "B = 1\n"
+    assert (destination / "feature.py").read_text(encoding="utf-8") == "FEATURE = 1\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_migration_uses_new_repo_without_locked_commit(tmp_path: Path) -> None:
+    old_upstream, old_commit = _make_upstream(
+        tmp_path,
+        {
+            "compat.py": "MODE = 'upstream'\n",
+            "feature.py": "FEATURE = 'old'\n",
+        },
+    )
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(old_upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, old_upstream, old_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    original_patch = patch_path.read_bytes()
+
+    replacement_root = tmp_path / "replacement"
+    replacement_root.mkdir()
+    new_upstream, new_commit = _make_upstream(
+        replacement_root,
+        {
+            "compat.py": "MODE = 'upstream'\n",
+            "feature.py": "FEATURE = 'new'\n",
+        },
+    )
+    missing_old_commit = _run(
+        ["git", "-C", new_upstream, "cat-file", "-e", f"{old_commit}^{{commit}}"],
+        cwd=new_upstream,
+        check=False,
+    )
+    assert missing_old_commit.returncode != 0
+    unreachable_old_upstream = tmp_path / "unreachable-old-upstream"
+    old_upstream.rename(unreachable_old_upstream)
+    assert not old_upstream.exists()
+
+    _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--url",
+        new_upstream.as_uri(),
+        "--branch",
+        "main",
+        "--commit",
+        new_commit,
+        "--repo",
+        new_upstream,
+    )
+
+    vendor = _vendor_data(lock)
+    assert vendor["url"] == new_upstream.as_uri()
+    assert vendor["branch"] == "main"
+    assert vendor["commit"] == new_commit
+    assert vendor["patch"] == "3rdparty/vendor_patches/example.patch"
+    assert patch_path.read_bytes() == original_patch
+    assert (destination / "compat.py").read_text(encoding="utf-8") == "MODE = 'trtllm'\n"
+    assert (destination / "feature.py").read_text(encoding="utf-8") == "FEATURE = 'new'\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", new_upstream)
+
+
+def test_merge_trees_preserves_independent_content_modes_and_binary_changes() -> None:
+    module = _load_vendor_sources_module()
+    file_entry = module.FileEntry
+    base_text = "\n".join(
+        [
+            "DOWNSTREAM = 0",
+            *(f"KEEP_{index} = {index}" for index in range(10)),
+            "UPSTREAM = 0",
+            "",
+        ]
+    ).encode()
+    downstream_text = base_text.replace(b"DOWNSTREAM = 0", b"DOWNSTREAM = 1")
+    upstream_text = base_text.replace(b"UPSTREAM = 0", b"UPSTREAM = 1")
+    base = {
+        "script.py": file_entry(base_text, executable=False),
+        "downstream.bin": file_entry(b"\x00base-downstream\xff", executable=False),
+        "upstream.bin": file_entry(b"\x00base-upstream\xff", executable=False),
+    }
+    downstream = {
+        "script.py": file_entry(downstream_text, executable=True),
+        "downstream.bin": file_entry(b"\x00trtllm\xfe", executable=True),
+        "upstream.bin": base["upstream.bin"],
+    }
+    upstream = {
+        "script.py": file_entry(upstream_text, executable=False),
+        "downstream.bin": base["downstream.bin"],
+        "upstream.bin": file_entry(b"\x00new-upstream\xfd", executable=False),
+    }
+
+    merged = module._merge_trees(base, downstream, upstream)
+
+    expected_text = upstream_text.replace(b"DOWNSTREAM = 0", b"DOWNSTREAM = 1")
+    assert merged["script.py"] == file_entry(expected_text, executable=True)
+    assert merged["downstream.bin"] == downstream["downstream.bin"]
+    assert merged["upstream.bin"] == upstream["upstream.bin"]
+
+
+def test_merge_trees_reports_same_file_binary_changes_as_a_content_conflict() -> None:
+    module = _load_vendor_sources_module()
+    file_entry = module.FileEntry
+    with pytest.raises(module.VendorError, match="binary.*shared.bin"):
+        module._merge_trees(
+            {"shared.bin": file_entry(b"\0base\xff")},
+            {"shared.bin": file_entry(b"\0downstream\xfe")},
+            {"shared.bin": file_entry(b"\0upstream\xfd")},
+        )
+
+
+def test_merge_file_translates_preparation_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_vendor_sources_module()
+    real_write_bytes = Path.write_bytes
+
+    def fail_merge_input_write(path: Path, data: bytes) -> int:
+        if path.name == "base" and path.parent.name.startswith("trtllm-vendor-merge-"):
+            raise OSError("injected merge-input write failure")
+        return real_write_bytes(path, data)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(Path, "write_bytes", fail_merge_input_write)
+        with pytest.raises(module.VendorError, match="prepare source merge.*compat.py"):
+            module._merge_file_contents(
+                "compat.py",
+                b"MODE = 'base'\n",
+                b"MODE = 'downstream'\n",
+                b"MODE = 'upstream'\n",
+            )
+
+
+def test_merge_file_does_not_mislabel_operational_git_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_vendor_sources_module()
+
+    def git_not_found(*_: object, **__: object) -> None:
+        raise FileNotFoundError("injected missing Git")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(module.subprocess, "run", git_not_found)
+        with pytest.raises(module.VendorError) as missing_git:
+            module._merge_file_contents(
+                "compat.py",
+                b"MODE = 'base'\n",
+                b"MODE = 'downstream'\n",
+                b"MODE = 'upstream'\n",
+            )
+    assert "not found" in str(missing_git.value).lower()
+    assert "conflict" not in str(missing_git.value).lower()
+
+    def fail_operationally(*_: object, **__: object) -> bytes:
+        raise module._GitCommandError("injected Git option failure", 129)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(module, "_run_git", fail_operationally)
+        with pytest.raises(module._GitCommandError) as operational_failure:
+            module._merge_file_contents(
+                "compat.py",
+                b"MODE = 'base'\n",
+                b"MODE = 'downstream'\n",
+                b"MODE = 'upstream'\n",
+            )
+    assert "conflict" not in str(operational_failure.value).lower()
+
+
+def test_sync_migration_conflict_does_not_mutate_state(tmp_path: Path) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": "MODE = 'upstream'\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text("MODE = 'trtllm'\n", encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+
+    (upstream / _SOURCE / "compat.py").write_text("MODE = 'new-upstream'\n", encoding="utf-8")
+    conflicting_commit = _commit(upstream, "conflicting upstream change")
+    original_lock = lock.read_bytes()
+    original_destination = _tree_snapshot(destination)
+    original_patch = patch_path.read_bytes()
+    original_patch_mode = stat.S_IMODE(patch_path.stat().st_mode)
+    original_patch_directory = _tree_snapshot(patch_path.parent)
+    original_destination_entries = sorted(path.name for path in destination.parent.iterdir())
+
+    result = _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--branch",
+        "main",
+        "--commit",
+        conflicting_commit,
+        "--repo",
+        upstream,
+        check=False,
+    )
+
+    _assert_failure(result, "conflict")
+    _assert_failure(result, "compat.py")
+    assert lock.read_bytes() == original_lock
+    assert _tree_snapshot(destination) == original_destination
+    assert patch_path.read_bytes() == original_patch
+    assert stat.S_IMODE(patch_path.stat().st_mode) == original_patch_mode
+    assert _tree_snapshot(patch_path.parent) == original_patch_directory
+    assert (
+        sorted(path.name for path in destination.parent.iterdir()) == original_destination_entries
+    )
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_migration_rolls_back_when_lock_save_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    original_source = "\n".join(
+        [
+            "UPSTREAM = 0",
+            *(f"KEEP_{index} = {index}" for index in range(10)),
+            "DOWNSTREAM = 0",
+            "",
+        ]
+    )
+    downstream_source = original_source.replace("DOWNSTREAM = 0", "DOWNSTREAM = 1")
+    updated_source = original_source.replace("UPSTREAM = 0", "UPSTREAM = 1")
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": original_source})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text(downstream_source, encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+
+    (upstream / _SOURCE / "compat.py").write_text(updated_source, encoding="utf-8")
+    updated_commit = _commit(upstream, "update upstream half of compatibility source")
+    original_lock = lock.read_bytes()
+    original_destination = _tree_snapshot(destination)
+    original_patch = patch_path.read_bytes()
+    original_patch_mode = stat.S_IMODE(patch_path.stat().st_mode)
+    original_patch_directory = _tree_snapshot(patch_path.parent)
+    original_destination_entries = sorted(path.name for path in destination.parent.iterdir())
+    module = _load_vendor_sources_module()
+
+    def fail_save_lock(_: object) -> None:
+        raise OSError("injected sync lock-save failure")
+
+    with monkeypatch.context() as failure:
+        failure.setattr(module, "_save_lock", fail_save_lock)
+        result = module.main(
+            [
+                "--lock",
+                str(lock),
+                "sync",
+                _VENDOR_NAME,
+                "--commit",
+                updated_commit,
+                "--repo",
+                str(upstream),
+            ]
+        )
+
+    assert result == 1
+    assert "injected sync lock-save failure" in capsys.readouterr().err
+    assert lock.read_bytes() == original_lock
+    assert _tree_snapshot(destination) == original_destination
+    assert patch_path.read_bytes() == original_patch
+    assert stat.S_IMODE(patch_path.stat().st_mode) == original_patch_mode
+    assert _tree_snapshot(patch_path.parent) == original_patch_directory
+    assert (
+        sorted(path.name for path in destination.parent.iterdir()) == original_destination_entries
+    )
+
+    _vendor(
+        consumer,
+        lock,
+        "sync",
+        _VENDOR_NAME,
+        "--commit",
+        updated_commit,
+        "--repo",
+        upstream,
+    )
+    merged_source = updated_source.replace("DOWNSTREAM = 0", "DOWNSTREAM = 1")
+    assert (destination / "compat.py").read_text(encoding="utf-8") == merged_source
+    assert patch_path.read_bytes() != original_patch
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_migration_keeps_committed_state_after_visible_lock_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_source = "\n".join(
+        [
+            "UPSTREAM = 0",
+            *(f"KEEP_{index} = {index}" for index in range(10)),
+            "DOWNSTREAM = 0",
+            "",
+        ]
+    )
+    downstream_source = original_source.replace("DOWNSTREAM = 0", "DOWNSTREAM = 1")
+    updated_source = original_source.replace("UPSTREAM = 0", "UPSTREAM = 1")
+    upstream, base_commit = _make_upstream(tmp_path, {"compat.py": original_source})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    destination = consumer / _DESTINATION
+    (destination / "compat.py").write_text(downstream_source, encoding="utf-8")
+    _create_vendor(consumer, lock, upstream, base_commit, mode="patched")
+    patch_path = consumer / str(_vendor_data(lock)["patch"])
+    original_patch = patch_path.read_bytes()
+    (upstream / _SOURCE / "compat.py").write_text(updated_source, encoding="utf-8")
+    updated_commit = _commit(upstream, "update upstream before interrupted migration")
+    module = _load_vendor_sources_module()
+    real_contextlib = module.contextlib
+    real_exit_stack = real_contextlib.ExitStack
+
+    class InterruptAfterBodyExitStack(real_exit_stack):
+        def __exit__(
+            self,
+            exception_type: type[BaseException] | None,
+            exception: BaseException | None,
+            traceback: object,
+        ) -> bool:
+            if exception_type is not None:
+                return real_exit_stack.__exit__(self, exception_type, exception, traceback)
+            interrupt = KeyboardInterrupt("injected interruption after lock replacement")
+            handled = real_exit_stack.__exit__(
+                self, KeyboardInterrupt, interrupt, interrupt.__traceback__
+            )
+            assert not handled
+            raise interrupt
+
+    class ContextlibProxy:
+        ExitStack = InterruptAfterBodyExitStack
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(real_contextlib, name)
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(module, "contextlib", ContextlibProxy())
+        with pytest.raises(KeyboardInterrupt, match="after lock replacement"):
+            module.main(
+                [
+                    "--lock",
+                    str(lock),
+                    "sync",
+                    _VENDOR_NAME,
+                    "--commit",
+                    updated_commit,
+                    "--repo",
+                    str(upstream),
+                ]
+            )
+
+    migrated_vendor = _vendor_data(lock)
+    migrated_patch = patch_path.read_bytes()
+    assert migrated_vendor["commit"] == updated_commit
+    assert migrated_vendor["patch_digest"] == (
+        f"sha256:{hashlib.sha256(migrated_patch).hexdigest()}"
+    )
+    assert migrated_patch != original_patch
+    assert (destination / "compat.py").read_text(encoding="utf-8") == updated_source.replace(
+        "DOWNSTREAM = 0", "DOWNSTREAM = 1"
+    )
+    assert not list(destination.parent.glob(".example.vendor-*"))
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_migration_backup_cleanup_failure_is_warning_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 1\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    _create_vendor(consumer, lock, upstream, base_commit, mode="exact")
+    destination = consumer / _DESTINATION
+    backup = destination.parent / ".example.vendor-backup"
+    (upstream / _SOURCE / "kernel.py").write_text("VALUE = 2\n", encoding="utf-8")
+    updated_commit = _commit(upstream, "update exact source before cleanup failure")
+    module = _load_vendor_sources_module()
+    real_remove_path = module._remove_path
+
+    def fail_backup_cleanup(path: Path) -> None:
+        if path == backup:
+            raise OSError("injected destination-backup cleanup failure")
+        real_remove_path(path)
+
+    with monkeypatch.context() as cleanup_failure:
+        cleanup_failure.setattr(module, "_remove_path", fail_backup_cleanup)
+        result = module.main(
+            [
+                "--lock",
+                str(lock),
+                "sync",
+                _VENDOR_NAME,
+                "--commit",
+                updated_commit,
+                "--repo",
+                str(upstream),
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert "warning:" in captured.err.lower()
+    assert "replacement is committed" in captured.err
+    assert "delete that backup manually" in captured.err.lower()
+    assert str(backup) in captured.err
+    assert backup.is_dir()
+    assert _vendor_data(lock)["commit"] == updated_commit
+    assert (destination / "kernel.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_absorbed_patch_directory_sync_failure_retains_valid_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upstream, consumer, lock, destination, patch_path, absorbed_commit = (
+        _prepare_absorbed_patch_migration(tmp_path)
+    )
+    patch_content = patch_path.read_bytes()
+    module = _load_vendor_sources_module()
+
+    def fail_directory_sync(_: Path) -> None:
+        raise OSError("injected sync lock-directory failure")
+
+    with monkeypatch.context() as sync_failure:
+        sync_failure.setattr(module, "_sync_directory", fail_directory_sync)
+        result = module.main(
+            [
+                "--lock",
+                str(lock),
+                "sync",
+                _VENDOR_NAME,
+                "--commit",
+                absorbed_commit,
+                "--repo",
+                str(upstream),
+            ]
+        )
+
+    assert result == 1
+    assert "injected sync lock-directory failure" in capsys.readouterr().err
+    vendor = _vendor_data(lock)
+    assert vendor["commit"] == absorbed_commit
+    assert "patch" not in vendor
+    assert "patch_digest" not in vendor
+    assert patch_path.read_bytes() == patch_content
+    assert (destination / "compat.py").read_text(encoding="utf-8") == "MODE = 'trtllm'\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_absorbed_patch_interrupt_after_visible_lock_leaves_valid_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream, consumer, lock, destination, patch_path, absorbed_commit = (
+        _prepare_absorbed_patch_migration(tmp_path)
+    )
+    patch_content = patch_path.read_bytes()
+    patch_mode = stat.S_IMODE(patch_path.stat().st_mode)
+    module = _load_vendor_sources_module()
+    real_save_lock = module._save_lock
+
+    def save_then_interrupt(lock_file: object) -> None:
+        real_save_lock(lock_file)
+        raise KeyboardInterrupt("injected absorbed-patch interruption")
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(module, "_save_lock", save_then_interrupt)
+        with pytest.raises(KeyboardInterrupt, match="absorbed-patch interruption"):
+            module.main(
+                [
+                    "--lock",
+                    str(lock),
+                    "sync",
+                    _VENDOR_NAME,
+                    "--commit",
+                    absorbed_commit,
+                    "--repo",
+                    str(upstream),
+                ]
+            )
+
+    vendor = _vendor_data(lock)
+    assert vendor["commit"] == absorbed_commit
+    assert "patch" not in vendor
+    assert "patch_digest" not in vendor
+    assert patch_path.read_bytes() == patch_content
+    assert stat.S_IMODE(patch_path.stat().st_mode) == patch_mode
+    assert (destination / "compat.py").read_text(encoding="utf-8") == "MODE = 'trtllm'\n"
+    assert not list(destination.parent.glob(".example.vendor-*"))
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_sync_absorbed_patch_cleanup_failure_warns_in_commit_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    upstream, consumer, lock, destination, patch_path, absorbed_commit = (
+        _prepare_absorbed_patch_migration(tmp_path)
+    )
+    patch_content = patch_path.read_bytes()
+    module = _load_vendor_sources_module()
+    real_save_lock_checked = module._save_lock_checked
+    real_sync_directory = module._sync_directory
+    real_unlink = Path.unlink
+    events: list[str] = []
+
+    def record_lock_save(lock_file: object, description: str) -> None:
+        real_save_lock_checked(lock_file, description)
+        events.append("lock-save")
+
+    def record_directory_sync(path: Path) -> None:
+        real_sync_directory(path)
+        events.append("directory-sync")
+
+    def fail_patch_cleanup(path: Path, missing_ok: bool = False) -> None:
+        if path == patch_path:
+            events.append("patch-unlink")
+            raise OSError("injected sync absorbed-patch cleanup failure")
+        real_unlink(path, missing_ok=missing_ok)
+
+    with monkeypatch.context() as cleanup_failure:
+        cleanup_failure.setattr(module, "_save_lock_checked", record_lock_save)
+        cleanup_failure.setattr(module, "_sync_directory", record_directory_sync)
+        cleanup_failure.setattr(Path, "unlink", fail_patch_cleanup)
+        result = module.main(
+            [
+                "--lock",
+                str(lock),
+                "sync",
+                _VENDOR_NAME,
+                "--commit",
+                absorbed_commit,
+                "--repo",
+                str(upstream),
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert events == ["lock-save", "directory-sync", "patch-unlink"]
+    assert "warning:" in captured.err.lower()
+    assert "lock is committed and valid" in captured.err
+    assert "unreferenced orphan" in captured.err
+    vendor = _vendor_data(lock)
+    assert vendor["commit"] == absorbed_commit
+    assert "patch" not in vendor
+    assert "patch_digest" not in vendor
+    assert patch_path.read_bytes() == patch_content
+    assert (destination / "compat.py").read_text(encoding="utf-8") == "MODE = 'trtllm'\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+def test_plain_sync_and_migration_serialize_state_mutation(tmp_path: Path) -> None:
+    upstream, base_commit = _make_upstream(tmp_path, {"kernel.py": "VALUE = 1\n"})
+    consumer, lock = _make_consumer(tmp_path)
+    _copy_python_sources(upstream, consumer)
+    _create_vendor(consumer, lock, upstream, base_commit, mode="exact")
+    destination = consumer / _DESTINATION
+    (upstream / _SOURCE / "kernel.py").write_text("VALUE = 2\n", encoding="utf-8")
+    updated_commit = _commit(upstream, "update source for concurrent migration")
+    plain_cached = tmp_path / "plain-sync-cached"
+    release_plain = tmp_path / "release-plain-sync"
+    migration_attempted = tmp_path / "migration-lock-attempted"
+    migration_entered = tmp_path / "migration-handler-entered"
+
+    plain_script = "\n".join(
+        [
+            "import importlib.util",
+            "import pathlib",
+            "import sys",
+            "import time",
+            "module_path, lock, upstream, cached, release = sys.argv[1:]",
+            "spec = importlib.util.spec_from_file_location('_vendor_sources_plain_sync', module_path)",
+            "assert spec is not None and spec.loader is not None",
+            "module = importlib.util.module_from_spec(spec)",
+            "sys.modules[spec.name] = module",
+            "spec.loader.exec_module(module)",
+            "replace_destination = module._replace_selected_destination",
+            "def pause_after_materialization(lock_file, vendor, tree):",
+            "    pathlib.Path(cached).write_text('cached', encoding='utf-8')",
+            "    while not pathlib.Path(release).exists():",
+            "        time.sleep(0.01)",
+            "    replace_destination(lock_file, vendor, tree)",
+            "module._replace_selected_destination = pause_after_materialization",
+            "raise SystemExit(module.main([",
+            "    '--lock', lock, 'sync', 'example', '--repo', upstream,",
+            "]))",
+        ]
+    )
+    migration_script = "\n".join(
+        [
+            "import contextlib",
+            "import importlib.util",
+            "import pathlib",
+            "import sys",
+            "module_path, lock, upstream, commit, attempted, entered = sys.argv[1:]",
+            "spec = importlib.util.spec_from_file_location('_vendor_sources_migration', module_path)",
+            "assert spec is not None and spec.loader is not None",
+            "module = importlib.util.module_from_spec(spec)",
+            "sys.modules[spec.name] = module",
+            "spec.loader.exec_module(module)",
+            "state_lock = module._vendor_state_lock",
+            "@contextlib.contextmanager",
+            "def marked_state_lock(path, *, exclusive):",
+            "    pathlib.Path(attempted).write_text('attempted', encoding='utf-8')",
+            "    with state_lock(path, exclusive=exclusive):",
+            "        pathlib.Path(entered).write_text('entered', encoding='utf-8')",
+            "        yield",
+            "module._vendor_state_lock = marked_state_lock",
+            "raise SystemExit(module.main([",
+            "    '--lock', lock, 'sync', 'example', '--commit', commit, '--repo', upstream,",
+            "]))",
+        ]
+    )
+
+    def wait_for_marker(marker: Path, process: subprocess.Popen[str], description: str) -> None:
+        deadline = time.monotonic() + 10
+        while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not marker.exists():
+            stdout, stderr = process.communicate(timeout=5)
+            pytest.fail(f"{description} was not reached.\nstdout:\n{stdout}\nstderr:\n{stderr}")
+
+    plain = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            plain_script,
+            str(_VENDOR_SOURCES),
+            str(lock),
+            str(upstream),
+            str(plain_cached),
+            str(release_plain),
+        ],
+        cwd=consumer,
+        env=_command_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    migration: subprocess.Popen[str] | None = None
+    try:
+        wait_for_marker(plain_cached, plain, "plain-sync materialization barrier")
+        migration = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                migration_script,
+                str(_VENDOR_SOURCES),
+                str(lock),
+                str(upstream),
+                updated_commit,
+                str(migration_attempted),
+                str(migration_entered),
+            ],
+            cwd=consumer,
+            env=_command_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        wait_for_marker(migration_attempted, migration, "migration lock-attempt barrier")
+        time.sleep(0.2)
+        assert migration.poll() is None
+        assert not migration_entered.exists()
+
+        release_plain.write_text("release", encoding="utf-8")
+        plain_stdout, plain_stderr = plain.communicate(timeout=10)
+        migration_stdout, migration_stderr = migration.communicate(timeout=10)
+    finally:
+        if plain.poll() is None:
+            plain.kill()
+            plain.communicate(timeout=5)
+        if migration is not None and migration.poll() is None:
+            migration.kill()
+            migration.communicate(timeout=5)
+
+    assert plain.returncode == 0, f"stdout:\n{plain_stdout}\nstderr:\n{plain_stderr}"
+    assert migration.returncode == 0, f"stdout:\n{migration_stdout}\nstderr:\n{migration_stderr}"
+    assert migration_entered.exists()
+    assert _vendor_data(lock)["commit"] == updated_commit
+    assert (destination / "kernel.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--offline")
+    _vendor(consumer, lock, "check", _VENDOR_NAME, "--repo", upstream)
+
+
+@pytest.mark.parametrize("waiter_exclusive", (True, False))
+def test_state_lock_remains_held_across_lock_file_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    waiter_exclusive: bool,
+) -> None:
+    module = _load_vendor_sources_module()
+    lock = tmp_path / "vendor-sources.lock.yaml"
+    lock.write_text("old lock\n", encoding="utf-8")
+    replacement_visible = threading.Event()
+    release_holder = threading.Event()
+    waiter_attempted = threading.Event()
+    waiter_entered = threading.Event()
+    observed_locks: list[bytes] = []
+    failures: list[BaseException] = []
+    waiter: threading.Thread
+    real_flock = module.fcntl.flock
+
+    def marked_flock(file_descriptor: int, operation: int) -> None:
+        waiter_operation = module.fcntl.LOCK_EX if waiter_exclusive else module.fcntl.LOCK_SH
+        if threading.current_thread() is waiter and operation == waiter_operation:
+            waiter_attempted.set()
+        real_flock(file_descriptor, operation)
+
+    def hold_lock_through_replacement() -> None:
+        try:
+            with module._vendor_state_lock(lock, exclusive=True):
+                module._atomic_write(lock, b"new lock\n")
+                replacement_visible.set()
+                if not release_holder.wait(timeout=5):
+                    raise AssertionError("timed out waiting to release the state lock")
+        except BaseException as error:
+            failures.append(error)
+
+    def wait_for_replaced_lock() -> None:
+        try:
+            with module._vendor_state_lock(lock, exclusive=waiter_exclusive):
+                observed_locks.append(lock.read_bytes())
+                waiter_entered.set()
+        except BaseException as error:
+            failures.append(error)
+
+    monkeypatch.setattr(module.fcntl, "flock", marked_flock)
+    holder = threading.Thread(target=hold_lock_through_replacement)
+    waiter = threading.Thread(target=wait_for_replaced_lock)
+    holder.start()
+    assert replacement_visible.wait(timeout=5)
+    waiter.start()
+    assert waiter_attempted.wait(timeout=5)
+    assert not waiter_entered.wait(timeout=0.1)
+    release_holder.set()
+    holder.join(timeout=5)
+    waiter.join(timeout=5)
+
+    assert not holder.is_alive()
+    assert not waiter.is_alive()
+    assert failures == []
+    assert waiter_entered.is_set()
+    assert observed_locks == [b"new lock\n"]

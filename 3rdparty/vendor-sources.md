@@ -41,20 +41,24 @@ flowchart TD
     A -- No --> B{Destination exists?}
     B -- No --> C[create]
     B -- Yes --> D[create --adopt exact or patched]
-    A -- Yes --> E{What do you need?}
-    E -- Inspect --> F[list, status, or check]
-    E -- Restore locked bytes --> G[sync current immutable pin]
-    E -- Use a newer upstream commit --> H[Prepare matching destination, then pin]
-    E -- Destination changed --> I{Should the change go upstream?}
-    I -- No, TensorRT-LLM only --> J[patch create or refresh]
-    I -- Yes --> K[Temporary branch, export, commit and push, then pin]
-    E -- Stop vendoring --> L[remove]
+    A -- Yes --> E{Destination exists?}
+    E -- No --> F[sync current immutable pin]
+    E -- Yes --> G{What do you need?}
+    G -- Inspect --> H[list, status, or check]
+    G -- Restore locked bytes --> I[sync]
+    G -- Use a newer upstream commit --> J{Destination matches lock?}
+    J -- Yes --> O[sync --commit FULL_SHA]
+    J -- No --> P[Resolve edits with sync, patch, or export]
+    G -- Destination changed --> K{Should the change go upstream?}
+    K -- No, TensorRT-LLM only --> L[patch create or refresh]
+    K -- Yes --> M[Temporary branch, export, commit and push, then pin]
+    G -- Stop vendoring --> N[remove]
 ```
 
-`sync` only restores the commit and compatibility patch already recorded in the
-lock. It never discovers, imports, or pins a newer upstream commit. To move to a
-new upstream revision, first make the destination equal that revision plus the
-existing compatibility patch, then use `pin`.
+Plain `sync` restores the commit and compatibility patch already recorded in
+the lock. Add an explicit full commit to migrate a clean vendor to that
+revision in one command. `sync` never discovers or follows a moving branch or
+tag tip.
 
 ## Inspect vendors
 
@@ -107,7 +111,7 @@ python scripts/vendor_sources.py create VENDOR \
 Use `--adopt patched` instead to capture intentional TensorRT-LLM compatibility
 adaptations. Adoption never silently accepts an unrepresented difference.
 
-## Restore the current lock
+## Restore or migrate with sync
 
 Discard destination edits and reproduce the currently locked upstream commit
 plus its persistent patch:
@@ -118,6 +122,44 @@ python scripts/vendor_sources.py sync VENDOR --repo /path/to/upstream
 
 This overwrites the selected destination files. It does not update the lock,
 look at a branch tip, or choose a newer commit.
+
+To migrate a clean vendor to a newer upstream revision, provide its full,
+immutable commit:
+
+```bash
+python scripts/vendor_sources.py sync VENDOR \
+  --commit NEW_FULL_COMMIT \
+  --branch main \
+  --repo /path/to/upstream
+```
+
+Use `--url NEW_URL` when the revision comes from a different remote, or
+`--tag TAG` instead of `--branch BRANCH`. `--url`, `--branch`, and `--tag` are
+metadata changes and are accepted only with `--commit`; `--branch` and `--tag`
+are mutually exclusive. The full commit remains authoritative. The tool never
+resolves or chases the recorded branch or tag tip. During migration, a checkout
+provided with `--repo` need not have the requested revision checked out; its
+object database only needs to contain `NEW_FULL_COMMIT`.
+
+Migration requires the destination to match its current lock entry. This
+prevents an unrecorded edit from being overwritten or accidentally folded into
+the update. For an exact vendor, migration replaces the destination with the
+new selected upstream tree. For a patched vendor, it performs a three-way
+rebase from the old upstream tree, through the current patched materialization,
+onto the new upstream tree. It then regenerates the persistent patch with only
+the adaptations that remain downstream. If upstream absorbed the whole patch,
+the tool drops the patch and its lock metadata. A merge conflict leaves the
+destination, patch, and lock unchanged so the update can be resolved upstream
+or split into a reviewed TensorRT-LLM adaptation.
+
+Migration does not need to fetch the old locked commit. For an exact vendor,
+the verified destination is the old base. For a patched vendor, the tool
+reverse-applies the verified persistent patch and validates the reconstructed
+raw tree before rebasing it. This allows migration when, for example, an old
+pull-request commit is no longer advertised by the upstream Git endpoint. The
+old base then relies on the previously reviewed lock, destination digest, and
+patch as its provenance record; the requested new commit is still obtained and
+verified from the supplied checkout or URL.
 
 ## Maintain a TensorRT-LLM compatibility patch
 
@@ -182,23 +224,22 @@ python scripts/vendor_sources.py pin VENDOR \
   --repo /path/to/upstream
 ```
 
-`pin` first tries the selected files at `NEW_FULL_COMMIT` plus the existing
-persistent compatibility patch. They must exactly equal the checked-in
-destination. One exception is safe: if the raw new commit itself exactly equals
-the destination, upstream has absorbed the compatibility patch, so `pin` drops
-that patch and its metadata. Otherwise `pin` does not absorb a mismatch,
-regenerate the patch, or copy candidate files into the destination. On success
-it durably updates the immutable lock before removing an absorbed patch and
+`pin` is the post-export validation step, not the normal way to migrate an
+unchanged destination to a newer upstream revision. It verifies that the
+selected files at `NEW_FULL_COMMIT` plus the existing persistent compatibility
+patch exactly reproduce the already-exported destination. It does not copy
+candidate files into the destination or regenerate a mismatching patch. If the
+raw new commit itself reproduces the destination, upstream has absorbed the
+compatibility patch, so `pin` drops that patch and its metadata. On success it
+durably updates the immutable lock before removing an absorbed patch and
 restores passing offline checks. If the patch cannot be removed after that
 commit, `pin` succeeds with a warning and leaves a safe, unreferenced orphan;
 delete the reported file manually. A failure before the durable lock commit
 does not remove the existing patch. If directory synchronization fails after
 the atomic replacement, the lock may already show the new pin, but the retained
-patch keeps either recovered lock version reproducible.
-
-The same rule applies when adopting a newer commit that was developed upstream
-first: prepare the destination to exactly match the proposed commit plus the
-existing patch, then run `pin`. Do not use `sync` to look for that commit.
+patch keeps either recovered lock version reproducible. Use
+`sync --commit NEW_FULL_COMMIT` instead when the destination has no pending
+export and should be migrated by the tool.
 
 ## Remove a vendor
 
@@ -254,10 +295,11 @@ form.
 
 An offline digest proves that the committed destination matches the lock. It
 cannot independently prove that a URL, commit, and source directory produced
-that destination. Creating and pinning vendors therefore require a fetched or
-local repository, and URL or commit changes require vendor CODEOWNER review.
-Never put credentials in a lock URL. Run checks that use internal credentials
-only in a trusted environment, not with pull-request-controlled scripts.
+that destination. Creating, migrating, and pinning vendors therefore require a
+fetched or local repository, and URL or commit changes require vendor CODEOWNER
+review. Never put credentials in a lock URL. Run checks that use internal
+credentials only in a trusted environment, not with pull-request-controlled
+scripts.
 
 ## License and attribution
 

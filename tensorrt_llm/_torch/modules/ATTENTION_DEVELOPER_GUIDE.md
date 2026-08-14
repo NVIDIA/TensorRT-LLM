@@ -283,8 +283,9 @@ The FMHA package is split by role:
   files, and applies the recorded TRT-LLM compatibility patch. Exact upstream
   files retain FlashInfer's headers. Before editing this tree, read the
   [vendored-source lifecycle](../../../3rdparty/vendor-sources.md). Use a
-  persistent patch for TRT-LLM-only adaptations, or export an upstream-worthy
-  destination change and pin its committed upstream revision.
+  persistent patch for TRT-LLM-only adaptations, export an upstream-worthy
+  destination change and pin its committed upstream revision, or use
+  `sync --commit FULL_SHA` to migrate a clean vendor to a newer revision.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the regular `thop.attention` fallback library.
