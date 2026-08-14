@@ -5658,22 +5658,6 @@ files = [
 ]
 
 [[package]]
-name = "smg-grpc-proto"
-version = "0.4.14"
-description = "SMG gRPC proto definitions for vLLM, TRT-LLM, MLX, TokenSpeed, and SGLang"
-optional = false
-python-versions = ">=3.10"
-groups = ["main"]
-files = [
-    {file = "smg_grpc_proto-0.4.14-py3-none-any.whl", hash = "sha256:94ead6971aafbb24755ebcbd4fb680e38d067d3dc6bfeb2b5feeae3f2664da38"},
-    {file = "smg_grpc_proto-0.4.14.tar.gz", hash = "sha256:a8ea20872934472c94ffa192bafb2a4f71bc591ab4bfb240cb567801210fbc0f"},
-]
-
-[package.dependencies]
-grpcio = ">=1.81.1"
-protobuf = ">=5.26.0"
-
-[[package]]
 name = "sniffio"
 version = "1.3.1"
 description = "Sniff out which async library your code is running under"
@@ -6283,14 +6267,14 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "uvicorn"
-version = "0.52.1"
+version = "0.52.2"
 description = "The lightning-fast ASGI server."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "uvicorn-0.52.1-py3-none-any.whl", hash = "sha256:e4403f9d93188cf9d1088e9f40e3acd12630e2df8675316704379a7fc20fff6a"},
-    {file = "uvicorn-0.52.1.tar.gz", hash = "sha256:112ec661814189acbccd3f7b86460147cc065fc92c0821afa78918780e4354dd"},
+    {file = "uvicorn-0.52.2-py3-none-any.whl", hash = "sha256:0b916d247cf5500b320638ea11abf0fed7f348e8e1c7fde53a0e6b6319803512"},
+    {file = "uvicorn-0.52.2.tar.gz", hash = "sha256:4294500b9c8f7a3ef3e975d9e4be08c3eb76441af449a9e6e10146c6a182ffec"},
 ]
 
 [package.dependencies]
@@ -6823,4 +6807,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "095bbeb33ddd070d92200c4f4ed0dfaea0205b9a8132c20a78d3ffa1b88582cd"
+content-hash = "a584146594cfabc9fdee889efd34f9f66c022cd5071df5c66d96c01bd6c9abad"

@@ -51,6 +51,7 @@ __all__ = [
     "InklingForCausalLM",
     "InklingForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "KimiK3ForConditionalGeneration",
     "KimiLinearForCausalLM",
     "LagunaForCausalLM",
     "LlamaForCausalLM",
