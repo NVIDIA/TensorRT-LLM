@@ -3038,6 +3038,8 @@ def create_py_executor_instance(
             cross_kv_cache_manager=cross_kv_cache_manager,
             no_schedule_until_state=no_schedule_until_state,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
+            # A disaggregated generation worker must not replay context locally.
+            enable_recompute_pause=not is_disagg,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

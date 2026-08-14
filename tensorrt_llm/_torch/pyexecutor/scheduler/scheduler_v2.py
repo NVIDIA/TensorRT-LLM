@@ -162,6 +162,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         draft_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for MTP draft layers
         cross_kv_cache_manager: object | None = None,  # KVCacheManagerV2 for enc-dec cross-attn
         enable_prefix_aware_scheduling: bool = True,
+        enable_recompute_pause: bool = True,
     ) -> None:
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
@@ -176,6 +177,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.draft_kv_cache_manager = draft_kv_cache_manager
         self.cross_kv_cache_manager = cross_kv_cache_manager
         self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
+        self.enable_recompute_pause = enable_recompute_pause
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
                 "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, "
@@ -201,7 +203,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"KVCacheV2Scheduler: tokens_per_block={self.tokens_per_block}, "
             f"max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}, "
             f"draft_mgr={draft_mgr_name}, cross_mgr={cross_mgr_name}, "
-            f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}"
+            f"enable_prefix_aware_scheduling={enable_prefix_aware_scheduling}, "
+            f"enable_recompute_pause={enable_recompute_pause}"
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -1140,6 +1143,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         Recompute pause does not shrink the ordinary scheduling frontier; exact
         victim indices prevent destructively-freed requests from being revisited.
         """
+        if not self.enable_recompute_pause:
+            return req_it_end, False
+
         while True:
             victim_idx = None
             for i in range(recompute_pause_state.frontier - 1, req_it, -1):

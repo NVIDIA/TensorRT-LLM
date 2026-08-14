@@ -202,6 +202,7 @@ def make_scheduler(
     no_schedule_after_state: LlmRequestState | None = None,
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
+    enable_recompute_pause: bool = True,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -226,6 +227,7 @@ def make_scheduler(
             peft_cache_manager=peft_cache_manager,
             scheduler_capacity=scheduler_capacity,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
+            enable_recompute_pause=enable_recompute_pause,
             **kwargs,
         )
 
@@ -533,6 +535,33 @@ class TestKVCacheFailuresGen:
         assert ids(out.recompute_paused_requests) == [99]
         assert call_count[0] == 4
         mgr.free_resources.assert_called_once_with(victim)
+
+    def test_recompute_pause_gate_stops_destructive_fallback(self):
+        """Disabling recompute pause keeps ordinary suspension as the last fallback."""
+        call_count = [0]
+
+        def alloc_fn(req):
+            call_count[0] += 1
+            return call_count[0] == 1
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, has_host_tier=True)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100,
+            enable_recompute_pause=False,
+        )
+        victim = make_gen_request(99)
+
+        out = sched.schedule_request(
+            [make_gen_request(0), make_gen_request(1), victim],
+            set(),
+        )
+
+        assert ids(out.generation_requests) == [0]
+        assert set(ids(out.paused_requests)) == {1, 99}
+        assert out.recompute_paused_requests == []
+        assert call_count[0] == 3
+        mgr.free_resources.assert_not_called()
 
     def test_recompute_pause_skips_multimodal_victim(self):
         """Released MM inputs cannot be reconstructed by destructive pause."""
