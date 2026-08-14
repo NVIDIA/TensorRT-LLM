@@ -3775,7 +3775,9 @@ def runInfraDryRunInPreparedWorkspace(pipeline, String llmSrc, String stageName)
         "--test-list=${preprocessedLists.regular}",
     ]
 
-    withEnv(["stageName=${stageName}"]) {
+    // The synthetic benchmark still uses the standard defs/conftest.py reporting
+    // hooks, but it must not require the TRT-LLM product wheel just to collect.
+    withEnv(["stageName=${stageName}", "TRTLLM_INFRA_DRY_RUN=true"]) {
         withCredentials([
             string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
