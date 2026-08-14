@@ -140,11 +140,16 @@ params = vg.default_params
 params.video_reference = "clip.mp4"
 ```
 
-The equivalent serve request uploads the file, or sends a base64 string or `data:` URI in a JSON body:
+The equivalent serve request uploads the file, or sends a base64 string, `data:` URI, `http(s)` URL, or `file://` path as the field value in a JSON body:
 
 ```bash
+# multipart file upload (raw bytes, no base64)
 curl http://localhost:8000/v1/videos -F "prompt=the scene comes alive" -F "image_reference=@start.png"
 curl http://localhost:8000/v1/videos -F "prompt=continue the scene" -F "video_reference=@clip.mp4"
+
+# JSON body: the reference string may be base64, a data: URI, an http(s) URL, or a file:// path
+curl http://localhost:8000/v1/videos -H 'content-type: application/json' \
+  -d '{"prompt": "the scene comes alive", "image_reference": "https://example.com/start.png"}'
 ```
 
 When a model accepts the same modality in more than one role — Wan 2.1 I2V takes a first frame and an optional last frame — the `role` is required to disambiguate:
