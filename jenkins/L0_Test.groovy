@@ -4981,20 +4981,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-            // Gateway adapters are opt-in extras excluded from requirements.txt;
-            // each gateway declares its pins in a dedicated
-            // requirements-<gateway>.txt, and a test stage installs exactly
-            // zero or one gateway file so every adapter is tested under the
-            // dependency set its real opt-in users receive. A gateway whose
-            // pins co-resolve with the default environment (SMG today) is
-            // installed in the shared stages so its unit tests run from the
-            // regular shard pool instead of being skipped at collection; a
-            // gateway whose pins conflict with the default environment (for
-            // example a protobuf major-version floor or a custom package
-            // index) must instead install its file behind a dedicated stage
-            // guard and skip this one (see the Ray install below for the
-            // stage-scoped pattern).
+            // Gateway adapters are opt-in extras excluded from requirements.txt.
+            // SMG remains available to shared and mixed-scope shards; OpenEngine
+            // is added only when its focused CBTS rule contributes tests.
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
+            def cbtsScopes = testFilter[(CBTS_RESULT)]?.scopes ?: []
+            if (cbtsScopes.contains("openengineonly")) {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-openengine.txt")
+            }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")

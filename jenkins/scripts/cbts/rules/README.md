@@ -15,6 +15,7 @@ for the overall CBTS architecture.
 | `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. `.md`) |
 | `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. `.md`) |
 | `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
+| `openengine_rule.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. `.md`) → the block containing `unittest/grpc/openengine/` |
 | `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
 
 ## WaivesRule
@@ -247,6 +248,13 @@ Outcomes:
   blocks (True iff any matched block lives in `*_perf_sanity*` yaml).
 - Spec-dec source touched but no spec-dec block found anywhere
   (defensive) → `scope=None` (fallback).
+
+## OpenEngineRule
+
+Claims non-documentation source changes under `tensorrt_llm/grpc/openengine/` and keeps only test-db entries under `unittest/grpc/openengine/`. The focused test currently resolves to the pre-merge A10 PyTorch stages, which CBTS resizes to one shard for this single test. The rule also recognizes the exact Jenkins edits that preserve the contributing scopes and install `requirements-openengine.txt` for an OpenEngine-narrowed shard; any other edit to those shared CI files remains unhandled and forces baseline CI. If no OpenEngine test entry is registered, the rule returns `scope=None` and falls back to the baseline rather than silently skipping coverage.
+
+Tests under `tests/unittest/grpc/openengine/` remain owned by `TestsDefRule`;
+source-plus-test changes combine through the `testsonly` scope family.
 
 ## OutOfScopeRule
 
