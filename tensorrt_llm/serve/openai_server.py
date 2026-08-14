@@ -79,8 +79,9 @@ from tensorrt_llm.serve.openai_protocol import (
     EmbeddingUsageInfo, ErrorResponse, ImageEditRequest, ImageGenerationRequest,
     ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
     ModelList, PromptTokensDetails, ResponseFormat, ResponsesRequest,
-    ResponsesResponse, TokenizeRequest, TokenizeResponse, UpdateWeightsRequest,
-    UsageInfo, ensure_request_chat_template_allowed, to_llm_conversation_params,
+    ResponsesResponse, StreamOptions, TokenizeRequest, TokenizeResponse,
+    UpdateWeightsRequest, UsageInfo, ensure_request_chat_template_allowed,
+    to_llm_conversation_params,
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
@@ -204,6 +205,64 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "a relayed mode from a context worker. Reasoning content will not be "
         "separated correctly. Check that the context worker is running a "
         "build that relays 'resolved_thinking'.")
+
+
+def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
+                                model_type: Optional[str]) -> None:
+    """Apply Kimi/Moonshot API semantics to a chat request for kimi_k3.
+
+    The kimi_k3 checkpoint template natively renders control messages for
+    thinking effort, tool_choice, and response_format, but only reads them
+    from chat-template kwargs. Derive those kwargs from the request-level
+    fields so the OpenAI-style API surface drives the template; explicit
+    client-supplied ``chat_template_kwargs`` win over derived values. The
+    merged kwargs also steer the kimi_k3 reasoning parser's initial channel,
+    the guided-decoding structural tag, and the thinking-budget logits
+    processor downstream.
+
+    Kimi's API also reports usage in the final streaming chunk without the
+    client opting in, so default ``stream_options`` for streaming requests.
+    """
+    if model_type != "kimi_k3":
+        return
+    if request.stream and request.stream_options is None:
+        # StreamOptions defaults: include_usage=True, continuous off.
+        request.stream_options = StreamOptions()
+    derived: dict[str, Any] = {}
+    if request.thinking is not None:
+        enabled = request.thinking.type != "disabled"
+        derived["thinking"] = enabled
+        if enabled and request.thinking.effort is not None:
+            derived["thinking_effort"] = request.thinking.effort
+    if ("reasoning_effort" in request.model_fields_set
+            and request.reasoning_effort is not None):
+        # Kimi semantics: reasoning_effort overrides thinking.effort.
+        effort = getattr(request.reasoning_effort, "value",
+                         request.reasoning_effort).lower()
+        if effort == "none":
+            derived["thinking"] = False
+            derived.pop("thinking_effort", None)
+        elif effort in ("low", "high", "max"):
+            derived["thinking_effort"] = effort
+        # Other efforts (e.g. harmony's "medium") have no K3 equivalent;
+        # leave the template default.
+    if ("tool_choice" in request.model_fields_set and request.tools
+            and request.tool_choice in ("required", "none")):
+        derived["tool_choice"] = request.tool_choice
+    response_format = request.response_format
+    if response_format is not None and response_format.type in (
+            "json_object", "json_schema"):
+        derived["response_format"] = response_format.type
+        if response_format.type == "json_schema":
+            schema = response_format.json_schema
+            if isinstance(schema, dict) and "schema" in schema:
+                schema = schema["schema"]
+            derived["response_schema"] = schema
+    if derived:
+        request.chat_template_kwargs = {
+            **derived,
+            **(request.chat_template_kwargs or {}),
+        }
 
 
 def _configure_parser_special_token_decoding(
@@ -1673,6 +1732,8 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
+            _apply_kimi_chat_extensions(
+                request, resolve_top_level_model_type(self.model_config))
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
