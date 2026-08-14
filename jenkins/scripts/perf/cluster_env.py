@@ -51,6 +51,13 @@ UCX_ENV_RULES = [
         "*",
         "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
     ),
+    # oci-hsg: UCX picks wrong RDMA devices; pin the usable mlx5 ports and
+    # keep eth0 as the TCP fallback device.
+    (
+        "oci-hsg*",
+        "*",
+        "export UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_3:1,mlx5_4:1,eth0",
+    ),
     # nsc-svg: UCX picks wrong RDMA devices; pin the usable mlx5 ports.
     (
         "nsc-svg*",
