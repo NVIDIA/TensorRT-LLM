@@ -208,17 +208,28 @@ def test_unsupported_w4a16_configuration_falls_back_to_bf16(kwargs):
 
 
 @pytest.mark.parametrize("sm_version", BLACKWELL_SMS + NON_BLACKWELL_SMS)
-@pytest.mark.parametrize("algo", [QuantAlgo.FP8_BLOCK_SCALES, QuantAlgo.W4A16_AWQ, QuantAlgo.INT8])
-def test_unhandled_lm_head_algo_raises(algo, sm_version):
-    # Only the NVFP4 and rowwise FP8 shapes above are known-loadable for
-    # lm_head. Silently casting any other format would discard its scales.
+@pytest.mark.parametrize("algo", [QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES])
+def test_unsupported_fp8_lm_head_algo_raises(algo, sm_version):
     model_config = _model_config(algo)
 
     with patch(
         "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
     ):
-        with pytest.raises(ValueError, match="Quantized lm_head algorithm"):
+        with pytest.raises(ValueError, match="FP8 lm_head algorithm"):
             _normalize(model_config)
+
+
+@pytest.mark.parametrize("sm_version", BLACKWELL_SMS + NON_BLACKWELL_SMS)
+@pytest.mark.parametrize("algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_AWQ, QuantAlgo.INT8])
+def test_other_lm_head_algorithms_keep_existing_fallback(algo, sm_version):
+    model_config = _model_config(algo)
+
+    with patch(
+        "tensorrt_llm._torch.models.modeling_qwen3_5.get_sm_version", return_value=sm_version
+    ):
+        assert not _normalize(model_config)
+
+    _assert_lm_head_bf16(model_config)
 
 
 @pytest.mark.parametrize("sm_version", BLACKWELL_SMS + NON_BLACKWELL_SMS)

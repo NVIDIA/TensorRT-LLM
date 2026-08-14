@@ -434,11 +434,13 @@ def _lm_head_quant_enabled(model_config: ModelConfig) -> bool:
         is_fp8 = False
     elif cfg.quant_algo in _LM_HEAD_FP8_ALGOS:
         is_fp8 = True
-    else:
+    elif cfg.quant_algo in (QuantAlgo.FP8, QuantAlgo.FP8_BLOCK_SCALES):
         raise ValueError(
-            f"Quantized lm_head algorithm {cfg.quant_algo} is unsupported; "
+            f"FP8 lm_head algorithm {cfg.quant_algo} is unsupported; "
             "falling back to bf16 would discard its quantization scales."
         )
+    else:
+        return False
 
     pretrained = model_config.pretrained_config
     mapping = model_config.mapping
