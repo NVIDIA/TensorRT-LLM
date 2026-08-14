@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/kernels/fp8PerTokenQuant/fp8_per_token_quant.cuh"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #if defined(TORCH_VERSION_MAJOR)                                                                                       \
@@ -388,6 +389,9 @@ std::tuple<Tensor, Tensor> vectorized_per_token_fp8_quant(Tensor input)
     int64_t const hidden_size = input.size(-1);
     int64_t const num_tokens = numel / hidden_size;
     TORCH_CHECK(hidden_size <= INT_MAX, "hidden_size exceeds INT_MAX");
+    TORCH_CHECK(num_tokens <= INT_MAX, "num_tokens exceeds INT_MAX");
+
+    at::cuda::CUDAGuard device_guard{static_cast<signed char>(input.get_device())};
 
     Tensor output
         = torch::empty(input.sizes(), torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA).requires_grad(false));
