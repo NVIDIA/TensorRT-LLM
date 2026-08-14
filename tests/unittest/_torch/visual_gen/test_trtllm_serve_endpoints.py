@@ -17,6 +17,7 @@ import asyncio
 import base64
 import json
 import os
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -114,6 +115,22 @@ def _assert_visual_gen_server_timing(headers) -> None:
     server_timing = headers[SERVER_TIMING_HEADER]
     assert "generation;dur=1250.000000" in server_timing
     assert "denoise;dur=750.000000" in server_timing
+
+
+def _drive_job_to_completion(client, video_id, timeout: float = 5.0):
+    """Poll ``GET /v1/videos/{id}`` until the job reaches a terminal state.
+
+    Returns the terminal status (``"completed"``/``"failed"``) or ``None`` on
+    timeout. Shared by the async-video tests so the polling deadline lives in
+    one place.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status = client.get(f"/v1/videos/{video_id}").json().get("status")
+        if status in ("completed", "failed"):
+            return status
+        time.sleep(0.05)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1211,6 +1228,27 @@ class TestVideoGenerationSync:
         assert resp.headers["content-type"] == "video/mp4"
         assert len(resp.content) > 0
 
+    @pytest.mark.parametrize("removed", ["url", "b64_json"])
+    def test_removed_response_format_names_replacement(self, video_client, removed):
+        """Legacy video response_format values (url/b64_json) are rejected with
+        a 422 whose message names the replacement, not the generic
+        "Input should be 'file' or 'path'"."""
+        resp = video_client.post(
+            "/v1/videos/sync",
+            json={
+                "prompt": "x",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "response_format": removed,
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        _assert_llm_envelope(body, code=422, message_contains=removed)
+        assert "removed" in body["message"] and "file" in body["message"], body["message"]
+
     def test_sync_video_generation_with_params(self, video_client):
         resp = video_client.post(
             "/v1/videos/sync",
@@ -1660,16 +1698,7 @@ class TestGetVideoMetadata:
 
         # Drive to completion so output_path/output_paths are populated on the
         # job, then confirm the status endpoint returns status only (no leak).
-        import time as _time
-
-        deadline = _time.time() + 5
-        while _time.time() < deadline:
-            if video_client.get(f"/v1/videos/{video_id}").json()["status"] in (
-                "completed",
-                "failed",
-            ):
-                break
-            _time.sleep(0.05)
+        _drive_job_to_completion(video_client, video_id)
 
         resp = video_client.get(f"/v1/videos/{video_id}")
         assert resp.status_code == 200
@@ -1694,10 +1723,8 @@ class TestGetVideoMetadata:
 @pytest.mark.threadleak(enabled=False)  # FileResponse spawns AnyIO worker threads
 class TestGetVideoContent:
     def _insert_video_job(self, video_id: str, status: str = "queued"):
-        import time as _time
-
         job = VideoJob(
-            created_at=int(_time.time()),
+            created_at=int(time.time()),
             id=video_id,
             model="test-model",
             prompt="test prompt",
@@ -2151,8 +2178,6 @@ class TestVideoTensorResponse:
 
     @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
     def test_async_tensor_persists_and_serves(self, video_audio_client, fmt, tmp_path):
-        import time as _time
-
         client = video_audio_client
         resp = client.post(
             "/v1/videos",
@@ -2169,12 +2194,7 @@ class TestVideoTensorResponse:
         video_id = resp.json()["id"]
 
         # Drive the background task to completion via polling.
-        deadline = _time.time() + 5
-        while _time.time() < deadline:
-            status = client.get(f"/v1/videos/{video_id}").json().get("status")
-            if status in ("completed", "failed"):
-                break
-            _time.sleep(0.05)
+        _drive_job_to_completion(client, video_id)
 
         content = client.get(f"/v1/videos/{video_id}/content")
         assert content.status_code == 200
@@ -2588,17 +2608,6 @@ class TestAsyncVideoTransport:
     ``file`` (or unset) returns a ``FileResponse`` download;
     ``path`` returns a JSON envelope with the server-side output path(s)."""
 
-    def _drive_job_to_completion(self, client, video_id):
-        import time as _time
-
-        deadline = _time.time() + 5
-        while _time.time() < deadline:
-            status = client.get(f"/v1/videos/{video_id}").json().get("status")
-            if status in ("completed", "failed"):
-                return status
-            _time.sleep(0.05)
-        return None
-
     def test_async_path_returned_at_get_content(self, video_client):
         resp = video_client.post(
             "/v1/videos",
@@ -2616,7 +2625,7 @@ class TestAsyncVideoTransport:
         job = resp.json()
         assert job["response_format"] == "path"
 
-        status = self._drive_job_to_completion(video_client, job["id"])
+        status = _drive_job_to_completion(video_client, job["id"])
         assert status == "completed"
 
         content = video_client.get(f"/v1/videos/{job['id']}/content")
@@ -2647,7 +2656,7 @@ class TestAsyncVideoTransport:
         job = resp.json()
         assert job["response_format"] == "file"
 
-        self._drive_job_to_completion(video_client, job["id"])
+        _drive_job_to_completion(video_client, job["id"])
         content = video_client.get(f"/v1/videos/{job['id']}/content")
         assert content.status_code == 200
         # AVI FileResponse carries ``video/x-msvideo``; the path

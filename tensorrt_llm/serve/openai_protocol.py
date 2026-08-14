@@ -1866,6 +1866,26 @@ class VideoGenerationRequest(OpenAIBaseModel):
                 f"{self.width!r}, height={self.height!r}")
         return self
 
+    @field_validator("response_format", mode="before")
+    @classmethod
+    def _reject_removed_response_format(cls, value):
+        """Give migrating callers an actionable error for removed values.
+
+        ``url``/``b64_json`` were valid before the transport rewrite; run
+        before the ``Literal`` check so the error names the replacement
+        instead of the generic "Input should be 'file' or 'path'".
+        """
+        removed = {
+            "url":
+            ("'url' was removed for video; use 'file' (raw bytes -- the "
+             "old 'url' behavior, renamed) or 'path' (server-side path)."),
+            "b64_json": ("'b64_json' was removed for video; use 'file' (raw "
+                         "bytes) or 'path' (server-side path)."),
+        }
+        if isinstance(value, str) and value in removed:
+            raise ValueError(removed[value])
+        return value
+
 
 class VideoJob(OpenAIBaseModel):
     """Metadata for an asynchronous video generation job.
