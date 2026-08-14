@@ -640,7 +640,7 @@ def test_deepseek_v4_mtp_routed_experts_warn_when_probe_missing(tmp_path, monkey
     warnings = []
     monkeypatch.setattr(
         "tensorrt_llm._torch.model_config.logger.warning",
-        lambda msg, *args: warnings.append(msg % args if args else msg),
+        warnings.append,
     )
 
     num_hidden_layers = 2

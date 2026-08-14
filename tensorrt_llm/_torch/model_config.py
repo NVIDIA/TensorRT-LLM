@@ -716,18 +716,18 @@ class ModelConfig(Generic[TConfig]):
                 # fused_moe load_quant_scales.
                 logger.warning(
                     "DeepSeek-V4 MTP routed-expert layout could not be detected "
-                    "from %s; assuming the dense layout (%s). If this checkpoint "
+                    f"from {_DEEPSEEK_V4_MTP_ROUTED_EXPERT_WEIGHT}; assuming the "
+                    f"dense layout ({layout}). If this checkpoint "
                     "stores its MTP routed experts in a different format, "
-                    "loading will fail in fused_moe load_quant_scales.",
-                    _DEEPSEEK_V4_MTP_ROUTED_EXPERT_WEIGHT, layout)
+                    "loading will fail in fused_moe load_quant_scales.")
                 mtp_experts_quant_config = experts_quant_config
             elif mtp_layout != layout:
                 mtp_experts_quant_config = (
                     ModelConfig._make_routed_experts_quant_config(
                         mtp_layout, moe_backend))
                 logger.info(
-                    "DeepSeek-V4 MTP routed experts use a different layout (%s) "
-                    "than the dense experts (%s).", mtp_layout, layout)
+                    f"DeepSeek-V4 MTP routed experts use a different layout "
+                    f"({mtp_layout}) than the dense experts ({layout}).")
             else:
                 mtp_experts_quant_config = experts_quant_config
             for i in range(num_mtp):
