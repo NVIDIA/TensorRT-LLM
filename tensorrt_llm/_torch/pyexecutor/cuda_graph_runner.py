@@ -554,6 +554,21 @@ class CUDAGraphRunner:
                 cleared += 1
         return cleared
 
+    def clear_capture_only_spec_state_after_capture_pass(self) -> Optional[int]:
+        """Clear capture-only state after the real, non-warmup capture pass.
+
+        The warmup-only pass creates and caches graph metadata that the real
+        capture pass reuses. Clearing its advanced-sampling override after the
+        warmup-only pass would make the real capture record the greedy sampler
+        under the advanced-sampling graph key.
+
+        Returns ``None`` during warmup-only, otherwise the number of cached
+        metadata objects cleared.
+        """
+        if self.is_warmup_only:
+            return None
+        return self.clear_capture_only_spec_state()
+
     def needs_capture(self, key: KeyType):
         return self._capture_allowed and key not in self.graph_outputs
 

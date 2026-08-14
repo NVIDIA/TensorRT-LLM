@@ -138,3 +138,25 @@ def test_override_stays_live_while_the_flag_is_set():
         (CAPTURE_TEMPERATURE, CAPTURE_TOP_K, CAPTURE_TOP_P)
     ] * len(warmup_requests)
     assert graph_meta.is_all_greedy_sample is False
+
+
+def test_override_survives_warmup_only_then_clears_after_real_capture() -> None:
+    meta = _base_meta()
+    meta._force_non_greedy_for_capture = True
+    graph_meta = _graph_copy(meta)
+
+    runner = types.SimpleNamespace(
+        graph_metadata={("advanced", 8): {"spec_metadata": graph_meta}},
+        is_warmup_only=True,
+    )
+    runner.clear_capture_only_spec_state = types.MethodType(
+        CUDAGraphRunner.clear_capture_only_spec_state, runner
+    )
+
+    clear_after_pass = CUDAGraphRunner.clear_capture_only_spec_state_after_capture_pass
+    assert clear_after_pass(runner) is None
+    assert graph_meta._force_non_greedy_for_capture is True
+
+    runner.is_warmup_only = False
+    assert clear_after_pass(runner) == 1
+    assert graph_meta._force_non_greedy_for_capture is False
