@@ -108,10 +108,17 @@ def populate_file_pages(
     and an unaligned one would fail from the second window on with an error that is
     indistinguishable from an unsupported kernel.
 
-    The advice is issued through ``ctypes`` rather than ``mmap.mmap.madvise``
-    deliberately: population blocks for the duration of the underlying file read,
-    and ``ctypes`` releases the GIL during the call while the ``mmap`` method holds
-    it, which would serialize concurrent populating threads.
+    Both the mapping and the advice are issued through ``ctypes`` rather than the
+    built-in ``mmap`` module deliberately. Population blocks for the duration of
+    the underlying file read, and ``mmap.mmap.madvise`` holds the GIL for the whole
+    call while ``ctypes`` releases it, so the built-in method would serialize
+    concurrent populating threads (measured on a cold file: a background thread ran
+    ~500x slower during an ``mmap.madvise`` populate than during the ``ctypes``
+    equivalent). The GIL-free ``madvise`` in turn needs the mapping's base address,
+    which is why the mapping also comes from ``libc``: a read-only ``mmap.mmap``
+    never exposes its address (``ctypes.*.from_buffer`` requires a writable
+    buffer), and mapping writable/private just to extract one would reintroduce
+    the class of copy-on-write anonymous pages this populate exists to avoid.
 
     Returns the number of bytes populated. ``MADV_POPULATE_READ`` requires
     Linux >= 5.14 and an mmap-capable filesystem; when unsupported (or on any other
@@ -129,6 +136,8 @@ def populate_file_pages(
         size = os.fstat(fd).st_size
         if size == 0:
             return 0
+        # ctypes rather than mmap.mmap: see the GIL / base-address note in the
+        # docstring.
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         libc.mmap.restype = ctypes.c_void_p  # Default int restype truncates on 64-bit.
         libc.mmap.argtypes = [
