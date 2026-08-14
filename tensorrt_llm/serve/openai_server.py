@@ -2578,22 +2578,14 @@ class OpenAIServer(_VideoRoutesMixin):
                         self.media_storage_path / f"{image_id}_{i}{ext}"
                         for i in range(batch_size)
                     ]
-                    output.save(paths_in, format=request.format)
-                    if request.response_format == "path":
-                        data = [
-                            ImageObject(
-                                path=str(paths_in[i]),
-                                revised_prompt=request.prompt,
-                            ) for i in range(batch_size)
-                        ]
-                    else:
-                        data = [
-                            ImageObject(
-                                url=self._build_image_content_url(
-                                    raw_request, image_id, i),
-                                revised_prompt=request.prompt,
-                            ) for i in range(batch_size)
-                        ]
+                    # Report the paths save() actually wrote, not paths_in --
+                    # save() may normalize (e.g. fill a missing extension), so
+                    # its return is the on-disk location the client will open().
+                    saved = output.save(paths_in, format=request.format)
+                    data = [
+                        self._image_object(request, raw_request, image_id, i,
+                                           saved[i]) for i in range(batch_size)
+                    ]
                 response = ImageGenerationResponse(
                     created=int(time.time()),
                     data=data,
@@ -2623,19 +2615,9 @@ class OpenAIServer(_VideoRoutesMixin):
                         path = self.media_storage_path / f"{image_id}_{i}{ext}"
                         path.write_bytes(
                             image_to_bytes(image, format=pil_format))
-                        if request.response_format == "path":
-                            data.append(
-                                ImageObject(
-                                    path=str(path),
-                                    revised_prompt=request.prompt,
-                                ))
-                        else:
-                            data.append(
-                                ImageObject(
-                                    url=self._build_image_content_url(
-                                        raw_request, image_id, i),
-                                    revised_prompt=request.prompt,
-                                ))
+                        data.append(
+                            self._image_object(request, raw_request, image_id,
+                                               i, path))
                 response = ImageGenerationResponse(
                     created=int(time.time()),
                     data=data,
@@ -2699,6 +2681,20 @@ class OpenAIServer(_VideoRoutesMixin):
         """Return a fetchable HTTP URL for a generated image item."""
         base = str(raw_request.base_url).rstrip("/")
         return f"{base}/v1/images/{image_id}/content?i={i}"
+
+    def _image_object(self, request: ImageGenerationRequest,
+                      raw_request: Request, image_id: str, i: int,
+                      path: Path) -> ImageObject:
+        """Build the per-item ``ImageObject`` for the ``path``/``url`` transports.
+
+        ``b64_json`` is handled separately. Shared by the tensor and encoder
+        branches so they cannot drift when a transport changes.
+        """
+        if request.response_format == "path":
+            return ImageObject(path=str(path), revised_prompt=request.prompt)
+        return ImageObject(url=self._build_image_content_url(
+            raw_request, image_id, i),
+                           revised_prompt=request.prompt)
 
     async def _parse_image_edit_request(
         self,
