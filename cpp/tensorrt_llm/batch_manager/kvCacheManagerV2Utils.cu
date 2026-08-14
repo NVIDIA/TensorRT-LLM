@@ -191,11 +191,18 @@ void copyBasePageRowsToDevice(ITensor const& input, ITensor& output, SizeType32 
     auto const& srcShape = input.getShape();
     auto const& dstShape = output.getShape();
     constexpr SizeType32 kKvFactor = 2;
-    TLLM_CHECK(srcShape.nbDims == 4 && dstShape.nbDims == 4);
-    TLLM_CHECK(srcShape.d[0] == dstShape.d[0]);
-    TLLM_CHECK(srcShape.d[2] == kKvFactor && dstShape.d[2] == kKvFactor);
-    TLLM_CHECK(srcShape.d[3] == dstShape.d[3]);
-    TLLM_CHECK(numRows >= 0 && numRows <= srcShape.d[1] && numRows <= dstShape.d[1]);
+    TLLM_CHECK_WITH_INFO(srcShape.nbDims == 4 && dstShape.nbDims == 4,
+        "Base-page copy expects 4-D input and output, got %d-D and %d-D tensors.", srcShape.nbDims, dstShape.nbDims);
+    TLLM_CHECK_WITH_INFO(srcShape.d[0] == dstShape.d[0],
+        "Base-page copy pool counts must match, got %d input pools and %d output pools.", srcShape.d[0], dstShape.d[0]);
+    TLLM_CHECK_WITH_INFO(srcShape.d[2] == kKvFactor && dstShape.d[2] == kKvFactor,
+        "Base-page copy expects K/V factor %d, got %d for input and %d for output.", kKvFactor, srcShape.d[2],
+        dstShape.d[2]);
+    TLLM_CHECK_WITH_INFO(srcShape.d[3] == dstShape.d[3],
+        "Base-page copy block widths must match, got %d for input and %d for output.", srcShape.d[3], dstShape.d[3]);
+    TLLM_CHECK_WITH_INFO(numRows >= 0 && numRows <= srcShape.d[1] && numRows <= dstShape.d[1],
+        "Base-page copy row count %d must fit input capacity %d and output capacity %d.", numRows, srcShape.d[1],
+        dstShape.d[1]);
     if (numRows == 0)
     {
         return;
