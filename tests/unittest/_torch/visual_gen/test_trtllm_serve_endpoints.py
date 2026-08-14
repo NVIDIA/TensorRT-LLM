@@ -333,7 +333,10 @@ class MockVisualGenResult:
 # ---------------------------------------------------------------------------
 
 
-def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> TestClient:
+def _create_server(
+    generator: MockVisualGen,
+    model_name: str = "test-model",
+) -> TestClient:
     """Instantiate an OpenAIServer for VISUAL_GEN with a mocked generator.
 
     The server detects VisualGen generators via ``_is_visual_gen_instance``
@@ -437,6 +440,49 @@ def _mock_video_encoding():
         patch("tensorrt_llm.media.encoding._check_ffmpeg_available", return_value=True),
     ):
         yield
+
+
+@pytest.mark.parametrize(
+    "endpoint,payload",
+    [
+        ("/v1/images/generations", {"prompt": "cat", "response_format": "path"}),
+        (
+            "/v1/videos/sync",
+            {
+                "prompt": "cat",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "response_format": "path",
+            },
+        ),
+        (
+            "/v1/videos",
+            {
+                "prompt": "cat",
+                "size": "64x64",
+                "seconds": 1.0,
+                "fps": 8,
+                "response_format": "path",
+            },
+        ),
+    ],
+)
+def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endpoint, payload):
+    """With ``TRTLLM_DISABLE_RESPONSE_FORMAT_PATH=1``, ``response_format='path'``
+    is rejected with 400 on the image and video (sync + async) endpoints."""
+    monkeypatch.setenv("TRTLLM_DISABLE_RESPONSE_FORMAT_PATH", "1")
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+    gen = MockVisualGen(
+        image_output=_make_dummy_image_tensor(),
+        video_output=_make_dummy_video_tensor(),
+    )
+    client = _create_server(gen)
+    resp = client.post(endpoint, json=payload, headers={"content-type": "application/json"})
+    assert resp.status_code == 400
+    body = resp.json()
+    _assert_llm_envelope(body, code=400)
+    assert "path" in body["message"] and "disabled" in body["message"]
 
 
 # =========================================================================

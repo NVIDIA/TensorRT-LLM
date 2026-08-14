@@ -2527,6 +2527,10 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             image_id = f"image_{uuid.uuid4().hex}"
 
+            path_error = self._reject_disabled_path(request.response_format)
+            if path_error is not None:
+                return path_error
+
             # Client-side ValueErrors from request translation and
             # parameter validation are 400. Serialization failures below
             # (server-side: missing media, inconsistent batch) fall
@@ -2681,6 +2685,28 @@ class OpenAIServer(_VideoRoutesMixin):
         """Return a fetchable HTTP URL for a generated image item."""
         base = str(raw_request.base_url).rstrip("/")
         return f"{base}/v1/images/{image_id}/content?i={i}"
+
+    def _reject_disabled_path(self, response_format) -> Optional[Response]:
+        """Return a 400 when ``response_format='path'`` but it is disabled.
+
+        ``path`` discloses absolute server-side filesystem paths, so it can be
+        turned off via ``TRTLLM_DISABLE_RESPONSE_FORMAT_PATH=1`` on shared /
+        untrusted deployments (enabled by default). Returns ``None`` when
+        allowed.
+        """
+        if response_format != "path":
+            return None
+        if os.environ.get("TRTLLM_DISABLE_RESPONSE_FORMAT_PATH",
+                          "0").strip().lower() in ("1", "true", "yes", "on"):
+            return self.create_error_response(
+                "response_format='path' is disabled on this server "
+                "(TRTLLM_DISABLE_RESPONSE_FORMAT_PATH=1); it returns "
+                "server-side filesystem paths and is only meaningful for "
+                "co-located clients.",
+                err_type="BadRequestError",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        return None
 
     def _image_object(self, request: ImageGenerationRequest,
                       raw_request: Request, image_id: str, i: int,

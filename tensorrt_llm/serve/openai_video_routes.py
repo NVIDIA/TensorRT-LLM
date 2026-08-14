@@ -107,6 +107,9 @@ class _VideoRoutesMixin:
             try:
                 # Parse request based on content-type
                 request = await self._parse_video_generation_request(raw_request)
+                path_error = self._reject_disabled_path(request.response_format)
+                if path_error is not None:
+                    return path_error
                 video_id = f"video_{uuid.uuid4().hex}"
                 params = parse_visual_gen_params(
                     request,
@@ -317,6 +320,9 @@ class _VideoRoutesMixin:
         try:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
+            path_error = self._reject_disabled_path(request.response_format)
+            if path_error is not None:
+                return path_error
 
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(
