@@ -1028,7 +1028,13 @@ class SpecMetadata:
             # previous occupant accumulated, then seed the prompt this one starts
             # from. Only penalized requests are seeded -- reading the prompt costs a
             # host-side copy that an unpenalized request would never consult.
-            if getattr(request, "is_context_init_state", False):
+            #
+            # Gated on the LAST context chunk rather than merely on the context
+            # state: under chunked prefill ``is_context_init_state`` stays true for
+            # every chunk, so resetting on each one would repeatedly wipe the state
+            # the earlier chunks built and re-seed the prompt several times.
+            if getattr(request, "is_context_init_state", False) and getattr(
+                    request, "is_last_context_chunk", True):
                 reset_slots.append(slot)
                 if active[-1]:
                     seed_requests.append((slot, request))

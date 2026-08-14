@@ -71,11 +71,16 @@ def _apply_penalties_impl(
     # One-hot accumulate rather than scatter_add_, because rows sharing a slot would
     # otherwise race on the same counts entry -- and a captured graph cannot rely on
     # scatter ordering.
-    safe_tokens = torch.where(
-        intra_step_tokens >= 0, intra_step_tokens, intra_step_tokens.new_zeros(())
-    )
+    # Bound the ids on BOTH sides before they index the workspace. A draft slot can
+    # legitimately hold an id outside [0, vocab_size) -- an unfilled/padding entry, or
+    # a reduced-vocab draft head -- and an unbounded id would scatter out of bounds.
+    vocab = logits.size(-1)
+    in_range = (intra_step_tokens >= 0) & (intra_step_tokens < vocab)
+    safe_tokens = torch.where(in_range, intra_step_tokens, intra_step_tokens.new_zeros(()))
     intra_counts = torch.zeros_like(logits, dtype=torch.int32)
-    intra_counts.scatter_add_(1, safe_tokens.to(torch.int64), intra_step_valid.to(torch.int32))
+    intra_counts.scatter_add_(
+        1, safe_tokens.to(torch.int64), (intra_step_valid & in_range).to(torch.int32)
+    )
 
     # Output-side occurrences: drive all three penalties.
     count = counts[row_slots] + intra_counts
