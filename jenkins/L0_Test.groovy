@@ -6403,7 +6403,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     docBuildConfigs = [
         "CPU-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
-            runLLMDocBuild(pipeline, VANILLA_CONFIG, "A10-Build_Docs")
+            runLLMDocBuild(pipeline, VANILLA_CONFIG, "CPU-Build_Docs")
         }],
     ]
 

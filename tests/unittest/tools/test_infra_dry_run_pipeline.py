@@ -112,6 +112,12 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             conditional_properties,
             _top_level_workflow_properties(L0_TEST),
         )
+        self.assertIn(
+            'runLLMDocBuild(pipeline, VANILLA_CONFIG, "CPU-Build_Docs")', L0_TEST
+        )
+        self.assertNotIn(
+            'runLLMDocBuild(pipeline, VANILLA_CONFIG, "A10-Build_Docs")', L0_TEST
+        )
         upload_args = _groovy_list_values_after(prepared, "extraArgs += [")
         self.assertTrue(any(arg.startswith("--s3-upload-path=") for arg in upload_args))
         self.assertEqual(_pytest_capture_mode(upload_args, initial_mode="no"), "fd")
