@@ -52,10 +52,6 @@ from tensorrt_llm._torch.attention_backend.inkling import (
     InklingConvRuntime,
     InklingConvState,
     apply_short_conv,
-    build_page_table,
-    inkling_decode_attention,
-    inkling_prefill_attention,
-    write_kv_cache_hnd,
 )
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -325,18 +321,21 @@ class InklingAttention(QKNormRoPEAttention):
     Reuses :class:`QKNormRoPEAttention` for the fused qkv/o projections and
     per-head q/k RMSNorm (``skip_rope=True`` gives qk-norm without RoPE), and
     owns the extra ``r`` projection, the k/v short convolutions, and the
-    relative-logit projection. The attention *compute* runs through the Inkling
-    Triton path (``attention_backend/inkling/``) rather than the base backend:
-    Inkling's learned relative bias is a per-(query, head, relative-distance)
-    additive ``score_mod``, which no fused, CUDA-graph-safe TensorRT-LLM backend
-    exposes. The bias is precomputed torch-side into a ``rel_logits``
-    ``[num_query_tokens, local_heads, rel_extent]`` tensor and gathered+added by
-    the Triton kernels. Local layers apply the sliding window natively in the
-    kernel; global layers fold the log-scaling ``tau`` into ``rel_logits``.
+    relative-logit projection. Inkling's learned relative bias is a
+    per-(query, head, relative-distance) additive ``score_mod``, which no fused,
+    CUDA-graph-safe TensorRT-LLM backend exposes; it is precomputed torch-side
+    here into a ``rel_logits`` ``[num_query_tokens, local_heads, rel_extent]``
+    tensor and gathered+added by the Triton kernels. Local layers apply the
+    sliding window natively in the kernel; global layers fold the log-scaling
+    ``tau`` into ``rel_logits``.
 
-    KV read/write goes through ``KVCacheManagerV2`` in the HND paged layout.
-    ``self.attn`` (the base backend) is built but unused -- only its
-    runtime-assigned ``local_layer_idx`` is read here.
+    Everything below that -- the KV write, page-table construction and the
+    prefill/decode dispatch over ``KVCacheManagerV2``'s HND paged layout -- runs
+    in :meth:`InklingTritonAttention.forward_inkling`, per
+    ``ATTENTION_DEVELOPER_GUIDE.md`` §1.1. The three per-layer scalars that
+    compute needs (``sm_scale``, ``rel_extent``, ``window_left``) are handed to
+    the backend in ``__init__`` because ``create_attention()`` takes a fixed
+    kwarg list.
     """
 
     def __init__(self, model_config: ModelConfig[InklingTextConfig], layer_idx: int):
@@ -390,6 +389,17 @@ class InklingAttention(QKNormRoPEAttention):
         # inclusive radius: query p attends to keys [p - (w - 1), p].
         self.sm_scale = 1.0 / float(head_dim)
         self.window_left = (self.attention_window_size - 1) if self.is_local else -1
+        # The compute lives in the backend (see the class docstring), and
+        # ``create_attention()`` has no passthrough for model-specific kwargs, so
+        # hand it the three per-layer scalars here. They differ between local
+        # (sliding-window) and global (full-causal) layers, so they must be set
+        # per module instance, not derived in the backend. Assignment is
+        # unconditional: if a non-INKLING backend was forced, ``forward`` fails
+        # loudly on the missing ``forward_inkling`` rather than silently running
+        # a different attention.
+        self.attn.sm_scale = self.sm_scale
+        self.attn.rel_extent = self.rel_extent
+        self.attn.window_left = self.window_left
 
         # Attention-scoped TP. Under attention DP every rank runs the full head
         # set over its own requests, so the base built qkv_proj / o_proj with
@@ -497,219 +507,6 @@ class InklingAttention(QKNormRoPEAttention):
             rel = rel * tau[:, None, None]
         return rel.contiguous()
 
-    def _attention(self, q, k, v, rel_logits, attn_metadata, *, allow_mixed=False):
-        """Dispatch prefill / decode over the paged cache, supporting mixed
-        context+generation batches.
-
-        The runtime packs context requests first (each with its full new-token
-        span) then one-token generation requests (``seq_lens == 1``). We slice
-        the packed q/k/v/rel_logits + per-request metadata at that boundary and
-        run the context slice through the prefill kernel and the generation
-        slice through the paged-decode kernel, concatenating the outputs. Pure
-        context (``num_contexts == num_seqs``) and pure generation
-        (``num_contexts == 0``) fall out as the single-slice cases.
-        """
-        # KVCacheManagerV2 takes the global layer index and maps it through
-        # ``layer_offsets`` itself. ``self.attn.local_layer_idx`` is only primed
-        # inside the base attention forward, which Inkling bypasses.
-        cache_layer = self.layer_idx
-        kv = attn_metadata.kv_cache_manager.get_buffers(cache_layer, kv_layout="HND")
-        # kv: [num_pages, 2, num_kv_heads, page_size, head_dim]
-        k_cache, v_cache = kv[:, 0], kv[:, 1]
-        page_size = kv.shape[3]
-        mgr = attn_metadata.kv_cache_manager
-        request_ids = attn_metadata.request_ids
-        num_cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
-        seq_lens = attn_metadata.seq_lens.tolist()
-        num_contexts = attn_metadata.num_contexts
-        num_seqs = len(seq_lens)
-        ctx_tokens = sum(seq_lens[:num_contexts])
-
-        # A mixed context+generation batch needs the per-request short-conv state
-        # pool: the stateless path would convolve across the context/generation
-        # boundary. Refuse it unless the pool path is active.
-        if 0 < num_contexts < num_seqs and not allow_mixed:
-            raise NotImplementedError(
-                "InklingAttention: mixed context+generation batch needs the "
-                "short-conv state pool (pass conv_cache/conv_rt); the stateless "
-                "short-conv path cannot mix a batch"
-            )
-
-        outs = []
-        if num_contexts > 0:
-            outs.append(
-                self._run_context(
-                    q[:ctx_tokens],
-                    k[:ctx_tokens],
-                    v[:ctx_tokens],
-                    rel_logits[:ctx_tokens],
-                    seq_lens[:num_contexts],
-                    num_cached[:num_contexts],
-                    request_ids[:num_contexts],
-                    mgr,
-                    cache_layer,
-                    k_cache,
-                    v_cache,
-                    page_size,
-                )
-            )
-        if num_contexts < num_seqs:
-            outs.append(
-                self._run_generation(
-                    q[ctx_tokens:],
-                    k[ctx_tokens:],
-                    v[ctx_tokens:],
-                    rel_logits[ctx_tokens:],
-                    num_cached[num_contexts:],
-                    request_ids[num_contexts:],
-                    mgr,
-                    cache_layer,
-                    k_cache,
-                    v_cache,
-                    page_size,
-                    attn_metadata,
-                )
-            )
-        return outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
-
-    def _run_context(
-        self,
-        q,
-        k,
-        v,
-        rel_logits,
-        seq_lens,
-        num_cached,
-        request_ids,
-        mgr,
-        cache_layer,
-        k_cache,
-        v_cache,
-        page_size,
-    ):
-        device = q.device
-        # Persist new K/V to the paged cache for later generation reuse.
-        block_ids = mgr.get_batch_cache_indices(request_ids, cache_layer)
-        off = 0
-        for i, sl in enumerate(seq_lens):
-            write_kv_cache_hnd(
-                k_cache,
-                v_cache,
-                k[off : off + sl],
-                v[off : off + sl],
-                block_ids[i],
-                int(num_cached[i]),
-                page_size,
-            )
-            off += sl
-        cu = torch.zeros(len(seq_lens) + 1, dtype=torch.int32, device=device)
-        cu[1:] = torch.tensor(seq_lens, dtype=torch.int32, device=device).cumsum(0)
-        max_seqlen = max(seq_lens)
-        # NOTE: this attends only to the tokens of THIS call. The write above
-        # honours ``num_cached``, but ``inkling_prefill_attention`` takes no
-        # paged-KV argument, so a context request carrying cached history
-        # (chunked prefill, or a reused prefix) would silently drop all of it.
-        # Both are refused up front by
-        # ``reject_unsupported_inkling_kv_cache_features``; adding either one
-        # means giving Inkling a chunked-context prefill path that reads the
-        # pages back while carrying rel_logits and the sliding window across the
-        # boundary. ``num_cached`` is non-zero here only in that unsupported
-        # case, which is why the write path already accounts for it.
-        return inkling_prefill_attention(
-            q, k, v, cu, max_seqlen, self.sm_scale, rel_logits, self.rel_extent, self.window_left
-        )
-
-    def _run_generation(
-        self,
-        q,
-        k,
-        v,
-        rel_logits,
-        num_cached,
-        request_ids,
-        mgr,
-        cache_layer,
-        k_cache,
-        v_cache,
-        page_size,
-        attn_metadata,
-    ):
-        device = q.device
-        # --- Runtime CUDA-graph-safe path. ---------------------------------
-        # ``InklingAttentionMetadata.prepare()`` published this batch's decode
-        # metadata into stable GPU buffers, so the captured forward does zero
-        # host->device copy: it reads ``ink_seq_lens`` / ``ink_page_table`` and
-        # persists the new K/V with an in-graph scatter whose (page, offset)
-        # indices are derived on-GPU. Padding rows carry their own dummy request
-        # slots, so the scatter never corrupts a real request's page.
-        num_req = q.shape[0]
-        if getattr(attn_metadata, "ink_num_gen", 0) == num_req:
-            sl = attn_metadata.ink_seq_lens[:num_req]
-            pt = attn_metadata.ink_page_table[cache_layer][:num_req]
-            pos = (sl - 1).long()  # write slot = total_kv_len - 1 = num_cached
-            page_row = torch.div(pos, page_size, rounding_mode="floor")
-            offs = pos - page_row * page_size
-            pages = pt.gather(1, page_row.unsqueeze(1)).squeeze(1).long()
-            # Paired advanced indices select one (page, slot) per request ->
-            # [num_req, num_kv_heads, head_dim], matching the new k/v.
-            k_cache[pages, :, offs, :] = k.to(k_cache.dtype)
-            v_cache[pages, :, offs, :] = v.to(v_cache.dtype)
-            return inkling_decode_attention(
-                q,
-                k_cache,
-                v_cache,
-                sl,
-                pt,
-                page_size,
-                self.sm_scale,
-                rel_logits,
-                self.rel_extent,
-                self.window_left,
-            )
-        # Eager fallback (never captured): the decode metadata was not published,
-        # so build it here from the host block table, like the context path. This
-        # path is illegal under CUDA graph, and the usual cause is an explicit
-        # ``attn_backend`` override beating the model default -- say so.
-        if getattr(attn_metadata, "is_cuda_graph", False):
-            raise RuntimeError(
-                "Inkling decode metadata was not published for a CUDA-graph "
-                f"batch (ink_num_gen="
-                f"{getattr(attn_metadata, 'ink_num_gen', None)}, expected "
-                f"{num_req}); attn_metadata is "
-                f"{type(attn_metadata).__name__}, not InklingAttentionMetadata. "
-                "Inkling requires attn_backend='INKLING'; remove any "
-                "attn_backend override from --extra_llm_api_options / "
-                "LLM(attn_backend=...) and let the model default apply."
-            )
-        num_req = len(request_ids)
-        block_ids = mgr.get_batch_cache_indices(request_ids, cache_layer)
-        for i in range(num_req):
-            write_kv_cache_hnd(
-                k_cache,
-                v_cache,
-                k[i : i + 1],
-                v[i : i + 1],
-                block_ids[i],
-                int(num_cached[i]),
-                page_size,
-            )
-        total = [int(num_cached[i]) + 1 for i in range(num_req)]
-        decode_seq_lens = torch.tensor(total, dtype=torch.int32, device=device)
-        max_pages = max(len(b) for b in block_ids)
-        decode_page_table = build_page_table(block_ids, max_pages, device)
-        return inkling_decode_attention(
-            q,
-            k_cache,
-            v_cache,
-            decode_seq_lens,
-            decode_page_table,
-            page_size,
-            self.sm_scale,
-            rel_logits,
-            self.rel_extent,
-            self.window_left,
-        )
-
     def forward(
         self,
         position_ids: Optional[torch.IntTensor],
@@ -733,7 +530,7 @@ class InklingAttention(QKNormRoPEAttention):
         hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
         q, k, v = self._project(hidden_states, conv_pool_kv, conv_rt)
         rel_logits = self._build_rel_logits(hidden_states, position_ids)
-        attn_out = self._attention(
+        attn_out = self.attn.forward_inkling(
             q, k, v, rel_logits, attn_metadata, allow_mixed=conv_rt is not None
         )
         attn_out = attn_out.reshape(num_tokens, self.q_size)
@@ -1363,8 +1160,8 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         #
         # ``attn_backend``: ``InklingAttentionMetadata`` publishes the decode
         # seq_lens and page table into fixed-pointer GPU buffers before
-        # CUDA-graph capture. ``InklingTritonAttention`` changes nothing but the
-        # metadata class -- the compute lives in ``InklingAttention.forward``.
+        # CUDA-graph capture, and ``InklingTritonAttention.forward_inkling`` is
+        # the only implementation of Inkling's relative-bias attention.
         return {
             "attn_backend": "INKLING",
             "kv_cache_config": {
