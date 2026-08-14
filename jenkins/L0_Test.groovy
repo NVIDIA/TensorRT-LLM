@@ -791,7 +791,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         // `scontrol show job null`, whose "Invalid job id specified" output then
         // shows up in failure analysis as a bogus error signature.
         if (!isValidSlurmJobId(slurmJobID)) {
-            Utils.exec(pipeline, script: "echo No SLURM job ID captured for node ${nodeName}; skipping job cleanup dump")
+            Utils.exec(pipeline, script: "echo \"No SLURM job ID captured for node ${nodeName}; skipping job cleanup dump\"")
         } else {
             Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
