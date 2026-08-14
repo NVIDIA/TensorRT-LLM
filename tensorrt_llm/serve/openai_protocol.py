@@ -2062,29 +2062,33 @@ class VideoGenerationRequest(OpenAIBaseModel):
             default=None,
             description=
             ("Image reference(s) conditioning generation (e.g. image-to-video "
-             "first frame). JSON sends base64 bytes, a ``{content, role}`` "
-             "object, or a list of them; multipart uploads a single image file. "
-             "PNG or JPEG only — HEIF/AVIF are not supported."),
+             "first frame). A JSON string is base64 bytes (raw or ``data:`` "
+             "URI), an ``http(s)`` URL, or a ``file://`` path; or send a "
+             "``{content, role}`` object or a list of them; multipart uploads a "
+             "single image file. PNG or JPEG only — HEIF/AVIF are not supported."
+             ),
         )
     video_reference: Optional[Union[
         str, UploadFile, MediaReferenceItem,
         List[Union[str, MediaReferenceItem]]]] = Field(
             default=None,
             description=
-            ("Video reference(s) conditioning generation (video-to-video). JSON "
-             "sends base64 bytes, a ``{content}`` object, or a list of them; "
-             "multipart uploads a single video file. MP4 or AVI, with H.264 the "
-             "tested codec and others best-effort."),
+            ("Video reference(s) conditioning generation (video-to-video). A "
+             "JSON string is base64 bytes (raw or ``data:`` URI), an ``http(s)`` "
+             "URL, or a ``file://`` path; or send a ``{content}`` object or a "
+             "list of them; multipart uploads a single video file. MP4 or AVI, "
+             "with H.264 the tested codec and others best-effort."),
         )
     audio_reference: Optional[Union[
         str, UploadFile, MediaReferenceItem,
         List[Union[str, MediaReferenceItem]]]] = Field(
             default=None,
-            description=
-            ("Audio reference(s) conditioning generation. JSON sends base64 "
-             "bytes, a ``{content}`` object, or a list of them; multipart uploads "
-             "a single audio file. Accepted only by models that declare an audio "
-             "reference slot."),
+            description=(
+                "Audio reference(s) conditioning generation. A JSON string is "
+                "base64 bytes (raw or ``data:`` URI), an ``http(s)`` URL, or a "
+                "``file://`` path; or send a ``{content}`` object or a list of "
+                "them; multipart uploads a single audio file. Accepted only by "
+                "models that declare an audio reference slot."),
         )
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,

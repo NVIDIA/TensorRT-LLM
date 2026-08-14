@@ -518,6 +518,65 @@ class TestInputReferenceMaterialization:
             parse_visual_gen_params(request, "vid-11", generator, media_storage_path=str(tmp_path))
         assert list(tmp_path.iterdir()) == []
 
+    def test_file_uri_image_reference_read_and_materialized(self, tmp_path):
+        # A file:// reference is read from local disk and persisted like any other.
+        generator = _StubVisualGen()
+        src = tmp_path / "ref.png"
+        Image.new("RGB", (4, 4), (7, 8, 9)).save(src, format="PNG")
+        store = tmp_path / "store"
+        store.mkdir()
+        request = VideoGenerationRequest(prompt="x", image_reference=src.as_uri())
+        params = parse_visual_gen_params(
+            request, "vid-file", generator, media_storage_path=str(store)
+        )
+        assert Path(params.image_reference[0].content).read_bytes() == src.read_bytes()
+
+    def test_http_url_image_reference_fetched_and_materialized(self, tmp_path, monkeypatch):
+        # An http(s) reference is fetched through the guarded loader, then stored.
+        generator = _StubVisualGen()
+        buf = BytesIO()
+        Image.new("RGB", (4, 4)).save(buf, format="PNG")
+        png = buf.getvalue()
+
+        class _FakeResp:
+            def __init__(self, content):
+                self.content = content
+
+        monkeypatch.setattr(
+            "tensorrt_llm.serve.visual_gen_utils._safe_request_get",
+            lambda url, **kwargs: _FakeResp(png),
+        )
+        request = VideoGenerationRequest(prompt="x", image_reference="https://example.com/a.png")
+        params = parse_visual_gen_params(
+            request, "vid-url", generator, media_storage_path=str(tmp_path)
+        )
+        assert Path(params.image_reference[0].content).read_bytes() == png
+
+    def test_http_url_fetch_failure_is_client_error(self, tmp_path, monkeypatch):
+        # A blocked/failed fetch (e.g. SSRF guard) is a client 400, not a 500,
+        # and leaves nothing on disk.
+        generator = _StubVisualGen()
+
+        def _blocked(url, **kwargs):
+            raise RuntimeError("URL resolves to a non-public address (10.0.0.1)")
+
+        monkeypatch.setattr("tensorrt_llm.serve.visual_gen_utils._safe_request_get", _blocked)
+        request = VideoGenerationRequest(prompt="x", image_reference="http://10.0.0.1/a.png")
+        with pytest.raises(ValueError, match="reference URL could not be fetched"):
+            parse_visual_gen_params(
+                request, "vid-ssrf", generator, media_storage_path=str(tmp_path)
+            )
+        assert list(tmp_path.iterdir()) == []
+
+    def test_missing_file_uri_is_client_error(self, tmp_path):
+        # A file:// path that does not exist is a client 400, not a server 500.
+        generator = _StubVisualGen()
+        missing = (tmp_path / "does_not_exist.png").as_uri()
+        request = VideoGenerationRequest(prompt="x", image_reference=missing)
+        with pytest.raises(ValueError, match="reference file could not be read"):
+            parse_visual_gen_params(request, "vid-nf", generator, media_storage_path=str(tmp_path))
+        assert list(tmp_path.iterdir()) == []
+
 
 class TestMediaBytesProbes:
     """The in-memory signature probes the serve boundary routes on."""

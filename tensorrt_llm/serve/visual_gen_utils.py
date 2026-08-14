@@ -6,12 +6,18 @@ import binascii
 import os
 from collections.abc import Mapping
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from PIL import Image, UnidentifiedImageError
 
-from tensorrt_llm.inputs.media_io import is_isobmff_image_bytes, sniff_media_kind
+from tensorrt_llm.inputs.media_io import (
+    _normalize_file_uri,
+    _safe_request_get,
+    is_isobmff_image_bytes,
+    sniff_media_kind,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (
     ImageEditRequest,
@@ -130,22 +136,45 @@ def _read_reference_payload(reference: str) -> bytes:
         raise ValueError("reference is not valid base64 data.") from exc
 
 
+def _resolve_reference_string(reference: str) -> bytes:
+    """Resolve one reference string to raw bytes, dispatching on URL scheme.
+
+    Mirrors the LLM multimodal loader so serve references accept the same forms:
+    ``http(s)`` fetches through the SSRF-guarded loader (private-address block,
+    redirect re-validation, timeout, size cap); ``file://`` reads a local file;
+    ``data:`` and bare strings decode as base64. Fetch/read failures become
+    ``ValueError`` so a bad URL or path is a client 400, not a server 500.
+    """
+    scheme = urlparse(reference).scheme
+    if scheme in ("http", "https"):
+        try:
+            return _safe_request_get(reference).content
+        except Exception as exc:
+            raise ValueError(f"reference URL could not be fetched: {exc}") from exc
+    if scheme == "file":
+        try:
+            return Path(_normalize_file_uri(reference)).read_bytes()
+        except OSError as exc:
+            raise ValueError(f"reference file could not be read: {exc}") from exc
+    return _read_reference_payload(reference)
+
+
 def _reference_payload_and_role(ref) -> tuple[bytes, Optional[str]]:
     """Extract ``(payload_bytes, role)`` from one raw HTTP reference.
 
-    ``ref`` is a base64/data-URI string, a multipart ``UploadFile`` (has
-    ``.file``), or a ``MediaReferenceItem`` exposing ``content`` and an optional
-    ``role``.
+    ``ref`` is a string (base64/``data:`` URI, ``http(s)`` URL, or ``file://``
+    path), a multipart ``UploadFile`` (has ``.file``), or a ``MediaReferenceItem``
+    exposing ``content`` and an optional ``role``.
     """
     role = getattr(ref, "role", None)
     if isinstance(ref, str):
-        return _read_reference_payload(ref), role
+        return _resolve_reference_string(ref), role
     if hasattr(ref, "file"):  # multipart UploadFile
         return ref.file.read(), role
     data = getattr(ref, "content", None)
     if not isinstance(data, str):
-        raise ValueError("reference item must carry a base64 'content' string.")
-    return _read_reference_payload(data), role
+        raise ValueError("reference item must carry a 'content' string.")
+    return _resolve_reference_string(data), role
 
 
 def _materialize_reference(
