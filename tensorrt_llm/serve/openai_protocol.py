@@ -409,6 +409,7 @@ class EmbeddingResponse(OpenAIBaseModel):
 def _response_format_to_guided_decoding_params(
     response_format: Optional[ResponseFormat],
     reasoning_parser: Optional[str] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Optional[GuidedDecodingParams]:
     if response_format is None:
         guided_decoding_params = None
@@ -485,6 +486,32 @@ def _response_format_to_guided_decoding_params(
                     "begin": "<|start|>assistant<|channel|>final<|message|>",
                     "content": content,
                     "end": "",
+                },
+            ],
+            "stop_after_first":
+            True,
+        }
+    elif reasoning_parser == "kimi_k3":
+        # K3 XTML: the generation prompt already ends inside the channel the
+        # model starts in. In thinking mode (the default) the response channel
+        # opens mid-generation, so trigger the user constraint on it
+        # (mirrors the gpt_oss final-channel handling). In non-thinking mode
+        # the prompt ends inside <|open|>response<|sep|>, the trigger would
+        # never be generated, and the raw grammar applies from the first
+        # generated token instead.
+        thinking = (chat_template_kwargs
+                    or {}).get("thinking", True) is not False
+        if not thinking:
+            return guided_decoding_params
+        stag_format = {
+            "type":
+            "triggered_tags",
+            "triggers": ["<|open|>response<|sep|>"],
+            "tags": [
+                {
+                    "begin": "<|open|>response<|sep|>",
+                    "content": content,
+                    "end": "<|close|>response<|sep|>",
                 },
             ],
             "stop_after_first":
@@ -879,6 +906,18 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+class ChatCompletionThinkingParam(OpenAIBaseModel):
+    """Kimi/Moonshot ``thinking`` extension controlling reasoning output.
+
+    ``keep`` is fixed to ``"all"`` when thinking is enabled and ignored when
+    disabled; ``effort`` is only meaningful when enabled. A request-level
+    ``reasoning_effort`` overrides ``effort``.
+    """
+    type: Literal["enabled", "disabled"] = "enabled"
+    keep: Optional[Literal["all"]] = None
+    effort: Optional[Literal["low", "high", "max"]] = None
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -906,17 +945,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none", "auto"],
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
-        "low", "medium", "high"]] = Field(
+        "low", "medium", "high", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,
             description=(
                 "The level of reasoning effort to use. Controls how much "
                 "reasoning is shown in the model's response. Options: "
-                "'low', 'medium', 'high'."),
+                "'low', 'medium', 'high' (harmony/gpt-oss), plus 'max' and "
+                "'none' for models with Kimi-style thinking control."),
         )
+    # Kimi/Moonshot extension: structured control of reasoning output. The
+    # serving layer maps it into the chat-template kwargs for models whose
+    # template understands it (e.g. kimi_k3); other models ignore it.
+    thinking: Optional[ChatCompletionThinkingParam] = None
     thinking_token_budget: Optional[int] = None
     prompt_ignore_length: Optional[int] = 0
 
@@ -1086,7 +1130,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             guided_decoding=_response_format_to_guided_decoding_params(
-                self.response_format, reasoning_parser=reasoning_parser),
+                self.response_format,
+                reasoning_parser=reasoning_parser,
+                chat_template_kwargs=self.chat_template_kwargs),
             thinking_token_budget=self.thinking_token_budget,
 
             # logits_bias
@@ -1114,8 +1160,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def check_tool_choice(cls, data):
         if "tool_choice" not in data and data.get("tools"):
             data["tool_choice"] = "auto"
-        if "tool_choice" in data and data["tool_choice"] != "none":
-            if "tools" not in data or data["tools"] is None:
+        # "none" and "auto" are meaningful without tools; "required" and a
+        # named function must have a non-empty tools list to pick from.
+        if "tool_choice" in data and data["tool_choice"] not in ("none",
+                                                                 "auto"):
+            if not data.get("tools"):
                 raise ValueError(
                     "When using `tool_choice`, `tools` must be set.")
         return data
