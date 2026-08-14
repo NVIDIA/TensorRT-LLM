@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration tests for the optional Marlin + FlashInfer RMSNorm path."""
+"""Configuration tests for the NVFP4 Marlin + FlashInfer fused add-RMSNorm gate."""
 
 import pytest
 import torch
@@ -14,34 +14,42 @@ from tensorrt_llm._torch.utils import (
 )
 from tensorrt_llm._utils import get_sm_version
 
+# Requires FlashInfer, the Marlin kernel, and an Ada/Hopper GPU.
 skip_unless_marlin_flashinfer = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not IS_FLASHINFER_AVAILABLE
     or not hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
     or not (89 <= get_sm_version() < 100),
-    reason="Requires FlashInfer and the Marlin operator on Ada or Hopper",
+    reason="Requires FlashInfer and the Marlin operator on Ada (SM89) or Hopper (SM90-SM99)",
 )
+
+marlin_attrs = {"nvfp4_gemm_allowed_backends": ["marlin"]}
 
 
 def test_marlin_flashinfer_rmsnorm_gate_is_enabled_by_default():
-    with model_extra_attrs({"nvfp4_gemm_allowed_backends": ["marlin"]}):
+    with model_extra_attrs(marlin_attrs):
         assert allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin()
 
 
 def test_marlin_flashinfer_rmsnorm_gate_can_be_explicitly_disabled():
     with model_extra_attrs(
         {
-            "nvfp4_gemm_allowed_backends": ["marlin"],
+            **marlin_attrs,
             "enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin": False,
         }
     ):
         assert not allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin()
 
 
+def test_non_marlin_path_always_allows_flashinfer():
+    # Non-Marlin BF16/FP16 paths must not be affected by the Marlin flag.
+    assert allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin()
+
+
 @torch.inference_mode()
 @skip_unless_marlin_flashinfer
 def test_marlin_flashinfer_fused_add_rmsnorm_matches_aten_fallback():
-    """Validate O1 on both Marlin-supported GPU architecture families.
+    """FlashInfer and ATen add-RMSNorm produce equivalent BF16 outputs on Marlin GPUs.
 
     Marlin supports SM89 Ada (including L40S) and SM90-SM99 Hopper. The same
     test executes on either family, compares the default-on FlashInfer path
@@ -50,12 +58,12 @@ def test_marlin_flashinfer_fused_add_rmsnorm_matches_aten_fallback():
     torch.manual_seed(0)
     hidden_size = 2688  # Nemotron Nano 30B layer-boundary hidden dimension.
     norm = RMSNorm(hidden_size=hidden_size, eps=1e-6, dtype=torch.bfloat16, device="cuda")
+    norm.weight.copy_((1 + 0.1 * torch.randn(hidden_size, device="cuda")).to(torch.bfloat16))
     hidden_states = torch.randn((4, hidden_size), dtype=torch.bfloat16, device="cuda")
     residual = torch.randn_like(hidden_states)
-    marlin_attrs = {"nvfp4_gemm_allowed_backends": ["marlin"]}
 
     with model_extra_attrs(marlin_attrs):
-        assert is_nvfp4_marlin_enabled()
+        assert is_nvfp4_marlin_enabled(), "Marlin must be enabled for this parity test"
 
     with model_extra_attrs(
         {

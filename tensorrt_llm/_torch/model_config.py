@@ -191,8 +191,7 @@ class ModelConfig(Generic[TConfig]):
     nvfp4_gemm_allowed_backends: List[str] = field(
         default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'])
 
-    # Default-on performance path for FlashInfer's BF16 residual-add RMSNorm
-    # on Marlin-backed NVFP4 models. Set false to retain the ATen fallback.
+    # Default-on; set false to retain the ATen fallback for Marlin NVFP4 models.
     enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin: bool = True
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO

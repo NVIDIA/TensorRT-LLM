@@ -137,12 +137,15 @@ def is_nvfp4_marlin_enabled() -> bool:
 
 
 def allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin() -> bool:
-    """Whether the default-on Marlin FlashInfer performance path is enabled.
+    """Whether the FlashInfer fused BF16 add+RMSNorm path is allowed.
 
-    FlashInfer's fused BF16 add+RMSNorm is independent of the downstream
-    Marlin NVFP4 GEMM. Allow an explicit false setting to retain the ATen
-    fallback for A/B comparison or troubleshooting.
+    For non-Marlin BF16/FP16 paths FlashInfer is always eligible (unchanged
+    behaviour). For NVFP4 Marlin, the path is default-on but can be set false
+    via enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin to retain the
+    ATen fallback for A/B comparison or troubleshooting.
     """
+    if not is_nvfp4_marlin_enabled():
+        return True
     attrs = get_model_extra_attrs()
     return bool(attrs is None or attrs.get(
         'enable_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin', True))
