@@ -9,6 +9,7 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import (
     allow_flashinfer_fused_add_rmsnorm_with_nvfp4_marlin,
+    is_nvfp4_marlin_enabled,
     model_extra_attrs,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -16,8 +17,9 @@ from tensorrt_llm._utils import get_sm_version
 skip_unless_marlin_flashinfer = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not IS_FLASHINFER_AVAILABLE
+    or not hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
     or not (89 <= get_sm_version() < 100),
-    reason="Requires FlashInfer and a Marlin-supported Ada or Hopper GPU",
+    reason="Requires FlashInfer and the Marlin operator on Ada or Hopper",
 )
 
 
@@ -51,6 +53,9 @@ def test_marlin_flashinfer_fused_add_rmsnorm_matches_aten_fallback():
     hidden_states = torch.randn((4, hidden_size), dtype=torch.bfloat16, device="cuda")
     residual = torch.randn_like(hidden_states)
     marlin_attrs = {"nvfp4_gemm_allowed_backends": ["marlin"]}
+
+    with model_extra_attrs(marlin_attrs):
+        assert is_nvfp4_marlin_enabled()
 
     with model_extra_attrs(
         {
