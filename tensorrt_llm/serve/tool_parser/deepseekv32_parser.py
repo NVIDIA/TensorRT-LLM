@@ -191,6 +191,14 @@ class DeepSeekV32Parser(BaseToolParser):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # This increment may hold ordinary text ahead of the tool call. Hand that
+        # text back as content and keep only the markup in the buffer, otherwise
+        # it is consumed along with the tool call and never reaches the client.
+        normal_text, current_text = self._split_leading_normal_text(
+            current_text, [self.bot_token, "<｜DSML｜invoke"]
+        )
+        self._buffer = current_text
+
         all_calls: list[ToolCallItem] = []
         try:
             # Loop to handle multiple consecutive invoke blocks
@@ -288,11 +296,11 @@ class DeepSeekV32Parser(BaseToolParser):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=normal_text, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

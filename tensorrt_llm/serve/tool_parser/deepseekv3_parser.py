@@ -115,6 +115,14 @@ class DeepSeekV3Parser(BaseToolParser):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # This increment may hold ordinary text ahead of the tool call. Hand that
+        # text back as content and keep only the markup in the buffer, otherwise
+        # it is consumed along with the tool call and never reaches the client.
+        normal_text, current_text = self._split_leading_normal_text(
+            current_text, [self.bot_token, "<｜tool▁call▁begin｜>"]
+        )
+        self._buffer = current_text
+
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
@@ -187,17 +195,17 @@ class DeepSeekV3Parser(BaseToolParser):
                         else:
                             self._buffer = ""
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(normal_text=normal_text, calls=calls)
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

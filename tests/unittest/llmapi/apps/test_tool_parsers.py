@@ -4355,3 +4355,115 @@ class TestConfigureParserSpecialTokenDecoding:
 
         assert sampling_params.skip_special_tokens is False
         assert sampling_params.spaces_between_special_tokens is True
+
+
+# ============================================================================
+# Streaming: content sharing an increment with a tool call
+# ============================================================================
+
+_LEADING_TEXT = "Let me check the weather for you. "
+
+# Parser class plus a complete tool call in that parser's own format. Every
+# tool call starts with the parser's bot_token, so tests can split it there to
+# get a delta boundary that never lands inside a token.
+_LEADING_TEXT_PARSERS = {
+    "deepseek_v3": (
+        DeepSeekV3Parser,
+        ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+         '```json\n{"location": "NYC"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+         ),
+    ),
+    "deepseek_v31": (
+        DeepSeekV31Parser,
+        ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+         '{"location": "NYC"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'),
+    ),
+    "deepseek_v32": (
+        DeepSeekV32Parser,
+        ('<｜DSML｜function_calls> <｜DSML｜invoke name="get_weather"> '
+         '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+         "</｜DSML｜invoke> </｜DSML｜function_calls>"),
+    ),
+    "deepseek_v4": (
+        DeepSeekV4Parser,
+        ('<｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+         '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+         "</｜DSML｜invoke> </｜DSML｜tool_calls>"),
+    ),
+    "glm4": (
+        Glm4ToolParser,
+        ("<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+         "<arg_value>NYC</arg_value>\n</tool_call>"),
+    ),
+    # Glm47 already preserved the leading text before this fix; it is kept here
+    # as a guard against regressing it.
+    "glm47": (
+        Glm47ToolParser,
+        ("<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+         "<arg_value>NYC</arg_value>\n</tool_call>"),
+    ),
+    "qwen3": (
+        Qwen3ToolParser,
+        ('<tool_call>\n{"name": "get_weather", "arguments": '
+         '{"location": "NYC"}}\n</tool_call>'),
+    ),
+    "kimi_k2": (
+        KimiK2ToolParser,
+        ("<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+         '<|tool_call_argument_begin|>{"location": "NYC"}<|tool_call_end|>'
+         "<|tool_calls_section_end|>"),
+    ),
+}
+
+
+@pytest.mark.parametrize("parser_cls, tool_call",
+                         list(_LEADING_TEXT_PARSERS.values()),
+                         ids=list(_LEADING_TEXT_PARSERS))
+class TestStreamingLeadingText:
+    """Content that precedes a tool call must survive streaming.
+
+    Regression tests for issue #17580: the streaming path returned an empty
+    normal_text as soon as a tool call opened, so anything the model said
+    before calling the tool was consumed along with the markup and never
+    reached the client, even though detect_and_parse returns it for the same
+    input.
+    """
+
+    @staticmethod
+    def _feed(parser, deltas, tools):
+        """Stream deltas through the parser and accumulate what it emits."""
+        normal_text = ""
+        calls = []
+        for delta in deltas:
+            result = parser.parse_streaming_increment(delta, tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+        return normal_text, calls
+
+    def test_leading_text_in_same_increment(self, sample_tools, parser_cls,
+                                            tool_call):
+        parser = parser_cls()
+        normal_text, calls = self._feed(parser, [_LEADING_TEXT + tool_call],
+                                        sample_tools)
+
+        assert normal_text == _LEADING_TEXT
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+
+    def test_leading_text_emitted_once_when_call_spans_increments(
+            self, sample_tools, parser_cls, tool_call):
+        parser = parser_cls()
+        split_at = len(parser.bot_token)
+        deltas = [_LEADING_TEXT + tool_call[:split_at], tool_call[split_at:]]
+
+        normal_text, calls = self._feed(parser, deltas, sample_tools)
+
+        assert normal_text == _LEADING_TEXT
+        assert [call.name for call in calls if call.name] == ["get_weather"]
+
+    def test_tool_call_without_leading_text_emits_no_content(
+            self, sample_tools, parser_cls, tool_call):
+        parser = parser_cls()
+        normal_text, calls = self._feed(parser, [tool_call], sample_tools)
+
+        assert normal_text == ""
+        assert [call.name for call in calls if call.name] == ["get_weather"]
