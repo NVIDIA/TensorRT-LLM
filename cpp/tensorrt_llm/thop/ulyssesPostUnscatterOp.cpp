@@ -96,17 +96,60 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     return std::make_tuple(q_out, k_out, v_out);
 }
 
+// Self-attention-only variant that consumes the raw packed 5D all-to-all receive buffer
+// [P, B, Sp, 3, H, D]. This removes the Python-side packed-QKV permute/contiguous/unbind
+// chain before VANILLA/HND SDPA.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_packed_qkv_post_unscatter(
+    torch::Tensor& qkv_in, int64_t layout)
+{
+    TORCH_CHECK(qkv_in.dim() == 6, "ulysses_packed_qkv_post_unscatter expects [P, B, Sp, 3, H, D]");
+    TORCH_CHECK(qkv_in.size(3) == 3, "ulysses_packed_qkv_post_unscatter expects qkv dim size 3, got ",
+        qkv_in.size(3));
+    TORCH_CHECK(layout == 0 || layout == 1, "layout must be 0 (HND) or 1 (NHD), got ", layout);
+
+    CHECK_INPUT(qkv_in, torch::kBFloat16);
+
+    int64_t const P = qkv_in.size(0);
+    int64_t const B = qkv_in.size(1);
+    int64_t const Sp = qkv_in.size(2);
+    int64_t const H = qkv_in.size(4);
+    int64_t const D = qkv_in.size(5);
+    TORCH_CHECK(D % 8 == 0, "D (last dim) must be divisible by 8 (bf16 vec=8)");
+
+    bool const is_hnd = (layout == 0);
+    auto opts = qkv_in.options();
+    auto q_out = torch::empty({B, P * Sp, H, D}, opts);
+    auto k_out = torch::empty({B, P * Sp, H, D}, opts);
+    auto v_out = torch::empty({B, P * Sp, H, D}, opts);
+
+    if (qkv_in.numel() != 0)
+    {
+        auto stream = at::cuda::getCurrentCUDAStream();
+        tensorrt_llm::kernels::launchUlyssesPackedQkvPostUnscatter(qkv_in.data_ptr(), q_out.data_ptr(),
+            k_out.data_ptr(), v_out.data_ptr(), static_cast<int>(P), static_cast<int>(B), static_cast<int>(Sp),
+            static_cast<int>(H), static_cast<int>(D), stream);
+    }
+
+    if (is_hnd)
+    {
+        return std::make_tuple(q_out.transpose(1, 2), k_out.transpose(1, 2), v_out.transpose(1, 2));
+    }
+    return std::make_tuple(q_out, k_out, v_out);
+}
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     // layout: 0 = HND [B, H, P*Sp, D], 1 = NHD [B, P*Sp, H, D]. Default 0 keeps
     // backward compatibility with the original HND-only callers.
     m.def(
         "ulysses_post_unscatter_qkv(Tensor q_in, Tensor k_in, Tensor v_in, int layout=0) -> (Tensor, Tensor, Tensor)");
+    m.def("ulysses_packed_qkv_post_unscatter(Tensor qkv_in, int layout=0) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("ulysses_post_unscatter_qkv", &ulysses_post_unscatter_qkv);
+    m.impl("ulysses_packed_qkv_post_unscatter", &ulysses_packed_qkv_post_unscatter);
 }
 
 } // namespace torch_ext
