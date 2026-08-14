@@ -99,11 +99,17 @@ perf_report_exit_code=0
 # by a future per-rank merge step; rank-0-only coverage is sufficient for the
 # common single-rank and all-ranks-same-tests cases.)
 if [ "${SLURM_PROCID}" -eq 0 ]; then
-    eval $pytestCommand 2>&1 | tee "${PYTEST_LOG}"
-    pytest_exit_code=${PIPESTATUS[0]}
+    if eval "$pytestCommand" 2>&1 | tee "${PYTEST_LOG}"; then
+        pytest_exit_code=0
+    else
+        pytest_exit_code=${PIPESTATUS[0]}
+    fi
 else
-    eval $pytestCommand
-    pytest_exit_code=$?
+    if eval "$pytestCommand"; then
+        pytest_exit_code=0
+    else
+        pytest_exit_code=$?
+    fi
 fi
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 python3 "$llmSrcNode/tests/test_common/s3_output.py" \
