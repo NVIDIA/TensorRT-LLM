@@ -292,6 +292,8 @@ You can customize these by:
 - `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
 - `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
 
+> **`response_format="path"`** (image and video) returns absolute server-side file paths, only useful for clients co-located with the server (shared filesystem). Because `trtllm-serve` has no authentication, set `TRTLLM_DISABLE_RESPONSE_FORMAT_PATH=1` to reject `path` requests with HTTP 400.
+
 #### Tensor-format consumer contract
 
 When `format="safetensors"` or `format="pt"`, the payload bundles every populated media tensor (`image` / `video` / `audio`) and the scalar metadata (`frame_rate`, `audio_sample_rate`) into one file.
