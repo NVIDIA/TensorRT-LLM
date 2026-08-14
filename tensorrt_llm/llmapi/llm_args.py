@@ -5629,6 +5629,9 @@ class TorchLlmArgs(BaseLlmArgs):
             "optimized reader or collective setup. Runtime-ineligible loads fall "
             "back to native before model mutation.",
             status="prototype",
+            json_schema_extra={
+                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
+            },
         )
 
     mx_config: ModelExpressConfig = Field(
