@@ -357,6 +357,15 @@ def readSlurmSubmitOutput(def pipeline, Map remote, String jobWorkspace, String 
     } catch (InterruptedException e) {
         throw e
     } catch (Exception readEx) {
+        // A dead frontend must propagate so the enclosing withSlurmFrontendFailover
+        // fails over to another remote; swallowing it as "" would return an empty
+        // read to the caller, which then rethrows the original (generic) submit
+        // exception and strands the stage on the unreachable frontend. Any other
+        // read failure (missing file, transient) is non-fatal -- the caller
+        // rethrows the original exception unchanged.
+        if (CloudManager.isSlurmFrontendConnectionFailure(readEx)) {
+            throw readEx
+        }
         pipeline.echo("Ignorable warning: could not read ${outputPath} on ${remote.host}: ${readEx.message}")
         return ""
     }
