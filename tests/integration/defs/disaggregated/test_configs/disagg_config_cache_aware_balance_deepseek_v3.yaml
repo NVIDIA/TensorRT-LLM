@@ -16,7 +16,8 @@ context_servers:
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.1
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
 generation_servers:
   num_instances: 2
   router:
@@ -29,4 +30,5 @@ generation_servers:
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.1
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON

@@ -34,11 +34,10 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
-from ..models import AutoModelForCausalLM, LlamaForCausalLM
+from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
-                                     DecoderModelForCausalLM, MetaInitMode,
-                                     timing)
+from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
+                                     get_registered_model_class, timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
@@ -342,17 +341,29 @@ class ModelLoader:
     This class isolates model loading logic from the main execution engine.
     """
     _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION = 1
-    _POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
-        profiles=(PostTransformProfile(
-            profile_id="llama-for-causal-lm-target-v1",
-            root_model_class=LlamaForCausalLM,
-            architecture="LlamaForCausalLM",
-            model_type="llama",
-            speculative_mode=None,
-            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-        ), ))
+    _POST_TRANSFORM_PROFILE_REGISTRY: Optional[
+        PostTransformProfileRegistry] = None
+
+    @classmethod
+    def _post_transform_profile_registry(cls) -> PostTransformProfileRegistry:
+        # Built on first use: the profile references a model-zoo class, and
+        # importing it here (not at module level) keeps the zoo lazy for
+        # processes that import model_loader but never qualify a model.
+        if cls._POST_TRANSFORM_PROFILE_REGISTRY is None:
+            from ..models.modeling_llama import LlamaForCausalLM
+            cls._POST_TRANSFORM_PROFILE_REGISTRY = PostTransformProfileRegistry(
+                profiles=(PostTransformProfile(
+                    profile_id="llama-for-causal-lm-target-v1",
+                    root_model_class=LlamaForCausalLM,
+                    architecture="LlamaForCausalLM",
+                    model_type="llama",
+                    speculative_mode=None,
+                    protocol_version=cls.
+                    _MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+                    transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+                    transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+                ), ))
+        return cls._POST_TRANSFORM_PROFILE_REGISTRY
 
     def __init__(self,
                  llm_args: TorchLlmArgs,
@@ -402,6 +413,7 @@ class ModelLoader:
             # No config to resolve a model class from; still resolve the
             # "auto" sentinel so it never leaks past config loading.
             _resolve_transceiver_runtime_auto(llm_args)
+            _resolve_kv_cache_manager_v2_auto(llm_args)
             return llm_args
 
         config_kwargs = {
@@ -417,8 +429,18 @@ class ModelLoader:
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
-        use_kv_cache_manager_v2 = (
+        original_kv_cache_manager_setting = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
+
+        # Preferences follow the checkpoint's original architecture:
+        # _resolve_class may rewrite it to an execution class (e.g.
+        # MTPDraftModelForCausalLM), which must not drop the target model's
+        # preferences.
+        preference_cls = model_cls
+        architectures = getattr(config.pretrained_config, 'architectures', None)
+        if architectures:
+            preference_cls = get_registered_model_class(
+                architectures[0]) or model_cls
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -441,23 +463,13 @@ class ModelLoader:
             update_spec_config_from_model_config(llm_args.speculative_config,
                                                  config.pretrained_config)
 
-        # The transceiver preference follows the checkpoint's original
-        # architecture: _resolve_class may rewrite it to an execution class
-        # (e.g. MTPDraftModelForCausalLM), which must not drop the target
-        # model's preference.
-        preference_cls = model_cls
-        architectures = getattr(config.pretrained_config, 'architectures', None)
-        if architectures:
-            preference_cls = MODEL_CLASS_MAPPING.get(architectures[0],
-                                                     model_cls)
-
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
                                           config.pretrained_config)
-        _resolve_kv_cache_manager_v2_auto(
-            llm_args, model_defaults, original_setting=use_kv_cache_manager_v2)
+        _resolve_kv_cache_manager_v2_auto(llm_args, preference_cls,
+                                          config.pretrained_config)
         _validate_and_adjust_mamba_snapshot_config(config, llm_args)
-        if use_kv_cache_manager_v2 == "auto":
+        if original_kv_cache_manager_setting == "auto":
             logger.info(
                 "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
                 llm_args.kv_cache_config.use_kv_cache_manager_v2,
@@ -1131,7 +1143,7 @@ class ModelLoader:
         enabled_features = set()
         if loads_draft_weights:
             enabled_features.add(PostTransformFeature.SEPARATE_DRAFT_MODEL)
-        return cls._POST_TRANSFORM_PROFILE_REGISTRY.qualify(
+        return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
             model_type=config_identity.model_type,

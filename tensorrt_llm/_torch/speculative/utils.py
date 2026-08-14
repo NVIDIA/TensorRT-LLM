@@ -17,24 +17,23 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
 from .dflash import DFlashSpecMetadata, DFlashWorker
-from .draft_target import (DraftTargetOneModelSampler,
-                           DraftTargetOneModelSpecMetadata,
+from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
 from .dspark import DSparkSpecMetadata, DSparkWorker
 from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
-                     Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
-                     Eagle3OneModelWorker, Eagle3ResourceManager,
-                     Eagle3SpecMetadata, MTPEagleWorker)
+                     Eagle3OneModelSpecMetadata, Eagle3OneModelWorker,
+                     Eagle3ResourceManager, Eagle3SpecMetadata, MTPEagleWorker)
 from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .model_drafter import ModelDrafter
-from .mtp import MTPHiddenStatesManager, MTPSampler, MTPSpecMetadata, MTPWorker
+from .mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
 from .mtp_dynamic_tree import (MTPEagleDynamicTreeResourceManager,
                                MTPEagleDynamicTreeWorker)
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
-from .sa_worker import SASampler, SASpecMetadata, SAWorker
+from .sa_worker import SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
+from .spec_sampler_base import SpecSampler
 from .suffix_automaton import SuffixAutomatonManager
 
 _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES = (
@@ -393,27 +392,30 @@ def get_spec_decoder(
     sampler_args: TorchSampler.Args,
     spec_config: "DecodingBaseConfig",
 ):
-    if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
-        # MTP Eagle one-model now uses the same sampler as Eagle3 one-model.
-        return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
-    if spec_config.spec_dec_mode.is_mtp_vanilla():
-        nextn = spec_config.max_draft_len
-        if getattr(spec_config, "use_dynamic_tree", False):
-            nextn = spec_config.max_total_draft_tokens
-        return MTPSampler(sampler_args, nextn=nextn)
-    if spec_config.spec_dec_mode.is_eagle3(
-    ) or spec_config.spec_dec_mode.is_mtp_eagle():
-        # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
+    spec_dec_mode = spec_config.spec_dec_mode
+    if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
+        # Two-model path: the target model emits logits, so the general-purpose
+        # TorchSampler does the actual sampling (and folds in the d2t vocab
+        # mapping). One-model modes below sample inside the worker kernel.
         return TorchSampler(sampler_args)
-    if spec_config.spec_dec_mode.is_eagle3_one_model():
-        return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
-    if spec_config.spec_dec_mode.is_parallel_draft():
-        return MTPSampler(sampler_args,
-                          nextn=spec_config.tokens_per_gen_step - 1)
-    if spec_config.spec_dec_mode.is_sa():
-        return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
-    if spec_config.spec_dec_mode.is_draft_target_one_model():
-        return DraftTargetOneModelSampler(sampler_args)
+    if spec_dec_mode.use_one_engine():
+        # One sampler for every one-model mode (use_one_engine covers MTP,
+        # MTP Eagle, Eagle3, PARD/DFlash/DSpark, DraftTarget and SA): it only
+        # moves the worker's pre-sampled output around, and its buffer shapes
+        # derive from sampler_args alone.
+        #
+        # WORKAROUND (remove with eagle_choices in release 1.4): the static
+        # tree is the one mode where a step can accept more than
+        # max_draft_len + 1 tokens. The one-model drafter never builds the tree
+        # -- _forward_draft_loop is linear over runtime_draft_len, which for a
+        # non-linear tree is max_total_draft_tokens -- so max_draft_len only
+        # describes a tree depth that is never used, and acceptance is bounded
+        # by the wire width instead. Tree-aware acceptance only exists in the
+        # two-model TorchSampler path, which is deprecated alongside this.
+        accepted_path_len = None
+        if getattr(spec_config, "eagle_choices", None):
+            accepted_path_len = sampler_args.max_total_draft_tokens + 1
+        return SpecSampler(sampler_args, accepted_path_len=accepted_path_len)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
