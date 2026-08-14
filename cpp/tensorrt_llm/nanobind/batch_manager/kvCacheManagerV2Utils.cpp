@@ -161,8 +161,40 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         [](at::Tensor input, at::Tensor output, at::Tensor copyIndex, at::Tensor indexScales, at::Tensor kvOffset,
             uintptr_t stream)
         {
-            TLLM_CHECK_WITH_INFO(input.is_contiguous(), "input must be contiguous");
+            auto const checkInt32Contiguous = [](at::Tensor const& tensor, char const* name)
+            {
+                TLLM_CHECK_WITH_INFO(tensor.scalar_type() == at::kInt, "%s must contain int32 values", name);
+                TLLM_CHECK_WITH_INFO(tensor.is_contiguous(), "%s must be contiguous", name);
+            };
+            checkInt32Contiguous(input, "input");
+            checkInt32Contiguous(output, "output");
+            checkInt32Contiguous(copyIndex, "copy_index");
+            checkInt32Contiguous(indexScales, "index_scales");
+            checkInt32Contiguous(kvOffset, "kv_offset");
+
             TLLM_CHECK_WITH_INFO(output.device().is_cuda(), "output must be a CUDA tensor");
+            TLLM_CHECK_WITH_INFO(input.device().is_cpu() || input.device().is_cuda(),
+                "input and metadata must be either CPU or CUDA tensors");
+            TLLM_CHECK_WITH_INFO(copyIndex.device() == input.device() && indexScales.device() == input.device()
+                    && kvOffset.device() == input.device(),
+                "input, copy_index, index_scales, and kv_offset must be on the same device");
+            TLLM_CHECK_WITH_INFO(!input.device().is_cuda() || input.device() == output.device(),
+                "CUDA input and output tensors must be on the same device");
+
+            constexpr int64_t kKvFactor = 2;
+            TLLM_CHECK_WITH_INFO(input.dim() == 4 && output.dim() == 4,
+                "input and output must be [numPools, rowCapacity, 2, numBlocksPerSeq]");
+            TLLM_CHECK_WITH_INFO(copyIndex.dim() == 1 && indexScales.dim() == 1 && kvOffset.dim() == 1,
+                "copy_index, index_scales, and kv_offset must be one-dimensional");
+            TLLM_CHECK_WITH_INFO(input.size(0) == output.size(0), "input and output pool counts must match");
+            TLLM_CHECK_WITH_INFO(
+                input.size(2) == kKvFactor && output.size(2) == kKvFactor, "input and output must have K/V factor 2");
+            TLLM_CHECK_WITH_INFO(input.size(3) == output.size(3), "input and output block widths must match");
+            TLLM_CHECK_WITH_INFO(
+                output.size(1) >= copyIndex.size(0), "output must have at least one row per copy_index entry");
+            TLLM_CHECK_WITH_INFO(indexScales.size(0) == input.size(0) && kvOffset.size(0) == input.size(0),
+                "index_scales and kv_offset must have one entry per pool");
+
             auto _input = from_torch(input);
             auto _output = from_torch(output);
             auto _copyIndex = from_torch(copyIndex);

@@ -23,6 +23,8 @@ same bytes as an ordinary H2D copy, and invokes the same expansion kernel from
 device-resident data instead.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -118,6 +120,19 @@ def _make_materializer(host_table: torch.Tensor, index_scales, kv_offset):
     )
 
 
+def _stub_materializer(host_table: torch.Tensor) -> _BasePageTableMaterializer:
+    """Build the CPU-only materializer surface used by host-gather tests."""
+    materializer = object.__new__(_BasePageTableMaterializer)
+    materializer._host_block_offsets = host_table
+    materializer._host_base_page_indices = host_table[:, :, 0, :]
+    materializer._num_pools = host_table.shape[0]
+    materializer._row_capacity = host_table.shape[1]
+    materializer._max_blocks_per_seq = host_table.shape[3]
+    materializer._use_device_staging = True
+    materializer._use_device_expansion = True
+    return materializer
+
+
 @pytest.fixture
 def scales():
     return (
@@ -129,11 +144,7 @@ def scales():
 def test_materializer_gathers_only_canonical_base_rows():
     host_table = _make_host_table()
     copy_idx = torch.tensor([3, 0, 1], dtype=torch.int32)
-    materializer = object.__new__(_BasePageTableMaterializer)
-    materializer._host_block_offsets = host_table
-    materializer._host_base_page_indices = host_table[:, :, 0, :]
-    materializer._num_pools = _NUM_POOLS
-    materializer._max_blocks_per_seq = _MAX_BLOCKS_PER_SEQ
+    materializer = _stub_materializer(host_table)
 
     rows = materializer._gather_host_rows(
         copy_idx,
@@ -150,6 +161,7 @@ def test_materializer_gathers_only_canonical_base_rows():
     assert torch.equal(rows[:, :, 0], host_table[:, copy_idx.long(), 0, :])
 
 
+@requires_cuda
 def test_index_mapper_snapshot_gather_does_not_mutate_shared_copy_index():
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import IndexMapper
 
@@ -205,11 +217,7 @@ def test_materializer_resizes_and_populates_reusable_host_staging():
     host_table = _make_host_table()
     copy_idx = torch.tensor([3, 0, 3], dtype=torch.int32)
     num_blocks = _MAX_BLOCKS_PER_SEQ // 2
-    materializer = object.__new__(_BasePageTableMaterializer)
-    materializer._host_block_offsets = host_table
-    materializer._host_base_page_indices = host_table[:, :, 0, :]
-    materializer._num_pools = _NUM_POOLS
-    materializer._max_blocks_per_seq = _MAX_BLOCKS_PER_SEQ
+    materializer = _stub_materializer(host_table)
     staging = torch.empty(
         _NUM_POOLS,
         _CAPACITY,
@@ -242,11 +250,7 @@ def test_materializer_resizes_and_populates_reusable_host_staging():
 def test_materializer_rejects_host_staging_that_would_need_reallocation():
     host_table = _make_host_table()
     copy_idx = torch.tensor([3, 0, 1], dtype=torch.int32)
-    materializer = object.__new__(_BasePageTableMaterializer)
-    materializer._host_block_offsets = host_table
-    materializer._host_base_page_indices = host_table[:, :, 0, :]
-    materializer._num_pools = _NUM_POOLS
-    materializer._max_blocks_per_seq = _MAX_BLOCKS_PER_SEQ
+    materializer = _stub_materializer(host_table)
     staging = torch.empty(
         _NUM_POOLS,
         copy_idx.shape[0] - 1,
@@ -262,11 +266,7 @@ def test_materializer_rejects_host_staging_that_would_need_reallocation():
 @requires_native_page_table_kernel
 def test_materializer_regrows_pinned_staging_without_reallocation():
     host_table = _make_host_table(pin=True)
-    materializer = object.__new__(_BasePageTableMaterializer)
-    materializer._host_block_offsets = host_table
-    materializer._host_base_page_indices = host_table[:, :, 0, :]
-    materializer._num_pools = _NUM_POOLS
-    materializer._max_blocks_per_seq = _MAX_BLOCKS_PER_SEQ
+    materializer = _stub_materializer(host_table)
     staging = torch.empty(
         _NUM_POOLS,
         _CAPACITY,
@@ -290,11 +290,7 @@ def test_materializer_regrows_pinned_staging_without_reallocation():
 def test_materializer_rejects_noncontiguous_host_staging():
     host_table = _make_host_table()
     copy_idx = torch.tensor([3, 0, 1], dtype=torch.int32)
-    materializer = object.__new__(_BasePageTableMaterializer)
-    materializer._host_block_offsets = host_table
-    materializer._host_base_page_indices = host_table[:, :, 0, :]
-    materializer._num_pools = _NUM_POOLS
-    materializer._max_blocks_per_seq = _MAX_BLOCKS_PER_SEQ
+    materializer = _stub_materializer(host_table)
     staging = torch.empty(
         _NUM_POOLS,
         copy_idx.shape[0],
@@ -347,6 +343,23 @@ def test_native_materializer_rejects_non_cuda_destination():
         )
 
 
+@requires_cuda
+def test_native_materializer_rejects_mixed_source_devices():
+    from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+        copy_batch_block_offsets_to_device,
+    )
+
+    with pytest.raises(RuntimeError, match="must be on the same device"):
+        copy_batch_block_offsets_to_device(
+            _make_host_table(),
+            torch.empty((_NUM_POOLS, 1, 2, _MAX_BLOCKS_PER_SEQ), dtype=torch.int32, device="cuda"),
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+            torch.ones(_NUM_POOLS, dtype=torch.int32),
+            torch.zeros(_NUM_POOLS, dtype=torch.int32),
+            torch.cuda.current_stream().cuda_stream,
+        )
+
+
 class _StubTable:
     """Stands in for the page table: only its pinned-ness is consulted."""
 
@@ -359,6 +372,25 @@ class _StubTable:
 
 class TestUseDevicePageTable:
     """``auto`` must follow the kernel's contract, not a hardcoded default."""
+
+    def test_manager_predicate_reports_staging_without_expansion(self):
+        manager = object.__new__(KVCacheManagerV2)
+        manager._page_table_materializer = SimpleNamespace(
+            uses_device_staging=True,
+            uses_device_expansion=False,
+        )
+
+        assert manager.uses_device_page_table
+
+    def test_snapshot_rejects_staging_without_expansion(self):
+        manager = object.__new__(KVCacheManagerV2)
+        manager._page_table_materializer = SimpleNamespace(
+            uses_device_staging=True,
+            uses_device_expansion=False,
+        )
+
+        with pytest.raises(RuntimeError, match="requires device expansion metadata"):
+            manager.materialize_block_offsets_snapshot(torch.empty(0), [])
 
     @pytest.mark.parametrize("pinned", [True, False])
     @pytest.mark.parametrize("policy_pins", [True, False])
@@ -691,7 +723,8 @@ def test_forced_device_page_table_matches_the_native_kernel(monkeypatch):
 @requires_native_page_table_kernel
 def test_forced_device_page_table_matches_non_cc_swa(monkeypatch):
     """Compare SWA's CC transport against its established non-CC path."""
-    request_ids = list(range(1, 1 + _MANAGER_BATCH))
+    request_ids = [1, 2]
+    num_seqs = len(request_ids)
 
     def materialize(setting: str) -> torch.Tensor:
         monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
@@ -704,7 +737,7 @@ def test_forced_device_page_table_matches_non_cc_swa(monkeypatch):
             assert (
                 manager.add_dummy_requests(
                     request_ids=request_ids,
-                    token_nums=[_TOKENS_PER_REQUEST] * _MANAGER_BATCH,
+                    token_nums=[_TOKENS_PER_REQUEST] * num_seqs,
                     prepare_resource=True,
                 )
                 is not None
@@ -712,7 +745,7 @@ def test_forced_device_page_table_matches_non_cc_swa(monkeypatch):
             output = torch.full(
                 (
                     manager.num_attention_op_pools,
-                    _MANAGER_BATCH,
+                    num_seqs,
                     2,
                     manager.max_blocks_per_seq,
                 ),
@@ -724,10 +757,12 @@ def test_forced_device_page_table_matches_non_cc_swa(monkeypatch):
                 output,
                 request_ids,
                 beam_width=1,
-                num_contexts=_MANAGER_BATCH,
-                num_seqs=_MANAGER_BATCH,
+                num_contexts=num_seqs,
+                num_seqs=num_seqs,
             )
             torch.cuda.synchronize()
+            if setting == "1":
+                assert torch.all(manager._device_kv_cache_block_offsets_input[:, num_seqs:] == 0)
             return output.cpu()
         finally:
             manager.shutdown()
@@ -764,6 +799,7 @@ def test_materializer_rejects_non_cuda_and_unaligned_destinations(scales):
     index_scales, kv_offset = scales
     materializer = _make_materializer(_make_host_table(), index_scales, kv_offset)
     copy_idx = torch.tensor([0], dtype=torch.int32)
+    assert materializer.uses_device_expansion
 
     with pytest.raises(AssertionError):
         materializer.copy_block_offsets_to(
