@@ -98,7 +98,6 @@ from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy
-from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
 from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
@@ -132,10 +131,6 @@ _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
 # default stays EP-only (moe_ep == tp_size).
 _K3_MOE_TP_ENV = "TLLM_K3_MOE_TP_SIZE"
 _K3_MOE_EP_ENV = "TLLM_K3_MOE_EP_SIZE"
-
-# Route the exact Kimi RMSNorm through FlashInfer's single-kernel path. Set
-# this to "0" to retain the eager reference's byte-exact rounding behavior.
-_FUSED_RMSNORM = os.environ.get("KIMI_K3_FUSED_RMSNORM", "1") == "1"
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -287,16 +282,6 @@ class KimiK3RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if (
-            _FUSED_RMSNORM
-            and IS_FLASHINFER_AVAILABLE
-            and hidden_states.is_cuda
-            and hidden_states.dtype in (torch.float16, torch.bfloat16)
-            and self.weight.dtype == hidden_states.dtype
-        ):
-            from ..custom_ops import flashinfer_rmsnorm
-
-            return flashinfer_rmsnorm(hidden_states.contiguous(), self.weight, self.eps)
         input_dtype = hidden_states.dtype
         hidden_states_float = hidden_states.to(torch.float32)
         variance = hidden_states_float.pow(2).mean(-1, keepdim=True)
