@@ -354,21 +354,21 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
         """)
         )
 
-        # In-tree debug knobs, propagated to MPI workers via LLM.env_overrides:
-        #   TRTLLM_WORKER_PRINT_STACKS_PERIOD -> executor/worker.py:180
-        #     (periodic all-threads dump inside every MPI worker)
-        #   TLLM_LLMAPI_ZMQ_DEBUG             -> executor/ipc.py:79
-        #     (log every ZMQ send/recv on the proxy sockets)
-        #   TLLM_TRACE_EXECUTOR_LOOP          -> py_executor.py:1039
-        #     (trace one line per executor forward step)
-        #   TORCH_NCCL_DUMP_ON_TIMEOUT et al  -> upstream torch/NCCL
-        #     (dumps NCCL communicator state on collective timeout)
+        # In-tree debug knobs, propagated to MPI workers via LLM.env_overrides.
+        # ZMQ + executor-loop trace knobs were removed after the first attempt
+        # because they inflate the Jenkins console 10-100x per rep — for
+        # ~500 reps that would truncate the tail where the crash lives.
+        # The framework's --periodic-hang-traceback already dumps main-thread
+        # stacks on hang, so the added value here is:
+        #   * worker-side faulthandler (catches SIGSEGV / SIGABRT in the MPI
+        #     worker itself; framework only introspects pytest)
+        #   * persistent stderr (survives --capture=fd when worker dies)
+        #   * TORCH_NCCL_DUMP_ON_TIMEOUT (only fires on collective timeout,
+        #     so quiet on success)
         debug_env = {
             "TLLM_HANG_DUMP_DIR": str(dump_dir),
             "PYTHONPATH": str(sitecustomize_dir) + os.pathsep + os.environ.get("PYTHONPATH", ""),
             "TRTLLM_WORKER_PRINT_STACKS_PERIOD": "60",
-            "TLLM_LLMAPI_ZMQ_DEBUG": "1",
-            "TLLM_TRACE_EXECUTOR_LOOP": "1",
             "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
             "TORCH_NCCL_TRACE_BUFFER_SIZE": "20000",
             "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": str(dump_dir / "nccl_dump"),
