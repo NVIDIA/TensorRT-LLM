@@ -7,6 +7,8 @@ import pytest
 
 from tensorrt_llm._torch import nccl_window_graph
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_pool_owner_is_value_based():
     assert nccl_window_graph._shared_pool_owner(

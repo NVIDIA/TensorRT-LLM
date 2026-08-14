@@ -55,9 +55,7 @@ import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten
 
-from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
-
-from .._compat import make_weak_ref
+from .._compat import make_weak_ref, nccl_window_graph_capture
 from ..utils.logger import ad_logger
 
 

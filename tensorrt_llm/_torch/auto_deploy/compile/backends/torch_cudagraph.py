@@ -34,7 +34,6 @@ from torch.cuda import CUDAGraph
 from torch.fx import GraphModule
 from torch.fx._pytree import tree_flatten_spec
 from torch.utils._pytree import PyTree, TreeSpec, tree_flatten
-from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
 
 try:
     from tensorrt_llm._torch.autotuner import autotune
@@ -46,6 +45,7 @@ except ModuleNotFoundError:
         yield  # no-op in standalone mode
 
 
+from ..._compat import nccl_window_graph_capture
 from ...utils.cuda_graph import CudaGraphWarmUpPhase, cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.multi_stream_utils import disable_multi_stream
