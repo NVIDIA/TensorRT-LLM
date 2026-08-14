@@ -147,7 +147,12 @@ def cute_dsl_dspark_attention(
     attn_sink: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
-    """Run fused DSpark cache update + sliding-window MQA attention."""
+    """Run fused DSpark cache update + sliding-window MQA attention.
+
+    ``slots`` values must be in ``[0, kv_cache.shape[0])``, and ``start_pos``
+    values must be nonnegative. The support check does not inspect tensor values,
+    so callers are responsible for enforcing these preconditions.
+    """
     if not is_fused_dspark_attention_supported(
         q, main_kv, block_kv, kv_cache, slots, start_pos, attn_sink
     ):

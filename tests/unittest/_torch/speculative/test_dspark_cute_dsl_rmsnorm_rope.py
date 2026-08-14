@@ -66,9 +66,66 @@ def _reference(
 
 
 @pytest.mark.parametrize(
+    "invalid_case",
+    [
+        "x_dtype",
+        "weight_dtype",
+        "freq_dtype",
+        "odd_rope_dim",
+        "unaligned_rope_pairs",
+        "freq_rows",
+        "x_layout",
+    ],
+)
+def test_fused_dspark_rmsnorm_rope_support_gate_rejects_invalid_inputs(invalid_case):
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        is_fused_dspark_rmsnorm_rope_supported,
+    )
+
+    inputs = list(_make_inputs(2, 5, 512, 64, 1))
+    rope_dim = 64
+    if invalid_case == "x_dtype":
+        inputs[0] = inputs[0].float()
+    elif invalid_case == "weight_dtype":
+        inputs[1] = inputs[1].float()
+    elif invalid_case == "freq_dtype":
+        inputs[2] = inputs[2].to(torch.bfloat16)
+    elif invalid_case == "odd_rope_dim":
+        rope_dim = 63
+    elif invalid_case == "unaligned_rope_pairs":
+        rope_dim = 32
+    elif invalid_case == "freq_rows":
+        inputs[2] = inputs[2][:-1]
+    else:
+        inputs[0] = inputs[0].transpose(0, 1).contiguous().transpose(0, 1)
+
+    assert not is_fused_dspark_rmsnorm_rope_supported(*inputs, num_heads=1, rope_dim=rope_dim)
+
+
+def test_cute_dsl_dspark_rmsnorm_rope_rejects_invalid_inputs():
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        cute_dsl_dspark_rmsnorm_rope,
+    )
+
+    x, weight, freqs = _make_inputs(2, 5, 512, 64, 1)
+    with pytest.raises(ValueError, match="requires contiguous BF16"):
+        cute_dsl_dspark_rmsnorm_rope(x.float(), weight, freqs, 1, 64, 1e-6, True, True, False)
+
+
+def test_dspark_rmsnorm_rope_kernel_rejects_invalid_num_heads():
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
+        DSparkRMSNormRoPEKernel,
+    )
+
+    with pytest.raises(ValueError, match="num_heads must be positive"):
+        DSparkRMSNormRoPEKernel(512, 64, 0, 1e-6, True, True, False)
+
+
+@pytest.mark.parametrize(
     "hidden_dim,rope_dim,num_heads,apply_weight,apply_rmsnorm,inverse_rope",
     [
         (512, 64, 1, True, True, False),
+        (512, 64, 1, True, False, False),
         (512, 64, 24, False, True, False),
         (512, 64, 24, False, False, True),
         (1024, 0, 1, True, True, False),

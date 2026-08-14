@@ -312,27 +312,28 @@ def _rmsnorm_rope_batched(
     inverse_rope: bool = False,
 ) -> torch.Tensor:
     """Fuse DSpark RMSNorm and last-dimension RoPE when supported."""
-    freqs_real = torch.view_as_real(freqs_cis).reshape(-1, freqs_cis.shape[-1], 2)
-    if IS_CUTLASS_DSL_AVAILABLE and is_fused_dspark_rmsnorm_rope_supported(
-        t, weight, freqs_real, num_heads, rope_head_dim
-    ):
-        return cute_dsl_dspark_rmsnorm_rope(
-            t,
-            weight,
-            freqs_real,
-            num_heads,
-            rope_head_dim,
-            eps,
-            apply_weight,
-            apply_rmsnorm,
-            inverse_rope,
-        )
+    if IS_CUTLASS_DSL_AVAILABLE:
+        freqs_real = torch.view_as_real(freqs_cis).reshape(-1, freqs_cis.shape[-1], 2)
+        if is_fused_dspark_rmsnorm_rope_supported(t, weight, freqs_real, num_heads, rope_head_dim):
+            return cute_dsl_dspark_rmsnorm_rope(
+                t,
+                weight,
+                freqs_real,
+                num_heads,
+                rope_head_dim,
+                eps,
+                apply_weight,
+                apply_rmsnorm,
+                inverse_rope,
+            )
 
     if apply_rmsnorm:
         if apply_weight:
             t = _rmsnorm(t, weight, eps)
         else:
             t = t * torch.rsqrt(t.square().mean(-1, keepdim=True) + eps)
+    elif apply_weight:
+        t = (t.float() * weight.float()).to(t.dtype)
     if rope_head_dim > 0:
         t = _rope_last_dims_batched(t, rope_head_dim, freqs_cis, inverse=inverse_rope)
     return t
@@ -482,6 +483,10 @@ def dspark_attention_forward_batched(
         ``[G, block, dim]`` attention output (residual stream contribution).
     """
     g, block, _ = x.shape
+    if kv_cache.shape[1] != window_size:
+        raise ValueError(
+            f"kv_cache window extent {kv_cache.shape[1]} does not match window_size {window_size}"
+        )
     rd = rope_head_dim
     # Per-request RoPE phases gathered from the fixed table (no host-int slicing).
     main_freqs = freqs_cis[start_pos].unsqueeze(1)  # [G, 1, rd//2]

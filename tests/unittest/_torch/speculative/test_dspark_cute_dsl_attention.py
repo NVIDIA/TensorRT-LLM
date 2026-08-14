@@ -48,6 +48,39 @@ def _reference(q, main_kv, block_kv, kv_cache, slots, start_pos, sink):
     return dspark_sparse_attn(q, kv_full, sink, topk, q.shape[-1] ** -0.5), cache
 
 
+@pytest.mark.parametrize(
+    "invalid_case",
+    ["q_dtype", "head_dim", "q_layout", "index_dtype", "q_rank"],
+)
+def test_fused_dspark_attention_support_gate_rejects_invalid_inputs(invalid_case):
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
+        is_fused_dspark_attention_supported,
+    )
+
+    inputs = list(_make_inputs())
+    if invalid_case == "q_dtype":
+        inputs[0] = inputs[0].float()
+    elif invalid_case == "head_dim":
+        inputs[0] = inputs[0][..., :-1].contiguous()
+    elif invalid_case == "q_layout":
+        inputs[0] = inputs[0].transpose(0, 1).contiguous().transpose(0, 1)
+    elif invalid_case == "index_dtype":
+        inputs[5] = inputs[5].to(torch.int32)
+    else:
+        inputs[0] = inputs[0][0]
+
+    assert not is_fused_dspark_attention_supported(*inputs)
+
+
+def test_cute_dsl_dspark_attention_rejects_invalid_inputs():
+    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
+
+    inputs = list(_make_inputs())
+    inputs[0] = inputs[0].float()
+    with pytest.raises(ValueError, match="requires contiguous BF16"):
+        cute_dsl_dspark_attention(*inputs, 512**-0.5)
+
+
 def test_cute_dsl_dspark_attention_matches_reference():
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import cute_dsl_dspark_attention
 

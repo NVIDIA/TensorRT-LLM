@@ -33,6 +33,8 @@ class DSparkRMSNormRoPEKernel:
             )
         if rope_dim < 0 or rope_dim > hidden_dim or rope_dim % 2 != 0:
             raise ValueError(f"rope_dim must be even and in [0, {hidden_dim}]; got {rope_dim}")
+        if num_heads <= 0:
+            raise ValueError(f"num_heads must be positive; got {num_heads}")
         self.hidden_dim = hidden_dim
         self.rope_dim = rope_dim
         self.nope_dim = hidden_dim - rope_dim
