@@ -191,6 +191,66 @@ class InfraDryRunBenchmarkTest(unittest.TestCase):
                 self.assertIn(expected, result.stdout)
                 self.assertIn("1 passed, 1 deselected", result.stdout)
 
+    def test_positional_nodeid_does_not_import_unrelated_product_test(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / BENCHMARK_PATH.name).write_text(BENCHMARK_PATH.read_text())
+            (root / "test_unrelated_product.py").write_text(
+                'raise RuntimeError("unrelated product test imported")\n'
+            )
+            (root / "torch.py").write_text(
+                textwrap.dedent(
+                    """
+                    float32 = "float32"
+                    class Device:
+                        def __init__(self, kind, index=None):
+                            self.type, self.index = kind, index
+                    class Scalar:
+                        def item(self): return True
+                    class Tensor:
+                        def __init__(self, value, dtype, device):
+                            self.value, self.dtype, self.device = value, dtype, device
+                        def all(self): return Scalar()
+                    def device(kind, index=None): return Device(kind, index)
+                    def full(_shape, value, *, dtype, device): return Tensor(value, dtype, device)
+                    def matmul(left, _right): return Tensor(4.0, left.dtype, left.device)
+                    def full_like(tensor, value): return Tensor(value, tensor.dtype, tensor.device)
+                    def isfinite(tensor): return tensor
+                    def equal(left, right): return left.value == right.value
+                    """
+                )
+            )
+            (root / "conftest.py").write_text(
+                textwrap.dedent(
+                    """
+                    def pytest_addoption(parser):
+                        parser.addoption("--test-list")
+                    """
+                )
+            )
+
+            target = f"{BENCHMARK_PATH.name}::test_infra_dry_run_benchmark"
+            dry_list = root / "dry.txt"
+            dry_list.write_text(f"{target}\n")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "--collect-only",
+                    f"--test-list={dry_list}",
+                    target,
+                    "-q",
+                ],
+                cwd=root,
+                env={**os.environ, "stageName": "CPU-Generic-x86-1"},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn(target, result.stdout)
+            self.assertNotIn("test_unrelated_product.py", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
