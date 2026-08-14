@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -84,7 +85,8 @@ def apply_runtime_lora(
         )
 
     raw_tensors = _load_lora_tensors(config.path)
-    pairs, skipped_incomplete = _extract_lora_pairs(raw_tensors, config)
+    peft_alpha = _load_peft_lora_alpha(config.path)
+    pairs, skipped_incomplete = _extract_lora_pairs(raw_tensors, config, peft_alpha)
     modules = dict(transformer.named_modules())
     targets: Dict[str, List[_RuntimeLoRAAdapter]] = {}
     skipped_non_targets = 0
@@ -378,16 +380,46 @@ def _load_lora_tensors(path: str) -> Dict[str, torch.Tensor]:
         raise ValueError(f"No safetensors files found at {path}")
 
     raw: Dict[str, torch.Tensor] = {}
+    key_sources: Dict[str, Path] = {}
     for sft_path in sft_paths:
         with safetensors.torch.safe_open(sft_path, framework="pt") as f:
             for key in f.keys():
+                if key in raw:
+                    raise ValueError(
+                        f"Runtime LoRA duplicate tensor key {key!r} in {sft_path} "
+                        f"and {key_sources[key]}"
+                    )
                 raw[key] = f.get_tensor(key)
+                key_sources[key] = sft_path
     return raw
+
+
+def _load_peft_lora_alpha(path: str) -> Optional[float]:
+    lora_path = Path(path)
+    config_path = (
+        lora_path.parent / "adapter_config.json"
+        if lora_path.is_file()
+        else lora_path / "adapter_config.json"
+    )
+    if not config_path.is_file():
+        return None
+
+    with config_path.open("r", encoding="utf-8") as config_file:
+        adapter_config = json.load(config_file)
+    lora_alpha = adapter_config.get("lora_alpha")
+    if lora_alpha is None:
+        return None
+    if not isinstance(lora_alpha, (int, float)):
+        raise ValueError(
+            f"Runtime LoRA adapter_config.json lora_alpha must be a number, got {type(lora_alpha).__name__}"
+        )
+    return float(lora_alpha)
 
 
 def _extract_lora_pairs(
     raw: Dict[str, torch.Tensor],
     config: RuntimeLoRAConfig,
+    peft_alpha: Optional[float] = None,
 ) -> Tuple[List[_LoRAPair], int]:
     down_suffixes = (".lora_A.weight", ".lora_down.weight")
     up_suffixes = (".lora_B.weight", ".lora_up.weight")
@@ -425,7 +457,8 @@ def _extract_lora_pairs(
                 f"Runtime LoRA rank mismatch for '{base_name}': "
                 f"A={tuple(a.shape)}, B={tuple(b.shape)}"
             )
-        pair_scale = float(config.scale) * alpha.get(base_name, float(rank)) / float(rank)
+        pair_alpha = alpha.get(base_name, peft_alpha if peft_alpha is not None else float(rank))
+        pair_scale = float(config.scale) * pair_alpha / float(rank)
         pairs.append(_LoRAPair(base_name, a, b, pair_scale))
 
     skipped_incomplete += len(set(up_tensors) - set(down_tensors))
@@ -540,17 +573,17 @@ def _shard_adapter(
         )
 
     if isinstance(getattr(base_layer, "tp_sharding", None), dict):
-        raise RuntimeError(
+        raise ValueError(
             f"Runtime LoRA target '{module_name}' uses fused tensor-parallel sharding; "
             "fused TP runtime LoRA is not supported yet."
         )
     if adapter.output_start is not None:
-        raise RuntimeError(
+        raise ValueError(
             f"Runtime LoRA target '{module_name}' uses fused QKV output spans with TP; "
             "fused QKV TP runtime LoRA is not supported yet."
         )
     if not hasattr(base_layer, "load_shard"):
-        raise RuntimeError(
+        raise ValueError(
             f"Runtime LoRA target '{module_name}' is tensor-parallel but has no load_shard()"
         )
 
@@ -563,6 +596,6 @@ def _shard_adapter(
         a = adapter.a.to(device=device)
         b = base_layer.load_shard(adapter.b, device=device)
     else:
-        raise RuntimeError(f"Unsupported tensor-parallel mode for Runtime LoRA: {tp_mode}")
+        raise ValueError(f"Unsupported tensor-parallel mode for Runtime LoRA: {tp_mode}")
 
     return _RuntimeLoRAAdapter(a, b, adapter.scale, adapter.output_start)

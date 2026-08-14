@@ -532,8 +532,9 @@ class RuntimeLoRAConfig(StrictBaseModel):
         default_factory=list,
         status="prototype",
         description=(
-            "Transformer component names to patch. Empty means all transformer "
-            "components exposed by the pipeline."
+            "Transformer component names to patch. Empty is allowed only for "
+            "single-transformer pipelines; multi-transformer pipelines require "
+            "explicit component names."
         ),
     )
     strip_prefixes: List[str] = Field(

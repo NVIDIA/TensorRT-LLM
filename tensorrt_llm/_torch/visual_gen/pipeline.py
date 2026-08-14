@@ -417,8 +417,16 @@ class BasePipeline(nn.Module):
 
         from .runtime_lora import apply_runtime_lora
 
-        transformer_components = set(self.transformer_components)
-        component_names = runtime_lora.target_components or list(transformer_components)
+        transformer_component_names = list(self.transformer_components)
+        transformer_components = set(transformer_component_names)
+        if not runtime_lora.target_components and len(transformer_component_names) > 1:
+            raise ValueError(
+                "runtime_lora_config.target_components must be set when a pipeline "
+                f"has multiple transformer components: {transformer_component_names}. "
+                "A single runtime_lora_config.path cannot be safely applied by default "
+                "to every component."
+            )
+        component_names = runtime_lora.target_components or transformer_component_names
         total_applied = 0
         applications = []
         for component_name in component_names:
