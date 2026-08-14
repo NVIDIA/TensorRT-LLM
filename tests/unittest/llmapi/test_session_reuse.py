@@ -331,7 +331,7 @@ def test_autodeploy_nodeids_are_private():
     )
 
 
-def test_stateful_kv_cache_compare_nodeid_is_private():
+def test_stateful_kv_cache_compare_nodeid_is_private() -> None:
     from test_common.session_reuse_hooks import _is_private_nodeid
 
     assert _is_private_nodeid(
