@@ -108,6 +108,11 @@ _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
 )
 
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
+# Heuristic ported from SGLang's Blackwell cutoff:
+# https://github.com/sgl-project/sglang/blob/e84bbf68efb683c9e2eef4168c5198042544599d/python/sglang/srt/models/kimi_k3.py#L946-L954
+# It has not been tuned for TensorRT-LLM; benchmark and retune it for TRT-LLM's
+# projection kernels. Verify intentionally counts B * num_steps because those
+# flattened token rows form the projection GEMMs' M dimension.
 _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
 
 # Routed-expert MoE TP/EP split overrides (read per model init, not import).
