@@ -41,7 +41,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retriev
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
-from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator, postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
@@ -454,7 +454,7 @@ class WanPipeline(BasePipeline):
             prompt = [prompt]
         batch_size = len(prompt)
 
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed)
 
         self.validate_resolution(height, width, num_frames)
 
