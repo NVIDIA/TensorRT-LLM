@@ -808,9 +808,10 @@ def _check_page_table_is_gpu_addressable(**tensors: torch.Tensor) -> None:
     if pageable:
         raise RuntimeError(
             f"KVCacheManagerV2 page-table tensors {pageable} are pageable, but "
-            "copyBatchBlockOffsetsToDevice dereferences them from the GPU. Unset "
-            f"{_DEVICE_PAGE_TABLE_ENV} (or set it to 'auto') to expand the page "
-            "table from device memory instead."
+            "copyBatchBlockOffsetsToDevice dereferences them from the GPU. The native "
+            "path also requires a host mapping in the GPU address space, which CC does "
+            f"not provide even for pinned memory. Set {_DEVICE_PAGE_TABLE_ENV} to "
+            "'auto' or '1' to expand the page table from device memory instead."
         )
 
 
@@ -2016,6 +2017,10 @@ class KVCacheManagerV2(BaseResourceManager):
             device=device,
         )
         if self._page_table_materializer.uses_device_staging:
+            # Device staging uploads only the active rows, but the compiled SWA
+            # gather uses a capacity-sized identity index. Keep its inactive
+            # source rows defined even though their outputs are not consumed.
+            self._device_kv_cache_block_offsets_input.zero_()
             self._device_copy_idx_staging = torch.arange(
                 staging_capacity,
                 dtype=torch.long,
@@ -2395,6 +2400,11 @@ class KVCacheManagerV2(BaseResourceManager):
         backend's configuration.
         """
         return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
+
+    @property
+    def uses_device_page_table(self) -> bool:
+        """Whether attention page tables are materialized through device staging."""
+        return self._page_table_materializer.uses_device_staging
 
     @property
     def blocks_in_primary_pool(self) -> int:
@@ -4334,7 +4344,10 @@ class KVCacheManagerV2(BaseResourceManager):
         A caller that reuses ``host_staging`` must order that reuse after the
         prior asynchronous consumer has finished reading it.
         """
-        assert self._page_table_materializer.uses_device_expansion
+        if not self._page_table_materializer.uses_device_expansion:
+            raise RuntimeError(
+                "Block-offset snapshot materialization requires device expansion metadata"
+            )
         num_blocks = dst_tensor.shape[-1]
         host_rows = self._page_table_materializer._prepare_host_rows(
             len(request_ids),

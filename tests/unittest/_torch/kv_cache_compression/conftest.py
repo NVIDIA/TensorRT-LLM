@@ -251,7 +251,7 @@ def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
         index_mapper=SimpleNamespace(gather_k_block_offsets=gather),
         index_scales=torch.full((num_slots,), 2, dtype=torch.int32, pin_memory=True),
         kv_offset=torch.ones(num_slots, dtype=torch.int32, pin_memory=True),
-        _page_table_materializer=SimpleNamespace(uses_device_expansion=False),
+        uses_device_page_table=False,
         _stream=manager_stream,
     )
 
@@ -280,6 +280,7 @@ def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     fake_v2.impl = object()
     fake_v2.kv_cache_map = {}
     fake_v2.host_kv_cache_block_offsets = torch.zeros(1, 8, 2, 8, dtype=torch.int32)
+    fake_v2._page_table_materializer = SimpleNamespace(uses_device_expansion=False)
     fake_v2.pp_layers = []
     fake_v2.layer_offsets = {}
     fake_v2.layer_to_pool_mapping_dict = {}

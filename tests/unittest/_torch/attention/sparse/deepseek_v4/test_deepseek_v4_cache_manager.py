@@ -34,9 +34,10 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import _DEVICE_PAGE_TABLE_ENV
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import binding_to_torch_dtype
+from tensorrt_llm._utils import binding_to_torch_dtype, prefer_pinned
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
@@ -1506,6 +1507,61 @@ class TestDeepseekV4CacheManager:
             for req in requests:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
+
+    @pytest.mark.skipif(
+        not prefer_pinned(),
+        reason="the native page-table kernel cannot run without GPU-addressable host memory",
+    )
+    def test_forced_device_page_table_matches_native_sliding_tables(
+        self, monkeypatch, scratch_reuse_enabled: bool
+    ):
+        """Compare DSV4's CC transport with the established native path."""
+
+        def materialize(setting: str) -> torch.Tensor:
+            monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
+            cache_manager, _ = self._create_deepseek_v4_cache_manager(
+                tokens_per_block=self.tokens_per_block,
+                max_batch_size=4,
+                max_seq_len=1024,
+                compress_ratios=[1, 4, 128, 4],
+                dtype=DataType.BF16,
+                compressor_dtype=DataType.FLOAT,
+                enable_swa_scratch_reuse=scratch_reuse_enabled,
+            )
+            requests = []
+            try:
+                requests, num_contexts = self._prepare_mixed_copy_batch(
+                    cache_manager, self.tokens_per_block * 2 + 1
+                )
+                request_ids = [req.py_request_id for req in requests]
+                assert cache_manager.uses_device_page_table is (setting == "1")
+
+                with torch.cuda.stream(cache_manager._stream):
+                    cache_manager.compute_sliding_block_tables(
+                        request_ids,
+                        num_contexts=num_contexts,
+                    )
+                cache_manager._stream.synchronize()
+
+                if setting == "1":
+                    # DSV4 indexes the full-capacity source. The inactive tail
+                    # is not consumed, but it must remain defined for initcheck.
+                    assert torch.all(
+                        cache_manager._device_kv_cache_block_offsets_input[:, len(request_ids) :]
+                        == 0
+                    )
+                return cache_manager._precomputed_sliding_block_tables[
+                    :, :, : len(request_ids)
+                ].cpu()
+            finally:
+                for req in requests:
+                    cache_manager.free_resources(req)
+                cache_manager.shutdown()
+
+        native = materialize("0")
+        forced_device = materialize("1")
+
+        torch.testing.assert_close(forced_device, native)
 
     def test_copy_batch_sliding_block_tables_matches_python_converter(
         self, scratch_reuse_enabled: bool

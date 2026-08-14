@@ -98,7 +98,7 @@ def _allocate_block_offset_snapshot(
     block_offsets_host = torch.empty(
         snapshot_shape, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
     )
-    if not manager._page_table_materializer.uses_device_expansion:
+    if not manager.uses_device_page_table:
         _check_page_table_is_gpu_addressable(host_rows=block_offsets_host)
     block_offsets_device = torch.empty(snapshot_shape, dtype=torch.int32, device=anchor_pool.device)
     return block_offsets_host, block_offsets_device
@@ -616,7 +616,7 @@ class TriAttentionCompressionManager(KVCacheCompressionManager):
         device_block_offsets: torch.Tensor,
     ) -> None:
         """Snapshot host block offsets before their asynchronous device copy."""
-        if manager._page_table_materializer.uses_device_expansion:
+        if manager.uses_device_page_table:
             manager.materialize_block_offsets_snapshot(
                 device_block_offsets,
                 request_ids,
