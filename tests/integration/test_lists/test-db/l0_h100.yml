@@ -14,6 +14,8 @@ l0_h100:
       backend: pytorch
       orchestrator: mpi
   tests:
+  # Temporary CI validation: exercise pytest-timeout classification.
+  - test_fmha.py::test_fmha TIMEOUT (1)
   # ------------- PyTorch tests ---------------
   - unittest/_torch/attention
   - unittest/_torch/auto_deploy

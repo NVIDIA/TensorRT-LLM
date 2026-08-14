@@ -14,6 +14,8 @@ l0_b200:
       stage: pre_merge
       backend: pytorch
   tests:
+  # Temporary CI validation: exercise pytest-timeout classification.
+  - test_fmha.py::test_fmha TIMEOUT (1)
   # ------------- PyTorch tests ---------------
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4

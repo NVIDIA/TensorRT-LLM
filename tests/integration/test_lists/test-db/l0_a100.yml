@@ -13,6 +13,8 @@ l0_a100:
       stage: pre_merge
       backend: "pytorch"
   tests:
+    # Temporary CI validation: exercise pytest-timeout classification.
+    - test_fmha.py::test_fmha TIMEOUT (1)
     - unittest/llmapi/test_llm_pytorch.py -m "part0"
     - unittest/llmapi/test_llm_pytorch.py -m "part1"
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
