@@ -615,7 +615,7 @@ class TRTLLMWorker(Worker):
                         copy.deepcopy(generate_result.outputs[0].token_ids)))
 
     def fill_task_with_result(self, task: GenerationTask,
-                              result: GenerationResult):
+                              result: GenerationResult) -> None:
         task.output_str = result.outputs[0].text
         task.output_tokens = result.outputs[0].token_ids
         task.finish_reason = result.outputs[0].finish_reason
@@ -638,9 +638,10 @@ class TRTLLMWorker(Worker):
 
         try:
             if task.streaming_output_flag:
-                result = self.llm.generate_async(task.input_str,
-                                                 sampling_params=sampling_params,
-                                                 streaming=True)
+                result = self.llm.generate_async(
+                    task.input_str,
+                    sampling_params=sampling_params,
+                    streaming=True)
                 await self.streaming_generate_helper(result, None,
                                                      task.streaming_output_list)
             else:
@@ -667,8 +668,8 @@ class TRTLLMWorker(Worker):
                     sampling_params=sampling_params,
                     streaming=True)
             except RequestError as error:
+                task.end_flag = True
                 if self._is_max_num_tokens_request_error(error):
-                    task.end_flag = True
                     return self._finish_task_by_length(task)
                 print('TRTLLM worker get exception: ' + str(error))
                 return TaskStatus.WORKER_EXECEPTION
@@ -678,9 +679,17 @@ class TRTLLMWorker(Worker):
             task.request_handle.abort()
             return TaskStatus.SUCCESS
 
-        await self.streaming_generate_helper(
-            task.request_handle, task.streaming_step,
-            task.streaming_output_queue if task.streaming_output_flag else None)
+        try:
+            await self.streaming_generate_helper(
+                task.request_handle, task.streaming_step,
+                task.streaming_output_queue
+                if task.streaming_output_flag else None)
+        except RequestError as error:
+            task.end_flag = True
+            if self._is_max_num_tokens_request_error(error):
+                return self._finish_task_by_length(task)
+            print('TRTLLM worker get exception: ' + str(error))
+            return TaskStatus.WORKER_EXECEPTION
 
         self.fill_task_with_result(task, task.request_handle)
 
