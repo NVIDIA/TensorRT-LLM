@@ -19,21 +19,25 @@ def enforce_single_worker(monkeypatch):
 
 
 def test_dynamic_draft_len(enforce_single_worker):
-    def mock_get_draft_len_for_batch_size(draft_len_schedule, batch_size, max_total_draft_tokens):
-        # The draft length for each iter will be 4-4-2-2-0-0-2-2-4-4-2-2-0-0-2-2-...
+    def mock_get_draft_len_for_batch_size(
+        draft_len_schedule, batch_size, max_total_draft_tokens, min_draft_len=0
+    ):
+        # The draft length for each iter will be 4-4-2-2-1-1-2-2-4-4-2-2-1-1-2-2-...
         # which tested:
         # (1) decrease draft length: 4->2,
         # (2) increase draft length: 2->4,
-        # (3) disable and re-enable drafting: 2->0->2.
+        # (3) drop to the shortest sustainable draft length and back: 2->1->2.
+        # Scheduled draft lengths never reach 0: drafting has to keep refreshing
+        # the drafter's cross-iteration state (see min_runtime_draft_len).
         if mock_get_draft_len_for_batch_size.call_count % 8 < 2:
             dynamic_draft_len = 4
         elif mock_get_draft_len_for_batch_size.call_count % 8 < 4:
             dynamic_draft_len = 2
         elif mock_get_draft_len_for_batch_size.call_count % 8 < 6:
-            dynamic_draft_len = 0
+            dynamic_draft_len = 1
         else:
             dynamic_draft_len = 2
-        return dynamic_draft_len
+        return max(dynamic_draft_len, min_draft_len)
 
     # Create a Mock object with the mock function as side_effect
     mock_get_draft_len_for_batch_size = Mock(side_effect=mock_get_draft_len_for_batch_size)
