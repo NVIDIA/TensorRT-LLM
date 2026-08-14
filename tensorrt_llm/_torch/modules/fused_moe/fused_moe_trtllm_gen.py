@@ -29,7 +29,7 @@ from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
-                      Fp4QuantizedTensor)
+                      Fp4QuantizedTensor, MxFp8QuantizedTensor)
 from ..gated_mlp import GatedMLP
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEProblem, MoERejectReason, MoERunContext,
@@ -685,10 +685,12 @@ class TRTLLMGenFusedMoE(MoE):
         K3 decode shape. Returning ``None`` keeps every other model, shape,
         architecture, and op backend on the existing unfused path.
         """
-        sm_version = get_sm_version()
         if (os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1"
-                or isinstance(x, MxFp8QuantizedTensor)
-                or not 100 <= sm_version < 110 or not self.has_w4a8_mxfp4_mxfp8
+                or isinstance(x, MxFp8QuantizedTensor)):
+            return None
+
+        sm_version = get_sm_version()
+        if (not 100 <= sm_version < 110 or not self.has_w4a8_mxfp4_mxfp8
                 or not isinstance(self.op_backend, TRTLLMOpBackend)
                 or not isinstance(self.routing_method,
                                   DeepSeekV3MoeRoutingMethod)):
@@ -739,7 +741,7 @@ class TRTLLMGenFusedMoE(MoE):
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_gate_dequant[0])
         elif self.has_nvfp4:
-            if isinstance(x, Fp4QuantizedTensor):
+            if isinstance(x, Fp4QuantizedTensor, MxFp8QuantizedTensor):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                 x_row = x.shape[0]
                 x, x_sf = x.fp4_tensor, x.scaling_factor

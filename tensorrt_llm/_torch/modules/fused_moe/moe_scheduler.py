@@ -54,6 +54,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
+from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .impl_contract import MoECommPlan, MoERunContext
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
 
@@ -380,13 +381,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
             or moe.comm is not None
             or FORCE_SEPARATED_ROUTING
         )
+        supports_post_quant = moe.comm is None or moe.comm.supports_post_quant_dispatch()
         used_fused_route_quant = False
         if requires_separated_routing:
-            can_quantize_before_dispatch = (
-                moe.comm is None or moe.comm.supports_post_quant_dispatch()
-            )
             if (
-                can_quantize_before_dispatch
+                supports_post_quant
                 and isinstance(moe.backend, TRTLLMGenFusedMoE)
                 and not moe._using_load_balancer()
                 and not moe.apply_router_weight_on_input
@@ -510,8 +509,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
         if moe.comm is not None:
-            supports_post_quant = moe.comm.supports_post_quant_dispatch()
-
             # Debug: optional dummy AllReduce to break load-balancing artifacts
             if moe.enable_dummy_allreduce:
                 moe.dummy_allreduce()
@@ -555,7 +552,6 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
-                assert not used_fused_route_quant
                 x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No comm: just quantize
