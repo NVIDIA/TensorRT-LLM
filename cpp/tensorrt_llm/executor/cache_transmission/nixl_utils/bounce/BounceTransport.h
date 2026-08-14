@@ -152,8 +152,15 @@ public:
     /// available space. Successful workers have already sent ACK. Returns true if any were drained.
     bool drainScatterDone();
     /// A peer is gone: reclaim every receiver-side flow of that peer (deferring regions a worker is
-    /// still reading) and drop its not-yet-started scatter jobs.
+    /// still reading, quarantining regions the peer may still be RDMA-writing) and drop its
+    /// not-yet-started scatter jobs.
     void forget(std::string const& peer);
+
+    /// Time-driven reclamation (IO thread, called from tick()): reclaim flows the scheduler reports
+    /// idle beyond cfg.receiverFlowTimeoutMs — a dead/unreachable sender emits neither DATA nor a
+    /// cancel, so without this its granted regions leak forever — and return quarantined regions to
+    /// the arena once their cfg.quarantineMs deadline passes (scheduler.reapQuarantine).
+    void checkTimeouts();
 
     /// True while any scatter is enqueued-or-running (drives the IO loop's 0ms busy-poll).
     [[nodiscard]] bool busy() const
@@ -204,6 +211,8 @@ private:
     // drainScatterDone frees the region via freeOrphanRegion (flow already gone) or onScatterDone
     // (normal completion).
     std::unordered_map<std::uint64_t, bool> mScattering;
+
+    std::chrono::steady_clock::time_point mNextSweep{}; // checkTimeouts() throttle (IO-thread-only)
 };
 
 /// Sender role ([S]): submit() announces a WRITE via WANT; GRANT -> gather into a local arena region
