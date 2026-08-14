@@ -20,7 +20,6 @@ import re
 import sys
 from html import escape
 
-
 # ---------------------------------------------------------------------------
 # XML sanitisation helpers
 # ---------------------------------------------------------------------------
@@ -67,7 +66,7 @@ def load_timeout_map(path):
                         or not isinstance(rec.get("snippet"), str)
                     ):
                         raise ValueError(
-                            f"expected {{\"nodeid\": str, \"snippet\": str}}, "
+                            f'expected {{"nodeid": str, "snippet": str}}, '
                             f"got {type(rec).__name__} with keys "
                             f"{list(rec.keys()) if isinstance(rec, dict) else 'N/A'}"
                         )
@@ -87,6 +86,7 @@ def load_timeout_map(path):
 
 
 # ---------------------------------------------------------------------------
+
 
 def parse_xml_classname_name_file_from_testname(testname, stage_name):
     """Parse XML attributes from a test name.
@@ -177,7 +177,7 @@ def generate_timeout_xml(stage_name, testList, outputFilePath, timeout_map=None)
             snippet_escaped = sanitize_for_xml(timeout_map[test])
             error_block = (
                 f'        <error message="pytest_timeout">Pytest timeout.</error>\n'
-                f'        <system-out>{snippet_escaped}</system-out>'
+                f"        <system-out>{snippet_escaped}</system-out>"
             )
         else:
             # Unexpected termination (OOM, node crash, etc.) or unknown cause.
@@ -186,7 +186,7 @@ def generate_timeout_xml(stage_name, testList, outputFilePath, timeout_map=None)
         xmlContent += (
             f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
             f'file="{file_escaped}" time="1.0">\n'
-            f'{error_block}</testcase>'
+            f"{error_block}</testcase>"
         )
 
     xmlContent += "</testsuite></testsuites>"

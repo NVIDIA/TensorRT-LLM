@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Scan a pytest output log and emit confirmed pytest-timeout records as NDJSON.
+r"""Scan a pytest output log and emit confirmed pytest-timeout records as NDJSON.
 
 For each test that was killed by pytest-timeout (``--timeout-method=thread``),
 the timer thread prints two banner lines before calling ``os._exit(1)``:
@@ -116,8 +116,10 @@ def _scan_log(log_path, unfinished):
                     break
                 # Check size limits before appending.
                 line_bytes = len(next_line.encode("utf-8", errors="replace"))
-                if len(snippet_lines) >= _MAX_SNIPPET_LINES or \
-                        total_bytes + line_bytes > _MAX_SNIPPET_BYTES:
+                if (
+                    len(snippet_lines) >= _MAX_SNIPPET_LINES
+                    or total_bytes + line_bytes > _MAX_SNIPPET_BYTES
+                ):
                     truncated = True
                     # Drain until the second banner so the outer loop resumes
                     # correctly after this block.
