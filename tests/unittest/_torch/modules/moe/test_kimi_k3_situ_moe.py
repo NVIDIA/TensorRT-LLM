@@ -23,6 +23,7 @@ Covers the acceptance criteria of the SiTU cubin integration plan
 import dataclasses
 import os
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -35,6 +36,7 @@ from _torch.modules.moe.kimi_k3_ref_moe._moe_kernels import (
 from _torch.modules.moe.kimi_k3_ref_moe.kimi_k3_moe_block import KimiK3SparseMoeBlock
 from utils.util import check_accuracy
 
+import tensorrt_llm._torch.models.modeling_kimi_linear as modeling_kimi_linear
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
     _K3_MOE_EP_ENV,
@@ -534,6 +536,32 @@ def test_kimi_k3_routed_config_scopes_megamoe_capacity(backend, expected_moe_max
 
     assert routed_model_config.moe_max_num_tokens == expected_moe_max_num_tokens
     assert model_config.moe_max_num_tokens == 33024
+
+
+def test_kimi_k3_routed_config_logs_megamoe_capacity_override(monkeypatch):
+    info_once = MagicMock()
+    monkeypatch.setattr(modeling_kimi_linear.logger, "info_once", info_once)
+    model_config = ModelConfig(
+        mapping=Mapping(
+            world_size=16,
+            rank=0,
+            tp_size=16,
+            moe_ep_size=16,
+            enable_attention_dp=True,
+        ),
+        max_num_tokens=8192,
+        moe_max_num_tokens=33024,
+        moe_backend="MEGAMOE_DEEPGEMM",
+    )
+
+    KimiK3MoERuntime._routed_moe_model_config(model_config)
+
+    info_once.assert_any_call(
+        "Kimi K3 MegaMoE raises moe_max_num_tokens from 33024 to 131072 "
+        "because the global DP SymmBuffer requires capacity for "
+        "max_num_tokens * dp_size.",
+        key="kimi_k3_megamoe_capacity_override_33024_131072",
+    )
 
 
 def test_kimi_k3_routed_config_rejects_backend_without_situ_support():

@@ -889,8 +889,20 @@ class KimiK3MoERuntime(nn.Module):
         # Preserve an explicitly larger capacity.
         if routed_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
             default_moe_max_num_tokens = routed_model_config.max_num_tokens * routed_mapping.dp_size
+            configured_moe_max_num_tokens = int(routed_model_config.moe_max_num_tokens or 0)
+            if configured_moe_max_num_tokens < default_moe_max_num_tokens:
+                logger.info_once(
+                    "Kimi K3 MegaMoE raises moe_max_num_tokens from "
+                    f"{configured_moe_max_num_tokens} to {default_moe_max_num_tokens} "
+                    "because the global DP SymmBuffer requires capacity for "
+                    "max_num_tokens * dp_size.",
+                    key=(
+                        "kimi_k3_megamoe_capacity_override_"
+                        f"{configured_moe_max_num_tokens}_{default_moe_max_num_tokens}"
+                    ),
+                )
             routed_model_config.moe_max_num_tokens = max(
-                int(routed_model_config.moe_max_num_tokens or 0),
+                configured_moe_max_num_tokens,
                 default_moe_max_num_tokens,
             )
         routed_model_config._frozen = True

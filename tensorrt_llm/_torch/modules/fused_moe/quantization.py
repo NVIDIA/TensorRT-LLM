@@ -6462,6 +6462,16 @@ def _import_deep_gemm():
             f"upgrade the TRT-LLM bundled DeepGEMM to a release that "
             f"includes fp8_fp4_mega_moe.")
 
+    mega_moe_params = inspect.signature(_dg.fp8_fp4_mega_moe).parameters
+    missing_situ_params = [
+        name for name in ("situ_beta", "situ_linear_beta")
+        if name not in mega_moe_params
+    ]
+    if missing_situ_params:
+        raise _MegaMoEUnavailable(
+            "tensorrt_llm.deep_gemm.fp8_fp4_mega_moe does not accept "
+            f"{missing_situ_params}; upgrade the bundled DeepGEMM.")
+
     p_fp8 = getattr(_dg, "per_token_cast_to_fp8", None)
     if p_fp8 is None or "use_packed_ue8m0" not in inspect.signature(
             p_fp8).parameters:
@@ -6551,6 +6561,11 @@ class W4A8MXFP4MXFP8MegaMoEDeepGemmMethod(FusedMoEMethodBase):
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()
+
+    def pre_reload_weights(self, module: torch.nn.Module):
+        super().pre_reload_weights(module)
+        with _PACKED_MXFP4_SLOT_CLAIM_LOCK:
+            module._packed_mxfp4_loaded_slots.clear()
 
     def _iter_vanilla_expert_weights(self, weights: Dict, expert_id: int):
         return (
