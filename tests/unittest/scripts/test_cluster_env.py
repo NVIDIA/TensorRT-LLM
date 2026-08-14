@@ -82,6 +82,10 @@ def test_gpu_type_from_supported_gpus(
             "mlx5_4:1,mlx5_5:1,mlx5_10:1,mlx5_11:1",
         ),
         (
+            "oci-hsg-cs-001",
+            "export UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_3:1,mlx5_4:1,eth0",
+        ),
+        (
             "oci-aga-cs-001",
             "export UCX_TLS=cuda_ipc,cuda_copy,sm,self,tcp UCX_TCP_AF_PRIO=inet",
         ),
