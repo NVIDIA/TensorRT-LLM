@@ -20,14 +20,15 @@ import pytest
 import torch
 
 import tensorrt_llm._mnnvl_utils as mnnvl
-from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll, _A2AState
+from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
 
 
 class _FakeComm:
-    def __init__(self, rank=0, size=2):
+    def __init__(self, rank=0, size=2, membership=(0, 1)):
         self.rank = rank
         self.size = size
+        self.membership = membership
         self.barrier_count = 0
 
     def Get_rank(self):
@@ -38,6 +39,9 @@ class _FakeComm:
 
     def barrier(self):
         self.barrier_count += 1
+
+    def allgather(self, value):
+        return list(self.membership)
 
 
 class _TestMnnvlMemory(mnnvl.MnnvlMemory):
@@ -51,6 +55,7 @@ def memory(monkeypatch):
         comm=comm,
         comm_size=2,
         comm_rank=0,
+        comm_membership=(0, 1),
         aligned_size=64,
         mem_handles=[11, 22],
         start_address=1000,
@@ -59,6 +64,7 @@ def memory(monkeypatch):
     )
     obj = _TestMnnvlMemory.__new__(_TestMnnvlMemory)
     obj.ptr = 1032
+    obj.mapping = SimpleNamespace(rank=0)
     _TestMnnvlMemory.allocated_map = {obj.ptr: record}
     _TestMnnvlMemory.address_refcnt = {record.start_address: 1}
     _TestMnnvlMemory.current_start_address = record.start_address
@@ -100,14 +106,104 @@ def test_checkpoint_restore_reuses_layout_with_fresh_handles(memory, monkeypatch
     create_and_map = Mock(return_value=[33, 44])
     monkeypatch.setattr(_TestMnnvlMemory, "_create_and_map_handles", create_and_map)
 
-    obj.checkpoint_restore(restored_comm)
+    assert obj.checkpoint_restore(restored_comm)
 
     create_and_map.assert_called_once_with(restored_comm, 64, 1000, 256, 32)
     assert obj.ptr == 1032
-    assert obj.mapped
+    assert not obj.mapped
+    assert record.state is mnnvl._MnnvlAllocationState.RESTORING
     assert record.mem_handles == [33, 44]
+    assert record.comm is not restored_comm
+    assert record.pending_comm is restored_comm
+    obj._checkpoint_restore_complete()
+    assert obj.mapped
     assert record.comm is restored_comm
     assert _TestMnnvlMemory.comm is restored_comm
+
+
+def test_checkpoint_restore_rejects_changed_ordered_membership(memory):
+    obj, record = memory
+    obj.checkpoint_prepare()
+
+    with pytest.raises(RuntimeError, match="ordered membership differs"):
+        obj.checkpoint_restore(_FakeComm(membership=(1, 0)))
+
+    assert record.state is mnnvl._MnnvlAllocationState.UNMAPPED
+    assert record.pending_comm is None
+
+
+def test_checkpoint_prepare_failure_is_terminal_and_fails_closed(memory):
+    obj, record = memory
+    mnnvl.cuda.cuMemUnmap.side_effect = [None, RuntimeError("unmap failed")]
+
+    with pytest.raises(RuntimeError, match="unmap failed"):
+        obj.checkpoint_prepare()
+
+    assert not obj.mapped
+    assert record.state is mnnvl._MnnvlAllocationState.BROKEN
+    with pytest.raises(RuntimeError, match="broken state"):
+        obj.checkpoint_prepare()
+
+
+def test_checkpoint_restore_failure_is_terminal_and_fails_closed(memory, monkeypatch):
+    obj, record = memory
+    obj.checkpoint_prepare()
+    monkeypatch.setattr(
+        _TestMnnvlMemory,
+        "_create_and_map_handles",
+        Mock(side_effect=RuntimeError("restore failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        obj.checkpoint_restore(_FakeComm())
+
+    assert not obj.mapped
+    assert record.state is mnnvl._MnnvlAllocationState.BROKEN
+    with pytest.raises(RuntimeError, match="broken state"):
+        obj.checkpoint_restore(_FakeComm())
+
+
+def test_failed_frontend_restore_releases_unpublished_handles(memory, monkeypatch):
+    obj, record = memory
+    obj.checkpoint_prepare()
+    monkeypatch.setattr(
+        _TestMnnvlMemory,
+        "_create_and_map_handles",
+        Mock(return_value=[33, 44]),
+    )
+
+    assert obj.checkpoint_restore(_FakeComm())
+    obj._checkpoint_restore_failed()
+
+    assert record.state is mnnvl._MnnvlAllocationState.BROKEN
+    assert record.mem_handles == [None, None]
+    assert record.pending_comm is None
+    assert [call.args[0] for call in mnnvl.cuda.cuMemUnmap.call_args_list[-2:]] == [1032, 1288]
+    assert [call.args[0] for call in mnnvl.cuda.cuMemRelease.call_args_list[-2:]] == [33, 44]
+
+
+def test_failed_frontend_restore_cleanup_continues_after_cuda_errors(memory, monkeypatch):
+    obj, record = memory
+    obj.checkpoint_prepare()
+    monkeypatch.setattr(
+        _TestMnnvlMemory,
+        "_create_and_map_handles",
+        Mock(return_value=[33, 44]),
+    )
+
+    assert obj.checkpoint_restore(_FakeComm())
+    mnnvl.cuda.cuMemUnmap.reset_mock()
+    mnnvl.cuda.cuMemRelease.reset_mock()
+    mnnvl.cuda.cuMemUnmap.side_effect = [RuntimeError("unmap failed"), None]
+    mnnvl.cuda.cuMemRelease.side_effect = [RuntimeError("release failed"), None]
+
+    obj._checkpoint_restore_failed()
+
+    assert record.state is mnnvl._MnnvlAllocationState.BROKEN
+    assert record.mem_handles == [33, None]
+    assert record.pending_comm is None
+    assert [call.args[0] for call in mnnvl.cuda.cuMemUnmap.call_args_list] == [1032, 1288]
+    assert [call.args[0] for call in mnnvl.cuda.cuMemRelease.call_args_list] == [33, 44]
 
 
 def test_checkpoint_restore_rejects_changed_rank_layout(memory):
@@ -118,6 +214,54 @@ def test_checkpoint_restore_rejects_changed_rank_layout(memory):
         obj.checkpoint_restore(_FakeComm(rank=1))
 
     assert not obj.mapped
+
+
+def test_mnnvl_moe_restore_publishes_all_workspaces_after_frontend_ready(monkeypatch):
+    first = Mock()
+    first.checkpoint_restore.return_value = True
+    second = Mock()
+    second.checkpoint_restore.return_value = True
+    workspace_tensor = Mock()
+    mapping = SimpleNamespace(moe_ep_rank=0, moe_ep_size=2)
+    initialize_workspace = Mock()
+    synchronize = Mock()
+    comm = _FakeComm()
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", first)
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_prepare_workspace", second)
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace_tensor", workspace_tensor)
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_mapping", mapping)
+    monkeypatch.setattr(
+        mnnvl.torch.ops.trtllm,
+        "moe_initialize_workspace",
+        initialize_workspace,
+    )
+    monkeypatch.setattr(mnnvl.torch.cuda, "synchronize", synchronize)
+
+    mnnvl.MnnvlMoe.checkpoint_restore(comm)
+
+    first.checkpoint_restore.assert_called_once_with(comm)
+    second.checkpoint_restore.assert_called_once_with(comm)
+    initialize_workspace.assert_called_once_with(workspace_tensor, 0, 2)
+    synchronize.assert_called_once_with()
+    assert comm.barrier_count == 1
+    first._checkpoint_restore_complete.assert_called_once_with()
+    second._checkpoint_restore_complete.assert_called_once_with()
+
+
+def test_mnnvl_moe_restore_failure_marks_earlier_workspace_broken(monkeypatch):
+    first = Mock()
+    first.checkpoint_restore.return_value = True
+    second = Mock()
+    second.checkpoint_restore.side_effect = RuntimeError("second restore failed")
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", first)
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_prepare_workspace", second)
+
+    with pytest.raises(RuntimeError, match="second restore failed"):
+        mnnvl.MnnvlMoe.checkpoint_restore(_FakeComm())
+
+    first._checkpoint_restore_failed.assert_called_once_with()
+    first._checkpoint_restore_complete.assert_not_called()
+    second._checkpoint_restore_complete.assert_not_called()
 
 
 def test_close_detached_memory_only_frees_va(memory, monkeypatch):
@@ -290,30 +434,8 @@ def test_create_and_map_handles_close_failure_does_not_mask_original_error(monke
 def _make_moe_alltoall_for_lifecycle():
     obj = MoeAlltoAll.__new__(MoeAlltoAll)
     obj._destroyed = True
-    obj._state = _A2AState()
-    obj._alltoall_watchdog = None
     obj.mnnvl_mem = Mock(mapped=True)
     return obj
-
-
-def test_moe_alltoall_checkpoint_prepare_delegates_with_shared_owners():
-    first = _make_moe_alltoall_for_lifecycle()
-    second = _make_moe_alltoall_for_lifecycle()
-    shared_memory = Mock(mapped=True)
-    first.mnnvl_mem = shared_memory
-    second.mnnvl_mem = shared_memory
-
-    first.checkpoint_prepare()
-    second.checkpoint_prepare()
-
-    assert shared_memory.checkpoint_prepare.call_count == 2
-
-
-def test_moe_alltoall_checkpoint_prepare_rejects_active_phase():
-    obj = _make_moe_alltoall_for_lifecycle()
-    obj._state.phase = "dispatched"
-    with pytest.raises(RuntimeError, match="active MoE All-to-All phase"):
-        obj.checkpoint_prepare()
 
 
 def test_moe_alltoall_rejects_unmapped_workspace():

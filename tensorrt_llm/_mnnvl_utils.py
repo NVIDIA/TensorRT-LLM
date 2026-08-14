@@ -19,6 +19,7 @@ import os
 import platform
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, List, Optional, Union
 
 import pynvml
@@ -52,17 +53,27 @@ def _check_cu_result(cu_func_ret):
         return None
 
 
+class _MnnvlAllocationState(Enum):
+    MAPPED = "mapped"
+    PREPARING = "preparing"
+    UNMAPPED = "unmapped"
+    RESTORING = "restoring"
+    BROKEN = "broken"
+
+
 @dataclass
 class _MnnvlAllocationRecord:
     comm: Any
     comm_size: int
     comm_rank: int
+    comm_membership: tuple[int, ...]
     aligned_size: int
     mem_handles: List[Any]
     start_address: int
     rank_stride: int
     address_offset: int
-    mapped: bool = True
+    state: _MnnvlAllocationState = _MnnvlAllocationState.MAPPED
+    pending_comm: Any = None
 
 
 class MnnvlMemory:
@@ -114,8 +125,8 @@ class MnnvlMemory:
 
     @property
     def mapped(self) -> bool:
-        """Whether physical handles are mapped into this VA reservation."""
-        return type(self).allocated_map[self.ptr].mapped
+        """Whether the allocation is mapped and ready for data-path access."""
+        return type(self).allocated_map[self.ptr].state is _MnnvlAllocationState.MAPPED
 
     def as_torch_strided_tensor(self, dtype):
         num_segments = type(self).comm.Get_size()
@@ -335,6 +346,12 @@ class MnnvlMemory:
         comm = cls.get_comm(mapping)
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
+        comm_membership = tuple(int(rank) for rank in comm.allgather(mapping.rank))
+        if len(comm_membership) != comm_size:
+            raise RuntimeError(
+                "MNNVL communicator membership size does not match its rank count: "
+                f"{len(comm_membership)} != {comm_size}"
+            )
         all_rank_allocate_sizes = comm.allgather(size)
         assert len(all_rank_allocate_sizes) == comm_size
         assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
@@ -382,6 +399,7 @@ class MnnvlMemory:
             comm=comm,
             comm_size=comm_size,
             comm_rank=comm_rank,
+            comm_membership=comm_membership,
             aligned_size=aligned_size,
             mem_handles=mem_handles,
             start_address=cls.current_start_address,
@@ -397,8 +415,18 @@ class MnnvlMemory:
 
     @classmethod
     def close_mnnvl_memory(cls, ptr: int):
-        record = cls.allocated_map.pop(ptr)
-        if record.mapped:
+        record = cls.allocated_map[ptr]
+        if record.state not in (
+            _MnnvlAllocationState.MAPPED,
+            _MnnvlAllocationState.UNMAPPED,
+        ):
+            logger.warning(
+                "Skipping cleanup of MNNVL allocation in terminal state %s",
+                record.state.value,
+            )
+            return
+        cls.allocated_map.pop(ptr)
+        if record.state is _MnnvlAllocationState.MAPPED:
             cls._unmap_and_release_handles(record)
         cls.address_refcnt[record.start_address] -= 1
 
@@ -424,21 +452,30 @@ class MnnvlMemory:
         """Collectively detach backing handles while retaining graph-visible VA."""
         cls = type(self)
         record = cls.allocated_map[self.ptr]
-        if not record.mapped:
+        if record.state is _MnnvlAllocationState.UNMAPPED:
             return
-        torch.cuda.synchronize()
-        record.comm.barrier()
-        cls._unmap_and_release_handles(record)
-        record.mem_handles = [None] * record.comm_size
-        record.mapped = False
-        record.comm.barrier()
+        if record.state is not _MnnvlAllocationState.MAPPED:
+            raise RuntimeError(f"Cannot prepare MNNVL allocation in {record.state.value} state")
+        record.state = _MnnvlAllocationState.PREPARING
+        try:
+            torch.cuda.synchronize()
+            record.comm.barrier()
+            cls._unmap_and_release_handles(record)
+            record.mem_handles = [None] * record.comm_size
+            record.comm.barrier()
+        except Exception:
+            record.state = _MnnvlAllocationState.BROKEN
+            raise
+        record.state = _MnnvlAllocationState.UNMAPPED
 
-    def checkpoint_restore(self, comm) -> None:
-        """Collectively remap fresh handles at the original virtual addresses."""
+    def checkpoint_restore(self, comm) -> bool:
+        """Remap fresh handles while keeping data-path access disabled."""
         cls = type(self)
         record = cls.allocated_map[self.ptr]
-        if record.mapped:
-            return
+        if record.state is _MnnvlAllocationState.MAPPED:
+            return False
+        if record.state is not _MnnvlAllocationState.UNMAPPED:
+            raise RuntimeError(f"Cannot restore MNNVL allocation in {record.state.value} state")
         comm_size = comm.Get_size()
         comm_rank = comm.Get_rank()
         if comm_size != record.comm_size or comm_rank != record.comm_rank:
@@ -448,20 +485,69 @@ class MnnvlMemory:
                 f"rank/size {comm_rank}/{comm_size} != "
                 f"{record.comm_rank}/{record.comm_size}"
             )
-        torch.cuda.synchronize()
-        record.mem_handles = cls._create_and_map_handles(
-            comm,
-            record.aligned_size,
-            record.start_address,
-            record.rank_stride,
-            record.address_offset,
-        )
-        record.comm = comm
-        # A restored process must use the replacement communicator for future
-        # allocations. Existing detached records retain their own communicator
-        # until each record is restored with the same ordered group.
-        cls.comm = comm
-        record.mapped = True
+        comm_membership = tuple(int(rank) for rank in comm.allgather(self.mapping.rank))
+        if comm_membership != record.comm_membership:
+            raise RuntimeError(
+                "Cannot restore MNNVL memory with a communicator whose ordered "
+                "membership differs from the graph-visible allocation layout: "
+                f"{comm_membership} != {record.comm_membership}"
+            )
+        record.state = _MnnvlAllocationState.RESTORING
+        try:
+            torch.cuda.synchronize()
+            record.mem_handles = cls._create_and_map_handles(
+                comm,
+                record.aligned_size,
+                record.start_address,
+                record.rank_stride,
+                record.address_offset,
+            )
+        except Exception:
+            record.state = _MnnvlAllocationState.BROKEN
+            raise
+        record.pending_comm = comm
+        return True
+
+    def _checkpoint_restore_complete(self) -> None:
+        """Publish a restored allocation after frontend protocol readiness."""
+        record = type(self).allocated_map[self.ptr]
+        if record.state is not _MnnvlAllocationState.RESTORING:
+            raise RuntimeError(f"Cannot complete MNNVL restore in {record.state.value} state")
+        if record.pending_comm is None:
+            raise RuntimeError("Cannot complete MNNVL restore without a replacement communicator")
+        record.comm = record.pending_comm
+        type(self).comm = record.pending_comm
+        record.pending_comm = None
+        record.state = _MnnvlAllocationState.MAPPED
+
+    def _checkpoint_restore_failed(self) -> None:
+        """Make a failed frontend restore terminal and fail closed."""
+        record = type(self).allocated_map[self.ptr]
+        if record.state is _MnnvlAllocationState.RESTORING:
+            for rank, handle in enumerate(record.mem_handles):
+                rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
+                try:
+                    _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
+                except RuntimeError as error:
+                    logger.warning(
+                        "Failed to unmap unpublished MNNVL restore for rank %d: %s",
+                        rank,
+                        error,
+                    )
+                if handle is None:
+                    continue
+                try:
+                    _check_cu_result(cuda.cuMemRelease(handle))
+                except RuntimeError as error:
+                    logger.warning(
+                        "Failed to release unpublished MNNVL restore handle for rank %d: %s",
+                        rank,
+                        error,
+                    )
+                else:
+                    record.mem_handles[rank] = None
+            record.state = _MnnvlAllocationState.BROKEN
+            record.pending_comm = None
 
     @staticmethod
     @functools.cache
@@ -663,18 +749,28 @@ class MnnvlMoe:
     def checkpoint_restore(comm) -> None:
         """Restore TRT-native two-sided MoE workspaces at their original virtual addresses."""
         workspaces = (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
-        for workspace in workspaces:
-            if workspace is not None:
-                workspace.checkpoint_restore(comm)
-        if MnnvlMoe.moe_workspace_tensor is not None:
-            assert MnnvlMoe.moe_mapping is not None
-            torch.ops.trtllm.moe_initialize_workspace(
-                MnnvlMoe.moe_workspace_tensor,
-                MnnvlMoe.moe_mapping.moe_ep_rank,
-                MnnvlMoe.moe_mapping.moe_ep_size,
-            )
-        torch.cuda.synchronize()
-        comm.barrier()
+        restored_workspaces = []
+        try:
+            for workspace in workspaces:
+                if workspace is not None and workspace.checkpoint_restore(comm):
+                    restored_workspaces.append(workspace)
+            if not restored_workspaces:
+                return
+            if MnnvlMoe.moe_workspace_tensor is not None:
+                assert MnnvlMoe.moe_mapping is not None
+                torch.ops.trtllm.moe_initialize_workspace(
+                    MnnvlMoe.moe_workspace_tensor,
+                    MnnvlMoe.moe_mapping.moe_ep_rank,
+                    MnnvlMoe.moe_mapping.moe_ep_size,
+                )
+            torch.cuda.synchronize()
+            comm.barrier()
+        except Exception:
+            for workspace in restored_workspaces:
+                workspace._checkpoint_restore_failed()
+            raise
+        for workspace in restored_workspaces:
+            workspace._checkpoint_restore_complete()
 
     @staticmethod
     def require_mapped() -> None:
