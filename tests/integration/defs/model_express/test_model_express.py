@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 import pytest
 import torch
 from defs.trt_test_alternative import cleanup_process_tree, popen
+from packaging.version import InvalidVersion, Version
 
 from tensorrt_llm._torch.weight_sharing import ArtifactIdentity
 
@@ -60,6 +61,8 @@ _DONOR_PROCESS_FAILURE_MARKERS = (
     b"process returned a non-zero exit code",
 )
 _DONOR_PROCESS_FAILURE_OVERLAP = max(len(marker) for marker in _DONOR_PROCESS_FAILURE_MARKERS) - 1
+_MINIMUM_MODELEXPRESS_VERSION = Version("0.4.1")
+_MODELEXPRESS_VERSION_PREFIX = "MODELEXPRESS_VERSION="
 _MX_PREFLIGHT_SCRIPT = """
 import importlib.metadata as metadata
 import importlib.util
@@ -168,22 +171,37 @@ def _require_mx_environment(required_gpus: int) -> tuple[str, tuple[str, ...]]:
                 _skip_or_fail(f"ModelExpress service {mx_url!r} is unreachable: {error}")
             time.sleep(1)
 
-    preflight = subprocess.run(
-        [sys.executable, "-c", _MX_PREFLIGHT_SCRIPT],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    try:
+        preflight = subprocess.run(
+            [sys.executable, "-c", _MX_PREFLIGHT_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        _skip_or_fail(f"ModelExpress/NIXL preflight timed out after {error.timeout} seconds")
     if preflight.returncode != 0:
         detail = (preflight.stdout + preflight.stderr).strip()
         _skip_or_fail(f"ModelExpress/NIXL preflight failed: {detail}")
     version_lines = [
-        line for line in preflight.stdout.splitlines() if line.startswith("MODELEXPRESS_VERSION=")
+        line
+        for line in preflight.stdout.splitlines()
+        if line.startswith(_MODELEXPRESS_VERSION_PREFIX)
     ]
     if len(version_lines) != 1:
         _skip_or_fail(f"ModelExpress preflight did not report its version: {preflight.stdout!r}")
-    print(f"MX E2E client preflight passed: {version_lines[0]}")
+    modelexpress_version = version_lines[0].removeprefix(_MODELEXPRESS_VERSION_PREFIX)
+    try:
+        parsed_modelexpress_version = Version(modelexpress_version)
+    except InvalidVersion:
+        _skip_or_fail(f"ModelExpress client reported invalid version {modelexpress_version!r}")
+    if parsed_modelexpress_version < _MINIMUM_MODELEXPRESS_VERSION:
+        _skip_or_fail(
+            f"Unsupported ModelExpress client version {modelexpress_version!r}; "
+            f"requires >= {_MINIMUM_MODELEXPRESS_VERSION}"
+        )
+    print(f"MX E2E client preflight passed: ModelExpress {modelexpress_version}")
 
     configured_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if configured_devices and configured_devices.strip().lower() != "all":
