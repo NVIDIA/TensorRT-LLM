@@ -70,6 +70,25 @@ class _RuntimeLoRAAdapter:
         return self.output_start + self.b.shape[0]
 
 
+@dataclass(frozen=True)
+class _PreparedRuntimeLoRADelta:
+    adapter: _RuntimeLoRAAdapter
+    delta: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _PreparedRuntimeLoRATarget:
+    module_name: str
+    base_layer: nn.Module
+    deltas: Tuple[_PreparedRuntimeLoRADelta, ...]
+
+
+@dataclass(frozen=True)
+class _RuntimeLoRAPlan:
+    application: RuntimeLoRAApplication
+    targets: Tuple[_PreparedRuntimeLoRATarget, ...]
+
+
 def apply_runtime_lora(
     transformer: nn.Module,
     config: RuntimeLoRAConfig,
@@ -78,6 +97,26 @@ def apply_runtime_lora(
     raise_on_no_matches: bool = True,
 ) -> RuntimeLoRAApplication:
     """Fuse startup LoRA deltas into matching transformer module weights."""
+
+    plan = _prepare_runtime_lora(
+        transformer,
+        config,
+        default_strip_prefixes=default_strip_prefixes,
+        raise_on_no_matches=raise_on_no_matches,
+    )
+    application = _commit_runtime_lora_plan(plan)
+    _log_runtime_lora_application(application)
+    return application
+
+
+def _prepare_runtime_lora(
+    transformer: nn.Module,
+    config: RuntimeLoRAConfig,
+    *,
+    default_strip_prefixes: Iterable[str] = (),
+    raise_on_no_matches: bool = True,
+) -> _RuntimeLoRAPlan:
+    """Validate and stage startup LoRA deltas without mutating transformer weights."""
 
     if not isinstance(transformer, nn.Module):
         raise ValueError(
@@ -159,7 +198,7 @@ def apply_runtime_lora(
             "disable fuse_qkv, or set strict=False."
         )
 
-    applied_modules: List[str] = []
+    prepared_targets: List[_PreparedRuntimeLoRATarget] = []
     for module_name, adapters in targets.items():
         base_module = modules[module_name]
         if getattr(base_module, "_trtllm_runtime_lora_fused", False):
@@ -174,37 +213,51 @@ def apply_runtime_lora(
             continue
 
         try:
-            _fuse_lora_into_linear(base_module, adapters, module_name)
+            prepared_targets.append(
+                _prepare_lora_target_for_fusion(base_module, adapters, module_name)
+            )
         except ValueError:
             if config.strict:
                 raise
             skipped_non_targets += len(adapters)
             continue
-        applied_modules.append(module_name)
 
+    applied_modules = tuple(target.module_name for target in prepared_targets)
     if not applied_modules and raise_on_no_matches and config.strict:
         raise ValueError(
             f"No Runtime LoRA modules from {config.path!r} matched the transformer. "
             "Check target_components, strip_prefixes, and key_map."
         )
 
-    logger.info(
-        f"Runtime LoRA fused from {config.path}: applied={len(applied_modules)}, "
-        f"skipped_non_targets={skipped_non_targets}, skipped_incomplete={skipped_incomplete}"
-    )
-    return RuntimeLoRAApplication(
+    application = RuntimeLoRAApplication(
         path=config.path,
-        applied_modules=tuple(applied_modules),
+        applied_modules=applied_modules,
         skipped_non_targets=skipped_non_targets,
         skipped_incomplete=skipped_incomplete,
     )
+    return _RuntimeLoRAPlan(application, tuple(prepared_targets))
 
 
-def _fuse_lora_into_linear(
+def _commit_runtime_lora_plan(plan: _RuntimeLoRAPlan) -> RuntimeLoRAApplication:
+    for target in plan.targets:
+        _fuse_lora_into_linear(target.base_layer, target.deltas, target.module_name)
+    return plan.application
+
+
+def _log_runtime_lora_application(application: RuntimeLoRAApplication) -> None:
+    logger.info(
+        f"Runtime LoRA fused from {application.path}: "
+        f"applied={len(application.applied_modules)}, "
+        f"skipped_non_targets={application.skipped_non_targets}, "
+        f"skipped_incomplete={application.skipped_incomplete}"
+    )
+
+
+def _prepare_lora_target_for_fusion(
     base_layer: nn.Module,
     adapters: Iterable[_RuntimeLoRAAdapter],
     module_name: str,
-) -> None:
+) -> _PreparedRuntimeLoRATarget:
     weight = getattr(base_layer, "weight", None)
     if not isinstance(weight, torch.Tensor) or weight.is_meta:
         raise ValueError(f"Runtime LoRA target '{module_name}' has no loaded weight tensor")
@@ -216,17 +269,41 @@ def _fuse_lora_into_linear(
     in_features = int(getattr(base_layer, "in_features", 0))
     out_features = int(getattr(base_layer, "out_features", 0))
     device = weight.device
-    prepared_adapters: List[_RuntimeLoRAAdapter] = []
+    prepared_deltas: List[_PreparedRuntimeLoRADelta] = []
     with torch.no_grad():
         for adapter in adapters:
             local_adapter = _shard_adapter(base_layer, adapter, module_name, device)
             _validate_adapter_for_fusion(local_adapter, module_name, in_features, out_features)
             _validate_lora_delta_shape_for_adapter(weight, local_adapter, module_name)
-            prepared_adapters.append(local_adapter)
-        for local_adapter in prepared_adapters:
             delta = _compute_lora_weight_delta(local_adapter, device, weight.dtype)
             delta = _prepare_lora_delta_for_weight(weight, delta, local_adapter, module_name)
-            _add_lora_delta_to_weight(weight, delta, local_adapter, module_name)
+            target = _lora_weight_target(weight, local_adapter, module_name)
+            _validate_lora_delta_shape(
+                tuple(delta.shape),
+                tuple(target.shape),
+                local_adapter,
+                module_name,
+            )
+            prepared_deltas.append(_PreparedRuntimeLoRADelta(local_adapter, delta))
+    return _PreparedRuntimeLoRATarget(module_name, base_layer, tuple(prepared_deltas))
+
+
+def _fuse_lora_into_linear(
+    base_layer: nn.Module,
+    prepared_deltas: Iterable[_PreparedRuntimeLoRADelta],
+    module_name: str,
+) -> None:
+    weight = getattr(base_layer, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.is_meta:
+        raise ValueError(f"Runtime LoRA target '{module_name}' has no loaded weight tensor")
+    with torch.no_grad():
+        for prepared_delta in prepared_deltas:
+            _add_lora_delta_to_weight(
+                weight,
+                prepared_delta.delta,
+                prepared_delta.adapter,
+                module_name,
+            )
     setattr(base_layer, "_trtllm_runtime_lora_fused", True)
 
 

@@ -415,7 +415,11 @@ class BasePipeline(nn.Module):
         if runtime_lora is None or self._runtime_lora_applications:
             return
 
-        from .runtime_lora import apply_runtime_lora
+        from .runtime_lora import (
+            _commit_runtime_lora_plan,
+            _log_runtime_lora_application,
+            _prepare_runtime_lora,
+        )
 
         transformer_component_names = list(self.transformer_components)
         transformer_components = set(transformer_component_names)
@@ -428,7 +432,8 @@ class BasePipeline(nn.Module):
             )
         component_names = runtime_lora.target_components or transformer_component_names
         total_applied = 0
-        applications = []
+        plans = []
+        require_each_component_match = runtime_lora.strict and bool(runtime_lora.target_components)
         for component_name in component_names:
             if component_name not in transformer_components:
                 if runtime_lora.strict:
@@ -458,24 +463,37 @@ class BasePipeline(nn.Module):
                 continue
 
             component_prefixes = [f"{component_name}.", f"model.{component_name}."]
-            application = apply_runtime_lora(
+            plan = _prepare_runtime_lora(
                 component,
                 runtime_lora,
                 default_strip_prefixes=component_prefixes,
                 raise_on_no_matches=False,
             )
-            applications.append(application)
-            total_applied += len(application.applied_modules)
-            if application.applied_modules:
-                logger.info(
-                    f"Runtime LoRA fused into {component_name}: {list(application.applied_modules)}"
+            application = plan.application
+            if require_each_component_match and not application.applied_modules:
+                raise ValueError(
+                    f"No Runtime LoRA modules from {runtime_lora.path!r} matched "
+                    f"selected component '{component_name}'."
                 )
+            plans.append((component_name, plan))
+            total_applied += len(application.applied_modules)
 
         if total_applied == 0 and runtime_lora.strict:
             raise ValueError(
                 f"No Runtime LoRA modules from {runtime_lora.path!r} matched "
                 f"components {component_names}."
             )
+
+        applications = []
+        for component_name, plan in plans:
+            application = _commit_runtime_lora_plan(plan)
+            applications.append(application)
+            _log_runtime_lora_application(application)
+            if application.applied_modules:
+                logger.info(
+                    f"Runtime LoRA fused into {component_name}: {list(application.applied_modules)}"
+                )
+
         self._runtime_lora_applications = applications
 
     def _apply_teacache_coefficients(self, coefficients: Optional[Dict] = None) -> None:

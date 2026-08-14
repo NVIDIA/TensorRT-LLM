@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,13 +15,13 @@ from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig
 
 
 class TinyTransformer(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.proj = nn.Linear(2, 3, bias=False)
 
 
 class TinyWanFFNTransformer(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.block = nn.Module()
         self.block.ffn = nn.Module()
@@ -29,7 +30,7 @@ class TinyWanFFNTransformer(nn.Module):
 
 
 class TinyQwenMLPTransformer(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.block = nn.Module()
         self.block.img_mlp = nn.Module()
@@ -40,45 +41,52 @@ class TinyQwenMLPTransformer(nn.Module):
         self.block.txt_mlp.down_proj = nn.Linear(2, 3, bias=False)
 
 
+class TinyTwoLinearTransformer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first = nn.Linear(2, 3, bias=False)
+        self.second = nn.Linear(2, 3, bias=False)
+
+
 class TinyAttention(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.attn = nn.Module()
         self.attn.qkv_proj = nn.Linear(2, 9, bias=False)
 
 
 class TinyTritonLikeLinear(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.in_features = 2
         self.out_features = 3
         self.weight = nn.Parameter(torch.zeros(1, 2, 3), requires_grad=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.weight.squeeze(0)
 
 
 class TinyTritonTransformer(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.proj = TinyTritonLikeLinear()
 
 
 class TinyUnsupportedTPLinear(nn.Linear):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(2, 3, bias=False)
         self.tp_size = 2
         self.tp_mode = "row"
 
 
 class TinyTPTransformer(nn.Module):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.proj = TinyUnsupportedTPLinear()
 
 
 class TinyPipeline(BasePipeline):
-    def __init__(self, runtime_lora_config):
+    def __init__(self, runtime_lora_config: RuntimeLoRAConfig) -> None:
         nn.Module.__init__(self)
         self._runtime_lora_applications = []
         self.pipeline_config = MagicMock()
@@ -87,32 +95,33 @@ class TinyPipeline(BasePipeline):
         self._profiler = object()
 
     @property
-    def transformer_components(self):
+    def transformer_components(self) -> list[str]:
         return ["transformer", "_profiler"]
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: object, **kwargs: object) -> None:
         pass
 
-    def _init_transformer(self):
+    def _init_transformer(self) -> None:
         pass
 
-    def infer(self, req):
+    def infer(self, req: object) -> None:
         pass
 
 
 class TinyPipelineWithTransformerOnly(TinyPipeline):
     @property
-    def transformer_components(self):
+    def transformer_components(self) -> list[str]:
         return ["transformer"]
 
 
 class TinyPipelineWithTwoTransformers(TinyPipeline):
-    def __init__(self, runtime_lora_config):
+    def __init__(self, runtime_lora_config: RuntimeLoRAConfig) -> None:
         super().__init__(runtime_lora_config)
-        self.transformer_2 = nn.Linear(2, 3, bias=False)
+        self.transformer = TinyTransformer()
+        self.transformer_2 = TinyTransformer()
 
     @property
-    def transformer_components(self):
+    def transformer_components(self) -> list[str]:
         return ["transformer", "transformer_2"]
 
 
@@ -165,7 +174,7 @@ def test_runtime_lora_applies_scale_and_alpha(tmp_path):
     torch.testing.assert_close(model.proj(x), expected)
 
 
-def test_runtime_lora_uses_peft_adapter_config_alpha(tmp_path):
+def test_runtime_lora_uses_peft_adapter_config_alpha(tmp_path: Path) -> None:
     model = TinyTransformer()
     with torch.no_grad():
         model.proj.weight.zero_()
@@ -243,7 +252,7 @@ def test_runtime_lora_maps_wan_ffn_names(tmp_path):
     )
 
 
-def test_runtime_lora_maps_qwen_mlp_names(tmp_path):
+def test_runtime_lora_maps_qwen_mlp_names(tmp_path: Path) -> None:
     model = TinyQwenMLPTransformer()
     with torch.no_grad():
         model.block.img_mlp.up_proj.weight.zero_()
@@ -484,7 +493,9 @@ def test_runtime_lora_can_probe_component_without_matches(tmp_path):
     assert report.skipped_non_targets == 1
 
 
-def test_runtime_lora_rejects_partial_unmatched_targets_before_mutating(tmp_path):
+def test_runtime_lora_rejects_partial_unmatched_targets_before_mutating(
+    tmp_path: Path,
+) -> None:
     model = TinyTransformer()
     with torch.no_grad():
         model.proj.weight.zero_()
@@ -506,7 +517,35 @@ def test_runtime_lora_rejects_partial_unmatched_targets_before_mutating(tmp_path
     torch.testing.assert_close(model.proj.weight, torch.zeros_like(model.proj.weight))
 
 
-def test_runtime_lora_allows_unmatched_targets_when_not_strict(tmp_path):
+def test_runtime_lora_strict_shape_failure_does_not_mutate_prior_targets(
+    tmp_path: Path,
+) -> None:
+    model = TinyTwoLinearTransformer()
+    with torch.no_grad():
+        model.first.weight.zero_()
+        model.second.weight.zero_()
+
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "first.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "first.lora_B.weight": torch.ones(3, 1),
+            "second.lora_A.weight": torch.ones(1, 4),
+            "second.lora_B.weight": torch.ones(3, 1),
+        },
+        str(lora_path),
+    )
+
+    with pytest.raises(ValueError, match="input mismatch"):
+        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+    torch.testing.assert_close(model.first.weight, torch.zeros_like(model.first.weight))
+    torch.testing.assert_close(model.second.weight, torch.zeros_like(model.second.weight))
+    assert not getattr(model.first, "_trtllm_runtime_lora_fused", False)
+    assert not getattr(model.second, "_trtllm_runtime_lora_fused", False)
+
+
+def test_runtime_lora_allows_unmatched_targets_when_not_strict(tmp_path: Path) -> None:
     model = TinyTransformer()
     with torch.no_grad():
         model.proj.weight.zero_()
@@ -532,7 +571,7 @@ def test_runtime_lora_allows_unmatched_targets_when_not_strict(tmp_path):
     )
 
 
-def test_runtime_lora_rejects_duplicate_keys_across_safetensors(tmp_path):
+def test_runtime_lora_rejects_duplicate_keys_across_safetensors(tmp_path: Path) -> None:
     lora_dir = tmp_path / "adapter"
     lora_dir.mkdir()
     tensors = {
@@ -546,7 +585,7 @@ def test_runtime_lora_rejects_duplicate_keys_across_safetensors(tmp_path):
         apply_runtime_lora(TinyTransformer(), RuntimeLoRAConfig(path=str(lora_dir)))
 
 
-def test_runtime_lora_non_strict_skips_unsupported_tp_target(tmp_path):
+def test_runtime_lora_non_strict_skips_unsupported_tp_target(tmp_path: Path) -> None:
     model = TinyTPTransformer()
     lora_path = tmp_path / "adapter.safetensors"
     save_file(
@@ -616,8 +655,83 @@ def test_pipeline_runtime_lora_rejects_component_outside_transformer_surface():
         pipe._setup_runtime_lora()
 
 
-def test_pipeline_runtime_lora_requires_target_components_for_multi_transformer():
+def test_pipeline_runtime_lora_requires_target_components_for_multi_transformer() -> None:
     pipe = TinyPipelineWithTwoTransformers(RuntimeLoRAConfig(path="/tmp/lora.safetensors"))
 
     with pytest.raises(ValueError, match="target_components must be set"):
         pipe._setup_runtime_lora()
+
+
+def test_pipeline_runtime_lora_strict_failure_does_not_mutate_components(
+    tmp_path: Path,
+) -> None:
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "proj.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "proj.lora_B.weight": torch.ones(3, 1),
+        },
+        str(lora_path),
+    )
+    pipe = TinyPipelineWithTwoTransformers(
+        RuntimeLoRAConfig(
+            path=str(lora_path),
+            target_components=["transformer", "transformer_2"],
+        )
+    )
+    pipe.transformer_2.proj = nn.Linear(4, 3, bias=False)
+    with torch.no_grad():
+        pipe.transformer.proj.weight.zero_()
+        pipe.transformer_2.proj.weight.zero_()
+
+    with pytest.raises(ValueError, match="input mismatch"):
+        pipe._setup_runtime_lora()
+
+    torch.testing.assert_close(
+        pipe.transformer.proj.weight,
+        torch.zeros_like(pipe.transformer.proj.weight),
+    )
+    torch.testing.assert_close(
+        pipe.transformer_2.proj.weight,
+        torch.zeros_like(pipe.transformer_2.proj.weight),
+    )
+    assert not getattr(pipe.transformer.proj, "_trtllm_runtime_lora_fused", False)
+    assert not getattr(pipe.transformer_2.proj, "_trtllm_runtime_lora_fused", False)
+    assert pipe._runtime_lora_applications == []
+
+
+def test_pipeline_runtime_lora_strict_partial_component_match_does_not_mutate(
+    tmp_path: Path,
+) -> None:
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "model.transformer.proj.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "model.transformer.proj.lora_B.weight": torch.ones(3, 1),
+        },
+        str(lora_path),
+    )
+    pipe = TinyPipelineWithTwoTransformers(
+        RuntimeLoRAConfig(
+            path=str(lora_path),
+            target_components=["transformer", "transformer_2"],
+        )
+    )
+    with torch.no_grad():
+        pipe.transformer.proj.weight.zero_()
+        pipe.transformer_2.proj.weight.zero_()
+
+    with pytest.raises(ValueError, match="selected component 'transformer_2'"):
+        pipe._setup_runtime_lora()
+
+    torch.testing.assert_close(
+        pipe.transformer.proj.weight,
+        torch.zeros_like(pipe.transformer.proj.weight),
+    )
+    torch.testing.assert_close(
+        pipe.transformer_2.proj.weight,
+        torch.zeros_like(pipe.transformer_2.proj.weight),
+    )
+    assert not getattr(pipe.transformer.proj, "_trtllm_runtime_lora_fused", False)
+    assert not getattr(pipe.transformer_2.proj, "_trtllm_runtime_lora_fused", False)
+    assert pipe._runtime_lora_applications == []
