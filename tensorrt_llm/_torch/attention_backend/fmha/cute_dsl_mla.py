@@ -268,12 +268,10 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> tuple[bool, str]:
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
-        # ``MLA.forward`` invokes context and generation attention separately
-        # for a mixed scheduler batch.  This call receives only the compacted
-        # generation Q slice; ``meta.num_contexts`` is merely the offset of its
-        # sequence metadata and does not make this a mixed FMHA invocation.
-        if meta.num_generations <= 0:
-            return False, "CuTe DSL MLA FMHA requires a non-empty generation batch."
+        # It is to disable mix-batch(context request + generation request) for now.
+        # TODO: Eliminate high host overhead of cutedsl mla to enable mix-batch.
+        if (meta.num_contexts != 0 and attn.num_heads != 96) or meta.num_generations <= 0:
+            return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.helix_position_offsets is not None:
             return False, "CuTe DSL MLA FMHA does not support Helix parallelism."
         if meta.beam_width != 1:
