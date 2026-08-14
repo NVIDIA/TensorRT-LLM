@@ -29,7 +29,6 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization import DynamicLinearWeightLoader
-from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 
@@ -63,7 +62,7 @@ class GlmImageGELU(torch.nn.Module):
         approximate: str = "none",
         bias: bool = True,
         model_config: Optional[DiffusionModelConfig] = None,
-    ):
+    ) -> None:
         super().__init__()
         self.proj = _aux_linear(dim_in, dim_out, bias=bias, model_config=model_config)
         self.approximate = approximate
@@ -71,7 +70,7 @@ class GlmImageGELU(torch.nn.Module):
     def gelu(self, gate: torch.Tensor) -> torch.Tensor:
         return F.gelu(gate, approximate=self.approximate)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.proj(hidden_states)
         hidden_states = self.gelu(hidden_states)
         return hidden_states
@@ -84,12 +83,12 @@ class GlmImageLinearActivation(torch.nn.Module):
         dim_out: int,
         bias: bool = True,
         model_config: Optional[DiffusionModelConfig] = None,
-    ):
+    ) -> None:
         super().__init__()
         self.proj = _aux_linear(dim_in, dim_out, bias=bias, model_config=model_config)
         self.activation = F.silu
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.proj(hidden_states)
         return self.activation(hidden_states)
 
@@ -102,10 +101,10 @@ class GlmImageFeedForward(torch.nn.Module):
         mult: int = 4,
         dropout: float = 0.0,
         activation_fn: str = "geglu",
-        inner_dim=None,
+        inner_dim: Optional[int] = None,
         bias: bool = True,
         model_config: Optional[DiffusionModelConfig] = None,
-    ):
+    ) -> None:
         super().__init__()
         if inner_dim is None:
             inner_dim = int(dim * mult)
@@ -140,14 +139,14 @@ class GlmImageTimestepEmbedding(torch.nn.Module):
         time_embed_dim: int,
         out_dim: Optional[int] = None,
         model_config: Optional[DiffusionModelConfig] = None,
-    ):
+    ) -> None:
         super().__init__()
         self.linear_1 = _aux_linear(in_channels, time_embed_dim, model_config=model_config)
         self.act = torch.nn.SiLU()
         time_embed_dim_out = out_dim if out_dim is not None else time_embed_dim
         self.linear_2 = _aux_linear(time_embed_dim, time_embed_dim_out, model_config=model_config)
 
-    def forward(self, sample):
+    def forward(self, sample: torch.Tensor) -> torch.Tensor:
         sample = self.linear_1(sample)
         sample = self.act(sample)
         sample = self.linear_2(sample)
@@ -157,12 +156,12 @@ class GlmImageTimestepEmbedding(torch.nn.Module):
 class GlmImagePixArtAlphaTextProjection(torch.nn.Module):
     def __init__(
         self,
-        in_features,
-        hidden_size,
-        out_features=None,
-        act_fn="gelu_tanh",
+        in_features: int,
+        hidden_size: int,
+        out_features: Optional[int] = None,
+        act_fn: str = "gelu_tanh",
         model_config: Optional[DiffusionModelConfig] = None,
-    ):
+    ) -> None:
         super().__init__()
         if out_features is None:
             out_features = hidden_size
@@ -175,7 +174,7 @@ class GlmImagePixArtAlphaTextProjection(torch.nn.Module):
             raise ValueError(f"Unknown activation function: {act_fn}")
         self.linear_2 = _aux_linear(hidden_size, out_features, bias=True, model_config=model_config)
 
-    def forward(self, caption):
+    def forward(self, caption: torch.Tensor) -> torch.Tensor:
         hidden_states = self.linear_1(caption)
         hidden_states = self.act_1(hidden_states)
         hidden_states = self.linear_2(hidden_states)
@@ -190,7 +189,7 @@ class GlmImageCombinedTimestepSizeEmbeddings(torch.nn.Module):
         pooled_projection_dim: int,
         timesteps_dim: int = 256,
         model_config: Optional[DiffusionModelConfig] = None,
-    ):
+    ) -> None:
         super().__init__()
 
         self.time_proj = Timesteps(
@@ -237,7 +236,7 @@ class GlmImageImageProjector(torch.nn.Module):
         hidden_size: int = 2560,
         patch_size: int = 2,
         model_config: Optional[DiffusionModelConfig] = None,
-    ):
+    ) -> None:
         super().__init__()
         self.patch_size = patch_size
 
@@ -277,7 +276,7 @@ class GlmImageAdaLayerNormZero(torch.nn.Module):
 
     def forward(
         self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, temb: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, ...]:
         dtype = hidden_states.dtype
         norm_hidden_states = self.norm(hidden_states).to(dtype=dtype)
         norm_encoder_hidden_states = self.norm_context(encoder_hidden_states).to(dtype=dtype)
@@ -327,7 +326,7 @@ class GlmImageAdaLayerNormContinuous(torch.nn.Module):
         bias: bool = True,
         norm_type: str = "layer_norm",
         model_config: Optional[DiffusionModelConfig] = None,
-    ):
+    ) -> None:
         super().__init__()
         self.linear = _aux_linear(
             conditioning_embedding_dim, embedding_dim * 2, bias=bias, model_config=model_config
@@ -355,7 +354,7 @@ class GlmImageAttention(Attention):
         dtype: Optional[torch.dtype] = None,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
-    ):
+    ) -> None:
         config = config or DiffusionModelConfig()
         super().__init__(
             num_attention_heads=num_attention_heads,
@@ -401,7 +400,15 @@ class GlmImageAttention(Attention):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Only VANILLA honors key_padding_mask; TRTLLM and CUTEDSL drop it, and FA4
+        # reads it as a valid prefix while the pipeline left-pads.
+        if attention_mask is not None and self.attn_backend != "VANILLA":
+            raise NotImplementedError(
+                "Padded GlmImage prompts require the VANILLA attention backend, "
+                f"got {self.attn_backend}."
+            )
+
         batch_size, text_seq_length, _ = encoder_hidden_states.shape
         batch_size, image_seq_length, _ = hidden_states.shape
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -473,8 +480,8 @@ class GlmImageTransformerBlock(torch.nn.Module):
         eps: float = 1e-6,
         dtype: Optional[torch.dtype] = None,
         config: Optional[DiffusionModelConfig] = None,
-        layer_idx=0,
-    ):
+        layer_idx: int = 0,
+    ) -> None:
         super().__init__()
 
         # 1. Attention
@@ -501,7 +508,7 @@ class GlmImageTransformerBlock(torch.nn.Module):
                 List[Tuple[torch.Tensor, torch.Tensor]],
             ]
         ] = None,
-        attention_mask: Optional[Dict[str, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Timestep conditioning
@@ -550,12 +557,12 @@ class GlmImageTransformerBlock(torch.nn.Module):
 
 
 class GlmImageTransformer2DModel(BaseDiffusionModel):
-    def __init__(self, model_config: DiffusionModelConfig):
+    def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
 
         vgm = model_config.visual_gen_mapping
-        num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 32)
-        self.sharder = SequenceSharder.from_vgm(vgm, num_attention_heads=num_heads)
+        if vgm is not None and vgm.ulysses_size > 1:
+            raise NotImplementedError(f"GlmImage requires ulysses_size=1, got {vgm.ulysses_size}.")
 
         pretrained_config = model_config.pretrained_config
 

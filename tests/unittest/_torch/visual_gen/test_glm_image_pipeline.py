@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from diffusers import DiffusionPipeline
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.models.glm_image import GlmImagePipeline
+from tensorrt_llm._torch.visual_gen.models.glm_image import GlmImageAttention, GlmImagePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
 
@@ -374,6 +374,27 @@ def test_image_conditioning_not_supported():
     pipe = GlmImagePipeline.__new__(GlmImagePipeline)
     with pytest.raises(NotImplementedError, match="image-to-image"):
         pipe.forward(prompt=PROMPT, image=torch.zeros(1))
+
+
+def test_resolution_must_be_multiple_of_32():
+    """1008 clears the 16px latent pitch but not the 32px prior-token grid."""
+    pipe = GlmImagePipeline.__new__(GlmImagePipeline)
+    pipe.transformer = None
+    assert pipe.resolution_multiple_of == (32, 32)
+    with pytest.raises(ValueError, match="must be multiples of"):
+        pipe.forward(prompt=PROMPT, height=1008, width=1008)
+
+
+def test_padded_text_mask_requires_vanilla_backend():
+    """Backends that drop or misread key_padding_mask are rejected, not silently wrong."""
+    attn = GlmImageAttention.__new__(GlmImageAttention)
+    attn.attn_backend = "TRTLLM"
+    with pytest.raises(NotImplementedError, match="VANILLA"):
+        attn.forward(
+            torch.zeros(1, 4, 8),
+            encoder_hidden_states=torch.zeros(1, 2, 8),
+            attention_mask=torch.ones(1, 2, dtype=torch.long),
+        )
 
 
 # =============================================================================
