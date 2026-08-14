@@ -1225,12 +1225,21 @@ class AutoTuner:
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
 
-    def _record_backend_failure(self, custom_op: str, runner: TunableRunner,
+    def _record_backend_failure(self,
+                                custom_op: str,
+                                runner: TunableRunner,
                                 profile: OptimizationProfile,
                                 tuning_config: TuningConfig,
-                                input_tensors: List[torch.Tensor], what: str,
-                                exc: Exception, warning_key: str) -> None:
-        """Record a backend failure raised outside the timed profiling loop."""
+                                input_tensors: List[torch.Tensor],
+                                what: str,
+                                exc: Exception,
+                                detail: str = "") -> None:
+        """Record a backend failure raised outside the timed profiling loop.
+
+        `what` names the call that threw and doubles as the warning_once dedup
+        key, so it must be a constant per call site. Per-attempt context that
+        must not split the key (e.g. tactic) goes in `detail`.
+        """
         # Clear any pending CUDA error, same reason as #13469.
         try:
             torch.cuda.synchronize()
@@ -1239,10 +1248,13 @@ class AutoTuner:
                 f"[Autotuner] CUDA cleanup after {what} failure also failed: {sync_exc}"
             )
 
-        shapes = self._get_input_sizes(input_tensors)
+        context = [f"custom_op={custom_op}", f"runner={runner}"]
+        if detail:
+            context.append(detail)
+        context.append(f"shapes={self._get_input_sizes(input_tensors)}")
         logger.warning_once(
-            f"[Autotuner] {what} failed for custom_op={custom_op}, shapes={shapes}. Error: {exc}",
-            key=(custom_op, warning_key),
+            f"[Autotuner] {what} failed for {', '.join(context)}. Error: {exc}",
+            key=(custom_op, f"warning_autotuning_{what}_failure"),
         )
         self.stats.failed_profiling_count[custom_op].add(
             self.profiling_cache.get_cache_key(
@@ -1273,40 +1285,51 @@ class AutoTuner:
         best_runner_id, best_tactic = None, None
 
         # inputs_pre_hook and get_valid_tactics run backend-supplied code outside
-        # the per-tactic guard below. Treat a failure here like any other
+        # the per-tactic guard below. Treat a failure there like any other
         # profiling failure rather than letting it abort the process: when every
         # rank tunes, one abort strands the rest in _maybe_sync_cache_data().
-        try:
-            # If the inputs_pre_hook is provided, it will be called before profiling.
-            if tuning_config.inputs_pre_hook is not None:
-                input_tensors = tuning_config.inputs_pre_hook(input_tensors)
+        # Only those two calls are guarded -- the surrounding bookkeeping is
+        # framework code, and swallowing its bugs would hide them behind a
+        # "falling back to the default tactic" warning.
 
-            # Pre-walk the runners so we know the total candidate (runner, tactic)
-            # pair count before deciding whether to short-circuit profiling. The
-            # count is taken BEFORE distributed-strategy splitting; the PARALLEL
-            # strategy can leave a rank with one tactic locally even though the
-            # full set has several, and that case must still go through the
-            # timed profile path so the merge picks a real winner.
-            candidates = []
-            total_pairs = 0
-            for runner_id, runner in enumerate(runners):
-                # TODO: use FakeTensor here.
-                runner_arg_names = {
-                    p.name
-                    for p in inspect.signature(
-                        runner.forward).parameters.values()
-                }
+        # If the inputs_pre_hook is provided, it will be called before profiling.
+        if tuning_config.inputs_pre_hook is not None:
+            try:
+                input_tensors = tuning_config.inputs_pre_hook(input_tensors)
+            except Exception as e:
+                self._record_backend_failure(custom_op, runners[0], profile,
+                                             tuning_config, input_tensors,
+                                             "inputs_pre_hook", e)
+                return None, None, float('inf'), True
+
+        # Pre-walk the runners so we know the total candidate (runner, tactic)
+        # pair count before deciding whether to short-circuit profiling. The
+        # count is taken BEFORE distributed-strategy splitting; the PARALLEL
+        # strategy can leave a rank with one tactic locally even though the
+        # full set has several, and that case must still go through the
+        # timed profile path so the merge picks a real winner.
+        candidates = []
+        total_pairs = 0
+        for runner_id, runner in enumerate(runners):
+            # TODO: use FakeTensor here.
+            runner_arg_names = {
+                p.name
+                for p in inspect.signature(runner.forward).parameters.values()
+            }
+            try:
                 all_valid_tactics = runner.get_valid_tactics(
                     input_tensors, profile, **kwargs)
-                total_pairs += len(all_valid_tactics)
-                candidates.append(
-                    (runner_id, runner, runner_arg_names, all_valid_tactics))
-        except Exception as e:
-            self._record_backend_failure(
-                custom_op, runners[0], profile, tuning_config, input_tensors,
-                "Profiling candidate preparation", e,
-                "warning_autotuning_preparation_failure")
-            return None, None, float('inf'), True
+            except Exception as e:
+                # Bail out rather than skipping this runner: total_pairs would
+                # no longer describe the full candidate set, which is what the
+                # single-pair shortcut below keys off.
+                self._record_backend_failure(custom_op, runner, profile,
+                                             tuning_config, input_tensors,
+                                             "get_valid_tactics", e)
+                return None, None, float('inf'), True
+            total_pairs += len(all_valid_tactics)
+            candidates.append(
+                (runner_id, runner, runner_arg_names, all_valid_tactics))
 
         # MERGE/PARALLEL strategies rely on comparing per-rank timings to
         # pick the winning tactic across ranks. If a rank's local set of
@@ -1339,18 +1362,17 @@ class AutoTuner:
                 # timing.
                 min_time = 0.0
             except Exception as e:
-                shapes = self._get_input_sizes(input_tensors)
-                logger.warning_once(
-                    f"[Autotuner] Single-pair run failed for custom_op={custom_op}, runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
-                    key=(custom_op, "warning_autotuning_single_pair_failure"),
-                )
-                self.stats.failed_profiling_count[custom_op].add(
-                    self.profiling_cache.get_cache_key(
-                        custom_op,
-                        runner,
-                        profile.get_opt_shapes(),
-                        tuning_config,
-                        apply_map_to_tuning_buckets=False))
+                # do_preparation runs inside this try, so this is a backend
+                # failure path too and needs the same CUDA cleanup as the
+                # per-tactic handler below.
+                self._record_backend_failure(custom_op,
+                                             runner,
+                                             profile,
+                                             tuning_config,
+                                             input_tensors,
+                                             "single_pair_run",
+                                             e,
+                                             detail=f"tactic={tac}")
                 has_tuning_failure_occurred = True
         else:
             for runner_id, runner, runner_arg_names, all_valid_tactics in candidates:
@@ -1369,10 +1391,10 @@ class AutoTuner:
                     except Exception as e:
                         # Skip this runner rather than the whole op; the other
                         # runners' tactics are still usable.
-                        self._record_backend_failure(
-                            custom_op, runner, profile, tuning_config,
-                            input_tensors, "do_preparation", e,
-                            "warning_autotuning_do_preparation_failure")
+                        self._record_backend_failure(custom_op, runner, profile,
+                                                     tuning_config,
+                                                     input_tensors,
+                                                     "do_preparation", e)
                         has_tuning_failure_occurred = True
                         continue
 
