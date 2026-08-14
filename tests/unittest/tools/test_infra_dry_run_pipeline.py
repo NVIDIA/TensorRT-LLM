@@ -122,7 +122,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         body = _function_body(L0_TEST, "runLLMAgentFlowTest", "launchTestListCheck")
         self.assertIn("if (isInfraDryRun())", body)
         infra_pytest_install = (
-            "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout"
+            "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout mako"
         )
         self.assertIn(infra_pytest_install, body)
         self.assertIn(
