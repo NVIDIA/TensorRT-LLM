@@ -216,31 +216,57 @@ def test_group_quant_fp8_under_torch_compile(kernel: str) -> None:
     propagates into ``output_s``, so pinning ``fp8_max`` alone still compiles to
     an fp64 ``output_s``.
 
-    This is a Triton/Inductor codegen behavior, not an architecture one --
-    reproduced on triton 3.7.1 but not triton 3.6.0 on the same GPU -- so the
-    guard only bites on runners carrying the newer toolchain.
+    Whether Inductor binds these scalars as fp64 depends on the torch/Inductor
+    version, not the SM version: torch 2.10 emits ``'fp8_max': 'fp32'`` in the
+    generated kernel signature, torch 2.11 and 2.13 emit ``'fp64'`` (checked on
+    both sm_120 and sm_121, and with the same triton 3.6.0 on either side of the
+    split). So this guard only bites on runners carrying torch >= 2.11.
 
     ``fullgraph=True`` keeps a future graph break from turning this into a silent
     pass that never reaches Inductor.
+
+    The permutation maps come from the real ops rather than hand-built tensors:
+    Triton compiles and caches a separate kernel per argument dtype signature, so
+    synthesizing them risks exercising a specialization that never runs in
+    production. Building them outside ``run()`` keeps them clear of the compiled
+    region, so ``fullgraph=True`` is unaffected.
     """
     device = "cuda"
     gen = torch.Generator(device=device).manual_seed(4321)
 
     num_rows, hidden, num_experts, top_k = 8, 512, 2, 2
-    num_expanded = num_rows * top_k
     m_max = _align(num_rows, 128)
 
     x = torch.randn((num_rows, hidden), device=device, dtype=torch.float32, generator=gen)
-    # Two equally-sized experts over the expanded rows; the maps only have to be
-    # self-consistent for a compile guard, not model-realistic.
-    start_offsets = torch.tensor(
-        [0, num_expanded // 2, num_expanded], device=device, dtype=torch.int64
+    logits = torch.randn((num_rows, num_experts), device=device, dtype=torch.float32, generator=gen)
+    topk_vals, topk_ids = logits.topk(top_k, dim=-1)
+
+    (
+        perm_to_unperm,
+        _permuted_token_selected_experts,
+        expanded,
+        start_offsets,
+        _permuted_token_final_scales,
+        _unpermuted_row_to_permuted_row,
+    ) = torch.ops.trtllm.moe_permute_op(
+        x,
+        topk_ids.to(torch.int32),
+        torch.softmax(topk_vals, dim=-1).to(torch.float32),
+        None,  # fc1_expert_weights
+        None,  # fc2_expert_weights
+        None,  # quant_scales
+        input_sf=None,
+        num_experts_on_rank=num_experts,
+        tp_size=1,
+        tp_rank=0,
+        ep_size=1,
+        ep_rank=0,
+        cluster_size=1,
+        cluster_rank=0,
+        min_latency_mode=False,
+        use_fp8_block_scaling=False,
     )
-    row_indices = torch.repeat_interleave(
-        torch.arange(num_experts, device=device, dtype=torch.int32), num_expanded // num_experts
-    )
-    perm_to_unperm = torch.arange(num_expanded, device=device, dtype=torch.int32)
-    expanded = x.repeat(top_k, 1)
+    _masked_m, row_indices = preprocess_after_permute(start_offsets, expanded.shape[0])
 
     def run():
         out_q, out_s = _alloc_outputs(num_experts, m_max, hidden, device=device)

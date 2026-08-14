@@ -447,6 +447,10 @@ def _silu_and_mul_post_quant_kernel(
                 output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
             output_q = tl.clamp(gate_up / output_s, fp8_min,
                                 fp8_max).to(output_ptr.dtype.element_ty)
+            # The bitcast needs a 32-bit source. A no-op once the scalars above
+            # are pinned, but it keeps the requirement on the line that depends
+            # on it, so a future fp64 float arg here cannot silently break it.
+            output_s = output_s.to(tl.float32)
             output_s_int32 += ((output_s.to(tl.int32, bitcast=True) >> 23) <<
                                (8 * pack_index))
             tl.store(
@@ -614,6 +618,10 @@ def _per_token_quant_and_transform_kernel(
                 output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
             output_q = tl.clamp(act / output_s, fp8_min,
                                 fp8_max).to(output_ptr.dtype.element_ty)
+            # The bitcast needs a 32-bit source. A no-op once the scalars above
+            # are pinned, but it keeps the requirement on the line that depends
+            # on it, so a future fp64 float arg here cannot silently break it.
+            output_s = output_s.to(tl.float32)
             output_s_int32 += ((output_s.to(tl.int32, bitcast=True) >> 23) <<
                                (8 * pack_index))
             tl.store(
