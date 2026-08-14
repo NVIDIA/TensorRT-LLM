@@ -26,6 +26,49 @@ from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+# ---------------------------------------------------------------------------
+# Fused per-token AdaLN (CuTe DSL, sm100): one-pass LayerNorm + inline fp32
+# scale_shift_table+temb-chunk add + modulate, taking the RAW bf16 temb chunk
+# views + [D] fp32 table rows — no materialized fp32 [B, S, D] modulator
+# tensors, DRAM traffic at the analytic floor. Registered as functional
+# torch.library custom ops in the ``trtllm::`` namespace (opaque to inductor,
+# no graph breaks). Engages ONLY on the per-token path (temb.ndim == 4, e.g.
+# Wan2.2 TI2V-5B with expand_timesteps); the per-batch path (temb.ndim == 3)
+# keeps the baseline math (fusion measured no win at per-batch shapes).
+# Import is optional: without cutlass-dsl the blocks keep the eager/inductor
+# path.
+# ---------------------------------------------------------------------------
+try:
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln import (
+        fused_pertoken_adaln as _fused_pertoken_adaln,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln import (
+        fused_pertoken_adaln_residual as _fused_pertoken_adaln_residual,
+    )
+
+    _PERTOKEN_ADALN_IMPORT_OK = True
+except Exception:
+    _fused_pertoken_adaln = None
+    _fused_pertoken_adaln_residual = None
+    _PERTOKEN_ADALN_IMPORT_OK = False
+
+# Engage the residual variant (gate+residual+LN fused) at the norm2/norm3
+# sites in addition to the plain modulate kernel at norm1. Flip to False to
+# fall back to the norm1-style op only, leaving the gate/residual adds to
+# inductor.
+_PERTOKEN_ADALN_FUSE_RESIDUAL = True
+
+
+def _pertoken_adaln_arch_ok() -> Optional[bool]:
+    """sm100 (B200/GB200) only. None = CUDA not initialized yet (resolve lazily)."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.get_device_capability()[0] == 10
+    except Exception:
+        return False
+
+
 try:
     # Available in transformers<5
     from transformers.modeling_utils import get_parameter_device
@@ -372,6 +415,26 @@ class WanBlock(nn.Module):
         self._norm3_fp4_scale: Optional[torch.Tensor] = None
         self._fused_ln_supported = hidden_size == 5120
 
+        # Fused per-token AdaLN (CuTe DSL): init-time eligibility. bf16
+        # model, D % 256 == 0 and D <= 8192 (kernel LDG.128 contract),
+        # quantization hard-off, never competing with the in-tree D=5120
+        # fused path. sm100 resolves here when CUDA is up, else lazily at
+        # the first model forward (only ever flipping True -> False, keeping
+        # compile guards stable).
+        _has_quant = bool(quant_config is not None and getattr(quant_config, "quant_algo", None))
+        _has_quant = _has_quant or bool(getattr(model_config, "quant_config_dict", None))
+        self._use_fused_pertoken_adaln = (
+            _PERTOKEN_ADALN_IMPORT_OK
+            and dtype == torch.bfloat16
+            and hidden_size % 256 == 0
+            and hidden_size <= 8192
+            and not _has_quant
+            and not self._fused_ln_supported
+        )
+        _pta_arch = _pertoken_adaln_arch_ok()
+        if self._use_fused_pertoken_adaln and _pta_arch is not None:
+            self._use_fused_pertoken_adaln = _pta_arch
+
         self.ffn = MLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
@@ -518,7 +581,23 @@ class WanBlock(nn.Module):
         freqs_sin,
         timestep=None,
     ):
-        if temb.ndim == 4:
+        # Fused per-token AdaLN engages ONLY on the per-token path; requires
+        # the chunk views' stride(-1) == 1 (true for any temb with a
+        # contiguous last dim — enforced again inside the op).
+        _use_pta = self._use_fused_pertoken_adaln and temb.ndim == 4 and temb.stride(-1) == 1
+        if _use_pta:
+            # Raw bf16 chunk views of temb [B, S, 6, D] (strides
+            # (S*6D, 6D, 1)) + fp32 [6, D] table. The fused ops compute
+            # table_row + chunk.float() inline — bit-identical fp32 values to
+            # the baseline chunk math below, with no materialized modulators.
+            _shift_c = temb[:, :, 0]
+            _scale_c = temb[:, :, 1]
+            _gate_c = temb[:, :, 2]
+            _c_shift_c = temb[:, :, 3]
+            _c_scale_c = temb[:, :, 4]
+            _c_gate_c = temb[:, :, 5]
+            _t = self.scale_shift_table[0].float()  # [6, D] fp32 rows
+        elif temb.ndim == 4:
             # temb: batch_size, seq_len, 6, hidden_size
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
                 self.scale_shift_table.unsqueeze(0).float() + temb.float()
@@ -542,6 +621,13 @@ class WanBlock(nn.Module):
                 x, scale_msa, shift_msa, temb, self._norm1_fp4_scale, self.norm1.variance_epsilon
             )
             normed = self._reshape_fused_output(normed, x.shape)
+        elif _use_pta:
+            # Fused per-token AdaLN norm1: LN_noaffine(x.f32) * (1 +
+            # (t_scale + scale_c.f32)) + (t_shift + shift_c.f32) -> bf16,
+            # one kernel, fp32 accumulation, ONE final rounding.
+            normed = _fused_pertoken_adaln(
+                x, _shift_c, _scale_c, _t[0], _t[1], self.norm1.variance_epsilon
+            )
         else:
             normed = self.norm1(x.float()) * (1 + scale_msa) + shift_msa
             normed = normed.to(x.dtype)
@@ -563,24 +649,53 @@ class WanBlock(nn.Module):
         else:
             attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
 
-        x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
-
         if (
-            self._fused_ln_supported
+            _use_pta
+            and _PERTOKEN_ADALN_FUSE_RESIDUAL
             and isinstance(self.norm2, LayerNorm)
             and self.norm2.weight is not None
+            and self.norm2.bias is not None
         ):
-            _x_2d = x.reshape(-1, x.shape[-1])
-            norm_x = apply_fused_layernorm_affine_quant(
-                _x_2d,
-                self.norm2.weight.to(x.dtype),
-                self.norm2.bias.to(x.dtype),
-                self._norm2_fp4_scale,
-                eps=self.norm2.variance_epsilon,
+            # Fused residual variant at the gate->residual->norm2 boundary:
+            # residual_out = x + attn1_out * (t_gate + gate_c.f32);
+            # norm_x = LN_affine(residual_out). LN reads the ROUNDED residual
+            # (bit-matching the baseline intermediate .to(x.dtype)).
+            norm_x, x = _fused_pertoken_adaln_residual(
+                x,
+                attn1_out,
+                _gate_c,
+                _t[2],
+                self.norm2.weight.float(),
+                self.norm2.bias.float(),
+                None,
+                None,
+                None,
+                None,
+                self.norm2.variance_epsilon,
             )
-            norm_x = self._reshape_fused_output(norm_x, x.shape)
         else:
-            norm_x = self.norm2(x.float()).to(x.dtype)
+            if _use_pta:
+                # Inline fp32 gate row (bit-identical to the baseline chunk
+                # view); inductor fuses this into the gate/residual kernel.
+                gate_msa = _t[2] + _gate_c.float()
+            x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
+
+            if (
+                self._fused_ln_supported
+                and isinstance(self.norm2, LayerNorm)
+                and self.norm2.weight is not None
+            ):
+                _x_2d = x.reshape(-1, x.shape[-1])
+                norm_x = apply_fused_layernorm_affine_quant(
+                    _x_2d,
+                    self.norm2.weight.to(x.dtype),
+                    self.norm2.bias.to(x.dtype),
+                    self._norm2_fp4_scale,
+                    eps=self.norm2.variance_epsilon,
+                )
+                norm_x = self._reshape_fused_output(norm_x, x.shape)
+            else:
+                norm_x = self.norm2(x.float()).to(x.dtype)
 
         # I2V: Split encoder_hidden_states into image and text parts if needed
         encoder_hidden_states_img = None
@@ -621,11 +736,12 @@ class WanBlock(nn.Module):
             attn2_output = attn2_output + attn_img_output
 
         # Apply to_out once to the combined (text + image) attention output
-        x = x + self.attn2.to_out[0](attn2_output)
+        attn2_proj = self.attn2.to_out[0](attn2_output)
 
         # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
         # quant) reshaped back to [B, S, D]; self.ffn consumes it.
         if self._fused_ln_supported:
+            x = x + attn2_proj
             normed = self._fused_adaln_quant(
                 x,
                 c_scale_msa,
@@ -635,11 +751,40 @@ class WanBlock(nn.Module):
                 self.norm3.variance_epsilon,
             )
             normed = self._reshape_fused_output(normed, x.shape)
+        elif _use_pta and _PERTOKEN_ADALN_FUSE_RESIDUAL:
+            # Fused residual variant at the attn2-add->norm3 boundary:
+            # residual_out = x + attn2_proj (rounded like the baseline bf16
+            # add); normed = LN(residual_out) * (1 + (t_cscale +
+            # c_scale_c.f32)) + (t_cshift + c_shift_c.f32).
+            normed, x = _fused_pertoken_adaln_residual(
+                x,
+                attn2_proj,
+                None,
+                None,
+                None,
+                None,
+                _c_shift_c,
+                _c_scale_c,
+                _t[3],
+                _t[4],
+                self.norm3.variance_epsilon,
+            )
+        elif _use_pta:
+            x = x + attn2_proj
+            normed = _fused_pertoken_adaln(
+                x, _c_shift_c, _c_scale_c, _t[3], _t[4], self.norm3.variance_epsilon
+            )
         else:
+            x = x + attn2_proj
             normed = self.norm3(x.float()) * (1 + c_scale_msa) + c_shift_msa
             normed = normed.to(x.dtype)
         ffn_out = self.ffn(normed)
 
+        if _use_pta:
+            # The ffn gate stays on the inductor path — fusing it into the
+            # NEXT block's norm1 would cross the per-block compile boundary.
+            # Inline fp32 row; inductor fuses it into the gate/residual add.
+            c_gate_msa = _t[5] + _c_gate_c.float()
         x = (x.float() + ffn_out.float() * c_gate_msa).to(x.dtype)
 
         return x
@@ -653,6 +798,11 @@ class WanTransformer3DModel(BaseDiffusionModel):
         model_config: DiffusionModelConfig,
     ):
         super().__init__(model_config)
+
+        # Fused per-token AdaLN: the sm100 check may be unresolvable at init
+        # (no CUDA context under meta-init); finalized once at the first
+        # forward, only ever flipping block flags True -> False.
+        self._fused_pta_arch_resolved = _pertoken_adaln_arch_ok() is not None
 
         vgm = model_config.visual_gen_mapping
 
@@ -880,6 +1030,18 @@ class WanTransformer3DModel(BaseDiffusionModel):
             encoder_hidden_states = torch.cat(
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
+
+        # Fused per-token AdaLN: lazy sm100 resolution (walks modules so
+        # wrapped blocks — e.g. cache wrappers — are covered). Runs before
+        # any compiled block.
+        if not self._fused_pta_arch_resolved:
+            _pta_arch_ok = _pertoken_adaln_arch_ok()
+            if _pta_arch_ok is not None:
+                if not _pta_arch_ok:
+                    for _m in self.modules():
+                        if getattr(_m, "_use_fused_pertoken_adaln", False):
+                            _m._use_fused_pertoken_adaln = False
+                self._fused_pta_arch_resolved = True
 
         # Transformer blocks (attention handles distributed communication internally)
         for block in self.blocks:
