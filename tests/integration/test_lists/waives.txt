@@ -155,6 +155,7 @@ full:B300/accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_8gpu
 full:B300/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_dummy_load_format SKIP (https://nvbugs/6525059)
 full:B300/accuracy/test_llm_api_pytorch.py::TestStep3_7::test_fp8_block_scales[tp_size=4-ep_size=4-mtp_nextn=3] SKIP (https://nvbugs/6539941)
 full:B300/llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] SKIP (https://nvbugs/6475623)
+full:B300/unittest/_torch/attention/test_attention_backends.py::test_attention_backend[qwen2_0_5b_gqa_hd64-ctx-bf16-HND-p32-v1] SKIP (https://nvbugs/6610548)
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy SKIP (https://nvbugs/6571418)
 full:DGX_B200/disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b] SKIP (https://nvbugs/6594241)
 full:DGX_B200/perf/test_perf_sanity.py::test_e2e[aggr_upload-gemma4_26b_a4b_nvfp4_blackwell-gemma4_26b_a4b_nvfp4_tp1_1k1k] SKIP (https://nvbugs/6571410)
