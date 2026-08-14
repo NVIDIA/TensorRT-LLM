@@ -47,10 +47,10 @@ def _graph_copy(meta, batch_size=8):
     return graph_meta
 
 
-def _clear(graph_metadata):
+def _clear(graph_metadata, *, is_warmup_only=False):
     """CUDAGraphRunner.clear_capture_only_spec_state, called unbound."""
     return CUDAGraphRunner.clear_capture_only_spec_state(
-        types.SimpleNamespace(graph_metadata=graph_metadata)
+        types.SimpleNamespace(graph_metadata=graph_metadata, is_warmup_only=is_warmup_only)
     )
 
 
@@ -82,6 +82,19 @@ def test_graph_copy_inherits_flag_and_base_teardown_does_not_reach_it():
 
     meta._force_non_greedy_for_capture = False
     assert all(copy._force_non_greedy_for_capture for copy in copies)
+
+
+def test_clear_capture_only_spec_state_waits_for_capture_pass():
+    meta = _base_meta()
+    meta._force_non_greedy_for_capture = True
+    copies = [_graph_copy(meta, bs) for bs in (1, 2, 4)]
+    graph_metadata = {("advanced", i): {"spec_metadata": copy} for i, copy in enumerate(copies)}
+
+    assert _clear(graph_metadata, is_warmup_only=True) == 0
+    assert all(copy._force_non_greedy_for_capture for copy in copies)
+
+    assert _clear(graph_metadata) == len(copies)
+    assert not any(copy._force_non_greedy_for_capture for copy in copies)
 
 
 def test_clear_capture_only_spec_state_clears_every_cached_copy():

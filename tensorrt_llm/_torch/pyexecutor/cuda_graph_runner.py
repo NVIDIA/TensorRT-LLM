@@ -543,8 +543,15 @@ class CUDAGraphRunner:
         recorded into the graph. Clearing it here -- after the pass has captured
         every graph -- keeps capture correct and serving clean.
 
+        During the workspace-sizing warmup pass, ``is_warmup_only`` is true.
+        The cached copies are reused by the subsequent capture pass, so preserve
+        the override until that pass has recorded the actual graphs.
+
         Returns the number of cached metadata objects cleared.
         """
+        if self.is_warmup_only:
+            return 0
+
         cleared = 0
         for stored in self.graph_metadata.values():
             spec_metadata = stored.get("spec_metadata")
