@@ -48,7 +48,7 @@ def process_xml_failed_tests(xml_filename, failSignaturesList, rerun_0_file,
                           " will rerun 1 time, because of fail signature")
                 else:
                     rerun_0_file.write(test_to_line[test_name] + '\n')
-                    print(test_name + " will not rerun, because duration > 10 min and no fail signature")
+                    print(test_name + " will not rerun, because duration > 10 min and no failure signature matches")
     return ran_tests
 
 
