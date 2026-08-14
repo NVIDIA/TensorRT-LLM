@@ -678,8 +678,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         uint32_t numWorker = config.backendParams.find("num_workers") != config.backendParams.end()
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
-        nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
-            numWorker, 0, 10000, config.enableTelemetry};
+        nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_RW, numWorker,
+            0, 10000, config.enableTelemetry};
         std::string localIp = common::getLocalIp(common::getEnvNixlInterface(), mRank);
         // Bracket IPv6 literals (RFC 3986) so the last ':' always separates the port;
         // IPv4 keeps the legacy "ip:port" format for cross-version compatibility.
@@ -696,8 +696,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
             ? std::stoi(config.backendParams.at("num_workers"))
             : 1;
         mAddress.clear();
-        nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
-            numWorker, 0, 10000, config.enableTelemetry};
+        nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_RW, numWorker,
+            0, 10000, config.enableTelemetry};
         mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 
@@ -876,7 +876,11 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 #ifdef TLLM_BOUNCE_V2
     // Bounce fast path for many-small-desc VRAM writes (opt-in). Falls through to the standard
     // NIXL path for everything else. The returned future resolves once every chunk is
-    // scattered+ACKed at the peer (or FAILURE) — never hangs.
+    // scattered+ACKed at the peer (or FAILURE) — never hangs. Admission is final: once a request
+    // enters bounce, a failure (peer loss / requestTimeoutMs) fails the transfer with no automatic
+    // fallback to the standard path — the dominant failure causes (dead peer, partition) would fail
+    // there too, and silent fallback would mask bounce-layer faults. Fallbacks happen only at
+    // admission time (this gate, unhandshaked peer, disabled/failed arena setup).
     if (shouldUseBounce(request))
     {
         mBounceSubmitCount.fetch_add(1, std::memory_order_relaxed);

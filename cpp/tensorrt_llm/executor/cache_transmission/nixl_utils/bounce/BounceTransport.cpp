@@ -283,6 +283,9 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
         // long-running receiver leaks up to one request's in-flight allocation cap per failed rid.
         // Any region whose scatter is still running is deferred (flagged orphaned in mScattering,
         // freed on completion).
+        // Immediate free (no quarantine) is safe HERE because a cancel is sender-initiated: the
+        // sender defers it until its last in-flight RDMA write reached a terminal state
+        // (mPendingCancel / drainOrphanLocal), so nothing can still be writing these regions.
         std::vector<std::uint64_t> deferred;
         mCtx.sendGrants(mCtx.scheduler.reclaimFlow(key, scatteringRegions(), deferred));
         for (auto off : deferred)
@@ -421,11 +424,71 @@ void BounceReceiver::forget(std::string const& peer)
     // (2) Regions of this peer still scattering are reads already RUNNING in a worker — they must not
     //     be re-granted until the worker finishes. reclaimByPrefix defers those; we flag them orphaned
     //     in mScattering so drainScatterDone frees them via freeOrphanRegion on completion.
+    // (3) Every OTHER held region may STILL be RDMA-written by the peer: forget() is
+    //     receiver-initiated (invalidateRemoteAgent), so — unlike an explicit cancel — no
+    //     sender-side drain guarantees those writes ended, and a one-sided write cannot be aborted.
+    //     quarantineFor > 0 keeps them out of the arena until checkTimeouts()'s reapQuarantine.
     std::vector<std::uint64_t> deferred;
-    mCtx.sendGrants(mCtx.scheduler.reclaimByPrefix(peer + kSep, scatteringRegions(), deferred));
+    mCtx.sendGrants(mCtx.scheduler.reclaimByPrefix(
+        peer + kSep, scatteringRegions(), deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs))));
     for (auto off : deferred)
     {
         mScattering[off] = true;
+    }
+}
+
+void BounceReceiver::checkTimeouts()
+{
+    auto const now = std::chrono::steady_clock::now();
+    if (now < mNextSweep)
+    {
+        return; // throttled: no need to scan on every ~1ms tick
+    }
+    // Sweep granularity follows the smallest ENABLED timeout (a tenth of it, clamped to
+    // [50ms, 1s]) instead of a fixed constant: the 60s/30s defaults yield a 1s sweep, while a
+    // config that shrinks the timeouts to sub-second (tests, debugging) automatically gets a
+    // proportionally finer sweep — no hidden floor under the configured values.
+    int smallestMs = mCtx.cfg.receiverFlowTimeoutMs > 0 ? mCtx.cfg.receiverFlowTimeoutMs : 0;
+    if (mCtx.cfg.quarantineMs > 0)
+    {
+        smallestMs = smallestMs > 0 ? std::min(smallestMs, mCtx.cfg.quarantineMs) : mCtx.cfg.quarantineMs;
+    }
+    if (smallestMs <= 0)
+    {
+        // Lease disabled AND quarantine disabled: nothing is ever quarantined (reclaims free
+        // immediately) and no flow can go stale — nothing to sweep for.
+        mNextSweep = now + std::chrono::seconds(1);
+        return;
+    }
+    mNextSweep = now
+        + std::clamp(
+            std::chrono::milliseconds(smallestMs / 10), std::chrono::milliseconds(50), std::chrono::milliseconds(1000));
+    // Quarantine over for any expired region: no write posted before its flow's lease expired can
+    // plausibly still be in flight, so it may re-enter circulation (and may grant a waiter).
+    mCtx.sendGrants(mCtx.scheduler.reapQuarantine());
+    if (mCtx.cfg.receiverFlowTimeoutMs <= 0)
+    {
+        return; // lease disabled (mirror of requestTimeoutMs <= 0 on the sender)
+    }
+    for (auto const& flow : mCtx.scheduler.staleFlows(std::chrono::milliseconds(mCtx.cfg.receiverFlowTimeoutMs)))
+    {
+        // The flow's sender went silent after taking grants: it is dead or unreachable (a LIVE
+        // sender either makes progress or abandons via requestTimeoutMs + cancel well before this
+        // lease expires). Reclaim the whole flow — regions a worker still reads defer as orphans,
+        // all others quarantine (the silent peer's NIC may still be writing them).
+        auto const [peer, rid] = splitKey(flow);
+        TLLM_LOG_WARNING(
+            "BounceTransport(%s): flow lease expired (no progress within %d ms) peer=%s rid=%llu -> reclaiming "
+            "(regions quarantined for %d ms before reuse)",
+            mCtx.selfName.c_str(), mCtx.cfg.receiverFlowTimeoutMs, peer.c_str(), static_cast<unsigned long long>(rid),
+            mCtx.cfg.quarantineMs);
+        std::vector<std::uint64_t> deferred;
+        mCtx.sendGrants(mCtx.scheduler.reclaimFlow(
+            flow, scatteringRegions(), deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs))));
+        for (auto off : deferred)
+        {
+            mScattering[off] = true;
+        }
     }
 }
 
@@ -610,8 +673,11 @@ std::shared_future<TransferState> BounceSender::submit(
     catch (std::exception const& e)
     {
         // The eligibility gate (shouldUseBounce) screens the plan's preconditions, so this is a
-        // should-not-happen defense: resolve the future to FAILURE (the caller's task fails and can
-        // retry on the standard path) instead of letting the exception unwind out of submit().
+        // should-not-happen defense: resolve the future to FAILURE instead of letting the exception
+        // unwind out of submit(). Bounce admission is final for a request — a failure here (or later
+        // in the protocol) fails the transfer; there is deliberately no automatic re-submit on the
+        // standard NIXL path, so a bounce-layer fault surfaces to the caller instead of being
+        // silently absorbed as a slow success. Whether to retry is the caller's decision.
         TLLM_LOG_WARNING(
             "BounceTransport(%s): plan build for peer %s rejected: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
         promise->set_value(TransferState::kFAILURE);
@@ -1615,6 +1681,7 @@ void BounceTransport::tick(std::string& peer, std::string& blob)
     drainForgets();
     mSender.drainPendingPosts();        // retry credits parked when the arena was full (onAck freed regions)
     mSender.checkTimeouts();
+    mReceiver.checkTimeouts();          // expire grant leases of silent senders + free post-quarantine regions
     // Idle backoff: when there IS in-flight work (busy → 0ms poll) but nothing actually advanced
     // this pass — the classic case being a gather stalled behind unrelated model kernels (gather
     // event stays NotReady) — keep latency low for the first few spins, then sleep briefly so we

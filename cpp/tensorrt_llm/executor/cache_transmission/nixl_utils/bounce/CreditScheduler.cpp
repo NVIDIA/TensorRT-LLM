@@ -25,11 +25,13 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 CreditScheduler::CreditScheduler(std::uint64_t baseAddr, std::size_t arenaSizeBytes,
-    std::size_t arenaAllocationGranularityBytes, std::uint32_t maxInflightChunksPerRequest)
+    std::size_t arenaAllocationGranularityBytes, std::uint32_t maxInflightChunksPerRequest,
+    std::function<std::chrono::steady_clock::time_point()> clock)
     : mArena(arenaSizeBytes, arenaAllocationGranularityBytes)
     , mBaseAddr(baseAddr)
     , mMaxInflightChunksPerRequest(maxInflightChunksPerRequest == 0 ? 1 : maxInflightChunksPerRequest)
     , mEagerBudgetBytes(mArena.capacity() / 2)
+    , mClock(clock ? std::move(clock) : [] { return std::chrono::steady_clock::now(); })
 {
 }
 
@@ -175,6 +177,7 @@ std::vector<Grant> CreditScheduler::schedule()
             st.pending.pop_front();
             st.held.insert(*off);
             st.blockedAtGrantSequence.reset();
+            st.lastProgress = mClock(); // issuing a grant renews the flow's lease
             grants.push_back(Grant{*mDrainFlow, *off, mBaseAddr + *off, want});
             mCursor = (idx + 1) % mRing.size();
             ++mGrantSequence;
@@ -214,6 +217,7 @@ std::vector<Grant> CreditScheduler::schedule()
             st.pending.pop_front();
             st.held.insert(*off);
             st.blockedAtGrantSequence.reset();
+            st.lastProgress = mClock();         // issuing a grant renews the flow's lease
             grants.push_back(Grant{mRing[idx], *off, mBaseAddr + *off, want});
             mCursor = (idx + 1) % mRing.size(); // next sweep starts AFTER this flow -> round-robin
             ++mGrantSequence;
@@ -246,6 +250,7 @@ std::vector<Grant> CreditScheduler::onWant(std::string const& flow, std::vector<
     auto& st = mFlows[flow];
     st.pending.assign(chunkBytes.begin(), chunkBytes.end());
     st.blockedAtGrantSequence.reset();
+    st.lastProgress = mClock(); // a fresh WANT renews the flow's lease
     if (!chunkBytes.empty())
     {
         ensureInRing(flow);
@@ -265,14 +270,15 @@ std::vector<Grant> CreditScheduler::onScatterDone(std::string const& flow, std::
     if (it != mFlows.end() && it->second.held.erase(offset) > 0)
     {
         mArena.free(offset);
+        it->second.lastProgress = mClock(); // a completed scatter is flow progress: renew the lease
     }
     // else: not held by this flow (dup ACK / already reclaimed) -> ignore, stay idempotent.
     eraseIfDone(flow);
     return schedule();
 }
 
-void CreditScheduler::dropFlow(
-    std::string const& flow, std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut)
+void CreditScheduler::dropFlow(std::string const& flow, std::unordered_set<std::uint64_t> const& busy,
+    std::vector<std::uint64_t>& deferredOut, std::chrono::milliseconds quarantineFor)
 {
     auto it = mFlows.find(flow);
     if (it == mFlows.end())
@@ -288,6 +294,13 @@ void CreditScheduler::dropFlow(
             deferredOut.push_back(off);
             mOrphans.insert(off);
         }
+        else if (quarantineFor.count() > 0)
+        {
+            // Receiver-initiated reclaim: the peer may still be RDMA-writing this granted region
+            // (a one-sided write cannot be aborted, and no sender-side drain preceded this call).
+            // Keep it allocated (never re-grantable) until reapQuarantine() passes the deadline.
+            mQuarantined.emplace(off, mClock() + quarantineFor);
+        }
         else
         {
             mArena.free(off);
@@ -297,8 +310,9 @@ void CreditScheduler::dropFlow(
     dropFromRing(flow);
 }
 
-std::vector<Grant> CreditScheduler::reclaimByPrefix(
-    std::string const& prefix, std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut)
+std::vector<Grant> CreditScheduler::reclaimByPrefix(std::string const& prefix,
+    std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut,
+    std::chrono::milliseconds quarantineFor)
 {
     // Guard the degenerate empty prefix: compare(0,0,"")==0 for EVERY key, so it would reclaim all
     // flows of all peers. Callers always pass a real "peer<sep>" prefix; refuse empty defensively.
@@ -317,17 +331,58 @@ std::vector<Grant> CreditScheduler::reclaimByPrefix(
     }
     for (auto const& key : victims)
     {
-        dropFlow(key, busy, deferredOut);
+        dropFlow(key, busy, deferredOut, quarantineFor);
     }
     return schedule();
 }
 
-std::vector<Grant> CreditScheduler::reclaimFlow(
-    std::string const& flow, std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut)
+std::vector<Grant> CreditScheduler::reclaimFlow(std::string const& flow, std::unordered_set<std::uint64_t> const& busy,
+    std::vector<std::uint64_t>& deferredOut, std::chrono::milliseconds quarantineFor)
 {
     std::lock_guard<std::mutex> lk(mMu);
-    dropFlow(flow, busy, deferredOut);
+    dropFlow(flow, busy, deferredOut, quarantineFor);
     return schedule();
+}
+
+std::vector<std::string> CreditScheduler::staleFlows(std::chrono::milliseconds idleLimit) const
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    auto const now = mClock();
+    std::vector<std::string> stale;
+    for (auto const& [key, st] : mFlows)
+    {
+        // The lease protects arena REGIONS, so only flows holding one can go stale. A pending-only
+        // flow ties up no memory and may legitimately be idle for long: it is simply queued behind a
+        // full arena (its own sender's requestTimeoutMs bounds that wait). If its sender is dead it
+        // lingers as a few bytes of bookkeeping until a grant finally starts its lease.
+        if (!st.held.empty() && now - st.lastProgress > idleLimit)
+        {
+            stale.push_back(key);
+        }
+    }
+    return stale;
+}
+
+std::vector<Grant> CreditScheduler::reapQuarantine()
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    auto const now = mClock();
+    bool freed = false;
+    for (auto it = mQuarantined.begin(); it != mQuarantined.end();)
+    {
+        if (now >= it->second)
+        {
+            mArena.free(it->first);
+            it = mQuarantined.erase(it);
+            freed = true;
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    // Nothing freed -> nothing changed; skip the schedule() ring sweep this polling tick runs into.
+    return freed ? schedule() : std::vector<Grant>{};
 }
 
 bool CreditScheduler::heldByFlow(std::string const& flow, std::uint64_t offset) const

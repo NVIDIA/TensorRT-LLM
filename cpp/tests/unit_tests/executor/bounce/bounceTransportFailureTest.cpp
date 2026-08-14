@@ -271,6 +271,88 @@ TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
     EXPECT_EQ(cudaFree(dst), cudaSuccess);
 }
 
+// A sender that takes a GRANT and then dies emits neither DATA nor a cancel, so nothing
+// event-driven can ever reclaim its region — the receiver's grant lease must. After
+// receiverFlowTimeoutMs of silence the flow is reclaimed and its region quarantined for
+// quarantineMs, after which it must serve the next waiting flow; a late DATA for the expired
+// grant must be dropped (no scatter, no ACK).
+TEST(BounceTransportFailure, GrantLeaseExpiryReclaimsSilentSendersRegion)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto c = cfg(/*timeoutMs=*/30000); // sender-side request timeout: irrelevant here
+    c.receiverFlowTimeoutMs = 400;
+    c.quarantineMs = 200;
+    b::ZmqControlChannel sender("glSender");
+    b::ZmqControlChannel receiverChannel("glReceiver");
+    FailingTransferEngine receiverEngine;                   // receiver never posts writes; engine unused on its side
+    auto receiverBackend = makeBackend(c, /*regionCap=*/1); // arena holds exactly ONE region
+    auto receiver = std::make_unique<b::BounceTransport>(
+        "glReceiver", c, 0, &receiverChannel, &receiverEngine, receiverBackend.arena.get(), receiverBackend.exec.get());
+    ASSERT_TRUE(sender.addPeer("glReceiver", receiverChannel.localEndpoint()));
+
+    auto waitGrant = [&](std::uint64_t rid, std::chrono::milliseconds budget, std::vector<b::BounceCreditEntry>& out)
+    {
+        auto const deadline = std::chrono::steady_clock::now() + budget;
+        while (std::chrono::steady_clock::now() < deadline && out.empty())
+        {
+            std::string peer;
+            std::string blob;
+            b::BounceMsgHeader h{};
+            if (sender.recv(peer, blob, 20) && b::decodeHeader(blob, h)
+                && static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kGRANT && h.requestId == rid)
+            {
+                EXPECT_TRUE(b::decodeCredits(blob, h, out));
+            }
+        }
+        return !out.empty();
+    };
+
+    // rid=1 takes the single region... and goes silent (models a dead/unreachable sender).
+    sender.sendTo("glReceiver", b::encodeWant(/*rid=*/1, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credit1;
+    ASSERT_TRUE(waitGrant(1, std::chrono::seconds(5), credit1));
+    ASSERT_EQ(credit1.size(), 1u);
+
+    // rid=2 wants the region too. Before the lease (400ms) + quarantine (200ms) can possibly have
+    // elapsed, it must NOT be granted (premature reclaim would race rid=1's hypothetical write).
+    sender.sendTo("glReceiver", b::encodeWant(/*rid=*/2, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credit2;
+    EXPECT_FALSE(waitGrant(2, std::chrono::milliseconds(200), credit2)) << "region re-granted before lease expiry";
+    // ...but once the silent flow's lease expires and the quarantine passes, it must be.
+    ASSERT_TRUE(waitGrant(2, std::chrono::seconds(10), credit2)) << "silent sender's region never reclaimed";
+    ASSERT_EQ(credit2.size(), 1u);
+    EXPECT_EQ(credit2.front().regionHandle, credit1.front().regionHandle); // the one region, recycled
+
+    // Late DATA for the EXPIRED grant must be dropped (flow reclaimed -> heldByFlow false): exactly
+    // one ACK total, and it belongs to rid=2's legitimate DATA.
+    void* dst = nullptr;
+    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
+    b::BounceScatterRun run{0, reinterpret_cast<std::uintptr_t>(dst), 0, 0, 256, 1};
+    sender.sendTo("glReceiver", b::encodeData(/*rid=*/1, 0, 1, credit1.front().regionHandle, {run}));
+    sender.sendTo("glReceiver", b::encodeData(/*rid=*/2, 0, 1, credit2.front().regionHandle, {run}));
+    int ackRid1 = 0;
+    int ackRid2 = 0;
+    auto const ackDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < ackDeadline)
+    {
+        std::string peer;
+        std::string blob;
+        b::BounceMsgHeader h{};
+        if (sender.recv(peer, blob, 20) && b::decodeHeader(blob, h)
+            && static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kACK)
+        {
+            ackRid1 += h.requestId == 1 ? 1 : 0;
+            ackRid2 += h.requestId == 2 ? 1 : 0;
+        }
+    }
+    EXPECT_EQ(ackRid1, 0) << "late DATA for an expired grant was scattered/ACKed";
+    EXPECT_EQ(ackRid2, 1);
+
+    receiver->shutdown();
+    EXPECT_EQ(cudaFree(dst), cudaSuccess);
+}
+
 // GRANT and ACK messages carry peer-owned capabilities. Only the intended peer may grant, and an
 // ACK is valid only for the matching region after that chunk has reached Sent.
 TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)

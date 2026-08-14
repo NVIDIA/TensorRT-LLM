@@ -19,7 +19,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -571,6 +573,111 @@ TEST(CreditScheduler, ReclaimFlowFreesHeldDefersBusyAndHeldByFlow)
     std::vector<std::uint64_t> none;
     EXPECT_TRUE(s.reclaimFlow("nope", {}, none).empty());
     EXPECT_TRUE(none.empty());
+}
+
+// Scheduler over `nRegions` regions with a controllable fake clock: tests advance *now instead of
+// sleeping, keeping the lease/quarantine tests deterministic and instant.
+b::CreditScheduler makeTimedSched(
+    std::uint32_t nRegions, std::uint32_t maxInflight, std::shared_ptr<std::chrono::steady_clock::time_point> now)
+{
+    return b::CreditScheduler(
+        kBase, static_cast<std::size_t>(nRegions) * kRegion, kRegion, maxInflight, [now] { return *now; });
+}
+
+TEST(CreditScheduler, ReceiverReclaimQuarantinesUnwrittenRegionsUntilReaped)
+{
+    // Receiver-initiated reclaim (peer loss / lease expiry): granted-but-unwritten regions may STILL
+    // be RDMA-written by the peer, so quarantineFor > 0 must keep them out of the arena — not free
+    // them — until reapQuarantine() passes the time barrier.
+    auto now = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    auto s = makeTimedSched(/*nRegions=*/2, /*maxInflight=*/16, now);
+    std::string const flowA = std::string("A\x1f") + "1";
+    std::string const flowB = std::string("B\x1f") + "1";
+    auto g = s.onWant(flowA, want(2));
+    ASSERT_EQ(g.size(), 2u);
+
+    std::vector<std::uint64_t> deferred;
+    auto re = s.reclaimFlow(flowA, /*busy=*/{}, deferred, std::chrono::seconds(30));
+    EXPECT_TRUE(re.empty());                        // no waiter yet
+    EXPECT_TRUE(deferred.empty());
+    EXPECT_EQ(s.trackedFlows(), 0u);                // flow gone...
+    EXPECT_FALSE(s.heldByFlow(flowA, g[0].offset)); // ...so late DATA gets dropped
+    EXPECT_EQ(freeRegions(s), 0u);                  // ...but NOTHING went back to the arena
+
+    // A new flow must not be granted a quarantined region, and reaping early frees nothing.
+    EXPECT_TRUE(s.onWant(flowB, want(1)).empty());
+    EXPECT_TRUE(s.reapQuarantine().empty());
+    EXPECT_EQ(freeRegions(s), 0u);
+
+    // Quarantine over -> the regions re-enter circulation; one serves the waiter.
+    *now += std::chrono::seconds(31);
+    auto re2 = s.reapQuarantine();
+    ASSERT_EQ(re2.size(), 1u);
+    EXPECT_EQ(re2[0].flow, flowB);
+    EXPECT_EQ(s.heldCount(flowB), 1u);
+    EXPECT_EQ(freeRegions(s), 1u);
+
+    // Reaping again is a harmless no-op (the reaped offsets are live/free now, not re-freed).
+    EXPECT_TRUE(s.reapQuarantine().empty());
+    EXPECT_EQ(freeRegions(s), 1u);
+}
+
+TEST(CreditScheduler, ReceiverReclaimBusyRegionsDeferAsOrphansNotQuarantine)
+{
+    // Busy takes precedence: a region a scatter worker still READS follows the orphan path
+    // (freeOrphanRegion on scatter completion), never the quarantine path — reapQuarantine must not
+    // free it even after the quarantine window.
+    auto now = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    auto s = makeTimedSched(/*nRegions=*/2, /*maxInflight=*/16, now);
+    std::string const flow = std::string("A\x1f") + "1";
+    auto g = s.onWant(flow, want(2));
+    ASSERT_EQ(g.size(), 2u);
+
+    std::unordered_set<std::uint64_t> busy{g[0].offset};
+    std::vector<std::uint64_t> deferred;
+    (void) s.reclaimFlow(flow, busy, deferred, std::chrono::seconds(30));
+    ASSERT_EQ(deferred.size(), 1u);
+    EXPECT_EQ(deferred[0], g[0].offset);
+
+    *now += std::chrono::seconds(31);
+    EXPECT_TRUE(s.reapQuarantine().empty());
+    EXPECT_EQ(freeRegions(s), 1u); // only the quarantined region came back; the orphan is still busy
+
+    (void) s.freeOrphanRegion(g[0].offset);
+    EXPECT_EQ(freeRegions(s), 2u);
+}
+
+TEST(CreditScheduler, StaleFlowsReportsIdleFlowsOnly)
+{
+    // The lease that makes a dead sender observable: a flow with no progress (WANT / grant issued /
+    // scatter completed) beyond the idle limit is reported stale; any progress renews the lease.
+    auto now = std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
+    auto s = makeTimedSched(/*nRegions=*/2, /*maxInflight=*/1, now);
+    std::string const dead = std::string("A\x1f") + "1";
+    std::string const live = std::string("B\x1f") + "1";
+    auto ga = s.onWant(dead, want(1));
+    ASSERT_EQ(ga.size(), 1u);
+    auto gb = s.onWant(live, want(2)); // one granted, one pending (in-flight cap 1)
+    ASSERT_EQ(gb.size(), 1u);
+
+    // t+40s: `live` completes its first chunk -> frees the region + gets its next grant = progress.
+    *now += std::chrono::seconds(40);
+    ASSERT_EQ(s.onScatterDone(live, gb[0].offset).size(), 1u);
+
+    // t+70s: `dead` has been silent for 70s -> stale; `live` progressed 30s ago -> not stale.
+    *now += std::chrono::seconds(30);
+    auto stale = s.staleFlows(std::chrono::seconds(60));
+    ASSERT_EQ(stale.size(), 1u);
+    EXPECT_EQ(stale[0], dead);
+    EXPECT_TRUE(s.staleFlows(std::chrono::seconds(90)).empty()); // longer lease: nobody is stale yet
+
+    // Reclaim + quarantine + reap: the arena fully recovers the dead flow's region.
+    std::vector<std::uint64_t> deferred;
+    (void) s.reclaimFlow(dead, /*busy=*/{}, deferred, std::chrono::seconds(30));
+    EXPECT_EQ(freeRegions(s), 0u); // quarantined, not yet back
+    *now += std::chrono::seconds(31);
+    (void) s.reapQuarantine();
+    EXPECT_EQ(freeRegions(s), 1u); // recovered (live still holds its in-flight second chunk)
 }
 
 TEST(CreditScheduler, SharedArenaLocalAndRemoteShareOneAllocator)
