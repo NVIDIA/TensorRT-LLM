@@ -1369,14 +1369,14 @@ test = ["pytest (>=6)"]
 
 [[package]]
 name = "filelock"
-version = "3.32.2"
+version = "3.32.3"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.32.2-py3-none-any.whl", hash = "sha256:87dd94cf281e586d135fa51132b8e3d9a598b316e90377a288663c9321036c82"},
-    {file = "filelock-3.32.2.tar.gz", hash = "sha256:c33351e1f49cae33414acbc6d56784e6ecee82514ec90795da1161fc4836b5b8"},
+    {file = "filelock-3.32.3-py3-none-any.whl", hash = "sha256:7f0ca4bcc0e181c60dbbd8aa9ab5b120ebb99e4e064e83636340056f833a1f09"},
+    {file = "filelock-3.32.3.tar.gz", hash = "sha256:0ffa185a3540854c95caa7fa76b76cb219d907415e2c5dc9af25fd970563487f"},
 ]
 
 [[package]]
@@ -5658,22 +5658,6 @@ files = [
 ]
 
 [[package]]
-name = "smg-grpc-proto"
-version = "0.4.14"
-description = "SMG gRPC proto definitions for vLLM, TRT-LLM, MLX, TokenSpeed, and SGLang"
-optional = false
-python-versions = ">=3.10"
-groups = ["main"]
-files = [
-    {file = "smg_grpc_proto-0.4.14-py3-none-any.whl", hash = "sha256:94ead6971aafbb24755ebcbd4fb680e38d067d3dc6bfeb2b5feeae3f2664da38"},
-    {file = "smg_grpc_proto-0.4.14.tar.gz", hash = "sha256:a8ea20872934472c94ffa192bafb2a4f71bc591ab4bfb240cb567801210fbc0f"},
-]
-
-[package.dependencies]
-grpcio = ">=1.81.1"
-protobuf = ">=5.26.0"
-
-[[package]]
 name = "sniffio"
 version = "1.3.1"
 description = "Sniff out which async library your code is running under"
@@ -6283,14 +6267,14 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "uvicorn"
-version = "0.52.1"
+version = "0.52.3"
 description = "The lightning-fast ASGI server."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "uvicorn-0.52.1-py3-none-any.whl", hash = "sha256:e4403f9d93188cf9d1088e9f40e3acd12630e2df8675316704379a7fc20fff6a"},
-    {file = "uvicorn-0.52.1.tar.gz", hash = "sha256:112ec661814189acbccd3f7b86460147cc065fc92c0821afa78918780e4354dd"},
+    {file = "uvicorn-0.52.3-py3-none-any.whl", hash = "sha256:116af2710dbf47c80f463cd20ee4884b6662f4c9f227d797ddc7279d2fcc2c7c"},
+    {file = "uvicorn-0.52.3.tar.gz", hash = "sha256:18857b9e6579300be55c91c0a1cfd37d9a2cf0cabea33b88275f199eb73b8b58"},
 ]
 
 [package.dependencies]
@@ -6823,4 +6807,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "095bbeb33ddd070d92200c4f4ed0dfaea0205b9a8132c20a78d3ffa1b88582cd"
+content-hash = "9e47fb5c2154341a645f4b6ebc41fc0af53b3997e2b2008a99f4ea7ba43efcd0"

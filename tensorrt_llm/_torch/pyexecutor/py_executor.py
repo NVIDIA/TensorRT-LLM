@@ -748,6 +748,11 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+        # Requests with a buffered terminal response are terminated only after
+        # the synchronized flush has published that response.  This preserves
+        # queue-backed client delivery while retaining normal termination as
+        # the single owner of resource and result-queue cleanup.
+        self._pending_response_terminations: List[LlmRequest] = []
         # Same buffer-then-synced-flush pattern as _pending_transfer_responses
         # above: _handle_responses and _append_iter_stats are reached from
         # per-rank-divergent gates, so their tp_allgather collectives are
@@ -1177,7 +1182,10 @@ class PyExecutor:
                     (request.py_request_id, response))
             if self.async_transfer_manager.end_transfer(request):
                 self.active_requests.remove(request)
-                self._terminate_request(request)
+                if response:
+                    self._pending_response_terminations.append(request)
+                else:
+                    self._terminate_request(request)
             return
         if self.async_transfer_manager.end_transfer(request):
             if transfer_failed:
@@ -1195,11 +1203,15 @@ class PyExecutor:
         """
         responses = self._pending_transfer_responses
         self._pending_transfer_responses = []
+        requests_to_terminate = self._pending_response_terminations
+        self._pending_response_terminations = []
         if responses or self.enable_attention_dp:
             # Even when this rank has no responses we must participate in the
             # collective when ADP is enabled so that the other rank's gather
             # can complete.
             self._enqueue_responses(responses)
+        for request in requests_to_terminate:
+            self._terminate_request(request)
 
     def _handle_kv_transfer_timeouts_synced(self):
         """ADP-safe drain of the KV-transfer-timeout consensus collective.
@@ -4097,7 +4109,8 @@ class PyExecutor:
                 self.is_shutdown = True
                 self._handle_errors(error_msg,
                                     requests=None,
-                                    charge_budget=False)
+                                    charge_budget=False,
+                                    fatal_is_collective_aligned=True)
                 return
 
         if not (self.enable_attention_dp and self.dist.world_size != 1):
@@ -4192,6 +4205,13 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
+                    # _handle_disagg_cache_errors_synced() can buffer a
+                    # non-fatal response before scheduling observes shutdown.
+                    # Drain it before leaving the loop so the client does not
+                    # wait for its own timeout. Scheduling shutdown is
+                    # model-parallel synchronized, so every ADP rank reaches
+                    # this collective together.
+                    self._flush_pending_transfer_responses()
                     self._event_loop_completed = True
                     break
 
@@ -4203,6 +4223,11 @@ class PyExecutor:
                             self.kv_cache_manager.revert_allocate_generation(
                                 req)
                     self._finalize_adp_dummy_allocation(False)
+                    # _check_benchmark_disagg_gate() makes this retry decision
+                    # with a model-parallel all-gather. Flush before retrying so
+                    # a response buffered at the top of this pass is not held
+                    # until the benchmark fill gate opens.
+                    self._flush_pending_transfer_responses()
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -4352,7 +4377,6 @@ class PyExecutor:
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
-                    self._flush_pending_transfer_responses()
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
@@ -4383,6 +4407,14 @@ class PyExecutor:
                     self._check_kv_transfer_timeout()
 
                 self._kv_connector_terminate_requests()
+
+                # This is the one ADP-synchronized response flush for a
+                # completed executor-loop pass. It is deliberately outside
+                # ``if can_queue``: non-fatal errors can be buffered on an
+                # idle pass, and every ADP rank must enter the tp_gather in
+                # the same order. Keep it after all per-pass error handling
+                # so a response is not needlessly delayed to the next pass.
+                self._flush_pending_transfer_responses()
 
                 if self.enable_iter_perf_stats and sample_state is not None:
                     self._process_iter_stats(
@@ -4728,6 +4760,7 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
+                    self._flush_pending_transfer_responses()
                     self._event_loop_completed = True
                     break
 
@@ -4739,6 +4772,7 @@ class PyExecutor:
                             self.kv_cache_manager.revert_allocate_generation(
                                 req)
                     self._finalize_adp_dummy_allocation(False)
+                    self._flush_pending_transfer_responses()
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -7348,7 +7382,8 @@ class PyExecutor:
                        error_msg: Optional[str] = None,
                        *,
                        requests: Optional[List[LlmRequest]] = None,
-                       charge_budget: bool = True) -> None:
+                       charge_budget: bool = True,
+                       fatal_is_collective_aligned: bool = False) -> None:
         """Fail requests and optionally initiate shutdown on fatal errors.
 
         When ``charge_budget`` is True (the default), classifies the error
@@ -7384,6 +7419,14 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
+        multi_rank_adp = (self.enable_attention_dp
+                          and self.dist.world_size != 1)
+        # ``fatal_is_collective_aligned`` is set only by the synchronized caller
+        # (_handle_disagg_cache_errors_synced, after its world allreduce), which
+        # guarantees every ADP rank enters the fatal path in the same collective
+        # order. Do NOT infer it from ``self._fatal_error is not None``: a
+        # rank-local setter would then route into a tp_gather while peers are
+        # elsewhere, recreating the desync this path exists to prevent.
 
         budget_fatal = (self._error_budget.consume(error_msg)
                         if charge_budget else False)
@@ -7438,14 +7481,17 @@ class PyExecutor:
                                      client_id=getattr(item.request,
                                                        'client_id', None))))
 
-            adp_collective_required = (self.enable_attention_dp
-                                       and self.dist.world_size != 1)
-            if waiting_responses or adp_collective_required:
-                self._enqueue_responses(waiting_responses)
+            if not multi_rank_adp:
                 if waiting_responses:
+                    self._enqueue_responses(waiting_responses)
                     logger.info(
                         f"Drained {len(waiting_responses)} queued requests "
                         "on fatal error")
+            elif fatal_is_collective_aligned:
+                # Synchronized fatal: every ADP rank enters this drain gather
+                # together, so issue it even when this rank has no queued
+                # responses, to stay peer-aligned.
+                self._enqueue_responses(waiting_responses)
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
@@ -7463,12 +7509,65 @@ class PyExecutor:
                 request for request in self.active_requests
                 if request not in requests
             ]
-        self._enqueue_responses(list(error_responses.items()))
-        for request in failed_requests:
-            self._terminate_request(request)
+        defer_termination = False
+        publish_immediately = False
+        if is_fatal:
+            if multi_rank_adp:
+                if fatal_is_collective_aligned:
+                    # Synchronized fatal: all ranks agree and march through the
+                    # aligned publish/terminate collectives together, so publish
+                    # here instead of diverging.
+                    publish_immediately = True
+                else:
+                    # A novel rank-local fatal can be observed by one ADP rank
+                    # before its peers reach their next collective. Do not issue
+                    # tp_gather here: it would desynchronize the group exactly
+                    # like a rank-local non-fatal response. Skip the gather and
+                    # raise below; the distributed supervisor tears down peers.
+                    logger.error(
+                        "Skipping rank-local fatal response gather under ADP")
+            else:
+                publish_immediately = True
+        elif multi_rank_adp:
+            # Under attention DP, _enqueue_responses performs a tp_gather
+            # that every rank must enter in the same order. Non-fatal errors
+            # (e.g. a failed disagg KV transfer) are observed by a single
+            # rank, so enqueueing here would pair this rank's gather against
+            # a different collective on its peers — typically the per-step
+            # tp_allgather(batch_size) — corrupting both sides. Buffer the
+            # responses instead; every rank flushes the buffer together at
+            # _flush_pending_transfer_responses.
+            self._pending_transfer_responses.extend(error_responses.items())
+            self._pending_response_terminations.extend(failed_requests)
+            defer_termination = True
+        else:
+            # Without multi-rank ADP there is no rank-divergent collective, so
+            # publish the error immediately.
+            publish_immediately = True
+
+        if publish_immediately:
+            # A fatal executor exits before the next normal flush; a non-ADP
+            # executor has no rank-divergent collective. Both can publish the
+            # current errors plus any previously buffered terminal responses.
+            pending = self._pending_transfer_responses
+            self._pending_transfer_responses = []
+            pending_terminations = self._pending_response_terminations
+            self._pending_response_terminations = []
+            self._enqueue_responses(pending + list(error_responses.items()))
+            for request in pending_terminations:
+                self._terminate_request(request)
+
+        if not defer_termination:
+            for request in failed_requests:
+                self._terminate_request(request)
 
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
+            if multi_rank_adp and not fatal_is_collective_aligned:
+                # Only a novel rank-local fatal raises to force local teardown;
+                # a synchronized fatal has already published in lockstep and
+                # tears down every rank together via is_shutdown.
+                raise self._fatal_error
 
     def _terminate_request(self, request: LlmRequest):
         # Dummy requests don't participate in disagg KV cache transfers,
@@ -7568,8 +7667,27 @@ class PyExecutor:
                 gather_responses = []
                 if responses_list is not None:
                     for resp in responses_list:
-                        if resp is not None:
-                            gather_responses.extend(resp)
+                        if resp is None:
+                            continue
+                        if not isinstance(resp, (list, tuple)):
+                            # A non-list contribution means the TP collective
+                            # was matched against a *different* collective on
+                            # a peer rank (collectives pair by call order, not
+                            # by type). A common mismatch partner is the
+                            # per-step tp_allgather(batch_size), which makes
+                            # the stray payload an int. The gathered data is
+                            # corrupt on every rank, so fail fast instead of
+                            # raising an opaque TypeError below or silently
+                            # enqueueing garbage responses.
+                            raise RuntimeError(
+                                f"_enqueue_responses: TP collective desync — "
+                                f"gathered a {type(resp).__name__} "
+                                f"instead of a response list. A peer rank "
+                                f"entered a different collective (e.g. "
+                                f"tp_allgather(batch_size)); check for "
+                                f"per-rank-divergent callers of "
+                                f"_enqueue_responses.")
+                        gather_responses.extend(resp)
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
