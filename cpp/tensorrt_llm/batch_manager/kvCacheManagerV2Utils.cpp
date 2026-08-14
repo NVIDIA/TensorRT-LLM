@@ -223,6 +223,7 @@ namespace
 void gatherBasePageRowsImpl(at::Tensor const& source, at::Tensor destination, SizeType32 const* copyIndexData,
     int64_t copyIndexSize, SizeType32 numBlocks)
 {
+    constexpr int64_t kKvFactor = 2;
     TLLM_CHECK_WITH_INFO(source.device().is_cpu(), "source must be a CPU tensor");
     TLLM_CHECK_WITH_INFO(destination.device().is_cpu(), "destination must be a CPU tensor");
     TLLM_CHECK_WITH_INFO(source.scalar_type() == at::kInt, "source must contain int32 values");
@@ -230,8 +231,8 @@ void gatherBasePageRowsImpl(at::Tensor const& source, at::Tensor destination, Si
     TLLM_CHECK_WITH_INFO(source.is_contiguous(), "source must be contiguous");
     TLLM_CHECK_WITH_INFO(destination.is_contiguous(), "destination must be contiguous");
     TLLM_CHECK_WITH_INFO(
-        source.dim() == 4 && source.size(2) == 2, "source must be [numPools, rowCapacity, 2, maxBlocksPerSeq]");
-    TLLM_CHECK_WITH_INFO(destination.dim() == 4 && destination.size(2) == 2,
+        source.dim() == 4 && source.size(2) == kKvFactor, "source must be [numPools, rowCapacity, 2, maxBlocksPerSeq]");
+    TLLM_CHECK_WITH_INFO(destination.dim() == 4 && destination.size(2) == kKvFactor,
         "destination must be [numPools, numSequences, 2, numBlocksPerSeq]");
     TLLM_CHECK_WITH_INFO(destination.size(0) == source.size(0), "source and destination pool counts must match");
     TLLM_CHECK_WITH_INFO(destination.size(1) >= copyIndexSize, "destination must have one row per copyIndex entry");
@@ -253,8 +254,8 @@ void gatherBasePageRowsImpl(at::Tensor const& source, at::Tensor destination, Si
         {
             auto const sourceRow = static_cast<int64_t>(copyIndexData[destinationRow]);
             TLLM_CHECK_WITH_INFO(sourceRow >= 0 && sourceRow < sourceRows, "copyIndex row is out of bounds");
-            auto const sourceOffset = ((pool * sourceRows + sourceRow) * 2) * sourceBlocks;
-            auto const destinationOffset = ((pool * destinationRows + destinationRow) * 2) * destinationBlocks;
+            auto const sourceOffset = ((pool * sourceRows + sourceRow) * kKvFactor) * sourceBlocks;
+            auto const destinationOffset = ((pool * destinationRows + destinationRow) * kKvFactor) * destinationBlocks;
             std::memcpy(destinationData + destinationOffset, sourceData + sourceOffset, copyBytes);
         }
     }
