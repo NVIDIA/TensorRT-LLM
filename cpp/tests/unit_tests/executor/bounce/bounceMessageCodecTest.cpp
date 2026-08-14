@@ -229,7 +229,7 @@ TEST(BounceMessageCodec, HandshakeRoundTrip)
 {
     b::BounceHandshake in;
     in.wireVersion = b::kBounceVersion;
-    in.controlKind = b::BounceControlKind::kNIXL_NOTIF;
+    in.controlKind = b::BounceControlKind::kZMQ;
     in.arenaUsableCapacityBytes = 256ULL << 20;
     in.maxChunkSizeBytes = 32ULL << 20;
     in.endpoint = "tcp://10.0.0.1:5555";

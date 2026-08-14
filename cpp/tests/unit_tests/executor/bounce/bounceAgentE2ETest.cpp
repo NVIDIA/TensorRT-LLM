@@ -156,7 +156,6 @@ void clearBounceEnv()
     unsetenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES");
     unsetenv("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST");
     unsetenv("TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES");
-    unsetenv("TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS");
 }
 } // namespace
 
@@ -357,52 +356,6 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
     b->shutdown();
     cudaFree(bufs.src);
     cudaFree(bufs.dst);
-    clearBounceEnv();
-}
-
-TEST(BounceAgentE2E, NixlNotificationsPreserveSyncMessages)
-{
-    if (!hasCuda())
-    {
-        GTEST_SKIP() << "no CUDA device";
-    }
-    setBounceEnv();
-    setenv("TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS", "1", 1);
-
-    std::unique_ptr<kvc::NixlTransferAgent> a;
-    std::unique_ptr<kvc::NixlTransferAgent> b;
-    try
-    {
-        a = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{"notifAgentA", true, false, true});
-        b = std::make_unique<kvc::NixlTransferAgent>(kvc::BaseAgentConfig{"notifAgentB", true, false, true});
-    }
-    catch (std::exception const& e)
-    {
-        clearBounceEnv();
-        GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
-    }
-
-    a->loadRemoteAgent("notifAgentB", b->getLocalAgentDesc());
-    std::string const expected = "ordinary-sync-message";
-    a->notifySyncMessage("notifAgentB", expected);
-
-    bool received = false;
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (!received && std::chrono::steady_clock::now() < deadline)
-    {
-        auto notifications = b->getNotifiedSyncMessages();
-        auto const it = notifications.find("notifAgentA");
-        received = it != notifications.end()
-            && std::find(it->second.begin(), it->second.end(), expected) != it->second.end();
-        if (!received)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    }
-    EXPECT_TRUE(received) << "NIXL bounce control consumed an ordinary sync message";
-
-    a->shutdown();
-    b->shutdown();
     clearBounceEnv();
 }
 

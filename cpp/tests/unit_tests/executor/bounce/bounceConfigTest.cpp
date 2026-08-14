@@ -130,7 +130,6 @@ TEST(BounceConfig, DescriptiveNamesParse)
     env.set("TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS", "900");
     env.set("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", "yes");
     env.set("TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER", "false");
-    env.set("TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS", "on");
     env.set("TRTLLM_NIXL_BOUNCE_DISABLE_SCATTER_RUN_MERGING", "1");
     env.set("TRTLLM_NIXL_BOUNCE_USE_CUB_COPY", "true");
     env.set("TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS", "true");
@@ -144,7 +143,6 @@ TEST(BounceConfig, DescriptiveNamesParse)
     EXPECT_EQ(cfg.requestTimeoutMs, 900);
     EXPECT_TRUE(cfg.disableFabricMemory);
     EXPECT_FALSE(cfg.enableEagerGather);
-    EXPECT_TRUE(cfg.useNixlNotifications);
     EXPECT_TRUE(cfg.disableScatterRunMerging);
     EXPECT_TRUE(cfg.useCubCopy);
     EXPECT_TRUE(cfg.useZeroCopyArguments);
