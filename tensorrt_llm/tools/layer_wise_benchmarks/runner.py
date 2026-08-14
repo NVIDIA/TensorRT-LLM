@@ -801,7 +801,14 @@ class Runner:
         # length. Measured on DeepSeek-V4 (which reports num_pools=3): without headroom
         # registration runs out at request 90 of 128; at 3x it completes. The factor is
         # not derived, and a model whose pool layout differs may need a different one.
-        POOL_SPLIT_HEADROOM = 3
+        #
+        # Overridable by env because that sentence is a prediction, not a caveat: the 3
+        # was measured on V4-Flash at batch 128 / kv 1150, and V4-Pro runs batch 32 /
+        # kv 1675 through a different pool layout. Finding the right factor should not
+        # cost a wheel rebuild -- roughly an hour -- per attempt. The failure it guards
+        # is loud (the RuntimeError below names the shortfall and both knobs), so the
+        # loop is: read the number out of the error, re-run with the env set.
+        POOL_SPLIT_HEADROOM = int(os.environ.get("TLLM_LWB_POOL_SPLIT_HEADROOM", "3"))
         kv_cache_config = KvCacheConfig(
             max_tokens=POOL_SPLIT_HEADROOM
             * max_batch_size
