@@ -290,3 +290,22 @@ def test_draft_session_spans_mapper_and_materialization(monkeypatch):
         "materialize",
         "session_exit",
     ]
+
+
+def test_mtp_draft_session_reuses_target_mapper_during_materialization():
+    events = []
+    checkpoint_loader = _SessionCheckpointLoader(events, "/draft")
+    model = MagicMock()
+    model.draft_config = None
+    loader = ModelLoader.__new__(ModelLoader)
+    loader.spec_config = SimpleNamespace(speculative_model="/draft")
+    loader.mapping = object()
+    loader.weight_mapper = object()
+    loader._call_load_weights = MagicMock(
+        side_effect=lambda *_args, **_kwargs: events.append("materialize")
+    )
+
+    loader._materialize_draft_checkpoint_weights(checkpoint_loader, model)
+
+    assert loader._call_load_weights.call_args.args[2] is loader.weight_mapper
+    assert events == ["session_enter", "materialize", "session_exit"]
