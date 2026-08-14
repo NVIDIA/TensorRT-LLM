@@ -189,6 +189,16 @@ pipeline {
             steps {
                 container('trt-llm') {
                     script {
+                        // Validate params before they reach any shell to prevent injection.
+                        // TARGET_BRANCH and DAYS are the only user-controlled values that end
+                        // up in shell commands inside withCredentials.
+                        if (!params.TARGET_BRANCH.matches('[a-zA-Z0-9/_.-]+')) {
+                            error("Invalid TARGET_BRANCH: '${params.TARGET_BRANCH}'")
+                        }
+                        if (!params.DAYS.matches('[0-9]+')) {
+                            error("DAYS must be a positive integer, got: '${params.DAYS}'")
+                        }
+
                         sh """
                             cd ${LLM_ROOT}
                             git config --global --add safe.directory \$(pwd)
@@ -202,31 +212,80 @@ pipeline {
                             passwordVariable: 'GITHUB_API_TOKEN')]) {
                             def authedUrl = LLM_REPO.replaceFirst(
                                 'https://', "https://svc_tensorrt:${GITHUB_API_TOKEN}@")
-                            // Fetch and reset to avoid rebase conflicts when another commit
-                            // has already updated the duration file on the remote since checkout.
-                            sh """
-                                cd ${LLM_ROOT}
-                                git remote set-url origin ${authedUrl}
-                                git fetch origin ${params.TARGET_BRANCH}
-                                git reset --hard origin/${params.TARGET_BRANCH}
-                                cp new_test_durations.json ${DURATION_FILE_PATH}
-                            """
 
-                            def changeCount = sh(
-                                script: "cd ${LLM_ROOT} && git diff --name-only ${DURATION_FILE_PATH} | wc -l",
-                                returnStdout: true).trim()
-                            echo "Changed duration-file count: ${changeCount}"
-                            if (changeCount == "0") {
-                                echo "Duration file already up to date on ${params.TARGET_BRANCH}; nothing to push."
-                                return
+                            int maxRetries = 3
+                            for (int attempt = 1; attempt <= maxRetries; attempt++) {
+                                if (attempt > 1) {
+                                    echo "Push rejected; retrying (attempt ${attempt}/${maxRetries})..."
+                                    sleep(15)
+                                }
+
+                                // Fetch and reset to the latest remote HEAD before applying the
+                                // generated file, so concurrent pushes don't cause conflicts.
+                                // Validated params are passed via env vars to single-quoted sh.
+                                withEnv(["_AUTHED_URL=${authedUrl}",
+                                         "_TARGET_BRANCH=${params.TARGET_BRANCH}"]) {
+                                    sh '''
+                                        cd ''' + LLM_ROOT + '''
+                                        git remote set-url origin "$_AUTHED_URL"
+                                        git fetch origin "$_TARGET_BRANCH"
+                                        git reset --hard "origin/$_TARGET_BRANCH"
+                                    '''
+                                }
+
+                                // Re-run the count gate against the post-reset baseline.
+                                // SOURCE_REPO may differ from TARGET_REPO, so the baseline
+                                // must reflect the file that will actually be committed.
+                                def countItems = { path ->
+                                    sh(script: "python3 -c \"import json; print(len(json.load(open('${path}'))))\"",
+                                       returnStdout: true).trim() as Integer
+                                }
+                                def baselineCount = countItems("${LLM_ROOT}/${DURATION_FILE_PATH}")
+                                def newCount = countItems("${LLM_ROOT}/new_test_durations.json")
+                                echo "Post-reset counts -> baseline: ${baselineCount}, new: ${newCount}"
+                                if (baselineCount == 0) {
+                                    error("Baseline duration file is empty after reset; aborting.")
+                                }
+                                def diffPct = Math.abs(newCount - baselineCount) * 100.0 / baselineCount
+                                echo "Post-reset item-count difference: ${String.format('%.1f', diffPct)}%"
+                                if (diffPct >= 50.0) {
+                                    error("Post-reset item-count difference ${String.format('%.1f', diffPct)}% " +
+                                          ">= 50%; refusing to auto-commit. Download the archived " +
+                                          "new_test_durations.json, review, and upload manually.")
+                                }
+
+                                sh "cp ${LLM_ROOT}/new_test_durations.json ${LLM_ROOT}/${DURATION_FILE_PATH}"
+
+                                def changeCount = sh(
+                                    script: "cd ${LLM_ROOT} && git diff --name-only ${DURATION_FILE_PATH} | wc -l",
+                                    returnStdout: true).trim()
+                                echo "Changed duration-file count: ${changeCount}"
+                                if (changeCount == "0") {
+                                    echo "Duration file already up to date on ${params.TARGET_BRANCH}; nothing to push."
+                                    return
+                                }
+
+                                withEnv(["_TARGET_BRANCH=${params.TARGET_BRANCH}",
+                                         "_DAYS=${params.DAYS}"]) {
+                                    sh '''
+                                        cd ''' + LLM_ROOT + '''
+                                        git add ''' + DURATION_FILE_PATH + '''
+                                        git commit -s -m "[None][infra] Auto-update test durations from OpenSearch (last $_DAYS days)"
+                                    '''
+                                }
+
+                                try {
+                                    withEnv(["_TARGET_BRANCH=${params.TARGET_BRANCH}"]) {
+                                        sh 'cd ' + LLM_ROOT + ' && git push origin "HEAD:$_TARGET_BRANCH"'
+                                    }
+                                    break  // push succeeded
+                                } catch (Exception pushErr) {
+                                    echo "Push attempt ${attempt} failed: ${pushErr.getMessage()}"
+                                    if (attempt == maxRetries) { throw pushErr }
+                                    // Roll back the local commit so the next retry can re-apply cleanly.
+                                    sh "cd ${LLM_ROOT} && git reset HEAD~1"
+                                }
                             }
-
-                            sh """
-                                cd ${LLM_ROOT}
-                                git add ${DURATION_FILE_PATH}
-                                git commit -s -m "[None][infra] Auto-update test durations from OpenSearch (last ${params.DAYS} days)"
-                                git push origin HEAD:${params.TARGET_BRANCH}
-                            """
                         }
                     }
                 }
