@@ -32,6 +32,7 @@ l0_cpu:
   - unittest/_torch/memory
   - unittest/_torch/modeling
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/models/test_qwen3_5_lm_head_quant.py
   - unittest/_torch/modules
   - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
