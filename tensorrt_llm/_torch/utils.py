@@ -201,6 +201,37 @@ class Fp4QuantizedTensor:
         return self.fp4_tensor.shape
 
 
+@dataclass
+class MxFp8QuantizedTensor:
+    """MXFP8 activation and per-1x32 UE8M0 scaling factors."""
+
+    fp8_tensor: torch.Tensor
+    scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = False
+
+    @property
+    def shape(self):
+        return self.fp8_tensor.shape
+
+    @property
+    def dtype(self):
+        return self.fp8_tensor.dtype
+
+    def numel(self):
+        return self.fp8_tensor.numel()
+
+    def split(self, split_size_or_sections, dim=0):
+        if dim != 0:
+            raise ValueError(
+                "MxFp8QuantizedTensor can only be split along the token dimension"
+            )
+        fp8_chunks = self.fp8_tensor.split(split_size_or_sections, dim=dim)
+        sf_chunks = self.scaling_factor.split(split_size_or_sections, dim=dim)
+        return tuple(
+            MxFp8QuantizedTensor(fp8_chunk, sf_chunk, self.is_sf_swizzled)
+            for fp8_chunk, sf_chunk in zip(fp8_chunks, sf_chunks))
+
+
 def compute_swizzled_sf_shape(row: int, col: int):
     padded_row = pad_up(row, 128)
     padded_col = pad_up(col, 4)

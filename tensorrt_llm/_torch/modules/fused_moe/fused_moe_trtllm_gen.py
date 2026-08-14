@@ -741,7 +741,7 @@ class TRTLLMGenFusedMoE(MoE):
                 x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                     x, self.fc31_input_gate_dequant[0])
         elif self.has_nvfp4:
-            if isinstance(x, Fp4QuantizedTensor, MxFp8QuantizedTensor):
+            if isinstance(x, (Fp4QuantizedTensor, MxFp8QuantizedTensor)):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                 x_row = x.shape[0]
                 x, x_sf = x.fp4_tensor, x.scaling_factor
