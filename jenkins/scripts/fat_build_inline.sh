@@ -49,12 +49,15 @@ echo "[fat_build] Base sqsh: $BASE_SQSH_PATH"
 echo "[fat_build] LLM tarfile: ${LLM_TARFILE_URL%%\?*}"
 
 # Write the install script into WORK_DIR (mounted as /work inside the container).
-# Variable expansion happens here in the outer shell; the container sees literal values.
+# Quoted heredoc (<<'INSTALL_EOF') prevents outer-shell expansion of LLM_TARFILE_URL
+# and TAR_NAME; values are passed as positional arguments when the script is invoked.
 # All work is done inside /tmp/ in the container filesystem (not in the /work mount),
 # so the source tree (/tmp/TensorRT-LLM/) and installed packages are baked into the exported sqsh image.
-cat > "$WORK_DIR/install.sh" << INSTALL_EOF
+cat > "$WORK_DIR/install.sh" <<'INSTALL_EOF'
 #!/bin/bash
 set -euo pipefail
+LLM_TARFILE_URL="$1"
+TAR_NAME="$2"
 cd /tmp
 echo "[fat_build] Downloading $TAR_NAME..."
 wget -nv --tries=5 --retry-connrefused --waitretry=30 --timeout=300 "$LLM_TARFILE_URL"
@@ -78,6 +81,8 @@ echo "[fat_build] Installing trtllm wheel..."
 pip3 install --no-user --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl
 echo "[fat_build] Installing opencv-python-headless..."
 pip3 install --no-user --retries 10 opencv-python-headless
+echo "[fat_build] Installing ray (required for --run-ray test jobs)..."
+pip3 install --no-user --retries 10 "ray[default]==2.55.1"
 echo "[fat_build] Installed TensorRT-LLM version:"
 pip3 show tensorrt-llm || true
 echo "$LLM_TARFILE_URL" > /tmp/trtllm_installed.txt
@@ -91,7 +96,7 @@ echo "[fat_build] Running install inside container..."
 enroot start \
     --rw \
     --mount "$WORK_DIR:/work" \
-    "$FAT_CONTAINER" -- bash /work/install.sh
+    "$FAT_CONTAINER" -- bash /work/install.sh "$LLM_TARFILE_URL" "$TAR_NAME"
 
 echo "[fat_build] Exporting fat sqsh..."
 enroot export --output "$FAT_TMP" "$FAT_CONTAINER"
