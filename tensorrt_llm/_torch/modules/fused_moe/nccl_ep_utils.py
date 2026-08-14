@@ -19,6 +19,7 @@ NDTensors) for the MoE NcclEP communication strategy. Per-step dispatch handles
 are created in ``communication/nccl_ep.py``.
 """
 
+import os
 from typing import Optional
 
 import torch
@@ -132,7 +133,24 @@ class NcclEpContext:
         self.max_tokens_per_rank = max_tokens_per_rank
         self.max_top_k = max_top_k
         self.hidden_size = hidden_size
-        self.layout = Layout.RANK_MAJOR if layout is None else Layout(layout)
+        # EFA/non-IBGDA fabrics: the LOW_LATENCY device-initiated path faults
+        # (CUDA illegal memory access at first dispatch); HIGH_THROUGHPUT + FLAT
+        # is the working tuple there. TRTLLM_NCCL_EP_ALGO selects the algorithm
+        # (default LOW_LATENCY = unchanged behavior); when it is HIGH_THROUGHPUT
+        # and no explicit layout was requested, default the layout to FLAT (HT
+        # asserts on RANK_MAJOR).
+        self._ep_algorithm = (
+            Algorithm.HIGH_THROUGHPUT
+            if os.environ.get("TRTLLM_NCCL_EP_ALGO", "LOW_LATENCY").upper()
+            in ("HIGH_THROUGHPUT", "HT")
+            else Algorithm.LOW_LATENCY
+        )
+        if layout is not None:
+            self.layout = Layout(layout)
+        elif self._ep_algorithm == Algorithm.HIGH_THROUGHPUT:
+            self.layout = Layout.FLAT
+        else:
+            self.layout = Layout.RANK_MAJOR
         self.max_recv_tokens = self.ep_size * max_tokens_per_rank
 
         # topk_idx dtype passed to the EP runtime. NCCL-EP < 0.2 asserts
@@ -197,7 +215,7 @@ class NcclEpContext:
         )
 
         cfg = GroupConfig(
-            algorithm=Algorithm.LOW_LATENCY,
+            algorithm=self._ep_algorithm,
             num_experts=num_experts,
             max_dispatch_tokens_per_rank=max_tokens_per_rank,
             max_recv_tokens_per_rank=self.max_recv_tokens,
@@ -209,7 +227,7 @@ class NcclEpContext:
             f"NCCL EP group created: ep_size={self.ep_size}, "
             f"num_experts={num_experts}, max_tokens_per_rank={max_tokens_per_rank}, "
             f"hidden_size={hidden_size}, max_top_k={max_top_k}, "
-            f"layout={self.layout.name}"
+            f"layout={self.layout.name}, algorithm={self._ep_algorithm.name}"
         )
 
         device_id = torch.cuda.current_device()
@@ -223,7 +241,14 @@ class NcclEpContext:
         # check with CUDA_ERROR_INVALID_VALUE. Allocate via
         # nccl.core.mem_alloc (VMM-backed) then build a zero-copy torch
         # view over the raw pointer via the TRT-LLM CAI wrapper.
-        token_shape = (self.ep_size, max_tokens_per_rank, hidden_size)
+        # HT+FLAT asserts a 2D [max_recv, hidden] recv buffer (nccl_ep.cc ndim==2);
+        # LL rank-major keeps its 3D [ep_size, max_tokens_per_rank, hidden] shape.
+        _ht = self._ep_algorithm == Algorithm.HIGH_THROUGHPUT
+        token_shape = (
+            (self.max_recv_tokens, hidden_size)
+            if _ht
+            else (self.ep_size, max_tokens_per_rank, hidden_size)
+        )
         token_nbytes = self.ep_size * max_tokens_per_rank * hidden_size * 2
         self._output_tokens_alloc = None
         self._recv_x_window = None
@@ -251,21 +276,33 @@ class NcclEpContext:
         # Received topk indices: int32 [ep_size, max_tokens_per_rank, max_top_k]
         # for the LL rank-major dispatch contract. -1 marks invalid rows.
         # Downstream consumers want 2D [max_recv, max_top_k]; flatten via view.
-        self.recv_topk_idx_buf = torch.empty(
-            self.ep_size,
-            max_tokens_per_rank,
-            max_top_k,
-            dtype=torch.int32,
-            device=device,
-        )
+        # HT+FLAT: 2D [max_recv, top_k]; the shipped V1 header specifies int64
+        # recv_topk_idx carrying LOCAL expert ids (-1 unrouted).
+        if _ht:
+            self.recv_topk_idx_buf = torch.empty(
+                self.max_recv_tokens, max_top_k, dtype=torch.int64, device=device
+            )
+        else:
+            self.recv_topk_idx_buf = torch.empty(
+                self.ep_size,
+                max_tokens_per_rank,
+                max_top_k,
+                dtype=torch.int32,
+                device=device,
+            )
         # Received topk weights: float32 [ep_size, max_tokens_per_rank, max_top_k]
-        self.recv_topk_weights_buf = torch.empty(
-            self.ep_size,
-            max_tokens_per_rank,
-            max_top_k,
-            dtype=torch.float32,
-            device=device,
-        )
+        if _ht:
+            self.recv_topk_weights_buf = torch.empty(
+                self.max_recv_tokens, max_top_k, dtype=torch.float32, device=device
+            )
+        else:
+            self.recv_topk_weights_buf = torch.empty(
+                self.ep_size,
+                max_tokens_per_rank,
+                max_top_k,
+                dtype=torch.float32,
+                device=device,
+            )
         # Per-source-rank received-token counter (passed via
         # LayoutInfo.src_rank_counters at dispatch time).
         self.recv_rank_counter_buf = torch.empty(
@@ -365,7 +402,14 @@ def get_nccl_ep_context(
     from nccl.ep import Layout
 
     if layout is None:
-        layout = Layout.RANK_MAJOR
+        # Respect the TRTLLM_NCCL_EP_ALGO gate: forcing RANK_MAJOR here would
+        # override NcclEpContext's HT-aware default and re-break EFA.
+        layout = (
+            Layout.FLAT
+            if os.environ.get("TRTLLM_NCCL_EP_ALGO", "LOW_LATENCY").upper()
+            in ("HIGH_THROUGHPUT", "HT")
+            else Layout.RANK_MAJOR
+        )
     key = (
         mapping.moe_ep_size,
         mapping.moe_ep_rank,
