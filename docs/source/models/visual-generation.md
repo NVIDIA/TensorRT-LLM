@@ -121,7 +121,7 @@ The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queue
 
 ### Reference Inputs
 
-Conditioning references are supplied through the typed, per-modality fields `image_reference`, `video_reference`, and `audio_reference`. These fields share the **same names and shapes** across the Python API (`VisualGenParams`) and the serve request (`VideoGenerationRequest`), and each accepts a path, raw bytes, a single reference, or a list. Every pipeline declares the reference slots and roles it accepts through `ref_slot_specs`; a request is validated against that declaration before generation begins, so a missing required reference, an excess reference, or an unsupported role is rejected at the boundary. When served, references are carried on the video endpoints and are materialized (base64, `data:` URI, `http(s)` URL, `file://` path, or uploaded file) to a local path before reaching the worker. `http(s)` URLs are fetched through the same SSRF-guarded loader as the LLM multimodal path (private-address block, redirect re-validation, timeout, and size cap).
+Conditioning references are supplied through the typed, per-modality fields `image_reference`, `video_reference`, and `audio_reference`. These fields share the **same names and shapes** across the Python API (`VisualGenParams`) and the serve request (`VideoGenerationRequest`), and each accepts a path, raw bytes, a single reference, or a list. Every pipeline declares the reference slots and roles it accepts through `ref_slot_specs`; a request is validated against that declaration before generation begins, so a missing required reference, an excess reference, or an unsupported role is rejected at the boundary. When served, references are carried on the video endpoints and are materialized (base64, `data:` URI, `http(s)` URL, local file path, or uploaded file) to a local path before reaching the worker. A local path may be given bare or as a `file://` URI; `http(s)` URLs are fetched through the same SSRF-guarded loader as the LLM multimodal path (private-address block, redirect re-validation, timeout, and size cap).
 
 Most models take a single reference whose role is unambiguous, so no `role` is specified:
 
@@ -140,14 +140,14 @@ params = vg.default_params
 params.video_reference = "clip.mp4"
 ```
 
-The equivalent serve request uploads the file, or sends a base64 string, `data:` URI, `http(s)` URL, or `file://` path as the field value in a JSON body:
+The equivalent serve request uploads the file, or sends a base64 string, `data:` URI, `http(s)` URL, or local file path as the field value in a JSON body:
 
 ```bash
 # multipart file upload (raw bytes, no base64)
 curl http://localhost:8000/v1/videos -F "prompt=the scene comes alive" -F "image_reference=@start.png"
 curl http://localhost:8000/v1/videos -F "prompt=continue the scene" -F "video_reference=@clip.mp4"
 
-# JSON body: the reference string may be base64, a data: URI, an http(s) URL, or a file:// path
+# JSON body: the reference string may be base64, a data: URI, an http(s) URL, or a local file path
 curl http://localhost:8000/v1/videos -H 'content-type: application/json' \
   -d '{"prompt": "the scene comes alive", "image_reference": "https://example.com/start.png"}'
 ```

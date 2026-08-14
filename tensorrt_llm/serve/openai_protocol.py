@@ -2063,7 +2063,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
             description=
             ("Image reference(s) conditioning generation (e.g. image-to-video "
              "first frame). A JSON string is base64 bytes (raw or ``data:`` "
-             "URI), an ``http(s)`` URL, or a ``file://`` path; or send a "
+             "URI), an ``http(s)`` URL, or a local file path; or send a "
              "``{content, role}`` object or a list of them; multipart uploads a "
              "single image file. PNG or JPEG only — HEIF/AVIF are not supported."
              ),
@@ -2075,7 +2075,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
             description=
             ("Video reference(s) conditioning generation (video-to-video). A "
              "JSON string is base64 bytes (raw or ``data:`` URI), an ``http(s)`` "
-             "URL, or a ``file://`` path; or send a ``{content}`` object or a "
+             "URL, or a local file path; or send a ``{content}`` object or a "
              "list of them; multipart uploads a single video file. MP4 or AVI, "
              "with H.264 the tested codec and others best-effort."),
         )
@@ -2086,7 +2086,7 @@ class VideoGenerationRequest(OpenAIBaseModel):
             description=(
                 "Audio reference(s) conditioning generation. A JSON string is "
                 "base64 bytes (raw or ``data:`` URI), an ``http(s)`` URL, or a "
-                "``file://`` path; or send a ``{content}`` object or a list of "
+                "local file path; or send a ``{content}`` object or a list of "
                 "them; multipart uploads a single audio file. Accepted only by "
                 "models that declare an audio reference slot."),
         )

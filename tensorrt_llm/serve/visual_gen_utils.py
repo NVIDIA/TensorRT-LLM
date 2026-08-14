@@ -141,9 +141,11 @@ def _resolve_reference_string(reference: str) -> bytes:
 
     Mirrors the LLM multimodal loader so serve references accept the same forms:
     ``http(s)`` fetches through the SSRF-guarded loader (private-address block,
-    redirect re-validation, timeout, size cap); ``file://`` reads a local file;
-    ``data:`` and bare strings decode as base64. Fetch/read failures become
-    ``ValueError`` so a bad URL or path is a client 400, not a server 500.
+    redirect re-validation, timeout, size cap); ``file://`` and bare local paths
+    read from disk; ``data:`` and base64 strings decode inline. A bare string is
+    decoded as base64 first and, failing that, read as a local file path.
+    Fetch/read failures become ``ValueError`` so a bad URL or path is a client
+    400, not a server 500.
     """
     scheme = urlparse(reference).scheme
     if scheme in ("http", "https"):
@@ -156,13 +158,25 @@ def _resolve_reference_string(reference: str) -> bytes:
             return Path(_normalize_file_uri(reference)).read_bytes()
         except OSError as exc:
             raise ValueError(f"reference file could not be read: {exc}") from exc
-    return _read_reference_payload(reference)
+    if scheme == "data":
+        return _read_reference_payload(reference)
+    # Bare string: base64 first (the established default), else a local file path
+    # so a plain path works without the file:// scheme.
+    try:
+        return _read_reference_payload(reference)
+    except ValueError:
+        try:
+            return Path(reference).read_bytes()
+        except OSError as exc:
+            raise ValueError(
+                f"reference is not valid base64 data, and not a readable local file: {exc}"
+            ) from exc
 
 
 def _reference_payload_and_role(ref) -> tuple[bytes, Optional[str]]:
     """Extract ``(payload_bytes, role)`` from one raw HTTP reference.
 
-    ``ref`` is a string (base64/``data:`` URI, ``http(s)`` URL, or ``file://``
+    ``ref`` is a string (base64/``data:`` URI, ``http(s)`` URL, or a local file
     path), a multipart ``UploadFile`` (has ``.file``), or a ``MediaReferenceItem``
     exposing ``content`` and an optional ``role``.
     """

@@ -531,6 +531,20 @@ class TestInputReferenceMaterialization:
         )
         assert Path(params.image_reference[0].content).read_bytes() == src.read_bytes()
 
+    def test_bare_path_image_reference_read_and_materialized(self, tmp_path):
+        # A bare local path (no file:// scheme) is read from disk after the
+        # base64 decode attempt fails.
+        generator = _StubVisualGen()
+        src = tmp_path / "ref.png"
+        Image.new("RGB", (4, 4), (11, 22, 33)).save(src, format="PNG")
+        store = tmp_path / "store"
+        store.mkdir()
+        request = VideoGenerationRequest(prompt="x", image_reference=str(src))
+        params = parse_visual_gen_params(
+            request, "vid-bare", generator, media_storage_path=str(store)
+        )
+        assert Path(params.image_reference[0].content).read_bytes() == src.read_bytes()
+
     def test_http_url_image_reference_fetched_and_materialized(self, tmp_path, monkeypatch):
         # An http(s) reference is fetched through the guarded loader, then stored.
         generator = _StubVisualGen()
