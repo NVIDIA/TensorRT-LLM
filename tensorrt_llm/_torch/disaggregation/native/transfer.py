@@ -61,13 +61,13 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 )
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -82,6 +82,14 @@ LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
+
+# Keep standalone TxSession waits responsive to cancellation even when callers
+# do not configure a sender-future wait slice.
+_FALLBACK_TX_WAIT_SLICE_S = 1.0
+# Keep direct/standalone TxSession block-all waits finite when the caller omits
+# an overall deadline. KvCacheTransceiverV2 requires a configured transfer
+# timeout before it creates either sender or receiver sessions.
+_FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 
 @dataclass
@@ -767,6 +775,34 @@ class Sender(SenderBase):
             return block_ids.size
         return max(0, block_ids.size - (beam_width - 1))
 
+    @staticmethod
+    def _trim_receiver_window_head(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        peer_window_size: Optional[int],
+        beam_width: int,
+    ) -> np.ndarray:
+        """Drop the receiver's extra leading blocks for a windowed layer group.
+
+        A windowed receiver keeps a larger window when only it runs speculative
+        decoding, so its suffix starts earlier and the extra blocks are at the
+        head. Both starts are derived from list length, so trimming the tail
+        instead would shift every block one position early.
+
+        Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
+        _create_kv_slice, so there dst must not exceed src. A smaller dst
+        (generation prefix-cache reuse) is handled via dst_start.
+        """
+        block_diff = dst_block_ids.size - src_block_ids.size
+        if block_diff <= 0:
+            return dst_block_ids
+        if peer_window_size is None or beam_width > 1:
+            raise ValueError(
+                f"src/dst block count mismatch: {src_block_ids.size} vs "
+                f"{dst_block_ids.size} (dst must not exceed src)"
+            )
+        return dst_block_ids[block_diff:]
+
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
@@ -804,19 +840,18 @@ class Sender(SenderBase):
             src_block_ids = src_block_ids_per_groups[self_lg]
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-            # Both sides trim block lists to ceil(prompt_len / tpb) in
-            # _create_kv_slice, so dst must never exceed src. A smaller dst
-            # (generation prefix-cache reuse) is handled via dst_start below.
-            block_diff = dst_block_ids.size - src_block_ids.size
-            if block_diff > 0:
-                raise ValueError(
-                    f"src/dst block count mismatch: {src_block_ids.size} vs "
-                    f"{dst_block_ids.size} (dst must not exceed src)"
-                )
             tpb = extractor.page_table.tokens_per_block
             token_range = task._slice.token_range
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
+
+            peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
+            dst_block_ids = Sender._trim_receiver_window_head(
+                src_block_ids,
+                dst_block_ids,
+                peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
+                beam_width=task._beam_width,
+            )
 
             # Block lists are the suffix of [..., slice_end); cached prefix
             # is implicit in their size. token_start = (total_blocks - n) * tpb.
@@ -1204,12 +1239,15 @@ class TxSession(TxSessionBase):
         timeout_s: Optional[float] = None,
         prompt_len: Optional[int] = None,
         beam_width: int = 1,
+        overall_timeout_s: Optional[float] = None,
     ):
         super().__init__(
             sender,
             SessionArgsBase(params, prompt_len=prompt_len, beam_width=beam_width),
         )
         self._timeout_s = timeout_s
+        self._overall_timeout_s = overall_timeout_s
+        self._deadline_monotonic_s: Optional[float] = None
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
@@ -1260,6 +1298,11 @@ class TxSession(TxSessionBase):
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
         with self.lock:
+            if not self.kv_tasks:
+                overall_timeout_s = self._overall_timeout_s
+                if overall_timeout_s is None or overall_timeout_s <= 0:
+                    overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+                self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
             task = KVSendTask(
@@ -1336,11 +1379,15 @@ class TxSession(TxSessionBase):
     def wait_complete(self, blocking: bool = True) -> Optional[WaitResult]:
         """Poll or block until KV (and optionally aux) transfer finishes.
 
-        With blocking=True (default): waits up to _timeout_s for each task.
+        With blocking=True (default): retries bounded wait slices until the
+        transfer finishes or its overall deadline expires. Deadline expiry is
+        nonterminal: callers must retain the session and its KV pages because
+        peer writes may still be active. Errors and cancellation remain
+        terminal, but likewise do not prove that peer writes quiesced.
         With blocking=False: polls non-blockingly; returns None if any KV task
         or aux is not yet done.
         """
-        if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
+        if self.has_failed():
             return WaitResult.FAILED
         if not self.kv_tasks:
             return None
@@ -1362,17 +1409,77 @@ class TxSession(TxSessionBase):
                     return None
             return WaitResult.COMPLETED
 
+        # send() normally anchors this once, at the first dispatched KV task.
+        # Keep direct/internal TxSession construction bounded as well, and never
+        # reset the deadline on a later block-all call.
+        if self._deadline_monotonic_s is None:
+            overall_timeout_s = self._overall_timeout_s
+            if overall_timeout_s is None or overall_timeout_s <= 0:
+                overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+            with self.lock:
+                if self._deadline_monotonic_s is None:
+                    self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
+
+        # ``_timeout_s`` bounds one scheduler wait slice. The separate absolute
+        # deadline is shared by every KV task and aux; it is never reset by a
+        # later wait_complete() call.
+        wait_slice_s = self._timeout_s
+        if wait_slice_s is None or wait_slice_s <= 0:
+            wait_slice_s = _FALLBACK_TX_WAIT_SLICE_S
+
+        def wait_for_task(task: SendTaskBase) -> WaitResult:
+            while True:
+                # A task/session terminal state observed at the deadline
+                # boundary takes precedence over TIMEOUT.
+                if self.has_failed():
+                    return WaitResult.FAILED
+                if task.status == TaskStatus.TRANSFERRED:
+                    return WaitResult.COMPLETED
+
+                remaining_s = None
+                if self._deadline_monotonic_s is not None:
+                    remaining_s = self._deadline_monotonic_s - time.monotonic()
+                    if remaining_s <= 0:
+                        # The worker can publish terminal state between the
+                        # checks above and the clock read. Preserve boundary
+                        # precedence before classifying this as a timeout.
+                        if self.has_failed():
+                            return WaitResult.FAILED
+                        if task.status == TaskStatus.TRANSFERRED:
+                            return WaitResult.COMPLETED
+                        return WaitResult.TIMEOUT
+                timeout_s = wait_slice_s if remaining_s is None else min(wait_slice_s, remaining_s)
+                task.wait(timeout=timeout_s)
+
+        # A bounded slice keeps cancellation and sibling failure observable.
         for task in self.kv_tasks:
-            if not task.wait(timeout=self._timeout_s):
-                return WaitResult.TIMEOUT
-            if task.status == TaskStatus.ERROR:
+            result = wait_for_task(task)
+            if result != WaitResult.COMPLETED:
+                return result
+        if self._need_aux:
+            if self.aux_task is None:
+                # _finalize_send() installs the aux task synchronously before
+                # publishing the request to _send_reqs. Once every KV task is
+                # terminal, a missing required aux task is an invariant error,
+                # not an asynchronously pending transfer.
+                with self.lock:
+                    if self._terminal_status not in (
+                        SessionStatus.ERROR,
+                        SessionStatus.CANCELLED,
+                    ):
+                        self._exception = RuntimeError(
+                            "required auxiliary transfer was not dispatched"
+                        )
+                        self._terminal_status = SessionStatus.ERROR
                 return WaitResult.FAILED
-        if self._need_aux and self.aux_task is not None:
-            if not self.aux_task.wait(timeout=self._timeout_s):
-                return WaitResult.TIMEOUT
-            if self.aux_task.status == TaskStatus.ERROR:
-                return WaitResult.FAILED
-        return WaitResult.COMPLETED
+            result = wait_for_task(self.aux_task)
+            if result != WaitResult.COMPLETED:
+                return result
+        return (
+            WaitResult.FAILED
+            if self.status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+            else WaitResult.COMPLETED
+        )
 
     def set_exception(self, reason: str = ""):
         msg = f"TxSession {self.disagg_request_id} exception"
@@ -1560,7 +1667,11 @@ class Receiver(ReceiverBase):
         )
 
     @staticmethod
-    def _fanin_bounce_safe(overlap, peer_ri) -> bool:
+    def _fanin_bounce_safe(
+        overlap: PeerOverlap,
+        peer_ri: RankInfo,
+        receiver_page_table: Optional[KVCachePageTable],
+    ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
           * duplicate_head_factor == 1 -- else some ranks don't send KV (should_send_kv) yet still
@@ -1580,15 +1691,20 @@ class Receiver(ReceiverBase):
                 return False
         # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
         # fan-in owner only, so with multiple writers their contributions
-        # differ in size and the equal split is invalid.
-        if len(overlap.ranks) > 1 and peer_ri.page_table is not None:
-            for layer_group in peer_ri.page_table.layer_groups:
-                for pool_view in getattr(layer_group, "pool_views", ()):
-                    if pool_view.mapper_kind == MapperKind.REPLICATED:
-                        return False
+        # differ in size and the equal split is invalid. Inspect both endpoints:
+        # a masked PP stage may advertise no replicated view even though another
+        # stage owns one that is visible in the receiver's page table.
+        if len(overlap.ranks) > 1:
+            for page_table in (peer_ri.page_table, receiver_page_table):
+                if page_table is None:
+                    continue
+                for layer_group in page_table.layer_groups:
+                    for pool_view in getattr(layer_group, "pool_views", ()):
+                        if pool_view.mapper_kind == MapperKind.REPLICATED:
+                            return False
         return True
 
-    def dispatch_task(self, task: KVRecvTask):
+    def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
         logger.debug(
             f"Receiver.dispatch_task: unique_rid={task._unique_rid}, ctx_dp_rank={params.ctx_dp_rank}"
@@ -1630,9 +1746,31 @@ class Receiver(ReceiverBase):
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
         allow_bounce = task.expected_transfers == 1 or (
-            sender_dp_rank is not None and self._fanin_bounce_safe(topo_overlap, peer_infos)
+            sender_dp_rank is not None
+            and self._fanin_bounce_safe(
+                topo_overlap,
+                peer_infos,
+                self._registrar.self_extractor.page_table,
+            )
         )
-        bounced = allow_bounce and self._bounce.reserve(receiver_req, task.expected_transfers)
+        # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks (the sender
+        # appends its MambaPolicy fragments in _build_kv_write_meta), so the bounce region must be
+        # sized for those bytes too or the write would overrun into the neighboring slot.
+        extra_bytes = 0
+        if receiver_req.mamba_state_index is not None:
+            if peer_infos.page_table is None:
+                allow_bounce = False  # cannot size the sender's recurrent-state payload
+            else:
+                extra_bytes = MambaPolicy.payload_bytes(
+                    sender_page_table=peer_infos.page_table,
+                    receiver_page_table=self._registrar.self_extractor.page_table,
+                    dst_slot=receiver_req.mamba_state_index,
+                    sender_ri=peer_infos,
+                    receiver_ri=self._registrar.self_rank_info,
+                )
+        bounced = allow_bounce and self._bounce.reserve(
+            receiver_req, task.expected_transfers, extra_bytes=extra_bytes
+        )
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -1688,6 +1826,19 @@ class Receiver(ReceiverBase):
                 sender_info = RankInfo.from_bytes(message[0])
             finally:
                 messenger.stop()
+
+            # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
+            # The sender-side check (PeerRegistrar.register) runs in the
+            # sender's listener thread, where exceptions are only logged, so
+            # reject here — before REGISTER_RANK_INFO is even sent — to fail
+            # the first gen request loudly instead of hanging on a transfer
+            # the sender will never serve.
+            MambaPolicy.validate_peer_compatible(
+                self._registrar.self_rank_info,
+                sender_info,
+                self._registrar.self_extractor.page_table,
+                sender_info.page_table,
+            )
 
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
@@ -2223,12 +2374,19 @@ class RankInfoServer:
         self.shutdown()
 
 
-def _create_nixl_agent(name: str) -> NixlTransferAgent:
+def _create_nixl_agent(name: str, rank: int, world_size: int) -> NixlTransferAgent:
     num_threads = int(os.environ.get("TRTLLM_NIXL_NUM_THREADS", "8"))
     kwargs = {}
     if "TRTLLM_NIXL_SPLIT_BATCH_SIZE" in os.environ:
         kwargs["split_batch_size"] = int(os.environ["TRTLLM_NIXL_SPLIT_BATCH_SIZE"])
-    return NixlTransferAgent(name, True, num_threads=num_threads, **kwargs)
+    return NixlTransferAgent(
+        name,
+        True,
+        num_threads=num_threads,
+        rank=rank,
+        world_size=world_size,
+        **kwargs,
+    )
 
 
 def _make_aux_buffer(
@@ -2256,6 +2414,7 @@ class TransferWorkerConfig:
     tx_timeout_s: Optional[float] = None
     rx_timeout_s: Optional[float] = None
     bounce: Optional["Config"] = None
+    tx_overall_timeout_s: Optional[float] = None
 
 
 class TransferWorker:
@@ -2290,6 +2449,7 @@ class TransferWorker:
             timeout_s=self._config.tx_timeout_s,
             prompt_len=request.prompt_len,
             beam_width=request.py_beam_width,
+            overall_timeout_s=self._config.tx_overall_timeout_s,
         )
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
@@ -2320,8 +2480,11 @@ class TransferWorker:
     def _setup_transfer_engine(self):
         torch.cuda.set_device(self._config.device_id)
         CUASSERT(cudart.cudaSetDevice(self._config.device_id))
+        mapping = self._config.kv_cache_manager.mapping
         self._agent = _create_nixl_agent(
-            self._rank_info.instance_name + str(self._rank_info.instance_rank)
+            self._rank_info.instance_name + str(self._rank_info.instance_rank),
+            rank=mapping.rank,
+            world_size=mapping.world_size,
         )
         self._registered_mem: list = []
         try:

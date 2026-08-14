@@ -23,8 +23,9 @@ import pytest
 from pytest_split.algorithms import LeastDurationAlgorithm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+CI_SUBMIT_PATH = REPO_ROOT / "jenkins" / "scripts" / "perf" / "submit.py"
 SUBMIT_PATHS = (
-    REPO_ROOT / "jenkins" / "scripts" / "perf" / "submit.py",
+    CI_SUBMIT_PATH,
     REPO_ROOT / "jenkins" / "scripts" / "perf" / "local" / "submit.py",
 )
 EXAMPLE_SUBMIT_PATH = REPO_ROOT / "examples" / "disaggregated" / "slurm" / "benchmark" / "submit.py"
@@ -54,6 +55,11 @@ def submit_module(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.fixture
+def ci_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    return _load_module(CI_SUBMIT_PATH, monkeypatch)
+
+
+@pytest.fixture
 def example_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return _load_module(EXAMPLE_SUBMIT_PATH, monkeypatch)
 
@@ -70,11 +76,6 @@ def test_get_benchmark_config_accepts_positive_integer(submit_module: ModuleType
     benchmark_config = _get_benchmark_config(submit_module, concurrency)
 
     assert benchmark_config["concurrency"] == int(concurrency)
-
-
-@pytest.fixture
-def ci_submit_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    return _load_module(SUBMIT_PATHS[0], monkeypatch)
 
 
 def _select_ci_test_case_line(
@@ -273,3 +274,62 @@ def test_ci_submit_rejects_missing_pytest_split_durations(
             pytest_options="--splits 1 --group 1 --durations-path /remote/.test_durations",
             split_group=1,
         )
+
+
+@pytest.mark.parametrize(
+    ("assignment", "expected"),
+    (
+        ("LLM_MODELS_ROOT=/models", "/models"),
+        ("LLM_MODELS_ROOT='/models with spaces'", "/models with spaces"),
+        ("LLM_MODELS_ROOT=/models/cache=production", "/models/cache=production"),
+    ),
+)
+def test_extract_pytest_command_env(ci_submit_module: ModuleType, assignment: str, expected: str):
+    lines = [f'export pytestCommand="LLM_ROOT=/src {assignment} COLUMNS=300 pytest -vv"']
+
+    assert ci_submit_module.extract_pytest_command_env(lines, "LLM_MODELS_ROOT") == expected
+
+
+def test_extract_pytest_command_env_rejects_missing_leading_assignment(
+    ci_submit_module: ModuleType,
+):
+    lines = ['export pytestCommand="LLM_ROOT=/src pytest LLM_MODELS_ROOT=/too-late"']
+
+    with pytest.raises(ValueError, match="does not set leading environment variable"):
+        ci_submit_module.extract_pytest_command_env(lines, "LLM_MODELS_ROOT")
+
+
+def test_extract_pytest_command_env_rejects_malformed_export(ci_submit_module: ModuleType):
+    lines = ['export pytestCommand="LLM_ROOT=/src LLM_MODELS_ROOT=/models pytest']
+
+    with pytest.raises(ValueError, match="cannot parse exported pytestCommand"):
+        ci_submit_module.extract_pytest_command_env(lines, "LLM_MODELS_ROOT")
+
+
+def test_resolve_llm_models_root_falls_back_to_submitter_env(
+    ci_submit_module: ModuleType, monkeypatch
+):
+    monkeypatch.setenv("LLM_MODELS_ROOT", "/models/from-env")
+    lines = ['export pytestCommand="LLM_ROOT=/src pytest LLM_MODELS_ROOT=/too-late"']
+
+    assert ci_submit_module._resolve_llm_models_root(lines) == "/models/from-env"
+
+
+def test_resolve_llm_models_root_explains_both_missing_sources(
+    ci_submit_module: ModuleType, monkeypatch
+):
+    monkeypatch.delenv("LLM_MODELS_ROOT", raising=False)
+    lines = ['export pytestCommand="LLM_ROOT=/src pytest"']
+
+    with pytest.raises(ValueError, match="getPytestBaseCommandLine in L0_Test.groovy"):
+        ci_submit_module._resolve_llm_models_root(lines)
+
+
+def test_resolve_llm_models_root_does_not_mask_malformed_command(
+    ci_submit_module: ModuleType, monkeypatch
+):
+    monkeypatch.setenv("LLM_MODELS_ROOT", "/models/from-env")
+    lines = ['export pytestCommand="LLM_ROOT=/src pytest']
+
+    with pytest.raises(ValueError, match="cannot parse exported pytestCommand"):
+        ci_submit_module._resolve_llm_models_root(lines)

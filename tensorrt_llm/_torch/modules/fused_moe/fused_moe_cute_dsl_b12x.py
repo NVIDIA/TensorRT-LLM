@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from typing import Optional, Tuple, Union
 
 import torch
@@ -23,6 +24,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from ...utils import ActivationType, Fp4QuantizedTensor
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
+from .impl_contract import MoERunContext, MoEStaticCapability, require_comm_plan
 from .interface import _warn_and_return
 
 # Shared MoE output buffer pool, keyed by (max_num_tokens, hidden_size, dtype,
@@ -44,24 +46,25 @@ _ACTIVATION_MAP = {
 
 
 class CuteDslB12xFusedMoE(CuteDslFusedMoE):
-    """Hybrid CUTLASS-prefill / b12x-decode NVFP4 fused-MoE backend for SM120 / SM121.
+    """B12x NVFP4 fused-MoE backend for SM120 / SM121.
 
     Member of the cuteDSL backend family: the decode kernel
     (``flashinfer.B12xMoEWrapper.run``) is JIT-compiled CuTe DSL, so the
     backend slots in next to :class:`CuteDslFusedMoE` (which targets SM100 /
-    SM103). The hybrid prefill path still routes through the C++ CUTLASS
-    NVFP4 GroupGEMM via explicit :class:`CutlassFusedMoE` method calls; the
-    parent class on the MRO does not change which kernels execute, only
-    where the b12x backend sits in the family.
+    SM103). Plain NVFP4 prefill can route through the C++ CUTLASS NVFP4
+    GroupGEMM via explicit :class:`CutlassFusedMoE` method calls; the parent
+    class on the MRO does not change which kernels execute, only where the
+    b12x backend sits in the family.
 
     Composition (see ``MOE_DEVELOPER_GUIDE.md`` for the full explainer):
 
-    - **Prefill (``m >= _PREFILL_VIA_CUTLASS_THRESHOLD``)** explicitly
+    - **NVFP4 prefill (``m >= _PREFILL_VIA_CUTLASS_THRESHOLD``)** explicitly
       invokes :class:`CutlassFusedMoE` NVFP4 GroupGEMM. The b12x kernel's
       12-CTA-per-token MMA pattern is suboptimal at large ``m``.
     - **Decode (``m <  _PREFILL_VIA_CUTLASS_THRESHOLD``)** dispatches to
       FlashInfer's ``B12xMoEWrapper.run`` — a kernel purpose-built for
       ``m=1`` / small routed-row counts.
+    - **W4A16_NVFP4** stays on the b12x path for both prefill and decode.
 
     NVFP4 weights are loaded via :class:`NVFP4CuteDslB12xFusedMoEMethod`
     (an :class:`NVFP4CutlassFusedMoEMethod` subclass returned by
@@ -79,9 +82,15 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     The backend hard-rejects EP (b12x has no dispatch / combine kernel),
     MoE alltoall, ``Fp4QuantizedTensor`` input, ``swiglu_gptoss_style``
     biased SwiGLU, and activations outside ``{Relu2, Swiglu}``. It is
-    selected on the ``CUTEDSL`` MoE path when SM120 / SM121 + NVFP4 +
-    flashinfer-importable gates pass (see ``create_moe.get_moe_cls``).
+    selected on the ``CUTEDSL`` MoE path when SM120 / SM121 + NVFP4 or
+    W4A16_NVFP4 + flashinfer-importable gates pass (see
+    ``create_moe.get_moe_cls``).
     """
+
+    # Restated rather than inherited: the LoRA gate this replaces compared the
+    # exact class and answered False here, while the DWDP gate used isinstance
+    # and answered True through CuteDslFusedMoE.
+    capabilities = MoEStaticCapability(supports_moe_lora=False, supports_dwdp=True)
 
     # SM versions on which the FlashInfer b12x NVFP4 MoE kernel is available.
     # SM120 = desktop Blackwell (RTX 5090 / GB202); SM121 = GB10 / DGX Spark.
@@ -105,9 +114,9 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
         if sm_version not in cls._SUPPORTED_SM_VERSIONS:
             sm_list = "/".join(f"SM{v}" for v in sorted(cls._SUPPORTED_SM_VERSIONS))
             return _warn_and_return(f"CuteDslB12xFusedMoE requires {sm_list}, got SM{sm_version}")
-        if quant_algo != QuantAlgo.NVFP4:
+        if quant_algo not in {QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4}:
             return _warn_and_return(
-                f"CuteDslB12xFusedMoE only supports NVFP4 quantization "
+                f"CuteDslB12xFusedMoE only supports NVFP4 or W4A16_NVFP4 quantization "
                 f"(got quant_algo={quant_algo})"
             )
         if dtype_activation not in {torch.float16, torch.bfloat16}:
@@ -167,9 +176,12 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
 
     def _route_to_cutlass(self, x) -> bool:
         """Return ``True`` iff this call should fall back to the inherited
-        CUTLASS path (prefill chunk). ``Fp4QuantizedTensor`` inputs always
-        stay on the b12x path (which rejects them) so the existing error
-        message is preserved."""
+        CUTLASS path (NVFP4 prefill chunk). ``Fp4QuantizedTensor`` inputs
+        always stay on the b12x path (which rejects them) so the existing
+        error message is preserved."""
+        quant_config = getattr(self, "quant_config", None)
+        if quant_config is not None and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+            return False
         return isinstance(x, torch.Tensor) and x.shape[0] >= self._PREFILL_VIA_CUTLASS_THRESHOLD
 
     # ``post_load_weights`` is inherited from ``CutlassFusedMoE`` and
@@ -190,12 +202,12 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Hybrid dispatch entrypoint for activation handling.
 
-        Prefill chunks (``x.shape[0] >= _PREFILL_VIA_CUTLASS_THRESHOLD``) take
-        the inherited :meth:`CutlassFusedMoE.quantize_input` path so the
-        downstream ``run_moe`` can call CUTLASS NVFP4 GroupGEMM. Decode
-        chunks pass through unchanged because b12x quantizes activations
-        internally (consumes a bf16 / fp16 ``x`` and produces its own scale
-        factors).
+        NVFP4 prefill chunks take the inherited
+        :meth:`CutlassFusedMoE.quantize_input` path so the downstream
+        ``run_moe`` can call CUTLASS NVFP4 GroupGEMM. Decode chunks and
+        W4A16_NVFP4 chunks pass through unchanged because b12x quantizes
+        activations internally (consumes a bf16 / fp16 ``x`` and produces its
+        own scale factors).
         """
         if self._route_to_cutlass(x):
             return CutlassFusedMoE.quantize_input(
@@ -211,29 +223,21 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     @nvtx_range("[b12x] run_moe")
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
-        is_sf_swizzled: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        tuner_num_tokens: Optional[int] = None,
-        tuner_top_k: Optional[int] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: Optional[bool] = None,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
+        plan = require_comm_plan(self, ctx)
+        x = ctx.x
         if self._route_to_cutlass(x):
             # ``CutlassFusedMoE.run_moe`` forwards ``output_dtype`` straight
             # into the C++ ``trtllm::fused_moe`` op, which requires a concrete
             # high-precision ``ScalarType`` (uint8 / FP4-packed activations are
             # rejected at the kernel epilogue with "Invalid output type Byte").
-            # Schedulers that drive ``run_moe`` directly (the KV-cache capacity
-            # probe, for one) leave ``output_dtype`` unset, so fall back to
-            # ``x.dtype`` if it is a real compute dtype, else bf16. Mirrors the
-            # ``forward_chunk`` convention while staying safe for the FP4
-            # quant-input path (``x`` is uint8 after ``quantize_input``).
+            # ``ConfigurableMoE.forward`` always fills ``output_dtype``, so this
+            # only narrows the type for anything driving ``run_moe`` without it.
             _HIGH_PRECISION = {torch.float16, torch.bfloat16, torch.float32}
-            cutlass_output_dtype = output_dtype
+            cutlass_output_dtype = ctx.output_dtype
             if cutlass_output_dtype is None:
                 cutlass_output_dtype = (
                     x.dtype
@@ -242,17 +246,13 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
                 )
             return CutlassFusedMoE.run_moe(
                 self,
-                x,
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                x_sf=x_sf,
-                is_sf_swizzled=is_sf_swizzled,
-                output_dtype=cutlass_output_dtype,
-                tuner_num_tokens=tuner_num_tokens,
-                tuner_top_k=tuner_top_k,
-                moe_output=moe_output,
-                enable_alltoall=enable_alltoall,
+                replace(ctx, output_dtype=cutlass_output_dtype),
+                workspace=workspace,
             )
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        moe_output = plan.moe_output
         if self.b12x_wrapper is None or self._b12x_weights is None:
             raise RuntimeError(
                 "CuteDslB12xFusedMoE.run_moe called before process_weights_after_loading completed."

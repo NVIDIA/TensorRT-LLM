@@ -31,7 +31,8 @@ from ...model_config import ModelConfig
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
                       Fp4QuantizedTensor)
 from ..gated_mlp import GatedMLP
-from .interface import MoE, MoEWeightLoadingMode
+from .impl_contract import MoEInputRequirement, MoERunContext, require_comm_plan
+from .interface import FORCE_SEPARATED_ROUTING, MoE, MoEWeightLoadingMode
 from .moe_op_backend import MoEOpBackend, TRTLLMOpBackend, get_op_backend
 
 # isort: off
@@ -86,6 +87,16 @@ class TRTLLMGenFusedMoE(MoE):
     Expert is the concept from model's perspective while slot is the concept from model engine's perspective.
     There should be at lease `num_experts` slots in the model engine. More than that is OK, in that case, some experts may have multiple replicas.
     """
+
+    # bfloat16 routing scales are what these kernels read, and the DeepEP
+    # dispatch has to mark unfilled rows before they reach them.
+    input_requirement = MoEInputRequirement(
+        routing_scales_dtype=torch.bfloat16,
+        requires_sanitized_expert_ids=True,
+        # The combine reduction runs in bf16 regardless of the model's output
+        # dtype, so the NVLink one-sided payload buffer must be bf16 too.
+        onesided_workspace_dtype=torch.bfloat16,
+    )
 
     # Supported quantization algorithms for TRTLLMGenFusedMoE
     _SUPPORTED_QUANT_ALGOS = {
@@ -479,6 +490,18 @@ class TRTLLMGenFusedMoE(MoE):
             return True
         return self.use_dp and self.parallel_size > 1
 
+    def _routes_outside_the_kernel(self) -> bool:
+        """Whether top-k is precomputed, so the kernel must not route again.
+
+        Three independent triggers, none of which subsumes the others: a
+        kernel or parallel layout that forces it (both folded into
+        ``_supports_load_balancer``), a routing algorithm no C++ kernel
+        implements, and the host-routing override.
+        """
+        return (self._supports_load_balancer()
+                or self.routing_method.requires_separated_routing
+                or FORCE_SEPARATED_ROUTING)
+
     def _check_configs(self):
         assert not self.has_any_quant \
             or self.has_deepseek_fp8_block_scales \
@@ -755,13 +778,9 @@ class TRTLLMGenFusedMoE(MoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: Optional[torch.Tensor],
-        x_sf: Optional[torch.Tensor] = None,
-        router_logits: Optional[torch.Tensor] = None,
-        do_finalize: bool = True,
-        moe_output: Optional[torch.Tensor] = None,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> Union[torch.Tensor, tuple]:
         """
         Run MoE computation with TRTLLMGen backend.
@@ -770,26 +789,30 @@ class TRTLLMGenFusedMoE(MoE):
         quantization schemes (bf16, fp8_block_scales, nvfp4, w4a16_mxfp4,
         w4a8_nvfp4_fp8, w4a8_mxfp4_fp8, w4a8_mxfp4_mxfp8).
 
-        Args:
-            # Standard MoE interface parameters:
-            x: Input hidden states (may be pre-quantized)
-            token_selected_experts: Expert IDs [num_tokens, top_k]. If EPLB is enabled,
-                                    this represents expert slots [num_tokens, top_k] instead.
-            token_final_scales: Final scaling factors for each token
-            x_sf: Input scale factors (optional, for certain quantization schemes)
-
-            # TRTLLMGen-specific additional parameters:
-            router_logits: Router logits for integrated routing in some kernels.
-                          Should be None if routing has already been done (e.g., post_quant_comm).
-            do_finalize: Whether to finalize the output. If False, returns intermediate
-                        results (tuple) for nvfp4 and w4a8_nvfp4_fp8 schemes.
-            moe_output: Pre-allocated output buffer from workspace (optional).
-                       Used for mnnvlthroughput alltoall backend to avoid extra copies.
-
         Returns:
-            If do_finalize=True: final_hidden_states tensor
-            If do_finalize=False: tuple of intermediate outputs (for nvfp4 and w4a8_nvfp4_fp8)
+            If ``ctx.do_finalize``: final_hidden_states tensor
+            Otherwise: tuple of intermediate outputs (for nvfp4 and w4a8_nvfp4_fp8)
         """
+        del workspace  # TRTLLMGen kernels allocate their own intermediates.
+        plan = require_comm_plan(self, ctx)
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        do_finalize = ctx.do_finalize
+        moe_output = plan.moe_output
+        # The caller used to apply this filter before handing over the kwargs.
+        if self._routes_outside_the_kernel():
+            if ctx.router_logits is not None and token_selected_experts is None:
+                raise ValueError(
+                    f"{type(self).__name__} requires separated routing for this "
+                    "config, so ctx.router_logits is ignored, but "
+                    "ctx.token_selected_experts is None -- there is nothing left "
+                    "to route with. Supply precomputed top-k ids and scales.")
+            router_logits = None
+        else:
+            router_logits = ctx.router_logits
+
         routing_params = self._extract_routing_params()
         top_k = routing_params.top_k
         routing_bias = routing_params.routing_bias if router_logits is not None else None
