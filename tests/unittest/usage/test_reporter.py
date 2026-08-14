@@ -728,6 +728,20 @@ class TestProcessTelemetrySession:
         thread_cls.assert_not_called()
         send.assert_not_called()
 
+    def test_start_session_does_not_publish_partial_session(self, monkeypatch, enable_telemetry):
+        """A failed exit-hook registration cannot expose a partial session."""
+        monkeypatch.setattr(usage_lib, "_PROCESS_EXIT_HOOK_REGISTERED", False)
+
+        with patch.object(
+            usage_lib.atexit,
+            "register",
+            side_effect=RuntimeError("registration failed"),
+        ):
+            assert not usage_lib.start_usage_session()
+
+        assert usage_lib._SESSION is None
+        assert not usage_lib._PROCESS_EXIT_HOOK_REGISTERED
+
     def test_initial_report_slot_can_be_claimed_once(self, enable_telemetry):
         """Concurrent reporter starts cannot create two initial events."""
         assert usage_lib.start_usage_session()

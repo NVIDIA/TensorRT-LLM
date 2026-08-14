@@ -1153,8 +1153,7 @@ def start_usage_session(
             if _SESSION_DISABLED:
                 return False
             if _SESSION is None:
-                _REPORTER_STOP.clear()
-                _SESSION = _TelemetrySession(
+                session = _TelemetrySession(
                     usage_context=usage_context,
                     component=component or "unknown",
                     lifecycle_phase=lifecycle_phase or "unknown",
@@ -1162,6 +1161,9 @@ def start_usage_session(
                 if not _PROCESS_EXIT_HOOK_REGISTERED:
                     atexit.register(_report_process_exit)
                     _PROCESS_EXIT_HOOK_REGISTERED = True
+                _REPORTER_STOP.clear()
+                _SESSION = session
+                return True
             session = _SESSION
 
         session.configure(
