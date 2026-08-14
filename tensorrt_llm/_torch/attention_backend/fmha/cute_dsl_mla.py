@@ -269,6 +269,7 @@ class CuteDslMlaFmha(PhasedFmha):
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # It is to disable mix-batch(context request + generation request) for now.
+        # Trtllm-gen may fail under num_head == 96 so it is exempted from this check.
         # TODO: Eliminate high host overhead of cutedsl mla to enable mix-batch.
         if (meta.num_contexts != 0 and attn.num_heads != 96) or meta.num_generations <= 0:
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
