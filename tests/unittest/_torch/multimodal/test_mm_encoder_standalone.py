@@ -120,7 +120,7 @@ def _create_mm_disagg_llm(
 
 
 def _get_encoder_max_batch_size(model_dir: Path) -> int:
-    # Qwen2.5/3 VL and LLaVA's vision encoder seems to output different embeddings based on this value.
+    # Qwen2.5/3 VL vision encoders seem to output different embeddings based on this value.
     # The test only passes with this set to 1.
     if (model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR]
             or _is_fake_checkpoint(model_dir)):

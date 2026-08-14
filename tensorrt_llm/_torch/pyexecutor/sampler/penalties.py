@@ -65,9 +65,16 @@ class PenaltyStore:
       other token (the rest of the prompt plus each generated token) increments
       ``counts_cuda``, which drives presence/frequency and -- via ``counts > 0`` --
       repetition as well.
+
+    ``counts_cuda`` carries one row per *beam*: beam ``b`` of slot ``s`` owns row
+    ``s * max_beam_width + b`` (see ``counts_rows``), because beams diverge and each
+    needs its own history. ``presence_prefix_cuda`` stays one row per slot -- the
+    ignored prompt prefix is shared by every beam of a request. With
+    ``max_beam_width == 1`` the beam axis vanishes and both are plain slot-indexed.
     """
 
     max_num_sequences: int
+    max_beam_width: int
     device: torch.device
 
     # --- Penalty parameters (allocateBuffer counterpart), shape [max_num_sequences] ---
@@ -81,10 +88,18 @@ class PenaltyStore:
     """bool[slots]; whether a slot has an active occurrence penalty."""
     has_previous_token_cuda: torch.Tensor
     """bool[slots]; whether ``new_tokens`` contains a token to accumulate."""
+    beam_slot_cuda: torch.Tensor
+    """bool[slots]; whether the slot's counts must be re-parented each step.
+
+    Beam width is a per-request property, so a beam engine may host single-beam requests
+    too (see ``py_executor._validate_request`` / TRTLLM-14792). Only true beam slots have
+    a meaningful ``predecessor_beams`` row; a single-beam slot's is never written and must
+    not be believed. Stays all-False on a single-beam engine."""
 
     # --- Occurrence workspace (allocateWorkspace counterpart), allocated lazily ---
     counts_cuda: torch.Tensor | None = None
-    """int32[slots, vocab_size] or None; occurrence counts (see class docstring)."""
+    """int32[slots * max_beam_width, vocab_size] or None; occurrence counts
+    (see class docstring)."""
     presence_prefix_cuda: torch.Tensor | None = None
     """bool[slots, vocab_size] or None; ignored-prompt-prefix presence mask."""
 
@@ -92,9 +107,13 @@ class PenaltyStore:
     # ``stage_request_metadata`` so the hot path does not allocate per step.
     request_offsets_cuda: torch.Tensor | None = None
     request_num_steps_cuda: torch.Tensor | None = None
+    request_num_beams_cuda: torch.Tensor | None = None
+    """Stays None on a single-beam engine, which never stages a beam width."""
 
     @classmethod
-    def create(cls, *, max_num_sequences: int, device: torch.device) -> "PenaltyStore":
+    def create(
+        cls, *, max_num_sequences: int, max_beam_width: int, device: torch.device
+    ) -> "PenaltyStore":
         """Allocate the vocab-independent buffers with their no-op defaults.
 
         ``inference_mode(False)`` guards every allocation in this class: the
@@ -104,6 +123,7 @@ class PenaltyStore:
         with torch.inference_mode(False):
             return cls(
                 max_num_sequences=max_num_sequences,
+                max_beam_width=max_beam_width,
                 device=device,
                 repetition_cuda=torch.ones(max_num_sequences, dtype=torch.float32, device=device),
                 presence_cuda=torch.zeros(max_num_sequences, dtype=torch.float32, device=device),
@@ -112,7 +132,19 @@ class PenaltyStore:
                 has_previous_token_cuda=torch.zeros(
                     max_num_sequences, dtype=torch.bool, device=device
                 ),
+                beam_slot_cuda=torch.zeros(max_num_sequences, dtype=torch.bool, device=device),
             )
+
+    def counts_rows(self, slots_cuda: torch.Tensor) -> torch.Tensor:
+        """Map slot indices to the ``counts_cuda`` rows they own.
+
+        One row per beam, so slot ``s`` owns ``s * max_beam_width + b``. Returns
+        ``slots_cuda`` unchanged in the single-beam case, where the two coincide.
+        """
+        if self.max_beam_width == 1:
+            return slots_cuda
+        beams = torch.arange(self.max_beam_width, device=slots_cuda.device)
+        return (slots_cuda.unsqueeze(1) * self.max_beam_width + beams).reshape(-1)
 
     def ensure_workspace(self, *, vocab_size: int, needs_prefix: bool) -> None:
         """Allocate the vocab-sized workspace on first use.
@@ -124,7 +156,7 @@ class PenaltyStore:
         with torch.inference_mode(False):
             if self.counts_cuda is None:
                 self.counts_cuda = torch.zeros(
-                    (self.max_num_sequences, vocab_size),
+                    (self.max_num_sequences * self.max_beam_width, vocab_size),
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -136,13 +168,21 @@ class PenaltyStore:
                 )
 
     def stage_request_metadata(
-        self, request_offsets_host: torch.Tensor, request_num_steps_host: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        request_offsets_host: torch.Tensor,
+        request_num_steps_host: torch.Tensor,
+        request_num_beams_host: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Copy this step's ``[R]`` request metadata into persistent device buffers.
 
-        The host tensors are already pinned by the caller, so each step costs two
-        small async H2D copies into a reused allocation rather than two fresh
-        device tensors. Returned views are only valid until the next call.
+        The host tensors are already pinned by the caller, so each step costs a couple
+        of small async H2D copies into a reused allocation rather than fresh device
+        tensors. Returned views are only valid until the next call.
+
+        All three buffers are ``[R]`` and grow together under one capacity check.
+        ``request_num_beams_host`` is omitted on a single-beam engine, which then gets
+        ``None`` back and allocates no third buffer; a beam engine must pass it on every
+        call, including the first, or the buffer is never allocated.
         """
         num_requests = request_offsets_host.numel()
         with torch.inference_mode(False):
@@ -157,12 +197,24 @@ class PenaltyStore:
                 self.request_num_steps_cuda = torch.empty(
                     capacity, dtype=request_num_steps_host.dtype, device=self.device
                 )
+                self.request_num_beams_cuda = (
+                    torch.empty(capacity, dtype=request_num_beams_host.dtype, device=self.device)
+                    if request_num_beams_host is not None
+                    else None
+                )
         assert self.request_num_steps_cuda is not None
         offsets = self.request_offsets_cuda[:num_requests]
         num_steps = self.request_num_steps_cuda[:num_requests]
         offsets.copy_(request_offsets_host, non_blocking=True)
         num_steps.copy_(request_num_steps_host, non_blocking=True)
-        return offsets, num_steps
+        if request_num_beams_host is None:
+            return offsets, num_steps, None
+        assert self.request_num_beams_cuda is not None, (
+            "a beam engine must stage request_num_beams from its first call onwards"
+        )
+        num_beams = self.request_num_beams_cuda[:num_requests]
+        num_beams.copy_(request_num_beams_host, non_blocking=True)
+        return offsets, num_steps, num_beams
 
 
 class PenaltyHandler:
@@ -188,15 +240,18 @@ class PenaltyHandler:
         """Per-slot host-only bookkeeping (never read by the ops)."""
 
         prompt_ignore_length: int
+        uses_beam_search: bool = False
         initialized: bool = False
 
     def __init__(
         self,
         *,
         max_num_sequences: int,
+        max_beam_width: int,
         device: torch.device | str,
     ):
         self._max_num_sequences = max_num_sequences
+        self._max_beam_width = max_beam_width
         self._device = torch.device(device)
         # Whether any (past or current) active request uses prompt_ignore_length > 0,
         # which requires allocating the presence-prefix mask.
@@ -210,20 +265,12 @@ class PenaltyHandler:
         self._new_repetition: list[float] = []
         self._new_presence: list[float] = []
         self._new_frequency: list[float] = []
-        self.store = PenaltyStore.create(max_num_sequences=max_num_sequences, device=self._device)
-
-    @staticmethod
-    def validate_request(request: LlmRequest) -> None:
-        """Reject unsupported combinations for a penalized request.
-
-        Called from ``TorchSampler.validate_request`` (request admission), so a
-        violating request is failed individually instead of aborting the whole batch.
-        """
-        if _get_max_beam_width(request) > 1 and has_occurrence_penalty(request):
-            raise ValueError(
-                "TorchSampler does not support repetition, presence, or frequency "
-                "penalties with beam search."
-            )
+        self._new_beam_slot: list[bool] = []
+        self.store = PenaltyStore.create(
+            max_num_sequences=max_num_sequences,
+            max_beam_width=max_beam_width,
+            device=self._device,
+        )
 
     def _to_device(self, values: list[int], dtype: torch.dtype) -> torch.Tensor:
         return torch.tensor(values, dtype=dtype, pin_memory=prefer_pinned()).to(
@@ -240,7 +287,7 @@ class PenaltyHandler:
         gathered, so their stale parameters/counts are left untouched.
         """
         was_active = self._slots[slot] is not None
-        if not (_get_max_beam_width(request) == 1 and has_occurrence_penalty(request)):
+        if not has_occurrence_penalty(request):
             self._slots[slot] = None
             if was_active:
                 self._num_active_slots -= 1
@@ -259,7 +306,11 @@ class PenaltyHandler:
         if prompt_ignore_length > 0:
             self._needs_prefix = True
 
-        self._slots[slot] = self._SlotState(prompt_ignore_length=prompt_ignore_length)
+        uses_beam_search = self._max_beam_width > 1 and _get_max_beam_width(request) > 1
+        self._slots[slot] = self._SlotState(
+            prompt_ignore_length=prompt_ignore_length,
+            uses_beam_search=uses_beam_search,
+        )
         if not was_active:
             self._num_active_slots += 1
 
@@ -267,6 +318,7 @@ class PenaltyHandler:
         self._new_repetition.append(repetition if repetition is not None else 1.0)
         self._new_presence.append(presence if presence is not None else 0.0)
         self._new_frequency.append(frequency if frequency is not None else 0.0)
+        self._new_beam_slot.append(uses_beam_search)
 
     def update_for_new_requests(self, *, new_seq_slots_cuda_long: torch.Tensor) -> None:
         """Flush this step's admissions to the device in a handful of batched updates.
@@ -279,6 +331,10 @@ class PenaltyHandler:
         store = self.store
         store.active_cuda.index_fill_(0, new_seq_slots_cuda_long, False)
         store.has_previous_token_cuda.index_fill_(0, new_seq_slots_cuda_long, False)
+        if self._max_beam_width > 1:
+            # Stays all-False on a single-beam engine, so clearing it there would be a
+            # kernel launch per step for nothing.
+            store.beam_slot_cuda.index_fill_(0, new_seq_slots_cuda_long, False)
 
         if not self._new_slots:
             return
@@ -294,10 +350,19 @@ class PenaltyHandler:
         store.presence_cuda.index_copy_(0, slots_cuda, params_cuda[1])
         store.frequency_cuda.index_copy_(0, slots_cuda, params_cuda[2])
         store.active_cuda.index_fill_(0, slots_cuda, True)
+        if self._max_beam_width > 1:
+            store.beam_slot_cuda.index_copy_(
+                0,
+                slots_cuda,
+                torch.tensor(self._new_beam_slot, dtype=torch.bool, pin_memory=prefer_pinned()).to(
+                    self._device, non_blocking=True
+                ),
+            )
 
         # Re-zero the workspace rows so a prior occupant's counts do not leak in.
+        # counts_cuda holds one row per beam, so every beam of the slot must be cleared.
         if store.counts_cuda is not None:
-            store.counts_cuda.index_fill_(0, slots_cuda, 0)
+            store.counts_cuda.index_fill_(0, store.counts_rows(slots_cuda), 0)
         if store.presence_prefix_cuda is not None:
             store.presence_prefix_cuda.index_fill_(0, slots_cuda, False)
 
@@ -305,6 +370,7 @@ class PenaltyHandler:
         self._new_repetition.clear()
         self._new_presence.clear()
         self._new_frequency.clear()
+        self._new_beam_slot.clear()
 
     def _initialize_workspace(
         self,
@@ -328,6 +394,7 @@ class PenaltyHandler:
 
         # One conversion for the whole prompt; the split point is just
         # prompt_ignore_length, so the two groups are plain slices.
+        base_row = slot * self._max_beam_width
         tokens = self._to_device(prompt, torch.int64)
         prefix_tokens = tokens[: state.prompt_ignore_length]
         counted_tokens = tokens[state.prompt_ignore_length :]
@@ -341,11 +408,18 @@ class PenaltyHandler:
         Fusions.update_occurrence_workspace(
             counts_cuda,
             self.store.presence_prefix_cuda,
-            torch.full_like(counted_tokens, slot),
+            torch.full_like(counted_tokens, base_row),
             counted_tokens,
+            # The prefix mask is per slot: every beam shares the prompt.
             torch.full_like(prefix_tokens, slot),
             prefix_tokens,
         )
+        if state.uses_beam_search:
+            # Every beam starts from the same prompt. Seeding all of them, rather than
+            # only beam 0, also covers a generation-only (disaggregated decode) request
+            # whose first penalized step already has several beams and hence no
+            # re-parenting to broadcast beam 0's counts for it.
+            counts_cuda[base_row + 1 : base_row + self._max_beam_width].copy_(counts_cuda[base_row])
 
     def update_token_counts(
         self,
@@ -364,6 +438,9 @@ class PenaltyHandler:
 
         counts_cuda = self.store.counts_cuda
         assert counts_cuda is not None
+        # Only speculative decoding reaches here, and it is rejected together with
+        # beam search (TorchSampler.__init__), so beam 0 is the only live beam.
+        assert self._max_beam_width == 1, "speculative token commit is single-beam only"
         vocab_size = counts_cuda.size(-1)
         consumed_slots: list[int] = []
         counted_slots: list[int] = []
@@ -404,17 +481,35 @@ class PenaltyHandler:
         seq_slots: torch.Tensor,
         request_offsets: torch.Tensor,
         request_num_steps: torch.Tensor,
+        request_num_beams: torch.Tensor | None = None,
+        predecessor_beams: torch.Tensor | None = None,
         is_draft_batch: bool = False,
     ) -> None:
-        """Apply the occurrence penalties to ``logits`` in place.
+        """Advance the occurrence state for this step and apply the penalties to ``logits``.
 
         ``logits`` is the packed generated-token logits ``[sum(num_steps * num_beams),
-        vocab_size]``; request ``r`` owns ``request_num_steps[r]`` consecutive rows
-        starting at ``request_offsets[r]``, in beam-major / step-minor order.
-        ``request_offsets`` / ``request_num_steps`` are the caller's pinned host
+        vocab_size]``; request ``r`` owns ``request_num_steps[r] * request_num_beams[r]``
+        consecutive rows starting at ``request_offsets[r]``, in beam-major / step-minor
+        order. ``request_offsets`` / ``request_num_steps`` are the caller's pinned host
         tensors and are staged to the device here.
 
+        Beam search changes only where the counts come from, never where the penalty is
+        applied: every row is rewritten here, in place, on raw logits and before
+        temperature -- the same position in the pipeline as the single-beam path, so both
+        keep the ordering ``bias -> penalty -> bans -> temperature -> sampling``. What
+        beam search adds is a per-beam counts row, re-parented each step, and a row ->
+        (slot, beam) mapping so each beam is penalized against its own history.
+
+        With ``max_beam_width == 1`` the pending-token fold stays fused into the same
+        graph, so the whole step is one kernel.
+
         Args:
+            request_num_beams / predecessor_beams: required when ``max_beam_width > 1``.
+                ``request_num_beams`` is the row-layout width the caller packed ``logits``
+                at (the static admission width, not the per-iteration one), so that the
+                row -> beam mapping matches ``request_offsets``. ``predecessor_beams``
+                must still hold the *previous* step's parent map, i.e. this must run
+                before the step's beam sampling overwrites it.
             is_draft_batch: draft batches share this sampler but draw ``py_seq_slot``
                 from a separate numbering space that collides with target slots, so
                 penalizing them would read/write an unrelated target request's
@@ -442,9 +537,39 @@ class PenaltyHandler:
         for request, state in active_requests:
             self._initialize_workspace(request, state, logits.size(-1))
 
-        request_offsets_cuda, request_num_steps_cuda = store.stage_request_metadata(
-            request_offsets, request_num_steps
+        if self._max_beam_width > 1:
+            assert request_num_beams is not None and predecessor_beams is not None, (
+                "beam search requires request_num_beams and predecessor_beams"
+            )
+            num_beams_host = request_num_beams
+        else:
+            # Left None so the packed pass specializes to its single-beam graph.
+            num_beams_host = None
+
+        # Staged ahead of both consumers, since the views last only until the next call.
+        request_offsets_cuda, request_num_steps_cuda, num_beams_cuda = store.stage_request_metadata(
+            request_offsets, request_num_steps, num_beams_host
         )
+
+        if self._max_beam_width > 1:
+            # Both were established by the branch above -- a beam engine always stages a
+            # beam width -- but the narrowing does not survive stage_request_metadata, so
+            # restate it for the type checker.
+            assert predecessor_beams is not None and num_beams_cuda is not None
+            # Re-parent and fold up front. On a single-beam engine the fold stays fused
+            # into the packed graph below; here it cannot, because re-parenting has to
+            # happen first and it is not expressible inside that graph.
+            Fusions.update_beam_occurrence_counts(
+                counts_cuda,
+                store.active_cuda,
+                store.has_previous_token_cuda,
+                store.beam_slot_cuda,
+                new_tokens,
+                predecessor_beams,
+                seq_slots,
+                num_beams_cuda,
+                self._max_beam_width,
+            )
         Fusions.apply_batched_occurrence_penalties(
             logits,
             counts_cuda,
@@ -458,18 +583,30 @@ class PenaltyHandler:
             store.repetition_cuda,
             store.presence_cuda,
             store.frequency_cuda,
+            # None / 1 / True on a single-beam engine: no beam axis in the row mapping and
+            # the fold stays fused in.
+            num_beams_cuda,
+            self._max_beam_width,
+            self._max_beam_width == 1,
         )
-        # Arm has_previous_token for the slots this call penalized (active, num_steps > 0)
-        # so the next apply folds their sampled new_tokens. Done here rather than in the
-        # compiled op because the op's fold reads the flag for every request row; flipping
-        # it in the same graph would make the result depend on execution order within the
-        # kernel.
-        #
-        # The scan is kept on the host deliberately. The same thing can be expressed on
-        # device as active_cuda[seq_slots] & (num_steps > 0), avoiding this loop and the
-        # H2D, but that costs several extra kernel launches and measured 5-7us slower for
-        # batches up to 32 and no better at 64-256: the loop overlaps with the model
-        # forward, the launches do not.
+        self._arm_pending_tokens(requests, request_num_steps)
+
+    def _arm_pending_tokens(
+        self, requests: list[LlmRequest], request_num_steps: torch.Tensor
+    ) -> None:
+        """Arm has_previous_token for the slots this step advanced (active, num_steps > 0).
+
+        The next call then folds their sampled ``new_tokens``. Done on the host rather than
+        in the compiled op because the fold reads the flag for every request row; flipping
+        it in the same graph would make the result depend on execution order within the
+        kernel.
+
+        The scan is kept on the host deliberately. The same thing can be expressed on
+        device as active_cuda[seq_slots] & (num_steps > 0), avoiding this loop and the
+        H2D, but that costs several extra kernel launches and measured 5-7us slower for
+        batches up to 32 and no better at 64-256: the loop overlaps with the model
+        forward, the launches do not.
+        """
         pending_token_slots: list[int] = []
         for request, num_steps in zip(requests, request_num_steps.tolist()):
             slot = request.py_seq_slot
@@ -478,6 +615,6 @@ class PenaltyHandler:
             if self._slots[slot] is not None and num_steps > 0:
                 pending_token_slots.append(slot)
         if pending_token_slots:
-            store.has_previous_token_cuda.index_fill_(
+            self.store.has_previous_token_cuda.index_fill_(
                 0, self._to_device(pending_token_slots, torch.int64), True
             )
