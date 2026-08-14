@@ -377,6 +377,16 @@ def test_fp8_quantize_ue8m0_vs_triton(dtype, m, k):
 # Tests for fp8_quantize_1x128_packed_ue8m0 (SM100 fused quant+pack)
 # ---------------------------------------------------------------------------
 
+# The op guards on the C++ isSM100Family() (SM100-109), which is wider than the
+# utils.util helper of the same name. The Triton comparisons further down keep
+# using that helper: they are limited to the archs Triton can target, not to the
+# archs the op supports.
+skip_if_not_sm100_family = pytest.mark.skipif(
+    not 100 <= getSMVersion() < 110,
+    reason="fp8_quantize_1x128_packed_ue8m0 is SM100-family only. "
+    "Current SM is %d." % getSMVersion(),
+)
+
 
 def _decode_packed_int32_ue8m0(packed_int32):
     """Decode each packed int32 into four UE8M0 exponent bytes."""
@@ -412,8 +422,7 @@ def _legacy_packed_to_r128c4(packed_int32, m, num_quant_sf_k, sf_replication=1):
     return expected
 
 
-@pytest.mark.skipif(not isSM100Family(),
-                    reason="fp8_quantize_1x128_packed_ue8m0 is SM100 only.")
+@skip_if_not_sm100_family
 @pytest.mark.parametrize("m,k", [
     (1, 128),
     (3, 256),
@@ -459,8 +468,7 @@ def test_fp8_quantize_1x128_packed_ue8m0_r128c4(m, k):
         f"R128c4 UE8M0 mismatch for ({m}, {k})"
 
 
-@pytest.mark.skipif(not isSM100Family(),
-                    reason="fp8_quantize_1x128_packed_ue8m0 is SM100 only.")
+@skip_if_not_sm100_family
 @pytest.mark.parametrize("m,k", [(1, 128), (33, 640)])
 def test_fp8_quantize_1x128_packed_ue8m0_r128c4_zero_blocks(m, k):
     """All-zero blocks retain the legacy kernel's UE8M0 scale encoding."""
@@ -482,8 +490,7 @@ def test_fp8_quantize_1x128_packed_ue8m0_r128c4_zero_blocks(m, k):
     assert torch.equal(fused_scale, expected_scale)
 
 
-@pytest.mark.skipif(not isSM100Family(),
-                    reason="fp8_quantize_1x128_packed_ue8m0 is SM100 only.")
+@skip_if_not_sm100_family
 @pytest.mark.parametrize("m,k", [
     (1, 128),
     (3, 256),
@@ -511,8 +518,7 @@ def test_fp8_quantize_1x128_packed_ue8m0_r128c4_padding_is_zero(m, k):
     assert torch.count_nonzero(scale[~valid]).item() == 0
 
 
-@pytest.mark.skipif(not isSM100Family(),
-                    reason="fp8_quantize_1x128_packed_ue8m0 is SM100 only.")
+@skip_if_not_sm100_family
 @pytest.mark.parametrize("m,k", [(3, 256), (7, 512), (127, 4096)])
 def test_fp8_quantize_1x128_packed_ue8m0_legacy_layout(m, k):
     """The compatibility mode retains deep_gemm's packed SF contract."""
