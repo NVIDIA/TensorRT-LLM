@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode, UnquantizedLinearMethod
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import gelu_tanh, maybe_compile
@@ -463,6 +463,91 @@ class QwenEmbedRope(nn.Module):
 
 
 # ===========================================================================
+# Registered packed joint-QKV projection op (concat elimination).
+# ===========================================================================
+#
+# Functional (alias-free) torch.library custom op: allocates the packed joint
+# QKV buffer [1, S_txt + S_img, q_dim + 2*kv_dim] and writes the two
+# per-stream packed projections straight into its row slices via
+# ``torch.addmm(..., out=)``. Registering this as a custom op (the same
+# pattern as ``trtllm::fused_dit_qk_norm_rope``, the fused-rope op consumed a
+# few lines below in ``_prepare_qkv_fused``) makes inductor treat it as an
+# opaque extern call that OWNS its output buffer: when the same two
+# ``addmm(out=slice)`` calls are inlined in the compiled region instead,
+# functionalization materializes the addmm outputs and inductor does not
+# re-inplace extern kernels into slice views, emitting a cat-sized copy-back
+# kernel (``triton_poi_fused_view*``, measured at ~2.3% of a Qwen-Image
+# denoise step for the inlined addmm(out=) formulation).
+#
+# The op is deliberately FUNCTIONAL: it mutates no inputs (``mutates_args``
+# is empty) and its output is a fresh tensor aliasing no input, which is the
+# alias contract torch.compile supports cleanly (no auto_functionalize
+# wrapper, no defensive clones). The ``register_fake`` below gives tracing
+# the shape/dtype-only meta implementation (SymInt-safe). The
+# ``needs_fixed_stride_order`` tag pins the eager stride order for the op's
+# inputs when it is compiled, so inductor never feeds it non-contiguous
+# layouts the eager addmm path was not measured with.
+
+
+@torch.library.custom_op(
+    "trtllm::packed_qkv_proj",
+    mutates_args=(),
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+def _packed_qkv_proj(
+    encoder_hidden_states: torch.Tensor,
+    hidden_states: torch.Tensor,
+    txt_weight_packed: torch.Tensor,
+    txt_bias_packed: torch.Tensor,
+    img_weight_packed: torch.Tensor,
+    img_bias_packed: torch.Tensor,
+) -> torch.Tensor:
+    """Concat-free packed joint QKV: project into ``out=`` row slices.
+
+    Layout is bit-compatible with the torch.cat path of
+    ``_prepare_qkv_fused``: rows [0, S_txt) are the text stream, rows
+    [S_txt, S_txt + S_img) the image stream, columns [q | k | v]. Both
+    row-slices of the freshly allocated buffer are contiguous 2-D matrices
+    (B == 1, enforced by the caller's runtime guard), so eager addmm takes
+    the cublasLt bias-epilogue path with zero extra elementwise kernels.
+    """
+    s_txt = encoder_hidden_states.shape[1]
+    s_img = hidden_states.shape[1]
+    packed_dim = txt_weight_packed.shape[0]
+    qkv = hidden_states.new_empty((1, s_txt + s_img, packed_dim))
+    qkv_rows = qkv.view(s_txt + s_img, packed_dim)
+    torch.addmm(
+        txt_bias_packed,
+        encoder_hidden_states[0],
+        txt_weight_packed.t(),
+        out=qkv_rows[:s_txt],
+    )
+    torch.addmm(
+        img_bias_packed,
+        hidden_states[0],
+        img_weight_packed.t(),
+        out=qkv_rows[s_txt:],
+    )
+    return qkv
+
+
+@_packed_qkv_proj.register_fake
+def _packed_qkv_proj_fake(
+    encoder_hidden_states: torch.Tensor,
+    hidden_states: torch.Tensor,
+    txt_weight_packed: torch.Tensor,
+    txt_bias_packed: torch.Tensor,
+    img_weight_packed: torch.Tensor,
+    img_bias_packed: torch.Tensor,
+) -> torch.Tensor:
+    """Shape/dtype-only fake impl for tracing (dynamo/fake-tensor)."""
+    s_txt = encoder_hidden_states.shape[1]
+    s_img = hidden_states.shape[1]
+    packed_dim = txt_weight_packed.shape[0]
+    return hidden_states.new_empty((1, s_txt + s_img, packed_dim))
+
+
+# ===========================================================================
 # Joint self-attention for MMDiT.
 # ===========================================================================
 
@@ -575,6 +660,128 @@ class QwenJointAttention(Attention):
             allreduce_strategy=self.allreduce_strategy,
         )
 
+        # Fused joint-QKV packing (concat elimination). When engaged, the six
+        # per-stream Q/K/V projections write straight into the packed joint
+        # QKV buffer through the registered `trtllm::packed_qkv_proj`
+        # custom op (two addmm calls into contiguous `out=` row-slices),
+        # eliminating the three torch.cat's in `_prepare_qkv_fused` (measured
+        # at ~3.3% of a Qwen-Image denoise step as an inductor addmm+cat
+        # kernel) with no functionalization copy-back under the per-block
+        # torch.compile.
+        # Engine-internal gating only (no public knob); the packed weights are
+        # built once in `finalize_fused_qkv_pack()` after weight loading, and
+        # the per-projection parameters are re-pointed at row-views of the
+        # packed tensors so net weight memory is unchanged and the unfused
+        # fallback path stays bit-identical.
+        self._use_fused_qkv_pack = False
+        self._img_qkv_weight_packed: Optional[torch.Tensor] = None
+        self._img_qkv_bias_packed: Optional[torch.Tensor] = None
+        self._txt_qkv_weight_packed: Optional[torch.Tensor] = None
+        self._txt_qkv_bias_packed: Optional[torch.Tensor] = None
+
+    def _qkv_pack_linears(self) -> Tuple[Linear, ...]:
+        return (
+            self.to_q,
+            self.to_k,
+            self.to_v,
+            self.add_q_proj,
+            self.add_k_proj,
+            self.add_v_proj,
+        )
+
+    def _qkv_pack_eligibility(self) -> bool:
+        """Post-load eligibility for the packed joint-QKV addmm path.
+
+        The fused path only ever runs inside `_prepare_qkv_fused`, so fused
+        QK-norm+RoPE being configured (`fuse_qk_norm_rope`, TP=1) is a
+        precondition; the runtime bf16/cuda/head-dim gate stays
+        `_use_fused_qk_norm_rope`.
+        """
+        if not (self.fuse_qk_norm_rope and self.qk_norm):
+            return False
+        if self.tp_size != 1 or self.qkv_mode != QKVMode.SEPARATE_QKV:
+            return False
+        for linear in self._qkv_pack_linears():
+            # Strict type check, not isinstance: the FP8 linear methods
+            # subclass UnquantizedLinearMethod.
+            if type(linear.quant_method) is not UnquantizedLinearMethod:
+                return False
+            weight = getattr(linear, "weight", None)
+            bias = getattr(linear, "bias", None)
+            if weight is None or bias is None:
+                return False
+            if weight.dtype != torch.bfloat16 or bias.dtype != torch.bfloat16:
+                return False
+            if not weight.is_cuda:
+                return False
+            if weight.shape[1] != self.hidden_size:
+                return False
+            # The packed addmm bypasses Linear.forward: it must not skip an
+            # allgather, a LoRA branch, or a non-default GEMM backend.
+            if linear.gather_output or getattr(linear, "lora", None) is not None:
+                return False
+            if linear.use_custom_cublas_mm or linear.use_cute_dsl_bf16_gemm:
+                return False
+        if self.to_q.weight.shape[0] != self.local_q_dim:
+            return False
+        if (
+            self.to_k.weight.shape[0] != self.local_kv_dim
+            or self.to_v.weight.shape[0] != self.local_kv_dim
+        ):
+            return False
+        if (
+            self.add_q_proj.weight.shape[0] != self.local_q_dim
+            or self.add_k_proj.weight.shape[0] != self.local_kv_dim
+            or self.add_v_proj.weight.shape[0] != self.local_kv_dim
+        ):
+            return False
+        return True
+
+    def finalize_fused_qkv_pack(self) -> None:
+        """Build packed per-stream QKV weights after weight loading.
+
+        Called from `QwenImageTransformer2DModel.post_load_weights()` (after
+        every Linear's own `post_load_weights`). Packs [Wq; Wk; Wv] into one
+        [q_dim + 2*kv_dim, hidden] tensor per stream and re-points the
+        original parameters at contiguous row-views of it, so the packed
+        tensors add no weight memory and any later `param.data.copy_()`
+        (weight reload) stays coherent with the packed buffers.
+        """
+        self._use_fused_qkv_pack = False
+        if not self._qkv_pack_eligibility():
+            return
+        q_dim, kv_dim = self.local_q_dim, self.local_kv_dim
+        with torch.no_grad():
+            img_w = torch.cat(
+                [self.to_q.weight, self.to_k.weight, self.to_v.weight], dim=0
+            ).contiguous()
+            img_b = torch.cat([self.to_q.bias, self.to_k.bias, self.to_v.bias], dim=0).contiguous()
+            txt_w = torch.cat(
+                [self.add_q_proj.weight, self.add_k_proj.weight, self.add_v_proj.weight],
+                dim=0,
+            ).contiguous()
+            txt_b = torch.cat(
+                [self.add_q_proj.bias, self.add_k_proj.bias, self.add_v_proj.bias],
+                dim=0,
+            ).contiguous()
+        self.to_q.weight.data = img_w[:q_dim]
+        self.to_k.weight.data = img_w[q_dim : q_dim + kv_dim]
+        self.to_v.weight.data = img_w[q_dim + kv_dim :]
+        self.to_q.bias.data = img_b[:q_dim]
+        self.to_k.bias.data = img_b[q_dim : q_dim + kv_dim]
+        self.to_v.bias.data = img_b[q_dim + kv_dim :]
+        self.add_q_proj.weight.data = txt_w[:q_dim]
+        self.add_k_proj.weight.data = txt_w[q_dim : q_dim + kv_dim]
+        self.add_v_proj.weight.data = txt_w[q_dim + kv_dim :]
+        self.add_q_proj.bias.data = txt_b[:q_dim]
+        self.add_k_proj.bias.data = txt_b[q_dim : q_dim + kv_dim]
+        self.add_v_proj.bias.data = txt_b[q_dim + kv_dim :]
+        self._img_qkv_weight_packed = img_w
+        self._img_qkv_bias_packed = img_b
+        self._txt_qkv_weight_packed = txt_w
+        self._txt_qkv_bias_packed = txt_b
+        self._use_fused_qkv_pack = True
+
     @staticmethod
     def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
         return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
@@ -593,6 +800,29 @@ class QwenJointAttention(Attention):
             and self.head_dim in (64, 128, 256)
         )
 
+    def _build_packed_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Concat-free packed joint QKV via ``trtllm::packed_qkv_proj``.
+
+        The registered custom op (see module level) allocates the packed
+        buffer and projects both streams into its ``out=`` row slices. Going
+        through the op registry (instead of inlining the two addmm(out=)
+        calls here) keeps the buffer ownership opaque to inductor under the
+        production per-block torch.compile, so no functionalization
+        copy-back kernel is emitted.
+        """
+        return torch.ops.trtllm.packed_qkv_proj(
+            encoder_hidden_states,
+            hidden_states,
+            self._txt_qkv_weight_packed,
+            self._txt_qkv_bias_packed,
+            self._img_qkv_weight_packed,
+            self._img_qkv_bias_packed,
+        )
+
     def _prepare_qkv_fused(
         self,
         hidden_states: torch.Tensor,
@@ -600,14 +830,29 @@ class QwenJointAttention(Attention):
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        img_q, img_k, img_v = self.get_qkv(hidden_states)
-        txt_q = self.add_q_proj(encoder_hidden_states)
-        txt_k = self.add_k_proj(encoder_hidden_states)
-        txt_v = self.add_v_proj(encoder_hidden_states)
+        # Trace-time constants under the per-block torch.compile: flag is
+        # frozen post-load, shapes/dtypes recompile-guarded. B == 1 is the
+        # production CFG shape (two sequential B=1 calls); B > 1 falls back.
+        use_packed = (
+            self._use_fused_qkv_pack
+            and isinstance(hidden_states, torch.Tensor)
+            and isinstance(encoder_hidden_states, torch.Tensor)
+            and hidden_states.shape[0] == 1
+            and encoder_hidden_states.shape[0] == 1
+            and hidden_states.dtype == torch.bfloat16
+            and encoder_hidden_states.dtype == torch.bfloat16
+        )
+        if use_packed:
+            qkv = self._build_packed_qkv(hidden_states, encoder_hidden_states)
+        else:
+            img_q, img_k, img_v = self.get_qkv(hidden_states)
+            txt_q = self.add_q_proj(encoder_hidden_states)
+            txt_k = self.add_k_proj(encoder_hidden_states)
+            txt_v = self.add_v_proj(encoder_hidden_states)
 
-        txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
-        img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
-        qkv = torch.cat([txt_qkv, img_qkv], dim=1)
+            txt_qkv = torch.cat([txt_q, txt_k, txt_v], dim=-1)
+            img_qkv = torch.cat([img_q, img_k, img_v], dim=-1)
+            qkv = torch.cat([txt_qkv, img_qkv], dim=1)
 
         if fused_rotary_emb is None:
             fused_rotary_emb = qwen_joint_freqs_to_cos_sin(image_rotary_emb)
@@ -1266,6 +1511,12 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                         f"weight_scale_shape={scale_shape}, "
                         f"weight_scale_dtype={scale_dtype}"
                     ) from exc
+        # Pack per-stream QKV weights for the concat-free joint-QKV path.
+        # Must run after every Linear's post_load_weights (weights final);
+        # named_modules() keeps this robust to block wrappers (Cache-DiT).
+        for _, module in self.named_modules():
+            if isinstance(module, QwenJointAttention):
+                module.finalize_fused_qkv_pack()
 
     def forward(
         self,
