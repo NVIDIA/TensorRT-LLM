@@ -76,6 +76,11 @@ def forward_context_sparse_attn(
     position_ids: Optional[torch.Tensor] = None,
     indexer_intermediates: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
+    if getattr(self.mqa, "has_fp4_kv_cache", False):
+        raise NotImplementedError(
+            "NVFP4 DSA cache currently supports q_len=1 decode only; "
+            "context attention requires chunked top-k dequantization."
+        )
     if should_use_short_mha(self, attn_metadata, position_ids):
         return self.forward_context(
             q, compressed_kv, k_pe, position_ids, attn_metadata, output, latent_cache
@@ -113,6 +118,11 @@ def forward_generation_sparse_attn(
     latent_cache: Optional[torch.Tensor] = None,
     indexer_intermediates: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
+    if getattr(self.mqa, "has_fp4_kv_cache", False) and q.shape[0] != attn_metadata.num_generations:
+        raise NotImplementedError(
+            "NVFP4 DSA cache currently supports exactly one query token "
+            "per generation request (MTP is not supported)."
+        )
     if get_sm_version() >= 100:
         return self.forward_absorption_generation(
             q,

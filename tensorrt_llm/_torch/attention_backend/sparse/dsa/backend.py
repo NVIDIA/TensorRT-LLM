@@ -125,9 +125,43 @@ class DSATrtllmAttention(TrtllmAttention):
                     : topk_indices.shape[1],
                 ].copy_(topk_indices)
 
+        local_layer_idx = self.get_local_layer_idx(metadata)
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
-            topk_indices, metadata, self.get_local_layer_idx(metadata), is_generation
+            topk_indices, metadata, local_layer_idx, is_generation
         )
+
+        if metadata.kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            if not is_generation:
+                raise NotImplementedError(
+                    "NVFP4 DSA cache currently supports q_len=1 decode only; "
+                    "sparse context attention needs a chunked scratch path."
+                )
+            if topk_indices_global.shape[0] != metadata.num_generations:
+                raise NotImplementedError(
+                    "NVFP4 DSA cache currently supports exactly one query "
+                    "token per generation request (MTP is not supported)."
+                )
+            scratch = metadata.nvfp4_mla_fp8_scratch
+            compact_indices = metadata.nvfp4_mla_compact_indices
+            if scratch is None or compact_indices is None:
+                raise RuntimeError("NVFP4 MLA scratch buffers were not allocated")
+            num_rows = topk_indices_global.shape[0]
+            scratch = scratch[:num_rows]
+            compact_indices = compact_indices[:num_rows]
+            torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
+                metadata.host_kv_cache_pool_pointers,
+                metadata.host_kv_cache_pool_mapping,
+                topk_indices_global,
+                scratch,
+                compact_indices,
+                self.kv_scale_quant_orig,
+                local_layer_idx,
+                metadata._cached_num_pool_tokens,
+            )
+            # Static sparse MLA treats indices as offsets from kvPtr. Feed it
+            # compact offsets and the FP8 scratch base; TRTLLMGen is unchanged.
+            forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
+            return compact_indices, None
 
         return topk_indices_global, None
 

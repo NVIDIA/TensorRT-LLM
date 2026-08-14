@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttentionUtils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
+#include "tensorrt_llm/kernels/quantization.cuh"
 #include <algorithm>
 #include <cstdint>
 #include <cub/cub.cuh>
@@ -37,6 +38,19 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+
+template <typename T>
+inline __device__ void quantizeAndWriteMlaFp4(KVBlockArray const& scaleCache, int32_t batchIdx, int32_t tokenIdx,
+    int32_t inBlockIdx, uint32_t* dst, PackedVec<T>& values, float secondLevelScale)
+{
+    uint8_t* scaleOut = nullptr;
+    if ((inBlockIdx & 1) == 0)
+    {
+        auto* blockScales = reinterpret_cast<uint8_t*>(scaleCache.getKBlockPtr(batchIdx, tokenIdx));
+        scaleOut = blockScales + inBlockIdx / 2;
+    }
+    dst[inBlockIdx] = cvt_warp_fp16_to_fp4<T, 16, false>(values, secondLevelScale, scaleOut);
+}
 
 // A stateful callback functor that maintains the running sum between consecutive scans.
 struct BlockPrefixCallbackOp
@@ -442,10 +456,10 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
 
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
 __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe, T const* fuse_buf, void* quant_q,
-    KVCacheBuffer kv_cache, float2 const* cos_sin_cache, size_t head_num, int c_k, int total_s_len, int seq_len,
-    int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths, int* seqKVOffsets, int q_pe_ld,
-    int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
-    float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
+    KVCacheBuffer kv_cache, KVBlockArray kv_scale_cache, float2 const* cos_sin_cache, size_t head_num, int c_k,
+    int total_s_len, int seq_len, int* seqQOffset, uint32_t* fmha_tile_counter, int32_t const* kv_cache_lengths,
+    int* seqKVOffsets, int q_pe_ld, int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale,
+    float const* quant_scale_o, float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
     bool const* helix_is_inactive_rank, bool precomputed_cu_seqlens = false, bool precomputed_fmha_scheduler = false)
 {
@@ -483,10 +497,11 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
         }
 
         // Calculate bmm scale for FP8 MLA
-        if (cache_type == KvCacheDataType::FP8)
+        if (cache_type == KvCacheDataType::FP8 || cache_type == KvCacheDataType::NVFP4)
         {
             float dequant_scale_q_val = dequant_scale_q ? dequant_scale_q[0] : 1.f;
-            float dequant_scale_kv_val = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
+            float dequant_scale_kv_val
+                = cache_type == KvCacheDataType::NVFP4 ? 1.f : (dequant_scale_kv ? dequant_scale_kv[0] : 1.f);
             float quant_scale_o_val = quant_scale_o ? quant_scale_o[0] : 1.f;
             if (!precomputed_fmha_scheduler && bmm1_scale)
             {
@@ -579,6 +594,15 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                                     reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                                     reinterpret_cast<T const*>(&data), quant_scale_kv_val);
                             }
+                            else if (cache_type == KvCacheDataType::NVFP4)
+                            {
+                                if constexpr (!std::is_same_v<T, float>)
+                                {
+                                    auto& packed = reinterpret_cast<PackedVec<T>&>(data);
+                                    quantizeAndWriteMlaFp4(kv_scale_cache, batch_idx, token_kv_idx, inBlockIdx,
+                                        reinterpret_cast<uint32_t*>(kDst), packed, quant_scale_kv_val);
+                                }
+                            }
                             else
                                 reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                         }
@@ -588,7 +612,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                 {
                     auto const dst_q_idx = static_cast<size_t>(global_token_idx) * head_num * (c_k + ROPE_DIM)
                         + head_idx * (c_k + ROPE_DIM) + c_k + head_dim_idx;
-                    if (cache_type == KvCacheDataType::FP8)
+                    if (cache_type == KvCacheDataType::FP8 || cache_type == KvCacheDataType::NVFP4)
                     {
                         quantCopy<T, ELTS_PER_VEC>(reinterpret_cast<__nv_fp8_e4m3*>(quant_q) + dst_q_idx,
                             reinterpret_cast<T const*>(&data), quant_scale_q_val);
@@ -645,6 +669,17 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                                 reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
                                 fuse_buf + src_kv_global_offset + head_dim_idx, quant_scale_kv_val);
                         }
+                        else if (cache_type == KvCacheDataType::NVFP4)
+                        {
+                            if constexpr (!std::is_same_v<T, float>)
+                            {
+                                VecT data
+                                    = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
+                                auto& packed = reinterpret_cast<PackedVec<T>&>(data);
+                                quantizeAndWriteMlaFp4(kv_scale_cache, batch_idx, token_kv_idx, inBlockIdx,
+                                    reinterpret_cast<uint32_t*>(kDst), packed, quant_scale_kv_val);
+                            }
+                        }
                         else
                             reinterpret_cast<VecT*>(kDst)[inBlockIdx]
                                 = *reinterpret_cast<VecT const*>(&fuse_buf[src_kv_global_offset + head_dim_idx]);
@@ -655,7 +690,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     }
     else
     {
-        if (cache_type == KvCacheDataType::FP8)
+        if (cache_type == KvCacheDataType::FP8 || cache_type == KvCacheDataType::NVFP4)
         {
             int block_dim = gridDim.y - head_num - 1 - 8;
             int block_id = head_idx - head_num - 1 - 8;
@@ -1651,7 +1686,7 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         && params.quant_q_buf != nullptr && params.quant_scale_qkv != nullptr;
 
     dim3 grid(int(tensorrt_llm::common::divUp(params.acc_q_len, 32)), params.head_num + 1 + 8);
-    if (params.cache_type == KvCacheDataType::FP8 && !useFusedFp8Q)
+    if ((params.cache_type == KvCacheDataType::FP8 && !useFusedFp8Q) || params.cache_type == KvCacheDataType::NVFP4)
         grid.y += params.head_num * 8;
     TLLM_CHECK_WITH_INFO(params.acc_q_len % params.batch_size == 0,
         "MLA can only support input sequences with the same sequence length.");
@@ -1685,17 +1720,19 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     float const* quant_scale_q_eff = useFusedFp8Q ? params.quant_scale_qkv : params.quant_scale_q;
 
     cudaLaunchKernelEx(&config, kernel_instance, params.q_buf, params.q_pe, params.latent_cache, params.quant_q_buf,
-        kv_cache_buffer, params.cos_sin_cache, params.head_num, params.meta.kv_lora_rank, params.acc_q_len, seq_len,
-        params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
-        params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
-        quant_scale_q_eff, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
-        params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank,
-        params.precomputed_cu_seqlens, params.precomputed_fmha_scheduler);
+        kv_cache_buffer, params.kv_cache_block_scales_buffer, params.cos_sin_cache, params.head_num,
+        params.meta.kv_lora_rank, params.acc_q_len, seq_len, params.seqQOffset, params.fmha_tile_counter,
+        params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld, params.q_pe_stride, params.cache_type,
+        params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, quant_scale_q_eff, params.quant_scale_kv,
+        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale, params.helix_position_offsets,
+        params.helix_is_inactive_rank, params.precomputed_cu_seqlens, params.precomputed_fmha_scheduler);
 }
 
 template <typename T, typename KVCacheBuffer>
 void invokeMLAKvNormRopeQuantGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, cudaStream_t stream)
 {
+    TLLM_CHECK_WITH_INFO(params.cache_type != KvCacheDataType::NVFP4,
+        "Fused generation kv-norm does not yet support writing an NVFP4 MLA cache.");
     // DSv4 layout only: the kernel describes the latent row with its K_DIM/ROPE_DIM
     // template constants, so kv_lora_rank must actually match.
     TLLM_CHECK_WITH_INFO(!params.meta.rope_append && params.meta.kv_lora_rank == 448,

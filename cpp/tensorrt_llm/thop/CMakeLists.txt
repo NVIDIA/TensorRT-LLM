@@ -141,6 +141,7 @@ add_library(
   dsv3RopeOp.cpp
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
+  nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp

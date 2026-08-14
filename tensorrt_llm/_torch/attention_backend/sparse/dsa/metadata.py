@@ -125,6 +125,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._pool_cache_valid = False
         self._cached_kv_mgr_id = 0
         self._cached_pool_view = None
+        self._cached_num_pool_tokens = 0
         self._cached_tokens_per_block = 0
         self._cached_block_table_ctx = None
         self._cached_block_table_gen = None
@@ -178,6 +179,30 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
+        self.nvfp4_mla_fp8_scratch = None
+        self.nvfp4_mla_compact_indices = None
+        if self.kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            # Stable-address q_len=1 decode workspace, reused sequentially by
+            # every layer. IndexShare only shares selected positions; each
+            # layer still gathers its own latent cache into this buffer.
+            self.nvfp4_mla_fp8_scratch = self.get_empty(
+                self.cuda_graph_buffers,
+                (
+                    self.max_num_sequences,
+                    self.num_sparse_topk,
+                    self.kv_cache_manager.head_dim,
+                ),
+                cache_name="nvfp4_mla_fp8_scratch",
+                dtype=torch.float8_e4m3fn,
+                capture_graph=capture_graph,
+            )
+            self.nvfp4_mla_compact_indices = self.get_empty(
+                self.cuda_graph_buffers,
+                (self.max_num_sequences, self.num_sparse_topk),
+                cache_name="nvfp4_mla_compact_indices",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
 
     def prepare(self):
         super().prepare()
@@ -1013,9 +1038,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         pool = self.kv_cache_manager.get_unique_primary_pool()
         kv_cache_manager = self.kv_cache_manager
+        num_blocks, num_layers = pool.shape[:2]
         self._cached_tokens_per_block = kv_cache_manager.tokens_per_block
         head_dim = kv_cache_manager.head_dim
-        self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
+        self._cached_num_pool_tokens = num_blocks * num_layers * self._cached_tokens_per_block
+        if kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            # FP4 packs two values per byte and therefore cannot use the
+            # ordinary [token, head_dim] view. Its gather op reads the raw
+            # data/scale pools through their stable host pointers instead.
+            self._cached_pool_view = None
+        else:
+            self._cached_pool_view = pool.squeeze(2).view(-1, 1, head_dim)
         self._cached_block_table_ctx = self.block_table[: self.num_contexts]
         self._cached_block_table_gen = self.block_table[self.num_contexts : self.num_seqs]
         self._cached_req_idx_ctx = self.req_idx_per_token[: self.num_ctx_tokens]

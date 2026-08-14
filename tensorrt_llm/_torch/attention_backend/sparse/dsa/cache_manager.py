@@ -250,20 +250,21 @@ class DSACacheManager(KVCacheManager):
         use_fp4 = sparse_params.indexer_k_dtype == "fp4"
         indexer_data_dim = index_head_dim // 2 if use_fp4 else index_head_dim
 
-        # get kv cache dtype bytes
-        mem_per_token = 2
+        # Get latent KV-cache bytes. NVFP4 stores two values per data byte
+        # plus one E4M3 block scale for every 16 values.
         quant_config = model_config.quant_config
-        if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
-            mem_per_token = 1
-
-        # get head dim
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers
         )
-        # MLA latent K cache: stored at the KV cache dtype (BF16/FP8).
-        mem_per_token *= num_attention_layers * head_dim
+        if quant_config is not None and quant_config.quant_mode.has_fp4_kv_cache():
+            mem_per_token = num_attention_layers * (head_dim // 2 + math.ceil(head_dim / 16))
+        else:
+            bytes_per_element = (
+                1 if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache() else 2
+            )
+            mem_per_token = num_attention_layers * head_dim * bytes_per_element
 
         if num_layers is not None:
             num_indexer_layers = max(num_layers, 1)

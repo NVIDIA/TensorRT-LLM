@@ -1093,9 +1093,9 @@ int AttentionOp::mlaGeneration(
     int32_t const batch_beam = generation_params.beam_width * generation_params.num_requests;
 
     // The element size of the KV cache.
-    auto const elemSize = mKVCacheQuantMode.hasFp8KvCache() ? sizeof(__nv_fp8_e4m3) : sizeof(T);
+    auto const elemSize = mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : sizeof(T);
     auto const sizePerToken = num_kv_heads * head_size * elemSize;
-    params.cache_type = (mKVCacheQuantMode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
+    params.cache_type = (mFP8GenerationMLA ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
     auto kv_cache_buffer = KVBlockArray(batch_beam, generation_params.max_blocks_per_sequence, mTokensPerBlock,
         sizePerToken, generation_params.cyclic_attention_window_size,
@@ -1103,7 +1103,8 @@ int AttentionOp::mlaGeneration(
         generation_params.can_use_one_more_block, generation_params.host_primary_pool_pointer,
         generation_params.host_secondary_pool_pointer, generation_params.block_offsets);
 
-    // Currently NVFP4 KV cache is not supported for MLA. An empty placeholder is provided.
+    // Static sparse NVFP4 MLA reads a separately dequantized FP8 scratch pool,
+    // so this paged-cache scale descriptor is not consumed by the attention kernel.
     auto kv_scale_cache_buffer = KVBlockArray();
 
     void* scratchPtr = params.workspace;
@@ -2901,8 +2902,9 @@ int AttentionOp::initialize() noexcept
         "fuse_fp4_quant only supports SM100f or SM120 or SM121 devices.");
 
     // Check requirements for FP4 KV cache.
-    TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA,
-        "mFP8ContextFMHA must enable if FP4 KV cache is enabled");
+    TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA
+            || (mIsMLAEnabled && mUseSparseAttention && mFP8GenerationMLA),
+        "FP4 KV cache requires FP8 context FMHA or sparse MLA generation with an FP8 scratch pool");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != tensorrt_llm::DataType::kBF16),
@@ -3138,7 +3140,7 @@ int AttentionOp::initialize() noexcept
                     TLLM_CHECK_WITH_INFO(false, "The data type is not supported.");
                 }
 
-                if (mKVCacheQuantMode.hasFp8KvCache())
+                if (mFP8GenerationMLA)
                 {
                     qDataType = DATA_TYPE_E4M3;
                     kvDataType = DATA_TYPE_E4M3;

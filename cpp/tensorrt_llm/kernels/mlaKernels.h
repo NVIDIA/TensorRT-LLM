@@ -105,6 +105,8 @@ struct MlaParams
     int const* flash_mla_tile_scheduler_metadata = nullptr;
     int const* flash_mla_num_splits = nullptr;
     KvCacheDataType cache_type;
+    // Separate E4M3 block-scale pool used by NVFP4 paged MLA cache.
+    KVBlockArray kv_cache_block_scales_buffer{};
     // Scales for mla quantization
     float* bmm1_scale;
     float* bmm2_scale;
