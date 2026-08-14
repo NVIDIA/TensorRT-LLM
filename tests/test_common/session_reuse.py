@@ -40,6 +40,8 @@ Disabled under pytest-xdist workers (parallel tests would multiply live pools).
 import os
 import sys
 import threading
+import time
+from typing import Protocol
 
 # The spawn snapshot is shared with the session-prefetch layer (both hand a
 # live pool to a test that did not spawn it — same invariant).
@@ -67,8 +69,14 @@ _WEIGHT_CACHE_ENV = {
 }
 
 
-_RETIRE_THREADS: list = []
+_RETIRE_THREADS: list[threading.Thread] = []
 _RETIRE_LOCK = threading.Lock()
+
+
+class _PoolSession(Protocol):
+    _reuse_worker_pids: tuple[tuple[int, bytes | None], ...]
+
+    def shutdown(self) -> None: ...
 
 
 def _reap_retires(timeout: float = 60.0) -> None:
@@ -92,6 +100,31 @@ def _reap_retires(timeout: float = 60.0) -> None:
                 "[session-reuse] WARNING: pool retirement did not finish within 60s",
                 flush=True,
             )
+
+
+def _worker_start_time(pid: int) -> bytes | None:
+    """Read a worker's kernel start time without loading TRT-LLM eagerly."""
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    return _process_start_time(pid)
+
+
+def _kill_recorded_workers(real: _PoolSession) -> int:
+    """SIGKILL this pool's recorded workers, guarded against PID reuse."""
+    import signal
+
+    killed = 0
+    for pid, start_time in getattr(real, "_reuse_worker_pids", ()):
+        # Guard against PID recycling: only kill if the process at this PID
+        # is still the worker we recorded at spawn.
+        if start_time is None or _worker_start_time(pid) != start_time:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    return killed
 
 
 def _prefetcher():
@@ -193,7 +226,7 @@ class SessionReuseCache:
         return int(os.environ.get("TRTLLM_TEST_REUSE_MAX_USES", "16"))
 
     @staticmethod
-    def _retire(real, broken: bool = False):
+    def _retire(real: _PoolSession, broken: bool = False) -> None:
         """Dispose of a pool in the background without blocking the test.
 
         Healthy retires (lifetime cap, stale env snapshot, duplicate cache
@@ -209,23 +242,10 @@ class SessionReuseCache:
         needs no graceful stop; the driver reclaims GPU memory on process
         death) and then reap the client side.
         """
-        pids = getattr(real, "_reuse_worker_pids", ()) if broken else ()
 
-        def _dispose():
-            import signal
-
-            # Lazy: only runs when a pool exists, so tensorrt_llm is loaded.
-            from tensorrt_llm.llmapi.mpi_session import _process_start_time
-
-            for pid, start_time in pids:
-                # Guard against PID recycling: only kill if the process at
-                # this PID is still the worker we recorded at spawn.
-                if start_time is None or _process_start_time(pid) != start_time:
-                    continue
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+        def _dispose() -> None:
+            if broken:
+                _kill_recorded_workers(real)
             try:
                 real.shutdown()
             except Exception:
@@ -410,7 +430,7 @@ class SessionReuseCache:
         """Bypass the cache for the current test (private_mpi_session)."""
         self._suspended = suspended
 
-    def drain(self) -> None:
+    def drain(self, timeout: float = 60.0) -> None:
         """Shut down all cached pools in parallel (frees GPU/CPU footprint).
 
         Also reaps in-flight retire threads: drain runs at natural rendezvous
@@ -423,6 +443,7 @@ class SessionReuseCache:
             pools, self._pools = list(self._pools.values()), {}
         if not pools:
             return
+
         threads = [
             # daemon: a wedged pool shutdown must not keep the interpreter
             # alive at exit (a non-daemon thread would hang the CI stage).
@@ -431,16 +452,38 @@ class SessionReuseCache:
         ]
         for t in threads:
             t.start()
+
+        # Bound the whole parallel drain, rather than waiting ``timeout`` for
+        # every pool in sequence. A healthy shutdown remains graceful.
+        deadline = time.monotonic() + timeout
         for t in threads:
-            # Bounded wait: one wedged pool shutdown must not turn a drain at
-            # a shared seam (sessionfinish / RPC construction) into a
-            # suite-wide hang; a leaked wedged pool is the lesser evil.
-            t.join(timeout=60)
-            if t.is_alive():
-                print(
-                    "[session-reuse] WARNING: pool shutdown did not finish within 60s", flush=True
-                )
-        print(f"[session-reuse] drained {len(pools)} cached pool(s)", flush=True)
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        wedged = [(pool, thread) for pool, thread in zip(pools, threads) if thread.is_alive()]
+        for pool, _ in wedged:
+            killed = _kill_recorded_workers(pool)
+            print(
+                "[session-reuse] WARNING: pool shutdown did not finish within "
+                f"{timeout:g}s; sent SIGKILL to {killed} recorded worker(s)",
+                flush=True,
+            )
+
+        # Killing a wedged worker should release its GPU allocation and let
+        # the already-running shutdown return. Give that original thread a
+        # short bounded reap window; never start a concurrent second shutdown.
+        reap_deadline = time.monotonic() + min(timeout, 5.0)
+        for _, t in wedged:
+            t.join(timeout=max(0.0, reap_deadline - time.monotonic()))
+
+        still_alive = sum(t.is_alive() for t in threads)
+        if still_alive:
+            print(
+                f"[session-reuse] WARNING: {still_alive} pool shutdown thread(s) "
+                "remain after worker termination",
+                flush=True,
+            )
+        else:
+            print(f"[session-reuse] drained {len(pools)} cached pool(s)", flush=True)
 
 
 REUSE = SessionReuseCache()

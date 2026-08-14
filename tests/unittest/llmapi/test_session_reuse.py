@@ -312,6 +312,40 @@ def test_drain_shuts_cached_pools(reuse_cache):
     assert real.shut
 
 
+def test_drain_kills_recorded_worker_when_shutdown_wedges(
+    reuse_cache: SessionReuseCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signal
+    import subprocess
+    import sys
+
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"owned")
+
+    class _WedgedPool(_FakePool):
+        def __init__(
+            self, n_workers: int, wait_shutdown: bool = False, env_overrides: dict | None = None
+        ) -> None:
+            super().__init__(n_workers, wait_shutdown, env_overrides)
+            self.worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+            self._worker_identities = ((self.worker.pid, b"owned"),)
+
+        def shutdown(self) -> None:
+            self.worker.wait()
+            self.shut = True
+
+    session = reuse_cache.acquire(_WedgedPool, 1)
+    pool = session._real
+    session.shutdown()
+    try:
+        reuse_cache.drain(timeout=0.2)
+        assert pool.worker.returncode == -signal.SIGKILL
+        assert pool.shut
+    finally:
+        if pool.worker.poll() is None:
+            pool.worker.kill()
+        pool.worker.wait()
+
+
 def test_autodeploy_nodeids_are_private():
     from test_common.session_reuse_hooks import _is_private_nodeid
 
