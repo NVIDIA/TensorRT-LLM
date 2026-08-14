@@ -95,11 +95,20 @@ def get_source_dir():
     return get_project_dir() / "cpp"
 
 
-def get_build_dir(build_dir, build_type, build_root=None):
+def get_build_dir(build_dir, build_type, build_root=None, out_of_tree=False):
     if build_dir is None:
         dir_name = "build" if build_type == "Release" else f"build_{build_type}"
         if build_root is not None:
-            build_dir = Path(build_root).resolve() / f"cpp-{dir_name}"
+            # Isolate out-of-tree build state in its own CMake directory so
+            # that toggling --out-of-tree against an existing conventional
+            # build under the same --build_root always triggers a fresh
+            # configure (first_build) instead of reusing a CMakeCache whose
+            # redirected FMHA/version.h paths don't match the mode. Without
+            # this, switching modes without --clean/--configure_cmake would
+            # skip configure and silently write into the checkout despite
+            # --out-of-tree.
+            suffix = "-oot" if out_of_tree else ""
+            build_dir = Path(build_root).resolve() / f"cpp-{dir_name}{suffix}"
         else:
             build_dir = get_source_dir() / dir_name
     else:
@@ -775,7 +784,7 @@ def main(*,
             raise RuntimeError("Mooncake is not supported on Windows.")
         cmake_def_args.append(f"-DMOONCAKE_ROOT={mooncake_root}")
 
-    build_dir = get_build_dir(build_dir, build_type, build_root)
+    build_dir = get_build_dir(build_dir, build_type, build_root, out_of_tree)
     first_build = not Path(build_dir, "CMakeFiles").exists()
 
     if clean and build_dir.exists():
