@@ -313,6 +313,8 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             // Download timeout test results
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
             def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, timeoutTestFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+            // Non-fatal SCP of timeout_data.jsonl; absence is handled gracefully by generateTimeoutTestResultXml
+            Utils.exec(pipeline, script: scpFromRemoteCmd(remote, "/home/svc_tensorrt/bloom/scripts/${nodeName}/timeout_data.jsonl", "${stageName}/"), returnStatus: true, numRetries: 3)
             if (downloadTimeoutTestSucceed) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
@@ -446,10 +448,10 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
 
         try {
-            sh """
-                cd ${llmSrc}/tests/integration/defs && \
-                ${isolateTestCmdLine.join(" ")}
-            """
+            runPytestWithLog(stageName, isolateTestCmdLine, i,
+                "${WORKSPACE}/${stageName}/unfinished_test.txt",
+                "${WORKSPACE}/${stageName}/timeout_data.jsonl",
+                llmSrc)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -3257,6 +3259,37 @@ def launchTestListCheck(pipeline)
     })
 }
 
+/**
+ * Run a single pytest invocation with log capture and timeout classification.
+ *
+ * Writes the pytest command to a temporary script file (to avoid shell-quoting
+ * issues), then calls run_pytest_with_log.sh which:
+ *   - pipes pytest output through tee to a local log file
+ *   - runs classify_timeout.py to append confirmed timeout records to timeoutDataFile
+ *   - deletes the log immediately after classification
+ *   - exits with pytest's original exit code
+ *
+ * @param stageName       Stage name (used to derive outDir = WORKSPACE/stageName)
+ * @param pytestCommand   List<String> — the full pytest command including all args
+ * @param invIdx          Invocation index within this stage (for unique cmdFile naming)
+ * @param unfinishedFile  Full path to unfinished_test.txt
+ * @param timeoutDataFile Full path to timeout_data.jsonl (appended per invocation)
+ * @param llmSrc          Path to the TensorRT-LLM source root on the agent
+ */
+def runPytestWithLog(stageName, pytestCommand, invIdx, unfinishedFile, timeoutDataFile, llmSrc) {
+    def outDir = "${WORKSPACE}/${stageName}"
+    def cmdFile = "${outDir}/pytest_cmd_${invIdx}.sh"
+    def wrapperScript = "${llmSrc}/jenkins/scripts/run_pytest_with_log.sh"
+
+    sh "mkdir -p '${outDir}'"
+    writeFile file: cmdFile, text: "#!/usr/bin/env bash\ncd '${llmSrc}/tests/integration/defs'\n${pytestCommand.join(' ')}"
+    try {
+        sh "bash '${wrapperScript}' '${cmdFile}' '${outDir}' '${timeoutDataFile}' '${invIdx}' '${unfinishedFile}'"
+    } finally {
+        sh "rm -f '${cmdFile}' || true"
+    }
+}
+
 def generateTimeoutTestResultXml(pipeline, stageName) {
     def scriptPath = sh(
         script: "find . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
@@ -3264,7 +3297,10 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
     ).trim()
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
-    sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}'"""
+    def timeoutDataFile = "${curPath}/${stageName}/timeout_data.jsonl"
+    def timeoutDataArg = fileExists(timeoutDataFile) ? "--timeout-data-file '${timeoutDataFile}'" : ""
+    sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}' ${timeoutDataArg}"""
+    sh "rm -f '${timeoutDataFile}' || true"
     if (fileExists(outputFilePath)) {
         return true
     }
@@ -3645,10 +3681,10 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             "--reruns ${times - 1}"
         ]
         try {
-            sh """
-                cd ${llmSrc}/tests/integration/defs && \
-                ${newTestCmdLine.join(" ")}
-            """
+            runPytestWithLog(stageName, newTestCmdLine, times,
+                "${WORKSPACE}/${stageName}/unfinished_test.txt",
+                "${WORKSPACE}/${stageName}/timeout_data.jsonl",
+                llmSrc)
         } catch(InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -4281,13 +4317,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
+                // Clear any stale timeout_data.jsonl from a previous run of this stage.
+                // rm -rf below (regular path) would remove it too, but isolated-only or
+                // rerun-only stages skip rm -rf and could inherit a stale file.
+                sh "rm -f '${WORKSPACE}/${stageName}/timeout_data.jsonl' || true"
+                def timeoutDataFile = "${WORKSPACE}/${stageName}/timeout_data.jsonl"
+                def unfinishedFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
                 try {
                     if (preprocessedLists.regularCount > 0) {
-                        sh """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${pytestCommand.join(" ")}
-                        """
+                        sh "rm -rf '${WORKSPACE}/${stageName}/'"
+                        runPytestWithLog(stageName, pytestCommand, 0, unfinishedFile, timeoutDataFile, llmSrc)
                     } else {
                         echo "No regular tests to run for stage ${stageName}"
                         noRegularTests = true
@@ -4310,12 +4349,24 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             error "Regular tests failed after rerun attempt"
                         }
                         rerunFailed = true
-                    } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
-                        // Rerun passed but the first run had a timeout: mark this
-                        // stage FAILURE so "[${stageName}] Run Pytest" turns red,
-                        // not just the enclosing parent stage.
-                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                            error "Some tests terminated unexpectedly, please check the test report."
+                    } else {
+                        // Check whether the first run left genuinely unfinished tests
+                        // (timeout / OOM).  A normal assertion failure also leaves the
+                        // file on disk, but teardown removes the nodeid so the file
+                        // is empty; only a hard-kill (os._exit) leaves content behind.
+                        // We mirror generate_timeout_xml.py: file must exist AND have
+                        // at least one non-blank line.
+                        def unfinishedPath = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+                        def hasUnfinished = fileExists(unfinishedPath) &&
+                            readFile(unfinishedPath).readLines().any { it.trim() }
+                        if (hasUnfinished) {
+                            // Mark *this* stage FAILURE now — once the stage block
+                            // closes we can no longer set its result.  XML generation
+                            // is deferred to the single call after isolated tests so
+                            // that timeout_data.jsonl is not consumed early.
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                error "Some tests terminated unexpectedly, please check the test report."
+                            }
                         }
                     }
                 }

@@ -72,6 +72,20 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
+# Paths used for timeout classification.  All ranks share $jobWorkspace via
+# NFS, so rank 0 can write the log / JSONL there and uploadResults() can SCP
+# them from the login node without any extra copy step.
+PYTEST_LOG="${jobWorkspace}/pytest_output.log"
+TIMEOUT_DATA="${jobWorkspace}/timeout_data.jsonl"
+UNFINISHED_FILE="${jobWorkspace}/unfinished_test.txt"
+CLASSIFY_SCRIPT="${llmSrcNode}/jenkins/scripts/classify_timeout.py"
+
+# Rank 0 clears any leftover timeout_data.jsonl from a previous attempt so
+# stale records from a retry never pollute the new run's classification.
+if [ "${SLURM_PROCID}" -eq 0 ]; then
+    rm -f "${TIMEOUT_DATA}" || true
+fi
+
 # Turn off "exit on error" so the following lines always run
 set +e
 
@@ -79,9 +93,33 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-eval $pytestCommand
-pytest_exit_code=$?
+# Rank 0 captures stdout+stderr via tee for post-run timeout classification.
+# Other ranks execute directly to avoid write contention on the shared log.
+# (Multi-rank tests where each rank covers a disjoint test subset are handled
+# by a future per-rank merge step; rank-0-only coverage is sufficient for the
+# common single-rank and all-ranks-same-tests cases.)
+if [ "${SLURM_PROCID}" -eq 0 ]; then
+    eval $pytestCommand 2>&1 | tee "${PYTEST_LOG}"
+    pytest_exit_code=${PIPESTATUS[0]}
+else
+    eval $pytestCommand
+    pytest_exit_code=$?
+fi
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
+
+# Rank 0: scan the captured log for pytest-timeout banners and append records
+# to timeout_data.jsonl.  All steps are best-effort: a classify failure must
+# not change pytest_exit_code.
+if [ "${SLURM_PROCID}" -eq 0 ]; then
+    python3 "${CLASSIFY_SCRIPT}" \
+        --log        "${PYTEST_LOG}" \
+        --out        "${TIMEOUT_DATA}" \
+        --unfinished "${UNFINISHED_FILE}" || \
+        echo "WARNING: slurm_run.sh: classify_timeout.py failed; timed-out tests" \
+             "in this invocation may be reported as 'unknown' instead of" \
+             "'pytest_timeout'." >&2
+    rm -f "${PYTEST_LOG}" || true
+fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved
