@@ -197,6 +197,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
         weights = mx_loader.load_model(model)
         self._p2p_succeeded = mx_loader.p2p_succeeded
         self._transform_protocol_version_for_last_load = mx_loader.transform_protocol_version
+        if self._p2p_succeeded and weights:
+            self._p2p_succeeded = False
+            raise RuntimeError("MX P2P loading must not return native checkpoint weights")
         post_transform_compatible = (
             self._p2p_succeeded
             and transform_protocol_version is not None
@@ -209,6 +212,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
             and bool(self._local_source_identity.transform_abi_id)
         )
         if self._p2p_succeeded and not post_transform_compatible:
+            # Discovery includes the transform protocol in SourceIdentity, so
+            # this is only a backstop. RDMA already wrote the receiver buffers;
+            # falling back to disk here could mix transformed and raw weights.
             self._p2p_succeeded = False
             raise RuntimeError(
                 "MX transferred weights without a compatible TRT-LLM "
@@ -225,7 +231,12 @@ class MXCheckpointLoader(HfCheckpointLoader):
         *,
         source_identity: Optional[SourceIdentity] = None,
     ) -> None:
-        """Publish post-transform weights through the active MX load session."""
+        """Publish through the active MX session.
+
+        ``checkpoint_dir`` and ``source_identity`` are retained only for the
+        common checkpoint-loader hook signature; the session captured both at
+        load time.
+        """
         if self._mx_loader is not None:
             self._mx_loader.publish_model(model)
 

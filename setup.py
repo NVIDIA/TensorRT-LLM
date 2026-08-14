@@ -147,7 +147,7 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
-mx_deps = ["modelexpress>=0.4.1,<0.6.0"]
+mx_deps = ["modelexpress>=0.5.1,<0.6.0"]
 # Gateway protocol adapters are opt-in extras: the default installation must
 # not carry any gateway protobuf package. Each gateway owns a dedicated
 # requirements-<gateway>.txt as the single source of truth for its pins; CI

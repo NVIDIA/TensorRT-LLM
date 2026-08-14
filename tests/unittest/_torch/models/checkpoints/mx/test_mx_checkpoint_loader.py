@@ -131,9 +131,7 @@ def test_construction_preserves_checkpoint_loader_contract():
     ("effective_level", "expected_level"),
     ((logging.WARNING, logging.INFO), (logging.DEBUG, None)),
 )
-def test_transfer_log_dir_enables_info_records(
-    monkeypatch, effective_level, expected_level
-):
+def test_transfer_log_dir_enables_info_records(monkeypatch, effective_level, expected_level):
     monkeypatch.setenv("MX_TRANSFER_LOG_DIR", "/tmp/mx-transfer-logs")
     mx_logger = MagicMock()
     mx_logger.getEffectiveLevel.return_value = effective_level
@@ -342,6 +340,24 @@ def test_incompatible_transfer_protocol_fails_closed(monkeypatch):
     with pytest.raises(
         RuntimeError,
         match="compatible TRT-LLM transform protocol and SourceIdentity ABI",
+    ):
+        loader.load_weights("checkpoint", **_load_kwargs())
+
+    assert not loader.is_weights_preloaded()
+    assert not loader.is_post_transform_weights_preloaded()
+
+
+def test_p2p_transfer_cannot_return_native_weights(monkeypatch):
+    _install_fake_mx(
+        monkeypatch,
+        p2p_succeeded=True,
+        value={"disk": object()},
+    )
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+
+    with pytest.raises(
+        RuntimeError,
+        match="MX P2P loading must not return native checkpoint weights",
     ):
         loader.load_weights("checkpoint", **_load_kwargs())
 
