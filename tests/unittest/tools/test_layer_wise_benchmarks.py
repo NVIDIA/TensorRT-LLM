@@ -243,6 +243,11 @@ def test_deepseek_v32_ctx_dep(llm_root, world_size):
 
 
 # The pinned DeepSeek FP4 checkpoint requires SM100+.
+@pytest.mark.skip(
+    reason="--scaled-from rewrites WideEPMoE.select_alltoall_method_type, which is "
+    "the only alltoall-selection hook it patches. The WIDEEP backend is deprecated, "
+    "so weak scaling has no equivalent backend until the hook is generalized."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize("world_size", [4])
 def test_deepseek_r1_gen_scaled_from_16_dep(llm_root, world_size):

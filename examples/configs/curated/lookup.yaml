@@ -14,6 +14,26 @@
   config_path: examples/configs/curated/qwen3-next.yaml
   scenario: Max Throughput
   gpu_compatibility: "Any"
+- model: Qwen/Qwen3.8-2.4T-A95B-FP8
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.8-low-latency.yaml
+  scenario: Min Latency (No MTP)
+  gpu_compatibility: "B200, B300, GB200, GB300"
+- model: Qwen/Qwen3.8-2.4T-A95B-FP8
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.8-low-latency-mtp3.yaml
+  scenario: Min Latency (MTP3)
+  gpu_compatibility: "B200, B300, GB200, GB300"
+- model: Qwen/Qwen3.8-2.4T-A95B-FP8
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.8-high-throughput.yaml
+  scenario: Max Throughput (Static EPLB, No MTP)
+  gpu_compatibility: "B200, B300, GB200, GB300"
+- model: Qwen/Qwen3.8-2.4T-A95B-FP8
+  arch: Qwen3_5MoeForCausalLM
+  config_path: examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml
+  scenario: Max Throughput (Static EPLB, MTP3)
+  gpu_compatibility: "B200, B300, GB200, GB300"
 - model: nvidia/Qwen3.5-397B-A17B-NVFP4
   arch: Qwen3_5MoeForCausalLM
   config_path: examples/configs/curated/qwen3.5.yaml

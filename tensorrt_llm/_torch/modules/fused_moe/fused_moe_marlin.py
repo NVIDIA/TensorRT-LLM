@@ -31,6 +31,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, is_gated_activation, relu2
 from .fused_moe_cutlass import CutlassFusedMoE
+from .impl_contract import MoERunContext, MoEStaticCapability
 from .interface import _warn_and_return
 from .quantization import NVFP4MarlinFusedMoEMethod
 
@@ -52,8 +53,16 @@ class MarlinFusedMoE(CutlassFusedMoE):
     compatible. Requires the fused kernel to be built (no fallback path).
     """
 
+    # Restated rather than inherited from CutlassFusedMoE, whose exact-class
+    # LoRA comparison answered False for this backend.
+    capabilities = MoEStaticCapability(supports_moe_lora=False)
+
     _QUANT_SUPPORT_TABLE = {
         QuantAlgo.NVFP4: {
+            "sm_constraint": ("in", set(range(89, 100))),
+            "dtypes": {torch.bfloat16},
+        },
+        QuantAlgo.W4A16_NVFP4: {
             "sm_constraint": ("in", set(range(89, 100))),
             "dtypes": {torch.bfloat16},
         },
@@ -68,9 +77,9 @@ class MarlinFusedMoE(CutlassFusedMoE):
     ) -> Tuple[bool, Optional[str]]:
         sm_version = get_sm_version()
 
-        if quant_algo != QuantAlgo.NVFP4:
+        if quant_algo not in cls._QUANT_SUPPORT_TABLE:
             return _warn_and_return(
-                f"MarlinFusedMoE only supports NVFP4 (got quant_algo={quant_algo})"
+                f"MarlinFusedMoE only supports NVFP4 or W4A16_NVFP4 (got quant_algo={quant_algo})"
             )
 
         if not is_nvfp4_marlin_supported_sm(sm_version):
@@ -143,20 +152,24 @@ class MarlinFusedMoE(CutlassFusedMoE):
     # Main entry point
     # ====================================================================
 
+    def supports_moe_output_in_alltoall_workspace(self):
+        # Overrides the CutlassFusedMoE "True": this kernel always allocates
+        # and returns its own output tensor, so a workspace-backed buffer
+        # would be filled by nobody while combine() read from it.
+        return False
+
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
-        is_sf_swizzled: bool = True,
-        output_dtype: Optional[torch.dtype] = None,
-        tuner_num_tokens: Optional[int] = None,
-        tuner_top_k: Optional[int] = None,
-        moe_output: Optional[torch.Tensor] = None,
-        enable_alltoall: Optional[bool] = None,
-        router_logits: Optional[torch.Tensor] = None,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
+        del workspace  # Marlin owns its own scratch (see _marlin_workspace).
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        router_logits = ctx.router_logits
+        output_dtype = ctx.output_dtype
         assert output_dtype is None or output_dtype == torch.bfloat16
         assert _has_fused_moe_kernel(), (
             "marlin_nvfp4_moe_gemm is not available. Rebuild TensorRT-LLM "

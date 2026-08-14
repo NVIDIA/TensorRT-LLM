@@ -165,6 +165,7 @@ def get_dspark_topk_idxs_batched(
     window_size: int,
     block_size: int,
     start_pos: torch.Tensor,
+    valid_len: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sync-free, fixed-size (CUDA-graph-safe) batched ``get_dspark_topk_idxs``.
 
@@ -173,19 +174,18 @@ def get_dspark_topk_idxs_batched(
     ``start_pos``), this always returns the **fixed** width ``window_size +
     block_size`` and masks the unfilled context slots with ``-1``. The masked
     slots are excluded by :func:`dspark_sparse_attn` exactly as if they were
-    absent, so the result is numerically identical to gathering only the
-    ``min(window_size, start_pos+1)`` valid context positions — but the shape no
-    longer depends on the data, which is what CUDA-graph capture requires.
+    absent while the shape remains CUDA-graph safe.
 
-    Every query position attends to the same set: context window slots
-    ``0..window_size-1`` (slot ``c`` valid iff ``c <= start_pos[g]``, i.e. it has
-    been written) followed by the ``block_size`` block positions at offset
-    ``window_size`` (always valid).
+    Every query attends to the actually written circular-window suffix, followed
+    by the current-block positions. Without ``valid_len`` this preserves the
+    legacy ``start_pos``-only behavior.
 
     Args:
         window_size: sliding-window length of the captured-context KV cache.
         block_size: number of draft positions per request.
         start_pos: ``[G]`` int tensor of per-request absolute decode positions.
+        valid_len: optional ``[G]`` count of actually written rolling-window
+            entries. When omitted, preserve the legacy ``start_pos`` mask.
 
     Returns:
         int32 tensor ``[G, block_size, window_size + block_size]``.
@@ -193,9 +193,14 @@ def get_dspark_topk_idxs_batched(
     device = start_pos.device
     g = start_pos.shape[0]
     ctx_cols = torch.arange(window_size, device=device)  # [win]
-    # Context slot c holds a written key iff c <= start_pos (slots 0..start_pos
-    # filled; for start_pos >= window_size-1 the whole rolling window is filled).
-    valid = ctx_cols.unsqueeze(0) <= start_pos.unsqueeze(1)  # [G, win]
+    if valid_len is None:
+        valid = ctx_cols.unsqueeze(0) <= start_pos.unsqueeze(1)  # [G, win]
+    else:
+        # The valid entries are the contiguous logical suffix ending at
+        # start_pos, but their physical slots wrap modulo window_size.
+        valid_len = valid_len.clamp(min=0, max=window_size)
+        age = torch.remainder(start_pos.unsqueeze(1) - ctx_cols.unsqueeze(0), window_size)
+        valid = age < valid_len.unsqueeze(1)
     ctx_idx = torch.where(
         valid, ctx_cols.unsqueeze(0).expand(g, -1), torch.full_like(valid, -1, dtype=torch.long)
     )
@@ -371,6 +376,7 @@ def dspark_attention_forward_batched(
     start_pos: torch.Tensor,
     kv_cache: torch.Tensor,
     slots: torch.Tensor,
+    valid_len: torch.Tensor | None = None,
     *,
     wq_a: torch.Tensor,
     q_norm_w: torch.Tensor,
@@ -415,6 +421,9 @@ def dspark_attention_forward_batched(
         kv_cache: ``[N, window_size, head_dim]`` rolling captured-context windows
             (``N`` rows indexed by ``slots``; ``N == G`` for single-shot callers).
         slots: ``[G]`` int tensor mapping each request to its ``kv_cache`` row.
+        valid_len: optional ``[G]`` count of actually written context entries;
+            masks holes left when absolute positions are bootstrapped without
+            receiving the corresponding DSpark rolling-window state.
         freqs_cis: ``[maxlen, rope_head_dim // 2]`` precomputed plain-RoPE table;
             must satisfy ``maxlen > start_pos.max() + block_size``.
 
@@ -451,7 +460,7 @@ def dspark_attention_forward_batched(
     write_target[slots, slot_pos] = main_kv.squeeze(1).to(write_target.dtype)
     cache_rows = write_target[slots]  # [G, window, head_dim]
     kv_full = torch.cat([cache_rows, kv], dim=1)  # [G, window + block, head_dim]
-    topk = get_dspark_topk_idxs_batched(window_size, block, start_pos)
+    topk = get_dspark_topk_idxs_batched(window_size, block, start_pos, valid_len)
     o = dspark_sparse_attn(q, kv_full, attn_sink, topk, softmax_scale)  # [G, block, h, head_dim]
     o = _rope_last_dims_batched(o, rd, blk_freqs, inverse=True)
 

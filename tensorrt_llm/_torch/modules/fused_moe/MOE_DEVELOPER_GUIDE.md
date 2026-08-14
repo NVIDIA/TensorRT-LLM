@@ -119,7 +119,8 @@ ConfigurableMoE currently supports these backends (`create_moe.py`):
 - `CutlassFusedMoE`, `TRTLLMGenFusedMoE`, `DeepGemmFusedMoE`, `CuteDslFusedMoE`, `DenseGEMMFusedMoE`, `MegaMoEDeepGemm`, `MegaMoECuteDsl`
 
 Still on old path (standalone, with embedded communication):
-- `TritonFusedMoE`, `WideEPMoE`, `VanillaMoE`
+- `TritonFusedMoE`, `VanillaMoE`
+- `WideEPMoE` — deprecated, the `WIDEEP` backend can no longer be selected
 
 **Rule: All new features should target ConfigurableMoE + Backend + Scheduler architecture.**
 
@@ -152,7 +153,7 @@ Still on old path (standalone, with embedded communication):
 | `mega_moe/mega_moe_cute_dsl.py` | `MegaMoECuteDsl` | SM100/SM103 | NVFP4 via ported CuteDSL `Sm100MegaMoEKernel` fused dispatch+FC1+act+FC2+combine kernel; requires CUDA 13 Cutlass DSL runtime (PR #14354) and NVSHMEM provider (hard gate); threads per-expert `fc31_alpha`/`fc2_alpha`/`fc1_norm_const` through the kernel ABI and supports SwiGLU clamp via `swiglu_limit`; default deepgemm graph (topk score folded before fc1-out quant, host `combine_output.sum(dim=1)`) | `FUSED_COMM` |
 | `fused_moe_marlin.py` | `MarlinFusedMoE` | SM89-SM99 | W4A16 NVFP4 on Ada/Hopper (BF16 activations + FP4 weights, fused single-launch `marlin_nvfp4_moe_gemm` kernel); supports attention-DP + EP via external comm (scheduler precomputes routing; dispatch payload is plain BF16, no activation scales); non-NVFP4 layers (e.g. unquantized MTP draft layers) fall back to Cutlass in `get_moe_cls`; no dynamic EPLB | `EXTERNAL_COMM` |
 | `fused_moe_triton.py` | `TritonFusedMoE` | SM90 only | GPT-OSS on Hopper (requires `swiglu_gptoss_style=True`) | (legacy path) |
-| `fused_moe_wide_ep.py` | `WideEPMoE` | All GPUs | Deprecating — use ConfigurableMoE instead | (legacy path) |
+| `fused_moe_wide_ep.py` | `WideEPMoE` | All GPUs | Deprecated — `create_moe.py` rejects the `WIDEEP` backend. Wide EP and EPLB are available on the other backends: use `DEEPGEMM` for FP8 block-scale checkpoints, or `TRTLLM` / `CUTEDSL` / `CUTLASS` otherwise. Class kept for reference only | (legacy path) |
 | `fused_moe_vanilla.py` | `VanillaMoE` | All devices | Reference / debugging only | (legacy path) |
 
 ### Communication (`fused_moe/communication/`)
@@ -198,7 +199,7 @@ is available.
 
 Each backend's `can_implement(quant_algo, dtype_activation, swiglu_gptoss_style, ...)` method declares supported quantizations. Source of truth: the `can_implement` classmethod in each backend file.
 
-| Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | MegaMoE-CuteDSL | Triton | Marlin | WideEP | Vanilla |
+| Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | MegaMoE-CuteDSL | Triton | Marlin | WideEP (deprecated) | Vanilla |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | Unquantized (BF16/FP16) | Y (SM80+) | N | N | N | N | N | N | Y (SM90, BF16) | N | Y | Y |
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y | Y |

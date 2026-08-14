@@ -447,6 +447,7 @@ def test_seed_oss_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_seed_oss_config_registration():
     """Test that the config is properly recognized."""
     config = _create_small_config()
@@ -459,6 +460,7 @@ def test_seed_oss_config_registration():
     assert hasattr(config, "attention_out_bias")
 
 
+@pytest.mark.cpu_only
 def test_seed_oss_gqa_structure():
     """Test that attention uses GQA (fewer KV heads than Q heads)."""
     config = _create_small_config()
@@ -476,6 +478,7 @@ def test_seed_oss_gqa_structure():
     assert attn.o_proj.bias is None, "O projection should not have bias"
 
 
+@pytest.mark.cpu_only
 def test_seed_oss_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format."""
     config = _create_small_config()

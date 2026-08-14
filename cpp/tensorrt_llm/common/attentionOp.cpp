@@ -1224,11 +1224,11 @@ int AttentionOp::mlaGeneration(
         // Set the following parameters if sparseAttention is used.
         if (useSparseMLA())
         {
-            bool const useDynamicSparseMLA = mRuntimeSparseAttentionParams.sparse_mla_topk_lens != nullptr;
+            bool const useDynamicSparseMLA = mRuntimeSparseAttentionParams.sparse_attn_kv_lens != nullptr;
             tllmRunnerParams.mSparseAttention
                 = useDynamicSparseMLA ? SparseType::DynamicTokenSparse : SparseType::StaticTokenSparse;
             tllmRunnerParams.mSparseTopK = mRuntimeSparseAttentionParams.num_sparse_topk;
-            tllmRunnerParams.ptrSparseMlaTopKLens = mRuntimeSparseAttentionParams.sparse_mla_topk_lens;
+            tllmRunnerParams.ptrSparseMlaTopKLens = mRuntimeSparseAttentionParams.sparse_attn_kv_lens;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(
                 mRuntimeSparseAttentionParams.sparse_attn_indices);
             if (useDynamicSparseMLA)
