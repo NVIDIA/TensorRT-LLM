@@ -61,6 +61,9 @@ class _LayerCache:
         self.intermediate_ssm = torch.zeros(
             slots, t_max, h, v, k, dtype=torch.float32, device=device
         )
+        # This double drives the sequential-verify path, not the KDA
+        # fused-replay path, so it has no kda_* replay caches.
+        self.has_kda_replay_caches = False
 
 
 def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -> SimpleNamespace:
@@ -137,10 +140,14 @@ def test_kda_fused_prefill_matches_separate_projections():
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
 
-    expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    expected_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     expected = reference(hidden_states, _prefill_metadata(expected_cache, slot_indices, cu_seqlens))
 
-    actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    actual_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     actual = runtime(hidden_states, _prefill_metadata(actual_cache, slot_indices, cu_seqlens))
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
@@ -184,10 +191,14 @@ def test_kda_qkvg_multistream_decode_matches_separate_projections():
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
 
-    expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    expected_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     expected = reference(hidden_states, _decode_metadata(expected_cache, slot_indices))
 
-    actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    actual_cache = SimpleNamespace(
+        conv=conv_seed.clone(), temporal=state_seed.clone(), has_kda_replay_caches=False
+    )
     with with_multi_stream(True):
         actual = runtime(hidden_states, _decode_metadata(actual_cache, slot_indices))
 

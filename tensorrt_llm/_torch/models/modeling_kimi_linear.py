@@ -1665,7 +1665,7 @@ class KimiKDARuntime(nn.Module):
         if state_indices is None or state_indices.shape[0] != batch_size:
             state_indices = mamba_metadata.state_indices[:batch_size].long()
         cu_seqlens = mamba_metadata.query_start_loc_long[: num_prefills + 1]
-        num_decodes = batch_size - num_prefills
+        num_generations = batch_size - num_prefills
 
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         conv_pool = layer_cache.conv  # [slots, 3D, W] bf16
@@ -1685,9 +1685,9 @@ class KimiKDARuntime(nn.Module):
                     layer_cache,
                 )
             )
-        if num_decodes > 0:
-            decode_rows = hidden_states.shape[0] - num_ctx_tokens
-            if decode_rows == num_decodes:
+        if num_generations > 0:
+            num_gen_tokens = hidden_states.shape[0] - num_ctx_tokens
+            if num_gen_tokens == num_generations:
                 outputs.append(
                     self._forward_decode(
                         hidden_states[num_ctx_tokens:],
@@ -1710,13 +1710,13 @@ class KimiKDARuntime(nn.Module):
                 # SpeculativeState scratch buffers — never the live pools —
                 # and kv_cache_manager.update_mamba_states() promotes the
                 # accepted step after sampling.
-                assert decode_rows % num_decodes == 0, (
-                    f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
+                assert num_gen_tokens % num_generations == 0, (
+                    f"ragged generation batch: {num_gen_tokens} tokens for {num_generations} requests"
                 )
                 outputs.append(
                     self._forward_verify(
                         hidden_states[num_ctx_tokens:],
-                        decode_rows // num_decodes,
+                        num_gen_tokens // num_generations,
                         layer_cache,
                         conv_pool,
                         ssm_pool,
@@ -1732,7 +1732,7 @@ class KimiKDARuntime(nn.Module):
 
     def _has_kda_replay_caches(self, layer_cache) -> bool:
         """True when the manager allocated the fused-verify replay caches."""
-        return getattr(layer_cache, "kda_qkg_cache", None) is not None
+        return layer_cache is not None and layer_cache.has_kda_replay_caches
 
     def _sync_kda_replay_conv_window(
         self, layer_cache, slot_indices, conv_q, conv_k, conv_v
@@ -1748,13 +1748,8 @@ class KimiKDARuntime(nn.Module):
         """
         if not self._has_kda_replay_caches(layer_cache):
             return
-        w = self.mixer.conv_size
-        for cache, window in (
-            (layer_cache.kda_conv_q, conv_q),
-            (layer_cache.kda_conv_k, conv_k),
-            (layer_cache.kda_conv_v, conv_v),
-        ):
-            cache[:, :, : w - 1].index_copy_(0, slot_indices, window[:, :, 1:].to(cache.dtype))
+        layer_cache.commit_conv_window(slot_indices, conv_q, conv_k, conv_v,
+                                       self.mixer.conv_size)
 
     def _forward_prefill(
         self,
@@ -2203,12 +2198,12 @@ class KimiKDARuntime(nn.Module):
         additively with a token offset ``>= num_accepted``.
         """
         mixer = self.mixer
-        num_decodes = x2d.shape[0] // num_steps
+        num_generations = x2d.shape[0] // num_steps
         num_spec = num_steps - 1
         H = mixer.num_heads
         K = mixer.head_k_dim
-        x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
-        T_total = num_decodes * num_steps
+        x = x2d.view(num_generations, num_steps, -1)  # [B, T, hidden]
+        T_total = num_generations * num_steps
 
         projections = self._project_verify_inputs(x, T_total)
         if projections is None:
@@ -2239,9 +2234,9 @@ class KimiKDARuntime(nn.Module):
             torch.int32
         )  # accepted drafts of the previous round, per req
         cu_seqlens = torch.arange(
-            0, (num_decodes + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
+            0, (num_generations + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device
         )
-        cu_seqlens[:num_decodes].sub_(pending)
+        cu_seqlens[:num_generations].sub_(pending)
 
         out = mixer._dispatch.mtp_verify(
             x_q=x_q,
@@ -2270,7 +2265,7 @@ class KimiKDARuntime(nn.Module):
             lower_bound=lower_bound,
             scale=mixer.head_k_dim**-0.5,
         )
-        o = out.view(num_decodes, num_steps, H, mixer.head_dim)
+        o = out.view(num_generations, num_steps, H, mixer.head_dim)
         return self._output_gate_and_proj(x, o, onorm_g)
 
     def _build_mtp_conv_weights(self) -> None:
@@ -2316,8 +2311,8 @@ class KimiKDARuntime(nn.Module):
 
         mixer = self.mixer
         d = self.proj_size
-        num_decodes = x2d.shape[0] // num_steps
-        x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
+        num_generations = x2d.shape[0] // num_steps
+        x = x2d.view(num_generations, num_steps, -1)  # [B, T, hidden]
 
         projections = self._project_verify_inputs(x, x2d.shape[0])
         if projections is None:
@@ -2373,12 +2368,12 @@ class KimiKDARuntime(nn.Module):
             )
             step_outputs.append(o_t)
 
-            # Batch-row indexed ([:num_decodes] prefix), matching
+            # Batch-row indexed ([:num_generations] prefix), matching
             # update_mamba_states()'s intermediate_state_indices.
-            intermediate_conv[:num_decodes, t] = torch.cat([conv_q, conv_k, conv_v], dim=1).to(
+            intermediate_conv[:num_generations, t] = torch.cat([conv_q, conv_k, conv_v], dim=1).to(
                 intermediate_conv.dtype
             )
-            intermediate_ssm[:num_decodes, t] = state.to(intermediate_ssm.dtype)
+            intermediate_ssm[:num_generations, t] = state.to(intermediate_ssm.dtype)
 
         o = torch.cat(step_outputs, dim=1)  # [B, T, H, V]
         return self._output_gate_and_proj(x, o, onorm_g)
