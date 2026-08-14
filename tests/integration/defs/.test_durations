@@ -549,7 +549,6 @@
    "accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[phi-4-mini]": 16.173794749403342,
    "accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen2-7b]": 16.645926365795724,
    "accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[qwen3-0.6b]": 7.999092857142856,
-   "accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[starcoder2-3b]": 18.89151904761905,
    "accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_matches_huggingface[tinyllama-1.1b]": 6.422192857142857,
    "accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_cuda_graph_matches_eager_logits[bert-yelp]": 5.8486,
    "accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-cuda_graph]": 4.171104761904762,

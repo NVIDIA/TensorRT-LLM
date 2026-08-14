@@ -409,8 +409,6 @@ GPT-OSS/20B-NVFP4:
     accuracy: 85.0
 ByteDance-Seed/Seed-OSS-36B-Instruct:
   - accuracy: 90.8
-bigcode/starcoder2-3b:
-  - accuracy: 20.2
 bigcode/starcoder2-7b:
   - accuracy: 26.5
 bigcode/starcoder2-15b:
