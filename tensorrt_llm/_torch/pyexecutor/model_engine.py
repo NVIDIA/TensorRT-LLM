@@ -2301,17 +2301,16 @@ class PyTorchModelEngine(ModelEngine):
                     # live spec_metadata on every later replay, so leaving the
                     # flag set there makes _scan_one_model_sampling overwrite
                     # every serving request's sampling params with the synthetic
-                    # capture values (0.7 / 50 / 0.9). The runner defers this
-                    # cleanup during warmup-only because the real capture pass
-                    # reuses that pass's cached metadata.
-                    cleared = (
-                        self.cuda_graph_runner.
-                        clear_capture_only_spec_state_after_capture_pass())
-                    if cleared is not None:
+                    # capture values (0.7 / 50 / 0.9). Defer cleanup during
+                    # warmup-only because the real capture pass reuses that
+                    # pass's cached metadata.
+                    if not self.cuda_graph_runner.is_warmup_only:
+                        cleared = (self.cuda_graph_runner.
+                                   clear_capture_only_spec_state())
                         logger.info(
                             "Cleared capture-only sampling override from "
-                            f"{cleared} cached CUDA graph spec metadata object(s)."
-                        )
+                            f"{cleared} cached CUDA graph spec metadata "
+                            "object(s).")
 
         # Pass 1: greedy fast-path (dummy requests carry no sampling params,
         # so is_all_greedy_sample is naturally True).
