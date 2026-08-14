@@ -1,8 +1,8 @@
 # Nemotron-Ultra-V3 (mixed NVFP4 weights + FP8 KV + fp16 Mamba cache),
-# disaggregated E2E, 50K ISL / 2K OSL. MIN-LATENCY point.
-# Measured on GB200 NVL72 (28 GPUs = 1 ctx x DEP4 + 6 gen x TEP4):
-#   concurrency 12, out_tps 2263, tps/gpu 80.8, TPOT 2.34 ms (427 tok/s/user), TTFT 5.66 s.
-#   1 ctx : 6 gen instances, per-gen concurrency 2 -> 12 total.
+# disaggregated E2E, 50K ISL / 2K OSL. BALANCED point (Pareto knee).
+# Measured on GB300 NVL72 (24 GPUs = 5 ctx x DEP4 + 1 gen x DEP4):
+#   concurrency 178, out_tps 12208, tps/gpu 508.7, TPOT 9.79 ms (102 tok/s/user), TTFT 9.11 s.
+#   94% of peak tps/gpu at 2.5x the per-user speed of the con1197 point.
 # The captured configs spelled the MTP depth as
 # speculative_config.num_nextn_predict_layers; that field was removed from the
 # user-facing MTPDecodingConfig on main (StrictBaseModel now rejects it), so it
@@ -15,31 +15,31 @@ metadata:
   precision: fp4
   model_dir_name: Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k
   supported_gpus:
-  - GB200
+  - GB300
   script_file: disaggr_torch.slurm
   benchmark_type: 50k2k
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
   account: <account>
-  job_time: 02:00:00
+  job_time: 04:00:00
   job_name: unified-benchmark
   extra_args: --gres=gpu:4
   numa_bind: true
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: false
-  multi_round: 12
+  multi_round: 16
   benchmark_ratio: 0.0
   streaming: true
-  concurrency_list: '2'
+  concurrency_list: '178'
   input_length: 50000
   output_length: 2048
   dataset_file: <dataset_file>
 hardware:
   gpus_per_node: 4
-  num_ctx_servers: 1
-  num_gen_servers: 6
+  num_ctx_servers: 5
+  num_gen_servers: 1
 environment:
   container_mount: <container_mount>
   container_image: <container_image>
@@ -55,18 +55,18 @@ profiling:
 worker_config:
   gen:
     print_iter_log: true
-    max_batch_size: 1
-    max_num_tokens: 7
+    max_batch_size: 32
+    max_num_tokens: 224
     max_seq_len: 52304
     tensor_parallel_size: 4
     moe_expert_parallel_size: 4
     pipeline_parallel_size: 1
     context_parallel_size: 1
-    enable_attention_dp: false
-    enable_lm_head_tp_in_adp: false
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
     cuda_graph_config:
       enable_padding: true
-      batch_sizes: [1, 2, 4]
+      batch_sizes: [1, 2, 4, 8, 16, 24, 32]
     kv_cache_config:
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.85
@@ -75,7 +75,7 @@ worker_config:
       mamba_ssm_philox_rounds: 5
       mamba_ssm_stochastic_rounding: true
     moe_config:
-      backend: TRTLLM
+      backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
       max_tokens_in_buffer: 50256

@@ -17,8 +17,4 @@ l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8:
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-r1-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-v32-fp4_32k4k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)
   - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_deepseek-v32-fp4_8k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)
-  # Nemotron-3-Ultra-550B-A55B disagg-E2E balanced point (TEP8 bs64 mtp3, conc 64).
-  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb200_nemotron-ultra-v3-fp4_8k64k_con64_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)
-  # Nemotron-3-Ultra-550B-A55B disagg gen-only balanced point (TEP8 bs64 mtp3, conc 64).
-  - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_nemotron-ultra-v3-fp4_8k64k_con64_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)
   # - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (90)

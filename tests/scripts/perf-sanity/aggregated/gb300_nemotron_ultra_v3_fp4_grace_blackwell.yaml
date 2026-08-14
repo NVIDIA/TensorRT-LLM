@@ -1,4 +1,4 @@
-# Nemotron-Ultra-V3 (mixed NVFP4/FP8) — aggregated 50k/2k perf-sanity points on GB200.
+# Nemotron-Ultra-V3 (mixed NVFP4/FP8) — aggregated 50k/2k perf-sanity points on GB300.
 # All three run on 4 GPUs as a single trtllm-serve instance (prefill+decode colocated).
 #
 #   con1   TEP4 bs1   MTP6      81.0 tok/s/GPU   498.0 tok/s/user   min latency
@@ -23,7 +23,7 @@ metadata:
   precision: fp4
   model_dir_name: Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k
   supported_gpus:
-  - GB200
+  - GB300
   benchmark_type: 50k2k
 hardware:
   gpus_per_node: 4
