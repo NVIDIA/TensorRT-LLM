@@ -48,6 +48,7 @@ from ..pyexecutor.sampler.ops.flashinfer import (
     compute_probs_from_logits, resolve_advanced_sampling_filters,
     sample_from_logits_op, sampling_batch_spec_dec_one_model_for_rejection)
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from . import penalty_ops
 
 
 def rejection_sampling_one_model(
@@ -602,6 +603,48 @@ class SpecMetadata:
     use_rejection_sampling: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
+    # Whether the occurrence penalties are enabled (deploy-time; from
+    # DecodingBaseConfig.enable_penalty). Gates the occurrence workspace allocation.
+    enable_penalty: bool = False
+    # --- Occurrence-penalty state (allocated by prepare_penalty_buffers) ---
+    # int32 [num_slot_rows, vocab_size]; how often each token the MODEL generated has
+    # occurred. Read as ``count > 0`` by repetition/presence and as the count itself
+    # by frequency.
+    penalty_counts: Optional[torch.Tensor] = None
+    # int32 [num_slot_rows, ceil(vocab_size / 32)]; one bit per token id recording
+    # whether it appeared in the PROMPT. Prompt tokens feed repetition only -- the
+    # user's own text should not be charged presence/frequency -- and repetition only
+    # asks "seen or not", so a bitmask carries all the information a count would at
+    # 1/32 the memory of a full-width count tensor.
+    penalty_prompt_mask: Optional[torch.Tensor] = None
+    # Whether any request in the current batch has a penalty. Diagnostic only: it
+    # must NOT gate the apply pass, because decode steps replay a CUDA graph
+    # captured during warmup, when the flag is necessarily False. Whether a row is
+    # actually penalized is decided on device by ``penalty_active``.
+    #
+    # Held in a list rather than a plain bool because create_cuda_graph_metadata
+    # shallow-copies this object and both views must observe the same value; same
+    # reasoning as _sampling_params_signature below.
+    _batch_uses_penalty: list = field(default_factory=lambda: [False],
+                                      repr=False)
+
+    @property
+    def batch_uses_penalty(self) -> bool:
+        return self._batch_uses_penalty[0]
+
+    @batch_uses_penalty.setter
+    def batch_uses_penalty(self, value: bool) -> None:
+        self._batch_uses_penalty[0] = value
+
+    # Per-slot penalty parameters, with their no-op defaults (1.0 / 0.0 / 0.0).
+    penalty_repetition: Optional[torch.Tensor] = None
+    penalty_presence: Optional[torch.Tensor] = None
+    penalty_frequency: Optional[torch.Tensor] = None
+    # bool [num_slot_rows]; whether the slot has any active occurrence penalty.
+    penalty_active: Optional[torch.Tensor] = None
+    # Row that CUDA-graph dummy/padding requests (py_seq_slot is None) route to,
+    # so they never touch a real request's counts. Mirrors dummy_slot_row.
+    penalty_dummy_row: int = 0
     # Sampling parameters for non-greedy sampling (per-request)
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
@@ -855,6 +898,180 @@ class SpecMetadata:
                 dtype=torch.float32,
                 device='cuda')
 
+    def prepare_penalty_buffers(self):
+        """Allocate the slot-indexed occurrence-penalty buffers.
+
+        Idempotent and gated on ``enable_penalty``. Allocated up front rather than
+        on first use (the way ``TorchSampler``'s ``PenaltyStore.ensure_workspace``
+        does it) because a captured CUDA graph reads fixed buffer addresses: a lazy
+        first allocation would land after capture and the replayed kernel would read
+        the wrong pointer.
+
+        Sized and indexed exactly like the rejection buffers -- see
+        ``prepare_rejection_sampling_buffers`` for why the slot pool is
+        ``num_seq_slots`` (not ``max_num_requests``) and why one scratch row is
+        appended for dummy/padding requests.
+        """
+        if not self.enable_penalty or self.vocab_size <= 0:
+            return
+
+        slot_capacity = self.num_seq_slots or self.max_num_requests
+        if slot_capacity <= 0:
+            return
+        num_slot_rows = slot_capacity + 1
+
+        if self.penalty_counts is None:
+            self.penalty_counts = torch.zeros((num_slot_rows, self.vocab_size),
+                                              dtype=torch.int32,
+                                              device='cuda')
+            self.penalty_dummy_row = slot_capacity
+        if self.penalty_prompt_mask is None:
+            # 32 token ids per int32 word.
+            self.penalty_prompt_mask = torch.zeros(
+                (num_slot_rows, (self.vocab_size + 31) // 32),
+                dtype=torch.int32,
+                device='cuda')
+        if self.batch_slot_ids is None and self.max_num_requests > 0:
+            # Normally allocated by prepare_rejection_sampling_buffers; the penalties
+            # need the same row -> slot table even when rejection sampling is off.
+            self.batch_slot_ids = torch.empty((self.max_num_requests, ),
+                                              dtype=torch.long,
+                                              device='cuda')
+        if self.penalty_repetition is None:
+            # No-op defaults, so a slot that was never filled leaves logits untouched.
+            self.penalty_repetition = torch.ones((num_slot_rows, ),
+                                                 dtype=torch.float32,
+                                                 device='cuda')
+            self.penalty_presence = torch.zeros((num_slot_rows, ),
+                                                dtype=torch.float32,
+                                                device='cuda')
+            self.penalty_frequency = torch.zeros((num_slot_rows, ),
+                                                 dtype=torch.float32,
+                                                 device='cuda')
+            self.penalty_active = torch.zeros((num_slot_rows, ),
+                                              dtype=torch.bool,
+                                              device='cuda')
+
+    @staticmethod
+    def _request_prompt_tokens(request):
+        """The request's prompt token ids, or None when they are unavailable.
+
+        Sliced to ``py_orig_prompt_len`` so only the prompt is taken, never tokens
+        the model has already generated -- those belong to the output counts.
+        """
+        get_tokens = getattr(request, "get_tokens", None)
+        if get_tokens is None:
+            return None
+        prompt_len = getattr(request, "py_orig_prompt_len", None)
+        tokens = get_tokens(0)
+        if prompt_len is not None:
+            tokens = tokens[:prompt_len]
+        if not len(tokens):
+            return None
+        return torch.tensor(tokens,
+                            dtype=torch.int64,
+                            pin_memory=prefer_pinned())
+
+    @staticmethod
+    def _penalty_value(sampling_config, name: str, default: float) -> float:
+        """Read one penalty parameter, which the C++ SamplingConfig holds as an
+        optional singleton list. Missing / empty / None all mean "not set"."""
+        if sampling_config is None:
+            return default
+        values = getattr(sampling_config, name, None)
+        if values is None:
+            return default
+        if isinstance(values, (list, tuple)):
+            if len(values) == 0 or values[0] is None:
+                return default
+            return float(values[0])
+        return float(values)
+
+    def _populate_penalty_params(self, requests):
+        """Write each request's penalty parameters into its slot row.
+
+        Only the rows of the requests in this batch are touched; a slot keeps its
+        values for the request's lifetime, and ``penalty_active`` is rewritten every
+        step so a slot whose new occupant has no penalties stops being penalized
+        (slot reuse would otherwise inherit the previous request's parameters).
+
+        Counts for a newly admitted slot are zeroed here as well, for the same
+        reason. Requests without a slot (CUDA-graph dummies) are skipped; their
+        rows keep the no-op defaults.
+        """
+        if not self.enable_penalty or self.penalty_counts is None:
+            return
+
+        slots: list[int] = []
+        repetition: list[float] = []
+        presence: list[float] = []
+        frequency: list[float] = []
+        active: list[bool] = []
+        reset_slots: list[int] = []
+        seed_requests: list[tuple] = []
+        num_rows = self.penalty_counts.size(0)
+
+        for request in requests:
+            slot = getattr(request, "py_seq_slot", None)
+            if slot is None or slot >= num_rows:
+                continue
+            config = getattr(request, "sampling_config", None)
+            rep = self._penalty_value(config, "repetition_penalty", 1.0)
+            pre = self._penalty_value(config, "presence_penalty", 0.0)
+            freq = self._penalty_value(config, "frequency_penalty", 0.0)
+            slots.append(slot)
+            repetition.append(rep)
+            presence.append(pre)
+            frequency.append(freq)
+            active.append(rep != 1.0 or pre != 0.0 or freq != 0.0)
+            # A context request is starting its sequence: drop whatever the slot's
+            # previous occupant accumulated, then seed the prompt this one starts
+            # from. Only penalized requests are seeded -- reading the prompt costs a
+            # host-side copy that an unpenalized request would never consult.
+            if getattr(request, "is_context_init_state", False):
+                reset_slots.append(slot)
+                if active[-1]:
+                    seed_requests.append((slot, request))
+
+        # Host-side gate for the apply pass: with no penalized request in the batch,
+        # the whole vocab-sized rewrite is a no-op worth skipping.
+        self.batch_uses_penalty = any(active)
+
+        if not slots:
+            return
+
+        slots_cuda = torch.tensor(slots,
+                                  dtype=torch.long,
+                                  pin_memory=prefer_pinned()).to(
+                                      'cuda', non_blocking=True)
+        params = torch.tensor([repetition, presence, frequency],
+                              dtype=torch.float32,
+                              pin_memory=prefer_pinned()).to('cuda',
+                                                             non_blocking=True)
+        self.penalty_repetition.index_copy_(0, slots_cuda, params[0])
+        self.penalty_presence.index_copy_(0, slots_cuda, params[1])
+        self.penalty_frequency.index_copy_(0, slots_cuda, params[2])
+        self.penalty_active.index_copy_(
+            0, slots_cuda,
+            torch.tensor(active, dtype=torch.bool,
+                         pin_memory=prefer_pinned()).to('cuda',
+                                                        non_blocking=True))
+        if reset_slots:
+            reset_cuda = torch.tensor(reset_slots,
+                                      dtype=torch.long,
+                                      pin_memory=prefer_pinned()).to(
+                                          'cuda', non_blocking=True)
+            self.penalty_counts.index_fill_(0, reset_cuda, 0)
+            # The prompt bitmask is per-sequence too: a reused slot must not inherit
+            # the previous occupant's prompt.
+            self.penalty_prompt_mask.index_fill_(0, reset_cuda, 0)
+
+        # Seeded after the reset above, or the clear would wipe what we just wrote.
+        for slot, request in seed_requests:
+            prompt = self._request_prompt_tokens(request)
+            if prompt is not None:
+                penalty_ops.seed_prompt_mask(self, slot, prompt)
+
     def write_padding_onehot_draft_probs(self, padding_slot_ids, draft_len):
         """Write a one-hot draft-prob row (prob 1.0 at draft-vocab token id 0,
         the placeholder token) into each padding gen request's stable slot row.
@@ -1095,6 +1312,8 @@ class SpecMetadata:
         # batch_slot_ids below; this runs earlier than prepare() in the
         # model-engine flow. No-op unless use_rejection_sampling is set.
         self.prepare_rejection_sampling_buffers()
+        # Likewise for the occurrence-penalty workspace. No-op unless enable_penalty.
+        self.prepare_penalty_buffers()
 
         if self.temperatures is None:
             # Ensures determinism across ranks.
@@ -1140,14 +1359,21 @@ class SpecMetadata:
 
         # Always-populate the per-request slot id table when rejection sampling
         # is configured: it's tiny (max_num_requests longs) and needed at
-        # draft-sampler time to scatter draft probs by slot.
-        if self.use_rejection_sampling and self.batch_slot_ids is not None:
+        # draft-sampler time to scatter draft probs by slot. The penalties need the
+        # same table to map logits rows back to their slot, so they enable it too.
+        if (self.use_rejection_sampling
+                or self.enable_penalty) and self.batch_slot_ids is not None:
             self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
                 torch.tensor(per_request_slot_ids,
                              dtype=torch.long,
                              pin_memory=prefer_pinned()),
                 non_blocking=True,
             )
+
+        # Penalties are independent of the greedy/advanced split -- they rewrite the
+        # logits before sampling, so an all-greedy batch is penalized too (its argmax
+        # is taken over the penalized logits). Filled before the early return below.
+        self._populate_penalty_params(requests)
 
         # All-greedy: sampler takes the argmax branch (and rejection sampling
         # is also bypassed for all-greedy), so the per-token buffers are never
@@ -1671,6 +1897,38 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return accepted_tokens, num_accepted_tokens
 
+    def _apply_occurrence_penalties(self, logits, draft_tokens, num_contexts,
+                                    batch_size, spec_metadata):
+        """Penalize the target logits in place, before acceptance reads them.
+
+        No-op unless the deploy enabled the penalties and some request in the batch
+        actually uses one. ``logits`` must already be in the normalized
+        ``[ctx (1 row), gen (draft_len + 1 rows)]`` layout, i.e. after
+        ``_reshape_logits_for_accept`` -- which is what makes PARD's wider raw
+        layout fit the same mapping.
+        """
+        if not getattr(spec_metadata, "enable_penalty", False):
+            return
+        # NB: deliberately NOT gated on batch_uses_penalty. Decode steps replay a
+        # captured CUDA graph, so a host-side skip decided at capture time would be
+        # baked in permanently -- and capture happens during warmup, when no real
+        # request is resident and the flag is False. The penalty pass must always be
+        # captured; whether it changes anything is decided on device by
+        # ``penalty_active``, which the replayed kernel re-reads every step.
+        draft_len = draft_tokens.shape[1] if draft_tokens.dim() > 1 else 0
+        mapping = penalty_ops.build_row_mapping(spec_metadata, num_contexts,
+                                                batch_size, draft_len,
+                                                draft_tokens, logits.device)
+        if mapping is None:
+            return
+        row_slots, intra_tokens, intra_valid = mapping
+        if row_slots.numel() != logits.shape[0]:
+            # The caller's row layout is not the one this mapping describes (tree
+            # modes); penalizing against it would charge the wrong request.
+            return
+        penalty_ops.apply_penalties(logits, spec_metadata, row_slots,
+                                    intra_tokens, intra_valid)
+
     def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
                              batch_size, spec_metadata):
         """
@@ -1680,7 +1938,16 @@ class SpecWorkerBase(nn.Module, ABC):
         first sampled target token via the base logic, and rejection sampling
         runs on the gen subset. Draft probs for the gen subset are gathered
         from the slot-indexed buffer by `py_seq_slot`.
+
+        Occurrence penalties are applied to the target logits first, so both the
+        strict and the rejection branch verify against the penalized distribution.
+        The draft distribution is deliberately left unpenalized: rejection sampling
+        stays unbiased either way (it only requires draft_probs to match how the
+        draft tokens were actually drawn), so this costs acceptance rate rather
+        than correctness.
         """
+        self._apply_occurrence_penalties(logits, draft_tokens, num_contexts,
+                                         batch_size, spec_metadata)
         num_gens = batch_size - num_contexts
         if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
             draft_len = draft_tokens.shape[1]
@@ -1699,11 +1966,33 @@ class SpecWorkerBase(nn.Module, ABC):
                     num_contexts:batch_size]
                 draft_probs = spec_metadata.draft_probs[
                     gen_slot_ids, :draft_len, :stored_vocab]
-                return self._sample_and_accept_draft_tokens_rejection(
+                accepted = self._sample_and_accept_draft_tokens_rejection(
                     logits, draft_tokens, draft_probs, num_contexts, batch_size,
                     spec_metadata)
-        return self._sample_and_accept_draft_tokens_base(
+                return self._commit_occurrence_counts(accepted, batch_size,
+                                                      spec_metadata)
+        accepted = self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+        return self._commit_occurrence_counts(accepted, batch_size,
+                                              spec_metadata)
+
+    def _commit_occurrence_counts(self, accepted, batch_size, spec_metadata):
+        """Record the tokens this step accepted, so later steps penalize them.
+
+        Rejected speculative tokens never entered the sequence and are excluded by
+        ``num_accepted_tokens``. Passes ``accepted`` straight through so callers can
+        keep returning in one expression.
+        """
+        if not getattr(spec_metadata, "enable_penalty", False):
+            return accepted
+        accepted_tokens, num_accepted_tokens = accepted
+        slot_ids = spec_metadata.batch_slot_ids
+        if slot_ids is None:
+            return accepted
+        penalty_ops.update_penalty_counts(spec_metadata,
+                                          slot_ids[:batch_size].to(torch.int64),
+                                          accepted_tokens, num_accepted_tokens)
+        return accepted
 
     def _draft_logits_are_sharded(self, logits, spec_metadata):
         """Whether the draft logits are vocab-sharded and need a TP gather.
