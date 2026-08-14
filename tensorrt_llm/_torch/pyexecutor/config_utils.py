@@ -411,35 +411,13 @@ def extract_mamba_kv_cache_params(
     )
 
 
+_QWEN_IMAGE_BENCH_ARCHITECTURE = "QwenImageBenchForConditionalGeneration"
+
+
 def is_qwen_image_bench_config(config_dict: dict) -> bool:
-    """Detect Qwen-Image-Bench's composite VLM checkpoint config.
-
-    The checkpoint advertises the generic Qwen3.5 VLM architecture, but
-    TRT-LLM needs a dedicated architecture key to route it to
-    QwenImageBenchModel. Generic Qwen3.5 text checkpoints can also publish
-    composite text/vision metadata, so require the explicit
-    `language_model_only: false` marker from Qwen-Image-Bench before
-    rewriting the architecture.
-
-    The text-config normalization itself lives on
-    `modeling_qwen3_5.Qwen35ConfigCompat`; this stays here because it is pure
-    dispatch detection over the raw config dict and keeps the model module out
-    of the hot path until a Qwen3.5 checkpoint is actually loaded.
-    """
+    """Return whether the config explicitly requests QwenImageBenchModel."""
     architectures = config_dict.get("architectures") or []
-    text_config = config_dict.get("text_config")
-    vision_config = config_dict.get("vision_config")
-    required_multimodal_token_ids = {
-        "image_token_id",
-        "video_token_id",
-        "vision_start_token_id",
-        "vision_end_token_id",
-    }
-    return (config_dict.get("language_model_only") is False
-            and architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
-            and isinstance(text_config, dict) and bool(text_config)
-            and isinstance(vision_config, dict) and bool(vision_config)
-            and required_multimodal_token_ids.issubset(config_dict))
+    return architectures[:1] == [_QWEN_IMAGE_BENCH_ARCHITECTURE]
 
 
 def _resolve_composite_torch_dtype(*config_dicts: dict) -> torch.dtype:
@@ -579,7 +557,7 @@ def load_pretrained_config(model_name_or_path: str,
         # Keep the composite VLM config so the vision encoder and multimodal
         # token IDs remain available, but normalize the text side to the
         # Qwen3Next-compatible shape used by TRT-LLM's Qwen3.5 decoder.
-        model_config.architectures = ["QwenImageBenchForConditionalGeneration"]
+        model_config.architectures = [_QWEN_IMAGE_BENCH_ARCHITECTURE]
         model_config.text_config = transformers.Qwen3NextConfig.from_dict(
             Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
     elif model_type == "glm_moe_dsa":
