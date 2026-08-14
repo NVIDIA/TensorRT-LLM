@@ -95,6 +95,7 @@ def apply_runtime_lora(
 
     qkv_groups: Dict[str, Dict[str, _LoRAPair]] = {}
     incomplete_qkv_names: List[str] = []
+    skipped_target_names: List[str] = []
     for pair in pairs:
         target_name, fused_suffix = _resolve_target_name(
             pair.name,
@@ -105,6 +106,7 @@ def apply_runtime_lora(
         )
         if target_name is None:
             skipped_non_targets += 1
+            skipped_target_names.append(pair.name)
             continue
 
         if fused_suffix is None:
@@ -136,6 +138,25 @@ def apply_runtime_lora(
             )
             output_start += pair.b.shape[0]
 
+    has_resolved_targets = bool(targets)
+    if config.strict and skipped_non_targets and (raise_on_no_matches or has_resolved_targets):
+        sample_names = ", ".join(skipped_target_names[:5])
+        if len(skipped_target_names) > 5:
+            sample_names += ", ..."
+        raise ValueError(
+            f"Runtime LoRA skipped {skipped_non_targets} adapter target(s) from "
+            f"{config.path!r}: {sample_names}. Every LoRA target must match a "
+            "transformer module in strict mode. Check target_components, "
+            "strip_prefixes, and key_map."
+        )
+
+    if config.strict and incomplete_qkv_names:
+        raise ValueError(
+            "Runtime LoRA found incomplete fused-QKV adapter groups for "
+            f"{incomplete_qkv_names}. Provide all to_q/to_k/to_v tensors, "
+            "disable fuse_qkv, or set strict=False."
+        )
+
     applied_modules: List[str] = []
     for module_name, adapters in targets.items():
         base_module = modules[module_name]
@@ -158,13 +179,6 @@ def apply_runtime_lora(
             skipped_non_targets += len(adapters)
             continue
         applied_modules.append(module_name)
-
-    if config.strict and incomplete_qkv_names:
-        raise ValueError(
-            "Runtime LoRA found incomplete fused-QKV adapter groups for "
-            f"{incomplete_qkv_names}. Provide all to_q/to_k/to_v tensors, "
-            "disable fuse_qkv, or set strict=False."
-        )
 
     if not applied_modules and raise_on_no_matches and config.strict:
         raise ValueError(
@@ -457,7 +471,7 @@ def _candidate_names(
 
 def _normalize_common_name(name: str) -> str:
     normalized = name
-    for ff_prefix in (".ff.", ".audio_ff.", ".ffn."):
+    for ff_prefix in (".ff.", ".audio_ff.", ".ffn.", ".img_mlp.", ".txt_mlp."):
         if ff_prefix + "net.0.proj" in normalized:
             normalized = normalized.replace(ff_prefix + "net.0.proj", ff_prefix + "up_proj")
         elif ff_prefix + "net.2" in normalized:

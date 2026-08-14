@@ -28,6 +28,18 @@ class TinyWanFFNTransformer(nn.Module):
         self.block.ffn.down_proj = nn.Linear(2, 3, bias=False)
 
 
+class TinyQwenMLPTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = nn.Module()
+        self.block.img_mlp = nn.Module()
+        self.block.img_mlp.up_proj = nn.Linear(2, 3, bias=False)
+        self.block.img_mlp.down_proj = nn.Linear(2, 3, bias=False)
+        self.block.txt_mlp = nn.Module()
+        self.block.txt_mlp.up_proj = nn.Linear(2, 3, bias=False)
+        self.block.txt_mlp.down_proj = nn.Linear(2, 3, bias=False)
+
+
 class TinyAttention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -182,6 +194,56 @@ def test_runtime_lora_maps_wan_ffn_names(tmp_path):
     torch.testing.assert_close(
         model.block.ffn.down_proj(torch.tensor([[5.0, 7.0]])),
         torch.full((1, 3), 14.0),
+    )
+
+
+def test_runtime_lora_maps_qwen_mlp_names(tmp_path):
+    model = TinyQwenMLPTransformer()
+    with torch.no_grad():
+        model.block.img_mlp.up_proj.weight.zero_()
+        model.block.img_mlp.down_proj.weight.zero_()
+        model.block.txt_mlp.up_proj.weight.zero_()
+        model.block.txt_mlp.down_proj.weight.zero_()
+
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "block.img_mlp.net.0.proj.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "block.img_mlp.net.0.proj.lora_B.weight": torch.ones(3, 1),
+            "block.img_mlp.net.2.lora_A.weight": torch.tensor([[0.0, 1.0]]),
+            "block.img_mlp.net.2.lora_B.weight": torch.full((3, 1), 2.0),
+            "block.txt_mlp.net.0.proj.lora_A.weight": torch.tensor([[3.0, 0.0]]),
+            "block.txt_mlp.net.0.proj.lora_B.weight": torch.ones(3, 1),
+            "block.txt_mlp.net.2.lora_A.weight": torch.tensor([[0.0, 3.0]]),
+            "block.txt_mlp.net.2.lora_B.weight": torch.full((3, 1), 2.0),
+        },
+        str(lora_path),
+    )
+
+    report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+    assert set(report.applied_modules) == {
+        "block.img_mlp.up_proj",
+        "block.img_mlp.down_proj",
+        "block.txt_mlp.up_proj",
+        "block.txt_mlp.down_proj",
+    }
+    assert report.skipped_non_targets == 0
+    torch.testing.assert_close(
+        model.block.img_mlp.up_proj(torch.tensor([[5.0, 7.0]])),
+        torch.full((1, 3), 5.0),
+    )
+    torch.testing.assert_close(
+        model.block.img_mlp.down_proj(torch.tensor([[5.0, 7.0]])),
+        torch.full((1, 3), 14.0),
+    )
+    torch.testing.assert_close(
+        model.block.txt_mlp.up_proj(torch.tensor([[5.0, 7.0]])),
+        torch.full((1, 3), 15.0),
+    )
+    torch.testing.assert_close(
+        model.block.txt_mlp.down_proj(torch.tensor([[5.0, 7.0]])),
+        torch.full((1, 3), 42.0),
     )
 
 
@@ -351,8 +413,77 @@ def test_runtime_lora_raises_when_no_modules_match(tmp_path):
         str(lora_path),
     )
 
-    with pytest.raises(ValueError, match="No Runtime LoRA modules"):
+    with pytest.raises(ValueError, match="skipped 1 adapter target"):
         apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+
+def test_runtime_lora_can_probe_component_without_matches(tmp_path):
+    model = TinyTransformer()
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "missing.lora_A.weight": torch.ones(1, 2),
+            "missing.lora_B.weight": torch.ones(3, 1),
+        },
+        str(lora_path),
+    )
+
+    report = apply_runtime_lora(
+        model,
+        RuntimeLoRAConfig(path=str(lora_path)),
+        raise_on_no_matches=False,
+    )
+
+    assert report.applied_modules == ()
+    assert report.skipped_non_targets == 1
+
+
+def test_runtime_lora_rejects_partial_unmatched_targets_before_mutating(tmp_path):
+    model = TinyTransformer()
+    with torch.no_grad():
+        model.proj.weight.zero_()
+
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "proj.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "proj.lora_B.weight": torch.ones(3, 1),
+            "missing.lora_A.weight": torch.ones(1, 2),
+            "missing.lora_B.weight": torch.ones(3, 1),
+        },
+        str(lora_path),
+    )
+
+    with pytest.raises(ValueError, match="skipped 1 adapter target"):
+        apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path)))
+
+    torch.testing.assert_close(model.proj.weight, torch.zeros_like(model.proj.weight))
+
+
+def test_runtime_lora_allows_unmatched_targets_when_not_strict(tmp_path):
+    model = TinyTransformer()
+    with torch.no_grad():
+        model.proj.weight.zero_()
+
+    lora_path = tmp_path / "adapter.safetensors"
+    save_file(
+        {
+            "proj.lora_A.weight": torch.tensor([[1.0, 0.0]]),
+            "proj.lora_B.weight": torch.ones(3, 1),
+            "missing.lora_A.weight": torch.ones(1, 2),
+            "missing.lora_B.weight": torch.ones(3, 1),
+        },
+        str(lora_path),
+    )
+
+    report = apply_runtime_lora(model, RuntimeLoRAConfig(path=str(lora_path), strict=False))
+
+    assert report.applied_modules == ("proj",)
+    assert report.skipped_non_targets == 1
+    torch.testing.assert_close(
+        model.proj(torch.tensor([[5.0, 7.0]])),
+        torch.full((1, 3), 5.0),
+    )
 
 
 def test_runtime_lora_raises_on_shape_mismatch(tmp_path):
