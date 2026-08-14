@@ -21,6 +21,9 @@ from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -754,7 +757,7 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
         patch.object(creator, "_enable_kv_cache_stats", return_value=False),
         patch.object(
             creator,
-            "_fallback_if_unsupported_kv_cache_manager_v2",
+            "_validate_or_fallback_kv_cache_manager_v2",
             return_value=KVCacheManagerV2,
         ),
         patch(

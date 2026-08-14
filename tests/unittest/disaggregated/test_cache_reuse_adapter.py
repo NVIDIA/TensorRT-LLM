@@ -259,6 +259,97 @@ class TestPackedBeamBlockLayout:
 
 
 # ---------------------------------------------------------------------------
+# Windowed layer group where only the generation side runs speculative decoding.
+# ---------------------------------------------------------------------------
+
+
+class TestTrimReceiverWindowHead:
+    """Sender._trim_receiver_window_head drops the receiver's extra head blocks.
+
+    The receiver keeps a larger window when only it runs speculative decoding,
+    so its suffix starts earlier. Both token starts are derived from list
+    length, so the extra blocks must come off the head.
+    """
+
+    WINDOW = 128
+
+    def test_extra_receiver_blocks_come_off_the_head(self):
+        src_block_ids = np.array([10], dtype=np.int64)
+        dst_block_ids = np.array([20, 21], dtype=np.int64)
+
+        trimmed = Sender._trim_receiver_window_head(
+            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=1
+        )
+
+        np.testing.assert_array_equal(trimmed, [21])
+
+    def test_trimmed_receiver_maps_onto_the_last_prompt_block(self):
+        # Regression: trimming the tail leaves [20], which _align_kv_blocks then
+        # pairs with src block 10 -- one block early, so the last prompt block
+        # is never written.
+        src_block_ids = np.array([10], dtype=np.int64)
+        dst_block_ids = np.array([20, 21], dtype=np.int64)
+        total_blocks = 1225
+        tpb = 128
+
+        dst_block_ids = Sender._trim_receiver_window_head(
+            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=1
+        )
+        src_start = (total_blocks - Sender._beam0_block_count(src_block_ids, total_blocks, 1)) * tpb
+        dst_start = (total_blocks - Sender._beam0_block_count(dst_block_ids, total_blocks, 1)) * tpb
+
+        src, dst = Sender._align_kv_blocks(
+            src_block_ids,
+            dst_block_ids,
+            src_token_start=src_start,
+            dst_token_start=dst_start,
+            tokens_per_block=tpb,
+        )
+
+        np.testing.assert_array_equal(src, [10])
+        np.testing.assert_array_equal(dst, [21])
+
+    def test_equal_counts_are_untouched(self):
+        src_block_ids = np.array([10, 11], dtype=np.int64)
+        dst_block_ids = np.array([20, 21], dtype=np.int64)
+
+        trimmed = Sender._trim_receiver_window_head(
+            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=1
+        )
+
+        np.testing.assert_array_equal(trimmed, [20, 21])
+
+    def test_smaller_receiver_is_untouched(self):
+        # Generation prefix-cache reuse: handled downstream via dst_start.
+        src_block_ids = np.array([10, 11, 12], dtype=np.int64)
+        dst_block_ids = np.array([20], dtype=np.int64)
+
+        trimmed = Sender._trim_receiver_window_head(
+            src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=1
+        )
+
+        np.testing.assert_array_equal(trimmed, [20])
+
+    def test_non_windowed_group_still_raises(self):
+        src_block_ids = np.array([10], dtype=np.int64)
+        dst_block_ids = np.array([20, 21], dtype=np.int64)
+
+        with pytest.raises(ValueError, match="block count mismatch"):
+            Sender._trim_receiver_window_head(
+                src_block_ids, dst_block_ids, peer_window_size=None, beam_width=1
+            )
+
+    def test_multi_beam_still_raises(self):
+        src_block_ids = np.array([10], dtype=np.int64)
+        dst_block_ids = np.array([20, 21], dtype=np.int64)
+
+        with pytest.raises(ValueError, match="block count mismatch"):
+            Sender._trim_receiver_window_head(
+                src_block_ids, dst_block_ids, peer_window_size=self.WINDOW, beam_width=4
+            )
+
+
+# ---------------------------------------------------------------------------
 # TokenRange dataclass invariants.
 # ---------------------------------------------------------------------------
 

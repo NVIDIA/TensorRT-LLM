@@ -32,6 +32,9 @@ from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -310,13 +313,18 @@ class MockVisualGenResult:
 def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> TestClient:
     """Instantiate an OpenAIServer for VISUAL_GEN with a mocked generator.
 
-    We patch the ``VisualGen`` name inside the ``openai_server`` module so that
-    ``isinstance(generator, VisualGen)`` returns True for our mock.
+    The server detects VisualGen generators via ``_is_visual_gen_instance``
+    (a sys.modules probe, so plain LLM serving never imports visual_gen) and
+    caches the result in ``__init__``; patching the probe during construction
+    makes it recognize our mock.
     """
     from tensorrt_llm.llmapi.disagg_utils import ServerRole
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
-    with patch("tensorrt_llm.serve.openai_server.VisualGen", MockVisualGen):
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
         server = OpenAIServer(
             generator=generator,
             model=model_name,

@@ -447,6 +447,7 @@ def test_starcoder2_model_can_be_exported():
 # =========================================================================
 
 
+@pytest.mark.cpu_only
 def test_starcoder2_config_recognition():
     """Test that the config is properly recognized."""
     config = _create_small_config()
@@ -457,6 +458,7 @@ def test_starcoder2_config_recognition():
     assert hasattr(config, "sliding_window")
 
 
+@pytest.mark.cpu_only
 def test_starcoder2_gqa_structure():
     """Test that attention uses GQA (fewer KV heads than Q heads)."""
     config = _create_small_config()
@@ -468,6 +470,7 @@ def test_starcoder2_gqa_structure():
     assert attn.num_kv_heads < attn.num_heads, "Should use GQA"
 
 
+@pytest.mark.cpu_only
 def test_starcoder2_state_dict_keys():
     """Test that state_dict keys match expected HF checkpoint format."""
     config = _create_small_config()

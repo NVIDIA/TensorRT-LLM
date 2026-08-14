@@ -18,6 +18,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Optional, Union
 
+import pytest
+
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     Field,
@@ -28,6 +30,8 @@ from tensorrt_llm.llmapi.llm_args import (
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.llmapi_config import collect_llm_api_config_payloads
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _NestedConfig(StrictBaseModel):
