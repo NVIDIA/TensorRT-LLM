@@ -308,7 +308,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def __init__(
             self,
-            generator: Union[LLM, MultimodalEncoder, "VisualGen"],
+            generator: Optional[Union[LLM, MultimodalEncoder, "VisualGen"]],
             model: str,
             tool_parser: Optional[str],
             server_role: Optional[ServerRole],
@@ -321,9 +321,32 @@ class OpenAIServer(_VideoRoutesMixin):
             embedding_max_queue_size: int = 2048,
             input_processor_workers: int = 8,
             media_load_workers: int = 8,
-            internal_disagg_auth_key: Optional[str] = None):
+            internal_disagg_auth_key: Optional[str] = None,
+            collect_perf_metrics: Optional[bool] = None,
+            expose_perf_metrics: Optional[bool] = None):
+        """Build the server. ``generator`` may be ``None``.
+
+        A ``None`` generator builds a skeleton that can be served immediately
+        while the engine is still initializing; call :meth:`attach` with the
+        engine once it exists. Everything that reads the generator is
+        deferred until then.
+
+        ``collect_perf_metrics`` / ``expose_perf_metrics`` are normally read
+        off ``generator.args``, but the perf-metrics middleware has to be
+        installed before the app starts serving, which is before the engine
+        exists. Callers using the skeleton path must therefore pass them.
+        """
+        # Legacy path: a generator supplied here makes every downstream step
+        # in this constructor behave exactly as before. The skeleton path
+        # passes None and everything generator-dependent is deferred to
+        # attach().
         self.generator = generator
-        self._is_visual_gen = _is_visual_gen_instance(generator)
+        self._is_visual_gen = (_is_visual_gen_instance(generator)
+                               if generator is not None else False)
+        self._engine_started = False
+        self._teardown_deferred = False
+        self._perf_metrics_overrides = (collect_perf_metrics,
+                                        expose_perf_metrics)
         self._embedding_max_queue_delay = embedding_max_queue_delay
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
@@ -334,16 +357,8 @@ class OpenAIServer(_VideoRoutesMixin):
         # Seed media-IO decode defaults from the model's input processor, then
         # let the server's --media_io_kwargs win (per-request kwargs still
         # override at request time).
-        ip = getattr(self.generator, "input_processor", None)
-        if isinstance(ip, BaseMultimodalInputProcessor):
-            model_pref = ip.get_preferred_media_io_kwargs() or {}
-            if model_pref:
-                cfg = self.multimodal_server_config or MultimodalServerConfig()
-                merged = {m: dict(kw) for m, kw in model_pref.items()}
-                for modality, kw in (cfg.media_io_kwargs or {}).items():
-                    merged.setdefault(modality, {}).update(kw)
-                cfg.media_io_kwargs = merged
-                self.multimodal_server_config = cfg
+        self._seed_media_io_defaults()
+        self._chat_template_arg = chat_template
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self.server_role = server_role
@@ -373,12 +388,24 @@ class OpenAIServer(_VideoRoutesMixin):
             self.model = model
         self.metrics_collector = None
         args = getattr(self.generator, "args", None)
-        self._expose_perf_metrics = bool(
-            args and getattr(args, "return_perf_metrics", False))
+        # The explicit overrides win when given: on the skeleton path there is
+        # no generator to read, and the perf-metrics middleware must be
+        # installed now because Starlette refuses add_middleware once the app
+        # has started. serve.py takes them from llm_args, which is a plain
+        # dict available before the engine is built.
+        collect_override, expose_override = self._perf_metrics_overrides
+        if expose_override is not None:
+            self._expose_perf_metrics = bool(expose_override)
+        else:
+            self._expose_perf_metrics = bool(
+                args and getattr(args, "return_perf_metrics", False))
         perf_metrics_output_dir = (getattr(args, "perf_metrics_output_dir",
                                            None) if args else None)
-        self._collect_perf_metrics = (self._expose_perf_metrics
-                                      or perf_metrics_output_dir is not None)
+        if collect_override is not None:
+            self._collect_perf_metrics = bool(collect_override)
+        else:
+            self._collect_perf_metrics = (self._expose_perf_metrics or
+                                          perf_metrics_output_dir is not None)
         # AsyncLLM uses this flag to request engine-level snapshots. Preserve the
         # original value separately because only it controls public headers.
         if self._collect_perf_metrics and args is not None:
@@ -411,119 +438,28 @@ class OpenAIServer(_VideoRoutesMixin):
         # These are LLM-specific and can cause unnecessary memory usage
         if self._is_visual_gen:
             self._init_visual_gen()
-        else:
-            self._init_llm(chat_template)
+        elif self.has_engine:
+            self._init_llm(self._chat_template_arg)
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
-            await self._perf_metrics_writer.start()
-            if self.metadata_server is not None:
-                metadata = {
-                    "model": self.model,
-                    "version": VERSION,
-                    "timestamp": datetime.now().isoformat(),
-                    "server_role": server_role.name,
-                    "url": self.binding_addr
-                }
-                # TODO: add more metadata
-                # Off the loop: this lifespan now runs while the socket is
-                # already answering STARTING probes (see serve/lifecycle.py),
-                # so a slow etcd would leave /health accepted and never
-                # answered -- the third ambiguous state that contract removes.
-                await asyncio.to_thread(self.metadata_server.put,
-                                        f"trtllm/{self.generator.llm_id}",
-                                        metadata)
-                logger.info(f"trtllm/{self.generator.llm_id} is registered")
-
-            if self.disagg_cluster_config:
-                # ON the loop, unlike the etcd put above: this constructs an
-                # aiohttp.ClientSession, which binds to the running loop, so
-                # building it on a worker thread breaks every later request.
-                # It also does not dial the backend, so it need not be off-loop.
-                self.disagg_cluster_storage = create_cluster_storage_client(
-                    self.disagg_cluster_config.cluster_uri,
-                    self.disagg_cluster_config.cluster_name)
-                self.disagg_cluster_worker = DisaggClusterWorker(
-                    self.server_role, self.host, self.port,
-                    self.disagg_cluster_config, self.disagg_cluster_storage)
-
-            # VisualGen has no args
-            if not self._is_visual_gen:
-                # Start energy monitoring if enabled
-                if getattr(self.generator.args, "enable_energy_metrics", False):
-                    try:
-                        world_size = self.generator.args.parallel_config.world_size
-                        self.energy_monitor = EnergyMonitor(world_size)
-                        logger.info("Initialized GPU energy monitoring")
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to initialize GPU energy monitoring: {e}")
-                        self.energy_monitor = None
-
-                # Start background iteration stats collector if metrics are enabled
-                # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
-                # tensorrt backend does not have this attribute but it always has iter stats enabled.
-                if self.metrics_collector and getattr(
-                        self.generator.args, "enable_iter_perf_stats", True):
-                    # The background loop becomes the sole consumer of the
-                    # engine stats queue; /metrics reads from a tee buffer
-                    # bounded by iter_stats_max_iterations to avoid racing
-                    # the loop for the queue (nvbug 6102381).
-                    # One shared buffer is sufficient while this collector task
-                    # is the only consumer of the engine iteration-stats queue.
-                    # Other consumers can read it through get_iteration_stats(),
-                    # which clears the buffer. Adding another queue consumer
-                    # requires revisiting the buffering and clearing ownership.
-                    max_buf = self._iteration_stats_buffer_maxlen(
-                        getattr(self.generator.args,
-                                "iter_stats_max_iterations", 1000))
-                    self._iteration_stats_buffer = deque(maxlen=max_buf)
-                    self._iteration_stats_collector_task = asyncio.create_task(
-                        self._iteration_stats_collector_loop())
-                    # Wake up the collector immediately so it processes the
-                    # initial stats emitted by the executor at startup (e.g.
-                    # cache_config_info).
-                    self._iteration_stats_wakeup_event.set()
-                    logger.info(
-                        "Started background iteration stats collector task")
-
-            # Start the encode dynamic batcher (embedding server only). It must be
-            # started inside the running event loop, hence here rather than __init__.
-            if self.embedding_batcher is not None:
-                await self.embedding_batcher.start()
-                logger.info("Started encode dynamic batcher")
-
+            # Engine-dependent startup lives in attach(), not here: under the
+            # lifecycle contract uvicorn runs this before the engine exists,
+            # and it must return promptly so the socket starts listening.
+            # When the engine was supplied to __init__ (the non-lifecycle
+            # path) there is nothing to wait for, so run it now.
+            if self.has_engine and not self._engine_started:
+                await self._start_engine_services()
             yield
-
-            await self._perf_metrics_writer.close()
-            if self.embedding_batcher is not None:
-                await self.embedding_batcher.shutdown()
-                logger.info("Stopped encode dynamic batcher")
-
-            # Stop background iteration stats collector
-            if self._iteration_stats_collector_task is not None:
-                self._iteration_stats_collector_task.cancel()
-                try:
-                    await self._iteration_stats_collector_task
-                except asyncio.CancelledError:
-                    pass
-                logger.info("Stopped background iteration stats collector task")
-
-            if self.metadata_server is not None:
-                self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
-                logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
-            if self.disagg_cluster_worker:
-                await self.disagg_cluster_worker.deregister_worker()
-            if self.resource_governor is not None:
-                self.resource_governor.close()
-            # Deliberately inline on the loop despite being slow: blocking it
-            # means no asyncio timer can fire, so this teardown is never
-            # abandoned half-done. Off-loop it would keep running after its
-            # caller gave up, and BaseLLM.shutdown() takes no lock, so the two
-            # would drive ZeroMqQueue.close() from different threads -- not
-            # ZMQ-safe. Cost: /health and open connections stall until it
-            # finishes, accepted because the process is exiting anyway.
-            self.generator.shutdown()
+            # Skipped when attach() bound the engine: uvicorn awaits this
+            # shutdown with no timeout (LifespanOn.shutdown just does
+            # `await self.shutdown_event.wait()`), so a teardown run here
+            # could not be bounded, abandoned, or reported on. Under the
+            # lifecycle contract serve_with_lifecycle owns it instead and
+            # does all three. Without an orchestrator this is the only hook,
+            # so it still runs.
+            if self._engine_started and not self._teardown_deferred:
+                await self._stop_engine_services()
 
         self.app = FastAPI(lifespan=lifespan)
         if _MSGSPEC_ENABLED:
@@ -541,6 +477,174 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.metrics_collector.log_request_error(http_code=400)
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
+        if self.has_engine:
+            self._register_routes_for_role()
+
+        if self._collect_perf_metrics:
+            self.app.add_middleware(PerfMetricsMiddleware,
+                                    expose_headers=self._expose_perf_metrics,
+                                    writer=self._perf_metrics_writer)
+        self.app.add_middleware(ServerArrivalTimeMiddleware)
+
+    async def _start_engine_services(self) -> None:
+        """Engine-dependent startup: stats collector, registration, batcher.
+
+        Called from attach() under the lifecycle contract, or from the app's
+        lifespan when the engine was supplied to __init__.
+        """
+        await self._perf_metrics_writer.start()
+        if self.metadata_server is not None:
+            metadata = {
+                "model": self.model,
+                "version": VERSION,
+                "timestamp": datetime.now().isoformat(),
+                "server_role": server_role.name,
+                "url": self.binding_addr
+            }
+            # TODO: add more metadata
+            # Off the loop: this lifespan now runs while the socket is
+            # already answering STARTING probes (see serve/lifecycle.py),
+            # so a slow etcd would leave /health accepted and never
+            # answered -- the third ambiguous state that contract removes.
+            await asyncio.to_thread(self.metadata_server.put,
+                                    f"trtllm/{self.generator.llm_id}", metadata)
+            logger.info(f"trtllm/{self.generator.llm_id} is registered")
+
+        if self.disagg_cluster_config:
+            # ON the loop, unlike the etcd put above: this constructs an
+            # aiohttp.ClientSession, which binds to the running loop, so
+            # building it on a worker thread breaks every later request.
+            # It also does not dial the backend, so it need not be off-loop.
+            self.disagg_cluster_storage = create_cluster_storage_client(
+                self.disagg_cluster_config.cluster_uri,
+                self.disagg_cluster_config.cluster_name)
+            self.disagg_cluster_worker = DisaggClusterWorker(
+                self.server_role, self.host, self.port,
+                self.disagg_cluster_config, self.disagg_cluster_storage)
+
+        # VisualGen has no args
+        if not self._is_visual_gen:
+            # Start energy monitoring if enabled
+            if getattr(self.generator.args, "enable_energy_metrics", False):
+                try:
+                    world_size = self.generator.args.parallel_config.world_size
+                    self.energy_monitor = EnergyMonitor(world_size)
+                    logger.info("Initialized GPU energy monitoring")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to initialize GPU energy monitoring: {e}")
+                    self.energy_monitor = None
+
+            # Start background iteration stats collector if metrics are enabled
+            # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
+            # tensorrt backend does not have this attribute but it always has iter stats enabled.
+            if self.metrics_collector and getattr(
+                    self.generator.args, "enable_iter_perf_stats", True):
+                # The background loop becomes the sole consumer of the
+                # engine stats queue; /metrics reads from a tee buffer
+                # bounded by iter_stats_max_iterations to avoid racing
+                # the loop for the queue (nvbug 6102381).
+                # One shared buffer is sufficient while this collector task
+                # is the only consumer of the engine iteration-stats queue.
+                # Other consumers can read it through get_iteration_stats(),
+                # which clears the buffer. Adding another queue consumer
+                # requires revisiting the buffering and clearing ownership.
+                max_buf = self._iteration_stats_buffer_maxlen(
+                    getattr(self.generator.args, "iter_stats_max_iterations",
+                            1000))
+                self._iteration_stats_buffer = deque(maxlen=max_buf)
+                self._iteration_stats_collector_task = asyncio.create_task(
+                    self._iteration_stats_collector_loop())
+                # Wake up the collector immediately so it processes the
+                # initial stats emitted by the executor at startup (e.g.
+                # cache_config_info).
+                self._iteration_stats_wakeup_event.set()
+                logger.info("Started background iteration stats collector task")
+
+        # Start the encode dynamic batcher (embedding server only). It must be
+        # started inside the running event loop, hence here rather than __init__.
+        if self.embedding_batcher is not None:
+            await self.embedding_batcher.start()
+            logger.info("Started encode dynamic batcher")
+
+        self._engine_started = True
+
+    async def _stop_engine_services(self) -> None:
+        """Mirror of _start_engine_services; also tears the engine down."""
+        await self._perf_metrics_writer.close()
+        if self.embedding_batcher is not None:
+            await self.embedding_batcher.shutdown()
+            logger.info("Stopped encode dynamic batcher")
+
+        # Stop background iteration stats collector
+        if self._iteration_stats_collector_task is not None:
+            self._iteration_stats_collector_task.cancel()
+            try:
+                await self._iteration_stats_collector_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Stopped background iteration stats collector task")
+
+        if self.metadata_server is not None:
+            self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
+            logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
+        if self.disagg_cluster_worker:
+            await self.disagg_cluster_worker.deregister_worker()
+        if self.resource_governor is not None:
+            self.resource_governor.close()
+        # Deliberately inline on the loop despite being slow: blocking it
+        # means no asyncio timer can fire, so this teardown is never
+        # abandoned half-done. Off-loop it would keep running after its
+        # caller gave up, and BaseLLM.shutdown() takes no lock, so the two
+        # would drive ZeroMqQueue.close() from different threads -- not
+        # ZMQ-safe. Cost: /health and open connections stall until it
+        # finishes, accepted because the process is exiting anyway.
+        self.generator.shutdown()
+
+    def _seed_media_io_defaults(self) -> None:
+        """Seed media-IO decode defaults from the model's input processor.
+
+        The server's --media_io_kwargs still wins, and per-request kwargs
+        still win at request time. Re-run by _bind_engine because the input
+        processor only exists once the engine does.
+        """
+        ip = getattr(self.generator, "input_processor", None)
+        if isinstance(ip, BaseMultimodalInputProcessor):
+            model_pref = ip.get_preferred_media_io_kwargs() or {}
+            if model_pref:
+                cfg = self.multimodal_server_config or MultimodalServerConfig()
+                merged = {m: dict(kw) for m, kw in model_pref.items()}
+                for modality, kw in (cfg.media_io_kwargs or {}).items():
+                    merged.setdefault(modality, {}).update(kw)
+                cfg.media_io_kwargs = merged
+                self.multimodal_server_config = cfg
+
+    def _bind_engine(self, generator) -> None:
+        """Adopt a generator, redoing the __init__ steps that needed one."""
+        self.generator = generator
+        self._is_visual_gen = _is_visual_gen_instance(generator)
+        self._seed_media_io_defaults()
+        args = getattr(generator, "args", None)
+        # Mirrors __init__: AsyncLLM reads this to emit engine-level
+        # snapshots. The middleware itself was already installed there.
+        if self._collect_perf_metrics and args is not None:
+            args.return_perf_metrics = True
+        if self._is_visual_gen:
+            self._init_visual_gen()
+        else:
+            self._init_llm(self._chat_template_arg)
+
+    def _register_routes_for_role(self) -> None:
+        """Register the route table, which depends on the live engine.
+
+        Deferred until the engine exists: the role assertions read the
+        generator, and register_routes() reads
+        generator._executor.resource_governor_queue to decide whether the
+        resource-governor routes exist at all. Late registration is safe --
+        Starlette matches against a plain list and the OpenAPI schema is
+        generated lazily -- unlike middleware, which cannot be added once
+        the app has started.
+        """
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
                 "generator must be a VisualGen for VISUAL_GEN server"
@@ -559,11 +663,41 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.register_routes()
 
-        if self._collect_perf_metrics:
-            self.app.add_middleware(PerfMetricsMiddleware,
-                                    expose_headers=self._expose_perf_metrics,
-                                    writer=self._perf_metrics_writer)
-        self.app.add_middleware(ServerArrivalTimeMiddleware)
+    @property
+    def has_engine(self) -> bool:
+        """True once a generator is bound, by __init__ or by attach()."""
+        return self.generator is not None
+
+    async def stop_engine_services(self) -> bool:
+        """Run the engine teardown once; True if it ran to completion here.
+
+        The orchestrator calls this under a timeout, which is what keeps the
+        teardown bounded now that it no longer rides uvicorn's unbounded
+        lifespan shutdown. Idempotent: a second call is a no-op, so a caller
+        can never start one alongside a live teardown.
+        """
+        if not self._engine_started:
+            return False
+        self._engine_started = False
+        await self._stop_engine_services()
+        return True
+
+    async def attach(self, generator) -> None:
+        """Bind the engine to an already-serving skeleton.
+
+        The lifecycle contract hands uvicorn this server's app before the
+        engine exists, so everything that reads the generator -- tokenizer,
+        processor, model config, and the route table itself -- is deferred to
+        here. Must be awaited on the loop uvicorn is running on.
+        """
+        if self.has_engine:
+            raise RuntimeError(
+                "attach() called on a server that already has an engine")
+        self._bind_engine(generator)
+        self._register_routes_for_role()
+        # The orchestrator owns teardown from here; see the lifespan.
+        self._teardown_deferred = True
+        await self._start_engine_services()
 
     def _init_visual_gen(self):
         self.processor = None
