@@ -34,6 +34,7 @@ from typing import Dict, List, Optional, Type, Union
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.fused_moe.impl_base import MoEImplBase
 from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -80,7 +81,7 @@ class ConfigurableMoE(MoE):
     # (CuteDslFusedMoE / CutlassFusedMoE / ...). Allow the wrapper itself to
     # pass the non-divisible-EP gate so the inner backend's own gate is the
     # authoritative check -- if the chosen inner backend doesn't opt in, its
-    # ``MoE.__init__`` will still raise.
+    # construction / ``can_implement`` still rejects.
     _supports_non_divisible_ep: bool = True
     """
     Configurable MoE layer using composition pattern with automatic configuration
@@ -673,7 +674,7 @@ class ConfigurableMoE(MoE):
 
     # ========== Backend Validation ==========
 
-    def validate_backend(self, backend: MoE):
+    def validate_backend(self, backend: Union[MoE, MoEImplBase]):
         """Validate MoE backend compatibility with this ConfigurableMoE.
 
         Generic checks (always run):

@@ -14,37 +14,145 @@
 # limitations under the License.
 """Abstract base class for MoE execution units."""
 
+from __future__ import annotations
+
 import abc
-from typing import TYPE_CHECKING
+import os
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
 
-from .impl_blocks import MoEEplbWeightLayoutMixin, MoEWeightOwnerMixin
+from ...model_config import ModelConfig
+from ...utils import ActivationType, AuxStreamType, is_gated_activation
+from .impl_blocks import MoEEplbWeightLayoutMixin, MoEExecutionContractMixin, MoEWeightOwnerMixin
 from .impl_contract import MoEDeployment, MoEEligibility, MoEEplbBinding, MoEProblem, MoERunContext
+from .interface import MoESchedulerKind, MoEWeightLoadingMode
+from .routing import BaseMoeRoutingMethod
 
 if TYPE_CHECKING:
     from ...utils import Fp4QuantizedTensor
     from .impl_identity import MoEImplDescriptor
 
 
-class MoEImplBase(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module, abc.ABC):
+STANDALONE_MOE_IMPL_ERROR = (
+    "{name} is an execution unit, not a complete MoE layer. "
+    "Construct it through create_moe() / ConfigurableMoE."
+)
+
+
+def apply_moe_impl_construction_state(
+    module: nn.Module,
+    *,
+    routing_method: BaseMoeRoutingMethod,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: Optional[torch.dtype] = None,
+    reduce_results: bool = False,
+    model_config: ModelConfig = ModelConfig(),
+    aux_stream_dict: Optional[dict[AuxStreamType, torch.cuda.Stream]] = None,
+    weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
+    bias: bool = False,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
+    swiglu_limit_scalar: Optional[float] = None,
+    layer_idx: Optional[int] = None,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    init_load_balancer: bool = True,
+) -> None:
+    """Install the construction state backends used to get from ``MoE.__init__``.
+
+    ``MoEImplBase`` does not inherit ``MoE``, so nothing else sets the attributes
+    every execution unit reads off ``self``: ``hidden_size``, ``quant_config``,
+    ``mapping``, the partition sizes, and a default EPLB layout the wrapper later
+    overwrites. Layer-only work stays on ``MoE`` / ``ConfigurableMoE``
+    (``_register_layer``, ``_init_load_balancer``, ``AllReduce``, DWDP layout).
+
+    ``init_load_balancer=True`` asks for a standalone layer, which these classes
+    no longer are, so it is rejected.
+    """
+    if init_load_balancer:
+        raise TypeError(STANDALONE_MOE_IMPL_ERROR.format(name=type(module).__name__))
+
+    from .interface import _compute_ep_partition
+
+    module.routing_method = routing_method
+    module.num_experts = num_experts
+    module.hidden_size = hidden_size
+    module.intermediate_size = intermediate_size
+    module.weight_loading_mode = weight_loading_mode
+    module.bias = bias
+    module.dtype = dtype
+    module.reduce_results = reduce_results
+    module.swiglu_alpha = swiglu_alpha
+    module.swiglu_beta = swiglu_beta
+    module.swiglu_limit = swiglu_limit
+    module.swiglu_limit_scalar = swiglu_limit_scalar
+    module.layer_idx = layer_idx
+    module.layer_idx_str = str(layer_idx) if layer_idx is not None else None
+    module.activation_type = int(activation_type)
+    module.is_gated_activation = is_gated_activation(activation_type)
+    module.intermediate_size_expand_ratio = 2 if module.is_gated_activation else 1
+
+    module.quant_config = model_config.quant_config
+    module.force_dynamic_quantization = getattr(model_config, "force_dynamic_quantization", False)
+
+    module.cluster_rank = model_config.mapping.moe_cluster_rank
+    module.cluster_size = model_config.mapping.moe_cluster_size
+    module.smart_router = module.cluster_size > 1
+    module.rank = model_config.mapping.rank
+    module.tp_rank = model_config.mapping.moe_tp_rank
+    module.tp_size = model_config.mapping.moe_tp_size
+    module.ep_size = model_config.mapping.moe_ep_size
+    module.ep_rank = model_config.mapping.moe_ep_rank
+    module.moe_backend = model_config.moe_backend
+    module.use_dp = model_config.mapping.enable_attention_dp
+    module.mapping = model_config.mapping
+    module.parallel_rank = module.mapping.tp_rank
+    module.parallel_size = module.mapping.tp_size
+    module.intermediate_size_per_partition = intermediate_size // module.tp_size
+
+    # AllReduce belongs to the layer, not to an execution unit. Keep the
+    # attribute so the getattr sites that still probe it read None.
+    module.all_reduce = None
+    module.enable_dummy_allreduce = os.environ.get("TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
+
+    # Same defaults ``MoE.__init__`` used when ``init_load_balancer=False``.
+    # ConfigurableMoE overwrites the EPLB fields via ``_BACKEND_SYNC_ATTRS``.
+    module.aux_stream_dict = aux_stream_dict
+    module.layer_load_balancer = None
+    module.repeat_idx = 0
+    module.repeat_count = 1
+    expert_size, slot_start, slot_end = _compute_ep_partition(
+        module.num_experts, module.ep_size, module.ep_rank
+    )
+    module.expert_size_per_partition = expert_size
+    module.num_slots = module.num_experts
+    module.slot_start = slot_start
+    module.slot_end = slot_end
+    module.initial_local_expert_ids = list(range(slot_start, slot_end))
+    module.initial_global_assignments = list(range(module.num_experts))
+    module.allreduce = None
+
+
+class MoEImplBase(
+    MoEExecutionContractMixin, MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module, abc.ABC
+):
     """An execution unit. NOT a complete MoE layer.
 
-    Takes the concrete halves of the two blocks an expert-weight owner needs --
-    the weights themselves and the weight-side EPLB layout -- from the mixins,
-    which ``MoE`` includes as well. The abstract contract is restated here rather
-    than shared, because the two bases do not promise the same thing:
-    ``run_moe`` below is deliberately narrower than ``MoE.run_moe``, and only
-    this class enforces the contract at construction.
+    Takes the concrete halves of the three blocks an expert-weight owner needs --
+    what it declares to the scheduler, the weights themselves, and the
+    weight-side EPLB layout -- from the mixins, which ``MoE`` includes as well.
+    The abstract contract is restated here rather than shared, because the two
+    bases do not promise the same thing: ``run_moe`` below is deliberately
+    narrower than ``MoE.run_moe``, and only this class enforces the contract at
+    construction.
 
-    Method resolution is all the mixins carry across. ``MoE.__init__`` also
-    establishes the construction state every backend then reads off ``self``
-    (``hidden_size``, ``quant_config``, ``mapping``,
-    ``intermediate_size_per_partition``, and the rest), and this class
-    establishes none of it -- it takes an ``eplb`` binding and nothing else.
-    Swapping a backend's base class therefore needs matching constructor work
-    in the same change; it is not a one-line edit.
+    ``eplb`` is still optional: backends that have not moved to the binding yet
+    pass ``None`` and let ``apply_moe_impl_construction_state`` install the same
+    default layout ``MoE.__init__`` did. A later EPLB item makes it required.
 
     Deliberately does NOT inherit ``MoE``. Three consequences the design relies
     on:
@@ -59,16 +167,24 @@ class MoEImplBase(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module, abc.
 
     descriptor: "MoEImplDescriptor"  # set by every concrete subclass
 
-    def __init__(self, *, eplb: MoEEplbBinding) -> None:
+    # The other scheduler-facing defaults live in ``MoEExecutionContractMixin``.
+    # This one cannot: its default needs ``MoESchedulerKind`` from ``interface``,
+    # which ``impl_blocks`` cannot import without a cycle.
+    scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
+
+    def __init__(self, *, eplb: Optional[MoEEplbBinding] = None) -> None:
         super().__init__()
         # Layout is known BEFORE create_weights, because weight shapes depend
         # on it. Passing it here is what makes post-hoc setattr unnecessary.
         self.eplb = eplb
+        if eplb is None:
+            return
         # Project the binding onto the attribute names the quantization layer
         # reads off the weight owner (``module.expert_size_per_partition`` and
         # friends). Plain attributes rather than properties, because the DWDP
         # fixup rewrites the layout in place after construction.
         self.layer_idx = eplb.layer_idx
+        self.num_experts = eplb.num_experts
         self.num_slots = eplb.num_slots
         self.slot_start = eplb.slot_start
         self.slot_end = eplb.slot_end
@@ -84,11 +200,18 @@ class MoEImplBase(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module, abc.
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility: ...
 
     # ---- weight lifecycle -------------------------------------------------
-    @abc.abstractmethod
-    def create_weights(self) -> None: ...
+    # ``create_weights`` / ``load_weights`` / ``_check_configs`` are working
+    # defaults from ``MoEWeightOwnerMixin``; backends that need more (TRTLLMGen,
+    # MegaMoE-CuteDsl) override them.
 
     @abc.abstractmethod
-    def load_weights(self, weights: list[dict], allow_partial_loading: bool = False) -> None: ...
+    def _get_quant_method(self) -> object:
+        """Resolve the quantization method that owns this backend's weights.
+
+        No default: a Cutlass-layout NVFP4 method is not interchangeable with a
+        TRTLLMGen one.
+        """
+        ...
 
     # ---- execution --------------------------------------------------------
     @abc.abstractmethod
@@ -102,8 +225,8 @@ class MoEImplBase(MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module, abc.
     # its LIFETIME -- one allocation reused across chunks and alternated
     # between streams, so it outlives a single call and travels back in through
     # the signature. This signature is the state after that lifetime moves
-    # inside the impl; impls arriving on this base (TRTLLM-14958,
-    # TRTLLM-14960..14969) drop the parameter as they do.
+    # inside the impl; impls arriving on this base drop the parameter as they
+    # do.
     @abc.abstractmethod
     def run_moe(self, ctx: MoERunContext) -> torch.Tensor: ...
 

@@ -19,6 +19,11 @@ layer include these. They are stated once, here, because a class that allocates
 and loads expert weights needs them regardless of whether it also happens to be
 a complete layer.
 
+Three groups, by what the module is asked about: what it declares to the
+scheduler (:class:`MoEExecutionContractMixin`), what it does with the weights
+(:class:`MoEWeightOwnerMixin`), and how they are laid out under EPLB
+(:class:`MoEEplbWeightLayoutMixin`).
+
 Only *implementations* live here. Each base states its own abstract contract,
 because the two contracts differ on purpose -- ``MoEImplBase.run_moe`` is
 narrower than ``MoE.run_moe``, and only ``MoEImplBase`` enforces completeness at
@@ -31,9 +36,79 @@ of the EPLB forward-time orchestration (``_load_balancer_*``, ``repeat_idx``),
 which is driven from the wrapper and stays on ``MoE``.
 """
 
-from typing import Dict, List
+import inspect
+from typing import Dict, List, Optional, Union
 
 import torch
+
+from ...utils import Fp4QuantizedTensor
+from .impl_contract import MoEInputRequirement, MoEStaticCapability
+
+
+class MoEExecutionContractMixin:
+    """What an expert-weight owner answers about itself, with defaults.
+
+    Two kinds of question: what the module declares statically to the scheduler,
+    and what output shape it would produce for a given input. Both are answered
+    by the backend rather than the layer, so both are shared by ``MoE`` and
+    ``MoEImplBase`` -- a backend that moves between the two bases keeps
+    answering them unchanged. A missing default here would not fail at
+    construction, only at the first call that asks.
+    """
+
+    capabilities: MoEStaticCapability = MoEStaticCapability()
+    input_requirement: MoEInputRequirement = MoEInputRequirement()
+
+    # Non-divisible EP is ``num_experts % ep_size != 0``. Opt-in, because a
+    # backend has to handle a short final partition to claim it.
+    _supports_non_divisible_ep: bool = False
+
+    def supports_moe_output_in_alltoall_workspace(self) -> bool:
+        """Whether ``run_moe`` can write its output into the alltoall workspace.
+
+        ``False`` means the backend emits its own output tensor, so the
+        scheduler must not hand it a workspace buffer that ``combine()`` would
+        then read unfilled.
+        """
+        return False
+
+    def validate_configurable_moe(self, moe: "torch.nn.Module") -> None:
+        """Backend-specific validation hook called by ``ConfigurableMoE``.
+
+        ``ConfigurableMoE.validate_backend`` invokes this AFTER the generic
+        EPLB/load-balancer compatibility check, so a backend may inspect
+        ``moe.num_slots``, ``moe.ep_size``, ``moe._using_load_balancer()``, and
+        ``moe._using_dynamic_load_balancer()``. No-op by default; backends with
+        extra constraints (fused-comm ones rejecting dynamic EPLB) override it.
+        """
+        del moe
+
+    def forward_fake(
+        self,
+        x: Union["torch.Tensor", "Fp4QuantizedTensor"],
+        router_logits: "torch.Tensor",
+        *,
+        do_finalize: bool = True,
+        output_dtype: Optional["torch.dtype"] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        use_dp_padding: Optional[bool] = None,
+        **kwargs,
+    ) -> Union["torch.Tensor", List["torch.Tensor"]]:
+        """Meta-tensor output shape, for the custom op's ``register_fake``.
+
+        Needs only the input and ``self.mapping``, so an execution unit can
+        answer it too. Backends whose output dtype or un-finalized layout
+        differs override this and delegate the finalized case back here.
+        """
+        del router_logits, use_dp_padding, kwargs
+        is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
+        assert do_finalize, "Default forward_fake does not support do_finalize=False"
+        data_type = output_dtype if is_nvfp4_input else x.dtype
+        num_tokens = (
+            all_rank_num_tokens[self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
+        )
+        hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
+        return x.new_empty((num_tokens, hidden_size), dtype=data_type)
 
 
 class MoEWeightOwnerMixin:
@@ -50,6 +125,42 @@ class MoEWeightOwnerMixin:
     """
 
     # ---- weight lifecycle -------------------------------------------------
+    def create_weights(self) -> None:
+        """Allocate expert weights through the resolved quantization method.
+
+        Override when allocation needs more than this: TRTLLMGen passes a
+        fused-shared-expert count for FP8 block scales, and MegaMoE-CuteDsl must
+        rendezvous a symmetric-memory provider before anything is registered.
+        """
+        if self._weights_created:
+            return
+        self.quant_method = self._get_quant_method()
+        self.quant_method.create_weights(self)
+        self._weights_created = True
+        self._check_configs()
+
+    def _check_configs(self) -> None:
+        """Invariants to assert once the weights exist.
+
+        Nothing by default. A backend whose kernel constrains the configuration
+        it was built with (a top-k restriction, a quant-mode allow-list) asserts
+        that here, where ``_weights_created`` is guaranteed true.
+        """
+
+    def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False) -> None:
+        """Load one checkpoint dict into the allocated weights.
+
+        ``allow_partial_loading`` is forwarded only when the quant method
+        accepts it, because the methods do not share a signature.
+        """
+        assert self._weights_created
+        assert len(weights) == 1
+
+        kargs = {}
+        if "allow_partial_loading" in inspect.getfullargspec(self.quant_method.load_weights).args:
+            kargs["allow_partial_loading"] = allow_partial_loading
+        self.quant_method.load_weights(self, weights[0], self.weight_loading_mode, **kargs)
+
     def transform_weights(self) -> None:
         if getattr(self, "_weights_transformed", False):
             return

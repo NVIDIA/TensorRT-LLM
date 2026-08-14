@@ -22,7 +22,6 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, Fp4QuantizedTensor
-from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .impl_contract import (
     MoEDeployment,
@@ -54,16 +53,33 @@ _ACTIVATION_MAP = {
 }
 
 
-class CuteDslB12xFusedMoE(CuteDslFusedMoE):
+class CuteDslB12xFusedMoE(CutlassFusedMoE):
     """B12x NVFP4 fused-MoE backend for SM120 / SM121.
 
     Large prefill chunks use CUTLASS; decode uses FlashInfer's b12x kernel.
+
+    Inherits ``CutlassFusedMoE`` rather than only the shared blocks, unlike its
+    siblings (CuteDsl, DeepGemm, Marlin): ``_route_to_cutlass`` sends every
+    NVFP4 prefill chunk through ``CutlassFusedMoE.quantize_input`` /
+    ``CutlassFusedMoE.run_moe``, which read the whole Cutlass execution state
+    (chunking stream and events, ``use_fused_finalize``, the tuner flags, the
+    LoRA slot helpers, ``_tuner_shapes``, ``_run_moe_w4a16_nvfp4``).
     """
 
     # Restated rather than inherited: the LoRA gate this replaces compared the
     # exact class and answered False here, while the DWDP gate used isinstance
     # and answered True through CuteDslFusedMoE.
     capabilities = MoEStaticCapability(supports_moe_lora=False, supports_dwdp=True)
+
+    # This and ``supports_moe_output_in_alltoall_workspace`` came through
+    # ``CuteDslFusedMoE`` before the reparent and Cutlass answers differently on
+    # both, so both are restated to keep the declared values unchanged. Neither
+    # is reachable today (``can_implement`` rejects ``ep_size != 1`` and
+    # alltoall), but a base-class change should not flip them silently.
+    _supports_non_divisible_ep: bool = True
+
+    def supports_moe_output_in_alltoall_workspace(self) -> bool:
+        return self.has_nvfp4
 
     # SM versions on which the FlashInfer b12x NVFP4 MoE kernel is available.
     # SM120 = desktop Blackwell (RTX 5090 / GB202); SM121 = GB10 / DGX Spark.
@@ -144,12 +160,10 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
 
         super().__init__(*args, **kwargs)
 
-        # Eligibility (SM / quant / activation / EP) is owned by
-        # ``can_implement``. ``enable_alltoall`` is a run-time flag not yet on
-        # ``MoEDeployment``, so keep the construction guard here.
-        if self.enable_alltoall:
-            raise ValueError("CuteDslB12xFusedMoE does not support MoE alltoall communication.")
-
+        # No alltoall guard here: alltoall is picked by the wrapper's
+        # communication strategy, and ``can_implement`` already rejects the
+        # topologies that could pick it (ep_size != 1, attention-DP with
+        # parallel_size > 1).
         self._b12x_weights: Optional[dict] = None
         self.b12x_wrapper = None
 

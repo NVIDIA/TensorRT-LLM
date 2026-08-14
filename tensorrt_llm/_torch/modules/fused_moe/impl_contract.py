@@ -473,6 +473,10 @@ class MoEEplbBinding:
     """EPLB expert layout required before weight creation."""
 
     layer_idx: int
+    # The checkpoint expert count, not a slot-layout value, but needed here for
+    # the same reason: ``register_all_parameter_slot_and_to_fix_weight_fns``
+    # iterates over it to set up host-tensor sharing before weights exist.
+    num_experts: int
     num_slots: int
     slot_start: int
     slot_end: int

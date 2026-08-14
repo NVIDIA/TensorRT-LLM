@@ -15,7 +15,7 @@
 """Laguna / Laguna-XS model for TensorRT-LLM PyTorch backend."""
 
 import math
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -36,12 +36,13 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (
     MiniMaxM2MoeRoutingMethod,
+    MoEImplClass,
     RoutingMethodType,
     create_moe,
     resolve_moe_cls,
 )
-from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.fused_moe.interface import MoE as MoEInterface
+from ..modules.fused_moe.interface import MoEWeightLoadingMode
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.qk_norm_attention import QKNormRoPEAttention
@@ -66,7 +67,7 @@ class LagunaGate(nn.Module):
         num_experts: int,
         top_k: int,
         dtype: Optional[torch.dtype] = None,
-        moe_backend_cls: Type[MoE] = None,
+        moe_backend_cls: Optional[MoEImplClass] = None,
     ):
         super().__init__()
         self.top_k = top_k

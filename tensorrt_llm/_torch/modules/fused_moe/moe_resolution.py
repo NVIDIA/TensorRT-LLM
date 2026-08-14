@@ -37,6 +37,7 @@ from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
+from .impl_base import MoEImplBase
 from .impl_contract import (
     MoEDeployment,
     MoEEnvironment,
@@ -49,6 +50,7 @@ from .impl_contract import (
     canonical_routing,
 )
 from .impl_environment import collect_moe_environment
+from .interface import MoE
 from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
 
@@ -62,8 +64,15 @@ WIDEEP_DEPRECATION_MESSAGE = (
     "otherwise."
 )
 
+#: What ``resolve_moe_cls`` can hand back. Three shapes, not two: ``MoE`` is a
+#: complete layer, ``MoEImplBase`` an execution unit legal only as
+#: ``ConfigurableMoE.backend``, and ``VanillaMoE`` the PyTorch reference path --
+#: an ``nn.ModuleList`` that inherits neither, so a two-way union would exclude
+#: the backend the other two are checked against. ``create_moe`` re-exports it.
+MoEImplClass = Union[Type[MoE], Type[MoEImplBase], Type[VanillaMoE]]
+
 # Global priority: specialized first, broad fallbacks last.
-IMPL_PRIORITY: Tuple[Type, ...] = (
+IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     CuteDslB12xFusedMoE,  # SM120/121 NVFP4 decode only -- narrowest, so first
     MegaMoEDeepGemm,  # ahead of plain CuteDSL / DeepGEMM: better perf when eligible
     MegaMoECuteDsl,
@@ -78,7 +87,7 @@ IMPL_PRIORITY: Tuple[Type, ...] = (
 )
 
 # Family membership only; IMPL_PRIORITY decides try order.
-BACKEND_FAMILY: Dict[str, FrozenSet[Type]] = {
+BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     "CUTLASS": frozenset({CutlassFusedMoE}),
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinFusedMoE}),
@@ -100,10 +109,10 @@ if _UNRANKED:
     )
 
 # Widest coverage; default degradation target.
-FALLBACK_IMPL: Type = CutlassFusedMoE
+FALLBACK_IMPL: MoEImplClass = CutlassFusedMoE
 
 
-def _legacy_backend_name(impl_cls: Type) -> str:
+def _legacy_backend_name(impl_cls: MoEImplClass) -> str:
     """Diagnostic name used until each leaf class owns one fixed impl id."""
     return impl_cls.__name__
 
@@ -292,7 +301,7 @@ def build_moe_deployment(
 NO_FALLBACK_BACKENDS: FrozenSet[str] = frozenset({"VANILLA"})
 
 
-def _candidates_for(backend: str) -> List[Type]:
+def _candidates_for(backend: str) -> List[MoEImplClass]:
     """Requested family in priority order, then fallback."""
     normalized = backend.upper()
     if normalized == "WIDEEP":
@@ -348,7 +357,7 @@ def resolve_moe_impl(
 
     # Ask all candidates so the report lists alternatives.
     rejected = []
-    eligible: List[Type] = []
+    eligible: List[MoEImplClass] = []
     for candidate in candidates:
         if deployment.moe_lora_enabled and not candidate.capabilities.supports_moe_lora:
             rejected.append(
@@ -407,7 +416,7 @@ def resolve_moe_impl(
     return report
 
 
-def impl_class_for(report: MoEResolutionReport) -> Type:
+def impl_class_for(report: MoEResolutionReport) -> MoEImplClass:
     """The class a report's winner names, or raise with the whole trail."""
     if report.winner is None:
         raise ValueError(f"no MoE implementation can serve this layer. {report.describe()}")
@@ -419,6 +428,6 @@ def impl_class_for(report: MoEResolutionReport) -> Type:
     )
 
 
-def resolve_moe_cls(model_config: ModelConfig, **kwargs) -> Type:
+def resolve_moe_cls(model_config: ModelConfig, **kwargs) -> MoEImplClass:
     """Resolve and return only the implementation class."""
     return impl_class_for(resolve_moe_impl(model_config, **kwargs))
