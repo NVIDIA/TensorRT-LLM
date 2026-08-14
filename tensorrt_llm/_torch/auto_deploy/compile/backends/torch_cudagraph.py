@@ -34,6 +34,7 @@ from torch.cuda import CUDAGraph
 from torch.fx import GraphModule
 from torch.fx._pytree import tree_flatten_spec
 from torch.utils._pytree import PyTree, TreeSpec, tree_flatten
+from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
 
 try:
     from tensorrt_llm._torch.autotuner import autotune
@@ -254,9 +255,10 @@ class CapturedGraph(nn.Module):
         # capture graph now
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
+        graph_pool = self._cuda_graph_mem_pool or torch.cuda.graph_pool_handle()
         od = self._output_dynamic_dim
         output_extents = []
-        with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
+        with nccl_window_graph_capture(graph, graph_pool):
             # compute output
             out = self.model(*args, **kwargs)
             # write out into output buffer up to out batch size
@@ -270,7 +272,7 @@ class CapturedGraph(nn.Module):
                 o_buffer.narrow(od, 0, output_extent).copy_(o)
                 output_extents.append(output_extent)
         torch.cuda.synchronize()
-        self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
+        self._cuda_graph_mem_pool = graph_pool
         return graph, tuple(output_extents)
 
     def capture_graph(self, get_args_kwargs: GetArgsKwargsForBatchSize, batch_sizes: List[int]):
