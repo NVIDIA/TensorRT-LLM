@@ -614,7 +614,9 @@ class LagunaHfWeightMapper(HfWeightMapper):
         # ``checkpoints/hf/compressed_tensors.py`` so every mapper that has to
         # read both producers shares one implementation.
         if self._config is not None and self._config.quant_config.quant_mode.has_nvfp4():
-            weights = normalize_compressed_tensors_nvfp4_names(weights)
+            weights = normalize_compressed_tensors_nvfp4_names(
+                weights, allow_zero_global_scales=True
+            )
 
         return weights
 

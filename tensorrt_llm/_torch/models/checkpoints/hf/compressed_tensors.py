@@ -74,7 +74,9 @@ def invert_global_scale(tensor: torch.Tensor) -> torch.Tensor:
     return torch.nan_to_num(inverted, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
 
 
-def normalize_compressed_tensors_nvfp4_names(weights: dict) -> dict:
+def normalize_compressed_tensors_nvfp4_names(
+    weights: dict, *, allow_zero_global_scales: bool = False
+) -> dict:
     """Rename compressed-tensors NVFP4 tensors to the names the loaders expect.
 
     Selection is by tensor suffix, which is what makes this safe on a
@@ -90,13 +92,16 @@ def normalize_compressed_tensors_nvfp4_names(weights: dict) -> dict:
     Args:
         weights: Checkpoint tensors keyed by name. Values may be
             ``torch.Tensor`` or lazy safetensors slices.
+        allow_zero_global_scales: Preserve non-positive/non-finite scale
+            sentinels as zero. This is valid for uncalibrated MoE experts that
+            a fused loader can leave inactive, but not for a dense Linear.
 
     Returns:
         The tensors with NVFP4 names normalized and global scales inverted.
 
     Raises:
         ValueError: A rename would overwrite a tensor the checkpoint already
-            stores under the target name.
+            stores under the target name, or a dense global scale is invalid.
     """
     renamed: dict = {}
     changed = False
@@ -109,6 +114,14 @@ def normalize_compressed_tensors_nvfp4_names(weights: dict) -> dict:
             changed = True
             if old_suffix in _GLOBAL_SCALE_SUFFIXES:
                 tensor = value[...] if not isinstance(value, torch.Tensor) else value
+                if not allow_zero_global_scales and (
+                    not torch.isfinite(tensor).all() or not (tensor > 0).all()
+                ):
+                    raise ValueError(
+                        f"compressed-tensors tensor '{name}' contains a non-positive "
+                        "or non-finite global scale; dense NVFP4 layers require "
+                        "calibrated positive scales."
+                    )
                 value = invert_global_scale(tensor)
             break
         if new_name in renamed:
