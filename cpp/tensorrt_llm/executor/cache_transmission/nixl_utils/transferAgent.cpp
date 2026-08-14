@@ -49,7 +49,6 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/NixlNotifControlChannel.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/NixlTransferEngine.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ZmqControlChannel.h"
 #include <cuda_runtime_api.h>
@@ -70,8 +69,7 @@ struct NixlBounceState
 {
     BounceConfig cfg;
     int deviceId{};
-    NixlNotifControlChannel* notifChannel{}; // non-owning typed view; channel owns the object
-    std::unique_ptr<ControlChannel> channel; // ZmqControlChannel or NixlNotifControlChannel
+    std::unique_ptr<ControlChannel> channel; // ZmqControlChannel
     std::unique_ptr<BounceArena> arena;      // ONE shared buffer: receiver targets + local gather staging
     std::unique_ptr<ExecPool> exec;          // gather/scatter exec contexts (streams/scratch)
     // Engine is declared AFTER the arena so it is destroyed BEFORE it: ~NixlTransferEngine
@@ -175,25 +173,11 @@ void NixlTransferAgent::maybeInitBounce(std::optional<bool> agentBufferEnable)
         // self-bootstraps a DEALER to it from WANT. Pick the IP the same way the NIXL agent does
         // (TRTLLM_NIXL_INTERFACE NIC if set, else auto-detect via outbound route / hostname; the
         // shared common::getLocalIp util). IPv6 needs brackets in a zmq tcp endpoint.
-        std::string controlDesc;
-        if (cfg.useNixlNotifications)
-        {
-            // Control over NIXL notifications (UCX AM on the RDMA fabric): no socket to bind; the
-            // WANT bootstrap payload is this agent's serialized metadata (see NixlNotifControlChannel).
-            auto channel = std::make_unique<bounce::NixlNotifControlChannel>(mRawAgent.get(), mName);
-            st->notifChannel = channel.get();
-            st->channel = std::move(channel);
-            controlDesc = "nixl-notif";
-        }
-        else
-        {
-            std::string const localIp
-                = common::getLocalIp(common::getEnvNixlInterface(), mpi::MpiComm::world().getRank());
-            std::string const bindAddr
-                = (localIp.find(':') != std::string::npos) ? "tcp://[" + localIp + "]:*" : "tcp://" + localIp + ":*";
-            st->channel = std::make_unique<bounce::ZmqControlChannel>(mName, bindAddr);
-            controlDesc = st->channel->localEndpoint();
-        }
+        std::string const localIp = common::getLocalIp(common::getEnvNixlInterface(), mpi::MpiComm::world().getRank());
+        std::string const bindAddr
+            = (localIp.find(':') != std::string::npos) ? "tcp://[" + localIp + "]:*" : "tcp://" + localIp + ":*";
+        st->channel = std::make_unique<bounce::ZmqControlChannel>(mName, bindAddr);
+        std::string const controlDesc = st->channel->localEndpoint();
         st->engine = std::make_unique<bounce::NixlTransferEngine>(mRawAgent.get(), dev);
         std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
         // ONE shared arena for both roles (receiver RDMA-write targets + local gather staging),
@@ -965,12 +949,6 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
 {
     std::shared_lock<std::shared_mutex> lock(mLock);
     TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::getNotifiedSyncMessages called after shutdown");
-#ifdef TLLM_BOUNCE_V2
-    if (mBounce && mBounce->notifChannel)
-    {
-        return mBounce->notifChannel->takeNonBounceNotifications();
-    }
-#endif
     nixl_notifs_t notifs;
     auto status = mRawAgent->getNotifs(notifs);
     TLLM_CHECK_WITH_INFO(

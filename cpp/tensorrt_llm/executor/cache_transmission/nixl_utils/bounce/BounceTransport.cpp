@@ -1450,17 +1450,11 @@ std::string BounceTransport::localHandshakeBlob() const
     auto endpoint = mCtx.channel->localEndpoint();
     if (endpoint.empty())
     {
-        if (!mCtx.cfg.useNixlNotifications)
-        {
-            TLLM_THROW("BounceTransport(%s): ZMQ control requires a non-empty local endpoint", mCtx.selfName.c_str());
-        }
-        TLLM_LOG_WARNING(
-            "BounceTransport(%s): local control endpoint unavailable; not advertising bounce", mCtx.selfName.c_str());
-        return {};
+        TLLM_THROW("BounceTransport(%s): ZMQ control requires a non-empty local endpoint", mCtx.selfName.c_str());
     }
     BounceHandshake handshake;
     handshake.wireVersion = kBounceVersion;
-    handshake.controlKind = mCtx.cfg.useNixlNotifications ? BounceControlKind::kNIXL_NOTIF : BounceControlKind::kZMQ;
+    handshake.controlKind = BounceControlKind::kZMQ;
     handshake.arenaUsableCapacityBytes = mCtx.scheduler.arenaCapacity();
     handshake.maxChunkSizeBytes = mCtx.cfg.maxChunkSizeBytes; // post-ctor-clamp effective value
     handshake.endpoint = std::move(endpoint);
@@ -1491,8 +1485,7 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
             mCtx.selfName.c_str(), peer.c_str());
         return false;
     }
-    auto const localControlKind
-        = mCtx.cfg.useNixlNotifications ? BounceControlKind::kNIXL_NOTIF : BounceControlKind::kZMQ;
+    auto const localControlKind = BounceControlKind::kZMQ;
     // STRICT equality. maxChunkSizeBytes is compared on the effective (post-clamp) values both
     // sides advertise; each side already clamped its own value to its usable arena capacity, so
     // equality also guarantees our chunks always fit the peer's arena and its scatter scratch

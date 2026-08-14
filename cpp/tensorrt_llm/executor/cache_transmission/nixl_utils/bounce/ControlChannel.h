@@ -37,10 +37,10 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //
 // Why it is abstract
 //   The data plane (bulk RDMA) is always NIXL. The control plane is pluggable so
-//   we can pick the transport without touching the reactor / credit logic:
-//     - ZmqControlChannel        (default) — dedicated, event-driven zmq sockets.
-//     - NixlNotifControlChannel — reuse NIXL genNotif/getNotifs (no extra port).
-//   Crucially, NEITHER uses NIXL's postXferReq notifMsg — v2 abandons it entirely
+//   an alternative transport can be added without touching the reactor / credit
+//   logic; ZmqControlChannel (dedicated, event-driven zmq sockets) is the only
+//   production implementation.
+//   Crucially, it does NOT use NIXL's postXferReq notifMsg — v2 abandons it entirely
 //   (data-landed is detected by the sender polling getXferStatus, which already
 //   includes NIXL's ucp_ep_flush_nbx).
 //

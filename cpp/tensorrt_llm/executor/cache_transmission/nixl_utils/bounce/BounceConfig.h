@@ -52,11 +52,6 @@ struct BounceConfig
     // bidirectional deployment both sides can always still grant incoming regions (no mutual
     // eager-starvation); the credit-backed path is unaffected by the cap.
     bool enableEagerGather{true};
-    // TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS: carry the control messages (WANT/GRANT/DATA/ACK) over NIXL
-    // notifications (UCX active messages on the RDMA fabric) instead of ZMQ/TCP — a control hop
-    // drops from tens of microseconds to a few. Peers can use bounce together only when this setting
-    // matches; the capability handshake otherwise keeps transfers on the standard NIXL path.
-    bool useNixlNotifications{false};
     // TRTLLM_NIXL_BOUNCE_DISABLE_SCATTER_RUN_MERGING: DEBUG ONLY — disable scatter-run coalescing so the DATA
     // message carries one entry per desc (per-desc plan, hundreds of KB per chunk). Used to A/B the
     // control transports under large-message load; never enable in production.
@@ -217,7 +212,6 @@ struct BounceConfig
         cfg.useCubCopy = envBool("TRTLLM_NIXL_BOUNCE_USE_CUB_COPY", cfg.useCubCopy);
         cfg.useZeroCopyArguments = envBool("TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS", cfg.useZeroCopyArguments);
         cfg.enableEagerGather = envBool("TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER", cfg.enableEagerGather);
-        cfg.useNixlNotifications = envBool("TRTLLM_NIXL_BOUNCE_USE_NIXL_NOTIFICATIONS", cfg.useNixlNotifications);
         cfg.disableScatterRunMerging
             = envBool("TRTLLM_NIXL_BOUNCE_DISABLE_SCATTER_RUN_MERGING", cfg.disableScatterRunMerging);
         return cfg;

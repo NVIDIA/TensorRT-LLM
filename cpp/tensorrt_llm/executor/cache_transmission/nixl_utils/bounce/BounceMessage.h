@@ -153,12 +153,12 @@ inline constexpr std::uint16_t kBounceVersion = 2U;
 
 // ---- handshake (out-of-band, travels in AgentDesc — NOT a control-channel message) ----
 
-/// Which transport carries the bounce control messages. Peers MUST agree — the WANT bootstrap
-/// payload differs between the two (a zmq endpoint vs serialized NIXL metadata).
+/// Which transport carries the bounce control messages. Peers MUST agree — the field stays on the
+/// wire so a future alternative transport remains negotiable (an unknown value simply fails the
+/// strict handshake equality and falls back to the standard NIXL path).
 enum class BounceControlKind : std::uint8_t
 {
     kZMQ = 0,
-    kNIXL_NOTIF = 1,
 };
 
 /// Bounce capability handshake, advertised in this agent's AgentDesc metadata. A peer that loads
@@ -178,7 +178,7 @@ struct BounceHandshake
     // This agent's effective per-chunk cap after the arena-capacity clamp. Peers compare this field
     // exactly, which also keeps their scatter-plan capacities consistent.
     std::uint64_t maxChunkSizeBytes{0};
-    // Control-channel address: a zmq endpoint (kZMQ) or serialized NIXL metadata (kNIXL_NOTIF).
+    // Control-channel address: a zmq endpoint (kZMQ).
     std::string endpoint;
 };
 
