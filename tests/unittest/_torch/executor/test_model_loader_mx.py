@@ -207,13 +207,17 @@ def _llama_alias_state(model):
     }
 
 
-def _llama_embedding_logits(model: nn.Module) -> torch.Tensor:
+def _llama_input_embeddings(model: nn.Module) -> torch.Tensor:
     input_ids = torch.tensor(
         [0, 1, 2],
         dtype=torch.long,
         device=model.model.embed_tokens.weight.device,
     )
-    return model.lm_head(model.model.embed_tokens(input_ids))
+    return model.model.embed_tokens(input_ids)
+
+
+def _llama_embedding_logits(model: nn.Module) -> torch.Tensor:
+    return model.lm_head(_llama_input_embeddings(model))
 
 
 def _tiny_qwen2_model(
@@ -739,7 +743,7 @@ def test_default_profile_qualifies_real_tiny_llama_tp2_rank_lifecycle(
             loads_draft_weights=False,
         ),
         state_probes=(("aliases", _llama_alias_state),),
-        output_probes=(("embedding-logits", _llama_embedding_logits),),
+        output_probes=(("input-embeddings", _llama_input_embeddings),),
     )
 
     producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
