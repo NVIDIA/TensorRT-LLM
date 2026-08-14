@@ -50,6 +50,7 @@ def test_marlin_flashinfer_fused_add_rmsnorm_matches_aten_fallback():
     torch.manual_seed(0)
     hidden_size = 2688  # Nemotron Nano 30B layer-boundary hidden dimension.
     norm = RMSNorm(hidden_size=hidden_size, eps=1e-6, dtype=torch.bfloat16, device="cuda")
+    norm.weight.copy_((1 + 0.1 * torch.randn(hidden_size, device="cuda")).to(torch.bfloat16))
     hidden_states = torch.randn((4, hidden_size), dtype=torch.bfloat16, device="cuda")
     residual = torch.randn_like(hidden_states)
     marlin_attrs = {"nvfp4_gemm_allowed_backends": ["marlin"]}
@@ -68,5 +69,5 @@ def test_marlin_flashinfer_fused_add_rmsnorm_matches_aten_fallback():
     with model_extra_attrs(marlin_attrs):
         actual, actual_residual = norm(hidden_states.clone(), residual.clone())
 
-    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(actual_residual, expected_residual, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_residual, expected_residual, rtol=0, atol=0)
