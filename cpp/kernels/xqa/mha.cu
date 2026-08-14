@@ -2552,6 +2552,9 @@ CUBIN_EXPORT __global__
 
         // merge results from different warp groups
         SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, inputElemSize == 2 && cacheElemSize == 1);
+        // Only the CTA that performs the multi-block merge may write the output; a non-last CTA
+        // writing its unmerged partial would race with the merged result.
+        bool writesOutput = true;
         if (isMultiBlock)
         {
             static_assert(ctaShapeInWarps.y == 1, "not implemented");
@@ -2624,6 +2627,7 @@ CUBIN_EXPORT __global__
 
             // merge if we are the last CTA.
             bool const isLastCta = mbsmem.isLastCta;
+            writesOutput = isLastCta;
             if (isLastCta)
             {
                 MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
@@ -2714,7 +2718,7 @@ CUBIN_EXPORT __global__
                 smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
             }
         }
-        if (warpGrpIdx == 0)
+        if (writesOutput && warpGrpIdx == 0)
         {
 #if SPEC_DEC
             copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,
