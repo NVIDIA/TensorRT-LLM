@@ -989,10 +989,19 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
                 f"expert-slot bookkeeping instead of here. Pick a divisor of "
                 f"{num_experts}."
             )
-        # Pure expert parallelism (moe_tp_size 1) segfaults during CUDA-graph
-        # capture; the same layout is correct with graphs disabled. Root cause
-        # not yet found, so reject only that combination rather than the whole
-        # layout, and point at the configuration that works.
+        # Measured, not theoretical. On 4 GPUs, against the golden GSM8K run:
+        #
+        #   ep 1 / 2, cuda_graph on   acc 0.9667, zero score flips
+        #   ep 4,     cuda_graph OFF  acc 0.9667, zero score flips
+        #   ep 4,     cuda_graph on   SIGSEGV in warmup, all four ranks
+        #
+        # So the expert split itself is sound at every size tried, including
+        # moe_tp_size 1 -- pure EP reproduces the TP-only result per item. What
+        # breaks is pure EP together with CUDA-graph capture; changing
+        # max_batch_size / max_num_tokens does not move it, which rules out the
+        # expert GEMM shape. Root cause not yet found, so reject only that
+        # combination rather than the whole layout, and point at the
+        # configuration that works.
         moe_tp_size = getattr(mapping, "moe_tp_size", None)
         use_cuda_graph = getattr(model_config, "use_cuda_graph", False)
         if moe_tp_size is not None and moe_tp_size < 2 and use_cuda_graph:
