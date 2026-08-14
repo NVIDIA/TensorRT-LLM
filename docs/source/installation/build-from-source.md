@@ -108,7 +108,7 @@ With `--build_root <dir>` set, the following default under `<dir>` instead of th
 
 Conan's `cpp/CMakeUserPresets.json` convenience file is also skipped in this mode, since it would reference the (possibly ephemeral) out-of-tree build directory.
 
-Only final artifacts are still written into the checkout: `tensorrt_llm/libs`, `tensorrt_llm/include`, Python bindings and stubs, generated FMHA kernel sources, and the `.whl` output directory (`--dist_dir`).
+Only final artifacts are still written into the checkout: `tensorrt_llm/libs`, `tensorrt_llm/include`, Python bindings and stubs, generated FMHA kernel sources, the configured `cpp/include/tensorrt_llm/executor/version.h`, and the `.whl` output directory (`--dist_dir`).
 
 Related knobs for shared-storage workflows:
 
@@ -117,6 +117,16 @@ Related knobs for shared-storage workflows:
 - `--use-3rdparty-cache`: cache FetchContent git clones as bare repos under `TRTLLM_FETCHCONTENT_CACHE` (defaults to `3rdparty/.cache_3rdparty`), avoiding repeated full clones after a clean.
 
 Plain local-disk builds are unaffected: without `--build_root`, all paths behave as before.
+
+#### Out-of-tree wheel builds (read-only checkout)
+
+For CI or ephemeral-node workflows that only need a wheel, add `--out-of-tree` to guarantee the checkout is never written — it can even be mounted read-only:
+
+```bash
+python3 scripts/build_wheel.py --build_root /tmp/trtllm-build --out-of-tree --use_ccache -a "90-real"
+```
+
+In this mode the generated FMHA kernel sources and the configured `version.h` go to the build tree (via the `TRTLLM_FMHA_GEN_DIR` and `TRTLLM_VERSION_H_INCLUDE_DIR` CMake variables), and the wheel is assembled from a staging copy of the Python package under `<build_root>/package`, landing in `<build_root>/dist` by default. Submodules and git-lfs content must be materialized before the build (the usual `git submodule update --init --recursive`), since the build will not modify the checkout. Editable-install workflows (`--skip_building_wheel`, `--linking_install_binary`, `--install`) are incompatible with `--out-of-tree`: they import compiled artifacts from the checkout by design. `--version-override` is also incompatible, since it edits `tensorrt_llm/version.py` in the checkout.
 
 ### Python-only build (no C++ compilation)
 
