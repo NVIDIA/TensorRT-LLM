@@ -90,6 +90,10 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn("effectivePerfMode = infraDryRun ? false : perfMode", body)
         self.assertIn("getPytestBaseCommandLine(", body)
         self.assertIn("--test-list=${preprocessedLists.regular}", body)
+        self.assertIn(
+            "pytestCommand += getInfraDryRunPytestTargets(preprocessedLists.regular)",
+            body,
+        )
         self.assertIn("rerunFailedTests(", body)
         self.assertIn("runIsolatedTests(", body)
         self.assertIn("generateRerunReport(", body)
@@ -103,6 +107,10 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         for call in ("renderTestDB(", "processShardTestList(", "getPytestBaseCommandLine("):
             self.assertIn(call, prepared)
         self.assertIn("--test-list=${preprocessedLists.regular}", prepared)
+        self.assertIn(
+            "pytestCommand += getInfraDryRunPytestTargets(preprocessedLists.regular)",
+            prepared,
+        )
         self.assertIn('withEnv(["stageName=${stageName}", "TRTLLM_INFRA_DRY_RUN=true"])', prepared)
         self.assertNotIn("test_infra_dry_run_benchmark.py", prepared)
         self.assertLess(docs.index("if (isInfraDryRun())"), docs.index("make html"))
@@ -144,6 +152,20 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertLess(body.index(dry_environment), body.index("processShardTestList("))
         self.assertLess(body.index(dry_environment), body.index("${pytestCommand.join"))
 
+    def test_dry_run_limits_collection_to_rendered_nodeids(self):
+        targets = _function_body(
+            L0_TEST, "getInfraDryRunPytestTargets", "processShardTestList"
+        )
+        preprocessing = _function_body(
+            L0_TEST, "processShardTestList", "isValidSlurmJobId"
+        )
+        self.assertIn("if (!isInfraDryRun())", targets)
+        self.assertIn('.findAll { it.contains("::") }', targets)
+        self.assertIn(
+            "testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)",
+            preprocessing,
+        )
+
     def test_dry_run_conftest_does_not_require_product_bindings(self):
         dry_guard = '_INFRA_DRY_RUN = os.environ.get("TRTLLM_INFRA_DRY_RUN", "").lower() == "true"'
         self.assertIn(dry_guard, CONFTEST)
@@ -163,6 +185,10 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             "effectiveTestList = infraDryRun ? INFRA_DRY_RUN_TEST_CONTEXT : testList", body
         )
         self.assertIn("String[] taskArgs = getNodeArgs(", body)
+        self.assertIn(
+            "pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)",
+            body,
+        )
         self.assertIn('pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"', body)
         self.assertIn("if (!isInfraDryRun() && (disaggMultiNodeMode || aggMultiNodeMode))", body)
         self.assertNotIn("test_infra_dry_run_benchmark.py", body)

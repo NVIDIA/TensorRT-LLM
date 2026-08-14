@@ -569,6 +569,24 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
     return rerunFailed  // Return the updated value
 }
 
+def getInfraDryRunPytestTargets(testListPath) {
+    if (!isInfraDryRun()) {
+        return []
+    }
+
+    // --test-list filters items only after pytest has imported every file under
+    // the current directory. The CPU-only dry runners intentionally do not
+    // install the product test environment, so limit collection to the rendered
+    // synthetic nodeids as positional arguments as well.
+    def targets = readFile(file: testListPath).readLines()
+        .collect { it.trim().split(/\s+/, 2)[0] }
+        .findAll { it.contains("::") }
+    if (!targets) {
+        error "No pytest targets found in infrastructure dry-run list ${testListPath}"
+    }
+    return targets
+}
+
 def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
@@ -641,6 +659,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, du
         if (durationsPath) {
             testListCmd += ["--durations-path ${durationsPath}"]
         }
+        testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
         try {
             // First execute the pytest command and check if it succeeds
@@ -1927,7 +1946,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         "--s3-upload-mode=deferred",
                     ]
                 }
-                def pytestCommand = getPytestBaseCommandLine(
+                def pytestCommandParts = getPytestBaseCommandLine(
                     llmSrcNode,
                     stageName,
                     waivesListPathNode,
@@ -1936,7 +1955,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
                     extraArgs,
-                ).join(" ")
+                )
+                pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)
+                def pytestCommand = pytestCommandParts.join(" ")
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE
@@ -3778,6 +3799,7 @@ def runInfraDryRunInPreparedWorkspace(pipeline, String llmSrc, String stageName)
         pytestCommand += [
             "--test-list=${preprocessedLists.regular}",
         ]
+        pytestCommand += getInfraDryRunPytestTargets(preprocessedLists.regular)
 
         withCredentials([
             string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
@@ -5028,6 +5050,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // Only add --test-list if there are regular tests to run
         if (preprocessedLists.regularCount > 0) {
             pytestCommand += ["--test-list=${preprocessedLists.regular}"]
+            pytestCommand += getInfraDryRunPytestTargets(preprocessedLists.regular)
         }
 
         def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
