@@ -28,7 +28,8 @@ from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
-from subprocess import DEVNULL, CalledProcessError, check_output, run
+from subprocess import (DEVNULL, PIPE, CalledProcessError, Popen, check_output,
+                        run)
 from typing import Optional, Sequence
 
 try:
@@ -593,10 +594,24 @@ def _tar_pipe_copy(src: Path, dst: Path) -> bool:
     dst.mkdir(parents=True, exist_ok=True)
     # posix (pax) format keeps sub-second mtimes; the gnu default truncates
     # to whole seconds, which would defeat sync_tree's mtime comparison.
-    result = run(
-        f'"{tar_bin}" --format=posix -C "{src}" -chf - . | "{tar_bin}" -C "{dst}" -xf -',
-        shell=True)
-    return result.returncode == 0
+    #
+    # Chain the producer and consumer tars directly through an OS pipe rather
+    # than a shell string. Checking both return codes reports a failing
+    # producer (e.g. an unreadable source file) that a shell pipeline would
+    # mask behind the consumer's exit status, without depending on a bash that
+    # supports `set -o pipefail`; it also avoids shell quoting entirely.
+    producer = Popen(
+        [tar_bin, "--format=posix", "-C",
+         str(src), "-chf", "-", "."],
+        stdout=PIPE)
+    consumer = Popen([tar_bin, "-C", str(dst), "-xf", "-"],
+                     stdin=producer.stdout)
+    # Close our copy of the write end so the consumer sees EOF when the
+    # producer exits (and the producer gets SIGPIPE if the consumer dies).
+    producer.stdout.close()
+    consumer.wait()
+    producer.wait()
+    return producer.returncode == 0 and consumer.returncode == 0
 
 
 def sync_tree(src, dst, exclude: Sequence[str] = ()):
