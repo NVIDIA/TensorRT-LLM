@@ -560,8 +560,6 @@ def multimodal_model_root(request, llm_venv):
     assert models_root, "Did you set LLM_MODELS_ROOT?"
 
     tllm_model_name = request.param
-    if "VILA" in tllm_model_name:
-        models_root = os.path.join(llm_models_root(), "vila")
     if "cogvlm-chat" in tllm_model_name:
         models_root = os.path.join(llm_models_root(), "cogvlm-chat")
     if "video-neva" in tllm_model_name:
