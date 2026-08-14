@@ -334,6 +334,34 @@ def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath)
     }
 }
 
+// Read back the sbatch output the submit script captured to sbatch_output.txt
+// in the job workspace. A failed sh step surfaces only the exit code ("script
+// returned exit code 1"), so sbatch's stderr -- e.g. "Slurm backup controller
+// in standby mode" during a slurmctld failover -- never reaches
+// FailureClassifier.classify(), which matches the exception chain only. Like
+// scrapeSlurmLogForDeviceFault above, this is a GATE only: the caller folds
+// the returned text into a fresh exception and the shared-lib PATTERN_CATALOG
+// (the authoritative list) makes the real retry/severity decision. Returns ""
+// when the file is missing or unreadable, so the caller can rethrow the
+// original exception unchanged.
+def readSlurmSubmitOutput(def pipeline, Map remote, String jobWorkspace, String stageName) {
+    def outputPath = "${jobWorkspace}/sbatch_output.txt"
+    try {
+        return Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(remote,
+                "\"bash -c 'if [ -f \\\"${outputPath}\\\" ]; then head -c 1000 -- \\\"${outputPath}\\\"; fi'\""),
+            returnStdout: true,
+            numRetries: 1,
+        )?.trim()
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception readEx) {
+        pipeline.echo("Ignorable warning: could not read ${outputPath} on ${remote.host}: ${readEx.message}")
+        return ""
+    }
+}
+
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
@@ -2154,7 +2182,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
 
                     touch ${slurmJobLogPath}
-                    jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
+                    # Capture sbatch's combined output and persist it before acting on
+                    # the exit code: a failed sh step carries only the exit code back
+                    # to Jenkins, so a submission rejection's stderr (e.g. "Slurm
+                    # backup controller in standby mode") would otherwise never reach
+                    # the failure classifier. The pipeline reads sbatch_output.txt
+                    # back on failure (readSlurmSubmitOutput) and folds it into the
+                    # exception it throws.
+                    sbatch_rc=0
+                    sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
+                    printf '%s\\n' "\${sbatch_output}"
+                    printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
+                    if [ "\${sbatch_rc}" -ne 0 ]; then
+                        echo "Error: Slurm job submission failed with exit code \${sbatch_rc}."
+                        exit "\${sbatch_rc}"
+                    fi
+                    jobId=\$(printf '%s\\n' "\${sbatch_output}" | awk '/Submitted batch job/ {print \$4; exit}')
                     if [ -z "\$jobId" ]; then
                         echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1
@@ -2181,12 +2224,39 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // share the job workspace (slurm_job_id.txt, scripts) on that login
                 // node; a frontend disconnect fails the whole closure over to a fresh
                 // frontend as a unit (the submit script reuses an active job).
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(remote, scriptSubmitPathNode),
-                    numRetries: 3
-                )
+                try {
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(remote, scriptSubmitPathNode),
+                        numRetries: 3
+                    )
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception submitEx) {
+                    // Only enrich failures the classifier cannot already act on. An
+                    // interrupt (user abort / pipeline timeout) or an exception that
+                    // already classifies as infra must propagate unchanged --
+                    // wrapping them in a fresh cause-less Exception would erase the
+                    // FlowInterruptedException / typed-infra signal from the chain.
+                    def preClassified = FailureClassifier.classify(submitEx, InfraFailure.SLURM)
+                    if (preClassified instanceof PipelineInterruption || preClassified instanceof InfraFailure) {
+                        throw submitEx
+                    }
+                    // The sh step's exception carries only the exit code, so fold the
+                    // sbatch output captured by the submit script (stderr included)
+                    // into a fresh exception for FailureClassifier.classify() at the
+                    // runLLMTestlistOnSlurm caller; the shared-lib PATTERN_CATALOG
+                    // (e.g. its "Slurm backup controller in standby mode" row) then
+                    // drives the retry/severity decision. An empty read (file
+                    // missing or unreadable) preserves today's behavior by
+                    // rethrowing the original exception unchanged.
+                    def sbatchOutput = readSlurmSubmitOutput(pipeline, remote, jobWorkspace, stageName)
+                    if (sbatchOutput) {
+                        throw new Exception("SLURM job submission failed for ${stageName}: ${sbatchOutput}")
+                    }
+                    throw submitEx
+                }
 
                 def slurmMetadata = captureSlurmWorkspaceMetadata(pipeline, remote, jobWorkspace, placementContext, stageName)
                 def slurmJobId = slurmMetadata.slurmJobId
