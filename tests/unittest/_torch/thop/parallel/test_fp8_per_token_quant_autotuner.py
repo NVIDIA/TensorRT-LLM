@@ -130,21 +130,27 @@ class TestTunableFP8PerTokenQuant(unittest.TestCase):
     def test_scale_dtype_is_always_float32(self):
         """tunable_fp8_per_token_quant must normalize scales to float32.
 
-        The TRTLLM tactic returns input-dtype scales (e.g. bf16); the vectorized
-        tactic returns float32. The op must normalize so callers always get f32.
+        The raw TRTLLM kernel op returns input-dtype scales (e.g. bf16); the
+        vectorized kernel op already returns float32. Fp8PerTokenQuantRunner.forward()
+        normalizes both to float32 (so autotuner profiling times the same cast
+        inference pays), and the public op inherits that.
         """
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
             Fp8PerTokenQuantRunner,
             Fp8PerTokenQuantTactic,
         )
 
-        runner = Fp8PerTokenQuantRunner()
         x = torch.randn(512, 3072, dtype=torch.bfloat16, device="cuda")
 
+        # The raw kernel op is unnormalized: TRTLLM returns bf16 scales.
+        _, scale_raw = torch.ops.tensorrt_llm.quantize_e4m3_activation(x)
+        self.assertEqual(scale_raw.dtype, torch.bfloat16, "Raw TRTLLM kernel scale should be bf16")
+
+        # The runner normalizes regardless of tactic.
+        runner = Fp8PerTokenQuantRunner()
         _, scale_trt = runner(inputs=[x], tactic=Fp8PerTokenQuantTactic.TRTLLM)
-        # TRTLLM tactic returns bf16 scales before normalization.
         self.assertEqual(
-            scale_trt.dtype, torch.bfloat16, "Pre-normalization TRTLLM scale should be bf16"
+            scale_trt.dtype, torch.float32, "Runner must normalize TRTLLM scale to float32"
         )
 
         # The public op must normalize regardless.
@@ -153,47 +159,56 @@ class TestTunableFP8PerTokenQuant(unittest.TestCase):
             scale_public.dtype, torch.float32, "Public op must always return float32 scales"
         )
 
-    def test_forced_trtllm_tactic(self):
-        """TRTLLM_FP8_QUANT_TACTIC=trtllm must restrict tactics to TRTLLM only."""
-        from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-            Fp8PerTokenQuantRunner,
-            Fp8PerTokenQuantTactic,
-        )
+    def _assert_forced_tactic_bypasses_autotuner(self, env_value, expected_op):
+        """Shared body: the public op must dispatch directly to the forced
+        tactic without ever consulting AutoTuner.choose_one() (and therefore
+        without being able to hit a stale cached tactic)."""
+        from tensorrt_llm._torch.autotuner import AutoTuner
 
-        runner = Fp8PerTokenQuantRunner()
         x = torch.randn(128, 3072, dtype=torch.bfloat16, device="cuda")
 
         old = os.environ.pop("TRTLLM_FP8_QUANT_TACTIC", None)
         try:
-            os.environ["TRTLLM_FP8_QUANT_TACTIC"] = "trtllm"
-            tactics = runner.get_valid_tactics([x], profile=None)
-            self.assertEqual(tactics, [Fp8PerTokenQuantTactic.TRTLLM])
+            os.environ["TRTLLM_FP8_QUANT_TACTIC"] = env_value
+
+            called = []
+            orig_choose_one = AutoTuner.choose_one
+
+            def spy_choose_one(self, *args, **kwargs):
+                called.append(True)
+                return orig_choose_one(self, *args, **kwargs)
+
+            AutoTuner.choose_one = spy_choose_one
+            try:
+                qx, scale = torch.ops.trtllm.tunable_fp8_per_token_quant(x)
+            finally:
+                AutoTuner.choose_one = orig_choose_one
+
+            self.assertFalse(
+                called,
+                "AutoTuner.choose_one must not run when TRTLLM_FP8_QUANT_TACTIC is set",
+            )
+
+            qx_ref, scale_ref = expected_op(x)
+            self.assertTrue(torch.equal(qx, qx_ref))
+            self.assertTrue(torch.allclose(scale, scale_ref.float()))
         finally:
             if old is None:
                 os.environ.pop("TRTLLM_FP8_QUANT_TACTIC", None)
             else:
                 os.environ["TRTLLM_FP8_QUANT_TACTIC"] = old
+
+    def test_forced_trtllm_tactic(self):
+        """TRTLLM_FP8_QUANT_TACTIC=trtllm must dispatch to the TRTLLM kernel."""
+        self._assert_forced_tactic_bypasses_autotuner(
+            "trtllm", torch.ops.tensorrt_llm.quantize_e4m3_activation
+        )
 
     def test_forced_vectorized_tactic(self):
-        """TRTLLM_FP8_QUANT_TACTIC=vectorized must restrict tactics to VECTORIZED only."""
-        from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-            Fp8PerTokenQuantRunner,
-            Fp8PerTokenQuantTactic,
+        """TRTLLM_FP8_QUANT_TACTIC=vectorized must dispatch to the vectorized kernel."""
+        self._assert_forced_tactic_bypasses_autotuner(
+            "vectorized", torch.ops.tensorrt_llm.vectorized_per_token_fp8_quant
         )
-
-        runner = Fp8PerTokenQuantRunner()
-        x = torch.randn(128, 3072, dtype=torch.bfloat16, device="cuda")
-
-        old = os.environ.pop("TRTLLM_FP8_QUANT_TACTIC", None)
-        try:
-            os.environ["TRTLLM_FP8_QUANT_TACTIC"] = "vectorized"
-            tactics = runner.get_valid_tactics([x], profile=None)
-            self.assertEqual(tactics, [Fp8PerTokenQuantTactic.VECTORIZED])
-        finally:
-            if old is None:
-                os.environ.pop("TRTLLM_FP8_QUANT_TACTIC", None)
-            else:
-                os.environ["TRTLLM_FP8_QUANT_TACTIC"] = old
 
     def test_default_tactics_include_both(self):
         """Without env override, both tactics must be available."""
