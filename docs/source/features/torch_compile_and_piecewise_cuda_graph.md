@@ -124,10 +124,6 @@ Even with Piecewise CUDA Graph enabled, you may still observe bubbles in the con
 
 ## Known Issue
 
-Do not enable `torch_compile_config.enable_inductor` together with
-`torch_compile_config.enable_piecewise_cuda_graph`. Keep `enable_inductor`
-unset, or set it to `false`, when using Piecewise CUDA Graph.
-
 Torch compile cannot work with multi-ModelEngine config:
 
 1. Speculative Decoding in Two-Model Style
