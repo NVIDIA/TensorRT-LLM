@@ -17,52 +17,225 @@
 
 #pragma once
 
-#include "dataTransceiver.h"
-#include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
+#include "cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/executor/cache_transmission/cacheConcatenate.h"
+#include "tensorrt_llm/executor/cacheCommunicator.h"
+#include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
-#include "tensorrt_llm/runtime/iTensor.h"
-#include <NvInferRuntimeBase.h>
-#include <condition_variable>
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
+#include <fstream>
+#include <numeric>
+#include <vector>
+
+// Forward declare TransferSession in the correct global namespace scope
+namespace tensorrt_llm::batch_manager
+{
+class TransferSession;
+size_t computeBufferIdx(size_t processIdx, executor::kv_cache::TargetRanksInfo const& targetInfo);
+
+void sendBuffer(TransferSession& session, int deviceId, size_t processIdx,
+    std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
+    runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
+    executor::kv_cache::TargetRanksInfo const& targetInfo);
+
+void sendAllBuffers(TransferSession& session, int deviceId,
+    std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
+    runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
+    executor::kv_cache::TargetRanksInfo const& targetInfo, std::vector<size_t> const& pickUpConnections);
+
+namespace cache_formatter_utils
+{
+
+using CacheState = executor::kv_cache::CacheState;
+
+/**
+ * @brief Check if this rank should send cache data, given a pre-computed TargetRanksInfo.
+ *
+ * Callers that need RNN-specific target ranks should pass the result of targetIRanksForRnn().
+ */
+inline bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx,
+    executor::kv_cache::TargetRanksInfo const& targetInfo)
+{
+    if (targetInfo.mDupHeadFactor <= 1)
+    {
+        return true;
+    }
+
+    int selfCpSize = selfConfig.getParallelConfig().mContextParallelism;
+    int selfTpRank = (selfIdx % (selfConfig.getParallelConfig().mTensorParallelism * selfCpSize)) / selfCpSize;
+    int selfTpRankInDpGroup = selfTpRank;
+
+    if (selfConfig.getParallelConfig().mEnableAttentionDP)
+    {
+        int selfTPNumInDPGroup
+            = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
+        selfTpRankInDpGroup = selfTpRank % selfTPNumInDPGroup;
+    }
+
+    int destDPRank = destConfig.getParallelConfig().mEnableAttentionDP ? destConfig.getParallelConfig().mDPrank : 0;
+
+    return (destDPRank % targetInfo.mDupHeadFactor) == (selfTpRankInDpGroup % targetInfo.mDupHeadFactor);
+}
+
+/// @brief Convenience overload that computes KV-cache target ranks automatically.
+inline bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx)
+{
+    return needSendCache(
+        selfConfig, destConfig, selfIdx, executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx));
+}
+
+/**
+ * @brief Pick send connections, given a pre-computed TargetRanksInfo.
+ */
+inline std::vector<size_t> pickSendConnections(size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx,
+    CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks,
+    executor::kv_cache::TargetRanksInfo const& targetInfo)
+{
+    TLLM_CHECK(numConnections == counterPartRanks.size());
+
+    // NO duplicate head filtering - format/sendBuffer handles that
+    std::vector<size_t> indices;
+    for (auto rank : targetInfo.mIRanks)
+    {
+        auto it = std::find(counterPartRanks.begin(), counterPartRanks.end(), rank);
+        TLLM_CHECK_WITH_INFO(it != counterPartRanks.end(), "Required rank %d not found in counterPartRanks", rank);
+        indices.push_back(std::distance(counterPartRanks.begin(), it));
+    }
+    return indices;
+}
+
+/// @brief Convenience overload that computes KV-cache target ranks automatically.
+inline std::vector<size_t> pickSendConnections(size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx,
+    CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks)
+{
+    return pickSendConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks,
+        executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx));
+}
+
+/**
+ * @brief Pick receive connections and their corresponding local rank indices, given a pre-computed TargetRanksInfo.
+ * @return Pair of (pickUpConnections, localRankIndices) where pickUpConnections are indices into counterPartRanks
+ *         and localRankIndices are the corresponding indices into targetInfo.mIRanks.
+ */
+inline std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+    CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+    std::vector<SizeType32> const& counterPartRanks, executor::kv_cache::TargetRanksInfo const& targetInfo)
+{
+    if (targetInfo.mIRanks.empty())
+    {
+        return {{}, {}};
+    }
+
+    auto baseIndices
+        = pickSendConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks, targetInfo);
+
+    if (targetInfo.mPeerDupHeadFactor <= 1)
+    {
+        std::vector<size_t> localRankIndices(baseIndices.size());
+        std::iota(localRankIndices.begin(), localRankIndices.end(), 0);
+        return {baseIndices, localRankIndices};
+    }
+
+    int selfDPRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
+
+    std::vector<size_t> pickUpConnections;
+    std::vector<size_t> localRankIndices;
+    for (int i = 0; i < targetInfo.mDomainTPSize; i++)
+    {
+        if ((i % targetInfo.mPeerDupHeadFactor) == (selfDPRank % targetInfo.mPeerDupHeadFactor))
+        {
+            for (int j = 0; j < targetInfo.mDomainPPSize; j++)
+            {
+                size_t localIdx = (i * targetInfo.mDomainPPSize) + j;
+                pickUpConnections.push_back(baseIndices.at(localIdx));
+                localRankIndices.push_back(localIdx);
+            }
+        }
+    }
+    return {pickUpConnections, localRankIndices};
+}
+
+/// @brief Convenience overload that computes KV-cache target ranks automatically.
+inline std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+    CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+    std::vector<SizeType32> const& counterPartRanks)
+{
+    return pickRecvConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks,
+        executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx));
+}
+
+} // namespace cache_formatter_utils
+} // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, std::optional<LlmRequest const*> llmRequest,
+    BlockKey const& lastBlockKey, SizeType32 indexFromEnd, bool recvSideHasCP = false, SizeType32 ppSize = 1);
 
-class TransferHelper
-{
-public:
-    static void sendBuffer(
-        executor::kv_cache::Connection const& connection, runtime::IBuffer const& buf, uint64_t requestId)
-    {
-        int const tag = ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
-        connection.send(executor::kv_cache::DataContext{tag}, buf.data(), buf.getSizeInBytes());
-    }
+using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using Connection = tensorrt_llm::executor::kv_cache::Connection;
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using BaseKVCacheManager = kv_cache_manager::BaseKVCacheManager;
+using CacheTransBufferManager = kv_cache_manager::CacheTransBufferManager;
+using BlockRange = kv_cache_manager::BlockRange;
 
-    static void recvBuffer(executor::kv_cache::Connection const& connection, runtime::IBuffer& buf, uint64_t requestId)
-    {
-        int const tag = ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
-        connection.recv(executor::kv_cache::DataContext{tag}, buf.data(), buf.getSizeInBytes());
-    }
+BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    bool srcEnableBlockReuse, bool srcEnablePartialReuse, bool recvSideHasCP = false, SizeType32 srcPpSize = 1);
 
-private:
-    static constexpr int32_t kDATA_TAG{43};
-};
-
-// Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
-// parallel topology is completely identical, making it the preferred method.
-class CacheFormatter final : public IOFormatter
+// Used to support the cache transmission with different layouts and different protocols.
+class BaseCacheFormatter
 {
 public:
     using CacheState = executor::kv_cache::CacheState;
 
+    /// @brief Format the cache data into bytes for sending.
+    /// @param session The transfer session.
+    virtual void format(tensorrt_llm::batch_manager::TransferSession& session) = 0;
+
+    /// @brief Unformat the cache data from received bytes.
+    /// @param session The transfer session.
+    virtual void unformat(tensorrt_llm::batch_manager::TransferSession& session) = 0;
+
+    /// @brief Determine whether the sender is applicable to the source and target.
+    /// @param selfConfig Source data arrangement.
+    /// @param destConfig Target data arrangement.
+    /// @return Whether the sender is applicable to the source and target.
+    [[nodiscard]] virtual bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const = 0;
+
+    /// @brief Obtain the indies of the counterparts that need to be actually communicated with.
+    /// @param selfConfig Source data arrangement.
+    /// @param selfIdx The sequential index of the current executor process within the entire parallel group.
+    /// @param destConfig Target data arrangement.
+    /// @return The indies of the counterparts.
+    [[nodiscard]] virtual std::vector<SizeType32> getCounterparts(
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
+        = 0;
+
+    [[nodiscard]] virtual BaseKVCacheManager* getCacheManager() const noexcept = 0;
+
+    /// @brief Pick receive connections and their corresponding local rank indices.
+    /// @return Pair of (pickUpConnections, localRankIndices).
+    [[nodiscard]] virtual std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+        std::vector<SizeType32> const& counterPartRanks) const
+        = 0;
+
+    /// @brief Destructor.
+    virtual ~BaseCacheFormatter() = default;
+};
+
+// Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
+// parallel topology is completely identical, making it the preferred method.
+class CacheFormatter final : public BaseCacheFormatter
+{
+public:
     CacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
         : mCacheManager{cacheManager}
         , mCacheTransBufferManager{cacheTransBufferManager}
@@ -71,13 +244,9 @@ public:
         TLLM_CHECK(mCacheTransBufferManager);
     }
 
-    void formatOutput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager) override;
+    void format(tensorrt_llm::batch_manager::TransferSession& session) override;
 
-    void formatInput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager) override;
+    void unformat(tensorrt_llm::batch_manager::TransferSession& session) override;
 
     [[nodiscard]] bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const override;
 
@@ -87,17 +256,21 @@ public:
         return executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx).mIRanks;
     }
 
-    BaseKVCacheManager* getCacheManager() const noexcept
+    [[nodiscard]] BaseKVCacheManager* getCacheManager() const noexcept override
     {
         return mCacheManager;
     }
 
+    [[nodiscard]] std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+        std::vector<SizeType32> const& counterPartRanks) const override;
+
 private:
-    BaseKVCacheManager* mCacheManager{};
-
+    BaseKVCacheManager* mCacheManager;
     CacheTransBufferManager* mCacheTransBufferManager;
-
-    KvCacheMeasureHelper kvCacheMeasureHelper{common::getEnvKVCacheTransferOutputPath()};
 };
+
+std::unique_ptr<BaseCacheFormatter> createCacheFormatter(BaseKVCacheManager* cacheManager,
+    std::vector<CacheTransBufferManager*> const& cacheTransBufferManagers, bool isMLA = false);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

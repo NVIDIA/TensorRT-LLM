@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -73,29 +78,33 @@ struct Fused_multihead_attention_params_v1
 
 struct Fused_multihead_attention_params_v2
 {
-    // The QKV matrices.
+    // The packed QKV matrices.
     void* qkv_ptr;
     // The separate Q matrice.
     void* q_ptr;
-    // The separate KV matrice.
+    // The separate K matrice.
+    void* k_ptr;
+    // The separate V matrice.
+    void* v_ptr;
+    // The separate KV matrice (contiguous KV).
     void* kv_ptr;
     // The separate paged kv cache.
     fmha::Kv_block_array paged_kv_cache;
     // The mask to implement drop-out.
     void* packed_mask_ptr;
+    // The attention sinks (per head).
+    float* attention_sinks;
     // The O matrix (output).
     void* o_ptr;
     // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
     void* softmax_stats_ptr;
 
-    // The stride between rows of the Q, K and V matrices.
-    int64_t qkv_stride_in_bytes;
-    // The stride between rows of the separate Q matrice.
+    // The stride between rows of Q.
     int64_t q_stride_in_bytes;
-    // The stride between rows of the separate KV matrice.
-    int64_t kv_stride_in_bytes;
-    // The stride between rows of the separate V matrice, set if it is not same as that of K.
-    int64_t v_stride_in_bytes = 0;
+    // The stride between rows of K.
+    int64_t k_stride_in_bytes;
+    // The stride between rows of V.
+    int64_t v_stride_in_bytes;
     // The stride between matrices of packed mask.
     int64_t packed_mask_stride_in_bytes;
     // The stride between rows of O.
@@ -110,7 +119,8 @@ struct Fused_multihead_attention_params_v2
     // Kv in packed qkv layout: [B, S, 3, H, D]
     // Contiguous kv layout: [B, 2, H, S, D].
     // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
-    fmha::cudaTmaDesc tma_desc_kv;
+    fmha::cudaTmaDesc tma_desc_k;
+    fmha::cudaTmaDesc tma_desc_v;
     // Tma descriptor for o
     fmha::cudaTmaDesc tma_desc_o;
 
@@ -167,4 +177,13 @@ struct Fused_multihead_attention_params_v2
             float* scales;
         } q, k, v;
     } sage;
+
+    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
+    // A positive value means skip-softmax is enabled.
+    float skip_softmax_threshold_scale_factor = 0;
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skip_softmax_total_blocks;
+    uint32_t* skip_softmax_skipped_blocks;
+#endif
 };

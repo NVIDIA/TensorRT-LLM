@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
@@ -35,13 +36,15 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::speculative_decoding
 {
 template <int32_t BLOCK_SIZE>
 __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
     SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, runtime::SizeType32 const* seqSlots, SizeType32 batchSize, SizeType32 engineBatchSize,
-    SizeType32 numPaths, SizeType32 maxPathLen, bool isPathsSeqSlotIdx)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 engineBatchSize, SizeType32 numPaths,
+    SizeType32 maxPathLen, bool isPathsSeqSlotIdx)
 {
     // Specialize BlockScan for a 1D block of 128 threads of type int
     typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
@@ -81,22 +84,7 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
         }
         __syncthreads();
 
-        int32_t pathBatchIdx{batchSlot};
-        if (isPathsSeqSlotIdx)
-        {
-            // If paths tensor is the tensor arranged according to seq slot,
-            // we must find the position of the batchSlots index in the seq slot array.
-            // TODO optimize it.
-            for (int bi = 0; bi < batchSize; ++bi)
-            {
-                auto const seqSlot = seqSlots[bi];
-                if (batchSlot == seqSlot)
-                {
-                    pathBatchIdx = bi;
-                    break;
-                }
-            }
-        }
+        auto const pathBatchIdx = isPathsSeqSlotIdx ? bi : batchSlot;
 
         if (valid)
         {
@@ -117,13 +105,12 @@ __global__ void packAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32*
 
 void invokePackAcceptedPaths(SizeType32* acceptedLengthsCumSum, SizeType32* pathsOffsets,
     SizeType32 const* acceptedLengths, SizeType32 const* bestPathIds, SizeType32 const* paths,
-    SizeType32 const* batchSlots, runtime::SizeType32 const* seqSlots, SizeType32 batchSize, SizeType32 engineBatchSize,
-    SizeType32 numPaths, SizeType32 maxPathLen, bool isPathsLinearBatchIdx, cudaStream_t stream)
+    SizeType32 const* batchSlots, SizeType32 batchSize, SizeType32 engineBatchSize, SizeType32 numPaths,
+    SizeType32 maxPathLen, bool isPathsSeqSlotIdx, cudaStream_t stream)
 {
     constexpr SizeType32 BLOCK_SIZE = 1024;
     packAcceptedPaths<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(acceptedLengthsCumSum, pathsOffsets, acceptedLengths,
-        bestPathIds, paths, batchSlots, seqSlots, batchSize, engineBatchSize, numPaths, maxPathLen,
-        isPathsLinearBatchIdx);
+        bestPathIds, paths, batchSlots, batchSize, engineBatchSize, numPaths, maxPathLen, isPathsSeqSlotIdx);
 }
 
 namespace
@@ -501,4 +488,6 @@ template size_t getTypicalAcceptanceWorkspaceSize<float>(
 template size_t getTypicalAcceptanceWorkspaceSize<half>(
     SizeType32 batchSize, SizeType32 maxDecodingTokens, SizeType32 vocabSizePadded);
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+
+TRTLLM_NAMESPACE_END

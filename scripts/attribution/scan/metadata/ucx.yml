@@ -1,0 +1,5 @@
+name: ucx
+description: Unified Communication X - an optimized communication library
+source: container
+directory_matches:
+- /opt/hpcx/ucx

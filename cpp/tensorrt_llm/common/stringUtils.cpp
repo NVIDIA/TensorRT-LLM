@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <cerrno>
 #include <cstdarg>
@@ -23,7 +24,9 @@
 #include <iostream>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args)
@@ -34,6 +37,8 @@ void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list a
     size_t constexpr init_size = 2048;
     char fixed_buffer[init_size];
     auto const size = std::vsnprintf(fixed_buffer, init_size, format, args0);
+    va_end(args0);
+
     TLLM_CHECK_WITH_INFO(size >= 0, std::string(std::strerror(errno)));
     if (size == 0)
     {
@@ -71,4 +76,6 @@ std::unordered_set<std::string> str2set(std::string const& input, char delimiter
     return values;
 };
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

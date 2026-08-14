@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -478,7 +483,7 @@ struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3>
     inline __device__ bool is_valid(int row, int col) const
     {
         // Is it a valid position in the sequence, i.e. are we in the lower triangle?
-        return (row >= col) && (col >= max(0, row - sliding_window_size_));
+        return (row >= col) && (col >= max(0, row + 1 - sliding_window_size_));
     }
 
     // The sliding window size.
@@ -487,9 +492,62 @@ struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Assume we only pay attention to bidirectional sliding-window-size long sequence.
+// v v v x x x x x x
+// v v v v x x x x x
+// v v v v v x x x x
+// x v v v v v x x x
+// x v v v v v x x x
+// x x v v v v v x x
+// x x x v v v v v x
+// x x x x v v v v v
+// x x x x x v v v v
+// x x x x x x v v v
+
+template <typename Traits, typename Cta_tile>
+struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 4>
+{
+    // V5 mask is the bidirectional sliding window mask.
+    using Base = Mask<Traits, Cta_tile, 4>;
+
+    // The shape of the MMA tile.
+    using Mma_tile = typename Base::Mma_tile;
+
+    // Ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , seqlen_(block_info.actual_seqlen)
+    {
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
+        int row, col;
+        this->get_row_col(row, col, mi, ni, ii, jj);
+
+        // Is it a valid position in the sequence?
+        return is_valid(row, col);
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int row, int col) const
+    {
+        // Is it a valid position in the sequence, i.e. are we in the lower triangle?
+        return (col >= max(0, row - Base::sliding_window_size_ / 2))
+            && (col <= min(seqlen_ - 1, row + Base::sliding_window_size_ / 2));
+    }
+
+    // The sequence length.
+    int seqlen_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // The custom mask (from global memory).
 template <typename Traits, typename Cta_tile>
-struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 3>
+struct Mask<Traits, Cta_tile, 6> : public Mask<Traits, Cta_tile, 3>
 {
 
     using Base = Mask<Traits, Cta_tile, 3>;
@@ -946,11 +1004,51 @@ struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3
     inline __device__ bool is_valid(int row, int col) const
     {
         // Is it a valid position in the sequence?
-        return col <= row && col >= max(0, row - sliding_window_size_);
+        return col <= row && col >= max(0, row + 1 - sliding_window_size_);
     }
 
     // The sliding window size for attention.
     int sliding_window_size_;
+};
+
+template <typename Traits, typename Cta_tile>
+struct Mask_hopper<Traits, Cta_tile, 5> : public Mask_hopper<Traits, Cta_tile, 4>
+{
+
+    // V5 mask is the bidirectional sliding window mask.
+    using Base = Mask_hopper<Traits, Cta_tile, 4>;
+
+    // The shape of the MMA tile.
+    using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
+
+    // Ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Mask_hopper(Params const& params, Block_info const& block_info, int tidx)
+        : Base(params, block_info, tidx)
+        , seqlen_(block_info.actual_seqlen)
+    {
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const
+    {
+        int row, col;
+        this->get_row_col(row, col, mi, ni, ii, jj);
+
+        // Is it a valid position in the sequence?
+        return is_valid(row, col);
+    }
+
+    // Is a given position valid?
+    inline __device__ bool is_valid(int row, int col) const
+    {
+        // Is it a valid position in the sequence?
+        return col >= max(0, row - Base::sliding_window_size_ / 2)
+            && col <= min(seqlen_ - 1, row + Base::sliding_window_size_ / 2);
+    }
+
+    // The sequence length.
+    int seqlen_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

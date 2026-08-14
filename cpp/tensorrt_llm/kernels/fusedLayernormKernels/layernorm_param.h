@@ -16,10 +16,13 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 template <typename T>
@@ -34,6 +37,7 @@ struct GeneralFP4AddBiasResidualPreLayerNormParam
     T const* bias = nullptr;
     T const* gamma = nullptr;
     T const* beta = nullptr;
+    T* high_precision_normed_output = nullptr;
 
     int m;
     int n;
@@ -41,4 +45,6 @@ struct GeneralFP4AddBiasResidualPreLayerNormParam
     cudaStream_t stream;
 };
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

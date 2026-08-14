@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,9 @@
 #include "nixl.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -30,22 +33,43 @@ struct NixlHelper
     [[nodiscard]] static nixl_mem_t convert(MemoryType type);
     [[nodiscard]] static nixlBasicDesc convert(MemoryDesc const& desc);
     [[nodiscard]] static nixl_reg_dlist_t convertRegDlist(RegisterDescs const& descs);
+    [[nodiscard]] static nixl_reg_dlist_t convertRegDlist(FileDescs const& descs);
     [[nodiscard]] static nixl_xfer_op_t convert(TransferOp const& op);
     [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(TransferDescs const& descs);
+    [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(FileDescs const& descs);
+    static void posixGpuToFileFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
+    static void posixFileToGpuFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
 };
 
 class NixlTransferStatus final : public TransferStatus
 {
 public:
-    NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle);
+    NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle);
+    ~NixlTransferStatus() noexcept override;
+
+    NixlTransferStatus(NixlTransferStatus const&) = delete;
+    NixlTransferStatus& operator=(NixlTransferStatus const&) = delete;
+    NixlTransferStatus(NixlTransferStatus&&) = delete;
+    NixlTransferStatus& operator=(NixlTransferStatus&&) = delete;
 
     [[nodiscard]] bool isCompleted() const override;
 
-    void wait() const override;
+    [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
+
+    [[nodiscard]] int getLastStatus() const noexcept;
+    [[nodiscard]] std::string getLastStatusStr() const;
+
+    [[nodiscard]] bool release() override;
 
 private:
-    nixlAgent* mRawAgent{};
+    [[nodiscard]] nixl_status_t queryStatus() const;
+
+    // weak_ptr so the status outliving the owning agent is safe (lock() returns null after reset).
+    std::weak_ptr<nixlAgent> mWeakAgent;
     nixlXferReqH* mHandle{};
+    mutable std::atomic<int> mLastStatus{0};
+    bool const mSynchronizeHandleAccess;
+    mutable std::mutex mHandleMutex;
 };
 
 class NixlTransferAgent final : public BaseTransferAgent
@@ -53,6 +77,9 @@ class NixlTransferAgent final : public BaseTransferAgent
 public:
     NixlTransferAgent(BaseAgentConfig const& config);
     ~NixlTransferAgent();
+
+    /// Synchronously release NIXL agent / UCX / prog_thread. Idempotent.
+    void shutdown() noexcept;
 
     void registerMemory(RegisterDescs const& descs) override;
 
@@ -80,21 +107,62 @@ public:
 
     [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> getNotifiedSyncMessages() override;
 
-    ConnectionInfoType getConnectionInfo() override;
+    ConnectionInfoType getLocalConnectionInfo() override;
 
-    void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
+    void loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
 
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
 private:
-    std::unique_ptr<nixlAgent> mRawAgent;
+    // shared_ptr so outstanding NixlTransferStatus (via weak_ptr) can detect agent reset.
+    std::shared_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};
     nixl_opt_args_t mExtraParams;
     std::string mName;
     std::string mAddress;
+    int mRank{0};
+    int mWorldSize{1};
+    std::atomic<bool> mShutdown{false};
 
-    std::vector<char> mDRamSrcBuffer;
-    std::vector<char> mDRamDstBuffer;
+    /// Serializes (a) wrapper-map mutations vs reads and (b) drain-on-shutdown.
+    /// Writers (register/deregister/load/invalidate/shutdown) take unique_lock;
+    /// readers (submit / getLocalAgentDesc / checkRemoteDescs / etc.) take shared_lock.
+    mutable std::shared_mutex mLock;
+
+    /// Local VMM region info (from registerMemory). Keyed by local virtual address.
+    VramRegionMap mLocalVramRegionInfo;
+
+    /// Remote VMM region info (from loadRemoteAgent). Keyed by {agentName → {addr → info}}.
+    /// Per-agent maps because different remote agents may have overlapping virtual addresses.
+    std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
+};
+
+class NixlLoopbackAgent final : public BaseLoopbackAgent
+{
+public:
+    NixlLoopbackAgent(BaseAgentConfig const& config);
+    ~NixlLoopbackAgent() override;
+
+    /// Synchronously release the NIXL agent. Idempotent; drains in-flight requests.
+    void shutdown() noexcept;
+
+    virtual void executeLoopbackRequest(
+        MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) override;
+
+private:
+    int registerMemory(MemoryDescs const& descs);
+    int deregisterMemory(MemoryDescs const& descs);
+    int registerFiles(FileDescs const& descs);
+    int deregisterFiles(FileDescs const& descs);
+
+    [[nodiscard]] std::unique_ptr<TransferStatus> submitLoopbackRequests(
+        MemoryDescs const& memoryDescs, FileDescs const& filedescs, bool isOffload);
+
+    std::shared_ptr<nixlAgent> mRawAgent;
+    std::string mName;
+    std::atomic<bool> mShutdown{false};
+    /// Drain-on-shutdown: executeLoopbackRequest takes shared_lock; shutdown takes unique_lock.
+    mutable std::shared_mutex mLock;
 };
 
 #if defined(__clang__)
@@ -105,6 +173,11 @@ private:
 extern "C"
 {
     [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(BaseAgentConfig const* config);
+}
+
+extern "C"
+{
+    [[nodiscard]] std::shared_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config);
 }
 
 #if defined(__clang__)

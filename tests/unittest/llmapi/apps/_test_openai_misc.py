@@ -10,40 +10,56 @@ from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 
-@pytest.fixture(scope="module")
-def model_name():
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-
-
-@pytest.fixture(scope="module", params=[None, 'pytorch'])
-def backend(request):
+@pytest.fixture(scope="module",
+                params=[("pytorch", False), ("pytorch", True)],
+                ids=lambda p: f"{p[0]}-{'with' if p[1] else 'no'}_beam_search")
+def backend_and_beam_search(request):
     return request.param
 
 
-@pytest.fixture(scope="module", params=['8'])
+@pytest.fixture(scope="module")
+def backend(backend_and_beam_search):
+    return backend_and_beam_search[0]
+
+
+@pytest.fixture(scope="module")
+def enable_beam_search(backend_and_beam_search):
+    return backend_and_beam_search[1]
+
+
+@pytest.fixture(scope="module")
+def model_name(backend):
+    return "Qwen3/Qwen3-0.6B-Base"
+
+
+@pytest.fixture(scope="module", params=["8"])
 def max_batch_size(request):
     return request.param
 
 
-@pytest.fixture(scope="module", params=['80000'])
+@pytest.fixture(scope="module")
+def max_beam_width(enable_beam_search):
+    return 4 if enable_beam_search else 1
+
+
+# Note: In the model Qwen3-0.6B-Base, "max_position_embeddings" is 32768,
+# so the inferred max_seq_len is 32768.
+@pytest.fixture(scope="module", params=["32768"])
 def max_seq_len(request):
     return request.param
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str, max_batch_size: str,
-           max_seq_len: str):
+def server(model_name: str, backend: str, max_batch_size: str, max_seq_len: str,
+           enable_beam_search: bool, max_beam_width: int):
     model_path = get_model_path(model_name)
-    args = ["--max_beam_width", "4"]
-    if backend is not None:
-        args.append("--backend")
-        args.append(backend)
+    args = ["--backend", f"{backend}"]
+    if enable_beam_search:
+        args.extend(["--max_beam_width", str(max_beam_width)])
     if max_batch_size is not None:
-        args.append("--max_batch_size")
-        args.append(max_batch_size)
+        args.extend(["--max_batch_size", max_batch_size])
     if max_seq_len is not None:
-        args.append("--max_seq_len")
-        args.append(max_seq_len)
+        args.extend(["--max_seq_len", max_seq_len])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -77,24 +93,64 @@ def test_model(client: openai.OpenAI, model_name: str):
     assert model.id == model_name.split('/')[-1]
 
 
+def test_tokenize(server: RemoteOpenAIServer):
+    tokenize_url = server.url_for("_internal", "tokenize")
+
+    # prompt path: encode raw text directly.
+    prompt_resp = requests.post(tokenize_url, json={"prompt": "Hello, world!"})
+    assert prompt_resp.status_code == 200
+    prompt_body = prompt_resp.json()
+    assert prompt_body["count"] == len(prompt_body["tokens"]) > 0
+
+    # prompt is required; an empty body fails request-model validation. The
+    # server's RequestValidationError handler renders that as 400 (not the
+    # FastAPI default 422) to match the shared {"error": ...} envelope.
+    assert requests.post(tokenize_url, json={}).status_code == 400
+
+
+@pytest.mark.parametrize("use_beam_search", [False, True])
 # reference: https://github.com/vllm-project/vllm/blob/44f990515b124272f87954fc763d90697d8aa1db/tests/entrypoints/openai/test_basic.py#L123
 @pytest.mark.asyncio
-async def test_request_cancellation(server: RemoteOpenAIServer,
-                                    model_name: str):
+async def test_request_cancellation(server: RemoteOpenAIServer, model_name: str,
+                                    use_beam_search: bool,
+                                    enable_beam_search: bool, backend: str,
+                                    max_beam_width: int):
+    if backend == "pytorch" and use_beam_search != enable_beam_search:
+        pytest.skip("PyTorch backend fixes beam width on startup")
+
+    beam_search_args = {}
+    if use_beam_search:
+        beam_search_args = dict(
+            use_beam_search=True,
+            n=1,
+            best_of=max_beam_width,
+        )
+
     # clunky test: send an ungodly amount of load in with short timeouts
     # then ensure that it still responds quickly afterwards
-    pytest.skip("https://nvbugs/5310314")
-
     chat_input = [{"role": "user", "content": "Write a long story"}]
+
+    # Warmup
+    client = server.get_async_client()
+    response = await client.chat.completions.create(messages=chat_input,
+                                                    model=model_name,
+                                                    max_tokens=10000,
+                                                    extra_body=beam_search_args)
+
     client = server.get_async_client(timeout=0.5, max_retries=3)
     tasks = []
     # Request about 2 million tokens
     for _ in range(200):
         task = asyncio.create_task(
-            client.chat.completions.create(messages=chat_input,
-                                           model=model_name,
-                                           max_tokens=10000,
-                                           extra_body={"min_tokens": 10000}))
+            client.chat.completions.create(
+                messages=chat_input,
+                model=model_name,
+                max_tokens=10000,
+                extra_body={
+                    "min_tokens": 10000,
+                    **beam_search_args,
+                },
+            ))
         tasks.append(task)
 
     done, pending = await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
@@ -112,6 +168,7 @@ async def test_request_cancellation(server: RemoteOpenAIServer,
     client = server.get_async_client(timeout=5)
     response = await client.chat.completions.create(messages=chat_input,
                                                     model=model_name,
-                                                    max_tokens=10)
+                                                    max_tokens=10,
+                                                    extra_body=beam_search_args)
 
     assert len(response.choices) == 1

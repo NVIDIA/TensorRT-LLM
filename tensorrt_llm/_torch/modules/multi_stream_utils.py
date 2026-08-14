@@ -1,8 +1,35 @@
+import threading
+from contextlib import contextmanager
 from typing import Any, Callable, Optional
 
 import torch
 
-from ..pyexecutor.cuda_graph_runner import is_graph_capturing
+
+class do_multi_stream_local(threading.local):
+
+    def __init__(self):
+        self.do_multi_stream = False
+
+
+_local = do_multi_stream_local()
+
+
+def set_do_multi_stream(enable: bool):
+    _local.do_multi_stream = enable
+
+
+def do_multi_stream() -> bool:
+    return _local.do_multi_stream
+
+
+@contextmanager
+def with_multi_stream(enable: bool):
+    prev_do_multi_stream = _local.do_multi_stream
+    set_do_multi_stream(enable)
+    try:
+        yield
+    finally:
+        set_do_multi_stream(prev_do_multi_stream)
 
 
 def maybe_execute_in_parallel(
@@ -10,7 +37,8 @@ def maybe_execute_in_parallel(
         fn1: Callable,
         event0: torch.cuda.Event,
         event1: torch.cuda.Event,
-        aux_stream: Optional[torch.cuda.Stream] = None) -> tuple[Any, Any]:
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        disable_on_compile: bool = False) -> tuple[Any, Any]:
     """Utility function to run two functions in two cuda streams in parallel. Multi-stream is
     only enabled when cuda graph is turned on because switch stream has extra host overhead.
 
@@ -25,14 +53,20 @@ def maybe_execute_in_parallel(
         event1 (torch.cuda.Event): cuda event for fn1
         aux_stream (Optional[torch.cuda.Stream]): the second cuda stream for fn1.
             Multi-stream is disabled when aux_stream is None.
+        disable_on_compile (bool): if True, disable multi-stream when
+            torch.compile is tracing. Callers that are not inside a custom op
+            should set this to True so that stream/event ops are not captured
+            by dynamo. Callers inside custom ops (e.g. attention, MoE) should
+            leave this as False since custom ops are opaque to the compiler.
 
     Returns:
         tuple[Any, Any]: the return values of fn0() and fn1()
     """
 
-    do_multi_stream = is_graph_capturing() and aux_stream is not None
+    multi_stream = (do_multi_stream() and aux_stream is not None and
+                    not (disable_on_compile and torch.compiler.is_compiling()))
 
-    if do_multi_stream:
+    if multi_stream:
         event0.record()
         result0 = fn0()
 

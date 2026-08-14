@@ -15,16 +15,20 @@
  */
 
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/decodingKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/externalDraftTokensKernels.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/medusaDecodingKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
+#include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 
 #include <curand_kernel.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstring>
 #include <random>
 #include <unordered_set>
 
@@ -213,13 +217,15 @@ public:
 
         srcBeams.empty(*mBufferManager);
         srcBeams.reshape(batchSize, beamWidth, maxSeqLen);
-        mSrcCumLogProbs = mBufferManager->gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kFLOAT);
+        mSrcCumLogProbs
+            = mBufferManager->gpu(ITensor::makeShape({batchSize, beamWidth}), tensorrt_llm::DataType::kFLOAT);
 
         setBuffers(srcBeams, mSrcCumLogProbs, 2);
 
         dstBeams.empty(*mBufferManager);
         dstBeams.reshape(batchSize, beamWidth, maxSeqLen);
-        mDstCumLogProbs = mBufferManager->gpu(ITensor::makeShape({batchSize, beamWidth}), nvinfer1::DataType::kFLOAT);
+        mDstCumLogProbs
+            = mBufferManager->gpu(ITensor::makeShape({batchSize, beamWidth}), tensorrt_llm::DataType::kFLOAT);
 
         setBuffers(dstBeams, mDstCumLogProbs, 1);
     }
@@ -284,6 +290,190 @@ TEST_F(TestBeamHypothesesCopy, SingleBatchTest)
     checkAllEqual();
 }
 
+void runFinalizeKeepsPromptPrefixFromUnfinishedIds(SizeType32 beamWidth)
+{
+    SizeType32 constexpr batchSize{2};
+    SizeType32 constexpr maxSeqLen{9};
+    auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
+    auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
+    auto constexpr nvFloatType = TRTDataType<float>::value;
+    auto constexpr nvBoolType = TRTDataType<bool>::value;
+
+    auto stream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
+    auto bufferManager = std::make_shared<tensorrt_llm::runtime::BufferManager>(stream);
+
+    auto const idsShape = ITensor::makeShape({batchSize, beamWidth, maxSeqLen});
+    auto const cbaShape = ITensor::makeShape({batchSize, beamWidth * 2, maxSeqLen});
+    auto const beamShape = ITensor::makeShape({batchSize, beamWidth});
+    auto const cbaBeamShape = ITensor::makeShape({batchSize, beamWidth * 2});
+
+    auto outputIds = bufferManager->gpu(idsShape, nvTokenIdType);
+    auto outputIdsUnfinish = bufferManager->gpu(idsShape, nvTokenIdType);
+    auto parentIdsUnfinish = bufferManager->gpu(idsShape, nvSizeType);
+    auto outputIdsCBA = bufferManager->gpu(cbaShape, nvTokenIdType);
+    auto sequenceLengths = bufferManager->gpu(beamShape, nvSizeType);
+    auto inputLengths = bufferManager->gpu(beamShape, nvSizeType);
+    auto cumLogProbs = bufferManager->gpu(beamShape, nvFloatType);
+    auto sequenceLengthsCBA = bufferManager->gpu(cbaBeamShape, nvSizeType);
+    auto cumLogProbsCBA = bufferManager->gpu(cbaBeamShape, nvFloatType);
+    auto normedScoresCBA = bufferManager->gpu(cbaBeamShape, nvFloatType);
+    auto numBeamsCBA = bufferManager->gpu(ITensor::makeShape({batchSize}), nvSizeType);
+    auto batchDones = bufferManager->gpu(ITensor::makeShape({batchSize}), nvBoolType);
+    auto lengthPenalties = bufferManager->gpu(ITensor::makeShape({batchSize}), nvFloatType);
+
+    std::vector<TokenIdType> outputIdsHost(batchSize * beamWidth * maxSeqLen, 0);
+    std::vector<TokenIdType> outputIdsUnfinishHost(batchSize * beamWidth * maxSeqLen, -1);
+    std::vector<SizeType32> parentIdsUnfinishHost(batchSize * beamWidth * maxSeqLen, 0);
+    std::vector<TokenIdType> outputIdsCBAHost(batchSize * beamWidth * 2 * maxSeqLen, -777);
+    std::vector<SizeType32> sequenceLengthsHost(batchSize * beamWidth, 0);
+    std::vector<SizeType32> inputLengthsHost(batchSize * beamWidth, 0);
+    std::vector<float> cumLogProbsHost(batchSize * beamWidth, 0.0f);
+    std::vector<SizeType32> sequenceLengthsCBAHost(batchSize * beamWidth * 2, 0);
+    std::vector<float> cumLogProbsCBAHost(batchSize * beamWidth * 2, -100.0f);
+    std::vector<float> normedScoresCBAHost(batchSize * beamWidth * 2, -100.0f);
+    std::vector<SizeType32> numBeamsCBAHost(batchSize, beamWidth);
+    bool batchDonesHost[batchSize] = {false, false};
+    float lengthPenaltiesHost[batchSize] = {0.0f, 0.0f};
+
+    auto promptToken = [](SizeType32 batchIdx, SizeType32 pos) -> TokenIdType
+    { return static_cast<TokenIdType>((batchIdx + 1) * 100 + pos); };
+    auto unfinishedToken = [](SizeType32 batchIdx, SizeType32 beamIdx, SizeType32 pos) -> TokenIdType
+    { return static_cast<TokenIdType>(1000 + batchIdx * 100 + beamIdx * 10 + pos); };
+    auto cbaToken = [](SizeType32 batchIdx, SizeType32 cbaIdx, SizeType32 pos) -> TokenIdType
+    { return static_cast<TokenIdType>(3000 + batchIdx * 100 + cbaIdx * 10 + pos); };
+    auto inputLengthForBatch = [](SizeType32 batchIdx) -> SizeType32 { return batchIdx == 0 ? 3 : 5; };
+    auto sequenceLengthForBatch = [](SizeType32 batchIdx) -> SizeType32 { return batchIdx == 0 ? 7 : 8; };
+
+    for (SizeType32 batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        SizeType32 const inputLength = inputLengthForBatch(batchIdx);
+        SizeType32 const sequenceLength = sequenceLengthForBatch(batchIdx);
+        SizeType32 const idsBatchOffset = batchIdx * beamWidth * maxSeqLen;
+        SizeType32 const cbaBatchOffset = batchIdx * beamWidth * 2 * maxSeqLen;
+        SizeType32 const cbaBeamOffset = batchIdx * beamWidth * 2;
+
+        for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        {
+            SizeType32 const beamOffset = idsBatchOffset + beamIdx * maxSeqLen;
+            inputLengthsHost[batchIdx * beamWidth + beamIdx] = inputLength;
+            sequenceLengthsHost[batchIdx * beamWidth + beamIdx] = sequenceLength;
+            cumLogProbsHost[batchIdx * beamWidth + beamIdx]
+                = beamWidth == 1 ? 12.0f : (beamIdx == 1 ? 12.0f : 5.0f + beamIdx * 3.0f);
+
+            for (SizeType32 pos = 0; pos < sequenceLength; ++pos)
+            {
+                outputIdsUnfinishHost[beamOffset + pos]
+                    = pos < inputLength ? promptToken(batchIdx, pos) : unfinishedToken(batchIdx, beamIdx, pos);
+                parentIdsUnfinishHost[beamOffset + pos] = beamIdx;
+            }
+        }
+
+        for (SizeType32 cbaIdx = 0; cbaIdx < beamWidth; ++cbaIdx)
+        {
+            sequenceLengthsCBAHost[cbaBeamOffset + cbaIdx] = sequenceLength;
+            normedScoresCBAHost[cbaBeamOffset + cbaIdx]
+                = beamWidth == 1 ? 10.0f : (cbaIdx == 1 ? 10.0f : 1.0f - cbaIdx * 2.0f);
+            cumLogProbsCBAHost[cbaBeamOffset + cbaIdx] = normedScoresCBAHost[cbaBeamOffset + cbaIdx];
+            for (SizeType32 pos = inputLength; pos < sequenceLength; ++pos)
+            {
+                outputIdsCBAHost[cbaBatchOffset + cbaIdx * maxSeqLen + pos] = cbaToken(batchIdx, cbaIdx, pos);
+            }
+        }
+    }
+
+    bufferManager->copy(outputIdsHost.data(), *outputIds);
+    bufferManager->copy(outputIdsUnfinishHost.data(), *outputIdsUnfinish);
+    bufferManager->copy(parentIdsUnfinishHost.data(), *parentIdsUnfinish);
+    bufferManager->copy(outputIdsCBAHost.data(), *outputIdsCBA);
+    bufferManager->copy(sequenceLengthsHost.data(), *sequenceLengths);
+    bufferManager->copy(inputLengthsHost.data(), *inputLengths);
+    bufferManager->copy(cumLogProbsHost.data(), *cumLogProbs);
+    bufferManager->copy(sequenceLengthsCBAHost.data(), *sequenceLengthsCBA);
+    bufferManager->copy(cumLogProbsCBAHost.data(), *cumLogProbsCBA);
+    bufferManager->copy(normedScoresCBAHost.data(), *normedScoresCBA);
+    bufferManager->copy(numBeamsCBAHost.data(), *numBeamsCBA);
+    bufferManager->copy(batchDonesHost, *batchDones);
+    bufferManager->copy(lengthPenaltiesHost, *lengthPenalties);
+    stream->synchronize();
+
+    tk::BeamHypotheses bh;
+    bh.nMaxBatchSize = batchSize;
+    bh.nBatchSize = batchSize;
+    bh.nBeamWidth = beamWidth;
+    bh.nMaxSeqLen = maxSeqLen;
+    bh.lengthPenalties = bufferCast<float>(*lengthPenalties);
+    bh.inputLengths = bufferCast<SizeType32>(*inputLengths);
+    bh.outputIds = bufferCast<TokenIdType>(*outputIds);
+    bh.sequenceLengths = bufferCast<SizeType32>(*sequenceLengths);
+    bh.cumLogProbs = bufferCast<float>(*cumLogProbs);
+    bh.outputIdsCBA = bufferCast<TokenIdType>(*outputIdsCBA);
+    bh.sequenceLengthsCBA = bufferCast<SizeType32>(*sequenceLengthsCBA);
+    bh.cumLogProbsCBA = bufferCast<float>(*cumLogProbsCBA);
+    bh.normedScoresCBA = bufferCast<float>(*normedScoresCBA);
+    bh.numBeamsCBA = bufferCast<SizeType32>(*numBeamsCBA);
+    bh.batchDones = bufferCast<bool>(*batchDones);
+    bh.outputIdsUnfinish = bufferCast<TokenIdType>(*outputIdsUnfinish);
+    bh.parentIdsUnfinish = bufferCast<SizeType32>(*parentIdsUnfinish);
+
+    tk::invokeInsertUnfinishedPath(bh, stream->get());
+    tk::invokeFinalize(bh, stream->get());
+    stream->synchronize();
+
+    auto outputIdsResult = bufferManager->copyFrom(*outputIds, MemoryType::kCPU);
+    auto sequenceLengthsResult = bufferManager->copyFrom(*sequenceLengths, MemoryType::kCPU);
+    stream->synchronize();
+    auto const outputIdsPtr = bufferCast<TokenIdType>(*outputIdsResult);
+    auto const sequenceLengthsPtr = bufferCast<SizeType32>(*sequenceLengthsResult);
+
+    for (SizeType32 batchIdx = 0; batchIdx < batchSize; ++batchIdx)
+    {
+        SizeType32 const inputLength = inputLengthForBatch(batchIdx);
+        SizeType32 const sequenceLength = sequenceLengthForBatch(batchIdx);
+        for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
+        {
+            EXPECT_EQ(sequenceLengthsPtr[batchIdx * beamWidth + beamIdx], sequenceLength);
+            SizeType32 selectedCbaIdx = 0;
+            if (beamWidth == 1)
+            {
+                selectedCbaIdx = 1;
+            }
+            else
+            {
+                selectedCbaIdx = beamIdx == 0 ? 4 : (beamIdx == 1 ? 5 : 1);
+            }
+
+            for (SizeType32 pos = 0; pos < sequenceLength; ++pos)
+            {
+                TokenIdType expected = promptToken(batchIdx, pos);
+                if (pos >= inputLength)
+                {
+                    if (selectedCbaIdx >= beamWidth)
+                    {
+                        expected = unfinishedToken(batchIdx, selectedCbaIdx - beamWidth, pos);
+                    }
+                    else
+                    {
+                        expected = cbaToken(batchIdx, selectedCbaIdx, pos);
+                    }
+                }
+                SizeType32 const dst = batchIdx * beamWidth * maxSeqLen + beamIdx * maxSeqLen + pos;
+                EXPECT_EQ(outputIdsPtr[dst], expected)
+                    << "batchIdx=" << batchIdx << ", beamIdx=" << beamIdx << ", pos=" << pos;
+            }
+        }
+    }
+}
+
+TEST(BeamHypothesesFinalizeTest, KeepsPromptPrefixFromUnfinishedIds)
+{
+    runFinalizeKeepsPromptPrefixFromUnfinishedIds(3);
+}
+
+TEST(BeamHypothesesFinalizeTest, KeepsPromptPrefixFromUnfinishedIdsBeamWidthOne)
+{
+    runFinalizeKeepsPromptPrefixFromUnfinishedIds(1);
+}
+
 /**
  * @brief Fills a slice of a tensor with data from a source array.
  *
@@ -317,6 +507,8 @@ void fillTensorAtIndex(ITensor::SharedPtr tensor, SizeType32 idx, std::vector<T>
     bufferManager->copy(src.data(), *target);
 }
 
+} // anonymous namespace
+
 class TestGatherTree : public ::testing::Test
 {
 public:
@@ -326,20 +518,14 @@ public:
 
     using TensorPtr = ITensor::SharedPtr;
 
-    using DecodingOutputPtr = std::unique_ptr<DecodingOutput>;
-    DecodingOutputPtr decodingOutput{nullptr};
-
-    SamplingConfig samplingConfig = SamplingConfig();
-
     std::shared_ptr<tensorrt_llm::runtime::CudaStream> mStream{nullptr};
     std::shared_ptr<tensorrt_llm::runtime::BufferManager> mBufferManager{nullptr};
 
+    std::unique_ptr<tensorrt_llm::runtime::decoder::DecoderState> mDecodingState{nullptr};
+
     SamplingConfig mSamplingConfig;
 
-    using DecodingInputPtr = std::unique_ptr<DecodingInput>;
-    DecodingInputPtr decodingInput{nullptr};
-
-    TensorPtr targetOut{nullptr};
+    TensorPtr mTargetOut{nullptr};
 
     void SetUp() override
     {
@@ -350,64 +536,30 @@ public:
     // create the empty buffers with the correct shapes and zero them
     void createBuffers()
     {
-        auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
-        auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
-        auto constexpr nvFloatType = TRTDataType<float>::value;
+        SizeType32 constexpr tensorParallelism{1};
+        SizeType32 constexpr pipelineParallelism{1};
+        SizeType32 constexpr contextParallelism{1};
+        SizeType32 constexpr localRank{0};
+        WorldConfig const worldConfig{tensorParallelism, pipelineParallelism, contextParallelism, localRank};
 
-        auto const maxBatchSizeShape = ITensor::makeShape({batchSize});
-        auto const maxBatchSizeXmaxBeamWidth = ITensor::makeShape({batchSize, beamWidth});
+        SizeType32 constexpr vocabSize{51200};
+        SizeType32 constexpr nbAttentionLayers{2};
+        SizeType32 constexpr nbRnnLayers{0};
+        SizeType32 constexpr nbHeads{16};
+        SizeType32 constexpr hiddenSize{1024};
+        tensorrt_llm::DataType constexpr dtype{tensorrt_llm::DataType::kFLOAT};
+        ModelConfig modelConfig{
+            vocabSize, nbAttentionLayers + nbRnnLayers, nbAttentionLayers, nbRnnLayers, nbHeads, hiddenSize, dtype};
+
+        mDecodingState = std::make_unique<tensorrt_llm::runtime::decoder::DecoderState>();
+        mDecodingState->setup(
+            batchSize, beamWidth, maxSeqLen, 0, maxSeqLen, dtype, modelConfig, worldConfig, *mBufferManager);
+
+        auto constexpr nvTokenIdType = TRTDataType<TokenIdType>::value;
         auto const jointOutputIdsShape = ITensor::makeShape({batchSize, beamWidth, maxSeqLen});
 
-        { // prevent reusing these vars after std::move
-            auto dummyLogits = mBufferManager->emptyTensor(MemoryType::kGPU, nvFloatType);
-            auto endIds = mBufferManager->emptyTensor(MemoryType::kGPU, nvTokenIdType);
-            auto batchSlots = mBufferManager->emptyTensor(MemoryType::kPINNED, nvSizeType);
-            decodingInput = std::make_unique<DecodingInput>(
-                0, 0, 0, 0, std::move(dummyLogits), std::move(endIds), std::move(batchSlots));
-        }
-        auto& dInput = *decodingInput;
-
-        dInput.maxLength = maxSeqLen;
-
-        const_cast<ITensor&>(*dInput.endIds).reshape(maxBatchSizeShape);
-        const_cast<ITensor&>(*dInput.batchSlots).reshape(maxBatchSizeShape);
-        const_cast<ITensor&>(*dInput.endIds).reshape(maxBatchSizeShape);
-        const_cast<ITensor&>(*dInput.batchSlots).reshape(maxBatchSizeShape);
-        auto& inputLengths = const_cast<ITensor&>(*dInput.lengths);
-        dInput.lengths = mBufferManager->gpu(maxBatchSizeXmaxBeamWidth, nvSizeType);
-        mBufferManager->setZero(const_cast<ITensor&>(*dInput.lengths));
-
-        { // prevent reusing these vars after std::move
-
-            auto ids = mBufferManager->gpu(jointOutputIdsShape, nvTokenIdType);
-            mBufferManager->setZero(*ids);
-            auto gatheredIds = mBufferManager->gpu(jointOutputIdsShape, nvTokenIdType);
-            mBufferManager->setZero(*gatheredIds);
-
-            decodingOutput = std::make_unique<DecodingOutput>(std::move(ids), std::move(gatheredIds));
-        }
-        auto& dOutput = *decodingOutput;
-
-        dOutput.logProbs = mBufferManager->gpu(jointOutputIdsShape, nvFloatType);
-        mBufferManager->setZero(*dOutput.logProbs);
-        dOutput.logProbsTiled = mBufferManager->gpu(ITensor::makeShape({maxSeqLen, batchSize, beamWidth}), nvFloatType);
-        mBufferManager->setZero(*dOutput.logProbsTiled);
-        dOutput.lengths = mBufferManager->gpu(ITensor::makeShape({batchSize, beamWidth}), nvSizeType);
-        mBufferManager->setZero(*dOutput.lengths);
-        dOutput.cumLogProbs = mBufferManager->gpu(maxBatchSizeXmaxBeamWidth, nvFloatType);
-        mBufferManager->setZero(*dOutput.cumLogProbs);
-
-        dOutput.beamHypotheses.empty(*mBufferManager);
-        dOutput.beamHypotheses.reshape(batchSize, beamWidth, maxSeqLen);
-
-        dOutput.finishReasons
-            = mBufferManager->gpu(maxBatchSizeXmaxBeamWidth, TRTDataType<tk::FinishedState::UnderlyingType>::value);
-        mBufferManager->setZero(*dOutput.finishReasons);
-        dOutput.parentIds = mBufferManager->gpu(jointOutputIdsShape, nvTokenIdType);
-        mBufferManager->setZero(*dOutput.parentIds);
-
-        targetOut = mBufferManager->gpu(jointOutputIdsShape, nvTokenIdType);
-        mBufferManager->setZero(*targetOut);
+        mTargetOut = mBufferManager->gpu(jointOutputIdsShape, nvTokenIdType);
+        mBufferManager->setZero(*mTargetOut);
     }
 
     // clang-format off
@@ -420,12 +572,15 @@ public:
         auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
         auto constexpr nvFloatType = TRTDataType<float>::value;
 
+        auto const decodingInput = mDecodingState->getJointDecodingInput();
+        auto const decodingOutput = mDecodingState->getJointDecodingOutput();
+
         std::vector<SizeType32> len = {3, 3, 3, 3, 3};
-        TensorPtr inputLengths{ITensor::slice(constPointerCast(decodingInput->lengths), 0, 1)};
+        TensorPtr inputLengths{ITensor::slice(constPointerCast(decodingInput.lengths), 0, 1)};
         mBufferManager->copy(len.data(),*inputLengths);
 
         std::vector<SizeType32> eid = {0};
-        TensorPtr endIds{ITensor::slice(constPointerCast(decodingInput->endIds), 0, 1)};
+        TensorPtr endIds{ITensor::slice(constPointerCast(decodingInput.endIds), 0, 1)};
         mBufferManager->copy(eid.data(),*endIds);
 
         std::vector<std::vector<float>> logProbs =
@@ -437,7 +592,7 @@ public:
             {-2.96689, -1.63675, -2.31329, -0.0377979, -2.2442, -1.57552, -0.310524, -0.696636, -3.62298}
         };
         for (SizeType32 it = 0; it < logProbs.size(); it++){
-            fillTensorAtIndex(decodingOutput->logProbs, it, logProbs[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.logProbs, it, logProbs[it], true, mBufferManager);
         }
 
         std::vector<std::vector<float>> logProbsTiled =
@@ -453,17 +608,17 @@ public:
             {-2.41985, -2.61479, -1.01671, -3.62298, -1.26586},
             {-0.844337, -0.922832, -0.427682, -0.419985, -1.85996}
         };
-        TensorPtr logProbsTiledView = ITensor::view(decodingOutput->logProbsTiled,ITensor::makeShape({maxSeqLen*batchSize, beamWidth}));
+        TensorPtr logProbsTiledView = ITensor::view(decodingOutput.logProbsTiled,ITensor::makeShape({maxSeqLen*batchSize, beamWidth}));
         for (SizeType32 it = 0; it < logProbsTiled.size(); it++){
             auto logProbsSlice = ITensor::slice(logProbsTiledView, it+3,1);
             mBufferManager->copy(logProbsTiled[it].data(),*logProbsSlice);
         }
 
         std::vector<SizeType32> outputLenghts = {13, 13, 13, 13, 13};
-        mBufferManager->copy(outputLenghts.data(),*decodingOutput->lengths);
+        mBufferManager->copy(outputLenghts.data(),*decodingOutput.lengths);
 
         std::vector<float> cumLogProbs = {-15.0458, -15.4681, -15.8323, -15.8424, -16.0614};
-        mBufferManager->copy(cumLogProbs.data(),*decodingOutput->cumLogProbs);
+        mBufferManager->copy(cumLogProbs.data(),*decodingOutput.cumLogProbs);
 
         std::vector<std::vector<TokenIdType>> outputIdsCBA =
         {
@@ -472,7 +627,7 @@ public:
         };
         for(SizeType32 it = 0; it < outputIdsCBA.size(); it++)
         {
-            fillTensorAtIndex(decodingOutput->beamHypotheses.outputIdsCBA, it, outputIdsCBA[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.beamHypotheses.outputIdsCBA, it, outputIdsCBA[it], true, mBufferManager);
         }
 
         std::vector<std::vector<float>> logProbsCBA =
@@ -482,29 +637,29 @@ public:
         };
         for(SizeType32 it = 0; it < logProbsCBA.size(); it++)
         {
-            fillTensorAtIndex(decodingOutput->beamHypotheses.logProbsCBA, it, logProbsCBA[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.beamHypotheses.logProbsCBA, it, logProbsCBA[it], true, mBufferManager);
         }
 
         std::vector<SizeType32> sequenceLengthsCBA = {10, 10, 0, 0, 0, 0, 0, 0, 0, 0};
-        mBufferManager->copy(sequenceLengthsCBA.data(), *decodingOutput->beamHypotheses.sequenceLengthsCBA);
+        mBufferManager->copy(sequenceLengthsCBA.data(), *decodingOutput.beamHypotheses.sequenceLengthsCBA);
 
         std::vector<float> cumLogProbsCBA = {-13.6336, -13.8988, 0, 0, 0, 0, 0, 0, 0, 0};
-        mBufferManager->copy(cumLogProbsCBA.data(), *decodingOutput->beamHypotheses.cumLogProbsCBA);
+        mBufferManager->copy(cumLogProbsCBA.data(), *decodingOutput.beamHypotheses.cumLogProbsCBA);
 
         std::vector<float> normedScoresCBA = {-1.7042, -1.73735, 0, 0, 0, 0, 0, 0, 0, 0};
-        mBufferManager->copy(normedScoresCBA.data(), *decodingOutput->beamHypotheses.normedScoresCBA);
+        mBufferManager->copy(normedScoresCBA.data(), *decodingOutput.beamHypotheses.normedScoresCBA);
 
         std::vector<SizeType32> numBeamsCBA = {2};
-        mBufferManager->copy(numBeamsCBA.data(), *decodingOutput->beamHypotheses.numBeamsCBA);
+        mBufferManager->copy(numBeamsCBA.data(), *decodingOutput.beamHypotheses.numBeamsCBA);
 
         std::vector<float> minNormedScoresCBA = {-1.73735};
-        mBufferManager->copy(minNormedScoresCBA.data(), *decodingOutput->beamHypotheses.minNormedScoresCBA);
+        mBufferManager->copy(minNormedScoresCBA.data(), *decodingOutput.beamHypotheses.minNormedScoresCBA);
 
         std::vector<SizeType32> batchDones = {0};
-        mBufferManager->copy(batchDones.data(), *decodingOutput->beamHypotheses.batchDones);
+        mBufferManager->copy(batchDones.data(), *decodingOutput.beamHypotheses.batchDones);
 
         std::vector<uint8_t> finishReasons = {4, 4, 4, 4, 4};
-        mBufferManager->copy(finishReasons.data(), *decodingOutput->finishReasons);
+        mBufferManager->copy(finishReasons.data(), *decodingOutput.finishReasons);
 
         std::vector<std::vector<TokenIdType>> ids =
         {
@@ -516,7 +671,7 @@ public:
         };
         for(SizeType32 it = 0; it < ids.size(); it++)
         {
-            fillTensorAtIndex(decodingOutput->ids, it, ids[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.ids, it, ids[it], true, mBufferManager);
         }
 
         std::vector<std::vector<SizeType32>> parentIds =
@@ -529,7 +684,7 @@ public:
         };
         for(SizeType32 it = 0; it < parentIds.size(); it++)
         {
-            fillTensorAtIndex(decodingOutput->parentIds, it, parentIds[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.parentIds, it, parentIds[it], true, mBufferManager);
         }
 
         std::vector<std::vector<TokenIdType>> targetOutput =
@@ -542,7 +697,7 @@ public:
         };
         for(SizeType32 it = 0; it < targetOutput.size(); it++)
         {
-            fillTensorAtIndex(targetOut, it, targetOutput[it], true, mBufferManager);
+            fillTensorAtIndex(mTargetOut, it, targetOutput[it], true, mBufferManager);
         }
     }
 
@@ -553,12 +708,15 @@ public:
         auto constexpr nvSizeType = TRTDataType<SizeType32>::value;
         auto constexpr nvFloatType = TRTDataType<float>::value;
 
+        auto const decodingInput = mDecodingState->getJointDecodingInput();
+        auto const decodingOutput = mDecodingState->getJointDecodingOutput();
+
         std::vector<SizeType32> len = {3, 3, 3, 3, 3};
-        TensorPtr inputLengths{ITensor::slice(constPointerCast(decodingInput->lengths), 0, 1)};
+        TensorPtr inputLengths{ITensor::slice(constPointerCast(decodingInput.lengths), 0, 1)};
         mBufferManager->copy(len.data(),*inputLengths);
 
         std::vector<SizeType32> eid = {0};
-        TensorPtr endIds{ITensor::slice(constPointerCast(decodingInput->endIds), 0, 1)};
+        TensorPtr endIds{ITensor::slice(constPointerCast(decodingInput.endIds), 0, 1)};
         mBufferManager->copy(eid.data(),*endIds);
 
         std::vector<std::vector<float> >logProbs =
@@ -570,7 +728,7 @@ public:
             {-2.96689, -1.63675, -2.31329, -0.0377979, -1.31451, -3.85214, -1.72914}
         };
         for (SizeType32 it = 0; it < logProbs.size(); it++){
-            fillTensorAtIndex(decodingOutput->logProbs, it, logProbs[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.logProbs, it, logProbs[it], true, mBufferManager);
         }
 
         std::vector<std::vector<float>> logProbsTiled =
@@ -584,16 +742,16 @@ public:
             {-0.310524, -0.534199, -0.74379, -2.86232, -1.72914},
             {-0.696636, -0.493615, -0.237725, -3.07164, -3.11851}
         };
-        TensorPtr logProbsTiledView = ITensor::view(decodingOutput->logProbsTiled,ITensor::makeShape({maxSeqLen*batchSize, beamWidth}));
+        TensorPtr logProbsTiledView = ITensor::view(decodingOutput.logProbsTiled,ITensor::makeShape({maxSeqLen*batchSize, beamWidth}));
         for (SizeType32 it = 0; it < logProbsTiled.size(); it++){
             auto logProbsSlice = ITensor::slice(logProbsTiledView, it+3,1);
             mBufferManager->copy(logProbsTiled[it].data(),*logProbsSlice);
         }
         std::vector<SizeType32> outputLenghts = {11, 11, 11, 11, 11};
-        mBufferManager->copy(outputLenghts.data(),*decodingOutput->lengths);
+        mBufferManager->copy(outputLenghts.data(),*decodingOutput.lengths);
 
         std::vector<float> cumLogProbs = {-11.7816, -11.9304, -14.0883, -14.1566, -14.2035};
-        mBufferManager->copy(cumLogProbs.data(),*decodingOutput->cumLogProbs);
+        mBufferManager->copy(cumLogProbs.data(),*decodingOutput.cumLogProbs);
 
         std::vector<std::vector<TokenIdType>> outputIdsCBA =
         {
@@ -602,7 +760,7 @@ public:
         };
         for(SizeType32 it = 0; it < outputIdsCBA.size(); it++)
         {
-            fillTensorAtIndex(decodingOutput->beamHypotheses.outputIdsCBA, it, outputIdsCBA[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.beamHypotheses.outputIdsCBA, it, outputIdsCBA[it], true, mBufferManager);
         }
 
         std::vector<std::vector<float>> logProbsCBA =
@@ -612,29 +770,29 @@ public:
         };
         for(SizeType32 it = 0; it < logProbsCBA.size(); it++)
         {
-            fillTensorAtIndex(decodingOutput->beamHypotheses.logProbsCBA, it, logProbsCBA[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.beamHypotheses.logProbsCBA, it, logProbsCBA[it], true, mBufferManager);
         }
 
         std::vector<SizeType32> sequenceLengthsCBA  = {10, 10, 0, 0, 0, 0, 0, 0, 0, 0};
-        mBufferManager->copy(sequenceLengthsCBA.data(), *decodingOutput->beamHypotheses.sequenceLengthsCBA);
+        mBufferManager->copy(sequenceLengthsCBA.data(), *decodingOutput.beamHypotheses.sequenceLengthsCBA);
 
         std::vector<float> cumLogProbsCBA = {-13.6336, -13.8988, 0, 0, 0, 0, 0, 0, 0, 0};
-        mBufferManager->copy(cumLogProbsCBA.data(), *decodingOutput->beamHypotheses.cumLogProbsCBA);
+        mBufferManager->copy(cumLogProbsCBA.data(), *decodingOutput.beamHypotheses.cumLogProbsCBA);
 
         std::vector<float> normedScoresCBA = {-1.7042, -1.73735, 0, 0, 0, 0, 0, 0, 0, 0};
-        mBufferManager->copy(normedScoresCBA.data(), *decodingOutput->beamHypotheses.normedScoresCBA);
+        mBufferManager->copy(normedScoresCBA.data(), *decodingOutput.beamHypotheses.normedScoresCBA);
 
         std::vector<SizeType32> numBeamsCBA = {2};
-        mBufferManager->copy(numBeamsCBA.data(), *decodingOutput->beamHypotheses.numBeamsCBA);
+        mBufferManager->copy(numBeamsCBA.data(), *decodingOutput.beamHypotheses.numBeamsCBA);
 
         std::vector<float> minNormedScoresCBA = {-1.73735};
-        mBufferManager->copy(minNormedScoresCBA.data(), *decodingOutput->beamHypotheses.minNormedScoresCBA);
+        mBufferManager->copy(minNormedScoresCBA.data(), *decodingOutput.beamHypotheses.minNormedScoresCBA);
 
         std::vector<SizeType32> batchDones = {0};
-        mBufferManager->copy(batchDones.data(), *decodingOutput->beamHypotheses.batchDones);
+        mBufferManager->copy(batchDones.data(), *decodingOutput.beamHypotheses.batchDones);
 
         std::vector<uint8_t> finishReasons = {4, 4, 4, 4, 4};
-        mBufferManager->copy(finishReasons.data(), *decodingOutput->finishReasons);
+        mBufferManager->copy(finishReasons.data(), *decodingOutput.finishReasons);
 
         std::vector<std::vector<TokenIdType>> ids =
         {
@@ -646,7 +804,7 @@ public:
         };
         for(SizeType32 it = 0; it < ids.size(); it++)
         {
-            fillTensorAtIndex(decodingOutput->ids, it, ids[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.ids, it, ids[it], true, mBufferManager);
         }
 
         std::vector<std::vector<SizeType32>> parentIds =
@@ -659,7 +817,7 @@ public:
         };
         for(SizeType32 it = 0; it < parentIds.size(); it++)
         {
-            fillTensorAtIndex(decodingOutput->parentIds, it, parentIds[it], true, mBufferManager);
+            fillTensorAtIndex(decodingOutput.parentIds, it, parentIds[it], true, mBufferManager);
         }
 
         std::vector<std::vector<TokenIdType>> targetOutput =
@@ -672,7 +830,7 @@ public:
         };
         for(SizeType32 it = 0; it < targetOutput.size(); it++)
         {
-            fillTensorAtIndex(targetOut, it, targetOutput[it], true, mBufferManager);
+            fillTensorAtIndex(mTargetOut, it, targetOutput[it], true, mBufferManager);
         }
     }
 
@@ -680,12 +838,11 @@ public:
 
     bool checkResult()
     {
-
-        TensorPtr reference = this->mBufferManager->copyFrom((*targetOut), tensorrt_llm::runtime::MemoryType::kCPU);
+        auto const reference = this->mBufferManager->copyFrom(*mTargetOut, tensorrt_llm::runtime::MemoryType::kCPU);
         auto referencePtr = bufferCast<TokenIdType>(*reference);
 
-        TensorPtr real
-            = this->mBufferManager->copyFrom((*decodingOutput->gatheredIds), tensorrt_llm::runtime::MemoryType::kCPU);
+        auto const real = this->mBufferManager->copyFrom(
+            *mDecodingState->getGatheredIds(), tensorrt_llm::runtime::MemoryType::kCPU);
         auto realPtr = bufferCast<TokenIdType>(*real);
 
         bool allEqual = true;
@@ -707,7 +864,8 @@ TEST_F(TestGatherTree, GatherTreeNoSwap)
     createBuffers();
     hardcodeBuffersLen10();
     cudaDeviceSynchronize();
-    kernels::gatherTree(*decodingOutput, *decodingInput, mSamplingConfig, *mStream);
+    kernels::gatherTree(
+        mDecodingState->getJointDecodingOutput(), mDecodingState->getJointDecodingInput(), mSamplingConfig, *mStream);
     cudaDeviceSynchronize();
 
     EXPECT_TRUE(checkResult());
@@ -718,11 +876,188 @@ TEST_F(TestGatherTree, GatherTreeWithSwap)
     createBuffers();
     hardcodeBuffersLen8();
     cudaDeviceSynchronize();
-    kernels::gatherTree(*decodingOutput, *decodingInput, mSamplingConfig, *mStream);
+    kernels::gatherTree(
+        mDecodingState->getJointDecodingOutput(), mDecodingState->getJointDecodingInput(), mSamplingConfig, *mStream);
     cudaDeviceSynchronize();
 
     EXPECT_TRUE(checkResult());
 }
+
+// Test that generation logits are correctly reordered after gatherTree finalization.
+// Uses the same hardcoded beam search data as GatherTreeNoSwap, creates sentinel logits
+// where logits[slot][g][v] = slot (so we can verify which slot each beam's logits came from),
+// then runs the reorder algorithm and checks the result.
+TEST_F(TestGatherTree, GenerationLogitsReorder)
+{
+    // Compile-time proof that the fixture data causes beam reordering.
+    // hardcodeBuffersLen10: parentIds[slot=1][t=3] = 0 (row 1, col 3 of the parentIds table).
+    // Since 0 != 1, any beam trace through slot 1 at t=4 steps to slot 0 at t=3 — a concrete swap.
+    static constexpr SizeType32 kFixtureParentIds_slot1_t3 = 0;
+    static_assert(kFixtureParentIds_slot1_t3 != 1,
+        "parentIds[slot=1][t=3] must differ from slot 1 to guarantee a beam swap in this test");
+
+    createBuffers();
+    hardcodeBuffersLen10();
+    cudaDeviceSynchronize();
+    kernels::gatherTree(
+        mDecodingState->getJointDecodingOutput(), mDecodingState->getJointDecodingInput(), mSamplingConfig, *mStream);
+    cudaDeviceSynchronize();
+
+    // Verify gatherTree worked first
+    ASSERT_TRUE(checkResult());
+
+    // Now test the generation logits reordering algorithm.
+    // Copy ids, parentIds, gatheredIds, and seqLengths to host.
+    auto idsHost = mBufferManager->copyFrom(*mDecodingState->getIds(0), MemoryType::kCPU);
+    auto parentIdsHost = mBufferManager->copyFrom(*ITensor::at(mDecodingState->getParentIds(), {0}), MemoryType::kCPU);
+    auto gatheredIdsHost = mBufferManager->copyFrom(*mDecodingState->getGatheredIds(0), MemoryType::kCPU);
+    auto seqLengthsHost = mBufferManager->copyFrom(*mDecodingState->getSequenceLengths(0), MemoryType::kCPU);
+
+    auto const* idsData = bufferCast<TokenIdType>(*idsHost);
+    auto const* parentIdsData = bufferCast<TokenIdType>(*parentIdsHost);
+    auto const* gatheredIdsData = bufferCast<TokenIdType>(*gatheredIdsHost);
+    auto const* seqLengthsData = bufferCast<SizeType32>(*seqLengthsHost);
+
+    SizeType32 constexpr promptLen = 3;           // matches inputLengths in hardcodeBuffersLen10
+    SizeType32 constexpr vocabSizePadded = 32000; // LLaMA vocab size (matches fixture token IDs)
+    SizeType32 const maxNewTokens = maxSeqLen - promptLen;
+
+    // Populate sentinel logits: for each (pre-reassignment slot, gen step), place a 1.0f
+    // at the selected token position. All other entries stay 0. After correct reordering,
+    // logits[beam][g][gatheredToken] should be positive (the sentinel landed at the right place).
+    std::vector<float> logits(static_cast<size_t>(beamWidth) * maxNewTokens * vocabSizePadded, 0.0f);
+    for (SizeType32 postSlot = 0; postSlot < beamWidth; ++postSlot)
+    {
+        auto const genLen = seqLengthsData[postSlot] - promptLen;
+        for (SizeType32 g = 0; g < genLen; ++g)
+        {
+            SizeType32 const t = promptLen + g;
+            SizeType32 const preSlot = parentIdsData[postSlot * maxSeqLen + t];
+            TokenIdType const token = idsData[postSlot * maxSeqLen + t];
+            logits[static_cast<size_t>(preSlot * maxNewTokens + g) * vocabSizePadded + token] = 1.0f;
+        }
+    }
+
+    // Build slot trace and reorder (same algorithm as reorderGenerationLogitsForBeamSearch)
+    std::vector<std::vector<SizeType32>> slotTrace(beamWidth, std::vector<SizeType32>(maxNewTokens, 0));
+
+    for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+    {
+        auto const seqLen = seqLengthsData[beam];
+        auto const genLen = seqLen - promptLen;
+        if (genLen <= 0)
+        {
+            continue;
+        }
+
+        // Find starting slot by matching backtracked sequence
+        SizeType32 startSlot = -1;
+        for (SizeType32 s = 0; s < beamWidth; ++s)
+        {
+            SizeType32 slot = s;
+            bool matches = true;
+            for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+            {
+                if (idsData[slot * maxSeqLen + t] != gatheredIdsData[beam * maxSeqLen + t])
+                {
+                    matches = false;
+                    break;
+                }
+                if (t > promptLen)
+                {
+                    slot = parentIdsData[slot * maxSeqLen + t];
+                }
+            }
+            if (matches)
+            {
+                startSlot = s;
+                break;
+            }
+        }
+        ASSERT_GE(startSlot, 0) << "Could not find starting slot for beam " << beam;
+
+        // Build pre-reassignment slot trace in a single pass
+        SizeType32 slot = startSlot;
+        for (SizeType32 t = seqLen - 1; t >= promptLen; --t)
+        {
+            slot = parentIdsData[slot * maxSeqLen + t];
+            slotTrace[beam][t - promptLen] = slot;
+        }
+    }
+
+    // Reorder logits using a temp buffer (same approach as the production code)
+    auto const stepSize = static_cast<size_t>(vocabSizePadded) * sizeof(float);
+    std::vector<float> temp(beamWidth * vocabSizePadded);
+    auto* logitsPtr = reinterpret_cast<uint8_t*>(logits.data());
+    auto* tempPtr = reinterpret_cast<uint8_t*>(temp.data());
+
+    std::vector<SizeType32> genLens(beamWidth);
+    SizeType32 maxGenLen = 0;
+    for (SizeType32 b = 0; b < beamWidth; ++b)
+    {
+        genLens[b] = std::max(SizeType32{0}, seqLengthsData[b] - promptLen);
+        maxGenLen = std::max(maxGenLen, genLens[b]);
+    }
+
+    for (SizeType32 g = 0; g < maxGenLen; ++g)
+    {
+        bool stepNeedsReorder = false;
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            if (g < genLens[b] && slotTrace[b][g] != b)
+            {
+                stepNeedsReorder = true;
+                break;
+            }
+        }
+        if (!stepNeedsReorder)
+        {
+            continue;
+        }
+
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            auto const offset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+            std::memcpy(tempPtr + static_cast<size_t>(b) * stepSize, logitsPtr + offset, stepSize);
+        }
+        for (SizeType32 b = 0; b < beamWidth; ++b)
+        {
+            if (g >= genLens[b])
+            {
+                continue;
+            }
+            auto const dstOffset = (static_cast<size_t>(b) * maxNewTokens + g) * stepSize;
+            auto const srcSlot = slotTrace[b][g];
+            std::memcpy(logitsPtr + dstOffset, tempPtr + static_cast<size_t>(srcSlot) * stepSize, stepSize);
+        }
+    }
+
+    // Cross-check: after reorder, logits[beam][g][gatheredToken] should equal the 1.0f sentinel
+    // placed there during population. This is non-tautological: gatheredIdsData is produced
+    // independently by gatherTree tracing through parentIds, while the logits were reordered via
+    // the slot trace. A wrong slot's logits would have 0.0f at this position.
+    bool allCorrect = true;
+    for (SizeType32 beam = 0; beam < beamWidth; ++beam)
+    {
+        auto const genLen = genLens[beam];
+        for (SizeType32 g = 0; g < genLen; ++g)
+        {
+            TokenIdType const gatheredToken = gatheredIdsData[beam * maxSeqLen + (promptLen + g)];
+            float const logitAtGatheredToken
+                = logits[static_cast<size_t>(beam * maxNewTokens + g) * vocabSizePadded + gatheredToken];
+            if (logitAtGatheredToken != 1.0f)
+            {
+                TLLM_LOG_ERROR("Beam %d, step %d: logit at gathered token %d is %.1f, expected 1.0", beam, g,
+                    gatheredToken, logitAtGatheredToken);
+                allCorrect = false;
+            }
+        }
+    }
+    EXPECT_TRUE(allCorrect);
+}
+
+namespace
+{
 
 enum AcceptKernelMode
 {
@@ -807,32 +1142,35 @@ public:
         auto const ptrType = TRTDataType<T*>::value;
 
         mDraftTokens = mBufferManager->pinnedPool(
-            ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqlen}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqlen}), tensorrt_llm::DataType::kINT32);
         mTargetTokens = mBufferManager->pinnedPool(
-            ITensor::makeShape({mMaxBatchSize, mMaxTargetSeqlen}), nvinfer1::DataType::kINT32);
-        mOutputTokens
-            = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({mMaxBatchSize, mMaxTargetSeqlen}), tensorrt_llm::DataType::kINT32);
+        mOutputTokens = mBufferManager->pinnedPool(
+            ITensor::makeShape({mMaxBatchSize, mMaxSeqLen}), tensorrt_llm::DataType::kINT32);
         mNumsDraftTokens = mBufferManager->pinnedPool(
-            ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqPerStep}), nvinfer1::DataType::kINT32);
-        mSequenceLengths = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-        mAcceptedLengths = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-        mContextLengths = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqPerStep}), tensorrt_llm::DataType::kINT32);
+        mSequenceLengths
+            = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mAcceptedLengths
+            = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+        mContextLengths
+            = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         mFinishedSteps = mBufferManager->pinnedPool(ITensor::makeShape({mMaxDraftTokens + 1, mMaxBatchSize}),
             TRTDataType<tk::FinishedState::UnderlyingType>::value);
         mFinishedFinal = mBufferManager->pinnedPool(
             ITensor::makeShape({mMaxBatchSize}), TRTDataType<tk::FinishedState::UnderlyingType>::value);
-        mFinishedSum = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mFinishedSum = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
         mPaths = mBufferManager->pinnedPool(
-            ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqPerStep, mMaxDraftTokens}), nvinfer1::DataType::kINT32);
-        mEndIds = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+            ITensor::makeShape({mMaxBatchSize, mMaxDraftSeqPerStep, mMaxDraftTokens}), tensorrt_llm::DataType::kINT32);
+        mEndIds = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
 
-        mBatchSlots = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+        mBatchSlots = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         auto batchSlotsRange = BufferRange<SizeType32>(*mBatchSlots);
         std::iota(batchSlotsRange.begin(), batchSlotsRange.end(), 0);
 
         mCurandStates = mBufferManager->gpu(
-            ITensor::makeShape({mMaxBatchSize, sizeof(curandState_t)}), nvinfer1::DataType::kINT8);
+            ITensor::makeShape({mMaxBatchSize, sizeof(curandState_t)}), tensorrt_llm::DataType::kINT8);
 
         mAcceptedLen.resize(mMaxBatchSize);
         mOutputLen.resize(mMaxBatchSize);
@@ -862,8 +1200,9 @@ public:
             mMedusaInputLogitsPtrs
                 = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize, mMaxNumHeads}), ptrType);
             mTokensPerStep
-                = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
-            mBestPaths = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), nvinfer1::DataType::kINT32);
+                = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
+            mBestPaths
+                = mBufferManager->pinnedPool(ITensor::makeShape({mMaxBatchSize}), tensorrt_llm::DataType::kINT32);
         }
     }
 

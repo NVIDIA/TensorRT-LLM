@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -128,11 +129,12 @@ public:
 class PenaltySetupParams : public BaseSetupParams
 {
 public:
-    OptVec<float> temperature;             // [1] or [setupBatchSize]
-    OptVec<runtime::SizeType32> minLength; // [1] or [setupBatchSize]
-    OptVec<float> repetitionPenalty;       // [1] or [setupBatchSize]
-    OptVec<float> presencePenalty;         // [1] or [setupBatchSize]
-    OptVec<float> frequencyPenalty;        // [1] or [setupBatchSize]
+    OptVec<float> temperature;                      // [1] or [setupBatchSize]
+    OptVec<runtime::SizeType32> minLength;          // [1] or [setupBatchSize]
+    OptVec<float> repetitionPenalty;                // [1] or [setupBatchSize]
+    OptVec<float> presencePenalty;                  // [1] or [setupBatchSize]
+    OptVec<float> frequencyPenalty;                 // [1] or [setupBatchSize]
+    OptVec<runtime::SizeType32> promptIgnoreLength; // [1] or [setupBatchSize]
 };
 
 // Ban words layer
@@ -191,9 +193,9 @@ class ExplicitDraftTokensSetupParams : public DecodingSetupParams
 public:
     OptVec<float> temperature; // [setupBatchSize]
     // Hack to init some data for the context phase in the setup.
-    TensorPtr randomDataSample; // [maxBatchSize], on gpu
-    TensorPtr temperatures;     // [maxBatchSize], on gpu
-    nvinfer1::DataType dtype;   // [1]
+    TensorPtr randomDataSample;   // [maxBatchSize], on gpu
+    TensorPtr temperatures;       // [maxBatchSize], on gpu
+    tensorrt_llm::DataType dtype; // [1]
 };
 
 class EagleSetupParams : public DecodingSetupParams
@@ -201,9 +203,9 @@ class EagleSetupParams : public DecodingSetupParams
 public:
     OptVec<float> temperature; // [setupBatchSize]
     // Hack to init some data for the context phase in the setup.
-    TensorPtr randomDataSample; // [maxBatchSize], on gpu
-    TensorPtr temperatures;     // [maxBatchSize], on gpu
-    nvinfer1::DataType dtype;   // [1]
+    TensorPtr randomDataSample;   // [maxBatchSize], on gpu
+    TensorPtr temperatures;       // [maxBatchSize], on gpu
+    tensorrt_llm::DataType dtype; // [1]
 };
 
 class DynamicDecodeSetupParams : public BaseSetupParams
@@ -506,6 +508,10 @@ public:
     std::optional<TensorPtr> finished;       // [maxBatchSize * maxBeamWidth], on pinned
     std::optional<TensorPtr> sequenceLength; // [maxBatchSize * maxBeamWidth], on gpu
     std::optional<TensorPtr> cumLogProbs;    // [maxBatchSize * maxBeamWidth], on gpu, for Beam Search
+    //! NOTE: In the TRT backend, temperature is applied to logits in-place before sampling
+    //! (see decodingCommon.cu), so these log probs reflect the temperature-adjusted distribution.
+    //! This differs from the PyTorch backend's default behavior (LogprobMode.RAW), which computes
+    //! log probs from the raw model logits without temperature scaling.
     std::optional<TensorPtr> outputLogProbs; // [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu
     std::optional<TensorPtr> parentIds;      // [maxBatchSize, maxBeamWidth, maxSeqLen], on gpu, for Beam Search
 

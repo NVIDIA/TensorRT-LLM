@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,8 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import unittest
+from unittest.mock import patch
+
+import pytest
 
 from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _force_mpi_topology_mapping():
+    with patch("tensorrt_llm.mapping.mpi_disabled", return_value=False):
+        yield
 
 
 class TestMapping(unittest.TestCase):
@@ -44,3 +55,40 @@ class TestMapping(unittest.TestCase):
         self.assertTrue(m.is_last_pp_rank())
         self.assertEqual(m.prev_pp_rank(), 4)
         self.assertEqual(m.next_pp_rank(), 0)
+
+        m = Mapping(world_size=2, rank=0, cp_size=2)
+        self.assertEqual(len(m.tp_groups), 2)
+        self.assertEqual(len(m.pp_groups), 2)
+        self.assertEqual(len(m.cp_groups), 1)
+        self.assertEqual(m.tp_group, [0])
+        self.assertEqual(m.pp_group, [0])
+        self.assertEqual(m.cp_group, [0, 1])
+
+        m = Mapping(world_size=8, rank=3, tp_size=2, pp_size=2, cp_size=2)
+        self.assertEqual(len(m.tp_groups), 4)
+        self.assertEqual(len(m.pp_groups), 4)
+        self.assertEqual(len(m.cp_groups), 4)
+        self.assertEqual(m.tp_group, [1, 3])
+        self.assertEqual(m.pp_group, [3, 7])
+        self.assertEqual(m.cp_group, [2, 3])
+        self.assertTrue(m.is_first_pp_rank())
+        self.assertFalse(m.is_last_pp_rank())
+        self.assertFalse(m.is_first_cp_rank())
+        self.assertTrue(m.is_last_cp_rank())
+        self.assertEqual(m.prev_pp_rank(), 7)
+        self.assertEqual(m.next_pp_rank(), 7)
+        self.assertEqual(m.prev_cp_rank(), 2)
+        self.assertEqual(m.next_cp_rank(), 2)
+
+        m = Mapping(world_size=16, rank=9, tp_size=2, pp_size=2, cp_size=4)
+        self.assertEqual(m.tp_group, [9, 13])
+        self.assertEqual(m.pp_group, [1, 9])
+        self.assertEqual(m.cp_group, [8, 9, 10, 11])
+        self.assertFalse(m.is_first_pp_rank())
+        self.assertTrue(m.is_last_pp_rank())
+        self.assertFalse(m.is_first_cp_rank())
+        self.assertFalse(m.is_last_cp_rank())
+        self.assertEqual(m.prev_pp_rank(), 1)
+        self.assertEqual(m.next_pp_rank(), 1)
+        self.assertEqual(m.prev_cp_rank(), 8)
+        self.assertEqual(m.next_cp_rank(), 10)

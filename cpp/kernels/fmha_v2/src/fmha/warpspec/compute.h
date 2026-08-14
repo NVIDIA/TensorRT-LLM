@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -111,6 +116,12 @@ struct Compute
         SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
     };
 
+    // Whether use the bidirectional sliding window attention or not.
+    enum
+    {
+        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+    };
+
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
     enum
     {
@@ -173,7 +184,7 @@ struct Compute
 
     enum
     {
-        TILE_SIZE_V = STEP_KV * Kernel_traits::D
+        TILE_SIZE_V = STEP_KV * Kernel_traits::DV
     };
 
     enum
@@ -251,7 +262,8 @@ struct Compute
         actual_kv_seqlen, alibi_head_scale,                                                                            \
         USE_CUSTOM_MASK ? (head_info.mask_sum_s + q_step_idx * STEP_Q + local_q_tile_offset)                           \
                         : (q_step_idx * STEP_Q + head_info.q_tile_offset),                                             \
-        kv_step_idx * STEP_KV, sage_scale_row, cbr, cbr_v, mutex_accessor, kv_step_idx == kv_idx_end - 1);
+        kv_step_idx * STEP_KV, sage_scale_row, cbr, cbr_v, mutex_accessor,                                             \
+        &shared->skip_softmax_votes[kv_step_idx & 1][warpgroup_id], kv_step_idx == kv_idx_end - 1);
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -282,17 +294,30 @@ struct Compute
         // Is the chunked_attention used ?
         bool is_chunked_attention = params.log2_chunked_attention_size > 0;
 
-        // The left mask is needed when we attend to a specific sliding window or chunk.
+        // Handle sliding window or chunked attention masking
         if constexpr (SLIDING_OR_CHUNKED_ATTENTION)
         {
-            // The kv_left_mask_end is the start of the chunk.
-            kv_left_mask_end = div_up(is_chunked_attention
-                    ? ((tile_offset_end >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
-                    : (tile_offset_end - params.sliding_window_size),
-                STEP_KV);
+            if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
+            {
+                // Handle bidirectional sliding window attention
+                kv_left_mask_end = div_up(tile_offset_end - params.sliding_window_size / 2, STEP_KV);
+                kv_right_mask_start
+                    = min(kv_idx_end - 1, (tile_offset_start + params.sliding_window_size / 2 + 1) / STEP_KV);
+            }
+            else if (is_chunked_attention)
+            {
+                // Handle chunked attention
+                kv_left_mask_end = div_up(
+                    ((tile_offset_end >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size),
+                    STEP_KV);
+            }
+            else
+            {
+                kv_left_mask_end = div_up(tile_offset_end + 1 - params.sliding_window_size, STEP_KV);
+            }
         }
 
-        // The right mask is needed when causal mask (including sliding_window_attention or chunked attention) is used.
+        // The right mask is needed when causal mask is used.
         if constexpr (SKIP_CAUSAL_MASK_TILES)
         {
             kv_right_mask_start = tile_offset_start / STEP_KV;
@@ -326,9 +351,6 @@ struct Compute
         uint32_t smem_v = __cvta_generic_to_shared(&shared->smem_v[0]);
         Compute_tile_o ctile_o(0, smem_v);
 
-        // BMM2 epilogue
-        Tile_o_epilogue tile_o_epilogue(params);
-
         // Mutex between two compute groups.
         OrderedMutexAccessor mutex_accessor(shared->compute_mutex, warpgroup_id, SYNC_BARRIER);
         // Notify warpgroup 0 to execute HGMMA first (overlap HGMMA and Softmax Math Instructions).
@@ -358,6 +380,12 @@ struct Compute
             // Contiguous QKV FMHA assumes q, and kv have the same sequence length.
             int const actual_kv_seqlen = SEPARATE_Q_KV_BUFFER ? head_info.actual_kv_seqlen : actual_q_seqlen;
 
+            // Update threshold of Skip-Softmax
+            if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
+            {
+                softmax.skip_softmax_threshold = params.skip_softmax_threshold_scale_factor / actual_kv_seqlen;
+            }
+
             // Calculate the alibi head_scaling_factor.
             float alibi_head_scale
                 = APPLY_ALIBI ? get_alibi_head_scaling_factor<AlibiParams>(head_info.bidh, params.alibi_params) : 0.f;
@@ -367,6 +395,9 @@ struct Compute
             {
                 sage_scale_row = head_info.bidb * params.h + head_info.bidh;
             }
+
+            // BMM2 epilogue
+            Tile_o_epilogue tile_o_epilogue(params, head_info);
 
             int q_step_idx = warpgroup_id;
 
@@ -490,7 +521,7 @@ struct Compute
                 if (valid_run)
                 {
                     // Final step's update.
-                    tile_o_epilogue.scale(ctile_o, p_sum);
+                    tile_o_epilogue.scale(ctile_o, p_max, p_sum);
                     // Store o_tile to gmem.
                     gmem_o.store(ctile_o.acc_);
                 }
@@ -508,6 +539,13 @@ struct Compute
                 }
             }
         }
+#ifdef SKIP_SOFTMAX_STAT
+        if (tidx == 0)
+        {
+            atomicAdd(params.skip_softmax_total_blocks, softmax.total_blocks);
+            atomicAdd(params.skip_softmax_skipped_blocks, softmax.skipped_blocks);
+        }
+#endif
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -517,8 +555,15 @@ struct Compute
         Compute_tile_o& ctile_o, float (&p_max)[Mma_tile_p::CORES_M], float (&p_sum)[Mma_tile_p::CORES_M],
         int const tidx, int const actual_kv_seqlen, float const alibi_head_scale, int const row_offset,
         int const col_offset, int const sage_scale_row, Circular_buffer_q_reader& cbr, Circular_buffer_kv_reader& cbr_v,
-        OrderedMutexAccessor& mutex, bool complete = false)
+        OrderedMutexAccessor& mutex, uint32_t* skip_softmax_vote, bool complete = false)
     {
+
+        // Skip-softmax vote initialization
+        if (tidx == 0)
+        {
+            // Note that we need a named_barrier_wait in compute_single_tile to make sure init is before voting.
+            *skip_softmax_vote = 1;
+        }
 // load the scales of K/V from global memory
 #define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                                                        \
     if constexpr (block_size > 0)                                                                                      \
@@ -551,6 +596,10 @@ struct Compute
 
         // Ctile_p is only used once by each n step.
         ctile_p.clear();
+
+        // If skip_softmax is enabled, make sure there is no racing between the initialization and writing of
+        // skip_softmax_vote.
+        named_barrier_wait(Kernel_traits::SKIP_SOFTMAX_BARRIER_ID + threadIdx.x / 128, 128);
 
         // BMM1 (Q x K').
         warpgroup_arrive();
@@ -621,8 +670,31 @@ struct Compute
         softmax.apply_alibi_and_mask<APPLY_MASK>(
             ctile_p, params.alibi_params, alibi_head_scale, actual_kv_seqlen, row_offset, col_offset);
 
-        // Softmax Exp, max/sum, and update scales.
-        softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum);
+        // Softmax Exp, max/sum, and update scales. If returns false we skip the rest.
+        if (!softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum, skip_softmax_vote))
+        {
+            if constexpr (ENABLE_MUTEX && Kernel_traits::ELEMENT_BYTES == 1)
+            {
+                // Notify another warpgroup to execute QGMMA.
+                mutex.named_bar_arrive();
+            }
+            // Need to wait V, otherwise compute-sanitizer synccheck will fail.
+            int ready2 = cbr_v.peek();
+            if (!ready2)
+            {
+                cbr_v.wait();
+            }
+
+#pragma unroll
+            // Advance V descriptor by the same amount as the BMM2 loop would,
+            // so that the descriptor stays in sync for subsequent KV steps.
+            for (int kbi = 0; kbi < BMM2_MMAS_K_GROUPS - 1; kbi++)
+            {
+                ctile_o.increment_gmma_desc_group();
+            }
+
+            return;
+        }
 
         // experiments show that here is the best place to load scales of V
         float scales_v[SAGE_BLOCKS_PER_STEP_V];

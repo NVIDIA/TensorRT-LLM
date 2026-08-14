@@ -17,15 +17,16 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 // namespace tensorrt_llm::kernels
 namespace kernels
 {
@@ -34,7 +35,6 @@ namespace kernels
 struct MTPPrepareDrafterInputsParam
 {
     int numMTPModules;
-    int curMTPLayerIdx;
     int batchSize;
     int numContextRequest;
     int hiddenSize;
@@ -42,8 +42,9 @@ struct MTPPrepareDrafterInputsParam
     int* seqLens;
     void** __restrict__ mtpPastHiddenStatesPtrs;
     int** mtpPastTokensPtrs;
-    void* __restrict__ previousLayerHiddenStates;
-    int* previousLayerDraftTokens;
+    void* __restrict__ hiddenStates;
+    int* acceptedTokens;
+    int* numAcceptedTokens;
     int* returnInputIds;
     void* __restrict__ returnHiddenStates;
 };
@@ -115,4 +116,4 @@ void invokeMTPRelaxedAcceptance(MTPRelaxedAcceptanceParam& params, cudaStream_t 
 
 } // namespace kernels
 
-} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

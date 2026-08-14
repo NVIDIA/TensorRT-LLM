@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,7 +28,9 @@ extern "C"
         // sm >= 80
         TLLM_XQA_JIT_HMMA = 0,
         // sm == 90
-        TLLM_XQA_JIT_QGMMA = 1
+        TLLM_XQA_JIT_QGMMA = 1,
+        // sm == 120
+        TLLM_XQA_JIT_MLA = 2,
     } tllmXqaJitKernelType;
 
     typedef enum
@@ -61,6 +63,15 @@ extern "C"
         bool fp8_output;
         bool use_input_kv;
         tllmXqaJitRopeStyle rope_style; // useful only when use_input_kv is true.
+
+        // Number of head elements RoPE is applied to (rotary_embedding_dim). Equals head_size for
+        // full rotary; smaller for partial rotary (partial_rotary_factor < 1). Useful only when
+        // rope_style != NONE; callers may leave it 0, in which case it defaults to head_size.
+        unsigned int rotary_embedding_dim;
+
+        bool is_spec_dec_tree
+            = true; // useful only when multi_query_tokens, should be true unless using linear tree in spec-dec.
+        bool use_skip_softmax_attn;
     } tllmXqaJitContext;
 
     // tllmXqaJitProgram is an opaque handle for a program.

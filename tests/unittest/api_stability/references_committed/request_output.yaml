@@ -27,3 +27,6 @@ properties:
   finished:
     annotation: bool
     default: inspect._empty
+  disaggregated_params:
+    annotation: Optional[DisaggregatedParams]
+    default: inspect._empty

@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -80,10 +85,17 @@ struct HeadPtr
 
     __device__ inline Head* operator+(uint32_t i) const
     {
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+        auto const pageIdx = pageIndices[nbPages == 1 ? 0U : i / tokensPerPage];
+        return (pageIdx & (1U << 31))
+            ? nullptr
+            : pool + (tokensPerPage * nbKHeads * pageIdx + offset + (i % tokensPerPage) * nbKHeads);
+#else
         assert(nbPages == 1 || offset % tokensPerPage == 0);
         auto const pageIdx = pageIndices[nbPages == 1 ? 0U : i / tokensPerPage];
         return (pageIdx & (1U << 31)) ? nullptr
                                       : pool + (tokensPerPage * nbKHeads * pageIdx + offset + i % tokensPerPage);
+#endif
     }
 };
 
@@ -239,7 +251,12 @@ struct KVCacheList;
 template <>
 struct KVCacheList<true>
 {
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM;
+    GMemCacheHead* vCacheVLLM;
+#else
     GMemKVCacheHead* pool;
+#endif
     KVCachePageIndex const* kvCachePageList; // shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
     SeqLenDataType const* seqLenList;        // shape: [batchSize][beamWidth] (for compatibility)
     uint32_t maxNbPagesPerSeq;
@@ -281,7 +298,7 @@ __device__ inline uint32_t getCtxCacheSeqLen(BeamSearchParams const& beamSearchP
 
 template <uint32_t nbLoadedPages>
 __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true> const& cacheList, bool isK,
-    uint32_t idxReq, uint32_t idxBeam, uint32_t idxPageBeg, uint32_t nbPages)
+    uint32_t idxReq, uint32_t idxBeam, uint32_t idxPageBeg, uint32_t nbPages, uint32_t nbSkipLeadingPages)
 {
     auto const maxNbPagesPerSeq = cacheList.maxNbPagesPerSeq;
     Vec<KVCachePageIndex, nbLoadedPages> ret;
@@ -289,9 +306,16 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true>
     for (uint32_t i = 0; i < nbLoadedPages; i++)
     {
         uint32_t const idxPage = idxPageBeg + i;
-        ret[i] = (idxPage < nbPages ? cacheList.kvCachePageList[beamWidth * 2 * maxNbPagesPerSeq * idxReq
-                      + 2 * maxNbPagesPerSeq * idxBeam + maxNbPagesPerSeq * (isK ? 0U : 1U) + idxPage]
-                                    : kBAD_PAGE_INDEX);
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+        ret[i] = ((idxPage >= nbSkipLeadingPages && idxPage < nbPages)
+                ? cacheList.kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage]
+                : kBAD_PAGE_INDEX);
+#else
+        ret[i] = ((idxPage >= nbSkipLeadingPages && idxPage < nbPages)
+                ? cacheList.kvCachePageList[beamWidth * 2 * maxNbPagesPerSeq * idxReq + 2 * maxNbPagesPerSeq * idxBeam
+                    + maxNbPagesPerSeq * (isK ? 0U : 1U) + idxPage]
+                : kBAD_PAGE_INDEX);
+#endif
     }
     return ret;
 }
@@ -299,7 +323,7 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true>
 template <uint32_t nbWarps, uint32_t nbLoadedPages>
 __device__ inline void loadPagesForBeamSearchAsync(uint32_t idxWarp,
     Vec<Vec<KVCachePageIndex, nbLoadedPages>, beamWidth>& dst, KVCacheList<true> const& cacheList, bool isK,
-    uint32_t idxReq, uint32_t idxPageBeg, uint32_t nbPages)
+    uint32_t idxReq, uint32_t idxPageBeg, uint32_t nbPages, uint32_t nbSkipLeadingPages)
 {
     assert(idxWarp < nbWarps);
     auto const maxNbPagesPerSeq = cacheList.maxNbPagesPerSeq;
@@ -312,10 +336,11 @@ __device__ inline void loadPagesForBeamSearchAsync(uint32_t idxWarp,
     {
         constexpr uint32_t nbBytes = sizeof(KVCachePageIndex);
         uint32_t const idxPage = idxPageBeg + idxLoadedPage;
+        // TODO: for beamsearch we use pagedIdx = 0 instead of kBAD_PAGE_INDEX, should unify it
         ldgsts::copyAsync<nbBytes>(&dst[idxBeam][idxLoadedPage],
             &cacheList.kvCachePageList[beamWidth * 2 * maxNbPagesPerSeq * idxReq + 2 * maxNbPagesPerSeq * idxBeam
                 + (isK ? 0U : maxNbPagesPerSeq) + idxPage],
-            idxPage < nbPages ? nbBytes : 0U);
+            idxPage >= nbSkipLeadingPages && idxPage < nbPages ? nbBytes : 0U);
     }
 }
 
@@ -364,9 +389,14 @@ __device__ inline InputElem2 float2ToInputElem2(float2 src)
         reinterpret_cast<nv_bfloat162&>(dst) = __float22bfloat162_rn(src);
         return dst;
     }
+    else if constexpr (mha::is_same_v<InputElem2, __nv_fp8x2_e4m3>)
+    {
+        reinterpret_cast<__nv_fp8x2_e4m3&>(dst) = __nv_fp8x2_e4m3{src};
+        return dst;
+    }
     else
     {
-        return InputElem2{InputElem{src.x}, InputElem{src.y}};
+        trap();
     }
 }
 

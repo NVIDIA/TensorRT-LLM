@@ -1,2 +1,0 @@
-git+https://github.com/bfshi/scaling_on_scales.git
-transformers==4.36.2

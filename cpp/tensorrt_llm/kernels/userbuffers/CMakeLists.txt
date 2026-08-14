@@ -27,5 +27,6 @@ target_compile_options(userbuffers_src
 
 set_property(TARGET userbuffers_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET userbuffers_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+add_cuda_architectures(userbuffers_src 89)
 
 message(STATUS "UserBuffer ENABLE_MULTI_DEVICE is ${ENABLE_MULTI_DEVICE}")

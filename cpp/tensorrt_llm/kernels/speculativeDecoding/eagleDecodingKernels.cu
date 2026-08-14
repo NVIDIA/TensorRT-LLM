@@ -15,11 +15,13 @@
  */
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/speculativeDecoding/eagleDecodingKernels.h"
+
 #include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
 #ifndef CUDART_VERSION
 #error CUDART_VERSION Undefined!
@@ -32,7 +34,9 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::speculative_decoding
 {
 namespace
 {
@@ -504,7 +508,7 @@ __global__ void prepareGenEagleNetInputsKernel(SizeType32* nextSequenceLengths, 
     BlockScan(tempStorage.scan).ExclusiveSum(numNextLogits, outputLastIndicesBase);
     // Sync because tempStorage is reused.
     __syncthreads();
-    auto const maxGenLength = BlockReduce(tempStorage.reduce).Reduce(nextDraftLen, cub::Max());
+    auto const maxGenLength = BlockReduce(tempStorage.reduce).Reduce(nextDraftLen, cuda::maximum());
 
     // Thread 0 has the result.
     if (bid == 0)
@@ -1372,49 +1376,30 @@ void invokeGetPackedMaskFromPath(int32_t* specDecodingPackedMasks, SizeType32 co
 namespace
 {
 template <int BLOCK_SIZE>
-__global__ void augmentBatchSlotsKernel(SizeType32* augmentedSeqSlots, SizeType32* augmentedBatchSlots,
-    SizeType32 const* chunkedContextNextTokens, SizeType32 const* lastDraftLens, SizeType32 const* seqSlots,
-    SizeType32 const* batchSlots, SizeType32 actualBatchSize)
+__global__ void augmentBatchSlotsKernel(SizeType32* augmentedSeqSlots, SizeType32 const* chunkedContextNextTokens,
+    SizeType32 const* lastDraftLens, SizeType32 const* seqSlots, SizeType32 engineBatchSize)
 {
-    typedef cub::BlockScan<SizeType32, BLOCK_SIZE> BlockScan;
-    __shared__ typename BlockScan::TempStorage tempStorage;
-
     auto const batchIdx = static_cast<SizeType32>(threadIdx.x);
-    auto const valid = batchIdx < actualBatchSize;
+    auto const valid = batchIdx < engineBatchSize;
 
-    bool needDecoding{false};
     if (valid)
     {
         auto const draftLen = lastDraftLens[batchIdx];
-        needDecoding = (draftLen == 0 && chunkedContextNextTokens[batchIdx] == -1) || (draftLen > 0);
-    }
-
-    SizeType32 originalIndex{0};
-    BlockScan(tempStorage).ExclusiveSum(needDecoding, originalIndex);
-
-    if (needDecoding)
-    {
-        augmentedSeqSlots[batchIdx] = seqSlots[batchIdx];
-        augmentedBatchSlots[batchIdx] = batchSlots[originalIndex];
-    }
-    else if (valid)
-    {
-        augmentedSeqSlots[batchIdx] = -1;
-        augmentedBatchSlots[batchIdx] = -1;
+        auto const needDecoding = (draftLen == 0 && chunkedContextNextTokens[batchIdx] == -1) || (draftLen > 0);
+        augmentedSeqSlots[batchIdx] = needDecoding ? seqSlots[batchIdx] : -1;
     }
 }
 } // namespace
 
-void invokeAugmentBatchSlots(SizeType32* augmentedSeqSlots, SizeType32* augmentedBatchSlots,
-    runtime::SizeType32 const* chunkedContextNextTokens, runtime::SizeType32 const* lastDraftLens,
-    SizeType32 const* seqSlots, SizeType32 const* batchSlots, SizeType32 actualBatchSize, SizeType32 batchSize,
-    cudaStream_t stream)
+void invokeAugmentBatchSlots(SizeType32* augmentedSeqSlots, runtime::SizeType32 const* chunkedContextNextTokens,
+    runtime::SizeType32 const* lastDraftLens, SizeType32 const* seqSlots, SizeType32 engineBatchSize,
+    SizeType32 batchSize, cudaStream_t stream)
 {
     SizeType32 constexpr BLOCK_SIZE = 512;
     TLLM_CHECK_WITH_INFO(
-        actualBatchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", batchSize);
-    augmentBatchSlotsKernel<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(augmentedSeqSlots, augmentedBatchSlots,
-        chunkedContextNextTokens, lastDraftLens, seqSlots, batchSlots, actualBatchSize);
+        engineBatchSize <= BLOCK_SIZE, "Batch size larger than %d is not supported for EAGLE yet", batchSize);
+    augmentBatchSlotsKernel<BLOCK_SIZE><<<1, BLOCK_SIZE, 0, stream>>>(
+        augmentedSeqSlots, chunkedContextNextTokens, lastDraftLens, seqSlots, engineBatchSize);
 }
 
 namespace
@@ -2340,4 +2325,6 @@ void invokeCopyFinalDraftTokens(SizeType32 batchSize, SizeType32 maxDecodingDraf
     sync_check_cuda_error(stream);
 }
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+
+TRTLLM_NAMESPACE_END

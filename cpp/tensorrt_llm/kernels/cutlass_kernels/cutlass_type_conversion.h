@@ -16,7 +16,8 @@
 
 #pragma once
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include "cutlass/half.h"
 #include <cuda_fp16.h>
@@ -30,41 +31,41 @@
 #include "cutlass/float_subbyte.h"
 #include <cuda_fp4.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
 {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-// nvinfer1::DataType to Cutlass
+// tensorrt_llm::DataType to Cutlass
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-template <nvinfer1::DataType>
+template <tensorrt_llm::DataType>
 struct CutlassType
 {
     using type = void;
 };
 
 template <>
-struct CutlassType<nvinfer1::DataType::kHALF>
+struct CutlassType<tensorrt_llm::DataType::kHALF>
 {
     using type = cutlass::half_t;
 };
 
 template <>
-struct CutlassType<nvinfer1::DataType::kBF16>
+struct CutlassType<tensorrt_llm::DataType::kBF16>
 {
     using type = cutlass::bfloat16_t;
 };
 
 template <>
-struct CutlassType<nvinfer1::DataType::kFP8>
+struct CutlassType<tensorrt_llm::DataType::kFP8>
 {
     using type = cutlass::float_e4m3_t;
 };
 
 template <>
-struct CutlassType<nvinfer1::DataType::kFP4>
+struct CutlassType<tensorrt_llm::DataType::kFP4>
 {
     using type = cutlass::float_e2m1_t;
 };
@@ -163,4 +164,5 @@ struct CutlassToTllmTypeAdapter<cutlass::float_e2m1_t>
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

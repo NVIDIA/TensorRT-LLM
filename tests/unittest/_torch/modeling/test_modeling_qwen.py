@@ -17,8 +17,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_qwen import (
     Qwen2ForCausalLM, Qwen2ForProcessRewardModel)
 # yapf: enable
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    DecodingCUDAGraphRunner
+from _torch.helpers import create_mock_cuda_graph_runner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -265,6 +264,9 @@ class TestQwen(unittest.TestCase):
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
+        graph_runner = create_mock_cuda_graph_runner(
+            1) if scenario.use_cuda_graph else None
+
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
             if not scenario.use_cuda_graph:
@@ -272,19 +274,20 @@ class TestQwen(unittest.TestCase):
                                     position_ids=position_ids,
                                     attn_metadata=attn_metadata)
             else:
-                graph_runner = DecodingCUDAGraphRunner(
-                    attn_metadata.max_num_requests, "cuda", attn_metadata)
-                graph_runner.capture(lambda inputs: qwen.forward(**inputs))
+                inputs = {
+                    "input_ids": input_ids,
+                    "position_ids": position_ids,
+                    "attn_metadata": attn_metadata,
+                }
+                key = (1, 0, False)
+                graph_runner.capture(key, lambda inputs: qwen.forward(**inputs),
+                                     inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.run({
-                        "input_ids": input_ids,
-                        "position_ids": position_ids,
-                        "attn_metadata": attn_metadata,
-                    })
+                    logits = graph_runner.replay(key, inputs)
                 return logits
 
         if scenario.use_cuda_graph:
@@ -303,7 +306,8 @@ class TestQwen(unittest.TestCase):
                                    ref.logits[:, -1].float(),
                                    atol=0.4,
                                    rtol=0.4)
-
+        if graph_runner is not None:
+            graph_runner.clear()
         kv_cache_manager.shutdown()
 
     @parameterized.expand(

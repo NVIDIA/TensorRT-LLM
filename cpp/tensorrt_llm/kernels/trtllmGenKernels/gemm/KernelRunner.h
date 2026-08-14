@@ -16,20 +16,22 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda.h>
 
-#include "tensorrt_llm/kernels/trtllmGenKernels/common/Dtype.h"
+#include "trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
 #include <optional>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
 struct TrtllmGenGemmRunnerOptions
 {
-    Dtype eltType;
-    Dtype outputType;
+    gemm::trtllm::gen::Dtype eltTypeA;
+    gemm::trtllm::gen::Dtype eltTypeB{gemm::trtllm::gen::Dtype::Void};
+    gemm::trtllm::gen::Dtype outputType;
     bool deepSeekFp8{false};
     bool transposeMmaOutput{false};
 };
@@ -42,7 +44,7 @@ public:
     [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k);
 
     void run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale, void const* b, float const* bScale,
-        void* c, float* cScale, void* workspace, CUstream stream, int device);
+        void* c, float* cScale, float* cScalePtr, void* workspace, CUstream stream, int device);
 
     void run(int32_t m, int32_t n, int32_t k, void const* a, void const* b, void* c, float* cScale, void* workspace,
         CUstream stream, int device);
@@ -56,4 +58,5 @@ private:
     std::vector<int32_t> mPassingConfigIndices;
 };
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

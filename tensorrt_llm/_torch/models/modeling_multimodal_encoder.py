@@ -1,4 +1,4 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+# Copyright 2024-2026 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,11 +16,61 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/blob/main/llava/model/multimodal_encoder/
 
 import os
+from typing import Optional, Type
 
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
 
+from ..attention_backend.interface import AttentionMetadata
 from .modeling_multimodal_utils import multiscale_forward
+
+# Fallback capacity for the encoder ``AttentionMetadata``'s per-segment buffers
+# (``max_num_requests``). The encoder runs one attention segment per vision tile
+# / window, so the real bound is the segment count, which can far exceed the
+# request count (one image can expand into many tiles/windows).
+#
+# TODO: Once the scheduler caps an encoder forward at ``encoder_max_num_tokens``,
+# derive this from the token budget instead -- ``encoder_max_num_tokens //
+# min_tokens_per_segment`` (an exact segment bound). We cannot do that today:
+# ``encoder_max_num_tokens`` is not yet enforced (the attention workspace grows
+# past it), so a low value would under-size these fixed buffers, which -- unlike
+# the token workspace -- cannot grow. Until then, fall back to the legacy
+# worst-case capacity.
+_ENCODER_FALLBACK_MAX_NUM_REQUESTS = 8192
+
+
+class MultimodalEncoderMixin:
+    """Encoder-side counterpart to ``MultimodalModelMixin``.
+
+    Marker + default ``setup_attn_metadata`` for multimodal encoders whose
+    ``AttentionMetadata`` is built by ``PyTorchModelEngine`` after model load
+    using runtime sizes (``max_batch_size``, ``max_num_tokens``).
+
+    Subclasses set ``metadata_cls`` in their own ``__init__`` (typically from
+    ``get_attention_backend(model_config.attn_backend).Metadata``) and either
+    use the default ``setup_attn_metadata`` below or override it for custom
+    Metadata kwargs (e.g. FlashInfer ``kv_layout``, multi-metadata encoders).
+    """
+    metadata_cls: Type[AttentionMetadata]
+    attn_metadata: Optional[AttentionMetadata] = None
+
+    def setup_attn_metadata(self, max_num_requests: int,
+                            max_num_tokens: int) -> None:
+        max_num_requests = max(max_num_requests,
+                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
+            kv_cache_manager=None,
+        )
+
+    def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+        """Set an optional stable per-segment attention capacity.
+
+        Specialized encoders may override this hook. Keeping it separate from
+        `setup_attn_metadata` preserves that method's existing override
+        contract for external encoders.
+        """
 
 
 class VisionTower(nn.Module):
@@ -37,12 +87,12 @@ class VisionTower(nn.Module):
 
         if "clip" in self.name:
             self.vision_tower = AutoModel.from_pretrained(
-                model_name_or_path, torch_dtype=config.model_dtype)
+                model_name_or_path, dtype=config.model_dtype)
         elif "siglip" in self.name:
             self.vision_tower = AutoModel.from_pretrained(
                 model_name_or_path,
                 attn_implementation="flash_attention_2",
-                torch_dtype="auto")
+                dtype="auto")
         else:
             raise ValueError(f"Unsupported vision tower: {self.name}")
 

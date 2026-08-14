@@ -16,20 +16,21 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda.h>
 #include <optional>
 
-#include "tensorrt_llm/kernels/trtllmGenKernels/common/Dtype.h"
+#include "trtllmGen_gatedAct_export/trtllm/gen/DtypeDecl.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
 struct TrtllmGenGemmGatedActRunnerOptions
 {
-    Dtype eltType;
-    Dtype outputType;
+    gemmGatedAct::trtllm::gen::Dtype eltType;
+    gemmGatedAct::trtllm::gen::Dtype outputType;
     bool deepSeekFp8{false};
     bool transposeMmaOutput{false};
 };
@@ -56,4 +57,5 @@ private:
     std::vector<int32_t> mPassingConfigIndices;
 };
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

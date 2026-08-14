@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
@@ -25,13 +26,17 @@
 using namespace tensorrt_llm::common;
 using tensorrt_llm::common::op::UniqPtrWNullCopy;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct XqaFixedParams
 {
+    // Whether the attention is MLA.
+    bool isMLA;
     // The QKV input data type.
     kernels::Data_type inputDataType;
     // The XQA KV cache data type.
@@ -56,8 +61,12 @@ struct XqaFixedParams
     bool isPagedKv;
     // Is speculative decoding enabled.
     bool isSpecDecoding;
+    // Spec-dec tree bound for FMHA kernel selection.
+    int specDecodingTargetMaxGenLen = 0;
     // Do we apply alibi ?
     bool hasAlibi;
+    // Use trtllm-gen sparse attention kernel.
+    bool useTllmGenSparseAttention;
 };
 
 class XqaDispatcher
@@ -76,9 +85,11 @@ public:
     bool isSupported();
 
     // Run the XQA kernel.
-    void run(XQAParams const& params, KVLinearBuffer const& kv_cache_buffer);
+    void run(XQAParams const& params, KVLinearBuffer const& kv_cache_buffer,
+        KVLinearBuffer const& kv_cache_block_scales_buffer);
 
-    void run(XQAParams const& params, KVBlockArray const& kv_cache_buffer);
+    void run(
+        XQAParams const& params, KVBlockArray const& kv_cache_buffer, KVBlockArray const& kv_cache_block_scales_buffer);
 
     int getWorkspaceAlignment();
 
@@ -102,9 +113,14 @@ private:
 
 protected:
     template <typename T, typename KVCacheBuffer>
-    void runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buffer);
+    void runImpl(
+        XQAParams params, KVCacheBuffer const& kv_cache_buffer, KVCacheBuffer const& kv_cache_block_scales_buffer);
 };
+
+constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

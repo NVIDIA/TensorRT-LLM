@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import argparse
 import os
@@ -84,8 +89,9 @@ def is_header(entry: Entry):
 
 SOURCE_FILES = [
     'cuda_hint.cuh', 'defines.h', 'ldgsts.cuh', 'mha.cu', 'mha_sm90.cu',
-    'mha.h', 'mhaUtils.cuh', 'mma.cuh', 'platform.h', 'utils.cuh', 'utils.h',
-    'mha_stdheaders.cuh', 'gmma.cuh', 'gmma_impl.cuh', 'barriers.cuh', 'tma.h',
+    'mla_sm120.cu', 'mha.h', 'mhaUtils.cuh', 'mma.cuh', 'platform.h',
+    'utils.cuh', 'utils.h', 'mha_stdheaders.cuh', 'mha_components.cuh',
+    'mla_sm120.cuh', 'gmma.cuh', 'gmma_impl.cuh', 'barriers.cuh', 'tma.h',
     'specDec.h'
 ]
 
@@ -104,19 +110,26 @@ if args.embed_cuda_headers:
 all_entries = map(get_entry_from_input_fname, all_files)
 
 TEMPLATE_PROLOGUE = '''/*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
-namespace tensorrt_llm {
+#include "tensorrt_llm/common/config.h"
+
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels {
 '''
 
@@ -125,7 +138,8 @@ inline constexpr const char* {fname_var_name} = "{fname}";
 '''
 
 TEMPLATE_EPILOGUE = '''}
-}
+TRTLLM_NAMESPACE_END
+
 '''
 
 D = defaultdict(list)

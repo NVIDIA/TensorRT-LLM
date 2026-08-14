@@ -13,10 +13,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
 import unittest
 
 import numpy as np
+import pytest
 import torch
 
 import tensorrt_llm.bindings.internal.runtime as _tbr
@@ -25,6 +26,7 @@ import tensorrt_llm.bindings.internal.runtime as _tbr
 class TestMoePythonBindings(unittest.TestCase):
 
     def setUp(self):
+        os.environ["TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK"] = "1"
         torch.cuda.set_device(0)
         # Common test parameters
         self.expert_count = 8
@@ -135,6 +137,8 @@ class TestMoePythonBindings(unittest.TestCase):
             ep_size=self.ep_size,
             layer_updates_per_iter=self.layer_updates_per_iter)
 
+        balancer.set_use_gpu_memcpy(True)
+
         # Add a layer
         layer = balancer.add_layer(expert_count=self.expert_count,
                                    top_k=self.top_k,
@@ -205,6 +209,8 @@ class TestMoePythonBindings(unittest.TestCase):
             ep_size=self.ep_size,
             layer_updates_per_iter=self.layer_updates_per_iter)
 
+        balancer.set_use_gpu_memcpy(True)
+
         # Create initial weight assignments
         initial_assignments = []
         for r in range(self.ep_size):
@@ -265,6 +271,92 @@ class TestMoePythonBindings(unittest.TestCase):
 
         # Shutdown the load balancer
         balancer.shutdown()
+
+
+@pytest.mark.parametrize(
+    "expert_count,slot_count_per_rank,ep_size,expert_load_factors,expected_replica_counts",
+    [(4, 2, 2, [1, 2, 3, 4], [1, 1, 1, 1]),
+     (4, 3, 2, [0, 0, 0, 0], [2, 2, 1, 1]),
+     (4, 4, 2, [1, 4, 2, 1], [1, 4, 2, 1]),
+     (5, 3, 3, [10, 5, 2, 15, 8], [2, 1, 1, 3, 2]),
+     (3, 2, 2, [0, 10, 0], [1, 2, 1])],
+    ids=[
+        "equal_slots_and_experts", "zero_load_factors", "varied_load_factors",
+        "complex_load_distribution", "single_expert_with_load"
+    ])
+def test_do_replication(expert_count, slot_count_per_rank, ep_size,
+                        expert_load_factors, expected_replica_counts):
+    """Test the doReplication function.
+
+    Reference: MoeReplicationTest in cpp/tests/runtime/moeLoadBalancerTest.cpp
+    """
+    meta_info = _tbr.MoeLoadBalanceMetaInfo(
+        expert_count=expert_count,
+        top_k=2,
+        ep_rank=0,
+        ep_size=ep_size,
+        slot_count_per_rank=slot_count_per_rank)
+    placement_info = _tbr.MoePlacementCpuInfo()
+    placement_info.expert_replica_count = [0] * expert_count
+
+    _tbr.do_replication(meta_info, expert_load_factors, placement_info)
+
+    assert placement_info.expert_replica_count == expected_replica_counts
+    assert sum(
+        placement_info.expert_replica_count) == ep_size * slot_count_per_rank
+
+
+@pytest.mark.parametrize(
+    "expert_count,slot_count_per_rank,ep_size,expert_load_factors,replica_counts,max_expected_load_diff",
+    [(4, 2, 2, [1, 1, 1, 1], [1, 1, 1, 1], 0.001),
+     (4, 3, 2, [1, 3, 2, 1], [1, 2, 2, 1], 0.01),
+     (5, 3, 3, [10, 5, 2, 15, 8], [2, 1, 1, 3, 2], 2.0),
+     [3, 2, 2, [1, 100, 10], [1, 2, 1], 9.0],
+     [6, 3, 2, [2, 3, 4, 5, 6, 7], [1, 1, 1, 1, 1, 1], 1.0]],
+    ids=[
+        "equal_load_factors", "varied_load_factors",
+        "complex_load_distribution", "extreme_load_differences",
+        "one_replica_per_expert"
+    ])
+def test_do_placement(expert_count, slot_count_per_rank, ep_size,
+                      expert_load_factors, replica_counts,
+                      max_expected_load_diff):
+    """Test the doPlacement function.
+
+    Reference: MoePlacementTest in cpp/tests/runtime/moeLoadBalancerTest.cpp
+    """
+    meta_info = _tbr.MoeLoadBalanceMetaInfo(
+        expert_count=expert_count,
+        top_k=2,
+        ep_rank=0,
+        ep_size=ep_size,
+        slot_count_per_rank=slot_count_per_rank)
+    placement_info = _tbr.MoePlacementCpuInfo()
+    placement_info.expert_replica_count = replica_counts
+    placement_info.rank_expert_ids = [[0] * slot_count_per_rank
+                                      for _ in range(ep_size)]
+
+    _tbr.do_placement(meta_info, expert_load_factors, placement_info)
+
+    expert_assignments = [0] * expert_count
+    for local_expert_ids in placement_info.rank_expert_ids:
+        for expert_id in local_expert_ids:
+            expert_assignments[expert_id] += 1
+
+    assert expert_assignments == replica_counts
+
+    rank_loads = [0] * ep_size
+    for rank_id, local_expert_ids in enumerate(placement_info.rank_expert_ids):
+        for expert_id in local_expert_ids:
+            rank_loads[rank_id] += expert_load_factors[
+                expert_id] / replica_counts[expert_id]
+
+    max_load_diff = 0
+    for i in range(ep_size):
+        for j in range(i + 1, ep_size):
+            max_load_diff = max(max_load_diff,
+                                abs(rank_loads[i] - rank_loads[j]))
+    assert max_load_diff <= max_expected_load_diff
 
 
 if __name__ == '__main__':

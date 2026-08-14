@@ -23,13 +23,4 @@ methods:
         annotation: int
         default: 2048
     return_annotation: None
-  from_dict:
-    parameters:
-      config:
-        annotation: dict
-        default: inspect._empty
-    return_annotation: tensorrt_llm.llmapi.llm_utils.CalibConfig
-  to_dict:
-    parameters: {}
-    return_annotation: dict
 properties: {}

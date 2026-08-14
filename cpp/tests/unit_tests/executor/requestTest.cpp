@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/common/tllmException.h"
@@ -21,7 +26,9 @@ using ::testing::_;
 using ::testing::Invoke;
 
 using namespace tensorrt_llm::executor;
-using namespace tensorrt_llm::common;
+// Not a namespace-wide import: common also exports DataType/Dims, which would
+// make the unqualified DataType (= executor::DataType) below ambiguous.
+using tensorrt_llm::common::TllmException;
 
 TEST(RequestTest, validInputs)
 {
@@ -147,10 +154,11 @@ TEST(RequestTest, serializeDeserialize)
     auto request = Request({1, 2, 3, 4}, 11, true, SamplingConfig(), OutputConfig(), 112, 113,
         std::make_optional<std::vector<SizeType32>>({0, 1, 2, 3}), std::list<VecTokens>{{1, 2, 3}, {2, 3, 4}},
         std::nullopt, std::nullopt, ExternalDraftTokensConfig({2, 2, 2}),
-        PromptTuningConfig(embeddingTable, VecTokenExtraIds({1, 2, 3, 4})), embeddingTable, std::nullopt, std::nullopt,
-        std::nullopt, KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 1, 10)}, 10),
-        "Processor", std::nullopt, std::nullopt, 1234, false, 0.5, RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, 1, std::nullopt, std::nullopt,
+        PromptTuningConfig(embeddingTable, VecTokenExtraIds({1, 2, 3, 4})), std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt,
+        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 1, 10)}, 10), "Processor",
+        std::nullopt, std::nullopt, 1234, false, 0.5, RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, 1, std::nullopt, std::nullopt,
         GuidedDecodingParams(GuidedDecodingParams::GuideType::kREGEX, "\\d+"));
 
     auto serializedSize = Serialization::serializedSize(request);

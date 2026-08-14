@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
     std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
-    bool promptTableOffloading, bool enableTrtOverlap)
+    bool promptTableOffloading, bool enableTrtOverlap, bool failFastOnAttentionWindowTooLarge)
     : mMaxBeamWidth(maxBeamWidth)
     , mSchedulerConfig(std::move(schedulerConfig))
     , mKvCacheConfig(std::move(kvCacheConfig))
@@ -63,9 +63,10 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mGatherGenerationLogits(gatherGenerationLogits)
     , mPromptTableOffloading(promptTableOffloading)
     , mEnableTrtOverlap(enableTrtOverlap)
+    , mFailFastOnAttentionWindowTooLarge(failFastOnAttentionWindowTooLarge)
 {
-    TLLM_CHECK(iterStatsMaxIterations >= 0);
-    TLLM_CHECK(requestStatsMaxIterations >= 0);
+    TLLM_CHECK(iterStatsMaxIterations >= kUnlimitedStatsMaxIterations);
+    TLLM_CHECK(requestStatsMaxIterations >= kUnlimitedStatsMaxIterations);
     TLLM_CHECK(mMaxBeamWidth > 0);
     TLLM_CHECK(maxSeqIdleMicroseconds > 0);
 }
@@ -222,6 +223,11 @@ bool ExecutorConfig::getEnableTrtOverlap() const
     return mEnableTrtOverlap;
 }
 
+bool ExecutorConfig::getFailFastOnAttentionWindowTooLarge() const
+{
+    return mFailFastOnAttentionWindowTooLarge;
+}
+
 // setters
 
 void ExecutorConfig::setMaxBeamWidth(SizeType32 maxBeamWidth)
@@ -265,13 +271,13 @@ void ExecutorConfig::setNormalizeLogProbs(bool normalizeLogProbs)
 void ExecutorConfig::setIterStatsMaxIterations(SizeType32 iterStatsMaxIterations)
 {
     mIterStatsMaxIterations = iterStatsMaxIterations;
-    TLLM_CHECK(mIterStatsMaxIterations >= 0);
+    TLLM_CHECK(mIterStatsMaxIterations >= kUnlimitedStatsMaxIterations);
 }
 
 void ExecutorConfig::setRequestStatsMaxIterations(SizeType32 requestStatsMaxIterations)
 {
     mRequestStatsMaxIterations = requestStatsMaxIterations;
-    TLLM_CHECK(mRequestStatsMaxIterations >= 0);
+    TLLM_CHECK(mRequestStatsMaxIterations >= kUnlimitedStatsMaxIterations);
 }
 
 void ExecutorConfig::setBatchingType(BatchingType batchingType)
@@ -369,6 +375,11 @@ void ExecutorConfig::setPromptTableOffloading(bool promptTableOffloading)
 void ExecutorConfig::setEnableTrtOverlap(bool enableTrtOverlap)
 {
     mEnableTrtOverlap = enableTrtOverlap;
+}
+
+void ExecutorConfig::setFailFastOnAttentionWindowTooLarge(bool failFastOnAttentionWindowTooLarge)
+{
+    mFailFastOnAttentionWindowTooLarge = failFastOnAttentionWindowTooLarge;
 }
 
 } // namespace tensorrt_llm::executor

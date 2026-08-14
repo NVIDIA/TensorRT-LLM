@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,14 +14,15 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime_api.h>
 #include <string>
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImpl.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunnerUtils.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -58,12 +59,17 @@ public:
         return mInitialized;
     }
 
-    XQAKernelType getKernelType() const
+    [[nodiscard]] XQAKernelType getKernelType() const
     {
         return mKernelType;
     }
 
 private:
+    [[nodiscard]] CUfunction kernel() const
+    {
+        return reinterpret_cast<CUfunction>(mKernel);
+    }
+
     static constexpr char const* kFuncName = "kernel_mha";
     static constexpr char const* kSmemName = "smemSize";
     static constexpr char const* kKernelTypeName = "kernelType";
@@ -73,12 +79,13 @@ private:
     // Fields below are undefined prior to initialize() call.
     bool mInitialized;
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
-    CUmodule mModule;
-    CUfunction mFunction;
+    CUlibrary mLibrary;
+    CUkernel mKernel;
     unsigned int mSharedMemBytes;
     XQAKernelType mKernelType;
 };
 
 } // namespace jit
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

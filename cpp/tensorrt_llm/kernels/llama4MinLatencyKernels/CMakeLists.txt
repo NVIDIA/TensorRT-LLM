@@ -23,3 +23,4 @@ set_property(TARGET llama4_min_latency_kernels
              PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET llama4_min_latency_kernels
              PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_cuda_architectures(llama4_min_latency_kernels 90 100f)

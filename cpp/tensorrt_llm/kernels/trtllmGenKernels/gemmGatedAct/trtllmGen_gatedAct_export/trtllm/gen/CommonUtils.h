@@ -16,6 +16,9 @@
  */
 #pragma once
 
+namespace gemmGatedAct
+{
+
 namespace trtllm
 {
 namespace gen
@@ -41,3 +44,5 @@ inline T roundUp(T m, T n)
 
 } // namespace gen
 } // namespace trtllm
+
+} // namespace gemmGatedAct

@@ -15,20 +15,22 @@
  */
 
 #include "tensorrt_llm/thop/thUtils.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <array>
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
 
 tensorrt_llm::runtime::ITensor::Shape convert_shape(torch::Tensor tensor)
 {
-    constexpr auto trtMaxDims = nvinfer1::Dims::MAX_DIMS;
+    constexpr auto trtMaxDims = tensorrt_llm::Dims::MAX_DIMS;
     auto const torchTensorNumDims = tensor.dim();
     TLLM_CHECK_WITH_INFO(torchTensorNumDims <= trtMaxDims,
         "TensorRT supports at most %i tensor dimensions. Found a Torch tensor with %li dimensions.", trtMaxDims,
         torchTensorNumDims);
-    auto result = nvinfer1::Dims{};
+    auto result = tensorrt_llm::Dims{};
     result.nbDims = static_cast<int32_t>(torchTensorNumDims);
     for (int i = 0; i < torchTensorNumDims; i++)
     {
@@ -111,3 +113,5 @@ cudaDataType_t convert_torch_dtype(torch::ScalarType dtype)
 }
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

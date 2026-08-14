@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -23,6 +23,10 @@ set(CMAKE_CUDA_ARCHITECTURES 89-real 90a-real)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(BUILD_XQA_TESTS "Build XQA tests" OFF)
+set(PAGED_KV_CACHE_LAYOUT
+    "0"
+    CACHE STRING "Paged KV cache format (0 for XQA Original, 1 for VLLM)")
+add_definitions(-DPAGED_KV_CACHE_LAYOUT=${PAGED_KV_CACHE_LAYOUT})
 
 # todo: remove include_directories link_directories and link libs like
 # CUDA::cuda_driver CUDA::cudart CUDA::nvrtc
@@ -37,7 +41,7 @@ set(CMAKE_CXX_FLAGS
     "${CMAKE_CXX_FLAGS} -march=haswell -Wfatal-errors -Wreturn-type -Wall -Wextra -Wno-unknown-pragmas"
 )
 set(CMAKE_CUDA_FLAGS
-    "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler --expt-relaxed-constexpr -t 0 -res-usage"
+    "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler --expt-relaxed-constexpr -t 0 -res-usage -DPAGED_KV_CACHE_LAYOUT=${PAGED_KV_CACHE_LAYOUT}"
 )
 set(CUDA_PTXAS_FLAGS "-warn-lmem-usage -warn-double-usage -warn-spills"
 )# -Werror -v
@@ -63,8 +67,11 @@ set(XQA_SOURCES
     "gmma_impl.cuh"
     "barriers.cuh"
     "tma.h"
+    "mha_components.cuh"
+    "mla_sm120.cuh"
     "mha.cu"
-    "mha_sm90.cu")
+    "mha_sm90.cu"
+    "mla_sm120.cu")
 
 # For ${Python3_EXECUTABLE}
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -81,25 +88,40 @@ add_custom_command(
 add_custom_target(xqa_sources_h DEPENDS ${XQA_SOURCES_H})
 
 if(BUILD_XQA_TESTS)
-  # GoogleTest Preparation - Code block copied from
-  # https://google.github.io/googletest/quickstart-cmake.html
-  include(FetchContent)
-  FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.15.2)
-  include(GoogleTest)
+  if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    get_filename_component(TRT_LLM_ROOT_DIR
+                           "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+    add_subdirectory("${TRT_LLM_ROOT_DIR}/3rdparty"
+                     "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+  endif()
 
-  # Add Eigen via FetchContent
-  FetchContent_Declare(
-    eigen
-    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-    GIT_TAG 3.4.0)
-  FetchContent_MakeAvailable(googletest eigen)
+  # Try to find system installed GTest first
+  find_package(GTest QUIET)
+  if(NOT GTest_FOUND)
+    message(STATUS "System GTest not found, fetching from repository")
+    include(FetchContent)
+    FetchContent_MakeAvailable(googletest)
+    include(GoogleTest)
+  endif()
+
+  # Try to find system installed Eigen first
+  find_package(Eigen3 3.4 QUIET)
+  if(NOT Eigen3_FOUND)
+    message(STATUS "System Eigen not found, fetching from repository")
+    include(FetchContent)
+    FetchContent_MakeAvailable(eigen)
+  endif()
 
   enable_testing()
-  add_executable(unitTests mha.cu mha_sm90.cu test/test.cpp
-                           test/refAttention.cpp)
+  add_executable(
+    unitTests
+    mha.cu
+    mha_sm90.cu
+    mla_sm120.cu
+    tensorMap.cpp
+    test/warmup.cu
+    test/test.cpp
+    test/refAttention.cpp)
   target_include_directories(unitTests PUBLIC ${EIGEN3_INCLUDE_DIR})
   target_link_libraries(unitTests PUBLIC GTest::gtest GTest::gtest_main cuda
                                          Eigen3::Eigen)

@@ -1,362 +1,428 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 #!/usr/bin/env python
+
+# yapf: disable
 import asyncio
-import copy
-import json
-import logging
-import os
 import signal
+import socket
+import traceback
 from contextlib import asynccontextmanager
-from http import HTTPStatus
-from typing import List, Optional, Type, Union
+from typing import Callable, Optional
 
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.llmapi.disagg_utils import (ConditionalDisaggConfig,
-                                              RouterConfig)
-from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
-                                                ChatCompletionResponse,
-                                                CompletionRequest,
-                                                CompletionResponse,
-                                                DisaggregatedParams,
-                                                ErrorResponse)
-from tensorrt_llm.serve.router import KvCacheAwareRouter, create_router
+from tensorrt_llm.executor.executor import CppExecutorError
+from tensorrt_llm.llmapi import tracing
+from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
+                                              MetadataServerConfig, ServerRole)
+from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.cluster_storage import (
+    HttpClusterStorageServer, create_cluster_storage,
+    validate_http_cluster_storage_scope)
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
+                                                   DisaggCoordinatorService)
+from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
+from tensorrt_llm.serve.openai_disagg_service import (
+    OpenAIDisaggregatedService, ResponseHooks)
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest, CompletionRequest, UCompletionRequest,
+    UCompletionResponse, ensure_request_chat_template_allowed)
+from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
+                                             PerfMetricsJsonlWriter,
+                                             PerfMetricsMiddleware,
+                                             combine_disagg_metrics)
+from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+                                                get_steady_clock_now_in_seconds)
+from tensorrt_llm.serve.router import Router
 from tensorrt_llm.version import __version__ as VERSION
 
-logging.basicConfig(level=logging.INFO)
-
 # yapf: enale
-TIMEOUT_KEEP_ALIVE = 10  # seconds.
+_LOG_CONTROL_CHARACTERS = {
+    code: f"\\x{code:02x}"
+    for code in (*range(32), 127)
+}
+
+class RawRequestResponseHooks(ResponseHooks):
+    def __init__(self, raw_req: Request, queue_latency_metric,
+                 collect_perf_metrics: bool):
+        self.raw_req = raw_req
+        self.queue_latency_metric = queue_latency_metric
+        self.collect_perf_metrics = collect_perf_metrics
+        self.ctx_server = ""
+        self.gen_server = ""
+        self.request_id = ""
+        self.disagg_request_id = None
+        self.request_arrival_time = raw_req.state.server_arrival_time
+        self.server_first_token_time = 0
+        self.ctx_dispatch_time = 0
+        self.ctx_metrics = None
+        self.gen_metrics = None
+
+    def on_req_begin(self, request: UCompletionRequest):
+        params = request.disaggregated_params
+        if params is not None:
+            self.disagg_request_id = params.disagg_request_id
+            request_id = params.disagg_request_id or params.ctx_request_id
+            self.request_id = str(request_id or "")
+        self.queue_latency_metric.observe(
+            get_steady_clock_now_in_seconds() - self.request_arrival_time)
+
+    def on_disagg_request_id(self, disagg_request_id: int):
+        self.disagg_request_id = disagg_request_id
+        self.request_id = str(disagg_request_id)
+
+    def on_ctx_dispatch(self, request: UCompletionRequest):
+        self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
+
+    def on_perf_metrics(self, server: str, role: str, metrics: dict):
+        if role == "ctx":
+            self.ctx_server = server
+            self.ctx_metrics = metrics
+        elif role == "gen":
+            self.gen_server = server
+            self.gen_metrics = metrics
+
+    def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
+        self.ctx_server = ctx_server
+
+    def on_first_token(
+            self, gen_server: str, request: UCompletionRequest,
+            response: UCompletionResponse = None):
+        self.gen_server = gen_server
+        self.server_first_token_time = get_steady_clock_now_in_seconds()
+
+    def on_resp_done(
+            self, gen_server: str, request: UCompletionRequest,
+            response: UCompletionResponse = None):
+        self.gen_server = gen_server
+        if not self.collect_perf_metrics:
+            return
+        disagg_phase = {
+            "ctx_server": self.ctx_server,
+            "gen_server": self.gen_server,
+            "timing_metrics": {
+                "arrival_time": self.request_arrival_time,
+                "last_token_time": get_steady_clock_now_in_seconds(),
+                "server_arrival_time": self.request_arrival_time,
+                "ctx_dispatch_time": self.ctx_dispatch_time or None,
+                "server_first_token_time": self.server_first_token_time or None,
+            },
+        }
+        self.raw_req.state.perf_metrics_records.append(
+            combine_disagg_metrics(
+                self.request_id,
+                disagg_phase,
+                self.ctx_metrics,
+                self.gen_metrics,
+                disagg_request_id=self.disagg_request_id,
+            ))
+
 
 class OpenAIDisaggServer:
-
     def __init__(self,
-                 ctx_servers: List[str] = None,
-                 gen_servers: List[str] = None,
+                 config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
-                 ctx_router_config: Optional[RouterConfig] = None,
-                 gen_router_config: Optional[RouterConfig] = None,
-                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None):
+                 metadata_server_cfg: Optional[MetadataServerConfig] = None,
+                 metrics_interval_secs: int = 0,
+                 coordinator_url: Optional[str] = None):
+        self._config = config
+        self._req_timeout_secs = req_timeout_secs
+        self._server_start_timeout_secs = server_start_timeout_secs
+        self._metadata_server_cfg = metadata_server_cfg
+        self._metrics_interval_secs = metrics_interval_secs
+        self._allow_request_chat_template = getattr(
+            config, "allow_request_chat_template", False)
+        # When set, this is a forked worker: routing/readiness are delegated to
+        # the coordinator at coordinator_url (CoordinatorClient). Otherwise this
+        # process owns the routers + cluster state (DisaggCoordinatorService).
+        self._coordinator_url = coordinator_url
 
-        self.ctx_servers = ctx_servers
-        self.gen_servers = gen_servers
-        self.ctx_router = create_router(ctx_router_config, ctx_servers)
-        self.gen_router = create_router(gen_router_config, gen_servers)
-        self.conditional_disagg_config = conditional_disagg_config
+        self._perf_metrics_collector = DisaggPerfMetricsCollector(
+            config.perf_metrics_max_requests)
+        self._expose_perf_metrics = config.return_perf_metrics
+        self._collect_perf_metrics = (
+            config.return_perf_metrics
+            or config.perf_metrics_output_dir is not None)
+        self._perf_metrics_writer = PerfMetricsJsonlWriter(
+            config.perf_metrics_output_dir, "disagg")
 
-        if (len(self.gen_servers) == 0):
-            raise ValueError("At least one generation server must be provided")
+        self._disagg_cluster_storage = None
+        if config.disagg_cluster_config:
+            validate_http_cluster_storage_scope(
+                config.disagg_cluster_config.cluster_uri, config.hostname)
+            self._disagg_cluster_storage = create_cluster_storage(
+                config.disagg_cluster_config.cluster_uri,
+                config.disagg_cluster_config.cluster_name)
+        # The server doesn't build routers -- the coordinator object does:
+        # DisaggCoordinatorService (owner) or CoordinatorClient (delegating). The
+        # server just reads .ctx_router / .gen_router off whichever it holds.
+        if self._coordinator_url:
+            self._coordinator = CoordinatorClient(
+                self._coordinator_url, self._config, metadata_server_cfg,
+                request_timeout_s=self._req_timeout_secs,
+                startup_timeout_s=self._server_start_timeout_secs)
+        else:
+            self._coordinator = DisaggCoordinatorService(
+                self._config, self._create_client,
+                metadata_config=self._metadata_server_cfg,
+                server_preparation_func=self._sync_server_clock,
+                server_start_timeout_secs=self._server_start_timeout_secs)
+        self._ctx_router = self._coordinator.ctx_router
+        self._gen_router = self._coordinator.gen_router
 
-        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(ctx_servers) == 0:
-            raise ValueError("At least one context server must be provided")
+        self._service = OpenAIDisaggregatedService(
+            self._config, self._coordinator, self._create_client,
+            req_timeout_secs=self._req_timeout_secs)
 
-        if self.conditional_disagg_config is not None and not isinstance(self.gen_router, KvCacheAwareRouter):
-            raise ValueError("Generation router must be a KvCacheAwareRouter to enable conditional disaggregation")
+        try:
+            otlp_cfg = config.otlp_config
+            if otlp_cfg and otlp_cfg.otlp_traces_endpoint:
+                tracing.init_tracer("trt.llm", otlp_cfg.otlp_traces_endpoint)
+                logger.info(
+                    f"Initialized OTLP tracer successfully, endpoint: {otlp_cfg.otlp_traces_endpoint}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to initialize OTLP tracer: {e}")
 
-        # Session will be initialized in lifespan
-        self.session: Optional[aiohttp.ClientSession] = None
 
         @asynccontextmanager
-        async def lifespan(app: FastAPI):
-            # Create a persistent aiohttp ClientSession
-            self.session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=300),
-                timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
-
-            logging.info("Waiting for context and generation servers to be ready")
-            await self.wait_for_servers_ready(server_start_timeout_secs)
+        async def lifespan(app) -> None:
+            # The cluster manager (via setup) owns server preparation + monitoring.
+            await self._perf_metrics_writer.start()
+            await self._service.setup()
             yield
-            await self.session.close()  # Ensure session cleanup
+            await self._service.teardown()
+            await self._perf_metrics_writer.close()
 
         self.app = FastAPI(lifespan=lifespan)
 
+        if self._collect_perf_metrics:
+            self.app.add_middleware(
+                PerfMetricsMiddleware,
+                expose_headers=self._expose_perf_metrics,
+                writer=self._perf_metrics_writer)
+        self.app.add_middleware(ServerArrivalTimeMiddleware)
+
+        # Log request-body validation failures so a client/server schema mismatch
+        # shows up server-side. Throttled (first, then every 1000th) to avoid
+        # flooding the event loop when every request fails identically.
+        self._val_err_n = 0
         @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(_, exc):
+        async def validation_exception_handler(request: Request, exc):
+            self._perf_metrics_collector.validation_exceptions.inc()
+            self._val_err_n += 1
+            if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
+                try:
+                    errs = exc.errors()
+                    # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
+                    brief = [{"loc": e.get("loc"), "type": e.get("type"),
+                              "msg": e.get("msg")} for e in errs][:8]
+                except Exception:  # noqa: BLE001
+                    brief = str(exc)[:500]
+                method = request.method.translate(_LOG_CONTROL_CHARACTERS)
+                path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
+                logger.warning(
+                    f"[validation] {method} {path} 400 "
+                    f"(n={self._val_err_n}): {brief}")
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
 
-    @staticmethod
-    def create_error_response(
-            message: str,
-            status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> ErrorResponse:
-        raise HTTPException(status_code=500, detail=f"Internal server error {message}")
+    def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
+        async def disagg_id_generator():
+            return await self._coordinator.get_disagg_request_id()
+        client = OpenAIHttpClient(
+            router, role, self._req_timeout_secs, max_retries,
+            disagg_id_generator=disagg_id_generator,
+            request_perf_metrics=self._collect_perf_metrics,
+            internal_disagg_auth_key=self._config.internal_request_auth_key)
+        return client
 
     def register_routes(self):
+        # The disagg service owns only the request-serving endpoints (/v1/*) and
+        # perf metrics. Readiness / cluster topology are the coordinator's state,
+        # so /health and /cluster_info hook straight to self._coordinator.
+        self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion, CompletionRequest), methods=["POST"])
+        self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
+        self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/completions",
-                               self.openai_completion,
-                               methods=["POST"])
-        self.app.add_api_route("/v1/chat/completions",
-                               self.openai_chat_completion,
-                               methods=["POST"])
+        # import prometheus_client lazily to break the `set_prometheus_multiproc_dir`
+        from prometheus_client import (CollectorRegistry, make_asgi_app,
+                                       multiprocess)
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        self.app.mount("/prometheus/metrics", make_asgi_app(registry=registry))
+        # Single-process (local coordinator): mount the in-process HTTP cluster
+        # storage routes on this app. In worker mode the coordinator is remote and
+        # owns those routes (CoordinatorClient has no cluster_storage).
+        cluster_storage = getattr(self._coordinator, "cluster_storage", None)
+        if isinstance(cluster_storage, HttpClusterStorageServer):
+            cluster_storage.add_routes(self.app)
+        elif (isinstance(self._coordinator, CoordinatorClient)
+              and isinstance(self._disagg_cluster_storage,
+                             HttpClusterStorageServer)):
+            # Keep the configured public cluster_uri valid in fleet mode while
+            # the coordinator remains the sole owner of the HTTP storage state.
+            for path, method in (("/set", "POST"), ("/get", "GET"),
+                                 ("/delete", "DELETE"), ("/expire", "GET"),
+                                 ("/get_prefix", "GET")):
+                self.app.add_api_route(path,
+                                       self._proxy_cluster_storage_request,
+                                       methods=[method])
 
-    async def health(self) -> Response:
-        return Response(status_code=200)
-
-    async def version(self) -> JSONResponse:
-        ver = {"version": VERSION}
-        return JSONResponse(content=ver)
-
-    async def merge_streaming_responses(self, ctx_response,
-                                        gen_server: str,
-                                        gen_req: Union[CompletionRequest, ChatCompletionRequest]):
+    async def _proxy_cluster_storage_request(self,
+                                             raw_req: Request) -> Response:
         try:
+            body, status, content_type = (
+                await self._coordinator.proxy_cluster_storage_request(
+                    raw_req.method, raw_req.url.path,
+                    list(raw_req.query_params.multi_items()),
+                    await raw_req.body(), raw_req.headers.get("Content-Type")))
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.warning(f"Failed to proxy cluster storage request: {e}")
+            return JSONResponse(status_code=502,
+                                content={"error": "coordinator unavailable"})
+        headers = {"Content-Type": content_type} if content_type else None
+        return Response(content=body, status_code=status, headers=headers)
 
-            if ctx_response is not None and len(ctx_response.choices) != 1:
-                raise ValueError("Context server did not return a single choice. This is not expected")
+    @staticmethod
+    def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
+        """Populate conversation_params.conversation_id from supported headers.
 
-            # First yield the context response if it's not None
-            if ctx_response is not None:
-                # Remove the disaggregated params from the context response
-                data = ctx_response.model_dump()
-                del data['choices'][0]['disaggregated_params']
-                data = json.dumps(data)
-                yield f"data: {data}\n\n".encode('utf-8')
+        Body ``conversation_params.conversation_id`` is canonical. Headers are
+        used only when the body does not provide an id.
+        """
+        resolve_request_conversation_id(req, raw_req.headers)
 
-            #If request finished after first token not due to length, return right away and skip gen
-            if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
-                yield f"data: [DONE]\n\n".encode('utf-8')
-            else:
-                # Then yield the generation responses
-                if isinstance(gen_req, CompletionRequest):
-                    gen_response = await self.send_completion_request(gen_server, gen_req)
-                elif isinstance(gen_req, ChatCompletionRequest):
-                    gen_response = await self.send_chat_request(gen_server, gen_req)
+    def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
+        # Bind the concrete request model per route so FastAPI validates against it.
+        # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
+        # CompletionRequest first and 400 every chat body, so override the wrapper's
+        # annotation with request_type (as openai_server.py does).
+        @tracing.trace_span("disaggregated_request")
+        async def wrapper(req: request_type, raw_req: Request) -> Response:
+            try:
+                self._perf_metrics_collector.total_requests.inc()
+                if req.stream:
+                    self._perf_metrics_collector.stream_requests.inc()
                 else:
-                    raise TypeError("Invalid request type: {type(gen_req).__name__}")
+                    self._perf_metrics_collector.nonstream_requests.inc()
+                try:
+                    ensure_request_chat_template_allowed(
+                        req, self._allow_request_chat_template)
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
+                self._extract_conversation_id(req, raw_req)
+                hooks = RawRequestResponseHooks(
+                    raw_req, self._perf_metrics_collector.queue_latency_seconds,
+                    self._collect_perf_metrics)
+                response_or_generator = await entry_point(req, hooks)
+                self._perf_metrics_collector.total_responses.inc()
+                if req.stream:
+                    return StreamingResponse(
+                        content=response_or_generator,
+                        media_type="text/event-stream")
+                return JSONResponse(content=response_or_generator.model_dump())
+            except Exception as e:
+                self._handle_exception(e)
+        return wrapper
 
-                async for chunk in gen_response.body_iterator:
-                    yield chunk
-
-        finally:
-            await self.gen_router.finish_request(gen_req)
-
-    async def openai_completion(self, req: CompletionRequest) -> Response:
-        try:
-            if not isinstance(req.prompt, str):
-                # Check if it's a list and contains integers
-                if type(req.prompt) is list and len(req.prompt) == 1:
-                    req.prompt = req.prompt[0]
-                elif not isinstance(req.prompt, list) or not all(isinstance(x, int) for x in req.prompt):
-                    raise ValueError("Disaggregated server currently only supports single string prompt or list of integers in request")
-
-            return await self._send_disagg_request(req)
-
-        except Exception as e:
-            await self._handle_exception(e)
-
-    async def openai_chat_completion(self, req: ChatCompletionRequest) -> Response:
-
-        try:
-            return await self._send_disagg_request(req)
-        except Exception as e:
-            await self._handle_exception(e)
-
-    async def _handle_exception(self, exception):
+    def _handle_exception(self, exception):
         if isinstance(exception, CppExecutorError):
-            logging.exception(exception)
+            logger.error("CppExecutorError: ", traceback.format_exc())
             signal.raise_signal(signal.SIGINT)
         elif isinstance(exception, HTTPException):
-            raise exception  # Re-raise HTTP exceptions properly
+            self._perf_metrics_collector.http_exceptions.inc()
+            logger.error(f"HTTPException {exception.status_code} {exception.detail}: ", traceback.format_exc())
+            raise exception
         else:
-            logging.exception(exception)
+            self._perf_metrics_collector.internal_errors.inc()
+            logger.error("Internal server error: ", traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
-    async def _send_context_request(self, ctx_server: str, ctx_req: Union[CompletionRequest, ChatCompletionRequest]):
 
-        ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
-        ctx_req.stream = False
-        ctx_req.stream_options = None
+    async def health(self) -> Response:
+        if not await self._coordinator.is_ready():
+            return Response(status_code=503)
+        return Response(status_code=200)
 
-        logging.info("Sending request to ctx server: %s", ctx_server)
-        try:
-            if isinstance(ctx_req, ChatCompletionRequest):
-                ctx_response = await self.send_chat_request(ctx_server, ctx_req)
-            else:
-                assert isinstance(ctx_req, CompletionRequest)
-                ctx_response = await self.send_completion_request(ctx_server, ctx_req)
-        finally:
-            await self.ctx_router.finish_request(ctx_req)
+    async def cluster_info(self) -> JSONResponse:
+        return JSONResponse(content=await self._coordinator.cluster_info())
 
-        choices = ctx_response.choices
-        if len(choices) > 1:
-            raise ValueError("Disagg server returned more than one choice. This is currently not supported in disaggregated server.")
-        if choices[0].disaggregated_params is None:
-            raise ValueError("Context server did not return disaggregated params")
+    async def version(self) -> JSONResponse:
+        return JSONResponse(content={"version": VERSION})
 
-        return ctx_response
-
-    async def _send_disagg_request(self, req: Union[CompletionRequest, ChatCompletionRequest]):
-        gen_server = None
-        need_ctx = False
-        try:
-            # Determine if need context server
-            condition = self.conditional_disagg_config
-            if condition is not None:
-                assert isinstance(self.gen_router, KvCacheAwareRouter)
-                # Query kv cache status and select a best gen_server.
-                # The server is reserved for generation request
-                gen_server, info = await self.gen_router.get_next_server(req)
-                match_length = sum(info["matches"])
-                total_length = sum(len(token_list) for token_list in info["token_lists"])
-                if match_length == 0 or total_length - match_length > condition.max_local_prefill_length:
-                    need_ctx = True
-            elif os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
-                # Hard-code first token, ctx_request_id for testing
-                req.disaggregated_params = DisaggregatedParams(
-                    request_type="generation_only",
-                    first_gen_tokens=[7],
-                    ctx_request_id=1,
-                    encoded_opaque_state=None,
-                    draft_tokens=None)
-                # Since KV cache for prompt tokens will be uninitialized, need to ignore eos
-                req.ignore_eos = True
-            else:
-                need_ctx = True
-
-            if need_ctx:
-                ctx_req = copy.deepcopy(req)
-                ctx_server, _ = await self.ctx_router.get_next_server(ctx_req)
-                # TODO: add ctx_server info into generation request for pre-registration
-                ctx_response = await self._send_context_request(ctx_server, ctx_req)
-
-                if ctx_response is not None and len(ctx_response.choices) != 1:
-                    raise ValueError("Context server did not return a single choice. This is not expected")
-
-                # Append disaggregates parameters to generation request
-                req.disaggregated_params = ctx_response.choices[0].disaggregated_params
-                req.disaggregated_params.request_type = "generation_only"
-
-                # Replace the string prompt with prompt_tokens_ids
-                if isinstance(req, CompletionRequest):
-                    req.prompt = ctx_response.prompt_token_ids
-                elif isinstance(req, ChatCompletionRequest):
-                    req.prompt_token_ids = ctx_response.prompt_token_ids
-                else:
-                    raise ValueError("Invalid request type: {type(req).__name__}")
-            else:
-                ctx_response = None
-
-            # Pick a generation server if haven't reserved one, and send request
-            if gen_server is None:
-                gen_server, _ = await self.gen_router.get_next_server(req)
-            logging.info("Sending request to gen server: %s", gen_server)
-
-            if not req.stream:
-                try:
-                    #If request finished after first token for reason other than length, return right away and skip gen
-                    if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length","not_finished"]:
-                        del ctx_response.choices[0].disaggregated_params
-                        return ctx_response
-                    else:
-                        if isinstance(req, CompletionRequest):
-                            gen_response = await self.send_completion_request(gen_server, req)
-                        else:
-                            assert isinstance(req, ChatCompletionRequest)
-                            gen_response = await self.send_chat_request(gen_server, req)
-                        return gen_response
-                finally:
-                    if gen_server is not None:
-                        await self.gen_router.finish_request(req)
-
-            else:
-                # Return a streaming response that combines both context and generation responses
-                return StreamingResponse(
-                    self.merge_streaming_responses(ctx_response, gen_server, req),
-                    media_type="text/event-stream"
-                )
-        except:
-            if gen_server is not None:
-                await self.gen_router.finish_request(req)
-            raise
-
-
-    async def __call__(self, host, port):
+    async def __call__(self, host: str, port: int, sockets: list[socket.socket] | None = None):
+        keep_alive_timeout = self._config.server_keep_alive_timeout
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
-                                log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve()
+                                log_level=logger.level,
+                                timeout_keep_alive=keep_alive_timeout)
+        await uvicorn.Server(config).serve(sockets=sockets)
 
-    async def create_generator(self, url: str, request: Union[CompletionRequest, ChatCompletionRequest], end_point: str):
-        async with self.session.post(url + end_point, json=request.model_dump(exclude_unset=True)) as response:
-            content_type = response.headers.get("Content-Type", "")
-            if "text/event-stream" in content_type:
-                if not request.stream:
-                    raise ValueError("Received an event-stream although request stream was False")
+    async def _sync_server_clock(self, server: str):
+        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
+        async def query_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> tuple[Optional[float], Optional[float]]:
+            try:
+                originate_ts = get_steady_clock_now_in_seconds()
+                async with session.get(server_url) as response:
+                    destination_ts = get_steady_clock_now_in_seconds()
+                    if response.status == 200:
+                        response_content = await response.json()
+                        # Compute the steady clock timestamp difference using the NTP clock synchronization algorithm. https://en.wikipedia.org/wiki/Network_Time_Protocol#Clock_synchronization_algorithm
+                        receive_ts = response_content['receive_ts']
+                        transmit_ts = response_content['transmit_ts']
+                        delay = (destination_ts - originate_ts) - (transmit_ts - receive_ts)
+                        offset = ((receive_ts - originate_ts) + (transmit_ts - destination_ts)) / 2
+                        return delay, offset
+                    else:
+                        return None, None
+            except Exception:
+                return None, None
 
-                try:
-                    async for line in response.content.iter_any():
-                        if line:
-                            yield line
-                            await asyncio.sleep(0)
-                except Exception as e:
-                    logging.error(f"Unexpected error in stream: {e}")
-                    raise
+        async def set_steady_clock_offset(session: aiohttp.ClientSession, server_url: str, offset: float) -> None:
+            payload = {"offset": offset}
+            async with session.post(server_url, json=payload) as response:
+                if response.status != 200:
+                    logger.warning(f"Cannot set disagg server steady clock offset for server {server_url}, the perf metrics timestamps could be mis-aligned")
 
-    async def create_completion_generator(self, url: str, request: CompletionRequest):
-        async for chunk in self.create_generator(url, request, "/v1/completions"):
-            yield chunk
+        async def align_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> None:
+            delay, offset = await query_steady_clock_offset(session, server_url)
+            if delay is None or offset is None:
+                logger.warning(f"Unable to measure steady clock offset for {server_url}; skipping adjustment")
+                return
+            logger.info(f'Server: {server_url}, delay: {delay} second, offset: {offset} second')
+            # Negate the offset so that worker servers can adjust their steady clock by adding the new offset
+            await set_steady_clock_offset(session, server_url, -offset)
 
-    async def create_chat_generator(self, url: str, request: ChatCompletionRequest):
-        async for chunk in self.create_generator(url, request, "/v1/chat/completions"):
-            yield chunk
-
-    async def send_request(self, url: str,
-                           request: Union[CompletionRequest, ChatCompletionRequest],
-                           endpoint: str,
-                           response_type: Type[Union[CompletionResponse, ChatCompletionResponse]],
-                           create_generator: callable) -> Union[CompletionResponse, ChatCompletionResponse, StreamingResponse]:
-        if request.stream:
-            response_generator = create_generator(url, request)
-            return StreamingResponse(content=response_generator, media_type="text/event-stream")
-        else:
-            async with self.session.post(url + endpoint, json=request.model_dump(exclude_unset=True)) as response:
-                content_type = response.headers.get("Content-Type", "")
-                if "text/event-stream" in content_type:
-                    raise ValueError("Received an event-stream although request stream was False")
-
-                response_dict = await response.json()
-                if not response.ok:
-                    logging.error(f"Received failed response {response_dict}")
-                    response.raise_for_status()
-                return response_type(**response_dict)
-
-    async def send_completion_request(self, url: str, request: CompletionRequest) -> Union[CompletionResponse, StreamingResponse]:
-        return await self.send_request(url, request, "/v1/completions", CompletionResponse, self.create_completion_generator)
-
-    async def send_chat_request(self, url: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
-        return await self.send_request(url, request, "/v1/chat/completions", ChatCompletionResponse, self.create_chat_generator)
-
-    async def check_server_ready(self, server_url: str) -> bool:
-        try:
-            async with self.session.get(server_url+"/health") as response:
-                return response.status == 200
-        except Exception:
-            return False
-
-    async def wait_for_servers_ready(self, server_start_timeout_secs: int = 180):
-        async def are_servers_ready():
-            context_ready = all([await self.check_server_ready(url) for url in self.ctx_servers])
-            generation_ready = all([await self.check_server_ready(url) for url in self.gen_servers])
-            return context_ready and generation_ready
-
-        async def check_all_servers_ready():
-            while not await are_servers_ready():
-                wait_time = 3
-                logging.info("Context and generation servers are not ready. Waiting...")
-                await asyncio.sleep(wait_time)
+        server_scheme = "http://" if not server.startswith("http://") else ""
+        server_url = f"{server_scheme}{server}/steady_clock_offset"
 
         try:
-            await asyncio.wait_for(check_all_servers_ready(), timeout=server_start_timeout_secs)
-        except asyncio.CancelledError:
-            raise TimeoutError("Timeout waiting for context and generation servers to be ready")
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
+                timeout=aiohttp.ClientTimeout(total=self._req_timeout_secs)) as session:
+                await align_steady_clock_offset(session, server_url)
+        except (aiohttp.ClientError, OSError) as e:
+            logger.warning(f"Unable to align steady clock offset for {server_url}: {e}; skipping adjustment")

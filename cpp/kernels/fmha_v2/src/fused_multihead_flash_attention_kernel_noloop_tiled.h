@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -170,17 +175,40 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     // The start/end step of kv loops.
     // Do we need to mask out the tokens that is not in the sliding window.
     bool const mask_sliding_window
-        = Kernel_traits::SLIDING_WINDOW_ATTENTION && binfo.actual_kv_seqlen > params.sliding_window_size;
+        = (Kernel_traits::SLIDING_WINDOW_ATTENTION && binfo.actual_kv_seqlen > params.sliding_window_size)
+        || (Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+            && binfo.actual_kv_seqlen > params.sliding_window_size / 2 + 1); // +1 to include self token
+
     int const valid_seqlen = Kernel_traits::CAUSAL_MASK ? min(q_sequence_start + Cta_tile_p::M, binfo.actual_kv_seqlen)
                                                         : binfo.actual_kv_seqlen;
 
-    int const kv_loop_end = ((valid_seqlen + Cta_tile_p::N - 1) / Cta_tile_p::N) * Cta_tile_p::N;
-    int const kv_loop_start = mask_sliding_window
-        ? (max(0, q_sequence_start - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N
-        : 0;
-    int const sliding_window_mask_end = mask_sliding_window
-        ? (max(0, q_sequence_start + Cta_tile_p::M - 1 - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N
-        : 0;
+    int kv_loop_start = 0;
+    int kv_loop_end = fmha::div_up(valid_seqlen, int(Cta_tile_p::N)) * int(Cta_tile_p::N);
+    int sliding_window_mask_left = 0;
+    int sliding_window_mask_right = kv_loop_end;
+    if (mask_sliding_window)
+    {
+        if constexpr (Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
+        {
+            kv_loop_start = (max(0, q_sequence_start - params.sliding_window_size / 2) / Cta_tile_p::N) * Cta_tile_p::N;
+            sliding_window_mask_left
+                = (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size / 2) / Cta_tile_p::N)
+                * Cta_tile_p::N;
+
+            kv_loop_end = min(kv_loop_end,
+                (fmha::div_up(q_sequence_start + Cta_tile_p::M + params.sliding_window_size / 2, int(Cta_tile_p::N))
+                    * Cta_tile_p::N));
+            sliding_window_mask_right = min(sliding_window_mask_right,
+                ((q_sequence_start + params.sliding_window_size / 2) / int(Cta_tile_p::N)) * Cta_tile_p::N);
+        }
+        else
+        {
+            kv_loop_start = (max(0, q_sequence_start + 1 - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N;
+            sliding_window_mask_left
+                = (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size) / Cta_tile_p::N)
+                * Cta_tile_p::N;
+        }
+    }
 
     // Move K and V tiles.
     // We need offset here since we split single k loops into finer granularity.
@@ -265,7 +293,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     fmha::Clear_accumulator<Acc_type_o, Cta_tile_o::WARPS_K>::apply(acc_o);
 
     // Flash attention updater
-    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o> acc_o_normalizer;
+    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o> acc_o_normalizer(params, binfo);
     float global_max[Softmax::ROWS_PER_THREAD];
     float global_sum[Softmax::ROWS_PER_THREAD];
 
@@ -296,7 +324,8 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
         bool const first_step = (kv_loop == kv_loop_start);
         // It is possible that all tokens are masked out (sliding-window-attention).
-        bool const apply_sliding_window_mask = (mask_sliding_window && kv_loop <= sliding_window_mask_end);
+        bool const apply_sliding_window_mask
+            = (mask_sliding_window && (kv_loop <= sliding_window_mask_left || kv_loop >= sliding_window_mask_right));
         bool const apply_mask = params.has_alibi || (kv_loop >= kv_mask_loop_start) || apply_sliding_window_mask;
 
         // Declare the accumulators for the 1st gemm.
@@ -588,6 +617,8 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
     }     // Inner loop over the key/value sequence length.
 
+    // Update the sum if attention sinks are used.
+    acc_o_normalizer.update_sum(global_max, global_sum);
     // Update acc_o of flash attention
     acc_o_normalizer.final_update(acc_o, global_sum);
 

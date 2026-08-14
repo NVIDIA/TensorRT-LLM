@@ -15,17 +15,20 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 class DoraImpl
 {
 public:
     DoraImpl() = delete;
 
-    DoraImpl(std::vector<int> const& outHiddenSizes, nvinfer1::DataType type);
+    DoraImpl(std::vector<int> const& outHiddenSizes, tensorrt_llm::DataType type);
 
     ~DoraImpl() = default;
 
@@ -38,6 +41,8 @@ public:
 private:
     std::vector<int64_t> mCumModuleSizes;
     std::vector<int64_t> mHostBuf;
-    nvinfer1::DataType mType;
+    tensorrt_llm::DataType mType;
 };
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

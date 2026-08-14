@@ -22,10 +22,6 @@ set(BENCHMARK_ENABLE_TESTING
 set(BENCHMARK_ENABLE_INSTALL
     OFF
     CACHE INTERNAL "Disable google-benchmark install")
-FetchContent_Declare(
-  googlebenchmark
-  GIT_REPOSITORY https://github.com/google/benchmark.git
-  GIT_TAG v1.8.3)
 FetchContent_MakeAvailable(googlebenchmark)
 
 add_custom_target(micro_benchmarks)
@@ -44,8 +40,9 @@ function(add_benchmark test_name test_src)
                                             benchmark::benchmark)
 
   target_compile_features(${test_name} PRIVATE cxx_std_17)
-  target_compile_definitions(${test_name}
-                             PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
+  target_compile_definitions(
+    ${test_name} PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}"
+                        USING_OSS_CUTLASS_MOE_GEMM)
 
   add_dependencies(micro_benchmarks ${test_name})
 endfunction()

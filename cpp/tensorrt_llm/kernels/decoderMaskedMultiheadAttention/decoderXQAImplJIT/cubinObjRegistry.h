@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,13 +18,16 @@
 
 #include "compileEngine.h"
 #include "serializationUtils.h"
-#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplCommon.h"
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunnerUtils.h"
 
 #include <functional>
 #include <mutex>
 #include <unordered_map>
 
-namespace tensorrt_llm::kernels::jit
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::jit
 {
 
 // A thread-safe collection of CubinObjs, with caching functionality.
@@ -173,4 +176,6 @@ using CubinObjKey = XQAKernelFullHashKey;
 using CubinObjHasher = XQAKernelFullHasher;
 using CubinObjRegistry = CubinObjRegistryTemplate<CubinObjKey, CubinObjHasher>;
 
-} // namespace tensorrt_llm::kernels::jit
+} // namespace kernels::jit
+
+TRTLLM_NAMESPACE_END

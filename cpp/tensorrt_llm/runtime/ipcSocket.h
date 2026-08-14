@@ -33,7 +33,7 @@ void ncclIpcSocketClose(std::shared_ptr<NcclIpcSocket> handle);
 
 int ncclIpcSocketRecvFd(std::shared_ptr<NcclIpcSocket> handle);
 
-void ncclIpcSocketSendFd(std::shared_ptr<NcclIpcSocket> handle, int fd, int rank, uint64_t hash);
+void ncclIpcSocketSendFd(std::shared_ptr<NcclIpcSocket> handle, int fd, int rank);
 
 } // namespace tensorrt_llm::runtime
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #include "cubinObj.h"
 #include "nvrtcWrapper/include/nvrtcWrapper.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/utils.h"
@@ -44,8 +45,8 @@ void CHECK_TLLM_XQA_JIT_ERROR_(tllmXqaJitStatus result, char const* const func, 
 
 } // anonymous namespace
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -54,12 +55,15 @@ namespace jit
 CubinObj CompileEngine::compile() const
 {
     tllmXqaJitProgram program;
-    bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true);
+    // QGMMA runs attention fully in native FP8 format, including the output of the tiled
+    // Q @ K^T. For the multi-query spec-dec verify, this introduces undue errors on the verify
+    // path, which causes the rejection of otherwise legitimate tokens. In these cases, we defer
+    // to the HMMA kernel, which avoids that particular issue.
+    bool const isLinearSpecDec = mXqaParams.multi_query_tokens && !mXqaParams.is_spec_dec_tree;
+    bool const useQGMMAKernel = supportConfigQGMMA(mXqaParams, mSM, true) && !isLinearSpecDec;
+
     tllmXqaJitRopeStyle ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
-    bool const applyRoPEInXqaKernel = !mXqaParams.multi_query_tokens && useQGMMAKernel
-        && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
-                                              PositionEmbeddingType::kROPE_GPTJ},
-            mXqaParams.position_embedding_type);
+    bool const applyRoPEInXqaKernel = appliesRoPEInXqaKernel(mXqaParams, useQGMMAKernel);
     if (applyRoPEInXqaKernel)
     {
         TLLM_CHECK(useQGMMAKernel);
@@ -68,15 +72,14 @@ CubinObj CompileEngine::compile() const
         case PositionEmbeddingType::kROPE_GPTJ: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_GPTJ; break;
         case PositionEmbeddingType::kROPE_GPT_NEOX:
         case PositionEmbeddingType::kLONG_ROPE: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NEOX; break;
-        // For kROPE_M, set ropeStyle to TLLM_XQA_JIT_ROPE_NONE to let XQA kernel not apply RoPE.
-        // At runtime, a separate kernel (see invokeQKVPreprocessing) will be launched to apply RoPE.
-        case PositionEmbeddingType::kROPE_M: ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE; break;
         default: TLLM_THROW("TllmXqaJit: Bad RoPE type");
         }
     }
     else
     {
         // Make it explicit that Ampere-style kernel doesn't apply RoPE in the kernel.
+        // For kROPE_M, set ropeStyle to TLLM_XQA_JIT_ROPE_NONE to let XQA kernel not apply RoPE.
+        // At runtime, a separate kernel (see invokeQKVPreprocessing) will be launched to apply RoPE.
         ropeStyle = tllmXqaJitRopeStyle::TLLM_XQA_JIT_ROPE_NONE;
     }
     if (applyRoPEInXqaKernel)
@@ -98,12 +101,27 @@ CubinObj CompileEngine::compile() const
         /*paged_kv_cache=*/mXqaParams.paged_kv_cache,
         /*data_type=*/static_cast<int>(mXqaParams.data_type),
         /*kv_cache_data_type=*/static_cast<int>(mXqaParams.kv_cache_data_type),
-        /*kernel_type=*/useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA,
+        /*kernel_type=*/mXqaParams.isMLA() ? TLLM_XQA_JIT_MLA
+                                           : (useQGMMAKernel ? TLLM_XQA_JIT_QGMMA : TLLM_XQA_JIT_HMMA),
         /*fp8_output=*/mXqaParams.is_fp8_output,
         // If applyRoPEInXqaKernel, no scratch is needed for storing intermediate RoPE result. Use input KV instead of
         // scratch in this case.
         /*use_input_kv=*/applyRoPEInXqaKernel,
-        /*rope_style=*/ropeStyle};
+        /*rope_style=*/ropeStyle,
+        // When applying RoPE in-kernel, pass the actual rotary dim
+        // Otherwise pass head_size so the (unused) ROPE_ELEMS is valid for static_asserts.
+        /*rotary_embedding_dim=*/
+        applyRoPEInXqaKernel ? static_cast<uint32_t>(mXqaParams.rotary_embedding_dim)
+                             : static_cast<uint32_t>(mXqaParams.head_size),
+        /*is_spec_dec_tree=*/mXqaParams.is_spec_dec_tree,
+        /*use_skip_softmax_attn=*/mXqaParams.skip_softmax_threshold_scale_factor != 0};
+    if (context.kernel_type == TLLM_XQA_JIT_MLA)
+    {
+        auto const& c = context;
+        TLLM_CHECK(c.head_size == 576 && c.num_q_heads == 128 && c.num_kv_heads == 1 && c.beam_width == 1
+            && c.data_type == DATA_TYPE_E4M3 && c.kv_cache_data_type == DATA_TYPE_E4M3 && c.fp8_output == false
+            && !c.use_input_kv && ropeStyle == TLLM_XQA_JIT_ROPE_NONE);
+    }
 
     CHECK_TLLM_XQA_JIT_ERROR(tllmXqaJitCreateAndCompileProgram(&program, &context));
 
@@ -125,4 +143,5 @@ CompileEngine::CompileEngine(int SM, XQAParams const& xqaParams)
 
 } // namespace jit
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,7 +30,7 @@
 #include "tensorrt_llm/runtime/workerPool.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <cstdint>
 #include <limits>
@@ -52,7 +52,8 @@ PeftTaskNotCachedException::PeftTaskNotCachedException(std::string const& msg)
 PeftTaskNotCachedException::~PeftTaskNotCachedException() noexcept = default;
 
 std::pair<uint64_t, uint64_t> PeftCacheManager::getMaxNumSlots(PeftCacheManagerConfig const& config,
-    nvinfer1::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize, runtime::BufferManager const& bufferManager)
+    tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
+    runtime::BufferManager const& bufferManager)
 {
     TLLM_LOG_DEBUG("max1dModeSize=%llu", max1dModSize);
     TLLM_LOG_DEBUG("pageWidth=%llu", pageWidth);
@@ -223,6 +224,7 @@ void PeftCacheManager::prefetchLoraWeights(std::string const& modelDir, runtime:
         TensorPtr weights = runtime::utils::loadNpy(bufferManager, weightsFn, runtime::MemoryType::kCPU);
         TensorPtr config = runtime::utils::loadNpy(bufferManager, configFn, runtime::MemoryType::kCPU);
         TLLM_LOG_DEBUG("prefetch lora task %s", tasks[taskId].c_str());
+        configureDataType(weights->getDataType());
         mHostLoraCache->put(std::stoi(tasks[taskId]), weights, config, true);
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
@@ -262,7 +264,15 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     auto optLoraConfig = llmRequest->getLoraConfig();
     if (optTaskId || optLoraWeights || optLoraConfig)
     {
-        runtime::lora::loraValidateRequestTensors(optTaskId, optLoraWeights, optLoraConfig, mModelConfig, mWorldConfig);
+        auto const requestDataType = optLoraWeights
+            ? std::optional<tensorrt_llm::DataType>{optLoraWeights.value()->getDataType()}
+            : std::nullopt;
+        runtime::lora::loraValidateRequestTensors(
+            optTaskId, optLoraWeights, optLoraConfig, mModelConfig, mWorldConfig, requestDataType);
+        if (optLoraWeights)
+        {
+            configureDataType(optLoraWeights.value()->getDataType());
+        }
     }
     else
     {
@@ -373,11 +383,44 @@ void PeftCacheManager::addRequestPeft(std::shared_ptr<LlmRequest> llmRequest, bo
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
 }
 
-std::tuple<std::map<uint64_t, std::future<void>>, std::map<uint64_t, std::vector<uint64_t>>>
+void PeftCacheManager::configureDataType(tensorrt_llm::DataType dataType)
+{
+    auto const modelDataType = mModelConfig.getDataType();
+#ifdef ENABLE_FP8
+    TLLM_CHECK_WITH_INFO(dataType == modelDataType || dataType == tensorrt_llm::DataType::kFP8,
+        "Unsupported LoRA weights dtype %s for PEFT cache; expected model dtype %s or FP8",
+        runtime::IBuffer::getDataTypeName(dataType), runtime::IBuffer::getDataTypeName(modelDataType));
+#else
+    TLLM_CHECK_WITH_INFO(dataType == modelDataType,
+        "Unsupported LoRA weights dtype %s for PEFT cache; expected model dtype %s",
+        runtime::IBuffer::getDataTypeName(dataType), runtime::IBuffer::getDataTypeName(modelDataType));
+#endif
+
+    std::lock_guard<std::mutex> lock(mDataTypeMutex);
+    if (mDataType)
+    {
+        TLLM_CHECK_WITH_INFO(mDataType.value() == dataType,
+            "PEFT cache supports one homogeneous LoRA dtype; cache is %s but received %s",
+            runtime::IBuffer::getDataTypeName(mDataType.value()), runtime::IBuffer::getDataTypeName(dataType));
+        return;
+    }
+
+    mHostLoraCache->setDataType(dataType);
+    mDeviceLoraCache->setDataType(dataType);
+    mDataType = dataType;
+}
+
+tensorrt_llm::DataType PeftCacheManager::getDataType() const
+{
+    std::lock_guard<std::mutex> lock(mDataTypeMutex);
+    return mDataType.value_or(mModelConfig.getDataType());
+}
+
+std::tuple<std::unordered_map<uint64_t, std::future<void>>, BasePeftCacheManager::TaskIdToReqIds>
 PeftCacheManager::getTaskMaps(RequestVector const& contextRequests, RequestVector const& generationRequests)
 {
-    std::map<uint64_t, std::vector<uint64_t>> taskIdToReqIds;
-    std::map<uint64_t, std::future<void>> taskIdToFuture;
+    TaskIdToReqIds taskIdToReqIds;
+    std::unordered_map<uint64_t, std::future<void>> taskIdToFuture;
     std::lock_guard<std::mutex> futuresLock(mPutFuturesMutex);
     for (auto const& requests : {contextRequests, generationRequests})
     {
@@ -415,7 +458,7 @@ PeftCacheManager::getTaskMaps(RequestVector const& contextRequests, RequestVecto
     return {std::move(taskIdToFuture), taskIdToReqIds};
 }
 
-PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
+PeftCacheManager::EnsureBatchTaskResult PeftCacheManager::ensureBatchMapTaskId(
     RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache)
 {
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
@@ -426,7 +469,7 @@ PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
     auto [taskIdToFuture_, taskIdToReqIds] = getTaskMaps(contextRequests, generationRequests);
     auto taskIdToFuture = std::move(taskIdToFuture_); // captured structured bindings are a C++20 extension
 
-    std::map<uint64_t, std::future<std::vector<runtime::LoraCache::TaskLayerModuleConfig>>> ensureFutures;
+    std::unordered_map<uint64_t, std::future<std::vector<runtime::LoraCache::TaskLayerModuleConfig>>> ensureFutures;
     for (auto& [taskId, taskFuture] : taskIdToFuture)
     {
         auto fn = [&taskIdToFuture, taskId = taskId, this]() -> std::vector<runtime::LoraCache::TaskLayerModuleConfig>
@@ -457,18 +500,31 @@ PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
         ensureFutures.try_emplace(taskId, std::move(f));
     }
 
-    PeftTable peftTable{};
+    TaskPeftTable peftTable{};
     for (auto const& [taskId, reqIds] : taskIdToReqIds)
     {
         auto&& f = ensureFutures.at(taskId);
         auto const values = f.get();
-        for (auto const& reqId : reqIds)
-        {
-            peftTable.try_emplace(reqId, values);
-        }
+        peftTable.try_emplace(taskId, values);
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
-    return peftTable;
+    return {std::move(peftTable), std::move(taskIdToReqIds)};
+}
+
+PeftCacheManager::PeftTable PeftCacheManager::ensureBatch(
+    RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache)
+{
+    auto [taskTable, taskIdToReqIds] = ensureBatchMapTaskId(contextRequests, generationRequests, resetGpuCache);
+    PeftTable requestTable{};
+    for (auto const& [taskId, values] : taskTable)
+    {
+        auto const& reqIds = taskIdToReqIds.at(taskId);
+        for (auto const reqId : reqIds)
+        {
+            requestTable.try_emplace(reqId, values);
+        }
+    }
+    return requestTable;
 }
 
 bool PeftCacheManager::isTaskCached(uint64_t taskId) const
@@ -484,6 +540,11 @@ bool PeftCacheManager::isTaskDone(uint64_t taskId) const
 bool PeftCacheManager::isTaskDoneDevice(uint64_t taskId) const
 {
     return mDeviceLoraCache->isDone(taskId);
+}
+
+bool PeftCacheManager::isTaskCachedDevice(uint64_t const taskId) const
+{
+    return mDeviceLoraCache->has(taskId);
 }
 
 void PeftCacheManager::updateTaskState(uint64_t taskId, uint64_t reqId, bool terminate, bool pause)
@@ -601,10 +662,7 @@ SizeType32 PeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> llmRe
             {
                 return mHostLoraCache->determineNumPages(llmRequest->getLoraConfig().value());
             }
-            else
-            {
-                throw;
-            }
+            throw;
         }
     }
     TLLM_LOG_DEBUG("%s stop", __PRETTY_FUNCTION__);
@@ -648,3 +706,5 @@ SizeType32 NoOpPeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> l
     return 0;
 }
 } // namespace tensorrt_llm::batch_manager
+
+// TODO: merge C++ LoRA caching status with Py Slot manager

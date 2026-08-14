@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #define UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper"
@@ -26,28 +31,31 @@
 
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
-#include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "gtest/gtest.h"
+#include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <gmock/gmock.h>
 #include <memory>
 #include <random>
-#include <tensorrt_llm/batch_manager/dataTransceiverImpl.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
-#include <tensorrt_llm/executor/cache_transmission/cacheConcatenate.h>
+#include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
@@ -70,7 +78,7 @@ std::unique_ptr<texec::kv_cache::ConnectionManager> makeOneUcxConnectionManager(
         void* ret = dllGetSym(handle, name);
 
         TLLM_CHECK_WITH_INFO(ret != nullptr,
-            "Unable to load UCX wrapper library symbol, possible cause is that TensorRT-LLM library is not "
+            "Unable to load UCX wrapper library symbol, possible cause is that TensorRT LLM library is not "
             "built with UCX support, please rebuild in UCX-enabled environment.");
         return ret;
     };
@@ -84,6 +92,43 @@ class UcxCommTest : public ::testing::Test
 };
 
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using TransceiverTag = tensorrt_llm::batch_manager::TransceiverTag;
+
+TEST_F(UcxCommTest, recvConnectCancellation)
+{
+    try
+    {
+        auto connectionManager = makeOneUcxConnectionManager();
+        ASSERT_NE(connectionManager, nullptr);
+
+        std::atomic<bool> transferTerminate{false};
+        TransceiverTag::Id id;
+        auto receiveFuture = std::async(std::launch::async,
+            [&]() {
+                return connectionManager->recvConnect(
+                    DataContext{TransceiverTag::kID_TAG, transferTerminate}, &id, sizeof(id));
+            });
+
+        constexpr auto kReceiveStartPeriod = std::chrono::milliseconds{100};
+        constexpr auto kCancellationTimeout = std::chrono::seconds{5};
+        ASSERT_EQ(receiveFuture.wait_for(kReceiveStartPeriod), std::future_status::timeout);
+
+        transferTerminate.store(true, std::memory_order_relaxed);
+        ASSERT_EQ(receiveFuture.wait_for(kCancellationTimeout), std::future_status::ready);
+        EXPECT_EQ(receiveFuture.get(), nullptr);
+    }
+    catch (std::exception const& e)
+    {
+        std::string error = e.what();
+        if (error.find("UCX wrapper library is not open correctly") != std::string::npos
+            || error.find("Unable to load UCX wrapper library symbol") != std::string::npos)
+        {
+            GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
+        }
+
+        throw e;
+    }
+}
 
 TEST_F(UcxCommTest, Basic)
 {
@@ -127,11 +172,11 @@ TEST_F(UcxCommTest, Basic)
         tensorrt_llm::runtime::BufferManager bufferManager{std::make_shared<tensorrt_llm::runtime::CudaStream>()};
 
         // Create and fill source CUDA buffer with random data
-        auto srcBuffer = bufferManager.gpu(buffer.size(), nvinfer1::DataType::kINT8);
+        auto srcBuffer = bufferManager.gpu(buffer.size(), tensorrt_llm::DataType::kINT8);
         bufferManager.copy(buffer.data(), *srcBuffer);
         bufferManager.getStream().synchronize();
 
-        auto dstBuffer = bufferManager.gpu(buffer.size(), nvinfer1::DataType::kINT8);
+        auto dstBuffer = bufferManager.gpu(buffer.size(), tensorrt_llm::DataType::kINT8);
 
         // Send CUDA buffer using connection1
         connection1->send(DataContext{0x75}, srcBuffer->data(), srcBuffer->getSizeInBytes());
@@ -199,14 +244,14 @@ TEST_F(UcxCommTest, multiSend)
 
         tensorrt_llm::runtime::BufferManager bufferManager{std::make_shared<tensorrt_llm::runtime::CudaStream>()};
 
-        auto srcBuffer1 = bufferManager.gpu(buffer1.size(), nvinfer1::DataType::kINT8);
-        auto srcBuffer2 = bufferManager.gpu(buffer2.size(), nvinfer1::DataType::kINT8);
+        auto srcBuffer1 = bufferManager.gpu(buffer1.size(), tensorrt_llm::DataType::kINT8);
+        auto srcBuffer2 = bufferManager.gpu(buffer2.size(), tensorrt_llm::DataType::kINT8);
         bufferManager.copy(buffer1.data(), *srcBuffer1);
         bufferManager.copy(buffer2.data(), *srcBuffer2);
         bufferManager.getStream().synchronize();
 
-        auto dstBuffer1 = bufferManager.gpu(buffer1.size(), nvinfer1::DataType::kINT8);
-        auto dstBuffer2 = bufferManager.gpu(buffer2.size(), nvinfer1::DataType::kINT8);
+        auto dstBuffer1 = bufferManager.gpu(buffer1.size(), tensorrt_llm::DataType::kINT8);
+        auto dstBuffer2 = bufferManager.gpu(buffer2.size(), tensorrt_llm::DataType::kINT8);
 
         connection1Peer->send(DataContext{0x75}, srcBuffer1->data(), srcBuffer1->getSizeInBytes());
         connection2Peer->send(DataContext{0x75}, srcBuffer2->data(), srcBuffer2->getSizeInBytes());

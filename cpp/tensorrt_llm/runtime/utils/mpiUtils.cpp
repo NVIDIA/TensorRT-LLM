@@ -27,6 +27,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #ifndef _WIN32
@@ -96,6 +97,7 @@ namespace
 
 bool mpiInitialized = false;
 std::recursive_mutex mpiMutex;
+using SignalHandler = void (*)(int);
 
 MpiComm initLocalSession()
 {
@@ -161,6 +163,26 @@ int getNumNodes()
 #endif
 }
 
+bool isFaultToleranceModeEnabled()
+{
+    char const* val = std::getenv("TLLM_FAULT_TOLERANCE_MODE");
+    return val != nullptr && std::string_view(val) == "1";
+}
+
+void installFaultToleranceSignalHandlers()
+{
+    // Exit code mirrors the SIGKILL convention (128 + 9 = 137) so logs distinguish
+    // "rank died in WideEP FT mode" from generic crashes (typical EXIT_FAILURE = 1).
+    static constexpr int kFtRankAbortExitCode = 137;
+    for (int sig : {SIGABRT, SIGSEGV})
+    {
+        // Async-signal-safe: _exit() is in POSIX's safe set; MPI_Abort and printf are not.
+        // No logging from inside the handler; survivors log the dead-peer event.
+        SignalHandler previousHandler = std::signal(sig, [](int /*signal*/) { _exit(kFtRankAbortExitCode); });
+        TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "WideEP FT signal handler setup failed");
+    }
+}
+
 void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
 {
     // double-checked locking
@@ -190,26 +212,40 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
          * signals. Signals like SIGINT and SIGTERM should be issued to the parent and should terminate MPI workers
          * correctly.
          */
-        for (int sig : {SIGABRT, SIGSEGV})
+        if (isFaultToleranceModeEnabled())
         {
-            __sighandler_t previousHandler = nullptr;
-            if (forwardAbortToParent)
+            // WideEP FT mode (PR 1d.0): replace the MPI_Abort/SIGKILL handlers with a non-propagating
+            // _exit(137). FT mode also overrides forwardAbortToParent: killing the parent would defeat
+            // the entire purpose of letting survivors outlive a peer death.
+            installFaultToleranceSignalHandlers();
+            TLLM_LOG_INFO(
+                "WideEP fault-tolerance MPI signal handler mode enabled (TLLM_FAULT_TOLERANCE_MODE=1). "
+                "Reminder: launch mpirun with --mca orte_enable_recovery 1 for the handler to be effective; "
+                "see WideEP FT design §5.4 and audit-1a-findings.md Day 2.");
+        }
+        else
+        {
+            for (int sig : {SIGABRT, SIGSEGV})
             {
-                previousHandler = std::signal(sig,
-                    [](int signal)
-                    {
+                SignalHandler previousHandler = nullptr;
+                if (forwardAbortToParent)
+                {
+                    previousHandler = std::signal(sig,
+                        [](int signal)
+                        {
 #ifndef _WIN32
-                        pid_t parentProcessId = getppid();
-                        kill(parentProcessId, SIGKILL);
+                            pid_t parentProcessId = getppid();
+                            kill(parentProcessId, SIGKILL);
 #endif
-                        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-                    });
+                            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+                        });
+                }
+                else
+                {
+                    previousHandler = std::signal(sig, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
+                }
+                TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
             }
-            else
-            {
-                previousHandler = std::signal(sig, [](int signal) { MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE); });
-            }
-            TLLM_CHECK_WITH_INFO(previousHandler != SIG_ERR, "Signal handler setup failed");
         }
 
         // ensure local MPI communicator is initialized
@@ -222,6 +258,7 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
 
 void MpiComm::barrier() const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Barrier(mComm));
 #else
@@ -267,6 +304,7 @@ size_t invokeChunked(TMpiFunc func, TBase* buffer, size_t size, MPI_Datatype dty
 
 std::unique_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiType dtype, int root) const
 {
+    couldUseMPI();
     std::unique_ptr<MpiRequest> r = std::make_unique<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Ibcast, buffer, size, getMpiDtype(dtype), root, mComm, &r->mRequest);
@@ -278,11 +316,13 @@ std::unique_ptr<MpiRequest> MpiComm::bcastAsync(void* buffer, size_t size, MpiTy
 
 std::unique_ptr<MpiRequest> MpiComm::bcastAsync(runtime::IBuffer& buf, int root) const
 {
+    couldUseMPI();
     return bcastAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
 
 void MpiComm::bcast(void* buffer, size_t size, MpiType dtype, int root) const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Bcast, buffer, size, getMpiDtype(dtype), root, mComm);
 #else
@@ -292,12 +332,14 @@ void MpiComm::bcast(void* buffer, size_t size, MpiType dtype, int root) const
 
 void MpiComm::bcast(runtime::IBuffer& buf, int root) const
 {
+    couldUseMPI();
     bcast(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, root);
 }
 
 std::unique_ptr<MpiRequest> MpiComm::sendAsync(
     void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
 {
+    couldUseMPI();
     TLLM_LOG_DEBUG("start MPI_Isend with dest %d, tag %d, size %d", dest, static_cast<int>(tag), size);
     std::unique_ptr<MpiRequest> r = std::make_unique<MpiRequest>();
 #if ENABLE_MULTI_DEVICE
@@ -311,11 +353,13 @@ std::unique_ptr<MpiRequest> MpiComm::sendAsync(
 
 std::unique_ptr<MpiRequest> MpiComm::sendAsync(runtime::IBuffer const& buf, int dest, MpiTag tag) const
 {
+    couldUseMPI();
     return sendAsync(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
 }
 
 void MpiComm::sendRawTag(void const* buffer, size_t size, MpiType dtype, int dest, int tag) const
 {
+    couldUseMPI();
     TLLM_LOG_DEBUG("start MPI_Send with dest %d, tag %d, size %d", dest, tag, size);
 #if ENABLE_MULTI_DEVICE
     invokeChunked(MPI_Send, buffer, size, getMpiDtype(dtype), dest, tag, mComm);
@@ -327,16 +371,19 @@ void MpiComm::sendRawTag(void const* buffer, size_t size, MpiType dtype, int des
 
 void MpiComm::send(void const* buffer, size_t size, MpiType dtype, int dest, MpiTag tag) const
 {
+    couldUseMPI();
     sendRawTag(buffer, size, dtype, dest, static_cast<int>(tag));
 }
 
 void MpiComm::send(runtime::IBuffer const& buf, int dest, MpiTag tag) const
 {
+    couldUseMPI();
     send(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, dest, tag);
 }
 
 MPI_Status MpiComm::recvRawTag(void* buffer, size_t size, MpiType dtype, int source, int tag) const
 {
+    couldUseMPI();
     TLLM_LOG_DEBUG("start MPI_Recv with source %d, tag %d, size %d", source, tag, size);
     MPI_Status status{};
 #if ENABLE_MULTI_DEVICE
@@ -350,11 +397,13 @@ MPI_Status MpiComm::recvRawTag(void* buffer, size_t size, MpiType dtype, int sou
 
 MPI_Status MpiComm::recv(void* buffer, size_t size, MpiType dtype, int source, MpiTag tag) const
 {
+    couldUseMPI();
     return recvRawTag(buffer, size, dtype, source, static_cast<int>(tag));
 }
 
 MPI_Status MpiComm::recv(runtime::IBuffer& buf, int source, MpiTag tag) const
 {
+    couldUseMPI();
     return recv(buf.data(), buf.getSizeInBytes(), MpiType::kBYTE, source, tag);
 }
 
@@ -382,6 +431,7 @@ MpiComm const& MpiComm::setRawSessionByFortran(int64_t fortranHandle)
 
 void MpiComm::allreduce(void const* sendbuf, void* recvbuf, int count, MpiType dtype, MpiOp op) const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Allreduce(sendbuf, recvbuf, count, getMpiDtype(dtype), getMpiOp(op), mComm));
 #else
@@ -391,6 +441,7 @@ void MpiComm::allreduce(void const* sendbuf, void* recvbuf, int count, MpiType d
 
 void MpiComm::allgather(void const* sendbuf, void* recvbuf, int count, MpiType dtype) const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Allgather(sendbuf, count, getMpiDtype(dtype), recvbuf, count, getMpiDtype(dtype), mComm));
 #else
@@ -401,6 +452,7 @@ void MpiComm::allgather(void const* sendbuf, void* recvbuf, int count, MpiType d
 void MpiComm::allgatherv(void const* sendbuf, int sendcount, MpiType sendtype, void* recvbuf,
     std::vector<int> const& recvcounts, std::vector<int> const& displs, MpiType recvtype) const
 {
+    couldUseMPI();
 #if ENABLE_MULTI_DEVICE
     MPICHECK(MPI_Allgatherv(sendbuf, sendcount, getMpiDtype(sendtype), recvbuf, recvcounts.data(), displs.data(),
         getMpiDtype(recvtype), mComm));
@@ -450,6 +502,7 @@ bool MpiComm::iprobe(int source, MpiTag tag, MPI_Status* status) const
 
 void MpiComm::recvPoll(int source, MpiTag tag, int periodMs) const
 {
+    couldUseMPI();
     MPI_Status status;
     while (!iprobe(source, tag, &status))
     {
@@ -544,9 +597,16 @@ MpiComm::~MpiComm() noexcept
 #if ENABLE_MULTI_DEVICE
     if (mFreeComm && mComm)
     {
-        if (MPI_Comm_free(&mComm) != MPI_SUCCESS)
+        // Calling MPI_Comm_free after MPI has been finalized is undefined behavior.
+        // We need this check to prevent heap corruption during program exit when
+        // static MpiComm objects are created.
+        int finalized = 0;
+        if (MPI_Finalized(&finalized) == MPI_SUCCESS && !finalized)
         {
-            TLLM_LOG_ERROR("MPI_Comm_free failed");
+            if (MPI_Comm_free(&mComm) != MPI_SUCCESS)
+            {
+                TLLM_LOG_ERROR("MPI_Comm_free failed");
+            }
         }
     }
 #endif // ENABLE_MULTI_DEVICE

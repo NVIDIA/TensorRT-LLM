@@ -38,6 +38,7 @@ std::ostream& operator<<(std::ostream& os, ContextChunkingPolicy policy)
     {
     case ContextChunkingPolicy::kEQUAL_PROGRESS: os << "EQUAL_PROGRESS"; break;
     case ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED: os << "FIRST_COME_FIRST_SERVED"; break;
+    case ContextChunkingPolicy::kFORCE_CHUNK: os << "FORCE_CHUNK"; break;
     }
     return os;
 }

@@ -9,23 +9,24 @@ In addition, most tests are based on the offline API -- [LLM API](https://nvidia
 This test suite is organized as following:
 * [accuracy_core.py](./accuracy_core.py) provides the test harness, including hypothesis testing logics, evaluation task configurations, and common utilities.
 * [test_cli_flow.py](./test_cli_flow.py) contains the tests with CLI workflow, i.e., checkpoint conversion, engine building and evaluation.
-* [test_llm_api.py](./test_llm_api.py) contains the tests with LLM API and TensorRT backend.
 * [test_llm_api_pytorch.py](./test_llm_api_pytorch.py) contains the tests with LLM API and PyTorch backend.
 * [references](./references) registers the reference accuracies for each task, each model and each specification (e.g., data type, quantization).
 * [scripts](./scripts) provides some utility scripts that may help setup accuracy tests.
 
 The following tasks are currently supported:
 
-| Dataset           | Task                | Metric     | LLM API | CLI flow |
-|:-----------------:|:-------------------:|:----------:|:-------:|:--------:|
-| CNN Dailymail     | summarization       | rouge      | Y | Y |
-| MMLU              | QA; multiple choice | accuracy   | Y | Y |
-| GSM8K             | QA; regex matching  | accuracy   | Y | N |
-| GPQA              | QA; multiple choice | accuracy   | Y | N |
-| Humaneval         | code completion     | rouge*     | N | Y |
-| ZeroScrolls       | summarization       | rouge      | N | Y |
-| Passkey retrieval | retrieval           | accuracy   | N | Y |
-| SlimPajama-6B     | perplexity          | perplexity | N | Y |
+| Dataset                | Task                  | Metric     | Default ISL | Default OSL | LLM API | CLI flow |
+|:----------------------:|:---------------------:|:----------:|------------:|------------:|:--------:|:--------:|
+| CNN Dailymail          | summarization         | rouge      |         924 |         100 | Y | Y |
+| MMLU                   | QA; multiple choice   | accuracy   |       4,094 |           2 | Y | Y |
+| GSM8K                  | QA; regex matching    | accuracy   |       4,096 |         256 | Y | N |
+| GPQA                   | QA; multiple choice   | accuracy   |      32,768 |       4,096 | Y | N |
+| JSON mode eval         | structured generation | accuracy   |       1,024 |         512 | Y | N |
+| Humaneval              | code completion       | rouge*     |         924 |         100 | N | Y |
+| ZeroScrolls            | summarization         | rouge      |      24,576 |       8,192 | N | Y |
+| Passkey retrieval 64k  | retrieval             | accuracy   |      65,536 |          50 | N | Y |
+| Passkey retrieval 128k | retrieval             | accuracy   |     131,072 |          50 | N | Y |
+| SlimPajama-6B          | perplexity            | perplexity |      16,384 |           1 | N | Y |
 
 \* Rouge is an informal evaluation metric for code completion.
 
@@ -123,7 +124,7 @@ meta-llama/Llama-3.1-8B-Instruct:
 
 The first item is the default accuracy specification (i.e., using original Hugging Face model data type and no quantization), and the reference accuracy is 68.17. The second item is an accuracy specification with FP8 GEMM quantization, with a slightly lower reference accuracy 67.93. The third item is a specification with FP8 GEMM and KV cache quantization, with a further slightly lower reference accuracy 67.87.
 
-Model data type and quantization decide the precision in model computation, so accuracy differences can be *justified* if different data types or quantizations are used. Hence, they are the most typical components in accuracy specifications. Please see other categories of accuracy specifications documented in `AccuracyTask.get_num_samples_and_threshold` in [accuracy_core.py](./accuracy_core.py). Note that we exclude most inference features such as parallelism, because theoretically they should not affect model accuracy. Think from the opposite perspective, if enabling tensor parallelism results in statistically significant accuracy loss, we might need to check whether some accuracy bugs exist.
+Model data type and quantization decide the precision in model computation, so accuracy differences can be *justified* if different data types or quantizations are used. Hence, they are the most typical components in accuracy specifications. Please see other categories of accuracy specifications documented in `AccuracyTask.get_hypothesis_testing_params` in [accuracy_core.py](./accuracy_core.py). Note that we exclude most inference features such as parallelism, because theoretically they should not affect model accuracy. Think from the opposite perspective, if enabling tensor parallelism results in statistically significant accuracy loss, we might need to check whether some accuracy bugs exist.
 
 A direct implication is that multiple test cases with different features may share the same accuracy reference. This is by design. For example, we should expect a test case with tensor parallelism to have very similar accuracy to its single-GPU counterpart.
 

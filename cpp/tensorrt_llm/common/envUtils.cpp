@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
  */
 
 #include "envUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
@@ -25,7 +26,9 @@
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 std::optional<int32_t> getIntEnv(char const* name)
@@ -50,6 +53,17 @@ std::optional<size_t> getUInt64Env(char const* name)
     return {val};
 };
 
+std::optional<float> getFloatEnv(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
+    {
+        return std::nullopt;
+    }
+    float const val = std::stof(env);
+    return {val};
+}
+
 std::optional<std::string> getStrEnv(char const* name)
 {
     char const* const env = std::getenv(name);
@@ -61,13 +75,13 @@ std::optional<std::string> getStrEnv(char const* name)
 }
 
 // Returns true if the env variable exists and is set to "1"
-static bool getBoolEnv(char const* name)
+bool getBoolEnv(char const* name)
 {
     char const* env = std::getenv(name);
     return env && env[0] == '1' && env[1] == '\0';
 }
 
-std::string trim(std::string const& str)
+static std::string trim(std::string const& str)
 {
     size_t start = str.find_first_not_of(" \t\n\r");
     size_t end = str.find_last_not_of(" \t\n\r");
@@ -75,7 +89,7 @@ std::string trim(std::string const& str)
 }
 
 // Parse memory size
-size_t parseMemorySize(std::string const& input)
+static size_t parseMemorySize(std::string const& input)
 {
     std::string str = trim(input);
 
@@ -135,21 +149,6 @@ bool forceXQAKernels()
     static bool const forceXQA
         = (getIntEnv("TRTLLM_FORCE_XQA").value_or(0) != 0) || getEnvForceDeterministicAttention();
     return forceXQA;
-}
-
-std::optional<bool> getEnvEnableXQAJIT()
-{
-    static std::optional<bool> val = []
-    {
-        std::optional<bool> val = std::nullopt;
-        auto const tmp = getIntEnv("TRTLLM_ENABLE_XQA_JIT");
-        if (tmp.has_value())
-        {
-            val = static_cast<bool>(tmp.value());
-        }
-        return val;
-    }();
-    return val;
 }
 
 std::optional<int> getEnvXqaBlocksPerSequence()
@@ -235,7 +234,7 @@ bool getEnvUseTileSizeKv64ForTrtllmGen()
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;
-    static bool enablePDL = false;
+    static bool enablePDL = true;
 
     std::call_once(flag,
         [&]()
@@ -243,10 +242,36 @@ bool getEnvEnablePDL()
             if (getSMVersion() >= 90)
             {
                 // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
-                enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
+                char const* env = std::getenv("TRTLLM_ENABLE_PDL");
+                if (env)
+                {
+                    if (env[0] == '1' && env[1] == '\0')
+                    {
+                        enablePDL = true;
+                    }
+                    else if (env[0] == '0' && env[1] == '\0')
+                    {
+                        enablePDL = false;
+                    }
+                };
             }
         });
     return enablePDL;
+}
+
+bool getEnvEnableCascadeMmha()
+{
+    static bool const enable = getBoolEnv("TRTLLM_ENABLE_CASCADE_MMHA");
+    return enable;
+}
+
+bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
+{
+    static std::once_flag flag;
+    static bool enabled = false;
+
+    std::call_once(flag, [&]() { enabled = getBoolEnv("TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL"); });
+    return enabled;
 }
 
 bool getEnvUseUCXKvCache()
@@ -267,6 +292,12 @@ bool getEnvUseNixlKvCache()
     return useNixlKvCache;
 }
 
+bool getEnvUseMooncakeKvCache()
+{
+    static bool const useMooncakeKvCache = getBoolEnv("TRTLLM_USE_MOONCAKE_KVCACHE");
+    return useMooncakeKvCache;
+}
+
 std::string getEnvUCXInterface()
 {
     static std::once_flag flag;
@@ -284,16 +315,66 @@ std::string getEnvUCXInterface()
     return ucxInterface;
 }
 
+std::string getEnvNixlInterface()
+{
+    static std::once_flag flag;
+    static std::string nixlInterface;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* nixl_interface = std::getenv("TRTLLM_NIXL_INTERFACE");
+            if (nixl_interface)
+            {
+                nixlInterface = nixl_interface;
+            }
+        });
+    return nixlInterface;
+}
+
+std::string getEnvNixlBackend()
+{
+    static std::once_flag flag;
+    static std::string nixlBackend;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* nixl_backend = std::getenv("TRTLLM_NIXL_KVCACHE_BACKEND");
+            if (nixl_backend)
+            {
+                nixlBackend = nixl_backend;
+            }
+            else
+            {
+                // Default to UCX if not specified
+                nixlBackend = "UCX";
+            }
+        });
+    return nixlBackend;
+}
+
+std::string getEnvMooncakeInterface()
+{
+    static std::once_flag flag;
+    static std::string mooncakeInterface;
+
+    std::call_once(flag,
+        [&]()
+        {
+            char const* mooncake_interface = std::getenv("TRTLLM_MOONCAKE_INTERFACE");
+            if (mooncake_interface)
+            {
+                mooncakeInterface = mooncake_interface;
+            }
+        });
+    return mooncakeInterface;
+}
+
 bool getEnvDisaggLayerwise()
 {
     static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");
     return disaggLayerwise;
-}
-
-bool getEnvParallelCacheSend()
-{
-    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
-    return parallelCacheSend;
 }
 
 bool getEnvRequestKVCacheConcurrent()
@@ -320,6 +401,12 @@ bool getEnvTryZCopyForKVCacheTransfer()
     return zcopyForSysmmetricKVCache;
 }
 
+bool getEnvDisaggEnableInflightCancel()
+{
+    static bool const enabled = getBoolEnv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL");
+    return enabled;
+}
+
 bool getEnvForceDeterministic()
 {
     static bool const forceDeterministic = getBoolEnv("FORCE_DETERMINISTIC");
@@ -330,6 +417,12 @@ bool getEnvForceDeterministicMOE()
 {
     static bool const forceDeterministic = getBoolEnv("FORCE_MOE_KERNEL_DETERMINISTIC") || getEnvForceDeterministic();
     return forceDeterministic;
+}
+
+bool getEnvMOEDisableFinalizeFusion()
+{
+    static bool const moeDisableFinalizeFusion = getBoolEnv("TRTLLM_MOE_DISABLE_FINALIZE_FUSION");
+    return moeDisableFinalizeFusion;
 }
 
 bool getEnvForceDeterministicAttention()
@@ -352,7 +445,7 @@ size_t getEnvAllReduceWorkspaceSize()
     return workspaceSize;
 }
 
-std::string getEnvKVCacheTransferOutputPath()
+std::string const& getEnvKVCacheTimeOutputPath()
 {
     static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
     return outputPath;
@@ -365,10 +458,16 @@ bool getEnvKVCacheTransferUseAsyncBuffer()
     return useAsyncBuffer;
 }
 
+bool getEnvKVCacheTransferUseSyncBuffer()
+{
+    static bool const useSyncBuffer = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_USE_SYNC_BUFFER");
+    return useSyncBuffer;
+}
+
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 
-    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
+    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(1);
     return maxConcurrenceNum;
 }
 
@@ -400,10 +499,22 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
     return memSizeForKVCacheTransferBuffer;
 }
 
-uint16_t getEnvNixlPort()
+bool getEnvKVCacheTransferAllBlocksForWindow()
 {
-    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
-    return nixlPort;
+    static bool const allBlocksForWindow = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_ALL_BLOCKS_FOR_WINDOW");
+    return allBlocksForWindow;
+}
+
+bool getEnvKVCachePoolUseFabricMemory()
+{
+    static bool const useFabricMemory = getBoolEnv("TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY");
+    return useFabricMemory;
+}
+
+bool getEnvNixlDisableCoalesce()
+{
+    static bool const disableCoalesce = getBoolEnv("TRTLLM_NIXL_DISABLE_COALESCE");
+    return disableCoalesce;
 }
 
 bool getEnvDisaggBenchmarkGenOnly()
@@ -411,4 +522,65 @@ bool getEnvDisaggBenchmarkGenOnly()
     return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY");
 }
 
-} // namespace tensorrt_llm::common
+bool getEnvDisableChunkedAttentionInGenPhase()
+{
+    return getBoolEnv("TRTLLM_DISABLE_CHUNKED_ATTENTION_IN_GEN_PHASE");
+}
+
+static int sanitizeBlockSize(std::optional<int32_t> const& val)
+{
+    // Default 256 when not set or invalid
+    int block = val.value_or(256);
+    // Clamp to sane CUDA bounds and warp multiples
+    if (block <= 0)
+        block = 256;
+    if (block > 1024)
+        block = 1024;
+    // Round to nearest multiple of 32 (warp size)
+    block = (block + 31) / 32 * 32;
+    if (block == 0)
+        block = 256;
+    return block;
+}
+
+// Read an integer env var and sanitize it as a CUDA block size. Treats malformed
+// values (e.g. non-numeric strings that would throw inside std::stoi) as unset and
+// falls back to the default, so this debug knob never becomes a hard failure.
+static int getSanitizedBlockSizeFromEnv(char const* name)
+{
+    try
+    {
+        return sanitizeBlockSize(getIntEnv(name));
+    }
+    catch (std::exception const&)
+    {
+        TLLM_LOG_WARNING("Invalid value for %s. Falling back to default block size.", name);
+        return sanitizeBlockSize(std::nullopt);
+    }
+}
+
+int getEnvMoeA2ADispatchBlockSize()
+{
+    static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE");
+    return kBlock;
+}
+
+int getEnvMoeA2ACombineBlockSize()
+{
+    static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE");
+    return kBlock;
+}
+
+bool getEnvEplbForceGdrcopy()
+{
+    return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY");
+}
+
+bool getEnvPrintSkipSoftmaxStat()
+{
+    return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
+}
+
+} // namespace common
+
+TRTLLM_NAMESPACE_END

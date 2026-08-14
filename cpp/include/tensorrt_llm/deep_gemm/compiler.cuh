@@ -217,7 +217,7 @@ std::vector<std::filesystem::path> getJitIncludeDirs()
         }
         else
         {
-            TLLM_LOG_WARNING("Failed to find TensorRT-LLM installation, DeepGEMM will be disabled.");
+            TLLM_LOG_WARNING("Failed to find TensorRT LLM installation, DeepGEMM will be disabled.");
         }
     }
     return includeDirs;

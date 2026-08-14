@@ -9,7 +9,7 @@ Unit test should be small, fast, and test only for specific function.
 If you need to run them locally, the only dependencies are `requirements-dev.txt`.
 
 ```bash
-# in tensorrt-llm source repo root dir
+# in TensorRT LLM source repo root dir
 # use editable install, such that your local changes will be used immedietely in the tests w/o another install
 # see https://setuptools.pypa.io/en/latest/userguide/development_mode.html
 pip install -e ./
@@ -119,15 +119,17 @@ Due to CI hardware resource limitation, and some cases only run on specific GPUs
 
 In directory `integration/test_lists/test-db`, each yml file corresponds to a GPU type.
 
-In file `jenkins/L0_Test.groovy`, the variable `turtleConfigs` maps yml files to CI stages.
+In file `jenkins/L0_Test.groovy`, the variables `x86TestConfigs`, `SBSATestConfigs`, `x86SlurmTestConfigs` and `SBSASlurmTestConfigs` map yml files to CI stages according to platforms and launch methods.
 
 Currently the yml files are manually maintained, which requires developer to update them when new test cases are added.
 
-### How to choose GPU type
+### How to choose whether a GPU is needed and which GPU type
 
-The CI resource of each GPU type is different. Usually you should choose the cheapest GPU that fulfills test requirements. In most cases, an integration test case should only run on one GPU type, unless it's very important or has different behaviours on different GPUs.
+While TensorRT LLM is GPU-centric, the specific feature covered by a unit test may not need to interact with a GPU on its own. For unit tests that do not intrinsically require a GPU, prefer the CPU-only stages to avoid reserving unnecessary GPU resources. The CPU-only option applies only to unit tests.
 
-The priority is A10 > A30 > L40s > A100 > H100 > B200.
+When a test requires a GPU, choose the cheapest GPU that fulfills its requirements. In most cases, an integration test case should run on only one GPU type, unless it is especially important or behaves differently on different GPUs.
+
+The priority is A10 > A30 > L40S > A100 > H100 > B200.
 
 ## 2. Add an integration test
 
@@ -140,6 +142,8 @@ Once a new integration test case is added, the yml files must be updated to cont
 ## 3. Add a unit test
 
 A unit test are used to test a standalone feature or building block, and only runs partial workflow.
+
+Mark a unit test that does not require a GPU to run with `@pytest.mark.cpu_only` or file-level `pytestmark = pytest.mark.cpu_only`. Only these tests run in the CPU-only stages. You can define CPU and GPU cases in the same test file.
 
 For legacy and case management reason, the CI doesn't run unit tests directly. It uses a bridge to map multiple unit test cases into one integration test case, and manages these bridged cases.
 The bridge is implemented in `integration/defs/test_unittests.py` and `pytest_generate_tests` function in `tests/integration/defs/conftest.py`.
@@ -161,9 +165,9 @@ pytest unittest/an_existing_file.py -m "part0 and gpu2" # run some cases in a fi
 ```
 
 2. Check existing bridge cases and make sure your cases are not covered by an existing one.
-For example, you may want to add `pytest unittest/an_existing_file.py -k "some_keyword or another_keyword"`, but there is already `pytest unittest/an_existing_file.py -k "not thrid_keyword"` which covers your filter.
+For example, you may want to add `pytest unittest/an_existing_file.py -k "some_keyword or another_keyword"`, but there is already `pytest unittest/an_existing_file.py -k "not third_keyword"` which covers your filter.
 
-3. Choose a suitable GPU and add a line of your cases. For example, adding `unittest/an_existing_file.py -k "some_keyword or another_keyword"` to `tests/integration/test_lists/test-db/l0_a10.yml`.
+3. Choose a suitable CI stage and add a line to the corresponding test list config. For example, adding `unittest/an_existing_file.py -k "some_keyword or another_keyword"` to `tests/integration/test_lists/test-db/l0_a10.yml`.
 
 ## 4. Run a CI stage locally
 
@@ -185,7 +189,7 @@ l0_a10:
       linux_distribution_name: ubuntu*
   tests:
   # ------------- PyTorch tests ---------------
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
@@ -200,7 +204,7 @@ l0_a10:
 2. Copy all items in `tests` field to a text file, for example, `a10_list.txt`. Don't forget to remove extra characters like comments and the dash marks.
 
 ```
-disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
@@ -225,7 +229,7 @@ To set a timeout for specific long-running test cases, follow these steps:
 1. Locate the test case line in the corresponding test-db YAML file (e.g., `tests/integration/test_lists/test-db/l0_a10.yml`).
 2. Append `TIMEOUT (...)` to the test case line, as shown below:
    ```yaml
-   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
+   - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
    ```
    - Ensure there is **at least one space** before and after the `TIMEOUT` keyword.
    - The time value inside the parentheses `()` must be a **number** representing the timeout in **minutes**.
@@ -233,9 +237,53 @@ To set a timeout for specific long-running test cases, follow these steps:
 ### For Local Testing (TXT files):
 1. If you are running the tests locally using a prepared `.txt` file (e.g., `a10_list.txt`), append the `TIMEOUT` setting to the test case line in the same way:
    ```
-   disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
+   disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0] TIMEOUT (30)
    ```
 
-### Notes:
-- The `TIMEOUT` setting ensures that the test case will be terminated if it exceeds the specified time limit.
-- This setting is useful for preventing long-running or stuck tests from blocking the pipeline or local testing.
+## 6. Set isolated execution for cases individually
+
+Some test cases may experience intermittent failures due to resource conflicts, memory leaks, or state pollution when run together with other tests. The `ISOLATION` marker ensures these cases run in a separate pytest process, avoiding such issues.
+
+### When to use the `ISOLATION` marker:
+- Tests that modify global state or environment variables
+- Tests with memory-intensive operations that may affect subsequent tests
+- Tests that experience intermittent failures only when run with other tests
+- Tests that require exclusive access to certain resources (GPU memory, files, etc.)
+
+### Usage:
+Add `ISOLATION` to the test case line with proper spacing:
+
+**For CI (test-db YAML files):**
+```yaml
+- disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0] ISOLATION
+```
+
+## 7. Combining test markers
+
+Multiple markers can be combined for the same test case using commas. Both formats are valid:
+
+```yaml
+- test_case.py::test_function[param] ISOLATION, TIMEOUT (90)
+- test_case.py::test_function[param] TIMEOUT (90), ISOLATION
+```
+
+### Example:
+```yaml
+# Regular test (runs with other tests)
+- accuracy/test_llm_api.py::test_basic_functionality[gpt2]
+
+# Test with timeout only
+- accuracy/test_llm_api.py::test_long_running[model] TIMEOUT (60)
+
+# Isolated test (runs in separate process)
+- accuracy/test_llm_api.py::test_memory_intensive[large_model] ISOLATION
+
+# Isolated test with timeout
+- accuracy/test_llm_api.py::test_complex_workflow[model] ISOLATION, TIMEOUT (120)
+```
+
+### Important Notes:
+- **TIMEOUT**: Ensures the test terminates if it exceeds the specified time limit (in minutes). Useful for preventing stuck tests from blocking the pipeline.
+- **ISOLATION**: Runs the test in a separate pytest process to avoid resource conflicts and state pollution. Use sparingly as it increases execution time.
+- Ensure there is **at least one space** before and after each marker keyword
+- Both markers are case-sensitive and must be written exactly as `TIMEOUT` and `ISOLATION`

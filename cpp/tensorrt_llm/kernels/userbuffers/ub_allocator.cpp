@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 #include "ub_allocator.h"
+#include "tensorrt_llm/common/opUtils.h"
+#include <set>
+#include <stdexcept>
 
 namespace tensorrt_llm::runtime::ub
 {
@@ -23,38 +26,38 @@ UserBufferAllocator& UserBufferAllocator::Instance()
     return _;
 }
 
-void UserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& world_config)
+void UserBufferAllocator::initialize(::tensorrt_llm::runtime::WorldConfig const& worldConfig)
 {
-    if (!is_initialized())
+    if (!isInitialized())
     {
-        ub_comm_ = nullptr;
-        world_config_ = world_config;
-        create_communicator_grouped2(&ub_comm_, world_config_);
-        TLLM_CHECK(ub_comm_ != nullptr);
-        is_initialized_ = true;
+        mUbComm = nullptr;
+        mWorldConfig = worldConfig;
+        create_communicator_grouped2(&mUbComm, worldConfig);
+        TLLM_CHECK(mUbComm != nullptr);
+        mIsInitialized = true;
     }
 }
 
-bool UserBufferAllocator::is_initialized()
+bool UserBufferAllocator::isInitialized()
 {
-    return is_initialized_;
+    return mIsInitialized;
 }
 
-UBBuffer UserBufferAllocator::register_ub_buffer(size_t bytes)
+UBBuffer UserBufferAllocator::registerUBBuffer(size_t bytes)
 {
-    TLLM_CHECK(is_initialized());
+    TLLM_CHECK(isInitialized());
     void* addr = nullptr;
     int handle = -1;
-    handle = register_user_buffer_collective((void**) &addr, bytes, ub_comm_);
+    handle = register_user_buffer_collective((void**) &addr, bytes, mUbComm);
     return {addr, handle, bytes};
 }
 
 UBBuffer UserBufferAllocator::allocate(size_t bytes)
 {
-    TLLM_CHECK(is_initialized());
-    auto ub_buffer = register_ub_buffer(bytes);
+    TLLM_CHECK(isInitialized());
+    auto ub_buffer = registerUBBuffer(bytes);
     TLLM_CHECK(!ub_buffer.invalid());
-    buffers_.push_back(ub_buffer);
+    mBuffers.push_back(ub_buffer);
     return ub_buffer;
 }
 
@@ -62,13 +65,14 @@ void UserBufferAllocator::deallocate(void* addr) {}
 
 UBBuffer UserBufferAllocator::get(int idx)
 {
-    TLLM_CHECK(is_initialized() && idx < buffers_.size() && !buffers_[idx].invalid());
-    return buffers_[idx];
+    TLLM_CHECK(isInitialized() && idx < mBuffers.size() && !mBuffers[idx].invalid());
+    return mBuffers[idx];
 }
 
 communicator* UserBufferAllocator::comm()
 {
-    TLLM_CHECK(is_initialized());
-    return ub_comm_;
+    TLLM_CHECK(isInitialized());
+    return mUbComm;
 }
+
 }; // namespace tensorrt_llm::runtime::ub

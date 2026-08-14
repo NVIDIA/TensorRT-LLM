@@ -1,0 +1,1104 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+# Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/configs/qwen3_next.py
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# coding=utf-8
+# Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import copy
+import os
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+
+import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+from torch import nn
+from transformers import Qwen3NextConfig
+
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
+from tensorrt_llm._torch.modules.fused_shared_expert import \
+    fused_sigmoid_gate_mul_add
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.pyexecutor.config_utils import \
+    get_qwen3_hybrid_layer_types
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.models.modeling_utils import QuantConfig
+
+from ...logger import logger
+from ..attention_backend import AttentionMetadata
+from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
+                           MoEAllReduce, MoEAllReduceParams, allgather)
+from ..model_config import ModelConfig
+from ..modules.decoder_layer import DecoderLayer
+from ..modules.embedding import Embedding
+from ..modules.fused_moe import (BaseMoeRoutingMethod, MoEWeightLoadingMode,
+                                 RenormalizeMoeRoutingMethod,
+                                 RenormalizeNaiveMoeRoutingMethod,
+                                 RoutingMethodType, create_moe)
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode
+from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.rms_norm import RMSNorm
+from ..speculative import SpecMetadata
+from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
+from .modeling_qwen3 import Qwen3Attention
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
+
+
+def _fused_norm_weight(norm: RMSNorm) -> torch.Tensor:
+    """Weight to feed the fused AllReduce+RMSNorm op for ``norm``.
+
+    Gemma RMSNorm scales by ``(1 + weight)`` (see RMSNorm.forward), but the
+    fused AR+RMSNorm kernels (and the NCCL / NCCL_SYMMETRIC fallbacks the
+    AUTO strategy may pick) only apply ``weight``. Baking the ``+1`` into the
+    weight makes EVERY allreduce backend produce the correct gemma result
+    without any backend-specific flag.
+
+    For gemma norms the ``(1 + weight)`` tensor is precomputed once in
+    ``Qwen3NextForCausalLM.cache_derived_state`` and cached on the module as
+    ``_fused_norm_weight``. Computing it inline here would re-run a cast+add
+    elementwise kernel every forward inside the CUDA graph. The inline path
+    below is only a correctness fallback if the cache is absent.
+    """
+    cached = getattr(norm, "_fused_norm_weight", None)
+    if cached is not None:
+        return cached
+    w = norm.weight
+    if getattr(norm, "use_gemma", False):
+        return (w.float() + 1.0).to(w.dtype)
+    return w
+
+
+def _precompute_fused_norm_weights(module: nn.Module) -> None:
+    """Bake ``(1 + weight)`` once for every gemma RMSNorm under ``module``.
+
+    Caches the result on each norm as ``_fused_norm_weight`` so the fused
+    AllReduce+RMSNorm path reads a ready tensor instead of recomputing the
+    cast+add every forward. Non-gemma norms are left untouched (the fused op
+    uses their ``weight`` directly). Must run after weights are loaded onto the
+    device; the cached tensor is a plain attribute, not a registered buffer, so
+    it stays out of the state dict.
+
+    Norms whose ``weight`` was stripped are skipped: the layer-wise benchmark
+    runs ``remove_weights`` on unused layers (``skip_forward``), leaving a
+    ``use_gemma`` norm without a ``weight`` parameter; those layers never run
+    the fused path, so there is nothing to precompute.
+    """
+    for norm in module.modules():
+        if isinstance(norm, RMSNorm) and getattr(norm, "use_gemma", False):
+            w = getattr(norm, "weight", None)
+            if w is None:
+                continue
+            norm._fused_norm_weight = (w.float() + 1.0).to(w.dtype)
+
+
+def _eager_fusion_enabled(enable_attention_dp: bool) -> bool:
+    return (os.environ.get("TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
+            and not enable_attention_dp)
+
+
+def _experts_excluded_from_quant(model_config: ModelConfig[Qwen3NextConfig],
+                                 layer_idx: Optional[int]) -> bool:
+    """Is this layer's routed-experts module listed in ``exclude_modules``?
+
+    ``exclude_modules`` is applied only after every module is built, but
+    ``create_moe`` has to pick the MoE backend class before that. A backend
+    picked for FP8/NVFP4 weights rejects the experts if they turn out to be
+    bf16, so look the answer up now instead of waiting for that pass.
+    """
+    quant_config = model_config.quant_config
+    if layer_idx is None or not quant_config.exclude_modules:
+        return False
+    candidates = [f"model.layers.{layer_idx}.mlp.experts"]
+    n_hidden_layers = getattr(model_config.pretrained_config,
+                              "num_hidden_layers", None)
+    # One MTP layer has two names: mtp.layers.<i> in the checkpoint and
+    # model.layers.<n_hidden_layers + i> at runtime. Only the Qwen3.5 entry
+    # points rewrite the first into the second, so try both names here.
+    if n_hidden_layers is not None and layer_idx >= n_hidden_layers:
+        candidates.append(
+            f"mtp.layers.{layer_idx - n_hidden_layers}.mlp.experts")
+    return any(
+        quant_config.is_module_excluded_from_quantization(candidate)
+        for candidate in candidates)
+
+
+class Qwen3NextGate(nn.Module):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        dtype: Optional[torch.dtype] = None,
+        apply_routing: bool = False,
+        routing_method_type: RoutingMethodType = RoutingMethodType.Renormalize,
+        moe_backend: str = "CUTLASS",
+    ):
+        super().__init__()
+        self.top_k = top_k
+        self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
+                                               dtype=dtype),
+                                   requires_grad=False)
+        self.routing_method_type = routing_method_type
+        # FIXME: out_dtype=float32 does not work
+        # self.out_dtype = torch.float32 if moe_backend == "TRTLLM" else dtype
+        self.out_dtype = dtype
+
+        assert not apply_routing, "Qwen3NextGate routing is called inside MoE"
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits: torch.Tensor = torch.ops.trtllm.cublas_mm(
+            hidden_states, self.weight.t(), bias=None, out_dtype=self.out_dtype)
+        return logits
+
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
+        assert len(weights) == 1
+        weight = weights[0].get("weight")
+        if not allow_partial_loading:
+            assert weight is not None
+        if weight is not None:
+            self.weight.copy_(weight[:])
+
+    @property
+    def routing_method(self) -> BaseMoeRoutingMethod:
+        if self.routing_method_type == RoutingMethodType.RenormalizeNaive:
+            return RenormalizeNaiveMoeRoutingMethod(top_k=self.top_k)
+        elif self.routing_method_type == RoutingMethodType.Renormalize:
+            return RenormalizeMoeRoutingMethod(top_k=self.top_k)
+        else:
+            raise ValueError(
+                f"Unsupported routing method: {self.routing_method_type}")
+
+
+class Qwen3NextSparseMoeBlock(nn.Module):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen3NextConfig],
+        aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.model_config = model_config
+        self.hidden_dim = config.hidden_size
+        self.ffn_dim = config.intermediate_size
+        self.moe_intermediate_size = config.moe_intermediate_size
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
+        self.mapping = model_config.mapping
+
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
+
+        self.aux_stream = aux_stream
+
+        self.gate = Qwen3NextGate(
+            hidden_size=self.hidden_dim,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            dtype=config.torch_dtype,
+            apply_routing=False,
+            routing_method_type=RoutingMethodType.Renormalize,
+            moe_backend=model_config.moe_backend,
+        )
+
+        # Qwen3.5 BF16 checkpoints store fused [gate_up_proj, down_proj] per
+        # expert, while Qwen3Next and Qwen3.5 FP8 checkpoints store separate
+        # gate_proj/up_proj/down_proj (vanilla).  The model_type is set by HF
+        # config.json: "qwen3_5_moe_text" for Qwen3.5, "qwen3_next" otherwise.
+        weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
+                               if config.model_type == "qwen3_5_moe_text" else
+                               MoEWeightLoadingMode.VANILLA)
+        # For MIXED_PRECISION checkpoints (e.g. ModelOpt), the experts' real
+        # quant algo lives in the per-layer quant_config_dict keyed by TRT-LLM
+        # module name. Pass it as override_quant_config so the backend resolves
+        # the correct quant method (e.g. NVFP4) at construction, instead of
+        # inheriting the unquantized MIXED_PRECISION global and relying on
+        # apply_layerwise_quant_config (which rebinds the ConfigurableMoE
+        # wrapper but not its delegated backend).
+        expert_quant_config = None
+        quant_config_dict = getattr(model_config, "quant_config_dict", None)
+        if quant_config_dict and layer_idx is not None:
+            expert_quant_config = quant_config_dict.get(
+                f"model.layers.{layer_idx}.mlp.experts")
+        moe_model_config = model_config
+        if _experts_excluded_from_quant(model_config, layer_idx):
+            # These experts end up bf16 whatever the per-layer entry says, so
+            # build them on CUTLASS, the only backend that serves bf16
+            # unconditionally.
+            expert_quant_config = QuantConfig(kv_cache_quant_algo=model_config.
+                                              quant_config.kv_cache_quant_algo)
+            if model_config.moe_backend != "CUTLASS":
+                moe_model_config = copy.copy(model_config)
+                moe_model_config._frozen = False
+                moe_model_config.moe_backend = "CUTLASS"
+                moe_model_config._frozen = True
+                logger.warning(
+                    f"Layer {layer_idx} MoE experts are excluded from "
+                    "quantization; using moe_backend=CUTLASS for this layer "
+                    f"(other layers keep {model_config.moe_backend}).")
+        self.experts = create_moe(
+            num_experts=self.num_experts,
+            routing_method=self.gate.routing_method,
+            hidden_size=self.hidden_dim,
+            intermediate_size=self.moe_intermediate_size,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
+            dtype=config.torch_dtype,
+            reduce_results=False,
+            model_config=moe_model_config,
+            layer_idx=layer_idx,
+            weight_loading_mode=weight_loading_mode,
+            override_quant_config=expert_quant_config,
+        )
+
+        self.shared_expert = GatedMLP(
+            hidden_size=self.hidden_dim,
+            intermediate_size=config.shared_expert_intermediate_size,
+            bias=config.mlp_bias if hasattr(config, 'mlp_bias') else False,
+            dtype=config.torch_dtype,
+            config=model_config,
+            reduce_output=False,
+            layer_idx=layer_idx,
+            is_shared_expert=True,
+            overridden_tp_size=1 if self.enable_attention_dp else None)
+
+        self.shared_expert_gate = Linear(self.hidden_dim,
+                                         1,
+                                         bias=False,
+                                         dtype=config.torch_dtype,
+                                         quant_config=None)
+
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeShared]
+        }
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams] = None,
+        do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        assert hidden_states.shape[-1] == self.hidden_dim
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_dim)
+        use_dp_padding = False
+        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+
+        if self.enable_attention_dp and self.mapping.tp_size > 1 and get_sm_version(
+        ) == 120:
+            use_dp_padding = True
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
+
+        if not do_finalize:
+            # TODO: support do_finalize == False
+            raise NotImplementedError(
+                "do_finalize == False is not supported yet")
+
+        def _compute_routed_output():
+            router_logits = self.gate(hidden_states)
+            final_hidden_states = self.experts(
+                hidden_states,
+                router_logits,
+                output_dtype=hidden_states.dtype,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=use_dp_padding,
+                do_finalize=do_finalize,
+            )
+
+            return final_hidden_states
+
+        def _compute_shared_output():
+            shared_expert_output = self.shared_expert(
+                hidden_states,
+                lora_params=lora_params,
+            )
+            shared_expert_gate_logits = self.shared_expert_gate(hidden_states)
+            return shared_expert_output, shared_expert_gate_logits
+
+        final_hidden_states, shared_expert_outputs = maybe_execute_in_parallel(
+            _compute_routed_output,
+            _compute_shared_output,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
+        if not do_finalize:
+            return final_hidden_states
+
+        shared_expert_output, shared_expert_gate_logits = shared_expert_outputs
+        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            output_tensor, _ = torch.ops.trtllm.allocate_output(
+                final_hidden_states, self.allreduce.output_buffer_kind,
+                self.mapping.tp_group)
+            final_hidden_states = fused_sigmoid_gate_mul_add(
+                final_hidden_states,
+                shared_expert_gate_logits,
+                shared_expert_output,
+                output=output_tensor,
+            )
+            final_hidden_states = self.allreduce(
+                final_hidden_states, all_reduce_params=all_reduce_params)
+        else:
+            final_hidden_states = fused_sigmoid_gate_mul_add(
+                final_hidden_states, shared_expert_gate_logits,
+                shared_expert_output)
+        return final_hidden_states.view(orig_shape)
+
+
+class _DenseMlpAdapter(nn.Module):
+    """Wraps GatedMLP to match Qwen3NextSparseMoeBlock's forward interface.
+
+    This allows the decoder layer forward methods to call self.mlp(...)
+    with the same arguments regardless of whether MoE or dense MLP is used.
+    """
+
+    def __init__(self, mlp: GatedMLP, mapping):
+        super().__init__()
+        self.mlp = mlp
+        self.mapping = mapping
+        self.enable_attention_dp = mapping.enable_attention_dp
+        # Provide a dummy `experts` attribute so that
+        # `self.mlp.experts.has_nvfp4` checks in decoder forward don't crash.
+        self.experts = SimpleNamespace(has_nvfp4=False)
+
+    def forward(
+        self,
+        hidden_states,
+        attn_metadata=None,
+        all_reduce_params=None,
+        do_finalize=True,
+        lora_params=None,
+    ):
+        all_rank_num_tokens = (attn_metadata.all_rank_num_tokens
+                               if attn_metadata is not None else None)
+        return self.mlp(
+            hidden_states,
+            all_rank_num_tokens=all_rank_num_tokens,
+            final_all_reduce_params=all_reduce_params,
+            lora_params=lora_params,
+        )
+
+
+def _create_mlp(model_config, aux_stream, layer_idx):
+    """Create the appropriate MLP for this layer: MoE or dense GatedMLP."""
+    config = model_config.pretrained_config
+    num_experts = getattr(config, "num_experts", 0) or 0
+    if num_experts > 0:
+        return Qwen3NextSparseMoeBlock(model_config,
+                                       aux_stream,
+                                       layer_idx=layer_idx)
+    return _DenseMlpAdapter(
+        GatedMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=getattr(config, "mlp_bias", False),
+            dtype=config.torch_dtype,
+            overridden_tp_size=1
+            if model_config.mapping.enable_attention_dp else None,
+            config=model_config,
+        ),
+        model_config.mapping,
+    )
+
+
+class Qwen3NextLinearDecoderLayer(DecoderLayer):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen3NextConfig],
+        layer_idx: int,
+        aux_stream: torch.cuda.Stream,
+    ):
+        super().__init__()
+        self.model_config = model_config
+        config = model_config.pretrained_config
+        self.linear_attn = Qwen3NextGatedDeltaNet(model_config, aux_stream,
+                                                  layer_idx)
+
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
+
+        self.mlp = _create_mlp(model_config, aux_stream, layer_idx)
+
+        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                       eps=config.rms_norm_eps,
+                                       dtype=config.torch_dtype,
+                                       use_gemma=True)
+
+        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                                eps=config.rms_norm_eps,
+                                                dtype=config.torch_dtype,
+                                                use_gemma=True)
+        self.layer_idx = layer_idx
+
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
+
+        self.next_layer_layernorm: RMSNorm = None
+
+        self.fusion_config = EagerFusionConfig()
+        self.enable_fusion = _eager_fusion_enabled(self.enable_attention_dp)
+
+        has_tp = self.mapping.has_tp()
+        has_pp = self.mapping.has_pp()
+
+        self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
+        self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
+        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
+                                       or self.mapping.tp_size == 1
+                                       or self.enable_attention_dp)
+
+        self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor],
+        spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        if spec_metadata is not None and spec_metadata.is_layer_capture(
+                self.layer_idx):
+            self.fusion_config.POST_MOE_FUSION = False
+        # Linear Attention
+        ### FIXME: 1. forward_batch; 2. allreduce
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.linear_attn(
+                hidden_states,
+                attn_metadata,
+                spec_metadata=spec_metadata,
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not self.disable_attn_allreduce),
+                **kwargs)
+        if self.fusion_config.PRE_MOE_FUSION:
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=_fused_norm_weight(
+                        self.post_attention_layernorm),
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                ))
+        else:
+            # No fusion
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+
+        # Qwen3NextSparseMoeBlock does not implement do_finalize=False. Defer
+        # only its final all-reduce so the decoder can fuse it with RMSNorm.
+        do_finalize = True
+
+        hidden_states = self.mlp(
+            hidden_states,
+            attn_metadata,
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
+                                      or self.mapping.tp_size == 1)),
+            do_finalize=do_finalize,
+            lora_params=lora_params,
+        )
+
+        if self.fusion_config.POST_MOE_FUSION:
+            if do_finalize:
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=_fused_norm_weight(
+                            self.next_layer_layernorm),
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                    ))
+            else:
+                assert len(
+                    hidden_states
+                ) == 3, f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+
+                fc2_output = hidden_states[0]
+                expert_scale_factor = hidden_states[1]
+                expanded_idx_to_permuted_idx = hidden_states[2]
+
+                moe_all_reduce_params = MoEAllReduceParams(
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    expert_scale_factor=expert_scale_factor,
+                    shared_expert_output=None,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                    is_cutlass_min_latency=False,
+                )
+                hidden_states, residual = self.moe_allreduce(
+                    fc2_output, all_reduce_params=moe_all_reduce_params)
+
+        else:
+            if spec_metadata and spec_metadata.is_layer_capture(self.layer_idx):
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual)
+            if self.next_layer_layernorm is not None:
+                hidden_states, residual = self.next_layer_layernorm(
+                    hidden_states, residual)
+        return hidden_states, residual
+
+
+class Qwen3NextAttention(Qwen3Attention):
+
+    def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
+                 layer_idx: int, fuse_qk_norm_rope: bool):
+        super().__init__(model_config,
+                         layer_idx,
+                         fuse_qk_norm_rope=fuse_qk_norm_rope,
+                         attn_output_gate=True,
+                         use_gemma_rms_norm=True)
+        self._fuse_qk_norm_rope_gate = True
+
+
+class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
+
+    def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
+                 layer_idx: int, aux_stream: torch.cuda.Stream):
+        super().__init__()
+        self.model_config = model_config
+        config = model_config.pretrained_config
+
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
+
+        self.self_attn = Qwen3NextAttention(
+            model_config,
+            layer_idx=layer_idx,
+            # Gemma-style QK-norm is now supported by the fused qk_norm_rope
+            # kernel (use_gemma path), so fuse instead of running separate
+            # split + q/k RMSNorm + RoPE kernels.
+            fuse_qk_norm_rope=True,
+        )
+
+        self.mlp = _create_mlp(model_config, aux_stream, layer_idx)
+
+        self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                       eps=config.rms_norm_eps,
+                                       dtype=config.torch_dtype,
+                                       use_gemma=True)
+
+        self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
+                                                eps=config.rms_norm_eps,
+                                                dtype=config.torch_dtype,
+                                                use_gemma=True)
+        self.layer_idx = layer_idx
+
+        self.allreduce = AllReduce(mapping=model_config.mapping,
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
+
+        self.next_layer_layernorm: RMSNorm = None
+
+        self.fusion_config = EagerFusionConfig()
+        self.enable_fusion = _eager_fusion_enabled(self.enable_attention_dp)
+
+        has_tp = self.mapping.has_tp()
+        has_pp = self.mapping.has_pp()
+
+        self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
+
+        # POST_MOE_FUSION fuses the MoE-output all-reduce with the next layer's
+        # RMSNorm. It is a tensor-parallel (TEP) optimization: it is only valid
+        # when ranks share the same tokens (not attention_dp, where each rank holds
+        # different tokens and the MoE block does no cross-rank all-reduce). This
+        # mirrors the DeepSeek-V3 pattern (POST == PRE in the non-attention_dp path).
+        self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
+        # When PRE_MOE_FUSION is on, the attention all-reduce is deferred to the
+        # fused PRE all-reduce+RMSNorm, so disable the in-attention all-reduce to
+        # avoid reducing twice.
+        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
+                                       or self.mapping.tp_size == 1
+                                       or self.enable_attention_dp)
+        self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor],
+        spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        if spec_metadata is not None and spec_metadata.is_layer_capture(
+                self.layer_idx):
+            self.fusion_config.POST_MOE_FUSION = False
+
+        # Self Attention
+        hidden_states = self.self_attn(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_attn_allreduce),
+            lora_params=lora_params,
+            **kwargs,
+        )
+
+        if self.fusion_config.PRE_MOE_FUSION:
+            hidden_states, residual = self.allreduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    residual=residual,
+                    norm_weight=_fused_norm_weight(
+                        self.post_attention_layernorm),
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                ))
+        else:
+            # No fusion
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+
+        # The fully-fused do_finalize=False MoE path (MoEAllReduce on the
+        # unfinalized expert output) is not implemented by Qwen3NextSparseMoeBlock
+        # (it raises NotImplementedError). Keep do_finalize=True so POST_MOE_FUSION
+        # still fuses the *finalized* MoE all-reduce with the next layer's RMSNorm
+        # via the do_finalize branch below, without hitting the unimplemented path.
+        do_finalize = True
+        hidden_states = self.mlp(
+            hidden_states,
+            attn_metadata,
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
+                                      or self.mapping.tp_size == 1)),
+            do_finalize=do_finalize,
+            lora_params=lora_params,
+        )
+
+        if self.fusion_config.POST_MOE_FUSION:
+            if do_finalize:
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=_fused_norm_weight(
+                            self.next_layer_layernorm),
+                        eps=self.next_layer_layernorm.variance_epsilon,
+                    ))
+            else:
+                assert len(
+                    hidden_states
+                ) == 3, f"hidden_states must have 3 elements, but got {len(hidden_states)}"
+
+                fc2_output = hidden_states[0]
+                expert_scale_factor = hidden_states[1]
+                expanded_idx_to_permuted_idx = hidden_states[2]
+
+                moe_all_reduce_params = MoEAllReduceParams(
+                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                    expert_scale_factor=expert_scale_factor,
+                    shared_expert_output=None,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                    is_cutlass_min_latency=False,
+                )
+                hidden_states, residual = self.moe_allreduce(
+                    fc2_output, all_reduce_params=moe_all_reduce_params)
+
+        else:
+            if spec_metadata and spec_metadata.is_layer_capture(self.layer_idx):
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual)
+            if self.next_layer_layernorm is not None:
+                hidden_states, residual = self.next_layer_layernorm(
+                    hidden_states, residual)
+
+        return hidden_states, residual
+
+
+class Qwen3NextMTPHead(nn.Module):
+
+    def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.model_config = model_config
+        self.norm = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
+        self.mapping_lm_head_tp = None
+
+    @torch.compile(options={"max-autotune": True})
+    def get_last_token_states(self, hidden_states, attn_metadata):
+        last_tokens = torch.cumsum(
+            attn_metadata.seq_lens_cuda,
+            dim=0,
+            dtype=torch.long,
+        ) - 1
+        return hidden_states[last_tokens]
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                lm_head: Linear,
+                attn_metadata: AttentionMetadata,
+                return_context_logits: bool = False) -> torch.Tensor:
+        if not return_context_logits:
+            if attn_metadata is not None:
+                hidden_states = self.get_last_token_states(
+                    hidden_states, attn_metadata)
+            else:
+                hidden_states = hidden_states[-1].unsqueeze(0)
+
+        enable_attention_dp = self.model_config.mapping.enable_attention_dp
+        enable_lm_head_tp_in_adp = enable_attention_dp and self.model_config.mapping.enable_lm_head_tp_in_adp
+
+        if enable_lm_head_tp_in_adp:
+            self.mapping_lm_head_tp = create_lm_head_tp_mapping(
+                self.model_config.mapping, hidden_states.shape[0])
+            hidden_states = allgather(hidden_states,
+                                      self.mapping_lm_head_tp,
+                                      dim=0)
+
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
+            lm_head.gather_output = False
+        logits = lm_head(hidden_states,
+                         mapping_lm_head_tp=self.mapping_lm_head_tp,
+                         is_spec_decoding_head=True)
+        if not enable_attention_dp or enable_lm_head_tp_in_adp:
+            lm_head.gather_output = True
+        return logits
+
+
+class Qwen3NextMTP(Qwen3NextFullAttentionDecoderLayer):
+
+    def __init__(self, model_config: ModelConfig[Qwen3NextConfig],
+                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
+                                                       torch.cuda.Stream]):
+        # Some HF checkpoints (e.g. Qwen3.5 NVFP4) keep the whole MTP layer in
+        # bf16. Qwen3NextSparseMoeBlock handles that for every layer, MTP
+        # included, so nothing layer-specific is needed here.
+        super().__init__(model_config, layer_idx,
+                         aux_stream_dict[AuxStreamType.Attention])
+        config = model_config.pretrained_config
+        self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeShared]
+        }
+
+        self.pre_fc_norm_embedding = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
+        self.pre_fc_norm_hidden = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=config.torch_dtype,
+            use_gemma=True,
+        )
+
+        if model_config.mapping.enable_attention_dp:
+            self.fc = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=False,
+            )
+        else:
+            self.fc = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                mapping=model_config.mapping,
+                reduce_output=True,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+                use_cute_dsl_blockscaling_mm=False,
+            )
+        self.shared_head = Qwen3NextMTPHead(model_config)
+        # MTP applies shared_head.norm after the base decoder forward, so its
+        # MoE-output all-reduce cannot consume next_layer_layernorm.
+        self.fusion_config.POST_MOE_FUSION = False
+
+    def forward(
+        self,
+        input_ids: torch.IntTensor,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        embed_tokens: Embedding,
+        attn_metadata: AttentionMetadata,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del all_rank_num_tokens
+
+        def norm_embeds():
+            return self.pre_fc_norm_embedding(embed_tokens(input_ids))
+
+        def norm_hidden():
+            return self.pre_fc_norm_hidden(hidden_states)
+
+        inputs_embeds, hidden_states = maybe_execute_in_parallel(
+            norm_embeds,
+            norm_hidden,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
+        hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+
+        tp_size = self.model_config.mapping.tp_size
+        tp_rank = self.model_config.mapping.tp_rank
+        if tp_size > 1 and not self.model_config.mapping.enable_attention_dp:
+            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+
+        hidden_states = self.fc(hidden_states)
+
+        hidden_states, residual = super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            residual=None,
+            spec_metadata=spec_metadata,
+            **kwargs,
+        )
+        hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
+
+        return hidden_states
+
+
+ALL_DECODER_LAYER_TYPES = {
+    "full_attention": Qwen3NextFullAttentionDecoderLayer,
+    "linear_attention": Qwen3NextLinearDecoderLayer,
+}
+
+
+class Qwen3NextModel(DecoderModel):
+
+    def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
+        super().__init__(model_config)
+        config = self.model_config
+        pretrained_config = self.model_config.pretrained_config
+        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
+        self.aux_stream_dict = {
+            AuxStreamType.Attention: aux_stream_list[0],
+            AuxStreamType.MoeShared: aux_stream_list[0],
+            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
+            AuxStreamType.MoeBalancer: aux_stream_list[2],
+            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
+        }
+        self.aux_stream = self.aux_stream_dict[AuxStreamType.Attention]
+        self.preload_weight_modules = []
+        if config.moe_backend == "TRTLLM":
+            self.preload_weight_modules = [
+                "experts",
+                "routing_method",
+                "all_reduce",
+            ]
+
+        if model_config.mapping.enable_attention_dp:
+            # When attention_dp is enabled, we cannot do all_reduce since
+            # the problem size of different ranks are different.
+            # So, we don't do parallelism here.
+            self.embed_tokens = Embedding(pretrained_config.vocab_size,
+                                          pretrained_config.hidden_size,
+                                          dtype=pretrained_config.torch_dtype)
+        else:
+            self.embed_tokens = Embedding(
+                pretrained_config.vocab_size,
+                pretrained_config.hidden_size,
+                dtype=pretrained_config.torch_dtype,
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
+
+        layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
+        self.layers = nn.ModuleList([
+            ALL_DECODER_LAYER_TYPES[layer_types[layer_idx]](model_config,
+                                                            layer_idx,
+                                                            self.aux_stream)
+            for layer_idx in range(pretrained_config.num_hidden_layers)
+        ])
+        self.num_hidden_layers = pretrained_config.num_hidden_layers
+
+        self.norm = RMSNorm(
+            hidden_size=pretrained_config.hidden_size,
+            eps=pretrained_config.rms_norm_eps,
+            dtype=pretrained_config.torch_dtype,
+            use_gemma=True,
+        )
+
+    def forward(
+        self,
+        attn_metadata: AttentionMetadata,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+
+        mamba_metadata = attn_metadata.mamba_metadata
+        if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
+            attn_metadata.mamba_metadata = Mamba2Metadata(
+                attn_metadata.max_num_requests, chunk_size=128)
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        hidden_states = inputs_embeds
+        residual = None
+        for decoder_layer in self.layers[:self.num_hidden_layers]:
+            hidden_states, residual = decoder_layer(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                residual=residual,
+                spec_metadata=spec_metadata,
+                mamba_metadata=mamba_metadata,
+                lora_params=lora_params)
+        return hidden_states
+
+
+@register_auto_model("Qwen3NextForCausalLM")
+class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
+                                                       Qwen3NextConfig]):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen3NextConfig],
+    ):
+        if (model_config.spec_config is not None
+                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
+            ckpt_num_nextn = getattr(model_config.pretrained_config,
+                                     "num_nextn_predict_layers", None)
+            if ckpt_num_nextn not in (None, 1):
+                logger.warning(
+                    "Qwen3Next one-model MTP uses one shared MTP layer, but "
+                    f"checkpoint/config reports num_nextn_predict_layers={ckpt_num_nextn}. "
+                    "Forcing num_nextn_predict_layers=1 to keep eagle-style recurrence."
+                )
+            model_config.pretrained_config.num_nextn_predict_layers = 1
+
+        super().__init__(
+            Qwen3NextModel(model_config),
+            model_config,
+        )
+        self.preload_weight_modules = self.model.preload_weight_modules
+
+        if (model_config.spec_config is not None
+                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
+
+            self.model.layers.extend(self.draft_model.mtp_layers)
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+        """Disable block reuse until a snapshot policy is configured."""
+        return {"kv_cache_config": {"enable_block_reuse": False}}
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for the hybrid state layout."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls,
+                                          pretrained_config: object
+                                          | None = None) -> Literal["PYTHON"]:
+        """Use the Python transceiver for hybrid-state transfers."""
+        return "PYTHON"
+
+    def load_weights(self,
+                     weights: dict,
+                     weight_mapper: BaseWeightMapper,
+                     params_map: Optional[Dict[str, str]] = None,
+                     allow_partial_loading: bool = False):
+        new_weights = weight_mapper.preprocess_weights(
+            weights, allow_partial_loading=allow_partial_loading)
+        # `new_weights` aliases the source tensors for every key
+        # `preprocess_weights` did not rewrite -- the routed experts, i.e. most
+        # of a MoE checkpoint. Holding `weights` too would pin them, so
+        # consuming `new_weights` during the load would free nothing.
+        if hasattr(weights, "clear"):
+            weights.clear()
+        super().load_weights(
+            new_weights,
+            weight_mapper=weight_mapper,
+            params_map=params_map,
+            allow_partial_loading=allow_partial_loading,
+        )
+
+    def setup_aliases(self) -> None:
+        for idx, layer in enumerate(
+                self.model.layers[:self.config.num_hidden_layers]):
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = self.model.layers[
+                    idx + 1].input_layernorm
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        _precompute_fused_norm_weights(self)

@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaBufferUtils.cuh"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
@@ -29,7 +30,9 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 template <typename T, bool UE8M0_SF = false, typename = void>
@@ -67,8 +70,9 @@ struct FP4Converter<TIn, UE8M0_SF, std::enable_if_t<std::is_same_v<TIn, half> ||
     {
     }
 
+    // write_output=false: participate in warp shuffles but skip global writes (OOB threads).
     template <size_t ELTS_PER_THREAD, typename T>
-    __device__ __forceinline__ void post_process(int rowIdx, int n_base, T packed_input) const
+    __device__ __forceinline__ void post_process(int rowIdx, int n_base, T packed_input, bool write_output = true) const
     {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
@@ -78,10 +82,6 @@ struct FP4Converter<TIn, UE8M0_SF, std::enable_if_t<std::is_same_v<TIn, half> ||
         static_assert(NUM_THREADS_PER_SF == 2);
 
         int colIdx = n_base / ELTS_PER_THREAD;
-
-        // Get the input tensor offset.
-        // int inOffset = rowIdx * (numCols / ELTS_PER_THREAD) + colIdx;
-        // PackedVec vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
 
         // Get absolute maximum values among the local 8 values.
         auto localMax = __habs2({packed_input.array[0], packed_input.array[1]});
@@ -120,9 +120,6 @@ struct FP4Converter<TIn, UE8M0_SF, std::enable_if_t<std::is_same_v<TIn, half> ||
             SFValue = static_cast<float>(tmp);
         }
 
-        auto SFOffset = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */,
-            rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout, FP4QuantizationSFLayout::SWIZZLED);
-        *SFOffset = fp8SFVal;
         // Get the output scale.
         // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
         float outputScale = reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal));
@@ -148,11 +145,16 @@ struct FP4Converter<TIn, UE8M0_SF, std::enable_if_t<std::is_same_v<TIn, half> ||
         // Convert to e2m1 values.
         uint32_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
 
-        // Get the output tensor offset.
-        // Same as inOffset because 8 elements are packed into one uint32_t.
-        int64_t outOffset = rowIdx * (numCols / ELTS_PER_THREAD) + colIdx;
-        // Write the e2m1 values to global memory.
-        out[outOffset] = e2m1Vec;
+        if (write_output)
+        {
+            auto SFOffset
+                = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */, rowIdx, colIdx,
+                    std::nullopt /* numRows */, numCols / SF_VEC_SIZE, SFout, QuantizationSFLayout::SWIZZLED);
+            *SFOffset = fp8SFVal;
+
+            int64_t outOffset = rowIdx * (numCols / ELTS_PER_THREAD) + colIdx;
+            out[outOffset] = e2m1Vec;
+        }
 #else
         printf("FP4 is not supported pre-Blackwell!\n");
 #endif
@@ -184,7 +186,7 @@ struct FP4Converter<float, UE8M0_SF>
     }
 
     template <size_t ELTS_PER_THREAD, typename T>
-    __device__ __forceinline__ void post_process(int rowIdx, int n_base, T packed_input) const
+    __device__ __forceinline__ void post_process(int rowIdx, int n_base, T packed_input, bool write_output = true) const
     {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
@@ -233,8 +235,6 @@ struct FP4Converter<float, UE8M0_SF>
             SFValue = static_cast<float>(tmp);
         }
 
-        auto SFOffset = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */,
-            rowIdx, colIdx, std::nullopt /* numRows */, numCols, SFout, FP4QuantizationSFLayout::SWIZZLED);
         float outputScale = reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal));
 
         // Convert the input to float.
@@ -250,15 +250,22 @@ struct FP4Converter<float, UE8M0_SF>
         // Convert to e2m1 values.
         uint32_t e2m1Vec = fp32_vec_to_e2m1(fp2Vals);
 
-        // Get the output tensor offset.
-        // Same as inOffset because 8 elements are packed into one uint32_t.
-        int64_t outOffset = rowIdx * (numCols / ELTS_PER_THREAD) + colIdx;
-        // Write the e2m1 values to global memory.
-        out[outOffset] = e2m1Vec;
+        if (write_output)
+        {
+            auto SFOffset
+                = cvt_quant_get_sf_out_offset<uint32_t, NUM_THREADS_PER_SF>(std::nullopt /* batchIdx */, rowIdx, colIdx,
+                    std::nullopt /* numRows */, numCols / SF_VEC_SIZE, SFout, QuantizationSFLayout::SWIZZLED);
+            *SFOffset = fp8SFVal;
+
+            int64_t outOffset = rowIdx * (numCols / ELTS_PER_THREAD) + colIdx;
+            out[outOffset] = e2m1Vec;
+        }
 #else
         printf("FP4 is not supported pre-Blackwell!\n");
 #endif
     }
 };
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

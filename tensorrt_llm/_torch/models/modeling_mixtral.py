@@ -1,4 +1,5 @@
-from typing import Dict, Optional
+import re
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
@@ -12,11 +13,12 @@ from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
+from ..modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
+from ..utils import AuxStreamType
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             filter_weights, register_auto_model)
+                             register_auto_model)
 
 
 class MixtralMoE(nn.Module):
@@ -25,6 +27,7 @@ class MixtralMoE(nn.Module):
         self,
         model_config: ModelConfig[PretrainedConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -43,36 +46,31 @@ class MixtralMoE(nn.Module):
 
         reduce_results = True
 
-        self.experts = FusedMoE(
+        self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
             intermediate_size=self.ffn_dim,
-            aux_stream=aux_stream,
+            aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            layer_idx=layer_idx)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        use_dp_padding = False
-        if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
-            # Use padding here to keep the behavior unchanged
-            use_dp_padding = True
-            max_num_token = max(all_rank_num_tokens)
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, max_num_token - hidden_states.shape[0]))
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states,
             router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            use_dp_padding=use_dp_padding)
+            use_dp_padding=False,
+            lora_params=lora_params)
         return final_hidden_states
 
 
@@ -97,6 +95,23 @@ class MixtralAttention(Attention):
                          dtype=config.torch_dtype,
                          config=model_config)
 
+        self.attention_window_size = getattr(config, "sliding_window", None)
+
+    def forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> torch.Tensor:
+        return super().forward(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attn_metadata=attn_metadata,
+            attention_window_size=self.attention_window_size,
+            **kwargs,
+        )
+
 
 class MixtralDecoderLayer(DecoderLayer):
 
@@ -108,7 +123,9 @@ class MixtralDecoderLayer(DecoderLayer):
 
         self.self_attn = MixtralAttention(model_config, layer_idx=layer_idx)
 
-        self.block_sparse_moe = MixtralMoE(model_config, aux_stream)
+        self.block_sparse_moe = MixtralMoE(model_config,
+                                           aux_stream,
+                                           layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -122,10 +139,11 @@ class MixtralDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -140,13 +158,16 @@ class MixtralDecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
+        hidden_states = self.block_sparse_moe(hidden_states,
+                                              attn_metadata,
+                                              lora_params=lora_params)
         return hidden_states, residual
 
 
@@ -155,7 +176,6 @@ class MixtralModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
         config = model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.aux_stream = torch.cuda.Stream()
 
@@ -163,6 +183,8 @@ class MixtralModel(DecoderModel):
             config.vocab_size,
             config.hidden_size,
             dtype=config.torch_dtype,
+            enable_torch_compile_for_embedding=model_config.
+            enable_torch_compile_for_embedding,
         )
 
         self.layers = nn.ModuleList([
@@ -176,9 +198,10 @@ class MixtralModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -196,10 +219,85 @@ class MixtralModel(DecoderModel):
             hidden_states, residual = decoder_layer(position_ids=position_ids,
                                                     hidden_states=hidden_states,
                                                     attn_metadata=attn_metadata,
-                                                    residual=residual)
+                                                    residual=residual,
+                                                    lora_params=lora_params)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+
+
+def _unfuse_mixtral_moe_weights(weights: Dict) -> Dict:
+    """Unfuse HF transformers 5.x fused Mixtral MoE weights to per-expert format.
+
+    Transformers 5.x changed Mixtral to use fused expert weights:
+      - ``model.layers.N.mlp.experts.gate_up_proj`` [num_experts, 2*intermediate, hidden]
+      - ``model.layers.N.mlp.experts.down_proj`` [num_experts, hidden, intermediate]
+    and renamed ``block_sparse_moe`` to ``mlp``.
+
+    This function detects the new format and converts it to the per-expert
+    format that TRT-LLM expects:
+      - ``model.layers.N.block_sparse_moe.experts.{i}.w1.weight``
+      - ``model.layers.N.block_sparse_moe.experts.{i}.w3.weight``
+      - ``model.layers.N.block_sparse_moe.experts.{i}.w2.weight``
+
+    Modifies and returns the weights dict in-place.
+    """
+    keys_to_remove = []
+    keys_to_add = {}
+
+    for key in list(weights.keys()):
+        # Detect fused gate_up_proj: model.layers.N.mlp.experts.gate_up_proj
+        m = re.match(r'^(model\.layers\.\d+\.)mlp\.experts\.gate_up_proj$', key)
+        if m:
+            prefix = m.group(1)
+            value = weights[key]
+            if hasattr(value, 'dim') and value.dim() == 3:
+                num_experts = value.shape[0]
+                half = value.shape[1] // 2
+                for i in range(num_experts):
+                    # gate_up_proj first half = gate_proj (w1),
+                    # second half = up_proj (w3)
+                    keys_to_add[
+                        f"{prefix}block_sparse_moe.experts.{i}.w1.weight"] = value[
+                            i, :half, :]
+                    keys_to_add[
+                        f"{prefix}block_sparse_moe.experts.{i}.w3.weight"] = value[
+                            i, half:, :]
+                keys_to_remove.append(key)
+            continue
+
+        # Detect fused down_proj: model.layers.N.mlp.experts.down_proj
+        m = re.match(r'^(model\.layers\.\d+\.)mlp\.experts\.down_proj$', key)
+        if m:
+            prefix = m.group(1)
+            value = weights[key]
+            if hasattr(value, 'dim') and value.dim() == 3:
+                num_experts = value.shape[0]
+                for i in range(num_experts):
+                    keys_to_add[
+                        f"{prefix}block_sparse_moe.experts.{i}.w2.weight"] = value[
+                            i]
+                keys_to_remove.append(key)
+            continue
+
+        # Rename mlp.gate -> block_sparse_moe.gate (router weights)
+        m = re.match(r'^(model\.layers\.\d+\.)mlp\.gate\.(.+)$', key)
+        if m:
+            prefix = m.group(1)
+            suffix = m.group(2)
+            keys_to_add[f"{prefix}block_sparse_moe.gate.{suffix}"] = weights[
+                key]
+            keys_to_remove.append(key)
+            continue
+
+    if not keys_to_remove:
+        return weights
+
+    for key in keys_to_remove:
+        del weights[key]
+    weights.update(keys_to_add)
+
+    return weights
 
 
 @register_auto_model("MixtralForCausalLM")
@@ -212,26 +310,17 @@ class MixtralForCausalLM(DecoderModelForCausalLM[MixtralModel,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
 
-    def load_weights(self, weights: Dict):
-
-        params_map = {
-            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-        }
-
-        for name, module in self.named_modules():
-            if len(module._parameters) > 0:
-                names = name.split('.')
-                if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        module_weights.append(
-                            filter_weights('.'.join(names[:-1] + [new_name]),
-                                           weights))
-                    module.load_weights(weights=module_weights)
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module.named_parameters():
-                            p.data.copy_(module_weights[n][:])
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper=None,
+                     skip_modules: List[str] = [],
+                     params_map: Optional[Dict[str, str]] = None,
+                     allow_partial_loading: bool = False):
+        # Preprocess weights to handle transformers 5.x fused MoE format.
+        # This handles both the v1 (no mapper) and v2 (with mapper) paths.
+        _unfuse_mixtral_moe_weights(weights)
+        super().load_weights(weights,
+                             weight_mapper=weight_mapper,
+                             skip_modules=skip_modules,
+                             params_map=params_map,
+                             allow_partial_loading=allow_partial_loading)

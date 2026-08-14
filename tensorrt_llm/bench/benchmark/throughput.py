@@ -1,7 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import asyncio
-import json
+import sys
+from functools import partial
 from pathlib import Path
 
 import click
@@ -9,30 +24,34 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
 
+from tensorrt_llm.bench.benchmark import (GeneralExecSettings,
+                                          collect_explicit_cli_keys,
+                                          generate_json_report,
+                                          get_general_cli_options, get_llm)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
-from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
-from tensorrt_llm.bench.build.build import get_model_config
+from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
-    get_settings_from_engine, get_settings)
+    get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
 # isort: on
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
+from tensorrt_llm.bench.benchmark.utils.general import (
+    generate_warmup_dataset, update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
+from tensorrt_llm.bench.utils.data import (DatasetFormatError,
+                                           create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
-from tensorrt_llm.llmapi import LLM, CapacitySchedulerPolicy
+from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
 
 @click.command(name="throughput")
 @optgroup.group("Engine run configuration.",
-                help="Runtime settings for executing a TensorRT-LLM engine.")
+                help="Runtime settings for executing a TensorRT LLM engine.")
 @optgroup.option(
     "--engine_dir",
     type=click.Path(exists=True,
@@ -42,17 +61,37 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=None,
     help="Path to a serialized TRT-LLM engine.",
 )
-@optgroup.option("--backend",
-                 type=click.Choice(["pytorch", "autodeploy"]),
-                 default=None,
-                 help="Set to 'pytorch' for pytorch path. Default is cpp path.")
 @optgroup.option(
+    "--backend",
+    type=click.Choice(ALL_SUPPORTED_BACKENDS),
+    default="pytorch",
+    help="The backend to use for benchmark. Default is pytorch backend.")
+@optgroup.option(
+    "--custom_module_dirs",
+    type=click.Path(exists=True,
+                    readable=True,
+                    path_type=Path,
+                    resolve_path=True),
+    default=None,
+    multiple=True,
+    help="Paths to custom module directories to import.",
+)
+@optgroup.option(
+    "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
-    help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file. Can be specified as either --config or "
+    "--extra_llm_api_options.")
+@optgroup.option("--sampler_options",
+                 type=click.Path(exists=True,
+                                 readable=True,
+                                 path_type=Path,
+                                 resolve_path=True),
+                 default=None,
+                 help="Path to a YAML file that sets sampler options.")
 @optgroup.option(
     "--max_batch_size",
     type=int,
@@ -95,6 +134,24 @@ from tensorrt_llm.sampling_params import SamplingParams
     required=False,
     help="Pass in a dataset file for parsing instead of stdin.",
 )
+# For text models, tokenizer initialization is not needed when loading the model since the dataset is already tokenized.
+# For this reason, we skip tokenizer initialization by default.
+# However, for VLM models, tokenizer initialization is needed inside the model since the dataset contains texts and
+# raw media data. We cannot skip tokenizer initialization in this case.
+@optgroup.option(
+    "--no_skip_tokenizer_init",
+    is_flag=True,
+    default=False,
+    help="Do not skip tokenizer initialization when loading the model.",
+)
+@optgroup.option(
+    "--custom_tokenizer",
+    type=str,
+    default=None,
+    help="Custom tokenizer alias (e.g., 'deepseek_v32') or "
+    "fully-qualified 'module.path.ClassName' for models whose HF tokenizer "
+    "is incompatible with AutoTokenizer.",
+)
 @optgroup.option(
     "--eos_id",
     type=int,
@@ -108,6 +165,18 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=click.Choice(["image", "video"]),
     default=None,
     help="Modality of the multimodal requests.",
+)
+@optgroup.option(
+    "--image_data_format",
+    type=click.Choice(["pt", "pil"]),
+    default="pt",
+    help="Format of the image data for multimodal models.",
+)
+@optgroup.option(
+    "--data_device",
+    type=click.Choice(["cuda", "cpu"]),
+    default="cuda",
+    help="Device to load the multimodal data on.",
 )
 @optgroup.option(
     "--max_input_len",
@@ -124,6 +193,15 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Number of requests to cap benchmark run at. If not specified or set to 0, it will be the "
     "length of dataset.",
+)
+@optgroup.option(
+    "--duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help=
+    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration). "
+    "Requires --concurrency. Requests dropped at the deadline are excluded from the report, so the statistics "
+    "cover the requests that completed rather than the whole dataset.",
 )
 @optgroup.option(
     "--warmup",
@@ -221,17 +299,27 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where output should be written to.",
 )
 @optgroup.option(
-    "--enable_chunked_context",
-    is_flag=True,
-    default=False,
-    help="Enable chunking in prefill stage for enhanced throughput benchmark.",
+    "--request_json",
+    type=click.Path(dir_okay=False,
+                    writable=True,
+                    readable=False,
+                    path_type=Path,
+                    resolve_path=True),
+    required=False,
+    help="Path where per request information is written to.",
+)
+@optgroup.option(
+    "--enable_chunked_context/--disable_chunked_context",
+    default=True,
+    help=
+    "Enable/disable chunking in prefill stage for enhanced throughput benchmark. "
 )
 @optgroup.option(
     "--scheduler_policy",
     type=click.Choice(["guaranteed_no_evict", "max_utilization"]),
     default="guaranteed_no_evict",
-    help=
-    "KV cache scheduler policy: guaranteed_no_evict prevents request eviction, max_utilization optimizes for throughput.",
+    help=("KV cache scheduler policy: guaranteed_no_evict prevents request"
+          " eviction, max_utilization optimizes for throughput."),
 )
 @click.pass_obj
 def throughput_command(
@@ -239,74 +327,94 @@ def throughput_command(
     **params,
 ) -> None:
     """Run a throughput test on a TRT-LLM engine."""
-
     logger.info("Preparing to run throughput benchmark...")
-    # Parameters from CLI
-    # Model, experiment, and engine params
-    dataset_path: Path = params.pop("dataset")
-    eos_id: int = params.pop("eos_id")
-    warmup: int = params.get("warmup")
-    num_requests: int = params.pop("num_requests")
-    max_seq_len: int = params.pop("max_seq_len")
-    model: str = bench_env.model
-    checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
-    engine_dir: Path = params.pop("engine_dir")
-    concurrency: int = params.pop("concurrency")
-    backend: str = params.get("backend")
-    modality: str = params.pop("modality")
-    max_input_len: int = params.pop("max_input_len")
-    model_type = get_model_config(model, checkpoint_path).model_type
 
-    # Reporting options
-    report_json: Path = params.pop("report_json")
-    output_json: Path = params.pop("output_json")
-    iteration_log: Path = params.pop("iteration_log")
-    iteration_writer = IterationWriter(iteration_log)
+    # Parameters from CLI
+    image_data_format: str = params.get("image_data_format", "pt")
+    data_device: str = params.get("data_device", "cpu")
+    no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
+    custom_tokenizer: str = params.get("custom_tokenizer", None)
+
+    # Get general CLI options using the centralized function
+    options: GeneralExecSettings = get_general_cli_options(params, bench_env)
+    # Checked before the model is loaded so the mistake is reported in seconds
+    # rather than after several minutes of startup.
+    if options.duration is not None and options.concurrency <= 0:
+        raise click.UsageError(
+            "--duration requires a concurrency limit. Without one every request "
+            "is submitted to the engine at once, so there is no point at which "
+            "the deadline can be applied and the full dataset would run. Pass "
+            "--concurrency N.")
+    tokenizer = initialize_tokenizer(options.checkpoint_path, custom_tokenizer)
+
+    # Extract throughput-specific options not handled by GeneralExecSettings
+    max_batch_size = params.get("max_batch_size")
+    max_num_tokens = params.get("max_num_tokens")
+    enable_chunked_context: bool = params.get("enable_chunked_context")
+    scheduler_policy: str = params.get("scheduler_policy")
+
+    custom_module_dirs: list[Path] = params.pop("custom_module_dirs", [])
+    for custom_module_dir in custom_module_dirs:
+        try:
+            import_custom_module_from_dir(custom_module_dir)
+        except Exception as e:
+            logger.error(
+                f"Failed to import custom module from {custom_module_dir}: {e}")
+            raise e
+
+    # Eagerly import auto_deploy to ensure custom model configs
+    # are registered with transformers.AutoConfig before
+    # options.model_type triggers AutoConfig.from_pretrained().
+    if options.backend == "_autodeploy":
+        import tensorrt_llm._torch.auto_deploy  # noqa: F401
 
     # Runtime kwargs and option tracking.
     kwargs = {}
 
-    # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(checkpoint_path)
-
     # Dataset Loading and Preparation
-    with open(dataset_path, "r") as dataset:
-        metadata, requests = create_dataset_from_stream(
-            tokenizer,
-            dataset,
-            num_requests=num_requests,
-            model_dir=checkpoint_path,
-            model_type=model_type,
-            modality=modality,
-            max_input_seq_len_for_multimodal=max_input_len)
-        metadata.dataset_path = dataset_path
+    with open(options.dataset_path, "r") as dataset:
+        try:
+            metadata, requests = create_dataset_from_stream(
+                tokenizer,
+                dataset,
+                num_requests=options.num_requests,
+                model_dir=options.checkpoint_path,
+                model_type=options.model_type,
+                modality=options.modality,
+                image_data_format=image_data_format,
+                data_device=data_device,
+                max_input_seq_len_for_multimodal=options.max_input_len)
+        except DatasetFormatError as e:
+            raise click.UsageError(str(e))
+        metadata.dataset_path = options.dataset_path
         params["target_input_len"] = params.get(
             "target_input_len") or metadata.avg_isl
         params["target_output_len"] = params.get(
             "target_output_len") or metadata.avg_osl
 
-    if modality is None:
+    if options.modality is None:
         # Log dataset info
         # NOTE: This table is only accurate for non-multimodal models.
         #       The accurate table for multimodal models will be logged after the benchmark is done.
         logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if backend and backend.lower() in ["pytorch", "autodeploy"]:
+    if options.backend and options.backend.lower(
+    ) in ALL_SUPPORTED_BACKENDS and options.backend.lower() != "tensorrt":
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
         if bench_env.checkpoint_path is None:
-            snapshot_download(model)
+            snapshot_download(options.model, revision=bench_env.revision)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
-        kwargs_max_sql = max_seq_len or metadata.max_sequence_length
+        kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
         logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
         kwargs["max_seq_len"] = kwargs_max_sql
-    else:
-        assert max_seq_len is None, (
+    elif options.backend.lower() == "tensorrt":
+        assert options.max_seq_len is None, (
             "max_seq_len is not a runtime parameter for C++ backend")
-        exec_settings, build_cfg = get_settings_from_engine(engine_dir)
+        exec_settings, build_cfg = get_settings_from_engine(options.engine_dir)
         engine_max_seq_len = build_cfg["max_seq_len"]
 
         # TODO: Verify that the engine can handle the max/min ISL/OSL.
@@ -316,29 +424,29 @@ def throughput_command(
                 "Provided dataset contains a maximum sequence of "
                 f"{metadata.max_sequence_length}. Please rebuild a new engine "
                 "to support this dataset.")
+    else:
+        raise click.BadParameter(
+            f"{options.backend} is not a known backend, check help for available options.",
+            param_hint="backend")
 
-    exec_settings["model"] = model
+    exec_settings["model"] = options.model
+    exec_settings["revision"] = bench_env.revision
     engine_bs = exec_settings["settings_config"]["max_batch_size"]
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
     # Runtime Options
-    runtime_max_bs = params.pop("max_batch_size")
-    runtime_max_tokens = params.pop("max_num_tokens")
-    runtime_max_bs = runtime_max_bs or engine_bs
-    runtime_max_tokens = runtime_max_tokens or engine_tokens
-    kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
-    beam_width = params.pop("beam_width")
-    streaming: bool = params.pop("streaming")
-    enable_chunked_context: bool = params.pop("enable_chunked_context")
-    scheduler_policy: str = params.pop("scheduler_policy")
+    runtime_max_bs = max_batch_size or engine_bs
+    runtime_max_tokens = max_num_tokens or engine_tokens
 
     # Update configuration with runtime options
-    exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
+    exec_settings["settings_config"][
+        "kv_cache_percent"] = options.kv_cache_percent
     exec_settings["settings_config"]["max_batch_size"] = runtime_max_bs
     exec_settings["settings_config"]["max_num_tokens"] = runtime_max_tokens
-    exec_settings["settings_config"]["beam_width"] = beam_width
-    exec_settings["settings_config"][
-        "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION
+    exec_settings["settings_config"]["beam_width"] = options.beam_width
+    exec_settings["settings_config"]["scheduler_policy"] = (
+        CapacitySchedulerPolicy.GUARANTEED_NO_EVICT if scheduler_policy
+        == "guaranteed_no_evict" else CapacitySchedulerPolicy.MAX_UTILIZATION)
     exec_settings["settings_config"]["chunking"] = enable_chunked_context
 
     # Dynamic runtime features.
@@ -346,77 +454,113 @@ def throughput_command(
 
     # LlmArgs
     exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
-    exec_settings["iteration_log"] = iteration_log
+    exec_settings["iteration_log"] = options.iteration_log
+    exec_settings["explicit_cli_keys"] = collect_explicit_cli_keys()
 
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
     llm = None
+
     try:
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
-        kwargs['backend'] = backend
+        kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
+        kwargs['backend'] = options.backend
+        if (options.modality is None and options.backend == "pytorch"
+                and "disable_mm_encoder" not in kwargs
+                and not kwargs.get("mm_encoder_only", False)):
+            # Text-only benchmark: skip a multimodal checkpoint's encoder so
+            # its GPU memory goes to the KV cache pool instead. Text-only
+            # models ignore this flag. Overridable via extra_llm_api_options.
+            kwargs["disable_mm_encoder"] = True
+            logger.info(
+                "Text-only benchmark (--modality not set): the multimodal "
+                "encoder, if the model has one, will not be loaded.")
+        if bench_env.telemetry_config is not None:
+            kwargs["telemetry_config"] = bench_env.telemetry_config
 
-        if backend == "pytorch":
-            kwargs["enable_iter_perf_stats"] = True
+        runtime_config.settings_config.max_batch_size = kwargs.get(
+            "max_batch_size", runtime_config.settings_config.max_batch_size)
+        runtime_config.settings_config.max_num_tokens = kwargs.get(
+            "max_num_tokens", runtime_config.settings_config.max_num_tokens)
 
-        if runtime_config.backend == 'pytorch':
-            llm = PyTorchLLM(**kwargs)
-        else:
-            llm = LLM(**kwargs)
+        llm = get_llm(runtime_config, kwargs)
 
-        sampling_params = SamplingParams(end_id=eos_id,
-                                         pad_id=eos_id,
-                                         n=beam_width,
-                                         use_beam_search=beam_width > 1)
+        sampler_args = {
+            "end_id": options.eos_id,
+            "pad_id": options.eos_id,
+            "n": options.beam_width,
+            "use_beam_search": options.beam_width > 1
+        }
+        sampler_args = update_sampler_args_with_extra_options(
+            sampler_args, params.pop("sampler_options"))
+        sampling_params = SamplingParams(**sampler_args)
+
+        post_proc_params = None  # No detokenization
+
+        has_multi_turn = any(r.is_multi_turn for r in requests)
+        multi_turn_tokenizer = tokenizer if has_multi_turn else None
+        if has_multi_turn:
+            logger.info("Multi-turn requests detected. Turns will be processed "
+                        "sequentially within each request.")
 
         # Perform warmup if requested.
-        if warmup > 0:
+        if options.warmup > 0:
             logger.info("Setting up for warmup...")
-            warmup_dataset = generate_warmup_dataset(requests, warmup)
+            warmup_dataset = generate_warmup_dataset(requests, options.warmup)
             logger.info("Running warmup.")
             asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
+                                post_proc_params,
                                 warmup_dataset,
                                 False,
-                                concurrency,
-                                modality=modality))
+                                options.concurrency,
+                                modality=options.modality,
+                                tokenizer=multi_turn_tokenizer))
             # WAR: IterationResult is a singleton tied to the executor.
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
             llm._executor._iter_stats_result = None
             logger.info("Warmup done.")
 
+        iteration_writer = options.iteration_writer
         with iteration_writer.capture():
             statistics = asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
+                                post_proc_params,
                                 requests,
-                                streaming,
-                                concurrency,
+                                options.streaming,
+                                options.concurrency,
                                 iteration_writer.full_address,
-                                modality=modality))
+                                modality=options.modality,
+                                tokenizer=multi_turn_tokenizer,
+                                duration=options.duration))
 
-        logger.info(f"Benchmark done. Reporting results...")
-        if modality is not None:
+        logger.info("Benchmark done. Reporting results...")
+        if options.modality is not None:
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
 
         report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, kwargs, streaming)
-        if report_json:
-            logger.info(f"Writing report to '{report_json}'.")
-            with open(report_json, "w") as f:
-                f.write(
-                    json.dumps(report_utility.get_statistics_dict(), indent=4))
-        if output_json:
-            logger.info(f"Writing output to {output_json}.")
-            with open(output_json, "w") as f:
-                output_token_info = report_utility.get_output_tokens(tokenizer)
-                f.write(json.dumps(output_token_info, indent=4))
+                                       logger, kwargs, options.streaming)
+        # Generate reports for statistics, output tokens, and request info.
+        generate_json_report(options.report_json,
+                             report_utility.get_statistics_dict)
+        generate_json_report(
+            options.output_json,
+            partial(report_utility.get_output_tokens, tokenizer))
+        generate_json_report(
+            options.request_json,
+            partial(report_utility.get_request_info, tokenizer))
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")
+    except Exception:
+        import traceback
+        logger.error(f"Error during benchmarking:\n{traceback.format_exc()}")
+        sys.exit(1)
     finally:
         if llm is not None:
             llm.shutdown()

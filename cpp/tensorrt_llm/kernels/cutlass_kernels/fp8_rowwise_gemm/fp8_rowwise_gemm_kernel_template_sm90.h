@@ -26,6 +26,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif // __GNUC__
+#include "tensorrt_llm/common/config.h"
 
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
@@ -43,18 +44,19 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
+#include "tensorrt_llm/kernels/archCondition.h"
+
 #ifdef __GNUC__ // Check if the compiler is GCC or Clang
 #pragma GCC diagnostic pop
 #endif          // __GNUC__
 
-using namespace cute;
+TRTLLM_NAMESPACE_BEGIN
 
-namespace tensorrt_llm
-{
 namespace kernels
 {
 namespace cutlass_kernels
 {
+using namespace cute;
 
 template <typename ElementType, typename OutElementType, typename AccumElementType, typename CTAShape,
     typename ClusterShape, typename MainloopScheduleType, typename EpilogueScheduleType,
@@ -163,12 +165,37 @@ struct DeviceGemmFp8RowwiseSm90
             sizeof(typename CollectiveEpilogue::SharedStorage))>,
         MainLoopSchedule>::CollectiveOp;
 
-    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, // Indicates ProblemShape
-        CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
+    template <typename Base>
+    struct Sm90Only : Base
+    {
+        using typename Base::Params;
+
+        CUTLASS_DEVICE
+        void operator()(Params const& params, char* smem_buf)
+        {
+            if constexpr (tensorrt_llm::kernels::arch::is_match_v<90>)
+            {
+                this->Base::operator()(params, smem_buf);
+            }
+            else
+            {
+                if (cute::thread0())
+                {
+                    printf("%s : This kernel shall only run on SM90 devices.\n", __PRETTY_FUNCTION__);
+                    __trap();
+                }
+            }
+        }
+    };
+
+    using GemmKernel
+        = Sm90Only<cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, // Indicates ProblemShape
+            CollectiveMainloop, CollectiveEpilogue, TileScheduler>>;
 
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

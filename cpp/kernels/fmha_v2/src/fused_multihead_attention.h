@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -44,6 +49,8 @@ enum class Attention_mask_type
     CAUSAL,
     // Causal mask + attend to the specific sliding window or chunk.
     SLIDING_OR_CHUNKED_CAUSAL,
+    // Bidirectional sliding window attention.
+    BIDIRECTIONAL_SLIDING_WINDOW,
     // The custom mask input.
     CUSTOM_MASK,
 };
@@ -57,6 +64,7 @@ static inline std::string mask_type_to_string(Attention_mask_type mask_type)
     case Attention_mask_type::PADDING: return "padding";
     case Attention_mask_type::CAUSAL: return "causal";
     case Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL: return "sliding_or_chunked_causal";
+    case Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW: return "bidirectional_sliding_window";
     case Attention_mask_type::CUSTOM_MASK: return "custom_mask";
     default: assert(false); return "";
     }
@@ -74,6 +82,10 @@ enum class Attention_input_layout
     // of [B, 2, Blocks_per_Seq], and the indice indicates the block distance to the pool ptr in
     // global memory.
     Q_PAGED_KV,
+    // Q has [B, S, H, D] layout,
+    // K has [B, S, H_kv, D] layout,
+    // V has [B, S, H_kv, Dv] layout,
+    SEPARATE_Q_K_V,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -85,6 +97,7 @@ static inline std::string attention_input_layout_to_string(Attention_input_layou
     case Attention_input_layout::PACKED_QKV: return "packed_qkv";
     case Attention_input_layout::CONTIGUOUS_Q_KV: return "contiguous_q_kv";
     case Attention_input_layout::Q_PAGED_KV: return "contiguous_q_paged_kv";
+    case Attention_input_layout::SEPARATE_Q_K_V: return "separate_q_k_v";
     default: assert(false); return "";
     }
 }
@@ -114,8 +127,6 @@ struct Fused_multihead_attention_params_base
     // The O matrix (output).
     void* o_ptr;
 
-    // The stride between rows of the Q, K and V matrices.
-    int64_t qkv_stride_in_bytes;
     // The stride between rows of O.
     int64_t o_stride_in_bytes;
 
@@ -169,6 +180,8 @@ struct Fused_multihead_attention_params_base
 
 struct Fused_multihead_attention_params_v1 : Fused_multihead_attention_params_base
 {
+    // The stride between rows of the Q, K and V matrices.
+    int64_t qkv_stride_in_bytes;
     // The mask to implement drop-out.
     void* packed_mask_ptr;
 
@@ -187,10 +200,13 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
     void* packed_mask_ptr;
     // The mask input's stride in the N (K-seq) dimension.
     int64_t packed_mask_stride_in_bytes;
-    // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
+    // The Softmax stats vector of layout [total_tokens_q, h, 2], including softmax_max and softmax_sum
     void* softmax_stats_ptr;
-    // The stride between rows of softmax_stats_ptr
+    // The stride between rows of softmax_stats_ptr, default: h * sizeof(float2)
     int64_t softmax_stats_stride_in_bytes;
+
+    // The attention sinks (per head).
+    float* attention_sinks;
 
     // array of length b+1 holding prefix sum of actual q sequence lengths.
     int* cu_q_seqlens;
@@ -207,20 +223,25 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
     // Kv in packed qkv layout: [B, S, 3, H, D]
     // Contiguous kv layout: [B, 2, H, S, D].
     // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
-    fmha::cudaTmaDesc tma_desc_kv;
+    fmha::cudaTmaDesc tma_desc_k;
+    fmha::cudaTmaDesc tma_desc_v;
     // Tma descriptor for o
     fmha::cudaTmaDesc tma_desc_o;
 
     // Contiguous Q buffer pointer [B, S, H, D].
     void* q_ptr;
+    // The separate K matrice.
+    void* k_ptr;
+    // The separate V matrice.
+    void* v_ptr;
     // Contiguous KV buffer pointer [B, 2, H, S, D].
     void* kv_ptr;
     // Paged KV Cache buffer.
     fmha::Kv_block_array paged_kv_cache;
     // Q and KV stride (used by LDGSTS).
     int64_t q_stride_in_bytes;
-    int64_t kv_stride_in_bytes;
-    int64_t v_stride_in_bytes = 0;
+    int64_t k_stride_in_bytes;
+    int64_t v_stride_in_bytes;
 
     // Paged KV load.
     int blocks_per_tma_load;
@@ -265,6 +286,16 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
             float* scales;
         } q, k, v;
     } sage;
+
+    // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold_scale_factor / seqlen.
+    // A positive value means skip-softmax is enabled.
+    float skip_softmax_threshold_scale_factor = 0;
+
+#ifdef SKIP_SOFTMAX_STAT
+    // Statistics of skip-softmax, pointers of device memory for output
+    uint32_t* skip_softmax_total_blocks;
+    uint32_t* skip_softmax_skipped_blocks;
+#endif
 };
 
 #endif
@@ -304,6 +335,8 @@ struct Fused_multihead_attention_launch_params
     // harward properties to determine how to launch blocks
     int multi_processor_count = 0;
     int device_l2_cache_size = 0;
+    // skip softmax attention
+    bool enable_skip_softmax = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -16,11 +16,14 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_fp8.h>
 
 #include "tensorrt_llm/common/envUtils.h"
 
-namespace tensorrt_llm::kernels::llama4_min_latency
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::llama4_min_latency
 {
 
 namespace llama4_bf16_bf16_gemm
@@ -66,7 +69,7 @@ constexpr bool ENABLE_PREEXIT = 0;
 
 } // namespace llama4_fp8_fp8_gemm_swiglu
 
-inline void launch_kernel_fdl(
+inline void launch_kernel_pdl(
     dim3 grid_dim, dim3 block_dim, cudaStream_t stream, void* kernel_func, void* args[], int num_args)
 {
     cudaLaunchConfig_t config;
@@ -119,4 +122,6 @@ struct __align__(8) aligned_bfloat16x4
     __align__(8) __nv_bfloat16 data[4];
 };
 
-} // namespace tensorrt_llm::kernels::llama4_min_latency
+} // namespace kernels::llama4_min_latency
+
+TRTLLM_NAMESPACE_END

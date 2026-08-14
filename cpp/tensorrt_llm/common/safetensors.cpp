@@ -17,7 +17,8 @@
 #include "safetensors.h"
 #include "nlohmann/json.hpp"
 #include "tensorrt_llm/common/assert.h"
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cstdint>
 #include <fstream>
 #include <map>
@@ -25,9 +26,11 @@
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::common::safetensors
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::safetensors
 {
-using nvinfer1::DataType;
+using tensorrt_llm::DataType;
 
 static DataType convertDataTypeStrToEnum(std::string const& str)
 {
@@ -164,4 +167,6 @@ std::shared_ptr<ISafeTensor> ISafeTensor::open(char const* filename)
 {
     return std::make_shared<SafeTensor>(filename);
 }
-} // namespace tensorrt_llm::common::safetensors
+} // namespace common::safetensors
+
+TRTLLM_NAMESPACE_END

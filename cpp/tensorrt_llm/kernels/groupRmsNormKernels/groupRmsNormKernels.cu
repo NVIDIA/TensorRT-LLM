@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -21,9 +22,12 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/groupRmsNormKernels/groupRmsNormKernels.h"
 
-namespace tensorrt_llm::kernels::group_rms_norm
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::group_rms_norm
 {
 // Helper function to calculate the number of warps to launch for GroupRMSNormBase
 template <typename DType, int n>
@@ -108,7 +112,7 @@ __global__ void GroupRMSNormBaseKernel(GroupRMSParams<n> params, int rounds)
     PackedType const* __restrict__ weight_ptr = nullptr;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     // Find which input current warp operates on
@@ -260,7 +264,7 @@ __global__ void GroupRMSNormBaseKernel(GroupRMSParams<n> params, int rounds)
     }
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -302,7 +306,7 @@ __global__ void GroupRMSNormKernelLargeBatch(
     bool process_input_1 = warp_idx < warp_size_1;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     // Get input pointers
@@ -562,7 +566,7 @@ __global__ void GroupRMSNormKernelLargeBatch(
     }
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -652,9 +656,9 @@ void GroupRMSNormBaseKernelLauncher(GroupRMSParams<n>& params)
 
     switch (params.dtype)
     {
-    case nvinfer1::DataType::kHALF: GROUP_RMS_NORM_DISPATCH(half); break;
-    case nvinfer1::DataType::kBF16: GROUP_RMS_NORM_DISPATCH(__nv_bfloat16); break;
-    case nvinfer1::DataType::kFLOAT: GROUP_RMS_NORM_DISPATCH(float); break;
+    case tensorrt_llm::DataType::kHALF: GROUP_RMS_NORM_DISPATCH(half); break;
+    case tensorrt_llm::DataType::kBF16: GROUP_RMS_NORM_DISPATCH(__nv_bfloat16); break;
+    case tensorrt_llm::DataType::kFLOAT: GROUP_RMS_NORM_DISPATCH(float); break;
     default: TLLM_CHECK_WITH_INFO(false, "Unsupported data type for GroupRMSNorm");
     }
 
@@ -747,9 +751,9 @@ void GroupRMSNormKernelLargeBatchLauncher(GroupRMSParams<n>& params)
 
     switch (params.dtype)
     {
-    case nvinfer1::DataType::kHALF: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(half); break;
-    case nvinfer1::DataType::kBF16: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(__nv_bfloat16); break;
-    case nvinfer1::DataType::kFLOAT: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(float); break;
+    case tensorrt_llm::DataType::kHALF: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(half); break;
+    case tensorrt_llm::DataType::kBF16: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(__nv_bfloat16); break;
+    case tensorrt_llm::DataType::kFLOAT: GROUP_RMS_NORM_LARGE_BATCH_DISPATCH(float); break;
     default: TLLM_CHECK_WITH_INFO(false, "Unsupported data type for GroupRMSNormV2");
     }
 
@@ -810,15 +814,15 @@ void GroupRMSNormKernelLauncherWithHeuristic(GroupRMSParams<n>& params)
         // Choose the appropriate DType
         switch (params.dtype)
         {
-        case nvinfer1::DataType::kHALF:
+        case tensorrt_llm::DataType::kHALF:
             base_warps = calculateNumWarpsBase<half, n>(params);
             large_batch_warps = calculateNumWarpsLargeBatch<half, n>(params).num_warps_to_launch;
             break;
-        case nvinfer1::DataType::kBF16:
+        case tensorrt_llm::DataType::kBF16:
             base_warps = calculateNumWarpsBase<__nv_bfloat16, n>(params);
             large_batch_warps = calculateNumWarpsLargeBatch<__nv_bfloat16, n>(params).num_warps_to_launch;
             break;
-        case nvinfer1::DataType::kFLOAT:
+        case tensorrt_llm::DataType::kFLOAT:
             base_warps = calculateNumWarpsBase<float, n>(params);
             large_batch_warps = calculateNumWarpsLargeBatch<float, n>(params).num_warps_to_launch;
             break;
@@ -876,4 +880,6 @@ void GroupRMSNormKernelLauncherWithHeuristic(GroupRMSParams<n>& params)
 INSTANTIATE_GROUP_RMS_NORM_WITH_HEURISTIC(1)
 INSTANTIATE_GROUP_RMS_NORM_WITH_HEURISTIC(2)
 
-} // namespace tensorrt_llm::kernels::group_rms_norm
+} // namespace kernels::group_rms_norm
+
+TRTLLM_NAMESPACE_END

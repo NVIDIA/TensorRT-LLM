@@ -16,11 +16,12 @@
  * This file contains constants that decoderXQA*.{h,cpp} need.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <optional>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 inline constexpr int kMinHistoryTokensPerBlock = 128;
@@ -32,7 +33,13 @@ inline constexpr int kTargetWaveFactor = 8;
 // This should be enough. Huge batch size may result in larger value, but for large batch size,
 // multi-block mode is not useful. For llama v2 70b, 6000 results in ~12MB multi-block
 // workspace, and is enough for > 10 waves.
-inline constexpr int kXQA_MAX_NUM_SUB_SEQ = 6000;
+inline constexpr int getXqaMaxNumSubSeq(bool isMLA)
+{
+    constexpr int kXQA_MAX_NUM_SUB_SEQ = 6000;
+    constexpr int kXQA_MLA_MAX_NUM_SUB_SEQ = 500;
+    return isMLA ? kXQA_MLA_MAX_NUM_SUB_SEQ : kXQA_MAX_NUM_SUB_SEQ;
+}
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -16,12 +16,16 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 static constexpr runtime::SizeType32 TOP_K_MAX = 1024;
@@ -161,9 +165,8 @@ struct TopKSamplingKernelParams
         }
 
         TLLM_CHECK(((finishedOutput == nullptr) ^ (endIds == nullptr)) == 0);
-
-        TLLM_CHECK(0 < maxTopP && maxTopP <= 1.f);
-        TLLM_CHECK(0 <= maxTopK && maxTopK <= TOP_K_MAX);
+        TLLM_CHECK_WITH_INFO(0 < maxTopP && maxTopP <= 1.f, "maxTopP (%f) is out of range", maxTopP);
+        TLLM_CHECK_WITH_INFO(0 <= maxTopK && maxTopK <= TOP_K_MAX, "maxTopK (%d) is out of range", maxTopK);
         TLLM_CHECK((skipOutputIdCurrentStep && outputIdCurrentStep && returnAllSelectedTokens)
             || (skipOutputIdCurrentStep == nullptr && outputIdCurrentStep == nullptr));
     }
@@ -302,4 +305,6 @@ __device__ __host__ inline void setupTopKTopPRuntimeArgOne(runtime::SizeType32 b
     }
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

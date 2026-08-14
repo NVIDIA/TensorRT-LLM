@@ -16,22 +16,13 @@
 
 #include "fp8_blockscale_gemm.h"
 #include "fp8_blockscale_gemm_kernel.cuh"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm
-{
+TRTLLM_NAMESPACE_BEGIN
 
-template <typename ElementA, typename ElementB, typename ElementD>
-CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::CutlassFp8BlockScaleGemmRunner()
+namespace kernels::fp8_blockscale_gemm
 {
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-}
-
-template <typename ElementA, typename ElementB, typename ElementD>
-CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::~CutlassFp8BlockScaleGemmRunner()
-{
-    TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
-}
 
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(void* mat_d, void const* mat_a,
@@ -100,8 +91,8 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(__nv_fp8
 
 template <typename ElementA, typename ElementB, typename ElementD>
 void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void* mat_d, void const* mat_a,
-    void const* mat_b, int64_t const* problem_m_offsets, size_t num_problems, size_t shape_n, size_t shape_k,
-    cudaStream_t stream, float const* scales_a, float const* scales_b)
+    void const* mat_b, int64_t const* problem_m_offsets, size_t num_problems, size_t expected_m, size_t shape_n,
+    size_t shape_k, cudaStream_t stream, float const* scales_a, float const* scales_b)
 {
     constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
     constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
@@ -145,26 +136,43 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
         }
     }
 
+    int arch = tensorrt_llm::common::getSMVersion();
+    if (arch == 120)
+    {
+        if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_fp8_e4m3>)
+        {
+            fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, per_token_per_128c_scales,
+                nullptr, fp8_mat_b, per_block_scales, reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets,
+                num_problems, expected_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
+                internal_quantize_a, internal_quantize_b);
+        }
+        else
+        {
+            TLLM_THROW("sm120 fp8 blockscale moe gemm only supports ElementA=bfloat16, ElementB=fp8_e4m3.");
+        }
+        return;
+    }
+
 #ifdef COMPILE_HOPPER_TMA_GEMMS
     if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_bfloat16>)
     {
         fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, per_token_per_128c_scales,
             reinterpret_cast<__nv_bfloat16 const*>(mat_b), fp8_mat_b, per_block_scales,
-            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
+            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems, expected_m, max_shape_m_4_align_,
             max_shape_m_32_align_padded_, shape_n, shape_k, stream, internal_quantize_a, internal_quantize_b);
     }
     else if constexpr (std::is_same_v<ElementA, __nv_bfloat16> && std::is_same_v<ElementB, __nv_fp8_e4m3>)
     {
         fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a, per_token_per_128c_scales,
             nullptr, fp8_mat_b, per_block_scales, reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets,
-            num_problems, expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
+            num_problems, expected_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n, shape_k, stream,
             internal_quantize_a, internal_quantize_b);
     }
     else if constexpr (std::is_same_v<ElementA, __nv_fp8_e4m3> && std::is_same_v<ElementB, __nv_fp8_e4m3>)
     {
         fp8_grouped_gemm_run(nullptr, fp8_mat_a, per_token_per_128c_scales,
             reinterpret_cast<__nv_bfloat16 const*>(mat_b), fp8_mat_b, per_block_scales,
-            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
+            reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems, expected_m, max_shape_m_4_align_,
             max_shape_m_32_align_padded_, shape_n, shape_k, stream, internal_quantize_a, internal_quantize_b);
     }
     else
@@ -174,6 +182,15 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void*
 #else
     TLLM_THROW("fp8 blockscale gemm only support Hopper.");
 #endif
+}
+
+template <typename ElementA, typename ElementB, typename ElementD>
+void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(void* mat_d, void const* mat_a,
+    void const* mat_b, int64_t const* problem_m_offsets, size_t num_problems, size_t shape_n, size_t shape_k,
+    cudaStream_t stream, float const* scales_a, float const* scales_b)
+{
+    moeGemm(mat_d, mat_a, mat_b, problem_m_offsets, num_problems, expected_m_, shape_n, shape_k, stream, scales_a,
+        scales_b);
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
@@ -188,10 +205,10 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::strideBatchGe
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
-void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::fp8CS1x128(
-    __nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y, cudaStream_t stream)
+void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales,
+    __nv_bfloat16 const* mat, int shape_x, int shape_y, cudaStream_t stream, bool use_ue8m0)
 {
-    fp8_1x128_cs(mat_quant, scales, mat, shape_x, shape_y, stream);
+    fp8_1x128_cs(mat_quant, scales, mat, shape_x, shape_y, stream, use_ue8m0);
 }
 
 template <typename ElementA, typename ElementB, typename ElementD>
@@ -313,4 +330,6 @@ template class CutlassFp8BlockScaleGemmRunner<__nv_bfloat16, __nv_fp8_e4m3, __nv
 template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16>;
 template class CutlassFp8BlockScaleGemmRunner<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>;
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+} // namespace kernels::fp8_blockscale_gemm
+
+TRTLLM_NAMESPACE_END

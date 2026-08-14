@@ -1,0 +1,10 @@
+#!/bin/bash
+
+set -euo pipefail
+
+export WORLD_SIZE=$OMPI_COMM_WORLD_SIZE
+export RANK=$OMPI_COMM_WORLD_RANK
+export LOCAL_RANK=$OMPI_COMM_WORLD_LOCAL_RANK
+export NODE_RANK=$OMPI_COMM_WORLD_NODE_RANK
+
+"$@"

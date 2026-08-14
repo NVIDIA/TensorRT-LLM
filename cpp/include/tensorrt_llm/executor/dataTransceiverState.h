@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,12 @@
 
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -48,42 +50,82 @@ public:
         kMLA = 1,
     };
 
-    CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig, nvinfer1::DataType dataType,
-        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2)
+    CacheState(ModelConfig modelConfig, runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
+        AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableBlockReuse = false,
+        bool enablePartialReuse = false, bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0,
+        SizeType32 indexerKCacheQuantBlockSize = 128, bool indexerKCacheUseFp4 = false,
+        std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : mModelConfig(std::move(modelConfig))
         , mParallelConfig{worldConfig.getTensorParallelism(), worldConfig.getPipelineParallelism(),
-              worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(), worldConfig.getTensorParallelism()}
+              worldConfig.getContextParallelism(), worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(),
+              worldConfig.getTensorParallelism(), attentionLayerNumPerPP}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
+        mEnableBlockReuse = enableBlockReuse;
+        mEnablePartialReuse = enablePartialReuse;
+        mHasIndexerKCache = hasIndexerKCache;
+        mIndexerDimPerHead = indexerDimPerHead;
+        mIndexerKCacheQuantBlockSize = indexerKCacheQuantBlockSize;
+        mIndexerKCacheUseFp4 = indexerKCacheUseFp4;
+        mIndexerLayerNumPerPP = indexerLayerNumPerPP;
     }
 
     CacheState(std::vector<SizeType32> nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType,
+        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
-        int DPrank = 0, int DPsize = 0)
+        int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
+        bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
+        bool indexerKCacheUseFp4 = false, std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : mModelConfig{std::move(nbKvHeadPerLayer), sizePerHead, tokensPerBlock}
-        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
+              attentionLayerNumPerPP}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
+        mEnableBlockReuse = enableBlockReuse;
+        mEnablePartialReuse = enablePartialReuse;
+        mHasIndexerKCache = hasIndexerKCache;
+        mIndexerDimPerHead = indexerDimPerHead;
+        mIndexerKCacheQuantBlockSize = indexerKCacheQuantBlockSize;
+        mIndexerKCacheUseFp4 = indexerKCacheUseFp4;
+        mIndexerLayerNumPerPP = indexerLayerNumPerPP;
     }
 
     CacheState(SizeType32 nbAttentionLayers, SizeType32 nbKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
-        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, nvinfer1::DataType dataType,
+        SizeType32 tensorParallelism, SizeType32 pipelineParallelism, SizeType32 contextParallelism,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
-        int DPrank = 0, int DPsize = 0)
+        int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
+        bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
+        bool indexerKCacheUseFp4 = false, std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : mModelConfig{std::vector(nbAttentionLayers, nbKvHeads), sizePerHead, tokensPerBlock}
-        , mParallelConfig{tensorParallelism, pipelineParallelism, enableAttentionDP, DPrank, DPsize}
+        , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
+              attentionLayerNumPerPP}
         , mDataType{dataType}
         , mAttentionConfig(attentionType, kvFactor)
     {
+        mEnableBlockReuse = enableBlockReuse;
+        mEnablePartialReuse = enablePartialReuse;
+        mHasIndexerKCache = hasIndexerKCache;
+        mIndexerDimPerHead = indexerDimPerHead;
+        mIndexerKCacheQuantBlockSize = indexerKCacheQuantBlockSize;
+        mIndexerKCacheUseFp4 = indexerKCacheUseFp4;
+        mIndexerLayerNumPerPP = indexerLayerNumPerPP;
     }
 
     [[nodiscard]] bool operator==(kv_cache::CacheState const& other) const noexcept
     {
         return mModelConfig == other.mModelConfig && mParallelConfig == other.mParallelConfig
-            && mDataType == other.mDataType;
+            && mAttentionConfig == other.mAttentionConfig && mDataType == other.mDataType
+            && mRnnCacheState == other.mRnnCacheState && mEnableBlockReuse == other.mEnableBlockReuse
+            && mEnablePartialReuse == other.mEnablePartialReuse && mHasIndexerKCache == other.mHasIndexerKCache
+            && mIndexerDimPerHead == other.mIndexerDimPerHead
+            && mIndexerKCacheQuantBlockSize == other.mIndexerKCacheQuantBlockSize
+            && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4
+            && mIndexerLayerNumPerPP == other.mIndexerLayerNumPerPP;
     }
 
     struct ModelConfig
@@ -103,15 +145,20 @@ public:
     {
         SizeType32 mTensorParallelism;
         SizeType32 mPipelineParallelism;
+        SizeType32 mContextParallelism;
         bool mEnableAttentionDP;
         SizeType32 mDPrank;
         SizeType32 mDPsize;
+        // number of attention layers per pipeline parallelism rank, the size of the vector is equal to the pipeline
+        // parallelism size.
+        std::vector<SizeType32> mAttentionLayerNumPerPP;
 
         [[nodiscard]] bool operator==(ParallelConfig const& other) const noexcept
         {
             return mTensorParallelism == other.mTensorParallelism && mPipelineParallelism == other.mPipelineParallelism
-                && mEnableAttentionDP == other.mEnableAttentionDP && mDPrank == other.mDPrank
-                && mDPsize == other.mDPsize;
+                && mContextParallelism == other.mContextParallelism && mEnableAttentionDP == other.mEnableAttentionDP
+                && mDPrank == other.mDPrank && mDPsize == other.mDPsize
+                && mAttentionLayerNumPerPP == other.mAttentionLayerNumPerPP;
         }
     };
 
@@ -125,9 +172,86 @@ public:
         {
         }
 
+        [[nodiscard]] bool operator==(AttentionConfig const& other) const noexcept
+        {
+            return mAttentionType == other.mAttentionType && mKvFactor == other.mKvFactor;
+        }
+
         // attentionType ;
         AttentionType mAttentionType;
         int mKvFactor;
+    };
+
+    struct RnnModelConfig
+    {
+        /// Conv state section layout for section-aware split/concat in TP mismatch.
+        /// Conv state = [section0 | section1 | section2], always 3 sections.
+        /// Each section is independently TP-sharded, so TP mismatch requires per-section split.
+        /// Section dims are derived from mHiddenSize (= d_inner) and mNGroups * mDState (= ng_ds):
+        ///   kXBC: [d_inner, ng_ds, ng_ds]  (x | B | C)
+        ///   kQKV: [ng_ds, ng_ds, d_inner] (Q | K | V)
+        enum class ConvSectionLayout : SizeType32
+        {
+            kNONE = 0, // Legacy / unknown — no section-aware split
+            kXBC = 1,  // [d_inner, ng_ds, ng_ds]
+            kQKV = 2,  // [ng_ds, ng_ds, d_inner]
+        };
+
+        static constexpr SizeType32 kNumConvSections = 3;
+
+        SizeType32 mDState;      // SSM state dimension
+        SizeType32 mDConv;       // Conv state dimension (convKernel - 1)
+        SizeType32 mHiddenSize;  // Hidden dimension (= d_inner = head_dim * num_heads, GLOBAL)
+        SizeType32 mHeadDim;     // Head dimension (0 for Mamba1, >0 for Mamba2)
+        SizeType32 mConvDimSize; // Conv dimension size (GLOBAL, pre-TP-division)
+        SizeType32 mNGroups;     // Number of groups (for Mamba2)
+        SizeType32 mNumLayers;   // Number of layers
+        SizeType32 mNumHeads;    // Number of heads (GLOBAL, pre-TP-division)
+
+        ConvSectionLayout mConvSectionLayout{ConvSectionLayout::kNONE};
+
+        /// Compute the 3 GLOBAL conv section element counts for the first dim.
+        /// Returns {section0, section1, section2} in element counts (GLOBAL, pre-TP).
+        [[nodiscard]] std::array<SizeType32, kNumConvSections> getConvSectionDims() const noexcept
+        {
+            SizeType32 const dInner = mHiddenSize;      // = head_dim * num_heads
+            SizeType32 const ngDs = mNGroups * mDState; // n_groups * d_state
+            switch (mConvSectionLayout)
+            {
+            case ConvSectionLayout::kXBC: return {dInner, ngDs, ngDs};
+            case ConvSectionLayout::kQKV: return {ngDs, ngDs, dInner};
+            default: return {0, 0, 0}; // ConvSectionLayout::kNONE
+            }
+        }
+
+        [[nodiscard]] bool hasConvSections() const noexcept
+        {
+            return mConvSectionLayout != ConvSectionLayout::kNONE;
+        }
+
+        [[nodiscard]] bool operator==(RnnModelConfig const& other) const noexcept
+        {
+            return mDState == other.mDState && mDConv == other.mDConv && mHiddenSize == other.mHiddenSize
+                && mHeadDim == other.mHeadDim && mConvDimSize == other.mConvDimSize && mNGroups == other.mNGroups
+                && mNumLayers == other.mNumLayers && mNumHeads == other.mNumHeads
+                && mConvSectionLayout == other.mConvSectionLayout;
+        }
+    };
+
+    /// @brief Groups all RNN/Mamba cache configuration within CacheState.
+    struct RnnCacheState
+    {
+        RnnModelConfig mModelConfig;
+        /// Number of RNN layers per pipeline parallelism rank.
+        std::vector<SizeType32> mLayerNumPerPP;
+        tensorrt_llm::DataType mConvStateDataType;
+        tensorrt_llm::DataType mSsmStateDataType;
+
+        [[nodiscard]] bool operator==(RnnCacheState const& other) const noexcept
+        {
+            return mModelConfig == other.mModelConfig && mLayerNumPerPP == other.mLayerNumPerPP
+                && mConvStateDataType == other.mConvStateDataType && mSsmStateDataType == other.mSsmStateDataType;
+        }
     };
 
     [[nodiscard]] ModelConfig const& getModelConfig() const
@@ -145,9 +269,85 @@ public:
         return mAttentionConfig;
     }
 
-    [[nodiscard]] nvinfer1::DataType const& getDataType() const
+    [[nodiscard]] tensorrt_llm::DataType const& getDataType() const
     {
         return mDataType;
+    }
+
+    [[nodiscard]] bool getEnableBlockReuse() const
+    {
+        return mEnableBlockReuse;
+    }
+
+    [[nodiscard]] bool getEnablePartialReuse() const
+    {
+        return mEnablePartialReuse;
+    }
+
+    [[nodiscard]] bool getHasIndexerKCache() const
+    {
+        return mHasIndexerKCache;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerDimPerHead() const
+    {
+        return mIndexerDimPerHead;
+    }
+
+    [[nodiscard]] SizeType32 getIndexerKCacheQuantBlockSize() const
+    {
+        return mIndexerKCacheQuantBlockSize;
+    }
+
+    [[nodiscard]] bool getIndexerKCacheUseFp4() const
+    {
+        return mIndexerKCacheUseFp4;
+    }
+
+    //! \brief Per-PP-rank indexer K cache layer counts. With a masked indexer pool (per-layer
+    //! indexer mask, e.g. GLM 5.2 cross-layer indexer sharing) only full-indexer layers own a
+    //! pool row, so these counts can be smaller than the attention layer counts. Falls back to
+    //! the attention layer counts when unset (dense legacy layout).
+    [[nodiscard]] std::vector<SizeType32> const& getIndexerLayerNumPerPP() const
+    {
+        return mIndexerLayerNumPerPP.empty() ? mParallelConfig.mAttentionLayerNumPerPP : mIndexerLayerNumPerPP;
+    }
+
+    // =========================================================================
+    // RNN/Mamba cache state (optional, present only for hybrid models)
+    // =========================================================================
+
+    [[nodiscard]] bool hasRnnConfig() const noexcept
+    {
+        return mRnnCacheState.has_value();
+    }
+
+    void setRnnConfig(RnnModelConfig rnnModelConfig, std::vector<SizeType32> rnnLayerNumPerPP,
+        tensorrt_llm::DataType convStateDataType, tensorrt_llm::DataType ssmStateDataType)
+    {
+        mRnnCacheState = RnnCacheState{
+            std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType};
+    }
+
+    [[nodiscard]] RnnCacheState const& getRnnCacheState() const
+    {
+        TLLM_CHECK(mRnnCacheState.has_value());
+        return mRnnCacheState.value();
+    }
+
+    [[nodiscard]] RnnModelConfig const& getRnnModelConfig() const
+    {
+        return getRnnCacheState().mModelConfig;
+    }
+
+    [[nodiscard]] tensorrt_llm::DataType getConvStateDataType() const
+    {
+        return getRnnCacheState().mConvStateDataType;
+    }
+
+    [[nodiscard]] tensorrt_llm::DataType getSsmStateDataType() const
+    {
+        return getRnnCacheState().mSsmStateDataType;
     }
 
     [[nodiscard]] std::string toString() const
@@ -162,12 +362,53 @@ public:
         sstring << "mTokensPerBlock:" << mModelConfig.mTokensPerBlock << "\n";
         sstring << "tp:" << mParallelConfig.mTensorParallelism << "\n";
         sstring << "pp:" << mParallelConfig.mPipelineParallelism << "\n";
+        sstring << "cp:" << mParallelConfig.mContextParallelism << "\n";
         sstring << "enableAttentionDP:" << mParallelConfig.mEnableAttentionDP << "\n";
         sstring << "datatype:" << static_cast<int32_t>(mDataType) << "\n";
         sstring << "attentionType:" << static_cast<int32_t>(mAttentionConfig.mAttentionType) << "\n";
         sstring << "kvFactor:" << mAttentionConfig.mKvFactor << "\n";
         sstring << "dpRank:" << mParallelConfig.mDPrank << "\n";
         sstring << "dpSize:" << mParallelConfig.mDPsize << "\n";
+        sstring << "enableBlockReuse:" << mEnableBlockReuse << "\n";
+        sstring << "enablePartialReuse:" << mEnablePartialReuse << "\n";
+        sstring << "hasIndexerKCache:" << mHasIndexerKCache << "\n";
+        sstring << "indexerDimPerHead:" << mIndexerDimPerHead << "\n";
+        sstring << "indexerKCacheQuantBlockSize:" << mIndexerKCacheQuantBlockSize << "\n";
+        sstring << "indexerKCacheUseFp4:" << mIndexerKCacheUseFp4 << "\n";
+        sstring << "indexerLayerNumPerPP:";
+        for (auto layerNum : mIndexerLayerNumPerPP)
+        {
+            sstring << layerNum << ",";
+        }
+        sstring << "\n";
+        if (mRnnCacheState.has_value())
+        {
+            auto const& rnn = mRnnCacheState.value();
+            sstring << "RnnCacheState:\n";
+            sstring << "  dState:" << rnn.mModelConfig.mDState << "\n";
+            sstring << "  dConv:" << rnn.mModelConfig.mDConv << "\n";
+            sstring << "  hiddenSize:" << rnn.mModelConfig.mHiddenSize << "\n";
+            sstring << "  headDim:" << rnn.mModelConfig.mHeadDim << "\n";
+            sstring << "  convDimSize:" << rnn.mModelConfig.mConvDimSize << "\n";
+            sstring << "  nGroups:" << rnn.mModelConfig.mNGroups << "\n";
+            sstring << "  numLayers:" << rnn.mModelConfig.mNumLayers << "\n";
+            sstring << "  numHeads:" << rnn.mModelConfig.mNumHeads << "\n";
+            sstring << "  convSectionLayout:" << static_cast<int32_t>(rnn.mModelConfig.mConvSectionLayout) << "\n";
+            if (rnn.mModelConfig.hasConvSections())
+            {
+                auto const dims = rnn.mModelConfig.getConvSectionDims();
+                sstring << "  convSectionDims:[";
+                for (SizeType32 i = 0; i < RnnModelConfig::kNumConvSections; ++i)
+                {
+                    sstring << dims[i];
+                    if (i + 1 < RnnModelConfig::kNumConvSections)
+                        sstring << ",";
+                }
+                sstring << "]\n";
+            }
+            sstring << "  convStateDataType:" << static_cast<int32_t>(rnn.mConvStateDataType) << "\n";
+            sstring << "  ssmStateDataType:" << static_cast<int32_t>(rnn.mSsmStateDataType) << "\n";
+        }
         return sstring.str();
     }
 
@@ -175,8 +416,19 @@ private:
     friend class tensorrt_llm::executor::Serialization;
     ModelConfig mModelConfig;
     ParallelConfig mParallelConfig;
-    nvinfer1::DataType mDataType;
+    tensorrt_llm::DataType mDataType;
     AttentionConfig mAttentionConfig;
+    bool mEnableBlockReuse{false};
+    bool mEnablePartialReuse{false};
+    bool mHasIndexerKCache{false};
+    SizeType32 mIndexerDimPerHead{0};
+    SizeType32 mIndexerKCacheQuantBlockSize{128};
+    bool mIndexerKCacheUseFp4{false};
+    // Per-PP-rank indexer K cache layer counts (masked indexer pool). Empty = every attention
+    // layer owns an indexer K cache row (dense legacy layout); see getIndexerLayerNumPerPP().
+    std::vector<SizeType32> mIndexerLayerNumPerPP;
+    // RNN/Mamba cache state (optional, for hybrid models)
+    std::optional<RnnCacheState> mRnnCacheState;
 };
 
 struct MpiState
@@ -384,9 +636,28 @@ public:
         return mCommState;
     }
 
+    /// @brief Check if the cache state has RNN configuration.
+    [[nodiscard]] bool hasRnnCacheState() const noexcept
+    {
+        return mCacheState.has_value() && mCacheState->hasRnnConfig();
+    }
+
+    /// @brief Set only when exported via CacheTransceiver::getSerializedDataTransceiverState:
+    /// transfers driven by such a state have no LlmRequest on the sender.
+    [[nodiscard]] bool isArbitraryTransferState() const noexcept
+    {
+        return mIsArbitraryTransferState;
+    }
+
+    void setIsArbitraryTransferState(bool isArbitraryTransferState) noexcept
+    {
+        mIsArbitraryTransferState = isArbitraryTransferState;
+    }
+
     [[nodiscard]] bool operator==(DataTransceiverState const& other) const noexcept
     {
-        return mCacheState == other.mCacheState && mCommState == other.mCommState;
+        return mCacheState == other.mCacheState && mCommState == other.mCommState
+            && mIsArbitraryTransferState == other.mIsArbitraryTransferState;
     }
 
     [[nodiscard]] std::string toString() const
@@ -407,6 +678,7 @@ private:
     friend class Serialization;
     std::optional<kv_cache::CacheState> mCacheState;
     std::optional<kv_cache::CommState> mCommState;
+    bool mIsArbitraryTransferState{false};
 };
 
 } // namespace tensorrt_llm::executor

@@ -1,17 +1,23 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
 
+#define EIGEN_STACK_ALLOCATION_LIMIT (1U << 20)
 #include "../mha.h"
 #include <Eigen/Dense>
 
@@ -49,7 +55,11 @@ struct CacheSeq<true, false>
     GMemCacheHead const& operator[](uint32_t i) const
     {
         uint32_t const pageIdx = pageIndices[i / tokensPerPage];
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+        return pool[nbHeads * tokensPerPage * pageIdx + (i % tokensPerPage) * nbHeads + idxHead];
+#else
         return pool[tokensPerPage * nbHeads * pageIdx + tokensPerPage * idxHead + i % tokensPerPage];
+#endif
     }
 
     GMemCacheHead const* pool;
@@ -78,28 +88,32 @@ struct CacheSeq<true, true>
 template <typename MathElem, uint32_t tileSize, bool isPaged, bool useBeamSearch>
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize);
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks, float skipSoftmaxThresholdScaleFactor,
+    uint32_t* skippedBlockCount, uint32_t* totalBlockCount, uint32_t multiBlockNum);
 
 template <typename MathElem, bool isPaged, bool useBeamSearch>
 #if SPEC_DEC
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len);
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks, bool* hostMask, const uint32_t qSeqLen,
+    const uint32_t q_len);
 #else
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize);
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks);
 #endif
 
 template <uint32_t ropeStyle>
-InputHead applyRoPE(InputHead const& head, Vec<float, validElemsPerHead> const& ropeCosSin)
+InputHead applyRoPE(InputHead const& head, Vec<float, validRopeElemsPerHead> const& ropeCosSin)
 {
     if constexpr (ropeStyle == 0)
     {
         return head;
     }
-    constexpr uint32_t nbPairs = exactDiv(validElemsPerHead, 2);
-    InputHead dst;
+    // Only the first validRopeElemsPerHead elements are rotated (the rope region); the trailing
+    // [validRopeElemsPerHead, validElemsPerHead) elements pass through unrotated (partial rotary).
+    constexpr uint32_t nbPairs = exactDiv(validRopeElemsPerHead, 2);
+    InputHead dst = head;
     constexpr bool isNeox = (ropeStyle == 1);
     for (uint32_t i = 0; i < nbPairs; i++)
     {

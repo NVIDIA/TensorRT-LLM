@@ -29,7 +29,7 @@ CompileFlags:
 # Tweak the clangd parse settings for all files
 CompileFlags:
   Compiler: clang++
-  CompilationDatabase: .
+  CompilationDatabase: cpp/build
   Add:
     # report all errors
     - "-ferror-limit=0"

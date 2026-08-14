@@ -1,0 +1,2 @@
+# Configuration for 8 GPU models
+world_size: 8

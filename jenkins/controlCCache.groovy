@@ -1,10 +1,14 @@
 
 import java.lang.InterruptedException
 
-DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.04-py3-x86_64-ubuntu24.04-trt10.10.0.31-skip-tritondevel-202505211401-4539"
+DOCKER_IMAGE = "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
+ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 
-def createKubernetesPodConfig(image)
+def createKubernetesPodConfig(image, arch = "amd64")
 {
+    def archSuffix = arch == "arm64" ? "arm" : "amd"
+    def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
+
     def podConfig = [
         cloud: "kubernetes-cpu",
         namespace: "sw-tensorrt",
@@ -16,6 +20,8 @@ def createKubernetesPodConfig(image)
                 nodeSelector:
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux
+                imagePullSecrets:
+                  - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
                 containers:
                   - name: trt-llm
                     image: ${image}
@@ -31,24 +37,24 @@ def createKubernetesPodConfig(image)
                     resources:
                       requests:
                         cpu: 2
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: 2
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                     imagePullPolicy: Always
                   - name: jnlp
-                    image: urm.nvidia.com/docker/jenkins/inbound-agent:4.11-1-jdk11
+                    image: ${jnlpImage}
                     args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
                     resources:
                       requests:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                       limits:
                         cpu: '2'
-                        memory: 10Gi
+                        memory: 5Gi
                         ephemeral-storage: 25Gi
                 qosClass: Guaranteed
                 volumes:
@@ -116,10 +122,10 @@ pipeline {
                               case "Reset":
                                 sh "rm -rf ${CCACHE_DIR}"
                                 sh "mkdir -p ${CCACHE_DIR}"
-                                sh "printf \"max_size=300G\ntemporary_dir=/tmp/ccache\ncompression = true\n\" > ${CCACHE_DIR}/ccache.conf"
+                                sh "printf 'max_size=500G\ntemporary_dir=/tmp/ccache\ncompression=true\nbase_dir=/home/jenkins/agent/workspace/LLM\nsloppiness=file_macro,time_macros,pch_defines\n' > ${CCACHE_DIR}/ccache.conf"
                                 break
                               case "Config":
-                                sh "printf \"max_size=300G\ntemporary_dir=/tmp/ccache\ncompression = true\n\" > ${CCACHE_DIR}/ccache.conf"
+                                sh "printf 'max_size=500G\ntemporary_dir=/tmp/ccache\ncompression=true\nbase_dir=/home/jenkins/agent/workspace/LLM\nsloppiness=file_macro,time_macros,pch_defines\n' > ${CCACHE_DIR}/ccache.conf"
                                 break
                               case "Stats":
                                 sh "ccache -sv"

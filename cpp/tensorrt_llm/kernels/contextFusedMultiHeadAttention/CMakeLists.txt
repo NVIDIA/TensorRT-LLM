@@ -1,5 +1,5 @@
 #
-# SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -17,28 +17,89 @@
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
+list(FILTER SRC_CU EXCLUDE REGEX "fmha_v2_cu/.*")
+# The skip_softmax sm_120/sm_121 warp-specialized FMHA is a hand-written TU that
+# only compiles for the sm_120 family; it is added explicitly to the sm_120 arch
+# target below, not to the all-arch source list.
+list(FILTER SRC_CU EXCLUDE REGEX "skip_softmax_sm120/.*")
 
-filter_cuda_archs("80" SRC_CPP)
-filter_cuda_archs("86" SRC_CPP)
-filter_cuda_archs("89" SRC_CPP)
-filter_cuda_archs("90" SRC_CPP)
-filter_cuda_archs("100" SRC_CPP)
-filter_cuda_archs("120" SRC_CPP)
+add_library(context_attention_src OBJECT)
 
-filter_cuda_archs("80" SRC_CU)
-filter_cuda_archs("86" SRC_CU)
-filter_cuda_archs("89" SRC_CU)
-filter_cuda_archs("90" SRC_CU)
-filter_cuda_archs("100" SRC_CU)
-filter_cuda_archs("120" SRC_CU)
+filter_source_cuda_architectures(
+  SOURCE_LIST SRC_CPP
+  ARCHS 80 86 89 90 100 120
+  IMPLICIT_FAMILY)
 
-add_library(context_attention_src OBJECT ${SRC_CPP} ${SRC_CU})
-target_include_directories(
-  context_attention_src
-  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/src/
-          ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/generated/)
+target_sources(context_attention_src PRIVATE ${SRC_CPP} ${SRC_CU})
 target_compile_definitions(context_attention_src PRIVATE USE_DEMO_BERT_PARAMS=1
                                                          GENERATE_CUBIN=1)
-set_property(TARGET context_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_property(TARGET context_attention_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
-                                                   ON)
+set_target_properties(
+  context_attention_src PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                   CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+# Embed cubins via INCBIN. Replaces the bin2c-style hex-array .cpp stubs that
+# previously lived under cubin/. Symbol convention is cubin_<stem>_cu_cubin
+# because the generator (cpp/kernels/fmha_v2/setup.py) builds names from
+# `<fname>.replace('.', '_')` where `<fname>` includes the trailing `.cu`.
+include(tllm_cubin_archive)
+tllm_add_cubin_archive_sources(
+  context_attention_src "${CMAKE_CURRENT_SOURCE_DIR}/cubin"
+  SYMBOL_PREFIX cubin_
+  SYMBOL_SUFFIX _cu_cubin
+  ARCHS 80 86 89 90 100 120
+  IMPLICIT_FAMILY)
+
+foreach(arch IN ITEMS 80 86 89 90 100 120)
+  set(ARCH_ENABLED FALSE)
+  set(TARGET_ARCH "")
+  if(${arch} GREATER_EQUAL ${CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY})
+    if("${arch}f" IN_LIST CMAKE_CUDA_ARCHITECTURES_FAMILIES)
+      set(ARCH_ENABLED TRUE)
+      set(TARGET_ARCH "${arch}f")
+    endif()
+  else()
+    if("${arch}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      set(ARCH_ENABLED TRUE)
+      set(TARGET_ARCH "${arch}")
+    endif()
+  endif()
+
+  if(NOT ${ARCH_ENABLED})
+    continue()
+  endif()
+
+  file(GLOB arch_files "fmha_v2_cu/*_sm${arch}.cu")
+  # Compile the hand-written skip_softmax warp-specialized FMHA into the sm_120
+  # family target. It uses sm_120-only TMA + sync-MMA, so it must never be
+  # compiled for other architectures.
+  if(${arch} EQUAL 120)
+    list(
+      APPEND
+      arch_files
+      "${CMAKE_CURRENT_SOURCE_DIR}/skip_softmax_sm120/fused_multihead_flash_attention_ws_sm120.cu"
+    )
+  endif()
+  if(arch_files)
+    set(TARGET_NAME _context_attention_kernels_${arch})
+    add_library(${TARGET_NAME} OBJECT ${arch_files})
+    target_compile_definitions(${TARGET_NAME} PRIVATE USE_DEMO_BERT_PARAMS=1
+                                                      GENERATE_CUBIN=1)
+    # Let the all-arch dispatch TU (fused_multihead_attention_v2.cpp) know the
+    # skip_softmax bridge symbols are available so it can reference them without
+    # an undefined-symbol error on builds that exclude sm_120.
+    if(${arch} EQUAL 120)
+      target_compile_definitions(context_attention_src
+                                 PRIVATE TLLM_ENABLE_SKIP_SOFTMAX_SM120=1)
+    endif()
+    set_target_properties(
+      ${TARGET_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    target_include_directories(
+      ${TARGET_NAME}
+      PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/src/
+              ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/generated/)
+    set_cuda_architectures(${TARGET_NAME} ${TARGET_ARCH})
+    target_sources(context_attention_src
+                   PUBLIC $<TARGET_OBJECTS:${TARGET_NAME}>)
+  endif()
+endforeach()

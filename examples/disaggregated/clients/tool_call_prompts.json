@@ -1,0 +1,24 @@
+[
+  {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the weather in San Francisco?"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"location\":\"San Francisco\",\"unit\":\"fahrenheit\"}"
+            }
+          }
+        ]
+      }
+    ]
+  }
+]

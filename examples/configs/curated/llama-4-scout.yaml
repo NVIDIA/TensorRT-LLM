@@ -1,0 +1,9 @@
+max_batch_size: 1024
+max_num_tokens: 2048
+moe_expert_parallel_size: 1
+trust_remote_code: true
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 1024
+kv_cache_config:
+  dtype: fp8

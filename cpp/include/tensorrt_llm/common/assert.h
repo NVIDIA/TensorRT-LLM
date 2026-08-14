@@ -16,30 +16,18 @@
 
 #pragma once
 
-#include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmException.h"
 
-#include <string>
-
-namespace tensorrt_llm::common
-{
-[[noreturn]] inline void throwRuntimeError(char const* const file, int const line, char const* info)
-{
-    throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info).c_str());
-}
-
-[[noreturn]] inline void throwRuntimeError(char const* const file, int const line, std::string const& info = "")
-{
-    throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
-}
-
-} // namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
 
 class DebugConfig
 {
 public:
     static bool isCheckDebugEnabled();
 };
+
+TRTLLM_NAMESPACE_END
 
 #if defined(_WIN32)
 #define TLLM_LIKELY(x) (__assume((x) == 1), (x))
@@ -52,8 +40,8 @@ public:
 #define TLLM_CHECK(val)                                                                                                \
     do                                                                                                                 \
     {                                                                                                                  \
-        TLLM_LIKELY(static_cast<bool>(val)) ? ((void) 0)                                                               \
-                                            : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);       \
+        TLLM_LIKELY(static_cast<bool>(val))                                                                            \
+        ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);                              \
     } while (0)
 
 #define TLLM_CHECK_WITH_INFO(val, info, ...)                                                                           \
@@ -68,17 +56,17 @@ public:
 #define TLLM_CHECK_DEBUG(val)                                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (TLLM_UNLIKELY(DebugConfig::isCheckDebugEnabled()))                                                         \
+        if (TLLM_UNLIKELY(tensorrt_llm::DebugConfig::isCheckDebugEnabled()))                                           \
         {                                                                                                              \
-            TLLM_LIKELY(static_cast<bool>(val)) ? ((void) 0)                                                           \
-                                                : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);   \
+            TLLM_LIKELY(static_cast<bool>(val))                                                                        \
+            ? ((void) 0) : tensorrt_llm::common::throwRuntimeError(__FILE__, __LINE__, #val);                          \
         }                                                                                                              \
     } while (0)
 
 #define TLLM_CHECK_DEBUG_WITH_INFO(val, info, ...)                                                                     \
     do                                                                                                                 \
     {                                                                                                                  \
-        if (TLLM_UNLIKELY(DebugConfig::isCheckDebugEnabled()))                                                         \
+        if (TLLM_UNLIKELY(tensorrt_llm::DebugConfig::isCheckDebugEnabled()))                                           \
         {                                                                                                              \
             TLLM_LIKELY(static_cast<bool>(val))                                                                        \
             ? ((void) 0)                                                                                               \
@@ -86,12 +74,3 @@ public:
                 __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());                        \
         }                                                                                                              \
     } while (0)
-
-#define TLLM_THROW(...)                                                                                                \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        throw NEW_TLLM_EXCEPTION(__VA_ARGS__);                                                                         \
-    } while (0)
-
-#define TLLM_WRAP(ex)                                                                                                  \
-    NEW_TLLM_EXCEPTION("%s: %s", tensorrt_llm::common::TllmException::demangle(typeid(ex).name()).c_str(), ex.what())

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # NOTE: this file is for cubin generation, should not in final code release.
 
@@ -81,17 +86,16 @@ cpp_file_prefix_text = R"""/*
 * See the License for the specific language governing permissions and
 * limitations under the License.
 */
-namespace tensorrt_llm
-{
-namespace kernels
-{
+
+#include "tensorrt_llm/common/config.h"
+
+namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels {
 // clang-format off
 """
 
 cpp_file_suffex_text = R"""
 // clang-format on
-} // namespace kernels
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels
 """
 
 cubin_meta_info_struct_prefix_text = R"""
@@ -107,7 +111,7 @@ static const struct XQAKernelMetaInfo
     bool mPagedKVCache;
     bool mMultiQueryTokens;
     unsigned int mSM;
-    const unsigned long long* mCubin;
+    const unsigned char* mCubin;
     unsigned int mCubinSize;
     const char* mFuncName;
 } sXqaKernelMetaInfo[] = {
@@ -117,12 +121,12 @@ cubin_meta_info_struct_suffix_text = R"""
 };
 """
 
-is_medusa = False
+is_spec_dec = False
 
 
 def generate_cubin_meta_info_line(arch: int, compile_macros: List[CompileMacro],
                                   function_name: str, cubin_size: int,
-                                  is_last: bool, is_medusa: bool):
+                                  is_last: bool, is_spec_dec: bool):
     data_type_str = None
     kv_data_type_str = None
     head_dim = None
@@ -160,7 +164,7 @@ def generate_cubin_meta_info_line(arch: int, compile_macros: List[CompileMacro],
             assert (tokens_per_page % 2 == 0)
             paged_kv_cache = 'true' if tokens_per_page > 0 else 'false'
 
-    use_medusa = 'true' if is_medusa else 'false'
+    use_medusa = 'true' if is_spec_dec else 'false'
     assert data_type_str is not None
     assert kv_data_type_str is not None
     assert head_dim is not None
@@ -242,7 +246,13 @@ def build_commands(
     arch: int,
     input_filename: str,
     compile_macros: List[CompileMacro],
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str]:
+    """Returns (nvcc_command, cubin_file_path).
+
+    The cubin is written to `cubin/<function_name>.cubin` and is later
+    wrapped in a per-cubin `.cubin.tar.zst` tarball for git-LFS commit
+    (see archive_cubin).
+    """
     arch_str = str(arch) + 'a' if arch in (90, ) else str(arch)
     arch_option = f"-arch=compute_{arch_str} -code=sm_{arch_str}"
     name_info = build_name_info(compile_macros)
@@ -265,62 +275,59 @@ def build_commands(
     function_name = construct_name(func_name_prefix, arch, name_info)
     macro_options.append(f"-DKERNEL_FUNC_NAME={function_name}")
     all_macro_option = ' '.join(macro_options)
-    cubin_file_name = construct_name(func_name_prefix, arch, name_info,
-                                     ".cubin")
+    # Output goes under cubin_dir so the tarball-archive step finds it without
+    # having to chase relative paths. The base name is used both as the
+    # on-disk file (`<function_name>.cubin`) and as the C++ symbol stem
+    # (`<function_name>_cubin` after the build-time INCBIN aggregation).
+    cubin_file_name = os.path.join(cubin_dir, function_name + '.cubin')
     output_option = " ".join(["-o", cubin_file_name])
     nvcc_command = " ".join([
         nvcc_bin, nvcc_flags, arch_option, output_option, all_macro_option,
         input_filename
     ])
-    xxd_command = " ".join(["xxd -i", cubin_file_name])
-    return nvcc_command, xxd_command, cubin_file_name
+    return nvcc_command, cubin_file_name
 
 
-def save_cubin_cpp_file(xxd_output, func_name_prefix, arch, compile_macros):
-    name_info = build_name_info(compile_macros)
-    cubin_cpp_file_name = construct_name(func_name_prefix, arch, name_info,
-                                         ".cubin.cpp")
-    with open(cubin_cpp_file_name, "w") as f:
-        f.write(''.join(
-            [cpp_file_prefix_text, xxd_output, cpp_file_suffex_text]))
+def archive_cubin(cubin_file_name: str) -> None:
+    """Archive a freshly compiled `<dir>/<stem>.cubin` into `.tar.zst`.
 
+    Use `cmake -E tar`. The build-time helper
+    `tllm_add_cubin_archive_sources` extracts the same archive back to a
+    `<stem>.cubin` file and pulls it in via INCBIN.
 
-def convert_cubin_cpp_xxd(xxd_command: str, cubin_file_name: str):
-    result = subprocess.run(xxd_command.split(' '),
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            check=True,
-                            shell=False)
-    cubin_cpp_str = result.stdout
-    cubin_size = os.path.getsize(cubin_file_name)
-    return cubin_cpp_str, cubin_size
-
-
-def convert_cubin_cpp_np(cubin_file_name: str):
-    import numpy as np
-    cubin_size = os.path.getsize(cubin_file_name)
-    with open(cubin_file_name, 'rb') as f:
-        cubin_bin_data = f.read()
-    remainder = len(cubin_bin_data) % 8
-    if remainder != 0:
-        padding = b'\x00' * (8 - remainder)
-        cubin_bin_data += padding
-    array = np.frombuffer(cubin_bin_data, dtype=np.uint64)
-    array_name = cubin_file_name.replace('.', '_')
-    elements_per_line = 4
-    cpp_array_content = ',\n'.join(
-        ', '.join(
-            '0x{:016x}ULL'.format(array[i])
-            for i in range(start, min(start + elements_per_line, len(array))))
-        for start in range(0, len(array), elements_per_line))
-    cpp_array = 'unsigned long long ' + array_name + '[] = {\n' + cpp_array_content + '\n};\n' + 'unsigned int ' \
-                + array_name + '_len = ' + str(cubin_size) + ';\n'
-    return cpp_array, cubin_size
+    `--mtime="1970-01-01UTC"` pins the entry mtime so two runs over the same
+    cubin bytes produce a byte-identical tarball -- git/LFS see no diff,
+    which keeps the LFS object store from churning on every regeneration.
+    The consumer side compensates for the frozen entry mtime by copying the
+    tarball file's filesystem mtime onto the extracted cubin (see
+    cpp/cmake/modules/tllm_cubin_archive.cmake), so ninja's incremental
+    rebuild detection remains correct.
+    """
+    cubin_path = os.path.abspath(cubin_file_name)
+    cubin_dirname = os.path.dirname(cubin_path)
+    cubin_basename = os.path.basename(cubin_path)
+    archive_basename = cubin_basename + '.tar.zst'
+    subprocess.run(
+        [
+            'cmake',
+            '-E',
+            'tar',
+            'cf',
+            archive_basename,
+            '--zstd',
+            '--mtime=1970-01-01UTC',
+            '--',
+            cubin_basename,
+        ],
+        cwd=cubin_dirname,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
 
 
 def run_cubin_gen(arch_micro_file_list: CompileArchMacrosAndFile):
-    nvcc_command, xxd_command, cubin_file_name = build_commands(
+    nvcc_command, cubin_file_name = build_commands(
         build_func_name_prefix, arch_micro_file_list.arch,
         arch_micro_file_list.input_file_name, arch_micro_file_list.macro_list)
     function_name = construct_name(
@@ -329,17 +336,14 @@ def run_cubin_gen(arch_micro_file_list: CompileArchMacrosAndFile):
     print(f'generating for {function_name}... command: {nvcc_command}')
     cubin_size = None
     try:
-        result = subprocess.run(nvcc_command.split(' '),
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                check=True,
-                                shell=False)
-        # cubin_cpp_str, cubin_size = convert_cubin_cpp_xxd(xxd_command, cubin_file_name)
-        cubin_cpp_str, cubin_size = convert_cubin_cpp_np(cubin_file_name)
-        save_cubin_cpp_file(cubin_cpp_str, cubin_dir + build_func_name_prefix,
-                            arch_micro_file_list.arch,
-                            arch_micro_file_list.macro_list)
+        subprocess.run(nvcc_command.split(' '),
+                       stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE,
+                       text=True,
+                       check=True,
+                       shell=False)
+        cubin_size = os.path.getsize(cubin_file_name)
+        archive_cubin(cubin_file_name)
         if clean_cubin:
             os.remove(cubin_file_name)
     except subprocess.CalledProcessError as e:
@@ -376,7 +380,7 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
                     option_macro_names, option_short_names, option_combination)
             ]
             if arch in (90, ) and option_combination[
-                    3] == 2 and option_combination[2] == 1 and not is_medusa:
+                    3] == 2 and option_combination[2] == 1 and not is_spec_dec:
                 input_file_name = "mha_sm90.cu"
             else:
                 input_file_name = "mha.cu"
@@ -387,7 +391,7 @@ def generate_compile_arch_macro_list(compile_macro_options: list):
 
 def generate_header_file_contents(
         all_arch_macros: List[CompileArchMacrosAndFile],
-        name_size_list: List[Tuple[str, int]], is_medusa: bool):
+        name_size_list: List[Tuple[str, int]], is_spec_dec: bool):
     cubin_data_array = []
     cubin_length_array = []
     meta_line_array = []
@@ -398,15 +402,26 @@ def generate_header_file_contents(
         #function_name = construct_name(build_func_name_prefix, arch, build_name_info(macros))
         function_name, cubin_size = name_size
         cubin_variable_name = f"{function_name}_cubin"
+        # No `extern "C"`: the build-time INCBIN aggregator
+        # (cpp/cmake/modules/tllm_cubin_archive.cmake +
+        # cpp/include/tensorrt_llm/common/cubinIncbin.h) emits these symbols
+        # under their C++-mangled names so they're scoped to the surrounding
+        # `tensorrt_llm::TRTLLM_ABI_NAMESPACE::kernels` namespace, avoiding
+        # multi-definition collisions with other packages or other TRT-LLM
+        # ABI versions in the same final link.
+        # Match the definition site emitted by TLLM_INCBIN_NS in
+        # cpp/include/tensorrt_llm/common/cubinIncbin.h:
+        #   extern unsigned char const SYMBOL[];
+        #   extern unsigned int  const SYMBOL_len;
         cubin_data_array.append(
-            f"extern unsigned long long {cubin_variable_name}[];\n")
+            f'extern unsigned char const {cubin_variable_name}[];\n')
         cubin_length_array.append(
-            f"extern uint32_t {cubin_variable_name}_len;\n")
+            f'extern unsigned int const {cubin_variable_name}_len;\n')
         meta_line_array.append(
             generate_cubin_meta_info_line(arch, macros, function_name,
                                           cubin_size,
                                           i == len(all_arch_macros) - 1,
-                                          is_medusa))
+                                          is_spec_dec))
     cubin_data = ''.join(cubin_data_array)
     cubin_length = ''.join(cubin_length_array)
     meta_struct = ''.join([
@@ -422,8 +437,8 @@ if __name__ == "__main__":
         shutil.rmtree(cubin_dir)
     os.mkdir(cubin_dir)
 
-    if len(sys.argv) > 1 and sys.argv[1] == 'medusa':
-        is_medusa = True
+    if len(sys.argv) > 1 and sys.argv[1] == 'spec_dec':
+        is_spec_dec = True
         nvcc_flags = '-std=c++17 -O3 -cubin -DGENERATE_CUBIN=1 -DNDEBUG -DSPEC_DEC --use_fast_math -Xptxas=-v --allow-unsupported-compiler --expt-relaxed-constexpr -t 0'
         arch_options = [80, 86, 89, 90]
         config_list = [[
@@ -431,8 +446,9 @@ if __name__ == "__main__":
             CompileMacroOption('HEAD_ELEMS', 'd', [128]),
             CompileMacroOption('BEAM_WIDTH', 'beam', [1]),
             CompileMacroOption('CACHE_ELEM_ENUM', 'kvt', [0, 1, 2]),
-            CompileMacroOption('TOKENS_PER_PAGE', 'pagedKV',
-                               [0, 64, 128]),  # 0 denotes contiguous kv cache.
+            CompileMacroOption(
+                'TOKENS_PER_PAGE', 'pagedKV',
+                [0, 32, 64, 128]),  # 0 denotes contiguous kv cache.
             CompileMacroOption('HEAD_GRP_SIZE', 'nqpkv', [0]),
             CompileMacroOption('M_TILESIZE', 'm', [16, 32]),
         ]]
@@ -444,7 +460,7 @@ if __name__ == "__main__":
     with multiprocessing.Pool(processes=thread_count) as pool:
         name_size_list = pool.map(run_cubin_gen, arch_macro_lists)
     header_file_contents = generate_header_file_contents(
-        arch_macro_lists, name_size_list, is_medusa)
+        arch_macro_lists, name_size_list, is_spec_dec)
 
     with open(cubin_dir + build_func_name_prefix + '_cubin.h', "w") as f:
         f.write("".join(

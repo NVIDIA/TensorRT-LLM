@@ -1,13 +1,14 @@
+from enum import IntEnum
+
 import torch
 
 # The declarations must be aligned with thUtils.h
 SF_DTYPE = torch.uint8
 FLOAT4_E2M1X2 = torch.uint8
 
-
-def pad_up(x: int, y: int) -> int:
-    return ((x + y - 1) // y) * y
-
+# Number of elements sharing one NVFP4 E4M3 scale factor
+# (SF_VEC_SIZE in cpp/tensorrt_llm/kernels/quantization.h).
+NVFP4_SF_VEC_SIZE = 16
 
 # For GEMM autotuning.
 # Taken from https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h#L38
@@ -22,7 +23,16 @@ fp4_buckets = FP4_BUCKETS
 __all__ = ['float4_e2m1x2', 'float4_sf_dtype', 'pad_up', 'fp4_buckets']
 
 
-def get_fp4_shape(input_shape, sf_vec_size):
+def pad_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
+
+
+class FP4GemmType(IntEnum):
+    W4A4_NVFP4_NVFP4 = 0
+    W4A8_MXFP4_MXFP8 = 1
+
+
+def get_fp4_shape(input_shape, sf_vec_size, is_swizzled_layout=True):
     m = 1
     for i in range(len(input_shape) - 1):
         m *= input_shape[i]
@@ -30,7 +40,9 @@ def get_fp4_shape(input_shape, sf_vec_size):
     output_shape = [i for i in input_shape]
     output_shape[-1] //= 2
 
-    scale_shape = pad_up(m, 128) * pad_up(input_shape[-1] // sf_vec_size, 4)
+    scale_shape = pad_up(m, 128) * pad_up(
+        input_shape[-1] // sf_vec_size,
+        4) if is_swizzled_layout else m * (input_shape[-1] // sf_vec_size)
     return output_shape, scale_shape
 
 
@@ -41,8 +53,7 @@ def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
     to
     [r0, rN/2, r1, rN/2+1, ..., r(N/2-1), r(N-1)]
     """
-    assert x.dim() == 2, f"x should be a 2D tensor, not {x.dim()}"
-    M, K = x.shape
+    M = x.shape[0]
     assert M % 2 == 0, f"x.shape[0] must be even, not {M}"
 
     row_indices = torch.arange(M, dtype=torch.long)
@@ -112,11 +123,8 @@ def get_shuffle_matrix_a_row_indices(input_tensor: torch.Tensor,
     - We do NOT try to handle custom e2m1 memory usage (i.e. no 'K/2' bytes).
     - Instead, we purely reorder rows in a standard PyTorch shape [M, K].
     """
-    assert input_tensor.dim(
-    ) == 2, f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
-
-    # M, K from the input
-    M, K = input_tensor.shape
+    # M from the input
+    M = input_tensor.shape[0]
 
     # Choose block size 16 or 32
     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
@@ -160,7 +168,7 @@ def get_shuffle_matrix_sf_a_row_indices(
         num_elts_per_sf: int = 16) -> torch.Tensor:
 
     assert input_tensor.dtype == float4_sf_dtype
-    assert num_elts_per_sf == 16
+    assert num_elts_per_sf == 16 or num_elts_per_sf == 32
 
     assert input_tensor.dim(
     ) == 2, f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
@@ -199,4 +207,4 @@ def shuffle_matrix_sf_a(
         input_tensor, row_indices.to(input_tensor.device))
 
     # 128x4
-    return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave(w_shuffled)
+    return torch.ops.trtllm.block_scale_interleave(w_shuffled)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,10 +25,12 @@
 #include "tensorrt_llm/runtime/workerPool.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <future>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -57,7 +59,10 @@ class BasePeftCacheManager
 public:
     using LlmRequestPtr = std::shared_ptr<LlmRequest>;
     using RequestVector = std::vector<LlmRequestPtr>;
-    using PeftTable = std::map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
+    using PeftTable = std::unordered_map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
+    using TaskPeftTable = std::unordered_map<uint64_t, std::vector<runtime::LoraCache::TaskLayerModuleConfig>>;
+    using TaskIdToReqIds = std::unordered_map<uint64_t, std::vector<uint64_t>>;
+    using EnsureBatchTaskResult = std::tuple<TaskPeftTable, TaskIdToReqIds>;
 
     virtual ~BasePeftCacheManager() = default;
 
@@ -99,6 +104,8 @@ public:
 class PeftCacheManager : public BasePeftCacheManager
 {
 public:
+    using EnsureBatchTaskResult = BasePeftCacheManager::EnsureBatchTaskResult;
+
     PeftCacheManager(PeftCacheManagerConfig const& config, runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
 
@@ -109,11 +116,21 @@ public:
     PeftTable ensureBatch(RequestVector const& contextRequests, RequestVector const& generationRequests,
         bool resetGpuCache = false) override;
 
+    EnsureBatchTaskResult ensureBatchMapTaskId(
+        RequestVector const& contextRequests, RequestVector const& generationRequests, bool resetGpuCache = false);
+
     [[nodiscard]] bool isTaskCached(uint64_t taskId) const;
 
     [[nodiscard]] bool isTaskDone(uint64_t taskId) const;
 
     [[nodiscard]] bool isTaskDoneDevice(uint64_t taskId) const;
+
+    [[nodiscard]] bool isTaskCachedDevice(uint64_t const taskId) const;
+
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const;
+
+    //! Configure the homogeneous LoRA weight dtype before inserting an adapter.
+    void configureDataType(tensorrt_llm::DataType dataType);
 
     void resetDeviceCache() override;
 
@@ -137,7 +154,7 @@ public:
     void updateTaskState(uint64_t taskId, uint64_t reqId, bool terminate = false, bool pause = false);
 
     static std::pair<uint64_t, uint64_t> getMaxNumSlots(PeftCacheManagerConfig const& config,
-        nvinfer1::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
+        tensorrt_llm::DataType dataType, uint64_t pageWidth, uint64_t max1dModSize,
         runtime::BufferManager const& bufferManager);
 
     static std::pair<runtime::LoraCachePageManagerConfig, runtime::LoraCachePageManagerConfig> getPageManagerConfig(
@@ -159,11 +176,14 @@ private:
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mTaskIdToReqIds;
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mTaskIdToPausedReqIds;
 
-    std::tuple<std::map<uint64_t, std::future<void>>, std::map<uint64_t, std::vector<uint64_t>>> getTaskMaps(
+    std::tuple<std::unordered_map<uint64_t, std::future<void>>, TaskIdToReqIds> getTaskMaps(
         RequestVector const& contextRequests, RequestVector const& generationRequests);
 
     runtime::ModelConfig mModelConfig;
     runtime::WorldConfig mWorldConfig;
+
+    mutable std::mutex mDataTypeMutex;
+    std::optional<tensorrt_llm::DataType> mDataType;
 
     int mDevice{-1};
 };

@@ -10,7 +10,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..distributed import allgather
 from .flashinfer import FlashInferAttentionMetadata, PlanParams
-from .interface import AttentionBackend, AttentionMask, PredefinedAttentionMask
+from .interface import (AttentionBackend, AttentionForwardArgs,
+                        PredefinedAttentionMask, merge_attention_forward_args)
 
 
 # Please sync with flashinfer's DISPATCH_GQA_GROUP_SIZE in include/flashinfer/utils.cuh
@@ -312,9 +313,9 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
                 k: Optional[torch.Tensor],
                 v: Optional[torch.Tensor],
                 metadata: StarAttentionMetadata,
-                *,
-                attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
+        forward_args = merge_attention_forward_args(forward_args, kwargs)
         assert isinstance(
             metadata,
             StarAttentionMetadata,
@@ -331,7 +332,8 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
         num_ctx_tokens = metadata.num_ctx_tokens
         num_qry_tokens = metadata.num_qry_tokens
 
-        kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+        kv_cache = metadata.kv_cache_manager.get_buffers(
+            self.layer_idx, kv_layout=metadata.kv_layout)
         if self.quant_config and self.quant_config.layer_quant_mode.has_any_quant(
         ):
             qc = self.quant_config
@@ -411,10 +413,10 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
                                       return_lse=True)
             return output, lse
 
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
+        if forward_args.attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
-        elif attention_mask == PredefinedAttentionMask.FULL:
+        elif forward_args.attention_mask == PredefinedAttentionMask.FULL:
             attention_mask_type = int(AttentionMaskType.padding)
             attention_mask_data = None
         else:

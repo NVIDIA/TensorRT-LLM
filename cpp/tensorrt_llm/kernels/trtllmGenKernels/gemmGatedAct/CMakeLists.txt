@@ -18,12 +18,21 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-filter_cuda_archs("100" SRC_CPP)
+add_library(trtllm_gen_gemm_gated_act OBJECT)
+filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100f)
 
-add_library(trtllm_gen_gemm_gated_act OBJECT ${SRC_CPP} ${SRC_CU})
+target_sources(trtllm_gen_gemm_gated_act PRIVATE ${SRC_CPP} ${SRC_CU})
 target_compile_definitions(trtllm_gen_gemm_gated_act
                            PUBLIC TLLM_GEN_EXPORT_INTERFACE TLLM_ENABLE_CUDA)
 set_property(TARGET trtllm_gen_gemm_gated_act PROPERTY POSITION_INDEPENDENT_CODE
                                                        ON)
 set_property(TARGET trtllm_gen_gemm_gated_act
              PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+# Embed cubins via INCBIN.
+include(tllm_cubin_archive)
+tllm_add_cubin_archive_sources(
+  trtllm_gen_gemm_gated_act
+  "${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_gatedAct_export/cubins"
+  NAMESPACE gemmGatedAct tensorrt_llm kernels
+  ARCHS 100f)

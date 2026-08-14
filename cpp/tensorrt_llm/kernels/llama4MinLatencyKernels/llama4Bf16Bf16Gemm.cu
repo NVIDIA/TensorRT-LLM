@@ -14,10 +14,13 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Bf16Bf16Gemm.h"
 #include "tensorrt_llm/kernels/llama4MinLatencyKernels/llama4Utils.cuh"
 
-namespace tensorrt_llm::kernels::llama4_min_latency::llama4_bf16_bf16_gemm
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::llama4_min_latency::llama4_bf16_bf16_gemm
 {
 
 struct __align__(8) aligned_bf16x4
@@ -45,7 +48,7 @@ __global__ void llama4_bf16_bf16_gemm_kernel(int num_tokens,
     int const row = blockIdx.x % NUM_EXPERTS; // Matrix row / Output element index
     int const tid = threadIdx.x;              // Thread ID within the block
 
-    // FDL prefetch all B data
+    // PDL prefetch all B data
     aligned_bf16x4 b_vec[GEMM_K / BLOCK_SIZE / VEC_SIZE];
 #pragma unroll
     for (int chunk = 0; chunk < GEMM_K / BLOCK_SIZE / VEC_SIZE; chunk++)
@@ -57,7 +60,7 @@ __global__ void llama4_bf16_bf16_gemm_kernel(int num_tokens,
         b_vec[chunk] = reinterpret_cast<aligned_bf16x4 const*>(B)[row * GEMM_K / VEC_SIZE + base_idx];
     }
 
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+    cudaGridDependencySynchronize();
 
     // Process 5 chunks of 4 elements each
 #pragma unroll
@@ -113,7 +116,7 @@ void llama4_bf16_bf16_gemm_launcher(
     int const grid_size = NUM_EXPERTS * num_tokens;
 
     void* args[] = {(void*) &num_tokens, (void*) &A, (void*) &B, (void*) &C};
-    launch_kernel_fdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_bf16_bf16_gemm_kernel, args, 4);
+    launch_kernel_pdl(dim3(grid_size), dim3(BLOCK_SIZE), stream, (void*) llama4_bf16_bf16_gemm_kernel, args, 4);
 }
 
 void llama4_bf16_bf16_gemm_op(int num_tokens, void const* A, void const* B, void* C, cudaStream_t stream)
@@ -125,4 +128,6 @@ void llama4_bf16_bf16_gemm_op(int num_tokens, void const* A, void const* B, void
     llama4_bf16_bf16_gemm_launcher(num_tokens, A_bf16, B_bf16, C_bf16, stream);
 }
 
-} // namespace tensorrt_llm::kernels::llama4_min_latency::llama4_bf16_bf16_gemm
+} // namespace kernels::llama4_min_latency::llama4_bf16_bf16_gemm
+
+TRTLLM_NAMESPACE_END

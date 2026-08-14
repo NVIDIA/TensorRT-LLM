@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -30,12 +35,18 @@
 #include <cuda_fp8.h>
 
 inline constexpr float log2e = 1.4426950408889634; // std::log2(M_E)
-inline constexpr float safeInitRowMax = -1e+30F;
+// we used an optimization where exp(x-rowMax) is computed as:
+/*  bias = rowMax * log2e  // shared for the whole row
+    exp(x-rowMax) = exp2f(x * log2e - bias)
+*/
+// But this optimization is not numerically stable when (x * log2e - bias) is computed with FMA and x is too large. For
+// this reason, don't set safeInitRowMax with a huge absolute value.
+inline constexpr float safeInitRowMax = -1e+5F;
 inline constexpr int32_t kBAD_PAGE_INDEX = -1;
 __constant__ constexpr float kE4M3_MAX = 448.F;
 
 #ifdef __CUDA_ARCH__
-#if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200
+#if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
 constexpr uint32_t kMAX_SMEM_SIZE = (99u << 10);
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870
 constexpr uint32_t kMAX_SMEM_SIZE = (163u << 10);
@@ -113,6 +124,7 @@ DEFINE_VEC_BINARY_OP(-)
 DEFINE_VEC_BINARY_OP(*)
 DEFINE_VEC_BINARY_OP(/)
 DEFINE_VEC_BINARY_OP(==)
+DEFINE_VEC_BINARY_OP(!=)
 DEFINE_VEC_BINARY_OP(>)
 DEFINE_VEC_BINARY_OP(<)
 DEFINE_VEC_BINARY_OP(>=)
@@ -155,6 +167,7 @@ HOST_DEVICE_FUNC inline bool any(Vec<bool, size> const& src)
         return result;                                                                                                 \
     }
 DEFINE_VEC_UNARY_OP(expf)
+DEFINE_VEC_UNARY_OP(exp2f)
 DEFINE_VEC_UNARY_OP(__float2bfloat162_rn)
 DEFINE_VEC_UNARY_OP(__float2half2_rn)
 DEFINE_VEC_UNARY_OP(__float22half2_rn)
@@ -547,15 +560,17 @@ __device__ inline Vec<uint32_t, nbMat> ldmatrix(LdGrain const* row)
     {
         if (transpose)
         {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                         : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
-                         : "l"(__cvta_generic_to_shared(row)));
+            asm("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         else
         {
             asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
-                : "l"(__cvta_generic_to_shared(row)));
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
 #if 0
         auto checkMat = [&](uint32_t val, uint32_t idxMat) -> Vec<uint16_t, 8> const& {
@@ -593,13 +608,15 @@ __device__ inline Vec<uint32_t, nbMat> ldmatrix(LdGrain const* row)
         {
             asm("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
                 : "=r"(a), "=r"(b)
-                : "l"(__cvta_generic_to_shared(row)));
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         else
         {
             asm("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
                 : "=r"(a), "=r"(b)
-                : "l"(__cvta_generic_to_shared(row)));
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         return Vec<uint32_t, 2>{a, b};
     }
@@ -609,11 +626,15 @@ __device__ inline Vec<uint32_t, nbMat> ldmatrix(LdGrain const* row)
         {
             asm("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 %0, [%1];\n"
                 : "=r"(a)
-                : "l"(__cvta_generic_to_shared(row)));
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         else
         {
-            asm("ldmatrix.sync.aligned.m8n8.x2.shared.b16 %0, [%1];\n" : "=r"(a) : "l"(__cvta_generic_to_shared(row)));
+            asm("ldmatrix.sync.aligned.m8n8.x2.shared.b16 %0, [%1];\n"
+                : "=r"(a)
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         return Vec<uint32_t, 1>{a};
     }
@@ -629,6 +650,32 @@ __device__ inline Vec<uint32_t, 4> ldmatrix_4x(Warp const& warp, LdGrain const* 
     return ldmatrix<transpose, 4>(row);
 }
 
+template <uint32_t nbMat>
+__device__ inline Vec<uint32_t, nbMat * 2> ldmatrix_16x16_trans(LdGrain const* row)
+{
+    uint32_t a, b, c, d;
+    if constexpr (nbMat == 1)
+    {
+        asm("ldmatrix.sync.aligned.m16n16.x1.trans.shared::cta.b8 {%0, %1}, [%2];\n"
+            : "=r"(a), "=r"(b)
+            : "l"(__cvta_generic_to_shared(row))
+            : "memory");
+        return Vec<uint32_t, 2>{a, b};
+    }
+    else if constexpr (nbMat == 2)
+    {
+        asm("ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {%0, %1, %2, %3}, [%4];\n"
+            : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+            : "l"(__cvta_generic_to_shared(row))
+            : "memory");
+        return Vec<uint32_t, 4>{a, b, c, d};
+    }
+    else
+    {
+        static_assert(nbMat == 1 || nbMat == 2);
+    }
+}
+
 template <bool transpose, uint32_t nbMat>
 __device__ inline void stmatrix(LdGrain* row, Vec<uint32_t, nbMat> const& data)
 {
@@ -638,44 +685,47 @@ __device__ inline void stmatrix(LdGrain* row, Vec<uint32_t, nbMat> const& data)
     {
         if constexpr (transpose)
         {
-            asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"l"(
-                             __cvta_generic_to_shared(row)),
-                "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]));
+            asm("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"l"(
+                    __cvta_generic_to_shared(row)),
+                "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3])
+                : "memory");
         }
         else
         {
-            asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"l"(
-                             __cvta_generic_to_shared(row)),
-                "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]));
+            asm("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"l"(
+                    __cvta_generic_to_shared(row)),
+                "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3])
+                : "memory");
         }
     }
     else if constexpr (nbMat == 2)
     {
         if constexpr (transpose)
         {
-            asm volatile(
-                "stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1, %2};\n" ::"l"(__cvta_generic_to_shared(row)),
-                "r"(data[0]), "r"(data[1]));
+            asm("stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1, %2};\n" ::"l"(__cvta_generic_to_shared(row)),
+                "r"(data[0]), "r"(data[1])
+                : "memory");
         }
         else
         {
-            asm volatile(
-                "stmatrix.sync.aligned.m8n8.x2.shared.b16 [%0], {%1, %2};\n" ::"l"(__cvta_generic_to_shared(row)),
-                "r"(data[0]), "r"(data[1]));
+            asm("stmatrix.sync.aligned.m8n8.x2.shared.b16 [%0], {%1, %2};\n" ::"l"(__cvta_generic_to_shared(row)),
+                "r"(data[0]), "r"(data[1])
+                : "memory");
         }
     }
     else if constexpr (nbMat == 1)
     {
         if constexpr (transpose)
         {
-            asm volatile(
-                "stmatrix.sync.aligned.m8n8.x1.trans.shared.b16 [%0], {%1};\n" ::"l"(__cvta_generic_to_shared(row)),
-                "r"(data[0]));
+            asm("stmatrix.sync.aligned.m8n8.x1.trans.shared.b16 [%0], {%1};\n" ::"l"(__cvta_generic_to_shared(row)),
+                "r"(data[0])
+                : "memory");
         }
         else
         {
-            asm volatile("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};\n" ::"l"(__cvta_generic_to_shared(row)),
-                "r"(data[0]));
+            asm("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};\n" ::"l"(__cvta_generic_to_shared(row)),
+                "r"(data[0])
+                : "memory");
         }
     }
     else
@@ -700,10 +750,11 @@ struct None
 template <bool real, typename T>
 using RealTypeOrNone = mha::conditional_t<real, T, None>;
 
-struct CtaBarrierPair
+template <Scope producerScope = Scope::CTA, Scope consumerScope = Scope::CTA>
+struct MBarrierPair
 {
-    CtaBarrier produced;
-    CtaBarrier consumed;
+    MBarrier<producerScope> produced;
+    MBarrier<consumerScope> consumed;
 
     __device__ inline void initialize(uint32_t producedCount, uint32_t consumedCount)
     {
@@ -712,8 +763,11 @@ struct CtaBarrierPair
     }
 };
 
+using CtaBarrierPair = MBarrierPair<Scope::CTA, Scope::CTA>;
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-__device__ inline auto arrive_tx(CtaBarrier& bar, uint32_t txCount, uint32_t arriveCount = 1)
+template <Scope scope>
+__device__ inline auto arrive_tx(MBarrier<scope>& bar, uint32_t txCount, uint32_t arriveCount = 1)
 {
 #if USE_CUSTOM_BARRIER
     return bar.arrive_tx(txCount, arriveCount);
@@ -722,7 +776,8 @@ __device__ inline auto arrive_tx(CtaBarrier& bar, uint32_t txCount, uint32_t arr
 #endif
 }
 
-__device__ inline void arrive_tx_and_wait(CtaBarrier& bar, uint32_t txCount, uint32_t arriveCount = 1)
+template <Scope scope>
+__device__ inline void arrive_tx_and_wait(MBarrier<scope>& bar, uint32_t txCount, uint32_t arriveCount = 1)
 {
     bar.wait(arrive_tx(bar, txCount, arriveCount));
 }
@@ -878,4 +933,148 @@ __device__ inline void acqBulk()
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     asm volatile("griddepcontrol.wait;\n");
 #endif
+}
+
+__device__ inline uint3 nbClusters()
+{
+    uint3 id;
+    asm("mov.v4.u32 {%0, %1, %2, _}, %%nclusterid;\n" : "=r"(id.x), "=r"(id.y), "=r"(id.z));
+    return id;
+}
+
+__device__ inline uint3 clusterId()
+{
+    uint3 id;
+    asm("mov.v4.u32 {%0, %1, %2, _}, %%clusterid;\n" : "=r"(id.x), "=r"(id.y), "=r"(id.z));
+    return id;
+}
+
+__device__ inline uint32_t clusterCtaRank()
+{
+    uint32_t rank;
+    asm("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank));
+    return rank;
+}
+
+__device__ inline uint3 clusterCtaId()
+{
+    uint3 id;
+    asm("mov.v4.u32 {%0, %1, %2, _}, %%cluster_ctaid;\n" : "=r"(id.x), "=r"(id.y), "=r"(id.z));
+    return id;
+}
+
+// src and return are both generic address
+template <typename T>
+__device__ inline T* mapa(T* src, uint32_t clusterCtaRank)
+{
+    uint64_t dst;
+    asm volatile("mapa.u64 %0, %1, %2;\n" : "=l"(dst) : "l"(reinterpret_cast<uint64_t>(src)), "r"(clusterCtaRank));
+    return reinterpret_cast<T*>(dst);
+}
+
+template <typename T>
+__device__ inline T& mapa(T& src, uint32_t clusterCtaRank)
+{
+    return *mapa(&src, clusterCtaRank);
+}
+
+__device__ inline void clusterBarArrive()
+{
+    asm volatile("barrier.cluster.arrive.release.aligned;\n");
+}
+
+__device__ inline void clusterBarWait()
+{
+    asm volatile("barrier.cluster.wait.acquire.aligned;\n");
+}
+
+__device__ inline uint32_t clock32()
+{
+    uint32_t ret;
+    asm volatile("mov.u32 %0, %%clock;\n" : "=r"(ret)::"memory");
+    return ret;
+}
+
+template <uint32_t nbBufs, Scope producerScope = Scope::CTA, Scope consumerScope = Scope::CTA>
+struct BarWaiter
+{
+    MBarrierPair<producerScope, consumerScope> (*bars)[nbBufs];
+    uint32_t idx;
+    uint32_t idxBuf;
+    bool skipBarWait = false;
+
+    __device__ inline BarWaiter(MBarrierPair<producerScope, consumerScope> (&bars)[nbBufs], uint32_t idx)
+        : bars{&bars}
+        , idx{idx}
+        , idxBuf{idx % nbBufs}
+    {
+    }
+
+    __device__ inline bool testWait()
+    {
+        bool const parity = toParity<nbBufs>(idx);
+        skipBarWait = bar().produced.test_wait_parity(parity);
+        return skipBarWait;
+    }
+
+    __device__ inline BarWaiter next(uint32_t step = 1)
+    {
+        return BarWaiter{*bars, idx + step};
+    }
+
+    __device__ inline void wait()
+    {
+        if (!skipBarWait)
+        {
+            bar().produced.wait_parity(toParity<nbBufs>(idx));
+        }
+    }
+
+    __device__ inline MBarrierPair<producerScope, consumerScope>& bar()
+    {
+        return (*bars)[idxBuf];
+    }
+
+    __device__ inline void consumed()
+    {
+        bar().consumed.arrive();
+    }
+};
+
+class Timer
+{
+public:
+    __device__ inline Timer()
+    {
+        reset();
+    }
+
+    __device__ inline void print(char const* name = "unnamed", bool reset = false)
+    {
+        auto const toc = clock32();
+        printf("%s: %u (block={%u, %u, %u})\n", name, toc - mTic, blockIdx.x, blockIdx.y, blockIdx.z);
+        if (reset)
+        {
+            this->reset();
+        }
+    }
+
+    __device__ inline void reset()
+    {
+        mTic = clock32();
+    }
+
+private:
+    uint32_t mTic;
+};
+
+// [beg, end)
+struct Range
+{
+    uint32_t beg, end;
+};
+
+constexpr bool overlap(Range a, Range b)
+{
+    return a.beg < b.end && b.beg < a.end;
 }

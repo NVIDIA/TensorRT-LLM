@@ -16,11 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <functional>
 #include <memory>
 #include <optional>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 /**
@@ -74,6 +78,13 @@ public:
     {
     }
 
+    // Implicit conversion from OptionalRef<non-const T> to OptionalRef<const T>
+    template <typename U = T, typename = std::enable_if_t<std::is_const_v<U>>>
+    OptionalRef(OptionalRef<std::remove_const_t<T>> const& other)
+        : opt(other ? std::optional<std::reference_wrapper<T>>(std::ref(*other)) : std::nullopt)
+    {
+    }
+
     T* operator->() const
     {
         return opt ? &(opt->get()) : nullptr;
@@ -100,4 +111,6 @@ public:
     }
 };
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

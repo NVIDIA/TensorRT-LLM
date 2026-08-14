@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include "moe_gemm_kernels.h"
-#include "moe_kernels.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
@@ -26,6 +24,8 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -58,6 +58,8 @@ std::tuple<torch::Tensor, torch::Tensor> fused_topk_softmax(torch::Tensor const&
 }
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -68,5 +70,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fused_topk_softmax", &torch_ext::fused_topk_softmax);
+    m.impl("fused_topk_softmax", &tensorrt_llm::torch_ext::fused_topk_softmax);
 }

@@ -18,23 +18,16 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
-#include "tensorrt_llm/runtime/modelConfig.h"
 
 #include <memory>
-#include <optional>
+#include <mutex>
 
 namespace tensorrt_llm::batch_manager
 {
-namespace kv_cache_manager
-{
-class BaseKVCacheManager;
-} // namespace kv_cache_manager
-
-class SequenceSlotManager;
-class BasePeftCacheManager;
 class GenerateRequestOptions;
 } // namespace tensorrt_llm::batch_manager
 
@@ -46,13 +39,14 @@ struct SpeculativeDecodingFastLogitsInfo;
 namespace tensorrt_llm::batch_manager::utils
 {
 
+/// Background thread that sends draft model logits to the target model via MPI.
+/// Both \p draftRequestsWaitingToSendLogits (consumed here) and \p draftRequestsDoneSendingLogits
+/// (produced here for the main thread to drain) are guarded by \p draftRequestsMtx.
 void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadShouldExit,
-    RequestVector* draftRequestsWaitingToSendLogits, std::shared_ptr<SequenceSlotManager> const& seqSlotManager,
-    runtime::SizeType32 maxInputLen, std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& kvCacheManager,
-    std::shared_ptr<kv_cache_manager::BaseKVCacheManager> const& crossKvCacheManager,
-    std::shared_ptr<BasePeftCacheManager> const& peftCacheManager);
+    RequestVector* draftRequestsWaitingToSendLogits, RequestVector* draftRequestsDoneSendingLogits,
+    std::mutex* draftRequestsMtx);
 
-std::optional<runtime::ITensor::SharedPtr> targetModelReceiveLogits(
-    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, runtime::ModelConfig const& modelConfig);
+void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
+    executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, tensorrt_llm::DataType logitsDtype);
 
 } // namespace tensorrt_llm::batch_manager::utils

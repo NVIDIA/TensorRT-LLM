@@ -1,14 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import json
 import pickle
 import tempfile
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.mapping import Mapping
 
 
@@ -25,7 +31,9 @@ def test_quant_mode():
     assert _tb.QuantMode.fp8_qdq().has_fp8_qdq
 
     quant_mode = _tb.QuantMode.from_description(True, True, True, True, True,
-                                                True, True, True)
+                                                True, True, True, False, False,
+                                                False, False, False, False,
+                                                False, False)
     assert quant_mode.has_int4_weights
     quant_mode -= _tb.QuantMode.int4_weights()
     assert not quant_mode.has_int4_weights
@@ -83,12 +91,24 @@ def test_model_config():
     assert model_config.use_packed_input
 
     assert model_config.kv_cache_type is not None
+    # Test with C++ enums directly
     for enum_val in [
             _tb.KVCacheType.CONTINUOUS, _tb.KVCacheType.PAGED,
             _tb.KVCacheType.DISABLED
     ]:
         model_config.kv_cache_type = enum_val
         assert model_config.kv_cache_type == enum_val
+
+    # Test with Python enums converted to C++
+    for py_enum in [
+            KVCacheType.CONTINUOUS, KVCacheType.PAGED, KVCacheType.DISABLED
+    ]:
+        model_config.kv_cache_type = py_enum.to_cpp()
+        # Verify it was set correctly by comparing with C++ enum
+        assert model_config.kv_cache_type == getattr(_tb.KVCacheType,
+                                                     py_enum.name)
+        # Also verify round-trip conversion works
+        assert KVCacheType.from_cpp(model_config.kv_cache_type) == py_enum
 
     assert model_config.tokens_per_block == 64
     tokens_per_block = 1024
@@ -338,12 +358,12 @@ def test_llm_request():
     assert llm_request.pad_id == 99
     assert llm_request.end_id == 100
     assert llm_request.seq_slot is None
-    assert torch.equal(llm_request.prompt_embedding_table(),
+    assert torch.equal(llm_request.prompt_embedding_table,
                        kwargs["prompt_embedding_table"])
     assert llm_request.prompt_vocab_size == 2
-    assert torch.equal(llm_request.embedding_bias(), kwargs["embedding_bias"])
-    assert torch.equal(llm_request.stop_words_list(), kwargs["stop_words_list"])
-    assert torch.equal(llm_request.bad_words_list(), kwargs["bad_words_list"])
+    assert torch.equal(llm_request.embedding_bias, kwargs["embedding_bias"])
+    assert torch.equal(llm_request.stop_words_list, kwargs["stop_words_list"])
+    assert torch.equal(llm_request.bad_words_list, kwargs["bad_words_list"])
 
     assert llm_request.get_num_tokens(0) == 3
     assert llm_request.max_beam_num_tokens == 3
@@ -401,97 +421,76 @@ def test_llm_request():
     assert torch.equal(llm_request.draft_logits, logits)
 
 
-def test_trt_gpt_model_optional_params():
-    opt_params = _tb.TrtGptModelOptionalParams()
-
-    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
-    opt_params.kv_cache_config = kv_cache_config
-    assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
-
-    assert not opt_params.enable_trt_overlap
-    opt_params.enable_trt_overlap = True
-    assert opt_params.enable_trt_overlap
-
-    assert opt_params.device_ids is None
-    opt_params.device_ids = [0, 1]
-    assert opt_params.device_ids == [0, 1]
-
-    assert not opt_params.enable_chunked_context
-    opt_params.enable_chunked_context = True
-    assert opt_params.enable_chunked_context
-
-    assert opt_params.normalize_log_probs
-    opt_params.normalize_log_probs = False
-    assert not opt_params.normalize_log_probs
-
-    assert not opt_params.decoding_config.decoding_mode
-    opt_params.decoding_config.decoding_mode = _tb.executor.DecodingMode.TopKTopP(
+def test_generation_only_llm_request_adopts_draft_tokens() -> None:
+    request_id = 42
+    first_gen_tokens = [100]
+    draft_tokens = [101, 102, 103]
+    llm_request_type = _tb.internal.batch_manager.LlmRequestType
+    context_phase_params = _tb.executor.ContextPhaseParams(
+        first_gen_tokens,
+        request_id,
+        None,
+        draft_tokens,
+        None,
+        None,
     )
-    assert opt_params.decoding_config.decoding_mode.isTopKandTopP()
 
-    assert not opt_params.max_beam_width
-    opt_params.max_beam_width = 4
-    assert opt_params.max_beam_width == 4
+    llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=context_phase_params,
+    )
 
-    assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-    assert opt_params.scheduler_config.context_chunking_policy is None
-    opt_params.scheduler_config = _tb.executor.SchedulerConfig(
-        _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
-    assert opt_params.scheduler_config.capacity_scheduler_policy == _tb.executor.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-    assert opt_params.scheduler_config.context_chunking_policy == _tb.executor.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
+    assert llm_request.is_generation_only_request
+    assert llm_request.has_draft_tokens()
+    assert llm_request.num_draft_tokens == len(draft_tokens)
+    assert llm_request.draft_tokens == draft_tokens
+    assert llm_request.context_phase_params.draft_tokens == draft_tokens
 
+    late_llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
 
-def test_trt_gpt_model_optional_params_ctor():
-    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
-    enable_trt_overlap = True
-    device_ids = [0, 1]
-    normalize_log_probs = False
-    enable_chunked_context = True
-    peft_cache_manager_config = _tb.PeftCacheManagerConfig()
+    assert late_llm_request.draft_tokens is None
+    assert late_llm_request.num_draft_tokens == 0
 
-    opt_params = _tb.TrtGptModelOptionalParams(kv_cache_config,
-                                               enable_trt_overlap, device_ids,
-                                               normalize_log_probs,
-                                               enable_chunked_context,
-                                               peft_cache_manager_config)
-    assert opt_params.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
-    assert opt_params.enable_trt_overlap
-    assert opt_params.device_ids == device_ids
-    assert opt_params.normalize_log_probs == normalize_log_probs
-    assert opt_params.enable_chunked_context == enable_chunked_context
-    assert opt_params.gpu_weights_percent == 1
+    late_llm_request.context_phase_params = context_phase_params
 
-
-def test_KvCacheConfig_pickle():
-    cache = _tb.KvCacheConfig(free_gpu_memory_fraction=0.4)
-    cache1 = pickle.dumps(cache)
-    cache2 = pickle.loads(cache1)
-
-    assert cache2 == cache
+    assert late_llm_request.has_draft_tokens()
+    assert late_llm_request.num_draft_tokens == len(draft_tokens)
+    assert late_llm_request.draft_tokens == draft_tokens
 
 
-def test_TrtGptModelOptionalParams_pickle():
-    kv_cache_config = _tb.KvCacheConfig(10, [10], 0, 0.5, False)
-    enable_trt_overlap = True
-    device_ids = [0, 1]
-    normalize_log_probs = False
-    enable_chunked_context = True
-    peft_cache_manager_config = _tb.PeftCacheManagerConfig()
+@pytest.mark.cpu_only
+def test_llm_request_kv_cache_transfer_metric_bindings():
+    request = _tb.internal.batch_manager.LlmRequest(
+        request_id=0,
+        max_new_tokens=5,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[0, 1, 2],
+        is_streaming=True,
+    )
+    offset = _tb.internal.batch_manager.LlmRequest.global_steady_clock_offset
+    offset = offset if offset is not None else timedelta()
+    start = timedelta(seconds=1.25)
+    end = timedelta(seconds=2.5)
 
-    params1 = _tb.TrtGptModelOptionalParams(kv_cache_config, enable_trt_overlap,
-                                            device_ids, normalize_log_probs,
-                                            enable_chunked_context,
-                                            peft_cache_manager_config)
+    request.set_kv_cache_transfer_start(start)
+    request.set_kv_cache_transfer_end(end)
+    request.set_kv_cache_size(128)
 
-    params2 = pickle.loads(pickle.dumps(params1))
-
-    assert params2.kv_cache_config.free_gpu_memory_fraction == kv_cache_config.free_gpu_memory_fraction
-    assert params2.enable_trt_overlap
-    assert params2.device_ids == device_ids
-    assert params2.normalize_log_probs == normalize_log_probs
-    assert params2.enable_chunked_context == enable_chunked_context
-    assert params2.gpu_weights_percent == 1
+    assert request.kv_cache_transfer_start == start + offset
+    assert request.kv_cache_transfer_end == end + offset
+    assert request.kv_cache_size == 128
 
 
 def test_Mpicomm():
@@ -534,29 +533,26 @@ def test_SamplingConfig_pickle():
     config.beam_width_array = [[2, 3, 4, 5]]
 
     config1 = pickle.loads(pickle.dumps(config))
-
     assert config1 == config
 
 
 def test_KvCache_events_binding():
     stream = torch.cuda.Stream()
+    max_sequence_length = 10
     kwargs = {
         'num_kv_heads_per_layer': [1, 1],
         'size_per_head':
         128,
         'tokens_per_block':
         64,
-        'blocks_in_primary_pool':
-        1000,
-        'blocks_in_secondary_pool':
-        10000,
+        'blocks_per_window': {
+            max_sequence_length: (1000, 10000)
+        },
         'max_num_sequences':
         1,
         'max_beam_width':
         1,
-        'max_attention_window_vec': [10],
-        'temp_attention_window_inputs':
-        None,
+        'max_attention_window_vec': [max_sequence_length],
         'dtype':
         _tb.DataType.FLOAT,
         'sink_token_length':
@@ -564,11 +560,11 @@ def test_KvCache_events_binding():
         'stream':
         stream.cuda_stream,
         'max_sequence_length':
-        10,
+        max_sequence_length,
+        'chunk_size':
+        max_sequence_length,
         'enable_block_reuse':
         True,
-        'onboard_blocks':
-        False,
         'cache_type':
         _tb.internal.batch_manager.CacheType.SELF,
         'event_manager':

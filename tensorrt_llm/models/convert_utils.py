@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-from datasets import load_dataset
 
 from .._utils import torch_dtype_to_str
 from ..logger import logger
@@ -178,10 +177,24 @@ def load_state_dict(
     model_params = {}
     if file_path.suffix == '.safetensors':
         # load from safetensors file
-        from safetensors import safe_open
-        with safe_open(file_path, framework='pt', device=device) as f:
-            for name in f.keys():
-                tensor = f.get_tensor(name)
+        try:
+            from safetensors import safe_open
+            with safe_open(file_path, framework='pt', device=device) as f:
+                for name in f.keys():
+                    tensor = f.get_tensor(name)
+                    if dtype is not None:
+                        tensor = tensor.to(dtype)
+                    model_params[name] = tensor
+        except Exception as e:
+            # Fallback to safetensors.torch.load_file() for better compatibility
+            # with some HuggingFace-style adapters (e.g., PEFT-saved files)
+            logger.warning(
+                f"Failed to load {file_path} with safe_open(), "
+                f"falling back to safetensors.torch.load_file(): {e}")
+            import safetensors.torch
+            state_dict = safetensors.torch.load_file(str(file_path),
+                                                     device=device)
+            for name, tensor in state_dict.items():
                 if dtype is not None:
                     tensor = tensor.to(dtype)
                 model_params[name] = tensor
@@ -276,39 +289,6 @@ def iterate_shard_files(model_dir: Union[Path, str],
 
 def has_safetensors(model_dir: str):
     return len(list(Path(model_dir).glob('*.safetensors'))) > 0
-
-
-DEFAULT_HF_DATASET_META = {
-    'ccdv/cnn_dailymail': ('3.0.0', 'train', 'article'),
-    'cnn_dailymail': ('3.0.0', 'train', 'article'),
-    'lambada': (None, 'validation', 'text'),
-    '': (None, 'train', 'text'),  # Default value in HF
-}
-
-
-def load_calib_dataset(dataset_name_or_dir: str,
-                       config_name: Optional[str] = None,
-                       split: Optional[str] = None,
-                       key: Optional[str] = None,
-                       trust_remote_code=True,
-                       **kwargs):
-    if config_name is None:
-        for name, meta in DEFAULT_HF_DATASET_META.items():
-            if name in dataset_name_or_dir:
-                if config_name is None:
-                    config_name = meta[0]
-                if split is None:
-                    split = meta[1]
-                if key is None:
-                    key = meta[2]
-                break
-
-    dataset = load_dataset(dataset_name_or_dir,
-                           name=config_name,
-                           split=split,
-                           trust_remote_code=trust_remote_code,
-                           **kwargs)
-    return dataset[key]
 
 
 @torch.no_grad()

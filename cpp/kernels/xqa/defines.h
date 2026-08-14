@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -23,6 +28,18 @@
 #define HEAD_ELEMS 128
 #endif
 
+// nbQHeads / nbKHeads for MQA/GQA
+#ifndef HEAD_GRP_SIZE
+#define HEAD_GRP_SIZE 8
+#endif
+
+#define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
+
+#if IS_MLA
+#define INPUT_ELEM __nv_fp8_e4m3
+#define INPUT_ELEM2 __nv_fp8x2_e4m3
+#define HEAD_ELEMS_V 512
+#else
 // 1 means fp16 and 0 means bf16 input/output
 #ifndef INPUT_FP16
 #define INPUT_FP16 1
@@ -36,15 +53,11 @@
 #define INPUT_ELEM __nv_bfloat16
 #define INPUT_ELEM2 __nv_bfloat162
 #endif
+#endif
 
 // For beam search. Allowed values: 1, 4
 #ifndef BEAM_WIDTH
 #define BEAM_WIDTH 1
-#endif
-
-// nbQHeads / nbKHeads for MQA/GQA
-#ifndef HEAD_GRP_SIZE
-#define HEAD_GRP_SIZE 8
 #endif
 
 #ifndef SPEC_DEC
@@ -57,6 +70,12 @@ using MaskType = uint32_t;
 #ifndef M_TILESIZE
 #define M_TILESIZE 32
 #endif
+#endif
+
+// Enables SWAP AB optimization for speculative decoding when using a small, fixed Q_SEQ_LEN.
+// NOTE: Requires a uniform input sequence length for the entire batch.
+#ifdef SPEC_Q_SEQ_LEN
+static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is enabled.");
 #endif
 
 // 0: half/bf16 based on INPUT_FP16; 1: int8_t; 2: __nv_fp8_e4m3
@@ -83,6 +102,15 @@ using MaskType = uint32_t;
 #define USE_PAGED_KV_CACHE (TOKENS_PER_PAGE > 0)
 #endif
 
+// Paged KV Cache Format
+// 0 - XQA Original
+// 1 - separate K and V cache pools, each with layout (batch, seq_len, head, head_elem) for VLLM/SGLang
+#ifdef USE_PAGED_KV_CACHE
+#ifndef PAGED_KV_CACHE_LAYOUT
+#define PAGED_KV_CACHE_LAYOUT 0
+#endif
+#endif
+
 // don't modify
 #define USE_BEAM_SEARCH (BEAM_WIDTH > 1)
 
@@ -99,6 +127,18 @@ using MaskType = uint32_t;
 
 #ifndef SLIDING_WINDOW
 #define SLIDING_WINDOW 0
+#endif
+
+#ifndef SKIP_SOFTMAX_ATTN
+#define SKIP_SOFTMAX_ATTN 0
+#endif
+
+#ifndef SKIP_SOFTMAX_ATTN_BLOCK_STATS
+#define SKIP_SOFTMAX_ATTN_BLOCK_STATS 0
+#endif
+
+#ifndef SKIP_SOFTMAX_ATTN_FIX_THRESHOLD_GREATER_THAN_ONE
+#define SKIP_SOFTMAX_ATTN_FIX_THRESHOLD_GREATER_THAN_ONE 1
 #endif
 
 // 0 - no PDL
@@ -125,6 +165,14 @@ using MaskType = uint32_t;
 #endif
 #endif
 
+// Number of head elements RoPE is applied to (rotary_embedding_dim). Defaults to the full head
+// (HEAD_ELEMS) for full rotary; set smaller for partial rotary (partial_rotary_factor < 1). The
+// trailing [ROPE_ELEMS, HEAD_ELEMS) elements are passed through unrotated. Defined unconditionally
+// so validRopeElemsPerHead is well-formed even for kernels that do not apply RoPE in-kernel.
+#ifndef ROPE_ELEMS
+#define ROPE_ELEMS HEAD_ELEMS
+#endif
+
 // Output element type:
 //   0 - input element type
 //   1 - KV cache element type
@@ -146,6 +194,10 @@ static_assert(CACHE_ELEM_ENUM != 0);
 
 #ifndef OPTIMIZE_FOR_LATENCY
 #define OPTIMIZE_FOR_LATENCY 1
+#endif
+
+#ifndef IS_SPEC_DEC_TREE
+#define IS_SPEC_DEC_TREE 1 // by default SPEC_DEC expect tree-based draft token structure
 #endif
 
 #define DBG_BATCH_SIZE 2

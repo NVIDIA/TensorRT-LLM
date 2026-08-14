@@ -7,7 +7,6 @@ import pytest
 import torch
 import torch.nn as nn
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell_unittest
 
 import tensorrt_llm
@@ -29,6 +28,26 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+# needed since we reuse the mpi executor pool, first test running will leak a thread
+pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+def _assert_match_counts(backend, expected_match_count_by_pass):
+    # Key format:
+    # - "<pass_name>" for passes that are registered once
+    # - "<pass_name>:<allreduce_variant>" for UB passes that are registered
+    #   per allreduce backend, where <allreduce_variant> is "allreduce" or
+    #   "tunable_allreduce" or "autotuned_allreduce"
+    assert dict(backend.match_count_by_pass) == expected_match_count_by_pass
+
+
+def create_tp_mapping(tp_size, rank):
+    return Mapping(
+        world_size=tp_size,
+        tp_size=tp_size,
+        rank=rank,
+    )
 
 
 def init_userbuffers_allocator(tp_size, rank, max_ub_size):
@@ -123,12 +142,8 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
 
         ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
-        mapping = Mapping(
-            world_size=tensor_parallel_size,
-            tp_size=tensor_parallel_size,
-            rank=rank,
-        )
-        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
+        mapping = create_tp_mapping(tensor_parallel_size, rank)
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -170,7 +185,8 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("mnk", [(256, 512, 256), (32, 16, 64)],
                          ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}")
-def test_user_buffers_ar_rms_norm(mnk):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_ar_rms_norm(mnk, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float16
@@ -182,13 +198,11 @@ def test_user_buffers_ar_rms_norm(mnk):
     c = torch.randn((m, n), dtype=dtype)
     gamma = torch.randn((n), dtype=dtype)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ar_rms_norm,
-            *zip(*[(tensor_parallel_size, a, b, c, gamma)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ar_rms_norm,
+        *zip(*[(tensor_parallel_size, a, b, c, gamma)] * tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
@@ -215,12 +229,9 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
 
         ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
-        mapping = Mapping(
-            world_size=tensor_parallel_size,
-            tp_size=tensor_parallel_size,
-            rank=rank,
-        )
-        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
+        mapping = create_tp_mapping(tensor_parallel_size, rank)
+
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
@@ -262,7 +273,8 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
-def test_user_buffers_basic():
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_basic(mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float32
@@ -272,19 +284,19 @@ def test_user_buffers_basic():
     a = torch.randn((m, k), dtype=dtype)
     b = torch.randn((k, n), dtype=dtype)
     c = torch.randn((m, n), dtype=dtype)
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank,
-            *zip(*[(tensor_parallel_size, a, b, c)] * tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(tensor_parallel_size, a, b, c)] * tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("mnk", [(256, 512, 256), (32, 16, 64)],
                          ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}")
-def test_user_buffers_ar_rms_norm_fp8(mnk):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_ar_rms_norm_fp8(mnk, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float16
@@ -297,13 +309,12 @@ def test_user_buffers_ar_rms_norm_fp8(mnk):
     gamma = torch.randn((n), dtype=dtype)
     scale = torch.randn((1), dtype=torch.float32)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ar_rms_norm_fp8,
-            *zip(*[(tensor_parallel_size, a, b, c, gamma, scale)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ar_rms_norm_fp8,
+        *zip(*[(tensor_parallel_size, a, b, c, gamma, scale)] *
+             tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 class UBTestModel(nn.Module):
@@ -320,46 +331,48 @@ class UBTestModel(nn.Module):
         quant_config.layer_quant_mode
         self.rank = rank
         self.tp_size = tp_size
-        mapping = Mapping(
-            world_size=tp_size,
-            tp_size=tp_size,
-            rank=rank,
-        )
+        mapping = create_tp_mapping(tp_size, rank)
+
         self.l0 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l1 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l2 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l3 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l4 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
                          mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
         self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
@@ -424,6 +437,157 @@ class UBTestModel(nn.Module):
         return res
 
 
+def run_single_rank_ar_rms_norm_fp8_live_scale_compile(tensor_parallel_size, a,
+                                                       b, c, gamma, scale):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        if not ub.ub_supported():
+            return True
+        eps = 1e-6
+        dtype = a.dtype
+
+        a = a.cuda()
+        c = c.cuda()
+        gamma = gamma.cuda()
+        scale = scale.cuda()
+
+        ub_size = c.nelement() * c.element_size()
+        init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
+
+        b_partial = torch.chunk(b, tensor_parallel_size, 0)
+        weight = b_partial[rank].cuda()
+        mapping = create_tp_mapping(tensor_parallel_size, rank)
+
+        class Model(nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.allreduce = AllReduce(mapping=mapping,
+                                           strategy=AllReduceStrategy.AUTO,
+                                           dtype=dtype)
+
+            def forward(self, input, residual):
+                local = torch.chunk(input, tensor_parallel_size,
+                                    1)[rank].contiguous()
+                hidden = torch.matmul(local, weight)
+                norm, fused_residual = self.allreduce(
+                    hidden,
+                    all_reduce_params=AllReduceParams(
+                        strategy=AllReduceStrategy.AUTO,
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=gamma,
+                        eps=eps,
+                    ))
+                q_norm, q_scale = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    norm, scale)
+                # static_quantize_e4m3_per_tensor leaves its 2nd output
+                # uninitialized (see fp8Op.cpp:112). Keep q_scale live so the
+                # live-scale fusion pattern still matches, but override its
+                # value with the input scale (in input.dtype) so eager and
+                # fused outputs are comparable.
+                q_scale = q_scale.to(input.dtype) * 0 + scale.to(input.dtype)
+                dequantized = dequant(q_norm, q_scale, input.dtype)
+                return dequantized, fused_residual, q_scale
+
+        model = Model()
+        backend = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=mapping)
+        model_opt = torch.compile(model, backend=backend, fullgraph=True)
+
+        with torch.inference_mode():
+            ref_dequantized, ref_residual, ref_scale = model(a, c)
+            fused_dequantized, fused_residual, fused_scale = model_opt(a, c)
+
+        _assert_match_counts(
+            backend, {
+                "ar_residual_norm": 0,
+                "ar_residual_norm_quant": 1,
+                "ub_convert_supported_ar_to_ub:allreduce": 0,
+                "ub_prologue:allreduce": 0,
+                "ub_finalize:allreduce": 0,
+                "insert_copy_for_graph_output:allreduce": 0,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 1,
+                "ub_prologue:autotuned_allreduce": 1,
+                "ub_finalize:autotuned_allreduce": 0,
+                "insert_copy_for_graph_output:autotuned_allreduce": 0,
+                "add_norm_fallback": 0,
+            })
+
+        torch.cuda.synchronize()
+        if rank == 0:
+            torch.testing.assert_close(fused_dequantized,
+                                       ref_dequantized,
+                                       atol=5e-1,
+                                       rtol=1e-2)
+            torch.testing.assert_close(fused_residual,
+                                       ref_residual,
+                                       atol=5e-1,
+                                       rtol=1e-2)
+            torch.testing.assert_close(fused_scale, ref_scale)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+def run_single_rank_backend_passes_are_per_instance(tensor_parallel_size):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    support = ub.ub_supported()
+    if not support:
+        return True
+
+    mapping = create_tp_mapping(tensor_parallel_size, rank)
+    backend_no_ub = Backend(enable_inductor=False,
+                            enable_userbuffers=False,
+                            mapping=mapping)
+    backend_ub = Backend(enable_inductor=False,
+                         enable_userbuffers=True,
+                         mapping=mapping)
+
+    assert [
+        custom_pass.pass_name for custom_pass in backend_no_ub.custom_passes
+    ] == ["ar_residual_norm", "ar_residual_norm_quant", "add_norm_fallback"]
+    assert [custom_pass.pass_name
+            for custom_pass in backend_ub.custom_passes] == [
+                "ar_residual_norm",
+                "ar_residual_norm_quant",
+                "ub_convert_supported_ar_to_ub:allreduce",
+                "ub_prologue:allreduce",
+                "ub_finalize:allreduce",
+                "insert_copy_for_graph_output:allreduce",
+                "ub_convert_supported_ar_to_ub:tunable_allreduce",
+                "ub_prologue:tunable_allreduce",
+                "ub_finalize:tunable_allreduce",
+                "insert_copy_for_graph_output:tunable_allreduce",
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce",
+                "ub_prologue:autotuned_allreduce",
+                "ub_finalize:autotuned_allreduce",
+                "insert_copy_for_graph_output:autotuned_allreduce",
+                "add_norm_fallback",
+            ]
+
+    # A second Backend with the same config must build a distinct pass list —
+    # guards against any future reintroduction of class-level pass caching.
+    backend_ub2 = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=mapping)
+    for p1, p2 in zip(backend_ub.custom_passes, backend_ub2.custom_passes):
+        assert p1 is not p2
+    for p_no_ub, p_ub in zip(backend_no_ub.custom_passes,
+                             backend_ub.custom_passes):
+        assert p_no_ub is not p_ub
+
+    return True
+
+
 def run_single_rank_ub_pass(
         tensor_parallel_size, input, l0_weight, l0_input_scale, l0_weight_scale,
         l1_weight, l1_input_scale, l1_weight_scale, l2_weight, l2_input_scale,
@@ -450,16 +614,34 @@ def run_single_rank_ub_pass(
             quant(l3_weight, l3_weight_scale), l3_input_scale, l3_weight_scale,
             quant(l4_weight, l4_weight_scale), l4_input_scale, l4_weight_scale,
             norm0_gamma, norm1_gamma, norm2_gamma)
-        backend = Backend(enable_inductor=False, enable_userbuffers=True)
+        backend = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
         with torch.inference_mode():
             output_fused = model_opt(input)
-        # 3 AR_NORM fusion happens first
-        # 2 AR_NORM fused with Quant
-        # 1 AR_NORM replacement
-        # 3 Scaled MM Prologue
-        # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 1, 0, 3, 0, 2, 0]
+        # Assert the exact named pass totals rather than the raw fixed-point
+        # trace in backend.match_count. This is still an intentional tripwire
+        # for optimizer changes, but on semantic pass names instead of
+        # pass-manager bookkeeping zeros.
+        _assert_match_counts(
+            backend, {
+                "ar_residual_norm": 3,
+                "ar_residual_norm_quant": 2,
+                "ub_convert_supported_ar_to_ub:allreduce": 0,
+                "ub_prologue:allreduce": 0,
+                "ub_finalize:allreduce": 0,
+                "insert_copy_for_graph_output:allreduce": 0,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 3,
+                "ub_prologue:autotuned_allreduce": 3,
+                "ub_finalize:autotuned_allreduce": 2,
+                "insert_copy_for_graph_output:autotuned_allreduce": 1,
+                "add_norm_fallback": 0,
+            })
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -524,8 +706,7 @@ def run_single_rank_ub_pass(
                                        rtol=1e-2)
     except Exception:
         traceback.print_exc()
-
-        return False
+        raise
     return True
 
 
@@ -535,7 +716,8 @@ def run_single_rank_ub_pass(
 @pytest.mark.parametrize("tokens", [256, 16], ids=lambda x: f"_tokens{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=lambda x: "fp16" if x == torch.float16 else "bf16")
-def test_user_buffers_pass(hidden, tokens, dtype):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_pass(hidden, tokens, dtype, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
 
@@ -559,17 +741,54 @@ def test_user_buffers_pass(hidden, tokens, dtype):
     l4_input_scale = torch.full((1, ), 0.1, dtype=torch.float32)
     l4_weight_scale = torch.full((1, ), 0.1, dtype=torch.float32)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ub_pass,
-            *zip(*[(tensor_parallel_size, input, l0_weight, l0_input_scale,
-                    l0_weight_scale, l1_weight, l1_input_scale, l1_weight_scale,
-                    l2_weight, l2_input_scale, l2_weight_scale, l3_weight,
-                    l3_input_scale, l3_weight_scale, l4_weight, l4_input_scale,
-                    l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ub_pass,
+        *zip(*[(tensor_parallel_size, input, l0_weight, l0_input_scale,
+                l0_weight_scale, l1_weight, l1_input_scale, l1_weight_scale,
+                l2_weight, l2_input_scale, l2_weight_scale, l3_weight,
+                l3_input_scale, l3_weight_scale, l4_weight, l4_input_scale,
+                l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
+             tensor_parallel_size))
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason='needs 2 GPUs to run this test')
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
+                         ids=lambda x: "fp16" if x == torch.float16 else "bf16")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_ar_rms_norm_fp8_live_scale_compile(
+        dtype, mpi_pool_executor):
+    torch.manual_seed(44)
+    tensor_parallel_size = 2
+    m = 16
+    n = 32
+    k = 16
+    a = torch.randn((m, k), dtype=dtype)
+    b = torch.randn((k, n), dtype=dtype)
+    c = torch.randn((m, n), dtype=dtype)
+    gamma = torch.randn((n), dtype=dtype)
+    scale = torch.full((1, ), 0.1, dtype=torch.float32)
+
+    results = mpi_pool_executor.map(
+        run_single_rank_ar_rms_norm_fp8_live_scale_compile,
+        *zip(*[(tensor_parallel_size, a, b, c, gamma, scale)] *
+             tensor_parallel_size))
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason='needs 2 GPUs to run this test')
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_backend_passes_are_per_instance(mpi_pool_executor):
+    tensor_parallel_size = 2
+    results = mpi_pool_executor.map(
+        run_single_rank_backend_passes_are_per_instance,
+        *zip(*[(tensor_parallel_size, )] * tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
@@ -600,12 +819,8 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
 
         ub0_tensor = create_userbuffers_tensor(c.size(), a.dtype)
         hidden = torch.matmul(a_local, b_local, out=ub0_tensor)
-        mapping = Mapping(
-            world_size=tensor_parallel_size,
-            tp_size=tensor_parallel_size,
-            rank=rank,
-        )
-        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
+        mapping = create_tp_mapping(tensor_parallel_size, rank)
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -656,8 +871,9 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("mnk", [(256, 512, 256), (32, 64, 64)],
                          ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 @skip_pre_blackwell_unittest
-def test_user_buffers_ar_rms_norm_fp4(mnk):
+def test_user_buffers_ar_rms_norm_fp4(mnk, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float16
@@ -669,13 +885,11 @@ def test_user_buffers_ar_rms_norm_fp4(mnk):
     c = torch.randn((m, n), dtype=dtype)
     gamma = torch.randn((n), dtype=dtype)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ar_rms_norm_fp4,
-            *zip(*[(tensor_parallel_size, a, b, c, gamma)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ar_rms_norm_fp4,
+        *zip(*[(tensor_parallel_size, a, b, c, gamma)] * tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 class UBMMAddModel(nn.Module):
@@ -687,14 +901,10 @@ class UBMMAddModel(nn.Module):
         self.rank = rank
         self.hidden_size = hidden_size
         self.dtype = dtype
-        mapping = Mapping(
-            world_size=tp_size,
-            tp_size=tp_size,
-            rank=rank,
-        )
-        self.ar_0 = AllReduce(mapping).cuda()
-        self.ar_1 = AllReduce(mapping).cuda()
-        self.ar_2 = AllReduce(mapping).cuda()
+        mapping = create_tp_mapping(tp_size, rank)
+        self.ar_0 = AllReduce(mapping=mapping).cuda()
+        self.ar_1 = AllReduce(mapping=mapping).cuda()
+        self.ar_2 = AllReduce(mapping=mapping).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
         self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
@@ -747,7 +957,9 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
         init_userbuffers_allocator(tensor_parallel_size, rank, ub_size)
         model = UBMMAddModel(tensor_parallel_size, rank, hidden_size, dtype,
                              eps, norm0_gamma, norm1_gamma, norm2_gamma)
-        backend = Backend(enable_inductor=False, enable_userbuffers=True)
+        backend = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
         with torch.inference_mode():
             output_fused = model_opt(mm0_input_0, mm0_input_1, mm1_input_0,
@@ -760,12 +972,28 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
             torch.cuda.synchronize()
             output_ref = model(mm0_input_0, mm0_input_1, mm1_input_0,
                                mm1_input_1, residual_0, residual_1)
-        # 3 AR_NORM fusion happens first
-        # 0 AR_NORM fused with Quant
-        # 3 AR_NORM replacement
-        # 3 Prologue
-        # 1 UB Finalize Removal
-        assert backend.match_count == [3, 0, 0, 3, 0, 3, 0, 1, 0]
+        # Assert the exact named pass totals rather than the raw fixed-point
+        # trace in backend.match_count. This is still an intentional tripwire
+        # for optimizer changes, but on semantic pass names instead of
+        # pass-manager bookkeeping zeros.
+        _assert_match_counts(
+            backend, {
+                "ar_residual_norm": 3,
+                "ar_residual_norm_quant": 0,
+                "ub_convert_supported_ar_to_ub:allreduce": 0,
+                "ub_prologue:allreduce": 0,
+                "ub_finalize:allreduce": 0,
+                "insert_copy_for_graph_output:allreduce": 0,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 3,
+                "ub_prologue:autotuned_allreduce": 3,
+                "ub_finalize:autotuned_allreduce": 1,
+                "insert_copy_for_graph_output:autotuned_allreduce": 1,
+                "add_norm_fallback": 0,
+            })
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -786,7 +1014,8 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
 @pytest.mark.parametrize("tokens", [256, 16], ids=lambda x: f"_tokens{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=lambda x: "fp16" if x == torch.float16 else "bf16")
-def test_user_buffers_mm_add_prologue(hidden, tokens, dtype):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_mm_add_prologue(hidden, tokens, dtype, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
 
@@ -794,13 +1023,12 @@ def test_user_buffers_mm_add_prologue(hidden, tokens, dtype):
     norm1_gamma = torch.randn((hidden, ), dtype=dtype)
     norm2_gamma = torch.randn((hidden, ), dtype=dtype)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ub_mm_add_pass,
-            *zip(*[(tensor_parallel_size, tokens, hidden, dtype, norm0_gamma,
-                    norm1_gamma, norm2_gamma)] * tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ub_mm_add_pass,
+        *zip(*[(tensor_parallel_size, tokens, hidden, dtype, norm0_gamma,
+                norm1_gamma, norm2_gamma)] * tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 class UBFp4TestModel(nn.Module):
@@ -818,61 +1046,47 @@ class UBFp4TestModel(nn.Module):
         quant_config.layer_quant_mode
         self.rank = rank
         self.tp_size = tp_size
+        mapping = create_tp_mapping(tp_size, rank)
         self.l0 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l1 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l2 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l3 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.COLUMN,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.l4 = Linear(in_features=hidden_size,
                          out_features=hidden_size,
                          bias=False,
                          dtype=dtype,
-                         mapping=Mapping(
-                             world_size=tp_size,
-                             tp_size=tp_size,
-                             rank=rank,
-                         ),
+                         mapping=mapping,
                          tensor_parallel_mode=TensorParallelMode.ROW,
-                         quant_config=quant_config).cuda()
+                         quant_config=quant_config,
+                         enable_gemm_allreduce_fusion=False).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
         self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
@@ -977,7 +1191,7 @@ def run_single_rank_ub_pass_fp4(
 
         def block_scale_unswizzled(scale):
             sz = fp4_utils.pad_up(hidden_size, 128)
-            return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+            return torch.ops.trtllm.block_scale_interleave_reverse(
                 scale.cpu().view(sz, -1))[0:hidden_size]
 
         l0_weight_scale_block_unswizzled = block_scale_unswizzled(
@@ -1005,18 +1219,36 @@ def run_single_rank_ub_pass_fp4(
             l4_weight_scale_block_unswizzled.view(torch.float8_e4m3fn),
             l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)
 
-        backend = Backend(enable_inductor=False, enable_userbuffers=True)
+        backend = Backend(enable_inductor=False,
+                          enable_userbuffers=True,
+                          mapping=create_tp_mapping(tensor_parallel_size, rank))
         model_opt = torch.compile(model, backend=backend, fullgraph=True)
         with torch.inference_mode():
             output_ref = model(input)
             output_fused = model_opt(input)
 
-        # 3 AR_NORM fusion happens first
-        # 2 AR_NORM fused with Quant
-        # 1 AR_NORM replacement
-        # 3 Scaled MM Prologue
-        # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 1, 0, 3, 0, 2, 0]
+        # Assert the exact named pass totals rather than the raw fixed-point
+        # trace in backend.match_count. This is still an intentional tripwire
+        # for optimizer changes, but on semantic pass names instead of
+        # pass-manager bookkeeping zeros.
+        _assert_match_counts(
+            backend, {
+                "ar_residual_norm": 3,
+                "ar_residual_norm_quant": 2,
+                "ub_convert_supported_ar_to_ub:allreduce": 0,
+                "ub_prologue:allreduce": 0,
+                "ub_finalize:allreduce": 0,
+                "insert_copy_for_graph_output:allreduce": 0,
+                "ub_convert_supported_ar_to_ub:tunable_allreduce": 0,
+                "ub_prologue:tunable_allreduce": 0,
+                "ub_finalize:tunable_allreduce": 0,
+                "insert_copy_for_graph_output:tunable_allreduce": 0,
+                "ub_convert_supported_ar_to_ub:autotuned_allreduce": 3,
+                "ub_prologue:autotuned_allreduce": 3,
+                "ub_finalize:autotuned_allreduce": 2,
+                "insert_copy_for_graph_output:autotuned_allreduce": 1,
+                "add_norm_fallback": 0,
+            })
         torch.cuda.synchronize()
         torch.testing.assert_close(output_fused,
                                    output_ref,
@@ -1035,8 +1267,9 @@ def run_single_rank_ub_pass_fp4(
 @pytest.mark.parametrize("tokens", [256, 16], ids=lambda x: f"_tokens{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=lambda x: "fp16" if x == torch.float16 else "bf16")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 @skip_pre_blackwell_unittest
-def test_user_buffers_fp4_pass(hidden, tokens, dtype):
+def test_user_buffers_fp4_pass(hidden, tokens, dtype, mpi_pool_executor):
     torch.manual_seed(43)
     tensor_parallel_size = 2
 
@@ -1074,14 +1307,13 @@ def test_user_buffers_fp4_pass(hidden, tokens, dtype):
     l3_res = l2_res @ l3_weight.t()
     l3_res_scale = fp4_scale(l3_res)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ub_pass_fp4,
-            *zip(*[(tensor_parallel_size, input, l0_weight, input_scale,
-                    l0_weight_scale, l1_weight, l0_res_scale, l1_weight_scale,
-                    l2_weight, l1_res_scale, l2_weight_scale, l3_weight,
-                    l2_res_scale, l3_weight_scale, l4_weight, l3_res_scale,
-                    l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ub_pass_fp4,
+        *zip(*[(tensor_parallel_size, input, l0_weight, input_scale,
+                l0_weight_scale, l1_weight, l0_res_scale, l1_weight_scale,
+                l2_weight, l1_res_scale, l2_weight_scale, l3_weight,
+                l2_res_scale, l3_weight_scale, l4_weight, l3_res_scale,
+                l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
+             tensor_parallel_size))
+    for r in results:
+        assert r is True

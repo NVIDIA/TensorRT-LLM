@@ -61,7 +61,7 @@ std::optional<SequenceSlotManager::SlotIdType> SequenceSlotManager::getSequenceS
         auto const it = mSequenceIdToSlot.find(sequenceId);
         if (it == mSequenceIdToSlot.end())
         {
-            TLLM_LOG_ERROR("Could not find sequence id in allocated sequence slots");
+            TLLM_LOG_ERROR("Could not find sequence id %lu in allocated sequence slots", sequenceId);
         }
         else
         {

@@ -20,10 +20,11 @@
 
 #include "fmhaKernels.h"
 #include "fmhaRunnerParams.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -31,7 +32,9 @@ class TllmGenFmhaRunner
 {
 public:
     // Constructor.
-    explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut);
+    explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
+        int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0,
+        int numEltsPerSageAttnBlkV = 0, bool fusesDsv4InvRopeFp8Quant = false);
 
     TllmGenFmhaRunner() = default;
 
@@ -49,14 +52,21 @@ public:
 
 private:
     // The input/output datatype.
-    Data_type mDtypeQ, mDtypeKv, mDtypeOut;
+    Data_type mDtypeQ, mDtypeK, mDtypeV, mDtypeOut;
     // The SM version.
     int mSM;
     // The total device memory.
     size_t mTotalDeviceMemory;
     // The class that stores all the kernels.
-    TllmGenFmhaKernel const* mKernel;
+    TllmGenFmhaKernel* mKernel;
+    // SageAttention extensions.
+    int mNumEltsPerSageAttnBlkQ;
+    int mNumEltsPerSageAttnBlkK;
+    int mNumEltsPerSageAttnBlkP;
+    int mNumEltsPerSageAttnBlkV;
+    bool mFusesDsv4InvRopeFp8Quant{false};
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

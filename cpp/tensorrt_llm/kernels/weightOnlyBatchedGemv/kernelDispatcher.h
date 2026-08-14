@@ -16,11 +16,12 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/common.h"
 #include "tensorrt_llm/kernels/weightOnlyBatchedGemv/kernel.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace weight_only
@@ -45,6 +46,12 @@ void dispatcher(Params& params, cudaStream_t s)
     if constexpr (EnableZero)
     {
         // clang-format off
+#ifdef FAST_BUILD
+        // Fast build: only compile most common batch sizes to speed up compilation
+        DISPATCHER_FOR_M(1, 1, 4, 128);
+        DISPATCHER_FOR_M(4, 4, 4, 128);
+        DISPATCHER_FOR_M(8, 8, 4, 128);
+#else
         DISPATCHER_FOR_M(1, 1, 4, 128);
         DISPATCHER_FOR_M(2, 2, 4, 128);
         DISPATCHER_FOR_M(3, 3, 4, 128);
@@ -60,11 +67,18 @@ void dispatcher(Params& params, cudaStream_t s)
         DISPATCHER_FOR_M(13, 13, 4, 128);
         DISPATCHER_FOR_M(14, 14, 4, 128);
         DISPATCHER_FOR_M(15, 15, 4, 128);
+#endif
         // clang-format on
     }
     else
     {
         // clang-format off
+#ifdef FAST_BUILD
+        // Fast build: only compile most common batch sizes to speed up compilation
+        DISPATCHER_FOR_M(1, 1, 8, 128);
+        DISPATCHER_FOR_M(4, 4, 8, 128);
+        DISPATCHER_FOR_M(8, 8, 8, 128);
+#else
         DISPATCHER_FOR_M(1, 1, 8, 128);
         DISPATCHER_FOR_M(2, 2, 8, 128);
         DISPATCHER_FOR_M(3, 3, 8, 128);
@@ -80,6 +94,7 @@ void dispatcher(Params& params, cudaStream_t s)
         DISPATCHER_FOR_M(13, 13, 8, 128);
         DISPATCHER_FOR_M(14, 14, 8, 128);
         DISPATCHER_FOR_M(15, 15, 8, 128);
+#endif
         // clang-format on
     }
     throw std::runtime_error("unsupported m");
@@ -108,6 +123,11 @@ void check_pointer(Params& params, cudaStream_t s)
     }
     else
     {
+#ifdef FAST_BUILD
+        // Fast build: only compile the most common combination to speed up compilation
+        // Other combinations will use runtime branching with this single compiled kernel
+        check_alpha<Details, GroupSize, true, true, true>(params, s);
+#else
         if (params.act_scale && params.zeros && params.bias)
         {
             check_alpha<Details, GroupSize, true, true, true>(params, s);
@@ -140,6 +160,7 @@ void check_pointer(Params& params, cudaStream_t s)
         {
             check_alpha<Details, GroupSize, false, false, false>(params, s);
         }
+#endif
     }
 }
 
@@ -171,4 +192,5 @@ void select_gs(Params& params, cudaStream_t s)
         KernelDetails<A, B, Layout, ConverterInterleave, KTile>>(Params & params, cudaStream_t s);
 } // namespace weight_only
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

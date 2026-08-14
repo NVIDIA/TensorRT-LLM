@@ -70,7 +70,7 @@ SESSION_FORMAT_KEYS = [
 # Uses tuple to do (src, dest) key names
 TEST_DESCRIPTION_KEYS = [
     "perf_case_name", "network_name", "framework", "sm_clk", "mem_clk",
-    "gpu_idx", "network_hash", "flags"
+    "gpu_idx", "network_hash", "flags", "device_subtype"
 ]
 
 # Tuples are used if the internal dictionary keys are different from output dictionary keys.
@@ -350,7 +350,7 @@ def write_gpu_monitoring_no_test_results(logpath,
 
 def get_log(fpath):
     """
-    Converts TURTLE log output into an ordered dict of stdout and stderr.
+    Converts log output into an ordered dict of stdout and stderr.
     Used for raw_result for test_result.
 
     Args:

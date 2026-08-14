@@ -1,22 +1,25 @@
 import unittest
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 from parameterized import parameterized
+from utils.llm_data import llm_models_root
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_vila import (VilaConfig, VilaModel,
-                                                      fuse_input_embeds)
+from tensorrt_llm._torch.models.modeling_vila import (
+    VilaConfig, VilaModel, _validate_vila_mm_alignment, fuse_input_embeds)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 VILA_1_5_3B_CONFIG = {
-    "_name_or_path": "Efficient-Large-Model/VILA1.5-3b",
+    "_name_or_path": f"{llm_models_root()}/vila/VILA1.5-3b",
     "architectures": ["LlavaLlamaModel"],
     "drop_path_rate": 0.0,
     "hidden_size": 2560,
@@ -263,7 +266,7 @@ VILA_1_5_3B_CONFIG = {
 
 NVILA_8B_CONFIG = {
     "_attn_implementation_autoset": True,
-    "_name_or_path": "Efficient-Large-Model/NVILA-8B",
+    "_name_or_path": f"{llm_models_root()}/vila/NVILA-8B",
     "architectures": ["LlavaLlamaModel"],
     "chat_template": None,
     "drop_path_rate": 0.0,
@@ -694,3 +697,41 @@ class TestVila(unittest.TestCase):
 
         position_ids = torch.cat(position_ids).unsqueeze(0)
         return model, input_ids, position_ids, past_seen_tokens, attn_metadata, kv_cache_manager
+
+
+def test_validate_vila_mm_alignment_locates_in_vocab_media_tokens():
+    """VILA expands media placeholders to the in-vocab media token id, so the
+    alignment check must locate them via ``mm_token_ids`` (torch.isin). With the
+    legacy OOV (``>= vocab_size``) predicate it would find zero positions and
+    raise a spurious count mismatch."""
+    vocab_size = 100
+    media_token_id = 42
+    # text, 3 in-vocab media tokens, text
+    input_ids = torch.tensor(
+        [1, media_token_id, media_token_id, media_token_id, 2], dtype=torch.int)
+    embedding_layer = SimpleNamespace(num_embeddings=vocab_size)
+    mm_embeds = [torch.zeros(3, 8)]
+    mm_token_ids = torch.tensor([media_token_id], dtype=torch.int32)
+
+    text_token_indices, mm_token_indices = _validate_vila_mm_alignment(
+        input_ids=input_ids,
+        embedding_layer=embedding_layer,
+        mm_embeds=mm_embeds,
+        mm_token_ids=mm_token_ids,
+    )
+
+    torch.testing.assert_close(mm_token_indices.cpu(), torch.tensor([1, 2, 3]))
+    torch.testing.assert_close(text_token_indices.cpu(), torch.tensor([0, 4]))
+
+
+def test_validate_vila_mm_alignment_raises_on_count_mismatch():
+    """A genuine token/embed count mismatch must still raise."""
+    input_ids = torch.tensor([1, 42, 42, 2], dtype=torch.int)
+    embedding_layer = SimpleNamespace(num_embeddings=100)
+    with pytest.raises(ValueError, match="Multimodal token count mismatch"):
+        _validate_vila_mm_alignment(
+            input_ids=input_ids,
+            embedding_layer=embedding_layer,
+            mm_embeds=[torch.zeros(5, 8)],  # 5 embeds != 2 media tokens
+            mm_token_ids=torch.tensor([42], dtype=torch.int32),
+        )

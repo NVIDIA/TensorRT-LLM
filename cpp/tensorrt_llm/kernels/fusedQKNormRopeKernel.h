@@ -16,10 +16,11 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -32,13 +33,34 @@ void launchFusedQKNormRope(
     int const num_heads_k,   // Number of key heads
     int const num_heads_v,   // Number of value heads
     int const head_dim,      // Dimension per head
+    int const rotary_dim,    // Dimension for RoPE
     float const eps,         // Epsilon for RMS normalization
     void const* q_weight,    // RMSNorm weights for query [head_dim]
     void const* k_weight,    // RMSNorm weights for key [head_dim]
     float const base,        // Base for RoPE computation
     bool const interleave,   // Whether RoPE is applied in interleave mode (non-Neox style)
     int const* position_ids, // Position IDs for RoPE [num_tokens]
-    cudaStream_t stream);    // CUDA stream
+    float factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
+    float low,    // threshold for high frequency
+    float high,   // threshold for low frequency
+    float attention_factor, // attention_factor applied on cos and sin
+    cudaStream_t stream,    // CUDA stream
+    bool is_qk_norm,        // Whether to apply QK norm
+    bool use_gemma,         // Whether QK norm uses Gemma-style RMSNorm (scale by (1 + weight))
+    bool use_mrope,         // Whether to use interleaved mRoPE position selection
+    int mrope_section1,     // mrope_section[1] (height)
+    int mrope_section2);    // mrope_section[2] (width)
+
+// Out-of-place FP8 variant of launchFusedQKNormRope, folding the FP8
+// activation-quant into the norm+RoPE epilogue. Q and K get RMSNorm + RoPE; V is
+// copy-cast only.
+void launchFusedQKNormRopeToFp8(void const* qkv_in, // BF16 input [num_tokens, total_heads*head_dim]
+    void* qkv_out,                                  // FP8 E4M3 output buffer, same layout as input
+    int const num_tokens, int const num_heads_q, int const num_heads_k, int const num_heads_v, int const head_dim,
+    int const rotary_dim, float const eps, void const* q_weight, void const* k_weight, float const base,
+    bool const interleave, int const* position_ids, float factor, float low, float high, float attention_factor,
+    cudaStream_t stream, bool is_qk_norm, bool use_gemma, bool use_mrope, int mrope_section1, int mrope_section2);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

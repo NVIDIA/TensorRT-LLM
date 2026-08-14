@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,25 +16,90 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+#include <cstdint>
 #include <cuda.h>
-#include <optional>
+#include <vector>
 
-#include "tensorrt_llm/kernels/trtllmGenKernels/common/Dtype.h"
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
+// Backend-local activation type. The numeric values here are part of the Python/thop
+// contract (see ActType_TrtllmGen in tensorrt_llm/_torch/utils.py) and are intentionally
+// decoupled from the generated batchedGemm::gemmGatedAct::ActType, whose values shift
+// between generator exports. KernelRunner.cpp maps gated entries explicitly; never cast
+// between the two enums by value.
+enum class ActType
+{
+    // For ActType == SwiGlu, ideally we would like to have something like
+    //    gatedAct = scaleC * (x0 * scaleAb + beta) * ((x1 * scaleGate) * sigmoid(alpha * x1 *
+    //    scaleGate)).
+    // But for now, we use the simplified version
+    //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
+    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
+    // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
+    //
+    // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
+    SwiGlu,
+    Relu2,
+    Silu,
+    // SiTu gated activation (Kimi K3). Gate on x1, matching the SwiGlu convention:
+    //    left     = beta  * tanh(x0 / beta)
+    //    right    = alpha * tanh(x1 / alpha) * sigmoid(x1)
+    //    gatedAct = left * right
+    // alpha/beta come from the per-expert mPtrGatedActAlpha/mPtrGatedActBeta runtime
+    // parameters and must be > 0.
+    SiTu
+};
+
+// Gated activations combine gate and up projections inside the FC1 kernel; the FC1
+// logical output width is 2 * intermediateSize. Element-wise activations (Relu2/Silu)
+// run on a single projection.
+constexpr bool isGatedActType(ActType actType)
+{
+    return actType == ActType::SwiGlu || actType == ActType::SiTu;
+}
+
+// Type of the element-wise activation to apply after the Gemm
+enum class EltwiseActType
+{
+    None = 0,
+    // Gelu is defined as the following operation:
+    // act = x0 * phi(x0)
+    // where x0 is the output of the Gemm
+    // phi is the CDF of standard normal distribution approximated by
+    // phi(x) = 0.5 * (1 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+    Gelu,
+    // Relu2 (also known as squared Relu) is defined as the following operation:
+    // act = relu(x0) ^ 2
+    // where x0 is the output of the Gemm.
+    Relu2,
+    // Silu is defined as the following operation:
+    // act = x0 * sigmoid(x0)
+    // where x0 is the output of the Gemm.
+    Silu
+};
+
 struct TrtllmGenBatchedGemmRunnerOptions
 {
-    trtllm::gen::Dtype eltType;
-    trtllm::gen::Dtype outputType;
+    // Canonically, A is activation.
+    batchedGemm::trtllm::gen::Dtype dtypeA;
+    // Canonically, B is weight.
+    batchedGemm::trtllm::gen::Dtype dtypeB;
+    // C is output.
+    batchedGemm::trtllm::gen::Dtype dtypeC;
+    ActType actType{ActType::SwiGlu};
+    EltwiseActType eltwiseActType{EltwiseActType::None};
     bool deepSeekFp8{false};
     bool fusedAct{false};
     bool routeAct{false};
     bool staticBatch{false};
+    // Legacy: force transpose-only kernels. Used by fp8BatchedGemmTrtllmGen.
+    // MoE callers leave false (auto-selects transpose or non-transpose).
     bool transposeMmaOutput{false};
     int32_t tileSize{8};
     int32_t epilogueTileM{128};
@@ -46,20 +111,58 @@ public:
     explicit TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options);
 
     [[nodiscard]] size_t getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k,
-        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim);
+        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
+        int32_t configIndex) const;
 
-    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
-        int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA, void const* b,
-        void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC,
-        float const* scaleGateC, void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
-        int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
-        void* workspace, CUstream stream, int device);
+    // Generic GEMM interface
+    void run(int32_t m, int32_t n, int32_t k, int32_t validM, int32_t validN, int32_t validK,
+        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
+        void const* a, void const* sfA, void const* b, void const* sfB, void const* perTokensSfA,
+        void const* perTokensSfB, float const* scaleC, float const* scaleGateC, float const* bias,
+        float const* swiGluAlpha, float const* swiGluBeta, float const* clampLimit, void* c, void* outSfC,
+        int32_t const* routeMap, int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
+        int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace, CUstream stream,
+        int device, int32_t configIndex);
 
+    // Block-scaling GEMM
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
-        void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream, int device);
+        void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream, int device,
+        int32_t configIndex, int32_t validM = -1, int32_t validN = -1, int32_t validK = -1);
 
+    // Block-scaling GEMM with SwiGLU activation
+    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
+        void const* b, void const* sfB, float const* bias, float const* swiGluAlpha, float const* swiGluBeta,
+        float const* clampLimit, void* c, void* outSfC, void* workspace, CUstream stream, int device,
+        int32_t configIndex, int32_t validM = -1, int32_t validN = -1, int32_t validK = -1);
+
+    // FP8 per-tensor scaling GEMM
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* b,
-        float const* scaleC, float const* scaleGateC, void* c, void* workspace, CUstream stream, int device);
+        float const* scaleC, float const* scaleGateC, void* c, void* workspace, CUstream stream, int device,
+        int32_t configIndex, int32_t validM = -1, int32_t validN = -1, int32_t validK = -1);
+
+    // Get the list of configs that passed the validation based on the constructor options
+    [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const
+    {
+        return mPassingConfigIndices;
+    }
+
+    // Get the kernel name from the config index
+    [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
+
+    // Get the list of config indices that are valid for the given problem shape
+    [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t m, int32_t n, int32_t k,
+        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
+        int32_t validM = -1, int32_t validN = -1, int32_t validK = -1) const;
+
+    // Get a default config index that is valid for the given problem shape
+    // This will be used as the fallback config if using auto-tuning
+    [[nodiscard]] int64_t getDefaultValidConfigIndex(int32_t m, int32_t n, int32_t k,
+        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
+        int32_t validM = -1, int32_t validN = -1, int32_t validK = -1) const;
+
+    [[nodiscard]] bool isValidConfigIndex(int32_t configIndex, int32_t m, int32_t n, int32_t k,
+        std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim,
+        int32_t validM = -1, int32_t validN = -1, int32_t validK = -1) const;
 
 private:
     void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
@@ -67,8 +170,8 @@ private:
 
 private:
     TrtllmGenBatchedGemmRunnerOptions mOptions;
-    std::optional<int> mSelectedConfigIndex;
-    std::vector<int32_t> mPassingConfigIndices;
+    std::vector<int64_t> mPassingConfigIndices;
 };
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -20,6 +20,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif // __GNUC__
+#include "tensorrt_llm/common/config.h"
 
 #include "cute/tensor.hpp"
 #include "cutlass/conv/convolution.h"
@@ -42,14 +43,13 @@
 #pragma GCC diagnostic pop
 #endif          // __GNUC__
 
-using namespace cute;
+TRTLLM_NAMESPACE_BEGIN
 
-namespace tensorrt_llm
-{
 namespace kernels
 {
 namespace cutlass_kernels
 {
+using namespace cute;
 
 template <typename ElementType, typename AccumElementType, typename CTAShape, typename ClusterShape,
     typename MainloopScheduleType, typename EpilogueScheduleType, typename TileSchedulerType = void,
@@ -119,4 +119,5 @@ struct DeviceGemmGatedSm90
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

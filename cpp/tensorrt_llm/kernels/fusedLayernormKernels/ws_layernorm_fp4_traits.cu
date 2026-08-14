@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include <tuple>
 
 #include "tensorrt_llm/common/logger.h"
@@ -25,10 +26,13 @@
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 template <typename _Param, typename _InputType, typename _OutputType, typename _AccumulatorType, bool _RMS_NORM,
-    int _M_BLOCK, int _N_BLOCK, int _STAGES = 3, bool _PERSISTENT_MODE = true, bool _LOW_LATENCY_MODE = false>
+    int _M_BLOCK, int _N_BLOCK, int _STAGES = 3, bool _PERSISTENT_MODE = true, bool _LOW_LATENCY_MODE = false,
+    bool _HIGH_PRECISION_NORMED_OUTPUT = false>
 struct FP4AddBiasResidualPreLayerNormTraits
 {
 
@@ -56,12 +60,12 @@ struct FP4AddBiasResidualPreLayerNormTraits
     static constexpr bool PERSISTENT_MODE = _PERSISTENT_MODE;
     static constexpr bool LOW_LATENCY_MODE = _LOW_LATENCY_MODE;
     static constexpr bool PREFETCH_TO_L2 = false;
-    static constexpr bool HIGH_PRECISION_NORMED_OUTPUT = false;
+    static constexpr bool HIGH_PRECISION_NORMED_OUTPUT = _HIGH_PRECISION_NORMED_OUTPUT;
 };
 
 template <typename T>
-void invokeWSLayerNormImpl(
-    WarpSpecializedParam<GeneralFP4AddBiasResidualPreLayerNormParam<T>> param, bool use_rms_norm, int ctas)
+void invokeWSLayerNormImpl(WarpSpecializedParam<GeneralFP4AddBiasResidualPreLayerNormParam<T>> param, bool use_rms_norm,
+    int ctas, bool output_hp_norm)
 {
 
     auto _invoke = [&](auto traits)
@@ -77,10 +81,11 @@ void invokeWSLayerNormImpl(
         {
             int waves = ((param.m + Traits::M_BLOCK - 1) / Traits::M_BLOCK + ctas - 1) / ctas;
             TLLM_LOG_DEBUG(
-                "Selected TILE_M = %d, N = %d, STAGE = %d, PERSISTENT_MODE = %d, LOW_LATENCY_MODE = %d for param M = "
+                "Selected TILE_M = %d, N = %d, STAGE = %d, PERSISTENT_MODE = %d, LOW_LATENCY_MODE = %d, "
+                "HIGH_PRECISION_NORMED_OUTPUT = %d for param M = "
                 "%d, N = %d, num_sms = %d. (waves = %d)\n",
                 Traits::M_BLOCK, Traits::N_BLOCK, Traits::STAGES, Traits::PERSISTENT_MODE, Traits::LOW_LATENCY_MODE,
-                param.m, param.n, ctas, waves);
+                Traits::HIGH_PRECISION_NORMED_OUTPUT, param.m, param.n, ctas, waves);
             printed = true;
         }
 
@@ -114,15 +119,32 @@ void invokeWSLayerNormImpl(
         constexpr auto PERSISTENT = decltype(persistent)::value;
         constexpr auto LOW_LATENCY_MODE = decltype(low_latency_mode)::value;
 
+        // Select kernel variant based on use_rms_norm and output_hp_norm
         if (use_rms_norm)
         {
-            _invoke(FP4AddBiasResidualPreLayerNormTraits<GeneralFP4AddBiasResidualPreLayerNormParam<T>, T, T, float,
-                true, M_BLOCK, N_BLOCK, STAGES, PERSISTENT, LOW_LATENCY_MODE>{});
+            if (output_hp_norm)
+            {
+                _invoke(FP4AddBiasResidualPreLayerNormTraits<GeneralFP4AddBiasResidualPreLayerNormParam<T>, T, T, float,
+                    true, M_BLOCK, N_BLOCK, STAGES, PERSISTENT, LOW_LATENCY_MODE, true>{});
+            }
+            else
+            {
+                _invoke(FP4AddBiasResidualPreLayerNormTraits<GeneralFP4AddBiasResidualPreLayerNormParam<T>, T, T, float,
+                    true, M_BLOCK, N_BLOCK, STAGES, PERSISTENT, LOW_LATENCY_MODE, false>{});
+            }
         }
         else
         {
-            _invoke(FP4AddBiasResidualPreLayerNormTraits<GeneralFP4AddBiasResidualPreLayerNormParam<T>, T, T, float,
-                false, M_BLOCK, N_BLOCK, STAGES, PERSISTENT, LOW_LATENCY_MODE>{});
+            if (output_hp_norm)
+            {
+                _invoke(FP4AddBiasResidualPreLayerNormTraits<GeneralFP4AddBiasResidualPreLayerNormParam<T>, T, T, float,
+                    false, M_BLOCK, N_BLOCK, STAGES, PERSISTENT, LOW_LATENCY_MODE, true>{});
+            }
+            else
+            {
+                _invoke(FP4AddBiasResidualPreLayerNormTraits<GeneralFP4AddBiasResidualPreLayerNormParam<T>, T, T, float,
+                    false, M_BLOCK, N_BLOCK, STAGES, PERSISTENT, LOW_LATENCY_MODE, false>{});
+            }
         }
     };
 
@@ -137,23 +159,25 @@ void invokeWSLayerNormImpl(
 
         if (M_BLOCK == 1 && waves == 1)
         {
-            _invokeSelectRMSNorm(Int<1>{}, n_block, Int<1>{}, Bool<false>{}, Bool<true>{});
+            _invokeSelectRMSNorm(ConstInt<1>{}, n_block, ConstInt<1>{}, ConstBool<false>{}, ConstBool<true>{});
         }
         else if (waves <= 1)
         {
-            _invokeSelectRMSNorm(m_block, n_block, Int<1>{}, Bool<false>{}, Bool<false>{});
+            _invokeSelectRMSNorm(m_block, n_block, ConstInt<1>{}, ConstBool<false>{}, ConstBool<false>{});
         }
         else if (waves <= 2)
         {
-            _invokeSelectRMSNorm(m_block, n_block, Int<std::min(2, STAGES)>{}, Bool<true>{}, Bool<false>{});
+            _invokeSelectRMSNorm(
+                m_block, n_block, ConstInt<std::min(2, STAGES)>{}, ConstBool<true>{}, ConstBool<false>{});
         }
         else if (waves <= 3)
         {
-            _invokeSelectRMSNorm(m_block, n_block, Int<std::min(3, STAGES)>{}, Bool<true>{}, Bool<false>{});
+            _invokeSelectRMSNorm(
+                m_block, n_block, ConstInt<std::min(3, STAGES)>{}, ConstBool<true>{}, ConstBool<false>{});
         }
         else
         {
-            _invokeSelectRMSNorm(m_block, n_block, Int<STAGES>{}, Bool<true>{}, Bool<false>{});
+            _invokeSelectRMSNorm(m_block, n_block, ConstInt<STAGES>{}, ConstBool<true>{}, ConstBool<false>{});
         }
     };
 
@@ -169,7 +193,7 @@ void invokeWSLayerNormImpl(
 
         if (desired_m_block >= MAX_M_BLOCK)
         {
-            _invokeSelectPersistentMode(Int<MAX_M_BLOCK>{}, n_block);
+            _invokeSelectPersistentMode(ConstInt<MAX_M_BLOCK>{}, n_block);
             return;
         }
 
@@ -179,7 +203,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (1 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<1>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<1>{}, n_block);
             }
             else
             {
@@ -190,7 +214,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (2 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<2>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<2>{}, n_block);
             }
             else
             {
@@ -201,7 +225,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (4 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<4>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<4>{}, n_block);
             }
             else
             {
@@ -212,7 +236,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (8 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<8>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<8>{}, n_block);
             }
             else
             {
@@ -223,7 +247,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (16 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<16>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<16>{}, n_block);
             }
             else
             {
@@ -234,7 +258,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (32 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<32>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<32>{}, n_block);
             }
             else
             {
@@ -245,7 +269,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (64 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<64>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<64>{}, n_block);
             }
             else
             {
@@ -256,7 +280,7 @@ void invokeWSLayerNormImpl(
         {
             if constexpr (128 <= MAX_M_BLOCK)
             {
-                _invokeSelectPersistentMode(Int<128>{}, n_block);
+                _invokeSelectPersistentMode(ConstInt<128>{}, n_block);
             }
             else
             {
@@ -272,25 +296,25 @@ void invokeWSLayerNormImpl(
     auto _invokeSelectNBlock = [&]()
     {
         // if (param.n <= 512) {
-        //     _invokeSelectTileSize(Int<512>{});
+        //     _invokeSelectTileSize(ConstInt<512>{});
         // } else if (param.n <= 1024) {
-        //     _invokeSelectTileSize(Int<1024>{});
+        //     _invokeSelectTileSize(ConstInt<1024>{});
         // } else
         if (param.n <= 2048)
         {
-            _invokeSelectTileSize(Int<2048>{});
+            _invokeSelectTileSize(ConstInt<2048>{});
         }
         else if (param.n <= 4096)
         {
-            _invokeSelectTileSize(Int<4096>{});
+            _invokeSelectTileSize(ConstInt<4096>{});
         }
         else if (param.n <= 8192)
         {
-            _invokeSelectTileSize(Int<8192>{});
+            _invokeSelectTileSize(ConstInt<8192>{});
         }
         else if (param.n <= 16384)
         {
-            _invokeSelectTileSize(Int<16384>{});
+            _invokeSelectTileSize(ConstInt<16384>{});
         }
         else
         {
@@ -303,16 +327,20 @@ void invokeWSLayerNormImpl(
 
 template <>
 void invokeWSLayerNorm<GeneralFP4AddBiasResidualPreLayerNormParam<half>>(
-    WarpSpecializedParam<GeneralFP4AddBiasResidualPreLayerNormParam<half>> param, bool use_rms_norm, int ctas)
+    WarpSpecializedParam<GeneralFP4AddBiasResidualPreLayerNormParam<half>> param, bool use_rms_norm, int ctas,
+    bool output_hp_norm)
 {
-    invokeWSLayerNormImpl(param, use_rms_norm, ctas);
+    invokeWSLayerNormImpl(param, use_rms_norm, ctas, output_hp_norm);
 }
 
 template <>
 void invokeWSLayerNorm<GeneralFP4AddBiasResidualPreLayerNormParam<__nv_bfloat16>>(
-    WarpSpecializedParam<GeneralFP4AddBiasResidualPreLayerNormParam<__nv_bfloat16>> param, bool use_rms_norm, int ctas)
+    WarpSpecializedParam<GeneralFP4AddBiasResidualPreLayerNormParam<__nv_bfloat16>> param, bool use_rms_norm, int ctas,
+    bool output_hp_norm)
 {
-    invokeWSLayerNormImpl(param, use_rms_norm, ctas);
+    invokeWSLayerNormImpl(param, use_rms_norm, ctas, output_hp_norm);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

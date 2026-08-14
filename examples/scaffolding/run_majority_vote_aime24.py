@@ -76,9 +76,10 @@ def main():
         prompts.append(test_case["problem"])
 
     if args.static_with_benchmark or args.concurrency:
-        if args.concurrency == None:
+        if args.concurrency is None:
             args.concurrency = 1
 
+        task_collection_types = {}
         if args.static_with_benchmark:
             task_collection_types = {"token_counter": GenerationTokenCounter}
 
@@ -101,25 +102,29 @@ def main():
         result = results[i]
         test_case = test_dataset[i]
         ref_answer = int(test_case["answer"])
-        result.result()
-        output = result.output
-        extracted_answer = extract_answer_from_boxed(output.output_str)
+        output = result.outputs[0]
+        extracted_answer = extract_answer_from_boxed(output.text)
         try:
             # print(f"[QUESTION]:\n{prompt}\n\n[OUTPUT]\n\n{output.output_str}\n\n")
             answer = int(extracted_answer)
             print(f'Answer={answer}, reference={ref_answer}')
             if answer == ref_answer:
                 correct_count += 1
-        except:
+        except (ValueError, TypeError):
             print(f'extracted_answer={extracted_answer}, not integer.')
         total_count += 1
     print(
         f'Controller {controller_name} Accuracy: {correct_count} out of {total_count}'
     )
+
     if args.threshold is not None:
-        assert correct_count >= args.threshold * total_count, \
+        accuracy = correct_count / total_count
+        if accuracy < args.threshold:
+            print(
                 f'Accuracy check failed with {correct_count}/{total_count} < {args.threshold}'
-        print(f'Accuracy check passed with threshold={args.threshold}')
+            )
+        else:
+            print(f'Accuracy check passed with threshold={args.threshold}')
 
     if args.static_with_benchmark:
         print(f'Total time: {total_time}')

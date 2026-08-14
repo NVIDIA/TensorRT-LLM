@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/include/nvrtcWrapper.h"
@@ -70,6 +75,11 @@ std::string getMacroFlag(std::string const& name, std::string const& value)
 
 std::string getSMFlag(int SM)
 {
+    // SM121 uses the same cubin target as SM120 (sm_120f) for compatibility.
+    if (SM == 120 || SM == 121)
+    {
+        return "-arch=sm_120f";
+    }
     std::string smStr = std::to_string(SM);
     if (SM == 90)
     {
@@ -123,9 +133,15 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
         macros["INPUT_FP16"] = "0";
         macros["DTYPE"] = "__nv_bfloat16";
     }
+    else if (context->data_type == tensorrt_llm::kernels::DATA_TYPE_E4M3)
+    {
+        TLLM_CHECK(context->kernel_type == TLLM_XQA_JIT_MLA);
+    }
     else
     {
-        setErrorString("data_type is neither DATA_TYPE_FP16 nor DATA_TYPE_BF16");
+        setErrorString(
+            "data_type must be DATA_TYPE_FP16 or DATA_TYPE_BF16 for non-MLA kernels and DATA_TYPE_E4M3 for the MLA "
+            "kernel");
         return TLLM_XQA_JIT_INVALID_INPUT;
     }
 
@@ -168,10 +184,18 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
     macros["M_TILESIZE"] = std::to_string(m_tilesize);
     macros["USE_CUSTOM_BARRIER"] = "1";
     // Sliding window is not supported when spec dec is enabled.
-    macros["SLIDING_WINDOW"] = context->multi_query_tokens ? "0" : "1";
+    macros["SLIDING_WINDOW"] = context->multi_query_tokens && context->is_spec_dec_tree ? "0" : "1";
     macros["LOW_PREC_OUTPUT"] = context->fp8_output ? "1" : "0";
     macros["USE_INPUT_KV"] = context->use_input_kv ? "1" : "0";
     macros["ROPE_STYLE"] = std::to_string(int(context->rope_style));
+    // Number of head elements RoPE is applied to. Defaults to head_size (full rotary) when unset.
+    macros["ROPE_ELEMS"]
+        = std::to_string(context->rotary_embedding_dim != 0 ? context->rotary_embedding_dim : head_size);
+    macros["IS_SPEC_DEC_TREE"] = context->is_spec_dec_tree ? "1" : "0";
+    macros["SKIP_SOFTMAX_ATTN"] = context->use_skip_softmax_attn ? "1" : "0";
+#ifdef SKIP_SOFTMAX_STAT
+    macros["SKIP_SOFTMAX_ATTN_BLOCK_STATS"] = context->use_skip_softmax_attn ? "1" : "0";
+#endif
 
     // Without these macros, NVRTC uses precompiled headers for cuda_fp16.h etc.
     // Linking might fail due to ABI incompatibility.
@@ -205,7 +229,7 @@ tllmXqaJitStatus getBuildOptions(_tllmXqaJitProgram const* prog, std::vector<std
     result->push_back("--use_fast_math");
     result->push_back("-default-device");
 
-    // Arch
+    // Arch (sm120/sm121 both target sm_120f)
     result->push_back(getSMFlag(prog->context->sm));
 
     std::vector<std::string> macros;
@@ -224,8 +248,10 @@ tllmXqaJitStatus createProgram(tllmXqaJitProgram* prog, tllmXqaJitContext const*
     *prog = new _tllmXqaJitProgram;
     (*prog)->context = context;
 
-    char const* src_content = context->kernel_type == TLLM_XQA_JIT_QGMMA ? tensorrt_llm::kernels::mha_sm90_cu_content
-                                                                         : tensorrt_llm::kernels::mha_cu_content;
+    char const* src_content = context->kernel_type == TLLM_XQA_JIT_MLA
+        ? tensorrt_llm::kernels::mla_sm120_cu_content
+        : (context->kernel_type == TLLM_XQA_JIT_QGMMA ? tensorrt_llm::kernels::mha_sm90_cu_content
+                                                      : tensorrt_llm::kernels::mha_cu_content);
 
     std::vector<char const*> headers_content, headers_name;
     for (auto x : tensorrt_llm::kernels::xqa_headers_content)
@@ -263,6 +289,7 @@ tllmXqaJitStatus compileProgram(tllmXqaJitProgram prog)
         CHECK_NVRTC_ERROR(err);
     }
 #endif
+
     return TLLM_XQA_JIT_SUCCESS;
 }
 

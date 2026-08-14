@@ -1,0 +1,44 @@
+task: gsm8k_local
+
+dataset_path: parquet
+dataset_name: null
+dataset_kwargs:
+  data_files:
+    test: LLM_MODELS_ROOT/datasets/openai/gsm8k/main/test-00000-of-00001.parquet
+
+output_type: generate_until
+test_split: test
+doc_to_text: "Question: {{question}}\nAnswer:"
+doc_to_target: "{{answer}}" #" {{answer.split('### ')[-1].rstrip()}}"
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: false
+    regexes_to_ignore:
+      - ","
+      - "\\$"
+      - "(?s).*#### "
+      - "\\.$"
+generation_kwargs:
+  until:
+    - "Question:"
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+repeats: 1
+num_fewshot: 5
+filter_list:
+  - name: "strict-match"
+    filter:
+      - function: "regex"
+        regex_pattern: "#### (\\-?[0-9\\.\\,]+)"
+      - function: "take_first"
+  - name: "flexible-extract"
+    filter:
+      - function: "regex"
+        group_select: -1
+        regex_pattern: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+      - function: "take_first"

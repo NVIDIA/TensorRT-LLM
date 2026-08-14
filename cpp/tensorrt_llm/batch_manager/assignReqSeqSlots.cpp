@@ -30,14 +30,19 @@ void tensorrt_llm::batch_manager::AssignReqSeqSlots::operator()(SequenceSlotMana
     {
         for (auto const& llmReq : requests)
         {
+            if (llmReq->isDisaggGenerationInitState())
+            {
+                // Skip assigning sequence slot for DISAGG_GENERATION_INIT request
+                continue;
+            }
             auto const isReqNew = (llmReq->isContextInitState() && !llmReq->mSeqSlot)
                 || (llmReq->isDisaggGenerationTransmissionComplete());
             if (isReqNew && llmReq->getReturnPerfMetrics())
             {
-                llmReq->setFirstScheduledTime(std::chrono::steady_clock::now());
+                llmReq->setFirstScheduledTime();
             }
             auto const reqSeqSlot = seqSlotManager.getSequenceSlot(isReqNew, llmReq->mRequestId);
-            TLLM_CHECK_WITH_INFO(reqSeqSlot, "Unable to get batch slot for reqId");
+            TLLM_CHECK_WITH_INFO(reqSeqSlot, "Unable to get batch slot for request ID %lu", llmReq->mRequestId);
             llmReq->mSeqSlot = reqSeqSlot;
         }
     }

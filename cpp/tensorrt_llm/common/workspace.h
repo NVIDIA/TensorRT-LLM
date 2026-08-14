@@ -14,13 +14,17 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include <cstddef>
 #include <cstdint>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
-std::uintptr_t constexpr kCudaMemAlign = 128;
+// CuBLAS >= 12.9.1 requires 256-byte alignment.
+std::uintptr_t constexpr kCudaMemAlign = 256;
 
 inline int8_t* alignPtr(int8_t* ptr, uintptr_t to)
 {
@@ -84,4 +88,6 @@ inline size_t calculateTotalWorkspaceSize(
     return total;
 }
 
-}; // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

@@ -1,13 +1,17 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION &
-# AFFILIATES. All rights reserved. SPDX-License-Identifier: NVIDIA TensorRT
-# Source Code License Agreement
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related documentation
-# and any modifications thereto. Any use, reproduction, disclosure or
-# distribution of this material and related documentation without an express
-# license agreement from NVIDIA CORPORATION or its affiliates is strictly
-# prohibited.
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
 set(BATCH_MANAGER_TARGET_NAME tensorrt_llm_batch_manager)
 set(BATCH_MANAGER_STATIC_TARGET ${BATCH_MANAGER_TARGET_NAME}_static)
 
@@ -17,49 +21,44 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(SRCS
     allocateKvCache.cpp
     assignReqSeqSlots.cpp
+    baseTransBuffer.cpp
+    blockKey.cpp
     cacheFormatter.cpp
+    cacheTransferLayer.cpp
     mlaCacheFormatter.cpp
     cacheTransceiver.cpp
     capacityScheduler.cpp
     createNewDecoderRequests.cpp
     contextProgress.cpp
+    contextTransferCoordinator.cpp
     dataTransceiver.cpp
-    dataTransceiverImpl.cpp
     decoderBuffers.cpp
-    encoderBuffers.cpp
-    guidedDecoder.cpp
-    handleContextLogits.cpp
-    handleGenerationLogits.cpp
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
+    kvCacheManagerV2Utils.cpp
+    kvCacheManagerV2Utils.cu
     llmRequest.cpp
-    logitsPostProcessor.cpp
-    loraBuffers.cpp
-    makeDecodingBatchInputOutput.cpp
     medusaBuffers.cpp
     microBatchScheduler.cpp
     pauseRequests.cpp
     peftCacheManager.cpp
-    promptTuningBuffers.cpp
-    rnnStateBuffers.cpp
     rnnStateManager.cpp
-    runtimeBuffers.cpp
+    rnnCacheFormatter.cpp
+    rnnCacheTransBuffer.cpp
     sequenceSlotManager.cpp
-    transformerBuffers.cpp
-    trtEncoderModel.cpp
-    trtGptModelInflightBatching.cpp
-    updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
     utils/logitsThread.cpp
     utils/staticThreadPool.cpp
     evictionPolicy.cpp
-    cacheTransBuffer.cpp)
+    cacheTransBuffer.cpp
+    agentTree.cpp)
 
-file(GLOB_RECURSE XGRAMMAR_SRCS "${3RDPARTY_DIR}/xgrammar/cpp/*.cc")
+set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
+file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
-     "${3RDPARTY_DIR}/xgrammar/cpp/pybind/.*\\.cc")
+     "${xgrammar_source_dir}/cpp/nanobind/.*\\.cc")
 list(APPEND SRCS ${XGRAMMAR_SRCS})
 
 if(NOT WIN32)
@@ -77,12 +76,18 @@ else() # Windows
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4")
 endif()
 
+# Include kv_cache_manager_v2 C++ sources.
+include(${CMAKE_CURRENT_SOURCE_DIR}/kv_cache_manager_v2/CMakeLists.txt)
+list(APPEND SRCS ${KV_CACHE_MANAGER_V2_SRCS})
+
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
-  PUBLIC ${3RDPARTY_DIR}/xgrammar/3rdparty/picojson
-         ${3RDPARTY_DIR}/xgrammar/3rdparty/dlpack/include
-         ${3RDPARTY_DIR}/xgrammar/include)
+  PUBLIC ${xgrammar_source_dir}/3rdparty/picojson
+         ${xgrammar_source_dir}/3rdparty/dlpack/include
+         ${xgrammar_source_dir}/include
+         ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
+         ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
 set_target_properties(
   ${BATCH_MANAGER_STATIC_TARGET}
@@ -95,19 +100,6 @@ set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 target_compile_definitions(${BATCH_MANAGER_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
-# Find and link cuFile library for kvCacheTransferManager (GDS).
-if(ENABLE_CUFILE)
-  find_library(
-    CUFILE_LIBRARY
-    NAMES cufile
-    HINTS /usr/local/cuda-12.6/targets/x86_64-linux/lib
-          /usr/lib/x86_64-linux-gnu /usr/local/lib)
-  if(NOT CUFILE_LIBRARY)
-    message(FATAL_ERROR "Could not find cufile library inside container.")
-  endif()
-  target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
-endif()
-
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)
   find_package(ucxx REQUIRED)
@@ -117,3 +109,8 @@ if(ENABLE_UCX)
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC)
 
 endif()
+
+find_library(TORCH_PYTHON_LIB torch_python REQUIRED
+             HINTS ${TORCH_INSTALL_PREFIX}/lib)
+target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
+                      PUBLIC ${TORCH_PYTHON_LIB} Python3::Python pg_utils)

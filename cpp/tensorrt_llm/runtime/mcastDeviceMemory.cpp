@@ -20,7 +20,7 @@
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime_api.h>
@@ -30,19 +30,6 @@ namespace tensorrt_llm::runtime
 
 namespace
 {
-#define CUCHECK(cmd)                                                                                                   \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        CUresult retval = cmd;                                                                                         \
-        if (retval != CUDA_SUCCESS)                                                                                    \
-        {                                                                                                              \
-            const char* error_string;                                                                                  \
-            cuGetErrorString(retval, &error_string);                                                                   \
-            printf("Failed: Cuda error %s:%d '%s'\n", __FILE__, __LINE__, error_string);                               \
-            exit(EXIT_FAILURE);                                                                                        \
-        }                                                                                                              \
-    } while (0)
-
 // An efficient implementation assuming gran is a power of 2
 inline size_t roundUp(size_t val, size_t gran)
 {
@@ -51,7 +38,7 @@ inline size_t roundUp(size_t val, size_t gran)
 } // namespace
 
 McastDeviceMemory::McastDeviceMemory(
-    size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink)
+    size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink, int64_t mpiCommFortranHandle)
     : mIsMNNvlink(mnNvlink)
     , mDeviceIdx(deviceIdx)
     , mGroupSize(groupSize)
@@ -61,12 +48,17 @@ McastDeviceMemory::McastDeviceMemory(
     , mAllocationSize(0)
     , mMcPtr(0)
     , mMcHandle(0)
+#if ENABLE_MULTI_DEVICE
+    , mGroupComm(MPI_Comm_f2c(mpiCommFortranHandle), false)
+#else
+    , mGroupComm(nullptr, false)
+#endif
 {
 
-    cudaSetDevice(mDeviceIdx);
+    TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
     // Check if the device support multicasting
     int multicast_supported{0};
-    CUCHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, mDeviceIdx));
+    TLLM_CU_CHECK(cuDeviceGetAttribute(&multicast_supported, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, mDeviceIdx));
     if (multicast_supported == 0)
     {
         TLLM_THROW("[McastDeviceMemory] Device does not support multicasting.");
@@ -75,15 +67,18 @@ McastDeviceMemory::McastDeviceMemory(
     // From pytorch implementation for alignment
     constexpr size_t kSignalPadAlignment = 16UL;
     mSignalPadOffset = roundUp(mBufSize, kSignalPadAlignment);
+    int const world_rank{tensorrt_llm::mpi::MpiComm::session().getRank()};
+
     TLLM_LOG_DEBUG(
-        "[McastDeviceMemory] Rank: %u, Group size: %u, isMultiNode: %d, device_idx: %d, Signal pad offset: %zu",
-        mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
+        "[McastDeviceMemory] World Rank: %u, Group Rank: %u, Group size: %u, isMultiNode: %d, "
+        "device_idx: %d, Signal pad offset: %zu",
+        world_rank, mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
 
     if (mIsMNNvlink)
     {
         // For multi-node, we also need to check if fabric handle is supported
         int fabric_handle_supported{0};
-        CUCHECK(cuDeviceGetAttribute(
+        TLLM_CU_CHECK(cuDeviceGetAttribute(
             &fabric_handle_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, mDeviceIdx));
         if (fabric_handle_supported == 0)
         {
@@ -95,34 +90,41 @@ McastDeviceMemory::McastDeviceMemory(
     {
         allocNvlsMcastMem(mSignalPadOffset + kSIGNAL_PAD_SIZE);
     }
-    mSignalPadsDev.resize(mGroupSize);
+    // Initialize signal pads
+    mSignalPads.resize(mGroupSize);
     for (size_t i = 0; i < mGroupSize; i++)
     {
-        mSignalPadsDev[i] = mUcPtrs[i] + mSignalPadOffset;
+        mSignalPads[i] = mUcPtrs[i] + mSignalPadOffset;
         if (i == mGroupRank)
         {
-            cuMemsetD8(mSignalPadsDev[i], 0, kSIGNAL_PAD_SIZE);
+            cuMemsetD8(mSignalPads[i], 0, kSIGNAL_PAD_SIZE);
         }
     }
+    // Copy host array of pointers to device array
+    TLLM_CUDA_CHECK(cudaMalloc(&mSignalPadsDev, mGroupSize * sizeof(CUdeviceptr)));
+    TLLM_CUDA_CHECK(cudaMalloc(&mUcPtrsDev, mGroupSize * sizeof(CUdeviceptr)));
+    TLLM_CUDA_CHECK(
+        cudaMemcpy(mSignalPadsDev, mSignalPads.data(), mGroupSize * sizeof(CUdeviceptr), cudaMemcpyHostToDevice));
+    TLLM_CUDA_CHECK(cudaMemcpy(mUcPtrsDev, mUcPtrs.data(), mGroupSize * sizeof(CUdeviceptr), cudaMemcpyHostToDevice));
 }
 
 McastDeviceMemory::~McastDeviceMemory()
 {
     tensorrt_llm::common::unregisterMcastDevMemBuffer(this);
+    TLLM_CUDA_CHECK(cudaFree(mSignalPadsDev));
+    TLLM_CUDA_CHECK(cudaFree(mUcPtrsDev));
+
     if (mIsMNNvlink)
     {
         for (uint32_t rank = 0; rank < mGroupSize; rank++)
         {
-            if (rank == mGroupRank)
-            {
-                cuMemRelease(mUcHandles[rank]);
-            }
-            else
-            {
-                mUcHandles[rank] = 0;
-            }
+            TLLM_CU_CHECK(cuMemUnmap(mUcPtrs[rank], mAllocationSize));
+            // We need to release the handle on each rank
+            TLLM_CU_CHECK(cuMemRelease(mUcHandles[rank]));
         }
-        cuMemRelease(mMcHandle);
+        TLLM_CU_CHECK(cuMemUnmap(mMcPtr, mAllocationSize));
+        TLLM_CU_CHECK(cuMemAddressFree(mMcPtr, mAllocationSize));
+        TLLM_CU_CHECK(cuMemRelease(mMcHandle));
     }
     else
     {
@@ -133,21 +135,21 @@ McastDeviceMemory::~McastDeviceMemory()
 
 void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 {
-
-    auto const& mpi_comm = tensorrt_llm::mpi::MpiComm::session();
-
     CUmemAllocationHandleType const handle_type = CU_MEM_HANDLE_TYPE_FABRIC;
     CUmemAllocationProp prop = {};
     prop.requestedHandleTypes = handle_type;
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = mDeviceIdx;
+    prop.allocFlags.gpuDirectRDMACapable = 1;
 
-    size_t granularity{0};
-    TLLM_CU_CHECK(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    size_t alloc_granularity{0}, mc_granularity{0};
+    TLLM_CU_CHECK(cuMemGetAllocationGranularity(&alloc_granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
     // Round up the buffer size for grnularity
-    mAllocationSize = roundUp(bufSize + kSIGNAL_PAD_SIZE, granularity);
-
+    mAllocationSize = roundUp(bufSize + kSIGNAL_PAD_SIZE, alloc_granularity);
+    CUmulticastObjectProp mcProp = {.numDevices = mGroupSize, .size = mAllocationSize, .handleTypes = handle_type};
+    TLLM_CU_CHECK(cuMulticastGetGranularity(&mc_granularity, &mcProp, CU_MULTICAST_GRANULARITY_RECOMMENDED));
+    mAllocationSize = roundUp(mAllocationSize, mc_granularity);
     mUcHandles.resize(mGroupSize);
     // Allocates local gpu memory
     TLLM_CU_CHECK(cuMemCreate(&(mUcHandles[mGroupRank]), mAllocationSize, &prop, 0));
@@ -159,7 +161,7 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     // All gather
     cudaMallocHost(&exphndl, mGroupSize * sizeof(CUmemFabricHandle));
     memcpy(exphndl + mGroupRank * sizeof(CUmemFabricHandle), &myhndl, sizeof(CUmemFabricHandle));
-    mpi_comm.allgather(
+    mGroupComm.allgather(
         exphndl + mGroupRank * sizeof(CUmemFabricHandle), exphndl, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR);
     cudaDeviceSynchronize();
 
@@ -170,8 +172,6 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     cudaFreeHost(exphndl);
 
     // Initialize multicasting
-    CUmulticastObjectProp mcProp
-        = {.numDevices = mGroupSize, .size = mAllocationSize, .handleTypes = CU_MEM_HANDLE_TYPE_FABRIC};
     CUmemFabricHandle* fabric_handle;
     cudaMallocHost(&fabric_handle, sizeof(CUmemFabricHandle));
     if (mGroupRank == 0)
@@ -180,7 +180,7 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
         TLLM_CU_CHECK(cuMemExportToShareableHandle((void*) fabric_handle, mMcHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
     }
     // Broadcast
-    mpi_comm.bcast(fabric_handle, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR, 0);
+    mGroupComm.bcast(fabric_handle, sizeof(CUmemFabricHandle), mpi::MpiType::kCHAR, 0);
     cudaDeviceSynchronize();
     if (mGroupRank != 0)
     {
@@ -192,7 +192,7 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     // Bind memory addresses
     mUcPtrs.resize(mGroupSize);
     CUdeviceptr ptr;
-    TLLM_CU_CHECK(cuMemAddressReserve(&ptr, mAllocationSize * mGroupSize, 0, 0, 0));
+    TLLM_CU_CHECK(cuMemAddressReserve(&ptr, mAllocationSize * mGroupSize, mc_granularity, 0ULL, 0));
     CUmemAccessDesc accessDesc = {};
     accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
@@ -206,7 +206,7 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
     TLLM_CU_CHECK(cuMemSetAccess(ptr, mAllocationSize * mGroupSize, &accessDesc, 1));
 
     // Bind MC Pointers
-    TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, 0, 0U, 0));
+    TLLM_CU_CHECK(cuMemAddressReserve(&mMcPtr, mAllocationSize, mc_granularity, 0ULL, 0));
     TLLM_CU_CHECK(cuMemMap(mMcPtr, mAllocationSize, 0, mMcHandle, 0));
     TLLM_CU_CHECK(cuMemSetAccess(mMcPtr, mAllocationSize, &accessDesc, 1));
 
@@ -215,12 +215,9 @@ void McastDeviceMemory::allocMnMcastMem(size_t bufSize)
 
 void McastDeviceMemory::allocNvlsMcastMem(size_t bufSize)
 {
-    // Create a std::set to include all ranks in range (0, group_size)
-    std::set<int> ranks;
-    for (uint32_t i = 0; i < mGroupSize; ++i)
-    {
-        ranks.insert(i);
-    }
+    // Get the world ranks for ranks in this group
+    auto ranks_ = tensorrt_llm::mpi::getWorldRanks(mGroupComm);
+    std::set<int> ranks(ranks_.begin(), ranks_.end());
     // Reuse existing implementation
     mNvlsHandle = tensorrt_llm::runtime::ipcNvlsAllocate(bufSize, ranks);
     mMcHandle = mNvlsHandle->mc_handle;

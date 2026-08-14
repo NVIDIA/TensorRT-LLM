@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -34,6 +36,7 @@ struct XQAParams
     void* output_sf = nullptr;
     void const* qkv = nullptr;
     int32_t const* cache_indir = nullptr;
+    float const* attention_sinks = nullptr;
     float const* kv_scale_orig_quant = nullptr;
     float const* kv_scale_quant_orig = nullptr;
     int32_t const* host_past_key_value_lengths = nullptr;
@@ -42,21 +45,36 @@ struct XQAParams
     void* workspaces = nullptr;
     uint32_t batch_size = 0;
     int32_t beam_width = 0;
+    int32_t chunked_attention_size = INT_MAX;
     int32_t max_attention_window_size = 0;
     int32_t cyclic_attention_window_size = 0;
     int32_t sink_token_length = 0;
     int max_past_kv_length = 0;
     void const* qkv_bias;
-    int32_t const* sequence_lengths;                  //
-    int32_t const* context_lengths;                   // maybe not used now
-    void const* alibi_slopes;                         // maybe not used now
-    float const* rotary_embedding_inv_freq_cache;     // precomputed rotary inv freq
+    int32_t const* sequence_lengths;                   //
+    int32_t const* context_lengths;                    // maybe not used now
+    void const* alibi_slopes;                          // maybe not used now
+    float const* rotary_embedding_inv_freq_cache;      // precomputed rotary inv freq
     int32_t const* spec_decoding_packed_mask;
-    int const* spec_decoding_position_offsets;        // for position embedding.
-    int const* spec_decoding_generation_lengths;      // variable input lengths.
-    bool spec_decoding_is_generation_length_variable; // whether the generation lengths actually vary
-    int32_t spec_decoding_max_generation_length;      // max possible input length
+    int const* spec_decoding_position_offsets;         // for position embedding.
+    int const* spec_decoding_generation_lengths;       // variable input lengths.
+    bool spec_decoding_is_generation_length_variable;  // whether the generation lengths actually vary
+    int32_t spec_decoding_max_generation_length;       // max possible input length
+    int64_t* spec_decoding_bl_tree_mask_offset;        // for blackwell spec-dec tree mask offset
+    uint32_t* spec_decoding_bl_tree_mask;              // for blackwell spec-dec tree mask
+    int32_t* spec_bl_tree_first_sparse_mask_offset_kv; // for blackwell spec-dec tree first sparse mask offset kv
+    bool force_prepare_spec_dec_tree_mask = false;
     int32_t const* mrope_position_deltas = nullptr;
+    // Helix parallelism params.
+    int32_t const* helix_position_offsets = nullptr;
+    bool const* helix_is_inactive_rank = nullptr;
+    // Softmax stats output buffer for Helix parallelism (max and LSE per head).
+    float2* softmax_stats = nullptr;
+    // Optional TRTLLM-Gen FMHA JIT warmup shape.
+    bool trtllm_gen_jit_warmup = false;
+    int32_t trtllm_gen_jit_warmup_max_num_requests = 0;
+    int32_t trtllm_gen_jit_warmup_max_seq_len_q = 0;
+    int32_t trtllm_gen_jit_warmup_max_seq_len_kv = 0;
 
     // almost copy from GPTAttentionPluginCommon.
     // maybe use one struct for parameters in GPTAttentionPluginCommon and share the same here.
@@ -90,6 +108,8 @@ struct XQAParams
     int max_distance = 0;
     bool multi_block_mode;
     bool multi_query_tokens = false;
+    bool is_spec_dec_tree
+        = true; // by default, XQA spec-dec expect tree-based draft token, only affective when multi_query_tokens = true
 
     float const* logn_scaling_ptr = nullptr; // for logn scaling in XQA
 
@@ -100,7 +120,26 @@ struct XQAParams
     float const* fp4_out_sf_scale = nullptr; // SF scale for FP4 output.
     int32_t start_token_idx_sf = 0;          // The start token index in SF tensor.
 
+    void* quant_q_buffer_ptr = nullptr;
+
+    // for cross attention
+    int32_t const* encoder_input_lengths = nullptr;
+
+    // sparse attention parameters
+    SparseAttentionParams sparse_params;
+    bool use_sparse_attention_gen_paged = false;
+
+    // Skip softmax threshold.
+    float skip_softmax_threshold_scale_factor = 0;
+
+#ifdef SKIP_SOFTMAX_STAT
+    uint32_t* skip_softmax_total_blocks = nullptr;
+    uint32_t* skip_softmax_skipped_blocks = nullptr;
+#endif
+
     cudaStream_t stream = 0;
+    // layer index
+    int32_t layer_idx = 0;
 
     std::string toString() const
     {
@@ -135,7 +174,13 @@ struct XQAParams
            << "spec_decoding_is_generation_length_variable: "
            << (spec_decoding_is_generation_length_variable ? "true" : "false") << std::endl
            << "spec_decoding_max_generation_length: " << spec_decoding_max_generation_length << std::endl
+           << "spec_decoding_bl_tree_mask_offset: " << spec_decoding_bl_tree_mask_offset << std::endl
+           << "spec_decoding_bl_tree_mask: " << spec_decoding_bl_tree_mask << std::endl
+           << "spec_bl_tree_first_sparse_mask_offset_kv: " << spec_bl_tree_first_sparse_mask_offset_kv << std::endl
            << "mrope_position_deltas: " << mrope_position_deltas << std::endl
+           << "helix_position_offsets: " << helix_position_offsets << std::endl
+           << "helix_is_inactive_rank: " << helix_is_inactive_rank << std::endl
+           << "softmax_stats: " << softmax_stats << std::endl
            << "generation_input_length: " << generation_input_length << std::endl
            << "num_q_heads: " << num_q_heads << std::endl
            << "num_kv_heads: " << num_kv_heads << std::endl
@@ -169,11 +214,25 @@ struct XQAParams
            << "total_num_input_tokens :" << total_num_input_tokens << std ::endl
            << "is_fp8_output :" << (is_fp8_output ? "true" : "false") << std ::endl
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
+           << "encoder_input_lengths: " << encoder_input_lengths << std::endl
+           << "sparse_params: " << sparse_params.toString() << std::endl
+           << "use_sparse_attention_gen_paged :" << (use_sparse_attention_gen_paged ? "true" : "false") << std ::endl
+           << "skip_softmax_threshold_scale_factor :" << skip_softmax_threshold_scale_factor << std ::endl
+#ifdef SKIP_SOFTMAX_STAT
+           << "skip_softmax_total_blocks :" << skip_softmax_total_blocks << std ::endl
+           << "skip_softmax_skipped_blocks :" << skip_softmax_skipped_blocks << std ::endl
+#endif
            << "stream :" << stream;
 
         return ss.str();
     }
+
+    bool isMLA() const
+    {
+        return head_size == 576 && num_q_heads == 128 && num_kv_heads == 1;
+    }
 };
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

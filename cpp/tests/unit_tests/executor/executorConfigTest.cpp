@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/common/tllmException.h"
@@ -22,6 +27,17 @@ using ::testing::Invoke;
 using namespace tensorrt_llm::executor;
 using namespace tensorrt_llm::common;
 
+TEST(CacheTransceiverConfigTest, validatesKvTransferPollInterval)
+{
+    auto makeConfig = [](std::optional<int> pollIntervalMs)
+    { return CacheTransceiverConfig(std::nullopt, std::nullopt, std::nullopt, std::nullopt, pollIntervalMs); };
+
+    EXPECT_EQ(makeConfig(std::nullopt).getKvTransferPollIntervalMs(), std::nullopt);
+    EXPECT_EQ(makeConfig(1).getKvTransferPollIntervalMs(), 1);
+    EXPECT_THROW(makeConfig(0), TllmException);
+    EXPECT_THROW(makeConfig(-1), TllmException);
+}
+
 TEST(ExecutorConfigTest, ctorValidInputs)
 {
     SchedulerConfig schedulerConfig;
@@ -31,6 +47,12 @@ TEST(ExecutorConfigTest, ctorValidInputs)
     }
     {
         auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 0);
+    }
+    {
+        auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true,
+            ExecutorConfig::kUnlimitedStatsMaxIterations, ExecutorConfig::kUnlimitedStatsMaxIterations);
+        EXPECT_EQ(executorConfig.getIterStatsMaxIterations(), ExecutorConfig::kUnlimitedStatsMaxIterations);
+        EXPECT_EQ(executorConfig.getRequestStatsMaxIterations(), ExecutorConfig::kUnlimitedStatsMaxIterations);
     }
     {
         auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 1000);
@@ -82,9 +104,24 @@ TEST(ExecutorConfigTest, ctorInvalidInputs)
         FAIL() << "Expected TllmException";
     }
 
-    // iter stats negative
+    // iter stats below the unlimited sentinel
     ParallelConfig parallelConfigValid;
-    testInvalid(1, schedulerConfig, kvCacheConfig, true, true, -1, BatchingType::kINFLIGHT, parallelConfigValid);
+    testInvalid(1, schedulerConfig, kvCacheConfig, true, true, -2, BatchingType::kINFLIGHT, parallelConfigValid);
+
+    // request stats below the unlimited sentinel
+    try
+    {
+        auto executorConfig = ExecutorConfig(1, schedulerConfig, kvCacheConfig, true, true, 1000, -2);
+        FAIL() << "Expected TllmException";
+    }
+    catch (TllmException& e)
+    {
+        EXPECT_THAT(e.what(), testing::HasSubstr("Assertion failed"));
+    }
+    catch (std::exception const& e)
+    {
+        FAIL() << "Expected TllmException";
+    }
 }
 
 TEST(ExecutorConfigTest, extendedRuntimePerfKnobConfigTest)

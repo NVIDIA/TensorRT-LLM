@@ -14,17 +14,26 @@
  * limitations under the License.
  */
 #pragma once
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/xqaParams.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
 template <typename KVCacheBuffer>
-CUtensorMap makeTensorMapForKVCache(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver,
+CUtensorMap makeTensorMapForHopperXqaKVCache(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver,
     XQAParams const& xqaParams, KVCacheBuffer const& kv_cache_buffer);
 
+template <typename KVCacheBuffer>
+CUtensorMap makeTensorMapForXqaMlaKVCache(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver,
+    XQAParams const& xqaParams, KVCacheBuffer const& kv_cache_buffer, bool forK);
+
+CUtensorMap makeTensorMapForXqaMlaQ(
+    std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver, XQAParams const& xqaParams, void const* q);
+
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

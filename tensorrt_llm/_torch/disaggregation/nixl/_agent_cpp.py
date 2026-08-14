@@ -1,0 +1,223 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import time
+
+from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.logger import logger
+from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (  # noqa: E402
+    AgentDesc,
+    BaseAgentConfig,
+    MemoryDescs,
+    MemoryType,
+    TransferState,
+)
+from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
+    NixlTransferAgent as CppNixlTransferAgent,
+)
+
+from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
+
+
+class BindingsNixlTransferStatus(TransferStatus):
+    """TransferStatus wrapper using C++ bindings with GIL release."""
+
+    def __init__(self, cpp_status, agent_name: str = "?"):
+        self._cpp_status = cpp_status
+        self._agent_name = agent_name
+
+    def is_completed(self) -> bool:
+        """Check if transfer is completed (releases GIL)."""
+        return self._cpp_status.is_completed()
+
+    @nvtx_range("BindingsNixlTransferStatus.wait")
+    def wait(self, timeout_ms=None) -> bool:
+        """Wait for transfer to complete (releases GIL)."""
+        start_time = time.time()
+        if timeout_ms is None:
+            timeout_ms = -1
+        result = self._cpp_status.wait(timeout_ms)
+        if result != TransferState.SUCCESS:
+            logger.error(
+                f"NIXL (cpp binding) wait returned non-SUCCESS state={result} "
+                f"after {time.time() - start_time:.3f}s (agent={self._agent_name})."
+            )
+        return result == TransferState.SUCCESS
+
+    def last_status_str(self) -> str:
+        get = getattr(self._cpp_status, "get_last_status_str", None)
+        return get() if get is not None else "<unavailable>"
+
+    def last_status(self) -> int:
+        get = getattr(self._cpp_status, "get_last_status", None)
+        return int(get()) if get is not None else -1
+
+
+class BindingsNixlTransferAgent(BaseTransferAgent):
+    """NixlTransferAgent using C++ bindings with GIL release support.
+
+    This implementation uses the standalone nixl_bindings C++ module which releases
+    the GIL during blocking operations like wait().
+
+    The nixl_bindings module is independent from the main trtllm bindings,
+    so trtllm can function normally even without NIXL.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        use_prog_thread: bool = True,
+        num_threads: int = 1,
+        enable_telemetry: bool = False,
+        rank: int | None = None,
+        world_size: int | None = None,
+        **kwargs,
+    ):
+        backend_params = kwargs
+        for key, value in backend_params.items():
+            backend_params[key] = str(value)
+        backend_params["num_threads"] = str(num_threads)
+        # C++ reads "num_workers" (not "num_threads") for progress threads, default 1.
+        # Env-gated so the default is unchanged (more threads can hurt the coalesced bounce WRITE).
+        # Validate at the boundary: only a positive int reaches the backend.
+        nixl_num_workers = os.environ.get("TRTLLM_NIXL_NUM_WORKERS")
+        if nixl_num_workers is not None:
+            try:
+                workers = int(nixl_num_workers)
+            except ValueError:
+                workers = 0
+            if workers > 0:
+                backend_params["num_workers"] = str(workers)
+            else:
+                logger.warning(
+                    f"Ignoring invalid TRTLLM_NIXL_NUM_WORKERS={nixl_num_workers!r} "
+                    "(expected a positive integer)"
+                )
+
+        config = BaseAgentConfig(
+            name,
+            use_prog_thread,
+            multi_thread=False,
+            use_listen_thread=False,
+            enable_telemetry=enable_telemetry,
+            backend_params=backend_params,
+            rank=rank,
+            world_size=world_size,
+        )
+        self._cpp_agent = CppNixlTransferAgent(config)
+        self.name = name
+        logger.info(
+            f"BindingsNixlTransferAgent init: agent={name} "
+            f"use_prog_thread={use_prog_thread} num_threads={num_threads} "
+            f"enable_telemetry={enable_telemetry} backend_params={backend_params} "
+            f"UCX_TLS={os.environ.get('UCX_TLS', '<unset>')} "
+            f"UCX_LOG_LEVEL={os.environ.get('UCX_LOG_LEVEL', '<unset>')}"
+        )
+
+    def shutdown(self):
+        cpp_agent = getattr(self, "_cpp_agent", None)
+        if cpp_agent is None:
+            return
+        # Null out first so a re-entrant call after a raise is a no-op; errors propagate.
+        self._cpp_agent = None
+        cpp_agent.shutdown()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
+
+    def register_memory(self, descs: RegMemoryDescs):
+        """Register memory regions."""
+        cpp_descs = self._convert_reg_memory_descs(descs)
+        self._cpp_agent.register_memory(cpp_descs)
+
+    def deregister_memory(self, descs: RegMemoryDescs):
+        """Deregister memory regions."""
+        cpp_descs = self._convert_reg_memory_descs(descs)
+        self._cpp_agent.deregister_memory(cpp_descs)
+
+    def load_remote_agent(self, name: str, agent_desc: bytes):
+        """Load a remote agent by its descriptor (bytes)."""
+        cpp_desc = AgentDesc.deserialize(agent_desc)
+        self._cpp_agent.load_remote_agent(name, cpp_desc)
+
+    def load_remote_agent_by_connection(self, name: str, connection_info: str):
+        """Load a remote agent by connection info."""
+        self._cpp_agent.load_remote_agent_by_connection(name, connection_info)
+
+    def get_local_agent_desc(self) -> bytes:
+        """Get the local agent descriptor as bytes."""
+        agent_desc = self._cpp_agent.get_local_agent_desc()
+        return (
+            agent_desc.serialize()
+        )  # Serialize structured AgentDesc to opaque bytes for transport
+
+    def get_local_connection_info(self) -> str:
+        """Get the local connection info."""
+        return self._cpp_agent.get_local_connection_info()
+
+    def invalidate_remote_agent(self, name: str):
+        """Invalidate a remote agent."""
+        self._cpp_agent.invalidate_remote_agent(name)
+
+    def check_remote_descs(self, name: str, memory_descs: MemoryDescs) -> bool:
+        """Check if remote descriptors are available.
+
+        memory_descs should be C++ MemoryDescs type.
+        """
+        return self._cpp_agent.check_remote_descs(name, memory_descs)
+
+    def notify_sync_message(self, name: str, sync_message: str):
+        """Send a sync message to a remote agent."""
+        self._cpp_agent.notify_sync_message(name, sync_message)
+
+    def get_notified_sync_messages(self):
+        """Get notified sync messages."""
+        return self._cpp_agent.get_notified_sync_messages()
+
+    @nvtx_range("BindingsNixlTransferAgent.submit_transfer_requests")
+    def submit_transfer_requests(self, request: TransferRequest) -> TransferStatus:
+        """Submit transfer requests and return status.
+
+        request should be a C++ TransferRequest (from tensorrt_llm_transfer_agent_binding).
+        """
+        cpp_status = self._cpp_agent.submit_transfer_requests(request)
+        return BindingsNixlTransferStatus(cpp_status, agent_name=self.name)
+
+    def _convert_reg_memory_descs(self, descs: RegMemoryDescs) -> "MemoryDescs":
+        """Convert Python RegMemoryDescs to C++ MemoryDescs.
+
+        RegMemoryDescs.descs is List[Tuple[int, int, int, str]] = (ptr, size, device_id, name)
+        Extract first 3 elements for C++ batch constructor.
+        """
+        mem_type = self._convert_memory_type(descs.type)
+        # Extract (ptr, size, device_id) from 4-tuple, discard name
+        tuples = [(d[0], d[1], d[2]) for d in descs.descs]
+        return MemoryDescs(mem_type, tuples)
+
+    def _convert_memory_type(self, py_type: str) -> "MemoryType":
+        """Convert Python memory type string to C++ MemoryType."""
+        type_map = {
+            "DRAM": MemoryType.DRAM,
+            "VRAM": MemoryType.VRAM,
+            "GPU": MemoryType.VRAM,
+            "BLK": MemoryType.BLK,
+            "OBJ": MemoryType.OBJ,
+            "FILE": MemoryType.FILE,
+        }
+        return type_map.get(py_type.upper(), MemoryType.VRAM)

@@ -16,14 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cstddef>
 #include <stdint.h>
 #include <vector>
 
 #include "tensorrt_llm/common/cudaUtils.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace cutlass_kernels
@@ -73,4 +74,5 @@ void symmetric_quantize(int8_t* processed_quantized_weight, int8_t* unprocessed_
 
 } // namespace cutlass_kernels
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

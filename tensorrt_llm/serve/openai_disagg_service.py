@@ -1,0 +1,498 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import os
+from typing import Callable, Optional
+
+from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
+from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
+from tensorrt_llm.serve.openai_client import OpenAIClient
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    DisaggregatedParams,
+    DisaggScheduleStyle,
+    UCompletionRequest,
+    UCompletionResponse,
+)
+from tensorrt_llm.serve.openai_service import OpenAIService
+from tensorrt_llm.serve.responses_utils import (
+    ResponseHooks,
+    UCompletionResponseOrGenerator,
+    done_generator,
+)
+from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
+
+# Finish reasons for which a GEN handoff is still pending; any other reason means
+# the CTX request already completed and the disagg KV-cache handoff was never set up.
+_GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
+
+
+class OpenAIDisaggregatedService(OpenAIService):
+    def __init__(
+        self,
+        config: DisaggServerConfig,
+        coordinator: "DisaggCoordinator",
+        client_factory: Callable[[Router, ServerRole], OpenAIClient],
+        req_timeout_secs: int = 180,
+    ):
+        self._config = config
+        # The service drives the coordinator's ctx/gen routers uniformly, so serving
+        # is identical whether the router is the real one (single-process) or a
+        # delegating one that forwards placement to a remote coordinator (worker).
+        self._coordinator = coordinator
+        self._ctx_router = coordinator.ctx_router
+        self._gen_router = coordinator.gen_router
+        self._client_factory = client_factory
+        self._req_timeout_secs = req_timeout_secs
+        # Opt-in body-shrink for generation_only requests; see _get_gen_request.
+        self._strip_gen_message_history = config.gen_strip_message_history
+        # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
+        self._tokids_ctxbytes = config.gen_tokids_ctxbytes
+
+        self._ctx_client = None
+        self._gen_client = None
+        self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+
+        match self._config.schedule_style:
+            case "generation_first":
+                self._send_disagg_request = self._send_disagg_request_gen_first
+                self._schedule_style = DisaggScheduleStyle.GENERATION_FIRST
+                logger.info(
+                    f"Using generation first disagg schedule style, schedule_style: {self._config.schedule_style}"
+                )
+            case _:
+                self._send_disagg_request = self._send_disagg_request_ctx_first
+                self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+                logger.info(
+                    f"Using context first disagg schedule style, schedule_style: {self._config.schedule_style}"
+                )
+
+    async def openai_completion(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        if not isinstance(request.prompt, str):
+            # Reject empty prompt lists explicitly so the router does not
+            # index prompt[0] on an empty list.
+            if isinstance(request.prompt, list) and len(request.prompt) == 0:
+                raise ValueError("Disaggregated server does not support empty prompt list")
+            # Check if it's a list and contains integers
+            if type(request.prompt) is list and len(request.prompt) == 1:
+                request.prompt = request.prompt[0]
+            elif not isinstance(request.prompt, list) or not all(
+                isinstance(x, int) for x in request.prompt
+            ):
+                raise ValueError(
+                    "Disaggregated server currently only supports single string prompt or list of integers in request"
+                )
+
+        return await self._send_disagg_request(request, hooks)
+
+    async def openai_chat_completion(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        return await self._send_disagg_request(request, hooks)
+
+    async def _send_disagg_request_ctx_first(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponseOrGenerator:
+        # ctx_response contains a http response with ContextPhaseParams attached after prefill compute is done
+
+        if hooks:
+            hooks.on_req_begin(request)
+        # empty server means client decides which server to use
+        ctx_server = None
+        disagg_request_id = await self._coordinator.get_disagg_request_id()
+        if hooks:
+            hooks.on_disagg_request_id(disagg_request_id)
+        # reserve a gen_server if conditional disagg is needed
+        gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
+        # Context retries may replace disagg_request_id for the KV-transfer
+        # handshake. Keep the ID used to reserve the generation server separate
+        # so its coordinator-side load is released under the original key.
+        gen_reservation_id = disagg_request_id if gen_server else None
+        benchmark_gen_only = await self._check_gen_only_disagg(request)
+        need_ctx = need_ctx and not benchmark_gen_only
+        ctx_response = None
+        gen_req = request
+        if need_ctx:
+            try:
+                # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
+                # orchestrator/fleet (accept queue + event loop + pipeline).
+                if hooks:
+                    hooks.on_ctx_dispatch(request)
+                ctx_req = self._get_ctx_request(request, disagg_request_id)
+                # ctx generator is empty
+                ctx_server, _ = await self._ctx_router.get_next_server(
+                    ctx_req, exclude_server=gen_server, req_id=disagg_request_id
+                )
+                ctx_response = await self._ctx_client.send_request(
+                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
+                )
+                await self._verify_ctx_response(ctx_response)
+                ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
+                if ctx_response_disagg_params.disagg_request_id is not None:
+                    disagg_request_id = ctx_response_disagg_params.disagg_request_id
+                    if hooks:
+                        hooks.on_disagg_request_id(disagg_request_id)
+                gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+            except Exception:
+                if gen_server:
+                    await self._gen_router.finish_request(
+                        request, success=False, req_id=gen_reservation_id
+                    )
+                raise
+        else:
+            # When need_ctx=False the gen server handles full generation and
+            # must not see client-supplied disaggregated handoff params. The
+            # benchmark-only path above is the only trusted source here.
+            if not benchmark_gen_only:
+                gen_req = request.model_copy(update={"disaggregated_params": None})
+        if ctx_response is None or self._need_gen(ctx_response):
+            if not gen_server:
+                gen_server, _ = await self._gen_router.get_next_server(
+                    gen_req, exclude_server=ctx_server, req_id=disagg_request_id
+                )
+                gen_reservation_id = disagg_request_id
+            gen_response = await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
+            )
+            return gen_response
+        else:
+            if gen_server:
+                await self._gen_router.finish_request(request, req_id=gen_reservation_id)
+            if hooks:
+                hooks.on_resp_done("", request, ctx_response)
+            if request.stream:
+                # ctx client will never return a generator when streaming is requested
+                # make up for this by returning a done generator
+                return done_generator()
+            return ctx_response
+
+    def _need_gen(self, response: UCompletionResponse) -> bool:
+        if response and response.choices[0].finish_reason not in _GEN_PENDING_FINISH_REASONS:
+            del response.choices[0].disaggregated_params
+            return False
+        return True
+
+    @staticmethod
+    def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:
+        if request.conversation_params is not None:
+            return request.conversation_params.conversation_id
+        if request.disaggregated_params is not None:
+            return request.disaggregated_params.conversation_id
+        return None
+
+    def _get_ctx_request(
+        self, request: UCompletionRequest, disagg_request_id: Optional[int]
+    ) -> UCompletionRequest:
+        conversation_id = self._get_conversation_id(request)
+        ctx_request = request.model_copy(
+            update={
+                "disaggregated_params": DisaggregatedParams(
+                    request_type="context_only",
+                    disagg_request_id=disagg_request_id,
+                    schedule_style=self._schedule_style,
+                    conversation_id=conversation_id,
+                    return_prompt_token_ids_b64=self._tokids_ctxbytes,
+                ),
+                "stream": False,
+                "stream_options": None,
+            }
+        )
+        return ctx_request
+
+    def _get_gen_request(
+        self,
+        request: UCompletionRequest,
+        ctx_response: Optional[UCompletionResponse],
+        disagg_request_id: Optional[int],
+        ctx_server_info: Optional[dict] = None,
+    ) -> UCompletionRequest:
+        conversation_id = self._get_conversation_id(request)
+        if ctx_response:
+            request.disaggregated_params = ctx_response.choices[0].disaggregated_params
+            request.disaggregated_params.request_type = "generation_only"
+            request.disaggregated_params.schedule_style = self._schedule_style
+            request.disaggregated_params.conversation_id = conversation_id
+            request.disaggregated_params.ctx_usage = ctx_response.usage
+            # Replace the string prompt with prompt_tokens_ids
+            if isinstance(request, CompletionRequest):
+                request.prompt = ctx_response.prompt_token_ids
+            elif isinstance(request, ChatCompletionRequest):
+                # Relay the base64 token-id string verbatim (no int-list
+                # materialization on the orchestrator loop), else the int array.
+                if ctx_response.prompt_token_ids_b64 is not None:
+                    request.prompt_token_ids_b64 = ctx_response.prompt_token_ids_b64
+                else:
+                    request.prompt_token_ids = ctx_response.prompt_token_ids
+                # Opt-in: drop conversation history so the gen worker doesn't
+                # re-parse the full conversation JSON (dominates its GIL at high
+                # concurrency). It uses prompt_token_ids and only reads the last
+                # message; tools are preserved. Config-gated because it's unsafe
+                # for harmony/multimodal workers (model type is fixed per deploy).
+                if (
+                    self._strip_gen_message_history
+                    and request.messages
+                    and len(request.messages) > 1
+                ):
+                    request.messages = request.messages[-1:]
+        else:
+            # no ctx response, it's either a generation-only request or a generation-first disagg request
+            request.disaggregated_params = DisaggregatedParams(
+                request_type="generation_only",
+                ctx_request_id=disagg_request_id,
+                disagg_request_id=disagg_request_id,
+                schedule_style=self._schedule_style,
+                conversation_id=conversation_id,
+            )
+        if ctx_server_info and "server_info" in ctx_server_info:
+            disaggregated_params = ctx_server_info["server_info"].get("disaggregated_params", {})
+            if disaggregated_params:
+                # ctx_info_endpoint from get_disaggregated_params() is a list;
+                # the Pydantic model expects a single str.
+                ep = disaggregated_params.get("ctx_info_endpoint")
+                if isinstance(ep, list) and ep:
+                    disaggregated_params = {**disaggregated_params, "ctx_info_endpoint": ep[0]}
+                request.disaggregated_params = request.disaggregated_params.model_copy(
+                    update=disaggregated_params
+                )
+
+        request.disaggregated_params.disagg_request_id = disagg_request_id
+        return request
+
+    async def _check_conditional_disagg(self, request: UCompletionRequest, req_id: int) -> bool:
+        if self.conditional_disagg_config:
+            local_gen_router = (
+                self._gen_router._local
+                if isinstance(self._gen_router, CoordinatorDelegatingRouter)
+                else self._gen_router
+            )
+            if not isinstance(local_gen_router, KvCacheAwareRouter):
+                raise TypeError(
+                    "conditional disaggregation requires a KV-cache-aware generation router"
+                )
+            # Query kv cache status and select a best gen_server.
+            # The server is reserved for generation request
+            gen_server, info = await self._gen_router.get_next_server(request, req_id=req_id)
+            match_length = info["match_length"]
+            total_length = info["num_tokens"]
+            need_ctx_decision = (
+                match_length == 0
+                or total_length - match_length
+                > self.conditional_disagg_config.max_local_prefill_length
+            )
+            # Visibility hook for verifying bypass triggers in disagg deployments.
+            logger.debug(
+                f"[conditional_disagg] gen={gen_server} match={match_length} "
+                f"total={total_length} residual={total_length - match_length} "
+                f"max_local_prefill_length="
+                f"{self.conditional_disagg_config.max_local_prefill_length} "
+                f"→ need_ctx={need_ctx_decision}"
+            )
+            return gen_server, need_ctx_decision
+        return None, True
+
+    async def _check_gen_only_disagg(self, request: UCompletionRequest) -> bool:
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            # Hard-code first token, ctx_request_id for testing
+            request.disaggregated_params = DisaggregatedParams(
+                request_type="generation_only",
+                first_gen_tokens=[7],
+                ctx_request_id=1,
+                encoded_opaque_state=None,
+                draft_tokens=None,
+            )
+            request.ignore_eos = True
+            return True
+        return False
+
+    async def is_ready(self) -> bool:
+        # Per-request readiness gate for the /v1/ handlers (the server's /health
+        # and /cluster_info hook the coordinator directly). Cluster topology
+        # (cluster_info) is the coordinator's concern, not the request service's.
+        return await self._coordinator.is_ready()
+
+    @property
+    def conditional_disagg_config(self) -> Optional[ConditionalDisaggConfig]:
+        return self._config.conditional_disagg_config
+
+    async def setup(self) -> None:
+        # Build the request-sending clients from the coordinator's routers and share
+        # them with the coordinator service so its readiness checks use the same pool.
+        self._ctx_client = self._client_factory(
+            self._ctx_router, ServerRole.CONTEXT, self._config.max_retries
+        )
+        self._gen_client = self._client_factory(
+            self._gen_router, ServerRole.GENERATION, self._config.max_retries
+        )
+        if hasattr(self._coordinator, "set_clients"):
+            self._coordinator.set_clients(self._ctx_client, self._gen_client)
+        await self._coordinator.start()
+
+    async def teardown(self) -> None:
+        await self._ctx_client.shutdown()
+        await self._gen_client.shutdown()
+        await self._coordinator.stop()
+
+    async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
+        if ctx_response:
+            for idx, choice in enumerate(ctx_response.choices):
+                if choice.disaggregated_params is None:
+                    raise ValueError(
+                        f"Context server choice {idx} did not return disaggregated params."
+                        f" finish_reason={choice.finish_reason!r}"
+                    )
+                # A CTX request that finished early (e.g. EOS during prefill) never
+                # sets up the KV-cache handoff, so ctx_request_id/disagg_request_id
+                # stay None. Only enforce them when a GEN handoff is still pending --
+                # mirroring _need_gen, which skips the handoff for these responses.
+                if choice.finish_reason in _GEN_PENDING_FINISH_REASONS:
+                    if choice.disaggregated_params.ctx_request_id is None:
+                        raise ValueError(
+                            f"Invalid disaggregated params: ctx_request_id is None for choice {idx}."
+                            f" finish_reason={choice.finish_reason!r},"
+                            f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
+                        )
+                    if choice.disaggregated_params.disagg_request_id is None:
+                        raise ValueError(
+                            f"Invalid disaggregated params: disagg_request_id is None for choice {idx}."
+                            f" finish_reason={choice.finish_reason!r},"
+                            f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
+                        )
+            return ctx_response
+
+    async def _send_disagg_request_gen_first(
+        self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
+    ) -> UCompletionResponse:
+        if hooks:
+            hooks.on_req_begin(request)
+        # empty server means client decides which server to use
+        need_ctx = not (await self._check_gen_only_disagg(request))
+        ctx_server, gen_server = None, None
+        ctx_server_info = None
+        ctx_req, gen_req = None, None
+        # Single-issuer disagg id (see _send_disagg_request_ctx_first): fetch from
+        # the coordinator so fleet workers never mint colliding ids.
+        disagg_request_id = await self._coordinator.get_disagg_request_id()
+        if hooks:
+            hooks.on_disagg_request_id(disagg_request_id)
+        if need_ctx:
+            # arrival->here = pre-ctx wait in the orchestrator/fleet.
+            if hooks:
+                hooks.on_ctx_dispatch(request)
+            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
+                request, req_id=disagg_request_id
+            )
+            ctx_req = self._get_ctx_request(request, disagg_request_id)
+        gen_req = self._get_gen_request(
+            request,
+            ctx_response=None,
+            disagg_request_id=disagg_request_id,
+            ctx_server_info=ctx_server_info,
+        )
+
+        if request.stream and need_ctx:
+            # For streaming gen_first requests, the gen client returns a lazy
+            # async generator whose HTTP POST only fires when iterated. The ctx
+            # server blocks waiting for the gen server's rx session (gen_first
+            # protocol). Using asyncio.gather would deadlock: ctx waits for gen
+            # server, but gen POST is deferred until the generator is consumed,
+            # and the generator isn't consumed until gather returns.
+            #
+            # Fix: eagerly start consuming the gen generator in a background
+            # task so the HTTP POST fires, then pipe chunks through a queue.
+            gen_response = await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+            )
+
+            queue: asyncio.Queue = asyncio.Queue()
+
+            async def _consume_gen():
+                try:
+                    async for chunk in gen_response:
+                        await queue.put(chunk)
+                except Exception as e:
+                    await queue.put(e)
+                await queue.put(None)  # sentinel
+
+            consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
+
+            # Now send ctx request — gen server has received its request
+            try:
+                await self._ctx_client.send_request(
+                    ctx_req,
+                    server=ctx_server,
+                    hooks=hooks,
+                    req_id=disagg_request_id,
+                )
+            except Exception:
+                consume_task.cancel()
+                try:
+                    await consume_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
+
+            async def _yield_from_queue():
+                try:
+                    while True:
+                        item = await queue.get()
+                        if item is None:
+                            break
+                        if isinstance(item, Exception):
+                            raise item
+                        yield item
+                finally:
+                    if not consume_task.done():
+                        consume_task.cancel()
+                    try:
+                        await consume_task
+                    except asyncio.CancelledError:
+                        pass
+
+            return _yield_from_queue()
+        else:
+            # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
+            # through generator consumption, so asyncio.gather works fine.
+            tasks = []
+            if need_ctx:
+                tasks.append(
+                    asyncio.create_task(
+                        self._ctx_client.send_request(
+                            ctx_req,
+                            server=ctx_server,
+                            hooks=hooks,
+                            req_id=disagg_request_id,
+                        )
+                    )
+                )
+            tasks.append(
+                asyncio.create_task(
+                    self._gen_client.send_request(
+                        gen_req,
+                        server=gen_server,
+                        hooks=hooks,
+                        req_id=disagg_request_id,
+                    )
+                )
+            )
+            responses = await asyncio.gather(*tasks)
+            return responses[-1]

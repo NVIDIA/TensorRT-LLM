@@ -1,0 +1,20 @@
+# Extra LLM API options for trtllm-serve with the LMCache KV connector.
+#
+# Prerequisites:
+#   - lmcache installed: pip install lmcache
+#   - PyTorch backend (LMCache connector is wired through the PyTorch executor)
+#
+# IMPORTANT: Set PYTHONHASHSEED=0 before starting the process for
+# deterministic cache key hashing in LMCache.
+#
+# Example:
+#   PYTHONHASHSEED=0 trtllm-serve Qwen/Qwen2-1.5B-Instruct --backend pytorch --host 0.0.0.0 --port 8000 \
+#     --trust_remote_code \
+#     --extra_llm_api_options /path/to/this/file
+
+kv_cache_config:
+  enable_block_reuse: true
+  max_tokens: 150000
+
+kv_connector_config:
+  connector: lmcache

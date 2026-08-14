@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import argparse
 import os
 import subprocess
@@ -54,11 +69,12 @@ def parse_arguments():
     parser.add_argument(
         '--no-mpi',
         action='store_true',
-        help='Launch tritonserver without MPI (single instance mode)',
+        help=
+        'Launch tritonserver without MPI. Required for multi-instance deployments.',
         default=False,
     )
 
-    path = str(Path(__file__).parent.absolute()) + '/../all_models/gpt'
+    path = str(Path(__file__).parent.absolute()) + '/../all_models/llmapi'
     parser.add_argument('--model_repo', type=str, default=path)
 
     parser.add_argument(
@@ -97,6 +113,18 @@ def parse_arguments():
         'Append --oversubscribe to the mpirun command. Mainly for SLURM MPI usecases.'
     )
 
+    parser.add_argument(
+        '--trtllm_llmapi_launch',
+        action='store_true',
+        help='Launch tritonserver with trtllm-llmapi-launch',
+        default=False,
+    )
+    parser.add_argument(
+        '--exit_timeout',
+        type=int,
+        help='Exit timeout in seconds',
+        default=None,
+    )
     return parser.parse_args()
 
 
@@ -145,9 +173,20 @@ def add_port_config(cmd, grpc_port, http_port, metrics_port):
     return cmd
 
 
-def get_cmd(world_size, tritonserver, grpc_port, http_port, metrics_port,
-            model_repo, log, log_file, tensorrt_llm_model_name, oversubscribe,
-            multimodal_gpu0_cuda_mem_pool_bytes, no_mpi):
+def get_cmd(world_size,
+            tritonserver,
+            grpc_port,
+            http_port,
+            metrics_port,
+            model_repo,
+            log,
+            log_file,
+            tensorrt_llm_model_name,
+            oversubscribe,
+            multimodal_gpu0_cuda_mem_pool_bytes,
+            no_mpi,
+            trtllm_llmapi_launch,
+            exit_timeout=None):
     if no_mpi:
         assert world_size == 1, "world size must be 1 when using no-mpi"
 
@@ -162,7 +201,11 @@ def get_cmd(world_size, tritonserver, grpc_port, http_port, metrics_port,
     for i in range(world_size):
         if use_mpi:
             cmd += ['-n', '1']
+        if trtllm_llmapi_launch:
+            cmd += ['trtllm-llmapi-launch']
         cmd += [tritonserver, f'--model-repository={model_repo}']
+        if exit_timeout:
+            cmd += [f'--exit-timeout-secs={exit_timeout}']
 
         # Add port configuration
         cmd = add_port_config(cmd, grpc_port, http_port, metrics_port)
@@ -212,7 +255,7 @@ if __name__ == '__main__':
                   args.http_port, args.metrics_port, args.model_repo, args.log,
                   args.log_file, args.tensorrt_llm_model_name,
                   args.oversubscribe, args.multimodal_gpu0_cuda_mem_pool_bytes,
-                  args.no_mpi)
+                  args.no_mpi, args.trtllm_llmapi_launch, args.exit_timeout)
     env = os.environ.copy()
     if args.multi_model:
         if not args.disable_spawn_processes:

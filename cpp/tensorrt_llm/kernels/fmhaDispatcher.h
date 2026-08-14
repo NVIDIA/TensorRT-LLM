@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fmhaRunner.h"
 #include "tensorrt_llm/kernels/contextFusedMultiHeadAttention/fused_multihead_attention_common.h"
@@ -23,7 +24,9 @@
 
 using tensorrt_llm::common::op::UniqPtrWNullCopy;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -58,8 +61,13 @@ private:
     UniqPtrWNullCopy<kernels::FusedMHARunnerV2> mFMHARunner;
     // Runner for trtllm-gen fmha kernels (for SM == 100)
     UniqPtrWNullCopy<kernels::TllmGenFmhaRunner> mTllmGenFMHARunner;
+    // Cached SM count to avoid repeated cudaDeviceGetAttribute calls in the per-iter
+    // FMHA dispatch hot path (isSupported / run).
+    int mMultiProcessorCount{0};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

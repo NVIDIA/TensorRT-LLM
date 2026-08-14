@@ -14,13 +14,16 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "userbuffers.h"
 #include "utils.h"
 
-namespace tensorrt_llm::kernels::ub
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ub
 {
-using namespace tensorrt_llm::runtime::ub;
 #define MAX_THREADS 1024
 #define TIMEOUT 200000000000ull
 
@@ -56,12 +59,12 @@ __global__ void __launch_bounds__(MAX_THREADS)
     userbuffers_fp16_sum_inplace_gpu_rw(int const op, int const flagoffset, int const firstrank, int const myrank,
         int const gpustep, size_t const lineoffset, int const numlines, void** commbuff, int const handleridx)
 {
-#if __CUDA_ARCH__ >= 900
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
     __shared__ int4* userptr[RANKS];
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
     if (threadIdx.x < RANKS)
     {
         physgpu = myrank * gpustep + firstrank;
@@ -72,9 +75,6 @@ __global__ void __launch_bounds__(MAX_THREADS)
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
-#if __CUDA_ARCH__ >= 900
-        cudaGridDependencySynchronize();
-#endif
         flagptr[physgpu] = reduce_id;
         userptr[threadIdx.x] = reinterpret_cast<int4*>(commbuff[targetgpu + handleridx]);
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
@@ -130,6 +130,9 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *reduceidptr = reduce_id;
+#if __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 } // fp16 inplace reduce kernel (Hopper)
 
 template <typename DType, int RANKS>
@@ -137,12 +140,12 @@ __global__ void __launch_bounds__(MAX_THREADS)
     userbuffers_fp16_sum_inplace_gpu_rr(int const op, int const flagoffset, int const firstrank, int const myrank,
         int const gpustep, size_t const lineoffset, int const numlines, void** commbuff, int const handleridx)
 {
-#if __CUDA_ARCH__ >= 900
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
     __shared__ int4* userptr[RANKS];
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
     if (threadIdx.x < RANKS)
     {
         physgpu = myrank * gpustep + firstrank;
@@ -153,9 +156,6 @@ __global__ void __launch_bounds__(MAX_THREADS)
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
-#if __CUDA_ARCH__ >= 900
-        cudaGridDependencySynchronize();
-#endif
         flagptr[physgpu] = reduce_id;
         userptr[threadIdx.x] = reinterpret_cast<int4*>(commbuff[targetgpu + handleridx]);
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
@@ -239,6 +239,9 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *reduceidptr = reduce_id;
+#if __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 } // fp16 inplace reduce kernel (Ampere)
 
 #if __CUDA_ARCH__ >= 900
@@ -365,7 +368,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         *reduceidptr = reduce_id;
 } // fp16 inplace reduce kernel (Hopper) MC
 
-#else
+#else  // __CUDA_ARCH__ >= 900
 template <typename DType, int RANKS, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_mc(int const op, int const flagoffset,
     int const firstrank, int const myrank, int const gpustep, size_t const lineoffset, int const numlines,
@@ -375,7 +378,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
     asm volatile("brkpt;\n");
 }
 
-#endif
+#endif // __CUDA_ARCH__ >= 900
 
 #define callranks(x)                                                                                                   \
     if (ar_nvsize == x)                                                                                                \
@@ -466,7 +469,7 @@ __inline__ __device__ float compute_rmsnorm2(float val, float s_variance, DType 
     }
 
 // Quantizes the provided PackedVec into the uint32_t output
-template <class Type, bool UE8M0_SF = false>
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF = false>
 __device__ uint32_t cvt_warp_fp16_to_fp4_mc(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -475,7 +478,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4_mc(PackedVec<Type>& vec, float SFScaleV
 
 // Local maximum value.
 #pragma unroll
-    for (int i = 1; i < CVT_FP4_ELTS_PER_THREAD / 2; i++)
+    for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++)
     {
         localMax = __hmax2(localMax, __habs2(vec.elts[i]));
     }
@@ -530,10 +533,10 @@ __device__ uint32_t cvt_warp_fp16_to_fp4_mc(PackedVec<Type>& vec, float SFScaleV
     }
 
     // Convert the input to float.
-    float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
+    float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
 
 #pragma unroll
-    for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++)
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++)
     {
         if constexpr (std::is_same_v<Type, half>)
         {
@@ -566,14 +569,15 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int res_offset, uint32_t* scale_out, size_t const scale_out_offset, int first_token)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    constexpr int SF_VEC_SIZE = 16;
     using PackedVec = PackedVec<DType>;
-    cudaTriggerProgrammaticLaunchCompletion();
     float sf = *scale;
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
 
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
+    cudaGridDependencySynchronize();
     if (threadIdx.x < RANKS)
     {
         physgpu = myrank * gpustep + firstrank;
@@ -584,7 +588,6 @@ __global__ void __launch_bounds__(MAX_THREADS)
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
-        cudaGridDependencySynchronize();
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
         reduce_id = next_flag(reduce_id);
@@ -649,11 +652,11 @@ __global__ void __launch_bounds__(MAX_THREADS)
             uint8_t* sf_out = nullptr;
             if (threadIdx.x % 8 == 0)
             {
-                sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
-                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset,
-                    FP4QuantizationSFLayout::SWIZZLED);
+                sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
+                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim / SF_VEC_SIZE,
+                    scale_out + scale_out_offset, QuantizationSFLayout::SWIZZLED);
             }
-            uint32_t val = cvt_warp_fp16_to_fp4_mc(valout, sf, sf_out);
+            uint32_t val = cvt_warp_fp16_to_fp4_mc<DType, SF_VEC_SIZE>(valout, sf, sf_out);
             MULTIMEM_ST(val, mc_ptr_out + (out_lineoffset + line + g * loop_step0));
         }
     }
@@ -669,6 +672,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *reduceidptr = reduce_id;
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -681,14 +685,15 @@ __global__ void __launch_bounds__(MAX_THREADS)
         uint4* residual_out, int res_offset, uint32_t* scale_out, size_t const scale_out_offset)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    constexpr int SF_VEC_SIZE = 16;
     using PackedVec = PackedVec<DType>;
-    cudaTriggerProgrammaticLaunchCompletion();
     float sf = *scale;
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
 
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
+    cudaGridDependencySynchronize();
     if (threadIdx.x < RANKS)
     {
         physgpu = myrank * gpustep + firstrank;
@@ -699,7 +704,6 @@ __global__ void __launch_bounds__(MAX_THREADS)
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
-        cudaGridDependencySynchronize();
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
     }
@@ -761,14 +765,16 @@ __global__ void __launch_bounds__(MAX_THREADS)
                     (threadIdx.x + g * loop_step0) * sizeof(int4) / sizeof(DType) + j));
                 i++;
             }
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
-                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim, scale_out + scale_out_offset,
-                FP4QuantizationSFLayout::SWIZZLED);
-            mc_ptr_out[out_lineoffset + line + g * loop_step0] = cvt_warp_fp16_to_fp4(valout, sf, sf_out);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
+                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim / SF_VEC_SIZE,
+                scale_out + scale_out_offset, QuantizationSFLayout::SWIZZLED);
+            mc_ptr_out[out_lineoffset + line + g * loop_step0]
+                = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(valout, sf, sf_out);
         }
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *reduceidptr = reduce_id;
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -781,11 +787,11 @@ __global__ void __launch_bounds__(MAX_THREADS)
         float4* mc_ptr, DType const* beta, DType const* gamma, float const eps, int const RANKS, float4* mc_ptr_out,
         size_t const out_lineoffset, uint4* residual_in, uint4* residual_out, int res_offset)
 {
-    cudaTriggerProgrammaticLaunchCompletion();
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
+    cudaGridDependencySynchronize();
     if (threadIdx.x < RANKS)
     {
         physgpu = myrank * gpustep + firstrank;
@@ -796,7 +802,6 @@ __global__ void __launch_bounds__(MAX_THREADS)
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
-        cudaGridDependencySynchronize();
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
         reduce_id = next_flag(reduce_id);
@@ -871,6 +876,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *reduceidptr = reduce_id;
+    cudaTriggerProgrammaticLaunchCompletion();
 } // fp16 inplace reduce kernel (Hopper) MC with rmsNorm fused
 
 template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
@@ -880,11 +886,11 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int const handleridx, float4* mc_ptr, DType const* beta, DType const* gamma, float const eps, int const RANKS,
         uint4* uc_ptr_out, size_t const out_lineoffset, uint4* residual_in, uint4* residual_out, int res_offset)
 {
-    cudaTriggerProgrammaticLaunchCompletion();
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
+    cudaGridDependencySynchronize();
     if (threadIdx.x < RANKS)
     {
         physgpu = myrank * gpustep + firstrank;
@@ -895,7 +901,6 @@ __global__ void __launch_bounds__(MAX_THREADS)
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
-        cudaGridDependencySynchronize();
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
     }
@@ -959,6 +964,7 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *reduceidptr = reduce_id;
+    cudaTriggerProgrammaticLaunchCompletion();
 } // fp16 inplace reduce kernel (Hopper) MC with rmsNorm fused oneshot
 
 template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
@@ -968,13 +974,13 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
     float const eps, int const RANKS, float2* mc_ptr_out, size_t const out_lineoffset, float const* scale,
     uint4* residual_in, uint4* residual_out, int res_offset)
 {
-    cudaTriggerProgrammaticLaunchCompletion();
     float const sf = 1.f / (*scale);
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
 
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
+    cudaGridDependencySynchronize();
     if (threadIdx.x < RANKS)
     {
         physgpu = myrank * gpustep + firstrank;
@@ -985,7 +991,6 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
-        cudaGridDependencySynchronize();
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
         reduce_id = next_flag(reduce_id);
@@ -1063,6 +1068,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *reduceidptr = reduce_id;
+    cudaTriggerProgrammaticLaunchCompletion();
 } // quant kernel fp16->fp8 twoshot
 
 template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
@@ -1072,13 +1078,13 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
     float const eps, int const RANKS, uint2* mc_ptr_out, size_t const out_lineoffset, float const* scale,
     uint4* residual_in, uint4* residual_out, int res_offset)
 {
-    cudaTriggerProgrammaticLaunchCompletion();
     float const sf = 1.f / (*scale);
     __shared__ float s_variance;
     int hidden_dim = blockDim.x * UNROLL_NLINES * sizeof(int4) / sizeof(DType);
 
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
+    cudaGridDependencySynchronize();
     if (threadIdx.x < RANKS)
     {
         physgpu = myrank * gpustep + firstrank;
@@ -1089,7 +1095,6 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
-        cudaGridDependencySynchronize();
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
     }
@@ -1157,6 +1162,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *reduceidptr = reduce_id;
+    cudaTriggerProgrammaticLaunchCompletion();
 } // quant kernel fp16->fp8 oneshot
 
 template <typename DType, int UNROLL_NLINES>
@@ -1165,9 +1171,9 @@ __global__ void __launch_bounds__(MAX_THREADS)
         int const myrank, int const gpustep, size_t const lineoffset, int const numlines, void** commbuff,
         int const handleridx, float4* mc_ptr, int const RANKS, uint4* residual_in, int res_offset)
 {
-    cudaTriggerProgrammaticLaunchCompletion();
     int *flagptr, physgpu, targetgpu, *myptr;
     int *reduceidptr, reduce_id;
+    cudaGridDependencySynchronize();
     if (threadIdx.x < RANKS)
     {
         physgpu = myrank * gpustep + firstrank;
@@ -1178,7 +1184,6 @@ __global__ void __launch_bounds__(MAX_THREADS)
         reduce_id = next_flag(*reduceidptr);
         flagptr = (reinterpret_cast<int*>(commbuff[targetgpu])) + flagoffset + blockflagoffset;
         myptr += blockflagoffset;
-        cudaGridDependencySynchronize();
         flagptr[physgpu] = reduce_id;
         multi_gpu_block_barrier(reduce_id, (int volatile*) &myptr[targetgpu]);
         reduce_id = next_flag(reduce_id);
@@ -1214,9 +1219,10 @@ __global__ void __launch_bounds__(MAX_THREADS)
     }
     if (threadIdx.x == 0 && blockIdx.x == 0)
         *reduceidptr = reduce_id;
+    cudaTriggerProgrammaticLaunchCompletion();
 } // residual allgather kernel
 
-#else
+#else  // __CUDA_ARCH__ >= 900
 template <typename DType, int UNROLL_NLINES, bool DISABLE_FP32_ACC>
 __global__ void __launch_bounds__(MAX_THREADS)
     userbuffers_fp16_sum_gpu_mc_rmsnorm(int const op, int const flagoffset, int const firstrank, int const myrank,
@@ -1271,7 +1277,7 @@ __global__ void __launch_bounds__(MAX_THREADS) userbuffers_fp16_sum_inplace_gpu_
     asm volatile("brkpt;\n");
 }
 
-#endif
+#endif // __CUDA_ARCH__ >= 900
 
 #define callranksMC_RMSNORM_QUANT(x)                                                                                   \
     if (nlines == x)                                                                                                   \
@@ -1769,11 +1775,11 @@ int allgather2_userbuff_residual(int const handler, size_t const offset, size_t 
 }
 
 void allreduce2_userbuff_inplace_impl(int const handler, size_t const offset, size_t const elements,
-    nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+    tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1786,7 +1792,7 @@ void allreduce2_userbuff_inplace_impl(int const handler, size_t const offset, si
         break;
     }
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1804,17 +1810,17 @@ void allreduce2_userbuff_inplace_impl(int const handler, size_t const offset, si
 }
 
 int allgather2_userbuff_residual_impl(int const handler, size_t const offset, size_t const elements,
-    int const hidden_size, void* residual, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream,
+    int const hidden_size, void* residual, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream,
     bool force_enable)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
         return allgather2_userbuff_residual<half>(
             handler, offset, elements, hidden_size, residual, comm, stream, force_enable);
         break;
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
         return allgather2_userbuff_residual<__nv_bfloat16>(
             handler, offset, elements, hidden_size, residual, comm, stream, force_enable);
         break;
@@ -1825,11 +1831,11 @@ int allgather2_userbuff_residual_impl(int const handler, size_t const offset, si
 
 int allreduce2_userbuff_rmsnorm_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
-    void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+    void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1844,7 +1850,7 @@ int allreduce2_userbuff_rmsnorm_impl(int const handler, size_t const offset, int
         break;
     }
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1865,12 +1871,12 @@ int allreduce2_userbuff_rmsnorm_impl(int const handler, size_t const offset, int
 
 int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, size_t const elements, int const hidden_size, void* beta, void* gamma, float eps,
-    float* scalefactor, void* residual_in, void* residual_out, nvinfer1::DataType dataType, communicator* comm,
+    float* scalefactor, void* residual_in, void* residual_out, tensorrt_llm::DataType dataType, communicator* comm,
     cudaStream_t stream)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1885,7 +1891,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t con
         break;
     }
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1909,11 +1915,11 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_impl(int const handler, size_t con
 int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t const offset, int const out_handler,
     size_t const out_offset, int const scale_handler, size_t const scale_offset, size_t const elements,
     int const hidden_size, void* beta, void* gamma, float eps, float* scalefactor, void* residual_in,
-    void* residual_out, nvinfer1::DataType dataType, communicator* comm, cudaStream_t stream)
+    void* residual_out, tensorrt_llm::DataType dataType, communicator* comm, cudaStream_t stream)
 {
     switch (dataType)
     {
-    case nvinfer1::DataType::kHALF:
+    case tensorrt_llm::DataType::kHALF:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1930,7 +1936,7 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
         break;
     }
 #ifdef ENABLE_BF16
-    case nvinfer1::DataType::kBF16:
+    case tensorrt_llm::DataType::kBF16:
     {
         if (kDISABLE_FP32_ACCUMULATION)
         {
@@ -1950,4 +1956,6 @@ int allreduce2_userbuff_inplace_rmsnorm_quant_fp4_impl(int const handler, size_t
     default: TLLM_THROW("Unsupported dataType for allreduce2_userbuff_inplace_rmsnorm_quant_impl");
     }
 }
-} // namespace tensorrt_llm::kernels::ub
+} // namespace kernels::ub
+
+TRTLLM_NAMESPACE_END

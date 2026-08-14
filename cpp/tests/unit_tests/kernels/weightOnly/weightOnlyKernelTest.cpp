@@ -165,13 +165,13 @@ struct cutlassTypeMapper
         }                                                                                                              \
     };
 CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::FP16Int8Groupwise, "FP16Int8Groupwise", half, uint8_t, 8,
-    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS);
+    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY);
 CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::BF16Int8Groupwise, "BF16Int8Groupwise", __nv_bfloat16, uint8_t, 8,
-    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS);
+    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY);
 CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::FP16Int4Groupwise, "FP16Int4Groupwise", half, cutlass::uint4b_t, 4,
-    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS);
+    cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY);
 CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::BF16Int4Groupwise, "BF16Int4Groupwise", __nv_bfloat16, cutlass::uint4b_t,
-    4, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS);
+    4, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY);
 CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::FP16Int8PerChannel, "FP16Int8PerChannel", half, uint8_t, 8,
     cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY);
 CUTLASS_TYPE_MAPPER_REGISTRY(wo::KernelType::BF16Int8PerChannel, "BF16Int8PerChannel", __nv_bfloat16, uint8_t, 8,
@@ -220,7 +220,7 @@ void exec_cutlass_kernel(
     {
         tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<AType, AType>(
             reinterpret_cast<AType*>(scaled_act), reinterpret_cast<AType const*>(params.act),
-            reinterpret_cast<AType const*>(params.act_scale), params.m, params.k, stream);
+            reinterpret_cast<AType const*>(params.act_scale), params.m, params.k, nullptr, stream);
         act = scaled_act;
     }
     if constexpr (QuantOp == cutlass::WeightOnlyQuantOp::PER_COLUMN_SCALE_ONLY)
@@ -228,7 +228,7 @@ void exec_cutlass_kernel(
         runner.gemm(
             act, params.weight, params.scales, params.out, params.m, params.n, params.k, config, ws, ws_size, stream);
     }
-    else if (QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS)
+    else if (QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY)
     {
         runner.gemm(act, params.weight, params.scales, params.zeros, params.bias, params.out, params.m, params.n,
             params.k, params.groupsize, config, ws, ws_size, stream);
@@ -290,7 +290,7 @@ float run_cutlass_kernel(wo::Params& params, int warmup, int iter)
             msg << "\n (for"
                 << " m=" << params.m << ", n=" << params.n << ", k=" << params.k << ")"
                 << ", reason: \"" << e.what() << "\". Skipped\n";
-            std::cout << msg.str();
+            TLLM_LOG_TRACE(msg.str());
             cudaGetLastError(); // Reset the last cudaError to cudaSuccess.
             continue;
         }
@@ -332,7 +332,7 @@ bool benchmark_and_verify(int m, int n, int k, int groupsize, int warmup, int it
     {
         simple_assert(groupsize == 0);
     }
-    else if (cutlassTypeMapper<KT>::QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_AND_ZEROS)
+    else if (cutlassTypeMapper<KT>::QuantOp == cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY)
     {
         simple_assert(groupsize == 64 || groupsize == 128);
     }
@@ -379,7 +379,6 @@ bool benchmark_and_verify(int m, int n, int k, int groupsize, int warmup, int it
 
     if (groupsize != 0)
     {
-        p_zeros = d_zeros.data();
         p_bias = d_bias.data();
         p_act_scale = d_act_scale.data();
     }
@@ -402,9 +401,9 @@ TEST(Kernel, WeightOnly)
     int const arch = tensorrt_llm::common::getSMVersion();
     bool pass;
     int warmup = 10, iter = 30;
-    std::vector<int> ms{2, 4, 6, 8, 10, 12, 14};
+    std::vector<int> ms{1, 2, 4, 6, 8, 10, 12, 14};
     std::vector<int> ns{4096};
-    std::vector<int> ks{2048};
+    std::vector<int> ks{4096};
     for (auto m : ms)
     {
         for (auto n : ns)
@@ -428,6 +427,10 @@ TEST(Kernel, WeightOnly)
 #if defined(ENABLE_BF16)
                     if (arch >= 80)
                     {
+                        pass = benchmark_and_verify<wo::KernelType::BF16Int8PerChannel>(m, n, k, 0, warmup, iter);
+                        EXPECT_TRUE(pass);
+                        pass = benchmark_and_verify<wo::KernelType::BF16Int4PerChannel>(m, n, k, 0, warmup, iter);
+                        EXPECT_TRUE(pass);
                         pass = benchmark_and_verify<wo::KernelType::BF16Int8Groupwise>(m, n, k, 64, warmup, iter);
                         EXPECT_TRUE(pass);
                         pass = benchmark_and_verify<wo::KernelType::BF16Int8Groupwise>(m, n, k, 128, warmup, iter);
@@ -435,10 +438,6 @@ TEST(Kernel, WeightOnly)
                         pass = benchmark_and_verify<wo::KernelType::BF16Int4Groupwise>(m, n, k, 64, warmup, iter);
                         EXPECT_TRUE(pass);
                         pass = benchmark_and_verify<wo::KernelType::BF16Int4Groupwise>(m, n, k, 128, warmup, iter);
-                        EXPECT_TRUE(pass);
-                        pass = benchmark_and_verify<wo::KernelType::BF16Int8PerChannel>(m, n, k, 0, warmup, iter);
-                        EXPECT_TRUE(pass);
-                        pass = benchmark_and_verify<wo::KernelType::BF16Int4PerChannel>(m, n, k, 0, warmup, iter);
                         EXPECT_TRUE(pass);
                     }
 #endif

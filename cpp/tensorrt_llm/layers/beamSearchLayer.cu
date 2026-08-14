@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,11 @@
 #include "tensorrt_llm/kernels/beamSearchKernels/beamSearchKernelsTemplate.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/layers/defaultDecodingParams.h"
 #include "tensorrt_llm/layers/layerUtils.h"
+
 #include <limits>
 
 using namespace tensorrt_llm::runtime;
@@ -279,6 +280,7 @@ void BeamSearchLayer<T>::setup(SizeType32 const batchSize, SizeType32 const beam
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(BeamSearchLayer_setup);
 
     SizeType32 const maxBamWidth{mDecoderDomain.getBeamWidth()};
     TLLM_CHECK_WITH_INFO(beamWidth <= maxBamWidth, "Beam width is larger than the constructed for (%d > %d).",
@@ -313,6 +315,7 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     std::shared_ptr<runtime::DecodingLayerWorkspace> const& workspace)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    NVTX3_SCOPED_RANGE(BeamSearchLayer_forwardAsync);
 
     auto ip = std::dynamic_pointer_cast<DecodingInputs>(baseInputs);
     auto op = std::dynamic_pointer_cast<BeamSearchOutputs>(baseOutputs);
@@ -332,7 +335,10 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     BeamHypotheses bh;
     // bh's members not used in this function: outputIds, logProbs, outputIdsUnfinish, parentIdsUnfinish
     bh.bVBWS = this->mVBWS;
-    bh.nMaxBatchSize = static_cast<std::int32_t>(op->outputIdsPtr->getDimension<0>());
+    // outputIds retains its full maxBatchSize allocation; outputIdsPtr is sliced to the active
+    // batch size in DynamicDecodeLayer::prepareIdsPtrs (ITensor::slice(mOutputIdsPtrDevice, 0, batchSize))
+    // and must not be used as a stride for the [MSL, maxBatchSize, BM]-shaped logProbsTiled buffer.
+    bh.nMaxBatchSize = static_cast<std::int32_t>(op->outputIds->getDimension<0>());
     bh.nBatchSize = ip->localBatchSize;
     bh.nBeamWidth = op->outputIds->getDimension<1>();
     bh.nMaxSeqLen = op->outputIds->getDimension<2>();
@@ -394,7 +400,7 @@ void BeamSearchLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const
     T const* bias = static_cast<T const*>(nullptr);
     TLLM_CHECK_WITH_INFO(getWorkspaceSize() >= 2 * bh.nBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2,
         "Workspace size (%lu) is not enough for topk softmax required (%lu).", (uint64_t) getWorkspaceSize(),
-        (uint64_t) (2 * bh.nMaxBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2));
+        (uint64_t) (2 * bh.nBatchSize * bh.nBeamWidth * bh.nBeamWidth * 2));
 
     if (this->mV2 || this->mVBWS)
     {

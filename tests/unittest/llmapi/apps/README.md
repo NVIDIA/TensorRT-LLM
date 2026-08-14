@@ -1,3 +1,3 @@
-This directory contains the end-to-end tests for the LLM API applications in `examples/apps`.
+This directory contains the end-to-end tests for `trtllm-serve`.
 
 These tests are triggered in the `test_e2e.py`.

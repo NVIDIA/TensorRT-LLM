@@ -27,11 +27,11 @@ set(SRC_CU_EXTRA)
 list(FILTER SRC_CPP EXCLUDE REGEX ".*nvrtcWrapper/.*")
 add_subdirectory(decoderXQAImplJIT/nvrtcWrapper)
 
-filter_cuda_archs("80" SRC_CPP)
-filter_cuda_archs("86" SRC_CPP)
-filter_cuda_archs("89" SRC_CPP)
-filter_cuda_archs("90" SRC_CPP)
-filter_cuda_archs("120" SRC_CPP)
+add_library(decoder_attention_src OBJECT)
+filter_source_cuda_architectures(
+  SOURCE_LIST SRC_CPP
+  ARCHS 80 86 89 90 120
+  IMPLICIT_FAMILY)
 
 set(basic_heads 32 64 128)
 foreach(HEAD ${basic_heads})
@@ -39,6 +39,11 @@ foreach(HEAD ${basic_heads})
        instantiation/decoderMaskedMultiheadAttention${HEAD}*.cu)
   list(APPEND SRC_CU ${HEAD_SRCS})
 endforeach()
+
+# Cascade attention kernel. Compiled together with the basic heads so it lives
+# in the same shared library as the MMHA dispatcher that calls into it. Uses Dh
+# in {64, 128}.
+list(APPEND SRC_CU ${CMAKE_CURRENT_SOURCE_DIR}/cascadeAttentionKernel.cu)
 
 # skip mmha 48, 80, 96, 104, 112, 144, 160, 192 and 224 for fast build
 if(FAST_BUILD)
@@ -64,7 +69,7 @@ foreach(HEAD ${extra_heads})
 endforeach()
 
 if(NOT WIN32)
-  add_library(decoder_attention_src OBJECT ${SRC_CPP})
+  target_sources(decoder_attention_src PRIVATE ${SRC_CPP})
 
   # Split some sources to shared library for Linux
   add_library(${DECODER_SHARED_TARGET_0} SHARED ${SRC_CU})
@@ -78,10 +83,12 @@ if(NOT WIN32)
   set_property(TARGET ${DECODER_SHARED_TARGET_1}
                PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 else()
-  add_library(decoder_attention_src OBJECT ${SRC_CPP} ${SRC_CU} ${SRC_CU_EXTRA})
+  target_sources(decoder_attention_src PRIVATE ${SRC_CPP} ${SRC_CU}
+                                               ${SRC_CU_EXTRA})
 endif()
 
-target_link_libraries(decoder_attention_src PUBLIC nvrtc_wrapper_src)
+target_link_libraries(decoder_attention_src PUBLIC nvrtc_wrapper_src
+                                                   trtllm_gen_fmha_interface)
 set_property(TARGET decoder_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET decoder_attention_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
                                                    ON)

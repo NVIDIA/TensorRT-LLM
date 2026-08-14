@@ -77,16 +77,17 @@ def main():
     args = parse_arguments()
     workers = {}
 
-    llm_worker = TRTLLMWorker.init_with_new_llm(args.model_dir,
-                                                backend="pytorch",
-                                                max_batch_size=32,
-                                                max_num_tokens=4096,
-                                                temperature=0.9)
+    llm_worker = TRTLLMWorker.init_with_new_llm(
+        args.model_dir,
+        max_batch_size=32,
+        max_num_tokens=4096,
+    )
 
     prototype_generation_controller = NativeGenerationController(
-        custom_sampling_params={
+        sampling_params={
             "max_tokens": 4096,
             "top_p": 0.9,
+            "temperature": 0.9,
         })
     workers[NativeGenerationController.WorkerTag.GENERATION] = llm_worker
 
@@ -103,7 +104,7 @@ def main():
     prompt = "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\r\n\r\n"
 
     result = llm.generate(prompt)
-    extracted_answer = extract_answer_from_boxed(result.output.output_str)
+    extracted_answer = extract_answer_from_boxed(result.outputs[0].text)
     print(f'extracted_answer={extracted_answer}')
 
     llm.shutdown(shutdown_workers=True)

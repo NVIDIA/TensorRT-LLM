@@ -1,0 +1,17 @@
+{
+    "_description": "Baseline median latencies (µs) collected on B200 GPU, TRT-LLM 1.3.0rc7. Used for soft regression detection (warning-only, no test failure).",
+    "_regression_factor": 2.0,
+    "_collected": "2026-03-18",
+    "scheduler": {
+        "production_gen_only_bs8": 11.8,
+        "production_mixed_32gen_4ctx": 40.5
+    },
+    "sampler": {
+        "greedy_bs8": 43.5,
+        "stopwords_bs32": 103.1
+    },
+    "kv_cache": {
+        "gen_bs8": 9.5,
+        "ctx_bs8": 12.7
+    }
+}

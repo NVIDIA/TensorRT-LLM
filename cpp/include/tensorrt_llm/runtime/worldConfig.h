@@ -18,7 +18,6 @@
 
 #include "tensorrt_llm/runtime/common.h"
 
-#include <NvInferRuntime.h>
 #include <optional>
 #include <vector>
 
@@ -104,12 +103,14 @@ public:
 
     [[nodiscard]] SizeType32 constexpr getTensorParallelRank() const noexcept
     {
-        return mRank % mTensorParallelism;
+        // Layout: pp is outermost, then tp, then cp is innermost (consecutive).
+        return (mRank % (mTensorParallelism * mContextParallelism)) / mContextParallelism;
     }
 
     [[nodiscard]] SizeType32 constexpr getContextParallelRank() const noexcept
     {
-        return (mRank % (mTensorParallelism * mContextParallelism)) / mTensorParallelism;
+        // Layout: pp is outermost, then tp, then cp is innermost (consecutive).
+        return mRank % mContextParallelism;
     }
 
     [[nodiscard]] SizeType32 constexpr getLocalRank() const noexcept

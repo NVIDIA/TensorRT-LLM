@@ -1,0 +1,396 @@
+# DWDP reproduction matrix.
+#
+# This file defines only experiment-level benchmark settings. Cluster-, model-,
+# and dataset-specific paths belong in ``env.yaml``.
+
+experiment_defaults:
+  ratio: 0.8
+  isl_std: 0
+  enable_dp: true
+
+experiments:
+  # Naming convention:
+  # - `*_minus_1` means fewer context servers than the main case.
+  # Context-only reproduction.
+  - name: "context_only_dep"
+    dataset_key: "context_only_ratio_08"
+    isl: 8192
+    osl: 1
+    num_ctx_servers: 1
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 4
+    batch: 64
+    gen_max_tokens: 256
+    ctx_max_bs: 64
+    ctx_max_num_tokens: 33000
+    mtp: 0
+    eplb: 0
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "context_only_dwdp"
+    dataset_key: "context_only_ratio_08"
+    isl: 8192
+    osl: 1
+    num_ctx_servers: 4
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 4
+    batch: 64
+    gen_max_tokens: 256
+    ctx_max_bs: 64
+    ctx_max_num_tokens: 33000
+    mtp: 0
+    eplb: 0
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 1
+
+  # End-to-end reproduction: 20-40 TPS / user.
+  - name: "e2e_20_40_dep"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 5
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 256
+    gen_max_tokens: 512
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "e2e_20_40_dep_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 4
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 256
+    gen_max_tokens: 512
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "e2e_20_40_dwdp"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 20
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 256
+    gen_max_tokens: 512
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 5
+
+  - name: "e2e_20_40_dwdp_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 16
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 256
+    gen_max_tokens: 512
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 4
+
+  # End-to-end reproduction: 40-60 TPS / user.
+  - name: "e2e_40_60_dep"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 4
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 128
+    gen_max_tokens: 256
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 0
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "e2e_40_60_dep_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 3
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 128
+    gen_max_tokens: 256
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 0
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "e2e_40_60_dwdp"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 16
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 128
+    gen_max_tokens: 256
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 0
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 4
+
+  - name: "e2e_40_60_dwdp_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 12
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 8
+    batch: 128
+    gen_max_tokens: 256
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 0
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 3
+
+  # End-to-end reproduction: 60-80 TPS / user.
+  - name: "e2e_60_80_dep"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 7
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 64
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "e2e_60_80_dep_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 6
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 64
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "e2e_60_80_dwdp"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 28
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 64
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 7
+
+  - name: "e2e_60_80_dwdp_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 24
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 64
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 6
+
+  - name: "e2e_60_80_dwdp_minus_2"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 20
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 64
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 1
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 5
+
+  # End-to-end reproduction: 80-100 TPS / user.
+  - name: "e2e_80_100_dep"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 4
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 32
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 3
+    eplb: 256
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "e2e_80_100_dwdp"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 16
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 32
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 3
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 4
+
+  - name: "e2e_80_100_dwdp_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 12
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 16
+    batch: 32
+    gen_max_tokens: 128
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 3
+    eplb: 256
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 3
+
+  # End-to-end reproduction: 160-180 TPS / user.
+  - name: "e2e_160_180_dep"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 2
+    ctx_tp: 4
+    num_gen_servers: 1
+    gen_tp: 32
+    batch: 2
+    gen_max_tokens: 8
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 3
+    eplb: 0
+    prefetch: 0
+    dwdp: false
+    dwdp_group: 1
+
+  - name: "e2e_160_180_dwdp"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 8
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 32
+    batch: 2
+    gen_max_tokens: 8
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 3
+    eplb: 0
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 2
+
+  - name: "e2e_160_180_dwdp_minus_1"
+    dataset_key: "e2e_ratio_08"
+    isl: 8192
+    osl: 1024
+    num_ctx_servers: 4
+    ctx_tp: 1
+    num_gen_servers: 1
+    gen_tp: 32
+    batch: 2
+    gen_max_tokens: 8
+    ctx_max_bs: 4
+    ctx_max_num_tokens: 33000
+    mtp: 3
+    eplb: 0
+    prefetch: 64
+    dwdp: true
+    dwdp_group: 1

@@ -1,11 +1,13 @@
-### Generate text with guided decoding
+### :section Customization
+### :title Generate text with guided decoding
+### :order 0
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import GuidedDecodingParams
 
 
 def main():
 
-    # Specify the guided decoding backend; xgrammar is supported currently.
+    # Specify the guided decoding backend; xgrammar and llguidance are supported currently.
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               guided_decoding_backend='xgrammar')
 

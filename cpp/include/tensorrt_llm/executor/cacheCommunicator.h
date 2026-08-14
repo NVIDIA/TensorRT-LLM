@@ -17,6 +17,9 @@
 #pragma once
 
 #include "tensorrt_llm/executor/serialization.h"
+#include <atomic>
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -27,8 +30,9 @@ class CommState;
 struct DataContext
 {
 public:
-    explicit DataContext(int tag)
+    explicit DataContext(int tag, std::atomic<bool> const& transferTerminate = sDefaultTransferTerminate)
         : mTag{tag}
+        , mTransferTerminate(transferTerminate)
     {
     }
 
@@ -37,8 +41,15 @@ public:
         return mTag;
     }
 
+    [[nodiscard]] std::atomic<bool> const& getTransferTerminate() const noexcept
+    {
+        return mTransferTerminate;
+    }
+
 private:
+    inline static std::atomic<bool> sDefaultTransferTerminate{false};
     int const mTag;
+    std::atomic<bool> const& mTransferTerminate;
 };
 
 class Connection
@@ -54,6 +65,13 @@ public:
     {
         return false;
     }
+
+    virtual void activateBuffer(uint8_t /*kind*/) const {}
+
+    [[nodiscard]] virtual std::optional<size_t> getPreAssignedBufferId(uint8_t /*kind*/) const
+    {
+        return std::nullopt;
+    }
 };
 
 class ConnectionManager
@@ -66,6 +84,7 @@ public:
     [[nodiscard]] virtual std::vector<Connection const*> getConnections(CommState const& state) = 0;
 
     [[nodiscard]] virtual CommState const& getCommState() const = 0;
+    [[nodiscard]] virtual bool isRunning() const = 0;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

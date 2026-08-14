@@ -50,8 +50,8 @@ void tensorrt_llm::batch_manager::PauseRequests::operator()(RequestVector& reque
         for (auto& llmReq : requestsToPause)
         {
             auto const reqId = llmReq->mRequestId;
-            inflightReqIds.erase(reqId);
-            TLLM_LOG_DEBUG("request with ID %lu removed from DECODER model inflight set", reqId);
+            auto const removed = inflightReqIds.erase(reqId);
+            TLLM_LOG_DEBUG("request with ID %lu removed from DECODER model inflight set: %d", reqId, removed);
 
             // If a request in this context had been flagged to be paused, pause it right away
             if (reqIdsToPause.find(reqId) != reqIdsToPause.end())

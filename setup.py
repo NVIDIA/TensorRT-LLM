@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,8 +14,10 @@
 # limitations under the License.
 import os
 import platform
+import re
+import subprocess
+import sys
 from pathlib import Path
-from typing import List
 
 from setuptools import find_packages, setup
 from setuptools.dist import Distribution
@@ -49,9 +51,8 @@ def parse_requirements(filename: os.PathLike):
 
 
 def sanity_check():
-    bindings_path = Path(
-        __file__).resolve().parent / "tensorrt_llm" / "bindings"
-    if not bindings_path.exists():
+    tensorrt_llm_path = Path(__file__).resolve().parent / "tensorrt_llm"
+    if not (tensorrt_llm_path / "bindings").exists():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
@@ -72,7 +73,58 @@ def get_version():
     if version is None:
         raise RuntimeError(f"Could not set version from {version_file}")
 
+    # For develop / editable installs (`pip install -e .` or
+    # `python setup.py develop`), append the git commit hash as a PEP 440
+    # local version segment so the installed package is identifiable,
+    # e.g. "1.3.0rc21+58d8964d13".
+    is_develop = any(arg in sys.argv for arg in ("develop", "editable_wheel"))
+    if is_develop:
+        try:
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--short=10", "HEAD"],
+                cwd=Path(__file__).resolve().parent,
+                stderr=subprocess.DEVNULL).decode().strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            commit = ""
+        commit = re.sub(r"[^A-Za-z0-9.]", "", commit)
+        if commit:
+            version = f"{version}+{commit}"
+
     return version
+
+
+def get_project_urls() -> dict[str, str]:
+    source_commit = os.getenv("TRTLLM_BUILD_SOURCE_COMMIT")
+    if not source_commit:
+        return {}
+
+    return {
+        "Source Commit":
+        f"https://github.com/NVIDIA/TensorRT-LLM/commit/{source_commit}",
+    }
+
+
+def get_license():
+    """Get license files for the wheel package.
+
+    Prefers auto-generated ATTRIBUTIONS.md (copied to project root by build_wheel.py)
+    when available, falling back to hard-coded platform-specific attribution files.
+    """
+    import sysconfig
+
+    # Check for auto-generated attributions (copied to project root by build_wheel.py)
+    auto_generated_attributions = Path("ATTRIBUTIONS.md")
+    if auto_generated_attributions.exists():
+        return ["LICENSE", "ATTRIBUTIONS.md"]
+
+    # Fall back to hard-coded platform-specific attribution files
+    platform_tag = sysconfig.get_platform()
+    if "x86_64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
+    elif "arm64" in platform_tag or "aarch64" in platform_tag:
+        return ["LICENSE", "ATTRIBUTIONS-CPP-aarch64.md"]
+    else:
+        raise RuntimeError(f"Unrecognized CPU architecture: {platform_tag}")
 
 
 class BinaryDistribution(Distribution):
@@ -88,6 +140,14 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+mx_deps = ["modelexpress==0.4.1"]
+# Gateway protocol adapters are opt-in extras: the default installation must
+# not carry any gateway protobuf package. Each gateway owns a dedicated
+# requirements-<gateway>.txt as the single source of truth for its pins; CI
+# stages that exercise a gateway install that file explicitly, and the file
+# may carry gateway-specific options (such as an --extra-index-url) without
+# affecting the default dependency graph.
+grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -95,34 +155,67 @@ if constraints_file.exists():
 
 if on_windows:
     package_data = [
-        'libs/th_common.dll', 'libs/tensorrt_llm.dll',
-        'libs/nvinfer_plugin_tensorrt_llm.dll', 'bindings.*.pyd', "include/**/*"
+        'libs/th_common.dll', 'libs/tensorrt_llm.dll', 'bindings.*.pyd',
+        "include/**/*"
     ]
 else:
     package_data = [
-        'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
-        'libs/libnvinfer_plugin_tensorrt_llm.so',
-        'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
+        'libs/libtensorrt_llm.so',
+        'libs/libth_common.so',
+        'libs/libtensorrt_llm_ucx_wrapper.so',
+        'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
-        'libs/libdecoder_attention_1.so', 'bindings.*.so', "include/**/*"
+        'libs/nixl/**/*',
+        'tensorrt_llm_transfer_agent_binding*.so',
+        'tensorrt_llm_transfer_agent_binding.pyi',
+        'libs/libtensorrt_llm_mooncake_wrapper.so',
+        'libs/ucx/**/*',
+        'libs/libpg_utils.so',
+        'libs/libdecoder_attention_1.so',
+        'libs/nvshmem/License.txt',
+        'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
+        'libs/nvshmem/nvshmem_transport_ibgda.so.103',
+        'bindings.*.so',
+        'deep_ep/LICENSE',
+        'deep_ep/*.py',
+        'deep_ep_cpp_tllm.*.so',
+        "include/**/*",
+        'deep_gemm/LICENSE',
+        'deep_gemm/include/**/*',
+        'deep_gemm/*.py',
+        'deep_gemm_cpp_tllm.*.so',
+        'flash_mla/LICENSE',
+        'flash_mla/*.py',
+        'flash_mla_cpp_tllm.*.so',
+        'runtime/kv_cache_manager_v2/*.so',
+        'runtime/kv_cache_manager_v2/**/*.so',
+        'runtime/kv_cache_manager_v2/*.pyi',
+        'runtime/kv_cache_manager_v2/**/*.pyi',
+        'runtime/kv_cache_manager_v2/rawref/*.py',
+        'runtime/kv_cache_manager_v2/rawref/*.pyi',
+        'runtime/*__mypyc*.so',
     ]
 
 package_data += [
     'bindings/*.pyi',
-    'tools/plugin_gen/templates/*',
-    'bench/build/benchmark_config.yml',
+    'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',
+    "_torch/auto_deploy/config/*.yaml",
+    # Include CUDA source for fused MoE align extension so runtime JIT can find it in wheels
+    '_torch/auto_deploy/custom_ops/fused_moe/moe_align_kernel.cu',
+    '_torch/auto_deploy/custom_ops/fused_moe/triton_fused_moe_configs/*',
+    'usage/schemas/*.json',
 ]
 
 
-def download_precompiled(workspace: str) -> str:
+def download_precompiled(workspace: str, version: str) -> str:
     import glob
     import subprocess
 
     from setuptools.errors import SetupError
 
     cmd = [
-        "pip", "download", f"tensorrt_llm={get_version()}",
+        "python3", "-m", "pip", "download", f"tensorrt_llm=={version}",
         f"--dest={workspace}", "--no-deps",
         "--extra-index-url=https://pypi.nvidia.com"
     ]
@@ -137,18 +230,90 @@ def download_precompiled(workspace: str) -> str:
         return wheel_path
 
 
-def extract_from_precompiled(precompiled_location: str, package_data: List[str],
+def should_skip_precompiled_package_data(filename: str) -> bool:
+    """Return True for source-owned package data kept from local checkout.
+
+    Precompiled wheels own native bits. Source owns telemetry schema JSON.
+    Skip those wheel files so Python-only schema edits layer over old wheels.
+    """
+    filename = filename.replace("\\", "/")
+    source_owned_package_data_prefixes = ("tensorrt_llm/usage/schemas/", )
+    return filename.endswith(".json") and filename.startswith(
+        source_owned_package_data_prefixes)
+
+
+def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                              workspace: str) -> None:
-    """Extract package data (binaries and other materials) from a precompiled wheel to the working directory.
+    """Extract package data (binaries and other materials) from a precompiled wheel or local directory to the working directory.
     This allows skipping the compilation, and repackaging the binaries and Python files in the working directory to a new wheel.
+
+    Supports three source types:
+    - Local directory (git clone structure): e.g., /home/dev/TensorRT-LLM
+    - Local wheel file: e.g., /path/to/tensorrt_llm-*.whl
+    - Remote URL: Downloads and extracts from URL (wheel or tar.gz)
     """
     import fnmatch
+    import shutil
     import tarfile
     import zipfile
     from urllib.request import urlretrieve
 
     from setuptools.errors import SetupError
 
+    # Handle local directory (assuming repo structure)
+    if os.path.isdir(precompiled_location):
+        precompiled_location = os.path.abspath(precompiled_location)
+        print(
+            f"Using local directory as precompiled source: {precompiled_location}"
+        )
+        source_tensorrt_llm = os.path.join(precompiled_location, "tensorrt_llm")
+        if not os.path.isdir(source_tensorrt_llm):
+            raise SetupError(
+                f"Directory {precompiled_location} does not contain a tensorrt_llm folder."
+            )
+
+        # Walk through all files and match using fnmatch (consistent with wheel extraction)
+        for root, dirs, files in os.walk(source_tensorrt_llm):
+            for filename in files:
+                src_file = os.path.join(root, filename)
+                # Get path relative to precompiled_location (e.g., "tensorrt_llm/libs/libtensorrt_llm.so")
+                rel_path = os.path.relpath(src_file, precompiled_location)
+                dst_file = rel_path
+
+                # Skip yaml files
+                if dst_file.endswith(".yaml"):
+                    continue
+
+                # Keep source-owned package data local so Python-only schema edits
+                # layer over precompiled wheels.
+                if should_skip_precompiled_package_data(dst_file):
+                    continue
+
+                # Skip .py files EXCEPT for generated C++ extension wrappers
+                # (deep_gemm, deep_ep, flash_mla Python files are generated during build)
+                if dst_file.endswith(".py"):
+                    allowed_dirs = ("tensorrt_llm/deep_gemm/",
+                                    "tensorrt_llm/deep_ep/",
+                                    "tensorrt_llm/flash_mla/")
+                    if not any(dst_file.startswith(d) for d in allowed_dirs):
+                        continue
+
+                # Check if file matches any pattern using fnmatch (same as wheel extraction)
+                for filename_pattern in package_data:
+                    if fnmatch.fnmatchcase(rel_path,
+                                           f"tensorrt_llm/{filename_pattern}"):
+                        break
+                else:
+                    continue
+
+                dst_dir = os.path.dirname(dst_file)
+                if dst_dir:
+                    os.makedirs(dst_dir, exist_ok=True)
+                print(f"Copying {rel_path} from local directory.")
+                shutil.copy2(src_file, dst_file)
+        return
+
+    # Handle local file or remote URL
     if os.path.isfile(precompiled_location):
         precompiled_path = precompiled_location
         print(f"Using local precompiled file: {precompiled_path}.")
@@ -182,8 +347,30 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         for file in wheel.filelist:
-            if file.filename.endswith(".py"):
+            # Skip yaml files
+            if file.filename.endswith(".yaml"):
                 continue
+
+            # Keep source-owned package data local so Python-only schema edits
+            # layer over precompiled wheels.
+            if should_skip_precompiled_package_data(file.filename):
+                continue
+
+            # Skip .py files EXCEPT for generated C++ extension wrappers
+            # (deep_gemm, deep_ep, flash_mla Python files are generated during build)
+            if file.filename.endswith(".py"):
+                allowed_dirs = (
+                    "tensorrt_llm/deep_gemm/", "tensorrt_llm/deep_ep/",
+                    "tensorrt_llm/flash_mla/",
+                    "tensorrt_llm/runtime/kv_cache_manager_v2/rawref/__init__.py"
+                )
+                if not any(file.filename.startswith(d) for d in allowed_dirs):
+                    # Exclude all .py files in kv_cache_manager_v2 except rawref/__init__.py
+                    if file.filename.startswith("tensorrt_llm/runtime/kv_cache_manager_v2/") and \
+                       not file.filename.endswith("rawref/__init__.py"):
+                        continue
+                    continue
+
             for filename_pattern in package_data:
                 if fnmatch.fnmatchcase(file.filename,
                                        f"tensorrt_llm/{filename_pattern}"):
@@ -196,32 +383,106 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
             wheel.extract(file)
 
 
-use_precompiled: bool = os.getenv("TRTLLM_USE_PRECOMPILED") == "1"
-precompiled_location: str = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
-
-if precompiled_location:
-    use_precompiled = True
+precompiled: str | None = os.getenv("TRTLLM_USE_PRECOMPILED")
+precompiled_location: str | None = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
+use_precompiled: bool = (precompiled is not None
+                         and precompiled != "0") or (precompiled_location
+                                                     is not None)
 
 if use_precompiled:
     from tempfile import TemporaryDirectory
     with TemporaryDirectory() as tempdir:
         if not precompiled_location:
-            precompiled_location = download_precompiled(tempdir)
+            version = precompiled if precompiled != "1" else get_version()
+            precompiled_location = download_precompiled(tempdir, version)
         extract_from_precompiled(precompiled_location, package_data, tempdir)
 
 sanity_check()
+
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+    # We use find_packages with a custom exclude filter to handle the mypyc compiled modules.
+    # We want to exclude the .py source files for modules that are compiled to .so.
+    # We exclude the kv_cache_manager_v2 package entirely from the source list,
+    # but explicitly add back the rawref subpackage (which is not compiled by mypyc).
+    # The .so and .pyi files for kv_cache_manager_v2 are added via package_data.
+enable_mypyc = os.getenv("TRTLLM_ENABLE_MYPYC", "0") == "1"
+if enable_mypyc:
+    packages = find_packages(exclude=[
+        "tensorrt_llm.runtime.kv_cache_manager_v2",
+        "tensorrt_llm.runtime.kv_cache_manager_v2.*",
+    ]) + ["tensorrt_llm.runtime.kv_cache_manager_v2.rawref"]
+    exclude_package_data = {
+        "tensorrt_llm": [
+            "runtime/kv_cache_manager_v2/*.py",
+            "runtime/kv_cache_manager_v2/**/*.py"
+        ],
+        "tensorrt_llm.runtime.kv_cache_manager_v2": ["*.py", "**/*.py"],
+    }
+else:
+    packages = find_packages()
+    exclude_package_data = {}
+
+    # Remove mypyc shared objects from package_data to avoid packaging stale files
+    package_data = [
+        p for p in package_data if p not in [
+            'runtime/kv_cache_manager_v2/*.so',
+            'runtime/kv_cache_manager_v2/**/*.so', 'runtime/*__mypyc*.so'
+        ]
+    ]
+    # Ensure rawref is included
+    package_data.append('runtime/kv_cache_manager_v2/rawref/*.so')
+
+# Add vendored triton_kernels as an explicit top-level package.
+# This is vendored from the Triton project and kept at repo root so its
+# internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
+packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
+
+msa_package_dir = {"fmha_sm100": "3rdparty/MSA/python/fmha_sm100"}
+packages += ["fmha_sm100"]
+
+
+def get_build_state_options():
+    """Optionally redirect setuptools build state out of the source tree.
+
+    When TRTLLM_WHEEL_STAGING_DIR is set (e.g. by scripts/build_wheel.py
+    --build_root), the setuptools staging tree (build/) and *.egg-info are
+    written there instead of into the checkout. This keeps metadata-heavy
+    churn off slow network filesystems; behavior is unchanged when unset.
+    """
+    staging_dir = os.environ.get("TRTLLM_WHEEL_STAGING_DIR")
+    if not staging_dir:
+        return {}
+    staging = Path(staging_dir)
+    egg_base = staging / "egg-info"
+    egg_base.mkdir(parents=True, exist_ok=True)
+    return {
+        "build": {
+            "build_base": str(staging / "build")
+        },
+        "egg_info": {
+            "egg_base": str(egg_base)
+        },
+    }
+
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
     version=get_version(),
-    description='TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
-    long_description=
-    'TensorRT-LLM: A TensorRT Toolbox for Large Language Models',
+    description=
+    ('TensorRT LLM provides users with an easy-to-use Python API to define Large Language Models (LLMs) and supports '
+     'state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.'
+     ),
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     author="NVIDIA Corporation",
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
-    packages=find_packages(),
+    packages=packages,
+    package_dir=msa_package_dir,
+    exclude_package_data=exclude_package_data,
     # TODO Add windows support for python bindings.
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -230,16 +491,25 @@ setup(
         "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
+    options=get_build_state_options(),
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
-        'tensorrt_llm': package_data,
+        'tensorrt_llm':
+        package_data,
+        'triton_kernels': ['LICENSE', 'VERSION', 'README.md'],
+        'fmha_sm100': [
+            '*.py',
+            'csrc/**/*',
+            'cute/**/*',
+            'cutlass/include/**/*',
+            'cutlass/tools/util/include/**/*',
+            'cutlass/LICENSE.txt',
+        ],
     },
+    license_files=get_license(),
     entry_points={
         'console_scripts': [
-            'trtllm-build=tensorrt_llm.commands.build:main',
-            'trtllm-prune=tensorrt_llm.commands.prune:main',
-            'trtllm-refit=tensorrt_llm.commands.refit:main',
             'trtllm-bench=tensorrt_llm.commands.bench:main',
             'trtllm-serve=tensorrt_llm.commands.serve:main',
             'trtllm-eval=tensorrt_llm.commands.eval:main'
@@ -247,10 +517,13 @@ setup(
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
-        "devel": devel_deps,
+        "devel": devel_deps + grpc_smg_deps,
+        "mx": mx_deps,
+        "grpc-smg": grpc_smg_deps,
     },
     zip_safe=True,
     install_requires=required_deps,
     dependency_links=
     extra_URLs,  # Warning: Dependency links support has been dropped by pip 19.0
-    python_requires=">=3.7, <4")
+    python_requires=">=3.10, <4",
+    project_urls=get_project_urls())

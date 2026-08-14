@@ -4,12 +4,14 @@ All the bootstrapping is done with our original core work.
 """
 import copy
 import os
+import shlex
 import subprocess
 import tempfile
 import textwrap as tw
 
 from defs.runner_interface import PythonRunnerInterface
-from defs.trt_test_alternative import check_call, check_output, exists, makedirs
+from defs.trt_test_alternative import (check_call, check_output, exists,
+                                       makedirs, redact_args, redact_env)
 
 
 class PythonVenvRunnerImpl(PythonRunnerInterface):
@@ -22,7 +24,7 @@ class PythonVenvRunnerImpl(PythonRunnerInterface):
         venv_dir (str): Path to the virtualenv root directory, or None if this is
                         an externally-built virtualenv
         venv_bin (str): Path to the Python executable to use when running tests
-        workspace (str): Path to the TURTLE workspace
+        workspace (str): Path to the test workspace
     """
 
     def __init__(self, pip_opts, venv_dir, venv_bin, workspace):
@@ -116,14 +118,20 @@ class PythonVenvRunnerImpl(PythonRunnerInterface):
             new_env = os.environ
 
         if caller.__name__ == 'check_output':
-            result = subprocess.run(call_args,
-                                    env=new_env,
-                                    check=True,
-                                    capture_output=True,
-                                    **kwargs)
-            return result.stdout.decode('utf-8')
+            try:
+                result = subprocess.run(call_args,
+                                        env=new_env,
+                                        check=True,
+                                        capture_output=True,
+                                        **kwargs)
+                return result.stdout.decode('utf-8')
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Failed to run `{shlex.join(e.cmd)}`:\n"
+                                   f"Stdout: {e.stdout.decode()}\n"
+                                   f"Stderr: {e.stderr.decode()}\n")
         else:
-            print(f"Start subprocess with {caller}({call_args}, env={new_env})")
+            print(f"Start subprocess with {caller}({redact_args(call_args)}, "
+                  f"env={redact_env(new_env)})")
             return caller(call_args, env=new_env, **kwargs)
 
     def install_packages(self, packages):

@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/batch_manager/evictionPolicy.h"
@@ -111,6 +116,40 @@ TEST_F(LRUPolicyTest, ReleaseBlockTest)
     policy->releaseBlock(origPrimaryBlock);
 
     EXPECT_NE(origPrimaryBlock->getBlockId(), std::get<0>(policy->getFreeBlock(0))->getBlockId());
+}
+
+TEST_F(LRUPolicyTest, PooledPlaceholderReleaseReturnsToPlaceholderQueue)
+{
+    constexpr SizeType32 kPlaceholderCacheLevel = 2;
+    constexpr SizeType32 kWindowSize = 64;
+    auto constexpr kPooledPlaceholderBlockId = KVCacheBlock::kCachedBlocksRootId - 1;
+
+    std::vector<BlockPtr> allPlaceholderBlocksById(static_cast<size_t>(-kPooledPlaceholderBlockId) + 1);
+    auto pooledPlaceholder = KVCacheBlock::createPlaceholder(kPooledPlaceholderBlockId, kWindowSize);
+    allPlaceholderBlocksById[static_cast<size_t>(-kPooledPlaceholderBlockId)] = pooledPlaceholder;
+    policy->initializePlaceholders(allPlaceholderBlocksById);
+
+    EXPECT_EQ(policy->getNumFreeBlocks(kPlaceholderCacheLevel), 1);
+    auto [block, canOffload] = policy->getFreeBlock(0, /*wantPlaceholder=*/true);
+    EXPECT_EQ(block, pooledPlaceholder);
+    EXPECT_FALSE(canOffload);
+
+    policy->claimBlock(block);
+    EXPECT_EQ(policy->getNumFreeBlocks(kPlaceholderCacheLevel), 0);
+
+    policy->releaseBlock(block);
+    EXPECT_EQ(policy->getNumFreeBlocks(kPlaceholderCacheLevel), 1);
+    EXPECT_EQ(std::get<0>(policy->getFreeBlock(0, /*wantPlaceholder=*/true)), pooledPlaceholder);
+}
+
+TEST_F(LRUPolicyTest, SentinelPlaceholderReleaseDoesNotEnterPlaceholderQueue)
+{
+    constexpr SizeType32 kPlaceholderCacheLevel = 2;
+
+    auto sentinelPlaceholder = KVCacheBlock::createPlaceholder();
+    policy->releaseBlock(sentinelPlaceholder);
+
+    EXPECT_EQ(policy->getNumFreeBlocks(kPlaceholderCacheLevel), 0);
 }
 
 TEST_F(LRUPolicyTest, LRUTest)

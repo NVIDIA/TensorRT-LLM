@@ -9,7 +9,7 @@ involves a sequence of batched matrix multiplications, a softmax operation, and 
 as described in the [Attention Is All You Need](https://arxiv.org/abs/1706.03762) paper.
 [Multi-query Attention (MQA)](https://arxiv.org/abs/1911.02150) and [Group-query Attention (GQA)](https://arxiv.org/abs/2307.09288) are
 variants of MHA that use fewer KV heads than the number of query heads.
-TensorRT-LLM provides several implementations using different backends in `tensorrt_llm/_torch/attention_backend/`.
+TensorRT LLM provides several implementations using different backends in `tensorrt_llm/_torch/attention_backend/`.
 The following sections explain how to use these implementations and provide a brief guide on implementing new backends.
 
 ## Attention Backends
@@ -94,6 +94,7 @@ Its `forward` accepts the following arguments:
 | k | Tensor | Key tensor with shape `(num_tokens, num_kv_heads * head_dim)`. |
 | v | Tensor | Value tensor with shape `(num_tokens, num_kv_heads * head_dim)`. |
 | metadata | AttentionMetadata | Metadata for the attention operation. |
-| attention_mask | AttentionMask | Optional attention mask. If None, causal mask is applied. |
+| forward_args | AttentionForwardArgs | Optional per-forward arguments such as the attention mask, output buffers and scales, RoPE and MRoPE inputs, MLA buffers, and sparse-attention inputs. |
+| **kwargs | Any | Temporary compatibility path for fields declared by `AttentionForwardArgs`; unknown fields raise an error. |
 
-For example, the Flashinfer backend calls `append_paged_kv_cache` and then wrapper's `run` to perform the attention operation here.
+For example, the FlashInfer backend calls `append_paged_kv_cache` when it owns the KV-cache update, then calls the prefill, decode, or ragged-prefill wrapper's `run` method using the plan cached in `FlashInferAttentionMetadata`.

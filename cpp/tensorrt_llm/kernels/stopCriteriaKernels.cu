@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/stopCriteriaKernels.h"
@@ -21,8 +22,8 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -249,4 +250,5 @@ void invokeExplicitEOSCriterion(TokenIdType const** outputIds, TokenIdType const
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

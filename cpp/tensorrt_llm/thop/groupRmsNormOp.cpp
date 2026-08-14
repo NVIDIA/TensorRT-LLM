@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/groupRmsNormKernels/groupRmsNormKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -27,6 +28,8 @@
 #include <stdexcept>
 #include <torch/extension.h>
 #include <vector>
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -98,9 +101,9 @@ void groupRMSNormBase(torch::TensorList const& inputs, torch::TensorList const& 
         /* Handle dtype conversion */                                                                                  \
         switch (dtype)                                                                                                 \
         {                                                                                                              \
-        case torch::ScalarType::Half: params.dtype = nvinfer1::DataType::kHALF; break;                                 \
-        case torch::ScalarType::BFloat16: params.dtype = nvinfer1::DataType::kBF16; break;                             \
-        case torch::ScalarType::Float: params.dtype = nvinfer1::DataType::kFLOAT; break;                               \
+        case torch::ScalarType::Half: params.dtype = tensorrt_llm::DataType::kHALF; break;                             \
+        case torch::ScalarType::BFloat16: params.dtype = tensorrt_llm::DataType::kBF16; break;                         \
+        case torch::ScalarType::Float: params.dtype = tensorrt_llm::DataType::kFLOAT; break;                           \
         default: TORCH_CHECK(false, "Unsupported data type");                                                          \
         }                                                                                                              \
         tensorrt_llm::kernels::group_rms_norm::GroupRMSNormBaseKernelLauncher<n>(params);                              \
@@ -179,9 +182,9 @@ void groupRMSNormLargeBatch(torch::TensorList const& inputs, torch::TensorList c
     // Handle dtype conversion
     switch (dtype)
     {
-    case torch::ScalarType::Half: params.dtype = nvinfer1::DataType::kHALF; break;
-    case torch::ScalarType::BFloat16: params.dtype = nvinfer1::DataType::kBF16; break;
-    case torch::ScalarType::Float: params.dtype = nvinfer1::DataType::kFLOAT; break;
+    case torch::ScalarType::Half: params.dtype = tensorrt_llm::DataType::kHALF; break;
+    case torch::ScalarType::BFloat16: params.dtype = tensorrt_llm::DataType::kBF16; break;
+    case torch::ScalarType::Float: params.dtype = tensorrt_llm::DataType::kFLOAT; break;
     default: TORCH_CHECK(false, "Unsupported data type");
     }
 
@@ -258,9 +261,9 @@ void groupRMSNormHeuristic(torch::TensorList const& inputs, torch::TensorList co
         /* Handle dtype conversion */                                                                                  \
         switch (dtype)                                                                                                 \
         {                                                                                                              \
-        case torch::ScalarType::Half: params.dtype = nvinfer1::DataType::kHALF; break;                                 \
-        case torch::ScalarType::BFloat16: params.dtype = nvinfer1::DataType::kBF16; break;                             \
-        case torch::ScalarType::Float: params.dtype = nvinfer1::DataType::kFLOAT; break;                               \
+        case torch::ScalarType::Half: params.dtype = tensorrt_llm::DataType::kHALF; break;                             \
+        case torch::ScalarType::BFloat16: params.dtype = tensorrt_llm::DataType::kBF16; break;                         \
+        case torch::ScalarType::Float: params.dtype = tensorrt_llm::DataType::kFLOAT; break;                           \
         default: TORCH_CHECK(false, "Unsupported data type");                                                          \
         }                                                                                                              \
                                                                                                                        \
@@ -280,10 +283,12 @@ void groupRMSNormHeuristic(torch::TensorList const& inputs, torch::TensorList co
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("group_rms_norm_base", &torch_ext::groupRMSNormBase);
-    m.impl("group_rms_norm_large_batch", &torch_ext::groupRMSNormLargeBatch);
+    m.impl("group_rms_norm_base", &tensorrt_llm::torch_ext::groupRMSNormBase);
+    m.impl("group_rms_norm_large_batch", &tensorrt_llm::torch_ext::groupRMSNormLargeBatch);
     // Use groupRMSNormHeuristic which automatically selects between regular and large batch kernels
-    m.impl("group_rms_norm_heuristic", &torch_ext::groupRMSNormHeuristic);
+    m.impl("group_rms_norm_heuristic", &tensorrt_llm::torch_ext::groupRMSNormHeuristic);
 }

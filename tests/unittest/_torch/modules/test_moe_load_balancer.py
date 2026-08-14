@@ -1,17 +1,27 @@
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
 import torch
+from mpi4py import MPI
+from transformers import PretrainedConfig
 
-from tensorrt_llm._torch.modules.moe_load_balancer import (
-    MoeLoadBalancer, SingleLayerMoeLoadBalancer, get_moe_load_balancer,
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
+    MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
+    get_moe_load_balancer, maybe_create_moe_load_balancer,
     moe_load_balancer_add_single_layer)
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
+from tensorrt_llm.mapping import Mapping
 
 
 class TestMoeLoadBalancer(unittest.TestCase):
     """
     Test cases for the MoeLoadBalancer class.
     """
+
+    def setUp(self):
+        os.environ["TLLM_HOST_ACCESSIBLE_ALLOW_MANAGED_FALLBACK"] = "1"
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_moe_load_balancer_init(self, mock_load_balancer_impl):
@@ -154,6 +164,26 @@ class TestMoeLoadBalancer(unittest.TestCase):
         self.assertIsNone(result)
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_kimi_k25_creates_moe_load_balancer(self, mock_load_balancer_impl):
+        """Kimi-K2.5 wraps a DeepSeek MoE text model and must setup EPLB."""
+
+        mapping = Mapping(world_size=4, rank=0, tp_size=4, moe_ep_size=4)
+        pretrained_config = PretrainedConfig()
+        pretrained_config.architectures = ['KimiK25ForConditionalGeneration']
+        model_config = ModelConfig(pretrained_config=pretrained_config,
+                                   mapping=mapping,
+                                   moe_load_balancer=MoeLoadBalancerConfig(
+                                       num_slots=416, layer_updates_per_iter=2))
+
+        with maybe_create_moe_load_balancer(model_config, mapping) as balancer:
+            self.assertIsInstance(balancer, MoeLoadBalancer)
+            self.assertEqual(model_config.moe_load_balancer.num_local_slots,
+                             104)
+            self.assertEqual(get_moe_load_balancer(), balancer)
+
+        mock_load_balancer_impl.assert_called_once_with(0, 4, 2)
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_exception_in_context(self, mock_load_balancer_impl):
         """Test handling of exceptions inside the context manager."""
 
@@ -186,7 +216,9 @@ class TestMoeLoadBalancer(unittest.TestCase):
 
         # Setup
         mock_single_layer_impl = MagicMock()
-        layer = SingleLayerMoeLoadBalancer(mock_single_layer_impl, None)
+        layer = SingleLayerMoeLoadBalancer(mock_single_layer_impl,
+                                           MPI.COMM_WORLD,
+                                           expert_count=4)
 
         # Mock out torch.ops.trtllm functions
         with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage') as mock_wait, \
@@ -198,13 +230,13 @@ class TestMoeLoadBalancer(unittest.TestCase):
             # add_weight_slot
             mock_weight = MagicMock()
             layer._add_weight_slot(1, "weight1", mock_weight)
-            mock_single_layer_impl.add_weight_slot.assert_called_once_with(
+            mock_single_layer_impl.add_single_weight_slot.assert_called_once_with(
                 1, "weight1", mock_weight)
 
             # add_host_weight
             mock_host_weight = MagicMock()
             layer._add_host_weight(2, "weight2", mock_host_weight)
-            mock_single_layer_impl.add_host_weight.assert_called_once_with(
+            mock_single_layer_impl.add_single_host_weight.assert_called_once_with(
                 2, "weight2", mock_host_weight)
 
             # set_initial_weight_assignments
@@ -215,20 +247,18 @@ class TestMoeLoadBalancer(unittest.TestCase):
 
             # wait_for_gpu_stage
             mock_wait.return_value = torch.tensor([1])
-            result = layer.wait_for_gpu_stage()
+            layer.start_wait_gpu_stage()
+            layer.done_wait_gpu_stage()
+            result = layer.statistic_flag_tensor
             mock_wait.assert_called_once_with(
                 mock_single_layer_impl.get_pointer())
             self.assertEqual(result, mock_wait.return_value)
 
-            # set_cpu_stage
-            layer.set_cpu_stage()
-            mock_set_cpu.assert_called_once_with(
-                mock_single_layer_impl.get_pointer())
-
             # statistic
             mock_expert_ids = torch.tensor([[0, 1], [2, 3]])
             mock_enabled = torch.tensor([1])
-            layer.statistic(mock_expert_ids, mock_enabled, True, False)
+            layer.statistic_flag_tensor = mock_enabled
+            layer.update_statistic_with_global_ids(mock_expert_ids, True, False)
             mock_statistic.assert_called_once_with(
                 mock_expert_ids, mock_enabled,
                 mock_single_layer_impl.get_pointer(), True, False)
@@ -237,9 +267,13 @@ class TestMoeLoadBalancer(unittest.TestCase):
             mock_selected_experts = torch.tensor([[0, 1], [2, 3]])
             mock_route.return_value = torch.tensor([[0, 1], [2, 3]])
             result = layer.route(mock_selected_experts)
-            mock_route.assert_called_once_with(
-                mock_selected_experts, mock_single_layer_impl.get_pointer())
             assert torch.equal(result, mock_route.return_value)
+
+            # set_cpu_stage
+            layer.start_set_cpu_stage()
+            layer.done_set_cpu_stage()
+            mock_set_cpu.assert_called_once_with(
+                mock_single_layer_impl.get_pointer())
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_moe_load_balancer_lifecycle_methods(self, mock_load_balancer_impl):
@@ -260,18 +294,38 @@ class TestMoeLoadBalancer(unittest.TestCase):
         mock_load_balancer_impl.return_value.set_warm_up_iter_count.assert_called_once_with(
             10)
 
-        # start_iter
-        balancer.start_iter(1, True, True)
-        mock_load_balancer_impl.return_value.start_iter.assert_called_once_with(
-            1, True, True)
+        # reconfigure_mask_only
+        balancer.reconfigure_mask_only([2])
+        mock_load_balancer_impl.return_value.reconfigure_mask_only.assert_called_once_with(
+            [2])
 
-        # end_iter
-        balancer.end_iter(1)
-        mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(1)
+        balancer.set_iter_info(True, True)
+
+        with MoeLoadBalancerIterContext(balancer):
+            mock_load_balancer_impl.return_value.start_iter.assert_called_once_with(
+                0, True, True)
+
+        mock_load_balancer_impl.return_value.end_iter.assert_called_once_with(0)
 
         # shutdown
         balancer.shutdown()
         mock_load_balancer_impl.return_value.shutdown.assert_called_once()
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_reconfigure_mask_only_rejects_active_iteration(
+            self, mock_load_balancer_impl):
+        """Test mask-only reconfigure is rejected during an active iteration."""
+
+        torch.cuda.set_device(0)
+
+        balancer = MoeLoadBalancer(0, 4, 2)
+        balancer.in_iter = True
+
+        with self.assertRaisesRegex(RuntimeError, "iteration is active"):
+            balancer.reconfigure_mask_only([2])
+
+        mock_load_balancer_impl.return_value.reconfigure_mask_only.assert_not_called(
+        )
 
     def test_real_statistic_kernel(self):
         """Test the real statistic kernel functionality."""
@@ -288,6 +342,8 @@ class TestMoeLoadBalancer(unittest.TestCase):
         # Create a real MoeLoadBalancer
         balancer = MoeLoadBalancer(ep_rank, ep_size, 1)
 
+        balancer.set_use_gpu_memcpy(True)
+
         # Add a layer with initial weight assignments
         # Each slot is assigned to exactly one expert initially
         layer = balancer.add_layer(expert_count, top_k, slots_per_rank)
@@ -297,9 +353,8 @@ class TestMoeLoadBalancer(unittest.TestCase):
         # Finalize the model
         balancer.finalize_model()
 
-        # Start iteration - enable statistic, disable weight update
-        iter_id = 0
-        balancer.start_iter(iter_id, True, False)
+        # enable statistic, disable weight update
+        balancer.set_iter_info(True, False)
 
         # Create sample token data - each token selects 2 experts
         # 4 tokens, each selecting 2 experts
@@ -314,17 +369,18 @@ class TestMoeLoadBalancer(unittest.TestCase):
             device="cuda")
 
         try:
-            # Wait for GPU stage and get enabled flag
-            enabled = layer.wait_for_gpu_stage()
+            with MoeLoadBalancerIterContext(balancer):
+                # Wait for GPU stage and get enabled flag
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
 
-            # Run statistic - just test it runs without error
-            layer.statistic(gathered_raw_expert_ids, enabled, True, True)
+                # Run statistic - just test it runs without error
+                layer.update_statistic_with_global_ids(gathered_raw_expert_ids,
+                                                       True, True)
 
-            # Set CPU stage to signal completion
-            layer.set_cpu_stage()
-
-            # End iteration
-            balancer.end_iter(iter_id)
+                # Set CPU stage to signal completion
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
 
             # Test passed if we got here without exceptions
             self.assertTrue(True, "Statistic kernel ran successfully")
@@ -350,6 +406,8 @@ class TestMoeLoadBalancer(unittest.TestCase):
         # Create a real MoeLoadBalancer
         balancer = MoeLoadBalancer(ep_rank, ep_size, 1)
 
+        balancer.set_use_gpu_memcpy(True)
+
         # Add a layer with known initial weight assignments
         layer = balancer.add_layer(expert_count, top_k, slots_per_rank)
 
@@ -360,9 +418,8 @@ class TestMoeLoadBalancer(unittest.TestCase):
         # Finalize the model
         balancer.finalize_model()
 
-        # Start iteration - enable statistic, disable weight update
-        iter_id = 0
-        balancer.start_iter(iter_id, True, False)
+        # enable statistic, disable weight update
+        balancer.set_iter_info(True, False)
 
         # Create sample token data - tokens selecting different experts
         token_selected_experts = torch.tensor(
@@ -376,17 +433,17 @@ class TestMoeLoadBalancer(unittest.TestCase):
             device="cuda")
 
         try:
-            # Wait for GPU stage
-            layer.wait_for_gpu_stage()
+            with MoeLoadBalancerIterContext(balancer):
+                # Wait for GPU stage
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
 
-            # Run routing
-            routed_slots = layer.route(token_selected_experts)
+                # Run routing
+                routed_slots = layer.route(token_selected_experts)
 
-            # Set CPU stage
-            layer.set_cpu_stage()
-
-            # End iteration
-            balancer.end_iter(iter_id)
+                # Set CPU stage
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
 
             # Verify results - with our initial assignment, expert i should map to slot i
             expected_slots = torch.tensor(

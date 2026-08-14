@@ -1,41 +1,109 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import concurrent.futures
+import ctypes
 import os
+import re
+import sys
+import threading
+import traceback
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from typing import Any, Callable, List, NamedTuple, Optional
 
+from strenum import StrEnum
+
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.bindings.executor import Response
-from tensorrt_llm.llmapi.utils import print_colored_debug
-from tensorrt_llm.logger import logger
+from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
-from ..llmapi.utils import print_colored_debug
+from ..llmapi.utils import logger_debug
+from ..logger import logger
 
-PERIODICAL_RESP_IN_AWAIT = os.getenv(
-    "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT") == "1"
+
+class LlmLauncherEnvs(StrEnum):
+    # Spawn a process for the LLM-API Proxy
+    TLLM_SPAWN_PROXY_PROCESS = "TLLM_SPAWN_PROXY_PROCESS"
+    TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR = "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR"
+    TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = "TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"
+
+    # Whether to use periodical responses handler in await_responses
+    TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
+
+
+_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY: bytes | None = None
+_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _scrub_process_env_value(key_name: str, value: str) -> None:
+    if sys.platform != "linux":
+        return
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.getenv.restype = ctypes.c_void_p
+    value_ptr = libc.getenv(os.fsencode(key_name))
+    if value_ptr:
+        ctypes.memset(value_ptr, 0, len(os.fsencode(value)))
+
+
+def _normalize_spawn_proxy_process_ipc_hmac_key(key: str) -> bytes:
+    if not _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN.fullmatch(key):
+        raise ValueError("IPC HMAC key must be a 64-character hex string.")
+
+    try:
+        key_bytes = bytes.fromhex(key)
+    except ValueError as exc:
+        raise ValueError(
+            "IPC HMAC key must be a 64-character hex string.") from exc
+
+    if len(key_bytes) != 32:
+        raise ValueError("IPC HMAC key must be 32 bytes.")
+    return key_bytes
 
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     ''' Get the IPC address for the spawn proxy process dynamically. '''
-    return os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR")
+    return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR)
 
 
-def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes | None:
+def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
     ''' Get the HMAC key for the spawn proxy process dynamically. '''
-    if key := os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY"):
-        return bytes.fromhex(key)
+    global _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+    if _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY is not None:
+        return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+
+    env_name = LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value
+    key = os.environ.get(env_name)
+    if key is None:
+        raise RuntimeError(
+            f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY} is not set. "
+            "HMAC encryption is required for IPC communication.")
+    _scrub_process_env_value(env_name, key)
+    os.environ.pop(env_name, None)
+
+    _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
+        _normalize_spawn_proxy_process_ipc_hmac_key(key))
+    return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 
 
 def get_spawn_proxy_process_env() -> bool:
     ''' Get the environment variable for the spawn proxy process dynamically. '''
-    return os.getenv("TLLM_SPAWN_PROXY_PROCESS") == "1"
-
-
-if PERIODICAL_RESP_IN_AWAIT:
-    logger.info("Using periodical responses in await_responses")
+    return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS) == "1"
 
 
 def create_mpi_comm_session(
@@ -44,15 +112,15 @@ def create_mpi_comm_session(
     ) == 0, f"create_mpi_comm_session must be called by rank 0, but it was called by rank {mpi_rank()}"
     if get_spawn_proxy_process_env():
         assert get_spawn_proxy_process_ipc_addr_env(
-        ), "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR is not set."
-        print_colored_debug(
+        ), f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR} is not set."
+        logger_debug(
             f"Using RemoteMpiPoolSessionClient to bind to external MPI processes at {get_spawn_proxy_process_ipc_addr_env()}\n",
             "yellow")
         hmac_key = get_spawn_proxy_process_ipc_hmac_key_env()
         return RemoteMpiCommSessionClient(
             addr=get_spawn_proxy_process_ipc_addr_env(), hmac_key=hmac_key)
     else:
-        print_colored_debug(
+        logger_debug(
             f"Using MpiCommSession to bind to external MPI processes\n",
             "yellow")
         return MpiCommSession(n_workers=n_workers)
@@ -68,6 +136,23 @@ def has_event_loop() -> bool:
 
 class RequestError(RuntimeError):
     ''' The error raised when the request is failed. '''
+
+
+class EngineDeadError(RuntimeError):
+    """Raised by pending and new requests once the engine is known dead.
+
+    Sticky and engine-level (unlike the per-request ``RequestError``): when a
+    worker process dies, every queued ``GenerationResult`` is unblocked with this
+    error and every subsequent ``submit()`` raises it immediately, instead of
+    blocking forever on a response queue whose producer is gone.
+    """
+
+    def __init__(self, root_cause: Optional[BaseException] = None):
+        msg = "Engine has died"
+        if root_cause is not None:
+            msg += f": {type(root_cause).__name__}: {root_cause}"
+        super().__init__(msg)
+        self.root_cause = root_cause
 
 
 class ProcessPoolExecutorSession(MpiSession):
@@ -118,30 +203,117 @@ class IntraProcessQueue:
     def close(self):
         pass
 
+    def drain(self) -> list:
+        """Non-blocking drain: return all currently available messages."""
+        results = []
+        while True:
+            try:
+                results.append(self.queue.get_nowait())
+            except Empty:
+                break
+        return results
+
     def poll(self, timeout=None) -> bool:
-        try:
-            # Try to get an item from the queue without blocking
-            item = self.queue.get(timeout=timeout)
-            # If successful, put the item back to not alter the state
-            self.queue.put(item)
-            return True
-        except Empty:
-            # If the queue thread is empty, return False
+        with self.queue.not_empty:
+            if self.queue._qsize() > 0:
+                return True
+            if timeout is not None and timeout > 0:
+                self.queue.not_empty.wait(timeout=timeout)
+                return self.queue._qsize() > 0
             return False
 
 
 class WorkerCommIpcAddrs(NamedTuple):
     ''' IPC addresses (str) and HMAC keys (bytes) for communication with the worker processes. '''
     request_queue_addr: tuple[str, Optional[bytes]]
-    request_error_queue_addr: tuple[str, Optional[bytes]]
+    worker_init_status_queue_addr: tuple[str, Optional[bytes]]
     result_queue_addr: tuple[str, Optional[bytes]]
-    stats_queue_addr: tuple[str, Optional[bytes]]
-    kv_cache_events_queue_addr: tuple[str, Optional[bytes]]
+    resource_governor_queue_addr: Optional[tuple[str, Optional[bytes]]] = None
+    # Multi-frontend serving: one result lane per frontend. When set, the
+    # rank0 worker BINDS the request queue (PULL) and routes responses to
+    # these lanes; result_queue_addr then aliases lane 0 (the launcher).
+    frontend_result_queue_addrs: Optional[list[tuple[str,
+                                                     Optional[bytes]]]] = None
+
+
+# Multi-frontend client_id namespacing: a FRONTEND_ID_BITS-wide frontend id
+# sits just below the sign bit -- bit 63 stays clear so ids remain positive
+# in signed-int64 contexts -- and the low bits carry the per-frontend
+# request counter. A stray un-namespaced (small) id reads as frontend 0,
+# the launcher.
+FRONTEND_ID_BITS = 6
+# Keep llm_args.num_serve_frontends le= in sync (it cannot import this
+# module; test_multi_frontend_routing pins the two together).
+MAX_NUM_FRONTENDS = 1 << FRONTEND_ID_BITS
+FRONTEND_ID_SHIFT = 63 - FRONTEND_ID_BITS
+FRONTEND_COUNTER_MASK = (1 << FRONTEND_ID_SHIFT) - 1
+
+
+def get_frontend_id(client_id: Optional[int]) -> int:
+    """Extract the originating frontend id from a namespaced client id."""
+    if not isinstance(client_id, int):
+        return 0
+    return client_id >> FRONTEND_ID_SHIFT
+
+
+def namespace_client_id(frontend_id: int, client_id: int) -> int:
+    """Embed frontend_id in the top bits of a per-frontend client id."""
+    return (frontend_id << FRONTEND_ID_SHIFT) | (client_id
+                                                 & FRONTEND_COUNTER_MASK)
+
+
+def frontend_lane_index(client_id: Optional[int], num_lanes: int) -> int:
+    """The result-lane index for a response's originating frontend.
+
+    None (e.g. ADP dummy requests) and out-of-range frontend ids go to
+    lane 0, the launcher, which silently discards them like today.
+    """
+    frontend_id = get_frontend_id(client_id)
+    return frontend_id if frontend_id < num_lanes else 0
+
+
+def bucket_responses_by_frontend(responses: list,
+                                 num_frontends: int) -> list[list]:
+    """Bucket responses by frontend_lane_index of their client_id."""
+    buckets = [[] for _ in range(num_frontends)]
+    for rsp in responses:
+        buckets[frontend_lane_index(rsp.client_id, num_frontends)].append(rsp)
+    return buckets
+
+
+def multi_frontend_request_addr(ipc_dir: str) -> str:
+    """The request ingress bound by the rank0 worker; frontends PUSH-connect."""
+    return f"ipc://{os.path.join(ipc_dir, 'request.sock')}"
+
+
+def multi_frontend_result_addr(ipc_dir: str, frontend_id: int) -> str:
+    """The result lane bound by a frontend; worker/postproc PUSH-connect."""
+    return f"ipc://{os.path.join(ipc_dir, f'result_{frontend_id}.sock')}"
 
 
 def is_llm_response(instance):
-    from tensorrt_llm._torch.pyexecutor.llm_request import \
-        LlmResponse as PyLlmResponse
+    # Duck typing, expect one of:
+    #  tensorrt_llm.bindings.executor.Response
+    #  tensorrt_llm._torch.pyexecutor.llm_request.LlmResponse
+    # Avoid testing for "result", because an error bindings.executor.Response
+    # throws when accessing its result property.
+    return hasattr(instance, "has_error")
 
-    from .result import ResponseWrapper
-    return isinstance(instance, (Response, PyLlmResponse, ResponseWrapper))
+
+def print_alive_threads():
+    assert enable_llm_debug(
+    ), "print_alive_threads must be called with enable_llm_debug() enabled"
+
+    # Print all alive threads for debugging
+    alive_threads = [t for t in threading.enumerate() if t.is_alive()]
+    logger.info(
+        f'All alive threads after shutdown: {[t.name for t in alive_threads]}\n',
+        "red")
+    for t in alive_threads:
+        logger.info(f'Thread {t.name} (daemon={t.daemon}) is still alive')
+        # Get the stack trace for this thread
+        stack = sys._current_frames().get(t.ident)
+        if stack is not None:
+            logger.info(f'Stack trace for thread {t.name}:')
+            traceback.print_stack(stack, file=sys.stdout)
+            logger.info('')

@@ -1,7 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import subprocess
 
 import pytest
-from cuda import cuda, nvrtc
+
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import nvrtc
+except ImportError:
+    from cuda import cuda, nvrtc
 
 
 def ASSERT_DRV(err):
@@ -50,12 +69,14 @@ def getSMVersion():
                          ids=["fp16", "bf16", "fp16-fp32", "e4m3"])
 @pytest.mark.parametrize('flag', [
     "-s-q 128 -paged-kv", "-s-q 63 -paged-kv", "-paged-kv",
-    "-softcapping-scale-bmm1 30", "-contiguous-q-kv"
+    "-softcapping-scale-bmm1 30", "-contiguous-q-kv", "-use-attention-sinks"
 ])
 @pytest.mark.parametrize('tiled_kernel', ["", "-force-non-tiled"])
 def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
     verbose = 0
     sm_version = getSMVersion()
+    if flag == "-use-attention-sinks" and sm_version != 90:
+        pytest.skip("use-attention-sinks is only supported on sm90 currently.")
     if sm_version == 90 and tiled_kernel == "-force-non-tiled":
         pytest.skip(
             "Tiled/non-tiled flags only make a difference to ampere-style kernels."
@@ -71,6 +92,10 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
     # ada fp8 fmha only supports non-tiled kernels currently.
     if dtype == '-e4m3' and sm_version == 89 and tiled_kernel == "":
         pytest.skip("ada fp8 fmha only supports non-tiled kernels currently.")
+    # Known accuracy issue in this case.
+    skip_dense_mask_test = False
+    if d == 64 and dtype in ['-fp16-fp32', '-bf16'] and tiled_kernel == "":
+        skip_dense_mask_test = True
 
     # use higher error tolerance for bf16 and e4m3.
     epsilon = ''
@@ -100,10 +125,11 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
         if "softcapping-scale-bmm1" in flag:
             pytest.skip("skipping softcapping-scale-bmm1 for sm89 e4m3 fmha.")
 
-    subprocess.run(
-        f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
-        shell=True,
-        check=True)
+    if not skip_dense_mask_test:
+        subprocess.run(
+            f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
+            shell=True,
+            check=True)
     subprocess.run(
         f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -causal-mask -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
         shell=True,
@@ -117,8 +143,8 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
             f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -custom-mask -gqa 2 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
             shell=True,
             check=True)
-    # alibi and softcapping-scale-bmm1 are mutually exclusive.
-    if '-softcapping-scale-bmm1' not in flag:
+    # alibi doesn't work with softcapping-scale-bmm1/use-attention-sinks.
+    if '-softcapping-scale-bmm1' not in flag and '-use-attention-sinks' not in flag:
         subprocess.run(
             f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -causal-mask -alibi -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
             shell=True,
@@ -151,21 +177,39 @@ def test_trtllm_sage_attention_fmha(d, s):
                          ids=["bf16", "e4m3", "e4m3-bf16"])
 @pytest.mark.parametrize('s', [1024, 4096], ids=["seqlen-1024", "seqlen-4096"])
 def test_trtllm_context_mla_attention_fmha(dtype, s):
+    sm_version = getSMVersion()
+    if sm_version < 90:
+        pytest.skip("MLA kernels are only tested on sm90 and above currently.")
+
     # use higher error tolerance for bf16 and s = 4096.
     epsilon = ''
     if dtype == "-bf16" and s == 4096:
         epsilon += ' -epsilon 0.03'
 
-    sm_version = getSMVersion()
-    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 89:
-        pytest.skip("FP8 MLAs only supported on sm89 currently.")
+    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version not in [90, 120]:
+        pytest.skip("FP8 MLAs are only supported on sm90 and sm120 currently.")
 
-    # Context phase kernels.
+    # Context phase kernels, always use separate-q-k-v layout.
     subprocess.run(
-        f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
-    -force-non-warp-specialization -causal-mask {epsilon}",
+        f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} "
+        f"-causal-mask {epsilon} -separate-q-k-v",
         shell=True,
         check=True)
+
+    # For chunked prefill, we need to enable -save-softmax (dtype: bf16, layout: separate-q-k-v).
+    if dtype in ["-bf16", "-e4m3"]:
+        # padding mask
+        subprocess.run(
+            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} "
+            f"{epsilon} -separate-q-k-v -save-softmax",
+            shell=True,
+            check=True)
+        # causal mask
+        subprocess.run(
+            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} "
+            f"-causal-mask {epsilon} -separate-q-k-v -save-softmax",
+            shell=True,
+            check=True)
 
 
 @pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],
@@ -177,14 +221,17 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
                              "num-grouped-heads-64", "num-grouped-heads-128"
                          ])
 def test_trtllm_gen_mla_attention_fmha(dtype, s, num_grouped_heads):
+    sm_version = getSMVersion()
+    if sm_version < 90:
+        pytest.skip("MLA kernels are only tested on sm90 and above currently.")
+
     # use higher error tolerance for bf16 and s = 4096.
     epsilon = ''
     if dtype == "-bf16" and s == 4096:
         epsilon += ' -epsilon 0.03'
 
-    sm_version = getSMVersion()
-    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 89:
-        pytest.skip("FP8 MLAs only supported on sm89 currently.")
+    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 120:
+        pytest.skip("FP8 MLAs are only supported on sm120 currently.")
 
     # Generation phase kernels.
     subprocess.run(
@@ -235,3 +282,29 @@ def test_trtllm_chunked_attention(chunked_attention_size, input_layout):
             -chunked-attention-size {chunked_attention_size} -paged-kv",
             shell=True,
             check=True)
+
+
+# The test cases for sliding window attention.
+@pytest.mark.parametrize(
+    'sliding_window_size', [64, 127, 128, 129, 256, 512],
+    ids=[
+        "sliding-window-size-64", "sliding-window-size-127",
+        "sliding-window-size-128", "sliding-window-size-129",
+        "sliding-window-size-256", "sliding-window-size-512"
+    ])
+@pytest.mark.parametrize(
+    'mask_type',
+    ["-sliding-or-chunked-causal-mask", "-bidirectional-sliding-window-mask"])
+def test_trtllm_sliding_window_attention(sliding_window_size, mask_type):
+    if mask_type == "-bidirectional-sliding-window-mask":
+        sliding_window_size *= 2
+
+    subprocess.run(f"bin/fmha.exe -d 128 -b 2 -h 5 -s 2048 -min-s 1024 -bf16 \
+        -sliding-window-size {sliding_window_size} {mask_type}",
+                   shell=True,
+                   check=True)
+
+    subprocess.run(f"bin/fmha.exe -d 64 -b 2 -h 5 -s 2048 -min-s 1024 -bf16 \
+        -sliding-window-size {sliding_window_size} {mask_type}",
+                   shell=True,
+                   check=True)

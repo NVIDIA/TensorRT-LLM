@@ -13,13 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
-namespace tensorrt_llm::kernels::ar_fusion
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion
 {
 template <int NRanks>
 struct SyncComm
@@ -67,9 +71,9 @@ struct LamportComm
     {
         counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
         flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
-        clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
+        clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
         flag_value = *flag_ptr;
-        int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
+        auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
         clear_size = *clear_ptr;
         int data_offset = flag_value % 3;
         int clear_offset = (flag_value + 2) % 3;
@@ -85,7 +89,7 @@ struct LamportComm
         }
     }
 
-    __device__ __forceinline__ void update(int new_clear_size)
+    __device__ __forceinline__ void update(int64_t new_clear_size)
     {
         if (blockIdx.x == 0 && threadIdx.x == 0)
         {
@@ -100,10 +104,10 @@ struct LamportComm
 
     int* counter_ptr;
     int* flag_ptr;
-    int* clear_ptr;
+    int64_t* clear_ptr;
     uint8_t* data_bufs[NRanks];
     uint8_t* clear_buf;
-    int clear_size;
+    int64_t clear_size;
     int flag_value;
 };
 
@@ -136,6 +140,7 @@ public:
             {
                 st_flag(m_target_flag + flag_idx * NRanks, m_flag_value);
             }
+
             while (ld_flag(m_current_flag) == prev_flag(m_flag_value))
             {
             }
@@ -253,11 +258,14 @@ public:
         }
         if constexpr (GetQuantType<Pattern> == QuantType::kFP4)
         {
-            PackedVec<DType> pack_val = *reinterpret_cast<PackedVec<DType> const*>(&val);
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2>(std::nullopt, token_id, m_access_id_in_token,
-                std::nullopt, m_params.hidden_dim, reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+            constexpr int SF_VEC_SIZE = 16;
+            using PackedVec = PackedVec<DType>;
+            PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt, token_id, m_access_id_in_token,
+                std::nullopt, m_params.hidden_dim / SF_VEC_SIZE, reinterpret_cast<uint32_t*>(m_params.scale_out),
+                m_params.layout);
             reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id]
-                = cvt_warp_fp16_to_fp4(pack_val, m_scale_factor, sf_out);
+                = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
         }
         else if constexpr (GetQuantType<Pattern> == QuantType::kFP8)
         {
@@ -436,8 +444,8 @@ public:
     int tot_access;
 };
 
-template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams params)
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc, bool TriggerCompletionAtEnd = true>
+__global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams params)
 {
     IndexHelper<DType> index_helper(params);
     int token_id = index_helper.token_id;
@@ -448,8 +456,13 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
     int tot_access = index_helper.tot_access;
     float4 clear_vec = get_neg_zero();
     FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+    if constexpr (!TriggerCompletionAtEnd)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
     LamportComm<NRanks> comm(params.workspace, params.rank);
     int clear_access = comm.clear_size / kElemsPerAccess<DType>;
@@ -500,14 +513,19 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams pa
         float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
         fused_op(sum_val, tidx);
     }
+
     comm.update(params.size * NRanks);
+
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
+    if constexpr (TriggerCompletionAtEnd)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
 #endif
 }
 
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_twoshot_sync(
+__global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
     AllReduceFusionParams params, std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
     IndexHelper<DType> index_helper(params);
@@ -588,11 +606,11 @@ int get_sm_count()
     return sm_count;
 }
 
-template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
+template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc, bool TriggerCompletionAtEnd = true>
 void launch_oneshot_lamport(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
 {
-    TLLM_CUDA_CHECK(
-        cudaLaunchKernelEx(&cfg, allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc>, params));
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
+        allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, TriggerCompletionAtEnd>, params));
 }
 
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
@@ -634,8 +652,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
         }
     }
     int threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
+    // Cluster launch is supported on Hopper (SM90) and datacenter Blackwell (SM100/SM103),
+    // but NOT on workstation Blackwell (SM120/SM121) which lacks cluster launch hardware.
     int cluster_size;
-    if (SM >= 90)
+    bool const supports_cluster = (SM >= 90 && SM < 120);
+    if (supports_cluster)
     {
         cluster_size = 8;
     }
@@ -653,10 +674,16 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
         threads_per_block *= 2;
         cluster_size /= 2;
     }
+    int sm_count = get_sm_count();
+    while (cluster_num * cluster_size > sm_count && cluster_size > 1 && threads_per_block <= 512)
+    {
+        threads_per_block *= 2;
+        cluster_size /= 2;
+    }
     TLLM_CHECK(oneshot || threads_per_block >= params.nranks);
     int block_size = threads_per_block;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
-    int sm_count = get_sm_count();
+
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
     cudaLaunchConfig_t cfg;
     cudaLaunchAttribute attribute[2];
@@ -671,10 +698,18 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     attribute[1].val.clusterDim.y = 1;
     attribute[1].val.clusterDim.z = 1;
     cfg.attrs = attribute;
-    cfg.numAttrs = SM >= 90 ? 2 : 0;
+    cfg.numAttrs = supports_cluster ? 2 : 0;
     if (oneshot)
     {
-        launch_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc>(params, cfg);
+        bool trigger_completion_at_end = params.trigger_completion_at_end;
+        if (trigger_completion_at_end)
+        {
+            launch_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, true>(params, cfg);
+        }
+        else
+        {
+            launch_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, false>(params, cfg);
+        }
     }
     else
     {
@@ -684,9 +719,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
 
 bool use_fp32_acc()
 {
-    // we use fp16 acc type by default due to keep align with nccl
+    // FP32 accumulation is the default: native-dtype accumulation measurably hurts
+    // accuracy on models with large residual-stream outliers.
+    // Opt out with ALL_REDUCE_FUSION_KERNEL_ACC_FP32=0 to restore the legacy behavior.
     static char* fp32_acc = std::getenv("ALL_REDUCE_FUSION_KERNEL_ACC_FP32");
-    return fp32_acc != nullptr;
+    return fp32_acc == nullptr || fp32_acc[0] != '0';
 }
 
 void allreduce_fusion_op(AllReduceFusionParams const& params)
@@ -751,21 +788,25 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
                 "DType=float!");                                                                                       \
         }                                                                                                              \
     }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARRMSNorm)                                                     \
+    {                                                                                                                  \
+        DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARRMSNorm, NRanks);                                          \
+    }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported pattern!");                                  \
     }
 
 #define DISPATCH_DTYPE(NRanks)                                                                                         \
-    if (params.dtype == nvinfer1::DataType::kHALF)                                                                     \
+    if (params.dtype == tensorrt_llm::DataType::kHALF)                                                                 \
     {                                                                                                                  \
         DISPATCH_PATTERN(half, NRanks);                                                                                \
     }                                                                                                                  \
-    else if (params.dtype == nvinfer1::DataType::kBF16)                                                                \
+    else if (params.dtype == tensorrt_llm::DataType::kBF16)                                                            \
     {                                                                                                                  \
         DISPATCH_PATTERN(__nv_bfloat16, NRanks);                                                                       \
     }                                                                                                                  \
-    else if (params.dtype == nvinfer1::DataType::kFLOAT)                                                               \
+    else if (params.dtype == tensorrt_llm::DataType::kFLOAT)                                                           \
     {                                                                                                                  \
         DISPATCH_PATTERN(float, NRanks);                                                                               \
     }                                                                                                                  \
@@ -787,4 +828,6 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     DISPATCH_RANKS(16);
     TLLM_CHECK_WITH_INFO(false, "allreduce_fusion_kernel: unsupported ranks number!");
 }
-}; // namespace tensorrt_llm::kernels::ar_fusion
+}; // namespace kernels::ar_fusion
+
+TRTLLM_NAMESPACE_END

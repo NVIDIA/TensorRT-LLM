@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
-#include "tensorrt_llm/kernels/trtllmGenKernels/common/Dtype.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/gemm/KernelRunner.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/gemmGatedAct/KernelRunner.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -26,19 +25,21 @@
 
 #include <cstdint>
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
 namespace
 {
-template <tensorrt_llm::kernels::Dtype outDtype>
+template <gemm::trtllm::gen::Dtype outDtype>
 void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& globalScale, int64_t m,
     int64_t n, int64_t k, bool lowLatencyKernel)
 {
-    auto eltType = tensorrt_llm::kernels::Dtype::E4m3;
+    auto eltType = gemm::trtllm::gen::Dtype::E4m3;
 
     tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options
-        = {.eltType = eltType, .outputType = outDtype, .deepSeekFp8 = false, .transposeMmaOutput = lowLatencyKernel};
+        = {.eltTypeA = eltType, .outputType = outDtype, .deepSeekFp8 = false, .transposeMmaOutput = lowLatencyKernel};
 
     tensorrt_llm::kernels::TrtllmGenGemmRunner runner(options);
 
@@ -54,11 +55,11 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
         stream.stream(), mat1.get_device());
 }
 
-template <tensorrt_llm::kernels::Dtype outDtype>
+template <gemmGatedAct::trtllm::gen::Dtype outDtype>
 void runGemmGatedAct(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& globalScale,
     at::Tensor const& globalScaleGate, int64_t m, int64_t n, int64_t k, bool lowLatencyKernel)
 {
-    auto eltType = tensorrt_llm::kernels::Dtype::E4m3;
+    auto eltType = gemmGatedAct::trtllm::gen::Dtype::E4m3;
 
     tensorrt_llm::kernels::TrtllmGenGemmGatedActRunnerOptions options
         = {.eltType = eltType, .outputType = outDtype, .deepSeekFp8 = false, .transposeMmaOutput = lowLatencyKernel};
@@ -118,15 +119,15 @@ torch::Tensor fp8_per_tensor_scaling_tllmg_gemm_impl(torch::Tensor const& mat1, 
         switch (outDtype.value())
         {
         case at::ScalarType::Half:
-            runGemmGatedAct<tensorrt_llm::kernels::Dtype::Fp16>(
+            runGemmGatedAct<gemmGatedAct::trtllm::gen::Dtype::Fp16>(
                 out, mat1, mat2, globalScale, globalScaleGate.value(), m, n, k, lowLatencyKernel);
             break;
         case at::ScalarType::BFloat16:
-            runGemmGatedAct<tensorrt_llm::kernels::Dtype::Bfloat16>(
+            runGemmGatedAct<gemmGatedAct::trtllm::gen::Dtype::Bfloat16>(
                 out, mat1, mat2, globalScale, globalScaleGate.value(), m, n, k, lowLatencyKernel);
             break;
         case at::ScalarType::Float8_e4m3fn:
-            runGemmGatedAct<tensorrt_llm::kernels::Dtype::E4m3>(
+            runGemmGatedAct<gemmGatedAct::trtllm::gen::Dtype::E4m3>(
                 out, mat1, mat2, globalScale, globalScaleGate.value(), m, n, k, lowLatencyKernel);
             break;
         default: C10_THROW_ERROR(NotImplementedError, "outDtype must be one of fp16/bf16/e4m3.");
@@ -137,13 +138,13 @@ torch::Tensor fp8_per_tensor_scaling_tllmg_gemm_impl(torch::Tensor const& mat1, 
         switch (outDtype.value())
         {
         case at::ScalarType::Half:
-            runGemm<tensorrt_llm::kernels::Dtype::Fp16>(out, mat1, mat2, globalScale, m, n, k, lowLatencyKernel);
+            runGemm<gemm::trtllm::gen::Dtype::Fp16>(out, mat1, mat2, globalScale, m, n, k, lowLatencyKernel);
             break;
         case at::ScalarType::BFloat16:
-            runGemm<tensorrt_llm::kernels::Dtype::Bfloat16>(out, mat1, mat2, globalScale, m, n, k, lowLatencyKernel);
+            runGemm<gemm::trtllm::gen::Dtype::Bfloat16>(out, mat1, mat2, globalScale, m, n, k, lowLatencyKernel);
             break;
         case at::ScalarType::Float8_e4m3fn:
-            runGemm<tensorrt_llm::kernels::Dtype::E4m3>(out, mat1, mat2, globalScale, m, n, k, lowLatencyKernel);
+            runGemm<gemm::trtllm::gen::Dtype::E4m3>(out, mat1, mat2, globalScale, m, n, k, lowLatencyKernel);
             break;
         default: C10_THROW_ERROR(NotImplementedError, "outDtype must be one of fp16/bf16/e4m3.");
         }
@@ -162,6 +163,8 @@ torch::Tensor fp8_per_tensor_scaling_tllmg_gemm(torch::Tensor const& mat1, torch
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -171,5 +174,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fp8_per_tensor_scaling_tllmg_gemm", &torch_ext::fp8_per_tensor_scaling_tllmg_gemm);
+    m.impl("fp8_per_tensor_scaling_tllmg_gemm", &tensorrt_llm::torch_ext::fp8_per_tensor_scaling_tllmg_gemm);
 }

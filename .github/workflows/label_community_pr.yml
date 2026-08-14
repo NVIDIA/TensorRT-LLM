@@ -1,0 +1,37 @@
+name: Label Community PR
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # every hour at minute 0
+  workflow_dispatch:     # manual trigger option
+    inputs:
+      time_window_minutes:
+        description: 'Time window in minutes to look back for PRs'
+        required: false
+        default: 65
+        type: number
+
+jobs:
+  label_pr:
+    runs-on: ubuntu-latest
+    if: github.repository == 'NVIDIA/TensorRT-LLM'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run labeling script
+        env:
+          AUTO_LABEL_COMMUNITY_TOKEN: ${{ secrets.AUTO_LABEL_COMMUNITY_TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          COMMUNITY_LABEL: "Community want to contribute"
+          TIME_WINDOW_MINUTES: ${{ inputs.time_window_minutes || 65 }}
+        run: python .github/scripts/label_community_user.py

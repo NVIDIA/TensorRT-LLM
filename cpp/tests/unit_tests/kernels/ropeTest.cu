@@ -15,11 +15,13 @@
  */
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
+#include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
-#include "tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 
 #include <random>
@@ -29,6 +31,7 @@
 #include <cuda_fp4.h>
 #endif
 
+using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::kernels;
 
@@ -274,11 +277,6 @@ void computeReferenceBiasRope(QKVPreprocessingParams<fpType, KVCacheBuffer> para
 
     float kGlobalScale = 0.f;
     float vGlobalScale = 0.f;
-    if (params.kv_cache_scale_factors)
-    {
-        kGlobalScale = params.kv_cache_scale_factors[0];
-        vGlobalScale = params.kv_cache_scale_factors[1];
-    }
 
     // the size of a (Q)/K/V matrix TODO(dblanaru) separate this into q and kv sizes
 
@@ -448,7 +446,6 @@ protected:
     int32_t* q_seq_lengths{nullptr};
     int32_t* kv_seq_lengths{nullptr};
     float* kv_scale_orig_quant{nullptr};
-    float* kv_cache_scale_factors{nullptr};
 
     KVBlockArray::DataType* block_offsets{nullptr};
     void* host_primary_pool_pointer{nullptr};
@@ -508,26 +505,27 @@ protected:
     {
         auto const cu_seqlens_size = batch_size + 1;
 
-        cu_q_seqlens_tensor = mBufferManager->pinned(ITensor::makeShape({cu_seqlens_size}), nvinfer1::DataType::kINT32);
+        cu_q_seqlens_tensor
+            = mBufferManager->pinned(ITensor::makeShape({cu_seqlens_size}), tensorrt_llm::DataType::kINT32);
         cu_kv_seqlens_tensor
-            = mBufferManager->pinned(ITensor::makeShape({cu_seqlens_size}), nvinfer1::DataType::kINT32);
-        padding_offset_tensor
-            = mBufferManager->pinned(ITensor::makeShape({batch_size, input_seq_length}), nvinfer1::DataType::kINT32);
-        encoder_padding_offset_tensor
-            = mBufferManager->pinned(ITensor::makeShape({batch_size, cross_qkv_length}), nvinfer1::DataType::kINT32);
+            = mBufferManager->pinned(ITensor::makeShape({cu_seqlens_size}), tensorrt_llm::DataType::kINT32);
+        padding_offset_tensor = mBufferManager->pinned(
+            ITensor::makeShape({batch_size, input_seq_length}), tensorrt_llm::DataType::kINT32);
+        encoder_padding_offset_tensor = mBufferManager->pinned(
+            ITensor::makeShape({batch_size, cross_qkv_length}), tensorrt_llm::DataType::kINT32);
         fmha_tile_counter_ptr_tensor
-            = mBufferManager->pinned(ITensor::makeShape({mEnableContextFMHA ? 1 : 0}), nvinfer1::DataType::kINT32);
+            = mBufferManager->pinned(ITensor::makeShape({mEnableContextFMHA ? 1 : 0}), tensorrt_llm::DataType::kINT32);
         rotary_inv_freq_buf_tensor = mBufferManager->pinned(
-            ITensor::makeShape({batch_size, mRotaryEmbeddingDim / 2}), nvinfer1::DataType::kFLOAT);
+            ITensor::makeShape({batch_size, mRotaryEmbeddingDim / 2}), tensorrt_llm::DataType::kFLOAT);
 
         int const max_num_tokens = batch_size * input_seq_length;
         tokens_info_tensor
-            = mBufferManager->pinned(ITensor::makeShape({max_num_tokens, 2}), nvinfer1::DataType::kINT32);
+            = mBufferManager->pinned(ITensor::makeShape({max_num_tokens, 2}), tensorrt_llm::DataType::kINT32);
 
 #ifdef ENABLE_FP4
         if constexpr (std::is_same_v<KVCacheType, __nv_fp4_e2m1>)
         {
-            global_scale_tensor = mBufferManager->pinned(ITensor::makeShape({2}), nvinfer1::DataType::kFLOAT);
+            global_scale_tensor = mBufferManager->pinned(ITensor::makeShape({2}), tensorrt_llm::DataType::kFLOAT);
         }
 #endif
     }
@@ -590,7 +588,7 @@ protected:
         // // Rotary cos sin cache buffer to avoid re-computing.
         SizeType32 maxOutputSize{generateRandomSizeSmallerThan(1024)};
         rotary_cos_sin_tensor = this->mBufferManager->pinned(
-            ITensor::makeShape({mRotaryEmbeddingMaxPositions, mRotaryEmbeddingDim}), nvinfer1::DataType::kFLOAT);
+            ITensor::makeShape({mRotaryEmbeddingMaxPositions, mRotaryEmbeddingDim}), tensorrt_llm::DataType::kFLOAT);
         rotary_fill_help = bufferCast<float>(*(rotary_cos_sin_tensor));
         // createCosSinBuf(rotary_fill_help, mRotaryEmbeddingMaxPositions, mRotaryEmbeddingDim); //currently broken
         // fillWithOnesAndZerosInterleaved(rotary_fill_help, mRotaryEmbeddingMaxPositions*
@@ -600,7 +598,7 @@ protected:
 
         batch_size = generateRandomSizeSmallerThan(12);
 
-        q_seq_lengths_tensor = mBufferManager->pinned(ITensor::makeShape({batch_size}), nvinfer1::DataType::kINT32);
+        q_seq_lengths_tensor = mBufferManager->pinned(ITensor::makeShape({batch_size}), tensorrt_llm::DataType::kINT32);
         q_seq_lengths = bufferCast<int32_t>(*(q_seq_lengths_tensor));
 
         for (SizeType32 ii = 0; ii < batch_size; ++ii)
@@ -687,9 +685,9 @@ protected:
 
         if (global_scale_tensor)
         {
-            kv_cache_scale_factors = bufferCast<float>(*(global_scale_tensor));
-            kv_cache_scale_factors[0] = 5.1f;
-            kv_cache_scale_factors[1] = 0.25f;
+            kv_scale_orig_quant = bufferCast<float>(*(global_scale_tensor));
+            kv_scale_orig_quant[0] = 5.1f;
+            kv_scale_orig_quant[1] = 0.25f;
         }
 
         qkv_size = num_tokens * 3 * mNumHeads * mHeadSize;
@@ -715,8 +713,7 @@ protected:
         preprocessingParams.cu_kv_seq_lens = nullptr; // Only used by cross attention.
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = rotary_cos_sin;
-        preprocessingParams.kvScaleOrigQuant = kv_scale_orig_quant;
-        preprocessingParams.kv_cache_scale_factors = kv_cache_scale_factors;
+        preprocessingParams.qkv_scale_orig_quant = kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = nullptr; // Cast to int* if necessary
         preprocessingParams.batch_size = batch_size;
         preprocessingParams.max_input_seq_len = input_seq_length;

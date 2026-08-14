@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -111,7 +116,8 @@ struct Gmem_tile_qkv
     inline __device__ Gmem_tile_qkv(
         Params const& params, int qkv_offset, Block_info const& binfo, int tidx, int cta_row_offset = 0)
 
-        : params_qkv_stride_in_bytes_(params.qkv_stride_in_bytes)
+        // in PACKED_QKV, q_stride = k_stride = v_stride
+        : params_qkv_stride_in_bytes_(params.q_stride_in_bytes)
         , qkv_ptr_(reinterpret_cast<char const*>(params.qkv_ptr))
     {
 
@@ -132,7 +138,7 @@ struct Gmem_tile_qkv
         preds_[0] = fmha::pack_predicates(preds);
 
         // The row offset in the batched GEMM. For each seq element, we store QKV in that order.
-        int64_t row_offset = (int64_t) (row + cta_row_offset) * params.qkv_stride_in_bytes;
+        int64_t row_offset = (int64_t) (row + cta_row_offset) * params_qkv_stride_in_bytes_;
         // Add the block index.
         int idx;
         if (HEADS_INTERLEAVED)

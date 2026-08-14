@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/kernels/speculativeDecoding/common.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -23,7 +24,9 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::speculative_decoding
 {
 
 //! \brief Sets pointers to logits in logitsPtrs according to the draftDecodingTokens.
@@ -552,29 +555,23 @@ void invokeCopyOutputTokensIds(runtime::TokenIdType const* const* tmpOutputIdsPt
     runtime::SizeType32 const* inputPaths, runtime::SizeType32* outputPaths, runtime::SizeType32 maxPathLen,
     cudaStream_t stream);
 
-//! \brief Augment seq slots and batch slots from batchSize size to engineBatchSize size.
-//! For seqSlot sets -1 for non-last chunks (chunkedContextNextTokens != -1).
-//! For batchSlots sets -1 for non-last chunks. Copies actual batch slots to the last chunk or gen requests
-//! positions.
+//! \brief Augment seq slots so that non-last chunks are set to -1 (if chunkedContextNextTokens != -1).
 //!
 //! \param augmentedSeqSlots output buffer [engineBatchSize]
-//! \param augmentedBatchSlots output buffer [engineBatchSize]
 //! \param chunkedContextNextTokens input buffer [engineBatchSize], indicator of the not last chunk of the ctx
 //! requests. -1 for gen requests and last chunk, != -1 otherwise.
 //! \param lastDraftLens input buffer [engineBatchSize], number of draft tokens input to the current iteration.
 //! 0 for ctx requests and > 0 for gen requests.
 //! \param seqSlots input buffer [engineBatchSize], address map from local index to global index [0, batchSize]
 //! -> [0, maxBatchSize]
-//! \param batchSlots input buffer [engineBatchSize], address map from local index to global index [0, batchSize]
-//! -> [0, maxBatchSize]
 //! \param engineBatchSize number of sequences processed in the engine.
 //! Includes chunked context reqs that are not in the last chunk.
 //! \param batchSize the number of sequences to be decoded
 //! \param stream cuda stream.
-void invokeAugmentBatchSlots(runtime::SizeType32* augmentedSeqSlots, runtime::SizeType32* augmentedBatchSlots,
+void invokeAugmentBatchSlots(runtime::SizeType32* augmentedSeqSlots,
     runtime::SizeType32 const* chunkedContextNextTokens, runtime::SizeType32 const* lastDraftLens,
-    runtime::SizeType32 const* seqSlots, runtime::SizeType32 const* batchSlots, runtime::SizeType32 engineBatchSize,
-    runtime::SizeType32 batchSize, cudaStream_t stream);
+    runtime::SizeType32 const* seqSlots, runtime::SizeType32 engineBatchSize, runtime::SizeType32 batchSize,
+    cudaStream_t stream);
 
 //! \brief For Eagle-2, set topK tensor according to the max topK value for each request.
 //! And fill the batchSlots for the softMax kernel.
@@ -788,4 +785,6 @@ void invokeCopyFinalDraftTokens(runtime::SizeType32 batchSize, runtime::SizeType
     runtime::TokenIdType const* const* thirdTopKOutputIdsPtrs, runtime::TokenIdType* pluginOutputAllLayersDraftTokenIds,
     runtime::TokenIdType* pluginOutputDraftTokenIds, runtime::SizeType32* pluginOutputDraftLens, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+} // namespace kernels::speculative_decoding
+
+TRTLLM_NAMESPACE_END

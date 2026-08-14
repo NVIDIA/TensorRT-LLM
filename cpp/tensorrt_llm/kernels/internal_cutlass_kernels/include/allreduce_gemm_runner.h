@@ -24,12 +24,15 @@
 
 #include "cutlass/layout/layout.h"
 #include "cutlass_extensions/gemm_configs.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
 
 using namespace cute;
 using namespace tensorrt_llm::cutlass_extensions;
 
-namespace tensorrt_llm::kernels::cutlass_kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels
 {
 enum GemmAllReduceImpl
 {
@@ -268,4 +271,6 @@ private:
     std::map<KeyType, ValueType> mGemmRegistry;
 };
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels
+} // namespace kernels::cutlass_kernels
+
+TRTLLM_NAMESPACE_END

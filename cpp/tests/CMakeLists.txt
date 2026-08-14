@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -16,20 +16,22 @@
 # GoogleTest Preparation - Code block copied from
 # https://google.github.io/googletest/quickstart-cmake.html
 include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG v1.15.2)
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
+set(cutlass_source_dir ${CMAKE_BINARY_DIR}/_deps/cutlass-src)
 include_directories(
   ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include
   ${PROJECT_SOURCE_DIR}/include
-  ${3RDPARTY_DIR}/cutlass/include
-  ${3RDPARTY_DIR}/cutlass/tools/util/include
-  ${PROJECT_SOURCE_DIR}/tests/batch_manager
-  ${PROJECT_SOURCE_DIR}/tests/utils)
+  ${cutlass_source_dir}/include
+  ${cutlass_source_dir}/tools/util/include
+  ${PROJECT_SOURCE_DIR}/tests/batch_manager)
+
+# Tests previously inherited the MPI include dirs transitively through the
+# removed TensorRT plugin target's PUBLIC includes.
+if(ENABLE_MULTI_DEVICE)
+  include_directories(${MPI_C_INCLUDE_DIRS})
+endif()
 
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 
@@ -37,17 +39,17 @@ add_custom_target(google-tests)
 
 function(add_gtest test_name test_src)
   set(options NO_GTEST_MAIN NO_TLLM_LINKAGE)
+  set(oneValueArgs TIMEOUT)
   cmake_parse_arguments(ARGS "${options}" "${oneValueArgs}" "${multiValueArgs}"
                         ${ARGN})
   add_executable(${test_name} ${test_src})
 
-  target_link_libraries(${test_name} PUBLIC gmock_main TensorRT::OnnxParser)
+  target_link_libraries(${test_name} PUBLIC gmock_main)
   if(NOT ARGS_NO_GTEST_MAIN)
     target_link_libraries(${test_name} PUBLIC gtest_main)
   endif()
   if(NOT ARGS_NO_TLLM_LINKAGE)
-    target_link_libraries(${test_name} PUBLIC ${SHARED_TARGET}
-                                              nvinfer_plugin_tensorrt_llm)
+    target_link_libraries(${test_name} PUBLIC ${SHARED_TARGET})
     if(WIN32)
       target_link_libraries(${test_name} PRIVATE context_attention_src)
     endif()
@@ -60,41 +62,20 @@ function(add_gtest test_name test_src)
   target_compile_definitions(${test_name}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
+  set(test_properties ENVIRONMENT "CUDA_MODULE_LOADING=LAZY")
+  if(ARGS_TIMEOUT)
+    list(APPEND test_properties TIMEOUT "${ARGS_TIMEOUT}")
+  endif()
+
   gtest_discover_tests(
     ${test_name}
-    PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" DISCOVERY_MODE
+    PROPERTIES ${test_properties}
+               DISCOVERY_MODE
                PRE_TEST # WAR for DLL discovery on windows.
-               DISCOVERY_TIMEOUT 30) # Longer timeout needed because discovery
-                                     # can be slow on Windows
+               DISCOVERY_TIMEOUT
+               30) # Longer timeout needed because discovery can be slow on
+                   # Windows
   add_dependencies(google-tests ${test_name})
 endfunction()
 
 add_subdirectory(unit_tests)
-
-add_gtest(mpiUtilsTest runtime/mpiUtilsTest.cpp)
-
-add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
-add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
-add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
-
-add_gtest(moeLoadBalancerTest runtime/moeLoadBalancerTest.cpp)
-
-add_gtest(sanitizerTest runtime/sanitizerTest.cpp)
-
-add_gtest(eaglePackDataTest kernels/eaglePackDataTest.cpp)
-
-add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
-
-add_gtest(moeLoadBalanceKernelTest kernels/moeLoadBalanceKernelTest.cpp)
-
-add_gtest(eagleLayerTest layers/eagleLayerTest.cpp)
-
-add_subdirectory(utils)
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
-  add_subdirectory(batch_manager)
-endif()
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
-  add_subdirectory(executor)
-endif()

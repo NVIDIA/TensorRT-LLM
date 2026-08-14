@@ -14,7 +14,9 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
+from ..speculative import SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
@@ -27,12 +29,17 @@ class QwenAttention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-        if getattr(config, "rope_scaling", None) is not None:
+        rope_scaling = getattr(config, "rope_scaling", None)
+        # In transformers 5.x, rope_scaling is always a dict (never None)
+        # and uses "rope_type" key instead of "type".
+        rope_type = None
+        if rope_scaling is not None:
+            rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+        if rope_type is not None and rope_type != "default":
             pos_embd_params = PositionalEmbeddingParams(
-                type=PositionEmbeddingType.from_string(
-                    config.rope_scaling["type"]),
+                type=PositionEmbeddingType.from_string(rope_type),
                 rope=RopeParams.from_config(config),
-            )
+                mrope_section=rope_scaling.get('mrope_section', None))
         else:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
@@ -46,9 +53,60 @@ class QwenAttention(Attention):
             bias=True,
             pos_embd_params=pos_embd_params,
             layer_idx=layer_idx,
+            rope_fusion=not getattr(config, 'disable_fuse_rope', False),
             dtype=config.torch_dtype,
             dense_bias=False,
             config=model_config,
+        )
+
+
+# TODO this is a workaround to support yarn on Qwen2.
+# We need refactor the codes to merge QwenYarnAttention and QwenAttention.
+class QwenYarnAttention(QKNormRoPEAttention):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[Qwen2Config],
+        layer_idx: Optional[int] = None,
+        fuse_qk_norm_rope: bool = True,
+    ):
+        config = model_config.pretrained_config
+
+        if getattr(config, "rope_scaling", None) is not None:
+            if "type" in config.rope_scaling:
+                pos_type = config.rope_scaling["type"]
+            elif "rope_type" in config.rope_scaling:
+                pos_type = config.rope_scaling["rope_type"]
+            else:
+                raise ValueError(
+                    "rope_scaling must have type or rope_type field")
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.from_string(pos_type),
+                rope=RopeParams.from_config(config),
+            )
+        else:
+            pos_embd_params = PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams.from_config(config),
+            )
+
+        # Qwen3 has accuracy issues with deep_gemm (see: https://nvbugspro.nvidia.com/bug/5461712
+        # and https://nvbugspro.nvidia.com/bug/5505402)
+        disable_deep_gemm = True
+        super().__init__(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=True,
+            pos_embd_params=pos_embd_params,
+            fuse_qk_norm_rope=fuse_qk_norm_rope,
+            layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            dense_bias=False,
+            config=model_config,
+            disable_deep_gemm=disable_deep_gemm,
+            is_qk_norm=False,
         )
 
 
@@ -62,10 +120,21 @@ class QwenDecoderLayer(DecoderLayer):
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
-        self.self_attn = QwenAttention(
-            model_config,
-            layer_idx=layer_idx,
-        )
+
+        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_type = rope_scaling.get("rope_type",
+                                     rope_scaling.get("type")) \
+            if isinstance(rope_scaling, dict) else None
+        if rope_type == "yarn":
+            self.self_attn = QwenYarnAttention(
+                model_config,
+                layer_idx=layer_idx,
+            )
+        else:
+            self.self_attn = QwenAttention(
+                model_config,
+                layer_idx=layer_idx,
+            )
 
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
@@ -83,11 +152,12 @@ class QwenDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
+        mrope_config: Optional[dict] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -109,7 +179,11 @@ class QwenDecoderLayer(DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, **kwargs)
+
+        if spec_metadata is not None:
+            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
+                                                      hidden_states, residual)
         return hidden_states, residual
 
 
@@ -118,7 +192,6 @@ class QwenModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen2Config]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
 
         self.embed_tokens = Embedding(
             config.pretrained_config.vocab_size,
@@ -141,10 +214,11 @@ class QwenModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        mrope_config: Optional[Tuple[torch.Tensor, int]] = None,
+        mrope_config: Optional[dict] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -163,7 +237,9 @@ class QwenModel(DecoderModel):
                                                     hidden_states=hidden_states,
                                                     attn_metadata=attn_metadata,
                                                     residual=residual,
-                                                    mrope_config=mrope_config)
+                                                    mrope_config=mrope_config,
+                                                    spec_metadata=spec_metadata,
+                                                    **kwargs)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -185,20 +261,21 @@ class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: torch.LongTensor = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.IntTensor = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         mrope_config: Optional[dict] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
-        output = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-            mrope_config=mrope_config,
-        )
+        output = self.model(input_ids=input_ids,
+                            attn_metadata=attn_metadata,
+                            position_ids=position_ids,
+                            inputs_embeds=inputs_embeds,
+                            mrope_config=mrope_config,
+                            spec_metadata=spec_metadata,
+                            **kwargs)
 
         return self.logits_processor.forward(
             output,
@@ -236,8 +313,8 @@ class Qwen2ForProcessRewardModel(DecoderModelForCausalLM[QwenModel,
 
     def forward(self,
                 attn_metadata: AttentionMetadata,
-                input_ids: torch.LongTensor,
-                position_ids: Optional[torch.LongTensor] = None,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
                 inputs_embeds: Optional[torch.FloatTensor] = None,
                 **kwargs) -> torch.Tensor:
         assert attn_metadata.seq_lens is not None
@@ -280,8 +357,8 @@ class Qwen2ForRewardModel(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
 
     def forward(self,
                 attn_metadata: AttentionMetadata,
-                input_ids: torch.LongTensor,
-                position_ids: Optional[torch.LongTensor] = None,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
                 inputs_embeds: Optional[torch.FloatTensor] = None,
                 **kwargs) -> torch.Tensor:
         assert attn_metadata.seq_lens is not None

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,26 +22,16 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/kvCachePartialCopy.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
-#ifdef ENABLE_CUFILE
-#include <cufile.h>
-#endif
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-#include <cstring>
-#include <string>
-#include <vector>
-
 namespace tr = tensorrt_llm::runtime;
 namespace tk = tensorrt_llm::kernels;
+namespace kvc = tensorrt_llm::executor::kv_cache;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
@@ -86,11 +76,15 @@ static bool fileToGpuPosix(tr::ITensor::SharedPtr const& dstPtr, std::string con
     return true;
 }
 
-KVCacheTransferManager::KVCacheTransferManager(tr::BufferManager const& bufferManager)
+KVCacheTransferManager::KVCacheTransferManager(
+    tr::BufferManager const& bufferManager, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent)
     : mBufferManager{bufferManager}
     , mOnboardManager(std::make_shared<tr::CudaStream>())
     , mOffloadManager(std::make_shared<tr::CudaStream>())
+    , mLoopbackAgent{loopbackAgent}
 {
+    TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
+    TLLM_CHECK(mDeviceId != -1);
 }
 
 tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
@@ -104,12 +98,18 @@ tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
     return blockTensor;
 }
 
+tk::KVCacheIndex::UnderlyingType KVCacheTransferManager::getPendingTransferIndex(BlockPtr const& block)
+{
+    auto const blockOffset = block->getMemoryPoolBlockIndex();
+    return block->isPrimary() ? blockOffset : blockOffset | tk::KVCacheIndex::kSecondaryPoolFlag;
+}
+
 void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
-    std::optional<std::string> directory)
+    std::string const& directory)
 {
     TLLM_LOG_DEBUG("copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d", src->getBlockId(), dst->getBlockId(),
-        (int) isOffload, static_cast<int>(mode));
+        (isOffload ? "true" : "false"), static_cast<int>(mode));
 
     if (mode == executor::KvCacheTransferMode::DRAM)
     {
@@ -118,12 +118,54 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         // Iterate over all pools, partial-copy logic
         for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
         {
+            auto const& pool = pools[poolIdx];
+
+            // For layer-first layout pools, block data is non-contiguous across layers.
+            // Pool shape: {numLayers, numBlocks, kvFactor, blockSize}. For a fixed block
+            // index, per-layer slices are contiguous rows of (kvFactor * blockSize) elements,
+            // separated by a stride of numBlocks rows between layers. Issue this as a single
+            // pitched cudaMemcpy2DAsync instead of one cudaMemcpyAsync per layer.
+            if (pool.layerFirstLayout)
+            {
+                auto srcPool = src->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
+                auto dstPool = dst->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;
+                auto const srcBlockIdx = static_cast<size_t>(src->getMemoryPoolBlockIndex());
+                auto const dstBlockIdx = static_cast<size_t>(dst->getMemoryPoolBlockIndex());
+
+                // Compute pitches from each pool independently: primary and secondary pools
+                // may have different block counts (mNumPrimaryBlocks vs mNumSecondaryBlocks),
+                // so their per-layer strides differ. Using the primary shape for both pitches
+                // would corrupt host-offloaded recurrent state on CPU<->GPU transfers.
+                auto const& srcShape = srcPool->getShape();
+                auto const& dstShape = dstPool->getShape();
+                TLLM_CHECK_WITH_INFO(srcShape.nbDims >= 2,
+                    "Expected layer-first KVCache pool to have at least 2 dims, got %d", srcShape.nbDims);
+                TLLM_CHECK_WITH_INFO(dstShape.nbDims >= 2,
+                    "Expected layer-first KVCache pool to have at least 2 dims, got %d", dstShape.nbDims);
+                auto const srcLayerStrideBytes = srcPool->getSizeInBytes() / static_cast<size_t>(pool.numLayers);
+                auto const dstLayerStrideBytes = dstPool->getSizeInBytes() / static_cast<size_t>(pool.numLayers);
+                // rowBytes is the per-block per-layer payload — identical for primary and secondary.
+                auto const rowBytes = srcLayerStrideBytes / static_cast<size_t>(srcShape.d[1]);
+
+                auto* srcBase = static_cast<char*>(srcPool->data()) + srcBlockIdx * rowBytes;
+                auto* dstBase = static_cast<char*>(dstPool->data()) + dstBlockIdx * rowBytes;
+
+                auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
+                TLLM_CUDA_CHECK(cudaMemcpy2DAsync(dstBase, dstLayerStrideBytes, srcBase, srcLayerStrideBytes, rowBytes,
+                    static_cast<size_t>(pool.numLayers), cudaMemcpyDefault, stream));
+                continue;
+            }
+
             auto srcPtr = computeBlockPointer(src, pools, poolIdx);
             auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
 
+            // Does it contain block scales?
+            auto containsBlockScales = pool.containsBlockScales;
+
             // If no partial tokens or if the dataType is not supported for partial copy, copy entire block.
-            if (numTokensToCopy <= 0 || srcPtr->getDataType() == nvinfer1::DataType::kINT4
-                || srcPtr->getDataType() == nvinfer1::DataType::kFP4)
+            // Note that nvfp4 kv cache SFs use an interleaved layout, so we need to copy the entire block.
+            if (numTokensToCopy <= 0 || srcPtr->getDataType() == tensorrt_llm::DataType::kINT4
+                || srcPtr->getDataType() == tensorrt_llm::DataType::kFP4 || containsBlockScales)
             {
                 // For partial copy not implemented with these data types,
                 // just do a full copy.
@@ -131,7 +173,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             }
             else
             {
-                int const tokensPerBlock = pools[poolIdx].tokensPerBlock;
+                int const tokensPerBlock = pool.tokensPerBlock;
                 if (numTokensToCopy >= tokensPerBlock)
                 {
                     // If requested tokens >= entire block, just do a full copy.
@@ -140,16 +182,17 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
                 else
                 {
                     auto stream = (isOffload ? mOffloadManager : mOnboardManager).getStream().get();
-                    int const numLayers = pools[poolIdx].numLayers;
-                    int const numHeads = pools[poolIdx].numKvHeads;
-                    int const sizePerHead = pools[poolIdx].sizePerHead;
+                    int const numLayers = pool.numLayers;
+                    int const kvFactor = pool.kvFactor;
+                    int const numHeads = pool.numKvHeads;
+                    int const sizePerHead = pool.sizePerHead;
                     auto shape = srcPtr->getShape();
 
                     TLLM_CHECK_WITH_INFO(
                         shape.nbDims == 4, "Expected KVCache block to have 4 dims, got %d", shape.nbDims);
 
-                    tk::kvCacheBlockPartialCopy(
-                        *dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead, numTokensToCopy, stream);
+                    tk::kvCacheBlockPartialCopy(*dstPtr, *srcPtr, numLayers, numHeads, tokensPerBlock, sizePerHead,
+                        numTokensToCopy, kvFactor, stream);
                 }
             }
         }
@@ -158,158 +201,285 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         return;
     }
 
+    std::vector<kvc::FileDesc> fileBlobs;
+    std::vector<kvc::MemoryDesc> memoryBlobs;
+
     for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
     {
-        auto srcPtr = computeBlockPointer(src, pools, poolIdx);
-        auto dstPtr = computeBlockPointer(dst, pools, poolIdx);
+        TLLM_CHECK_WITH_INFO(!pools[poolIdx].layerFirstLayout,
+            "File-based offload/onboard is not supported for layer-first layout pools");
+        auto ptr = isOffload ? computeBlockPointer(src, pools, poolIdx) : computeBlockPointer(dst, pools, poolIdx);
+        auto block_id = src->getBlockId();
 
         TLLM_CHECK_WITH_INFO(
-            directory.has_value(), "Expected a directory path for KVCache offload, but none was provided.");
+            !directory.empty(), "Expected a directory path for KVCache offload, but none was provided.");
 
-        int size = std::snprintf(
-            nullptr, 0, "%s/block_%d_pool_%zu.bin", directory.value().c_str(), src->getBlockId(), poolIdx);
-
-        std::string filename(size + 1, '\0');
-        std::snprintf(filename.data(), filename.size(), "%s/block_%d_pool_%zu.bin", directory.value().c_str(),
-            src->getBlockId(), poolIdx);
+        int size = std::snprintf(nullptr, 0, "%s/block_%d_pool_%zu.bin", directory.c_str(), block_id, poolIdx);
+        std::string filename;
+        filename.resize(size + 1);
+        std::snprintf(
+            filename.data(), filename.size(), "%s/block_%d_pool_%zu.bin", directory.c_str(), block_id, poolIdx);
 
         if (mode == executor::KvCacheTransferMode::POSIX_DEBUG_FALLBACK)
         {
             TLLM_LOG_INFO("Forcing POSIX fallback for file: %s", filename.c_str());
             if (isOffload)
             {
-                gpuToFilePosix(srcPtr, filename);
+                gpuToFilePosix(ptr, filename);
             }
             else
             {
-                fileToGpuPosix(dstPtr, filename);
+                fileToGpuPosix(ptr, filename);
             }
             continue;
         }
-
-        int openFlags = isOffload ? (O_CREAT | O_WRONLY) : O_RDONLY;
-        int fd = ::open(filename.c_str(), openFlags, 0664);
-        if (fd < 0)
+        else if (mode == executor::KvCacheTransferMode::GDS)
         {
-            TLLM_LOG_ERROR(
-                "Failed to open '%s' for %s; fallback POSIX", filename.c_str(), (isOffload ? "writing" : "reading"));
 
-            if (isOffload)
-            {
-                gpuToFilePosix(srcPtr, filename);
-            }
-            else
-            {
-                fileToGpuPosix(dstPtr, filename);
-            }
-            continue;
+            int openFlags = isOffload ? (O_CREAT | O_WRONLY) : O_RDONLY;
+            fileBlobs.emplace_back(filename, openFlags, 0664, ptr->getSizeInBytes());
+            memoryBlobs.emplace_back(ptr->data(), ptr->getSizeInBytes(), mDeviceId);
+        }
+    }
+
+    if (mode == executor::KvCacheTransferMode::GDS)
+    {
+        if (mLoopbackAgent == nullptr)
+        {
+            TLLM_LOG_DEBUG("KVCacheTransferManager: creating mLoopbackAgent lazily");
+            kvc::BaseAgentConfig config{std::string("GDSAgent"), true, true};
+            mLoopbackAgent = kvc::makeLoopbackAgent("nixl", &config);
         }
 
-#ifdef ENABLE_CUFILE
-        CUfileDescr_t cufileDesc = {};
-        cufileDesc.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-        cufileDesc.handle.fd = fd;
+        kvc::FileDescs fileDescs(std::move(fileBlobs));
+        kvc::MemoryDescs memoryDescs(kvc::MemoryType::kVRAM, memoryBlobs);
 
-        CUfileHandle_t cufileHandle;
-        CUfileError_t status = cuFileHandleRegister(&cufileHandle, &cufileDesc);
-        if (status.err != CU_FILE_SUCCESS)
-        {
-            // Fallback to POSIX
-            TLLM_LOG_WARN(
-                "cuFileHandleRegister failed (err=%d). Falling back to POSIX for '%s'", status.err, filename.c_str());
-            ::close(fd);
-            if (isOffload)
-                gpuToFilePosix(srcPtr, filename);
-            else
-                fileToGpuPosix(dstPtr, filename);
-            continue;
-        }
-
-        ssize_t numBytes = static_cast<ssize_t>(srcPtr->getSizeInBytes());
-        if (isOffload)
-        {
-            ssize_t written = cuFileWrite(cufileHandle, srcPtr->data(), numBytes, 0, 0);
-            if (written < 0)
-            {
-                TLLM_LOG_ERROR("cuFileWrite error=%zd. Fallback to POSIX", written);
-                cuFileHandleDeregister(cufileHandle);
-                ::close(fd);
-                gpuToFilePosix(srcPtr, filename);
-                continue;
-            }
-        }
-        else
-        {
-            ssize_t readCount = cuFileRead(cufileHandle, dstPtr->data(), numBytes, 0, 0);
-            if (readCount < 0)
-            {
-                TLLM_LOG_ERROR("cuFileRead error=%zd. Fallback to POSIX", readCount);
-                cuFileHandleDeregister(cufileHandle);
-                ::close(fd);
-                fileToGpuPosix(dstPtr, filename);
-                continue;
-            }
-        }
-
-        cuFileHandleDeregister(cufileHandle);
-        ::close(fd);
-#else
-        // If GDS isn't enabled, fallback to POSIX automatically
-        TLLM_LOG_DEBUG("ENABLE_CUFILE=OFF, so fallback to POSIX for %s", filename.c_str());
-        ::close(fd); // close the file opened for GDS
-        if (isOffload)
-        {
-            gpuToFilePosix(srcPtr, filename);
-        }
-        else
-        {
-            fileToGpuPosix(dstPtr, filename);
-        }
-#endif
+        mLoopbackAgent->executeLoopbackRequest(memoryDescs, fileDescs, isOffload);
     }
 }
 
-void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr const& block,
+//
+// Note about recording events to wait for cudaMemcpyAsync calls between blocks:
+// The memory copy involves raw memory blocks, which are identified by the pool-qualified
+// memory pool block index. Using getBlockId() when recording events is wrong.
+// getBlockId() returns the logical block id, which has nothing to do with the raw memory
+// block pointers involved in a cudaMemcpy.
+//
+
+//
+// Notes about need for synchronization:
+//
+// Relying on decoder syncing GPU with CPU to ensure that blocks are ready
+// for offload/onboard/partial copy is dangerous. We have an asynchronous decoder
+// that may not synchronize or synchronize at a later point in the execution stream.
+// To avoid synchronization issues caused by changes to decoder design we rely on
+// KVCacheTransferManager::syncWithBufferManager() that ensures that internal copy streams
+// will wait for prefill and decode kernels that have already been scheduled.
+//
+// Earlier versions of this code did not account for all possible cases where a new block copy
+// needed to wait for a previously scheduled copy to finish. For instance, it is possible
+// that two primary blocks are offloaded to the same secondary block in a single step,
+// scheduling the second offloading without waiting for the first one to finish leads to
+// a corrupted block after offloading. It is possible that partial reuse will copy
+// from a block that is currently being onboarded, scheduling the partial copy without
+// waiting for the onboarding to finish will lead to a corrupted block. To handle all
+// possible cases needing synchronization we record separate events for reads and writes
+// to a block. When a new block copy is scheduled, we wait for all writes to the source
+// block and all reads and writes to a destination block.
+//
+// As before, syncTransfers() must be called after the last call to KVCacheManager::addSequenceBatch.
+// Failing to do so will lead to corrupted blocks eventually.
+//
+
+void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr const& block,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
-    std::optional<std::string> directory)
+    std::string const& directory)
 {
-    if (mode != executor::KvCacheTransferMode::DRAM
-        && mPendingOffloads.find(offloadBlock->getBlockId()) == mPendingOffloads.end())
+    auto const offloadedBlockIndex = getPendingTransferIndex(offloadedBlock);
+    auto const blockIndex = getPendingTransferIndex(block);
+
+    // Wait for any pending writes before reading from offloadedBlock
+    auto offloadedBlockPendingWriteItr = mPendingWrites.find(offloadedBlockIndex);
+    if (offloadedBlockPendingWriteItr != mPendingWrites.end())
     {
-        TLLM_LOG_DEBUG("Skipping onboard for block %d because it was never previously offloaded to disk",
-            offloadBlock->getBlockId());
-        return;
+        mOnboardManager.getStream().wait(offloadedBlockPendingWriteItr->second);
+        // Don't erase, we are not changing state of offloadedBlock
+    }
+    // Wait for any pending reads before overwriting block
+    auto blockPendingReadItr = mPendingReads.find(blockIndex);
+    if (blockPendingReadItr != mPendingReads.end())
+    {
+        mOnboardManager.getStream().wait(blockPendingReadItr->second);
+        mPendingReads.erase(blockPendingReadItr);
+    }
+    // Wait for any pending writes before overwriting block
+    auto blockPendingWriteItr = mPendingWrites.find(blockIndex);
+    if (blockPendingWriteItr != mPendingWrites.end())
+    {
+        mOnboardManager.getStream().wait(blockPendingWriteItr->second);
+        mPendingWrites.erase(blockPendingWriteItr);
     }
 
-    if (mPendingOffloads.find(offloadBlock->getBlockId()) != mPendingOffloads.end())
+    copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
+
+    // Update transfer statistics — distinguish host→GPU onboard from GPU→GPU intra-device copy
     {
-        mOnboardManager.getStream().wait(mPendingOffloads[offloadBlock->getBlockId()]);
+        std::lock_guard<std::mutex> lock(mStatsMutex);
+        auto bytes = computeBlockTransferBytes(pools, numTokensToCopy);
+        if (offloadedBlock->isPrimary())
+        {
+            ++mIntraDeviceCopyBlockCount;
+            mIntraDeviceCopyByteCount += bytes;
+        }
+        else
+        {
+            ++mOnboardBlockCount;
+            mOnboardByteCount += bytes;
+        }
     }
-    copyBlock(offloadBlock, block, pools, false, numTokensToCopy, mode, directory);
+
+    // Record new pending read from offloadedBlock
+    mPendingReads[offloadedBlockIndex] = tr::CudaEvent();
+    mOnboardManager.getStream().record(mPendingReads[offloadedBlockIndex]);
+    // Record new pending write to block
+    mPendingWrites[blockIndex] = tr::CudaEvent();
+    mOnboardManager.getStream().record(mPendingWrites[blockIndex]);
 }
 
 void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
-    std::optional<std::string> directory)
+    std::string const& directory)
 {
-    mPendingOffloads[block->getBlockId()] = tr::CudaEvent();
+    auto const blockIndex = getPendingTransferIndex(block);
+    auto const offloadBlockIndex = getPendingTransferIndex(offloadBlock);
+
+    // Wait for any pending writes before reading from block
+    auto blockPendingWriteItr = mPendingWrites.find(blockIndex);
+    if (blockPendingWriteItr != mPendingWrites.end())
+    {
+        mOffloadManager.getStream().wait(blockPendingWriteItr->second);
+        // Don't erase, we are not changing state of block
+    }
+    // Wait for any pending reads before overwriting offloadBlock
+    auto offloadBlockPendingReadItr = mPendingReads.find(offloadBlockIndex);
+    if (offloadBlockPendingReadItr != mPendingReads.end())
+    {
+        mOffloadManager.getStream().wait(offloadBlockPendingReadItr->second);
+        mPendingReads.erase(offloadBlockPendingReadItr);
+    }
+    // Wait for any pending writes before overwriting offloadBlock
+    auto offloadBlockPendingWriteItr = mPendingWrites.find(offloadBlockIndex);
+    if (offloadBlockPendingWriteItr != mPendingWrites.end())
+    {
+        mOffloadManager.getStream().wait(offloadBlockPendingWriteItr->second);
+        mPendingWrites.erase(offloadBlockPendingWriteItr);
+    }
+
     copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
-    mOffloadManager.getStream().record(mPendingOffloads[block->getBlockId()]);
+
+    // Update transfer statistics
+    {
+        std::lock_guard<std::mutex> lock(mStatsMutex);
+        ++mOffloadBlockCount;
+        mOffloadByteCount += computeBlockTransferBytes(pools, numTokensToCopy);
+    }
+
+    // Record new pending read from block
+    mPendingReads[blockIndex] = tr::CudaEvent();
+    mOffloadManager.getStream().record(mPendingReads[blockIndex]);
+    // Record new pending write to offloadBlock
+    mPendingWrites[offloadBlockIndex] = tr::CudaEvent();
+    mOffloadManager.getStream().record(mPendingWrites[offloadBlockIndex]);
+}
+
+void KVCacheTransferManager::syncWithBufferManager()
+{
+    tr::CudaEvent readyForOffloadEvent;
+    mBufferManager.getStream().record(readyForOffloadEvent);
+    mOffloadManager.getStream().wait(readyForOffloadEvent);
+
+    tr::CudaEvent readyForOnboardEvent;
+    mBufferManager.getStream().record(readyForOnboardEvent);
+    mOnboardManager.getStream().wait(readyForOnboardEvent);
+
+    // Once we synchronize, clear our list of pending transfers.
+    mPendingReads.clear();
+    mPendingWrites.clear();
 }
 
 void KVCacheTransferManager::syncTransfers()
 {
     tr::CudaEvent offloadEvent;
     mOffloadManager.getStream().record(offloadEvent);
+    mBufferManager.getStream().wait(offloadEvent);
 
     tr::CudaEvent onboardEvent;
     mOnboardManager.getStream().record(onboardEvent);
-
-    mBufferManager.getStream().wait(offloadEvent);
     mBufferManager.getStream().wait(onboardEvent);
 
-    // Once we synchronize, clear our list of pending thransfers.
-    mPendingOffloads.clear();
+    // Once we synchronize, clear our list of pending transfers.
+    mPendingReads.clear();
+    mPendingWrites.clear();
+}
+
+KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()
+{
+    std::lock_guard<std::mutex> lock(mStatsMutex);
+    KvCacheTransferStats stats;
+    stats.onboardBlocks = mOnboardBlockCount;
+    stats.onboardBytes = mOnboardByteCount;
+    stats.offloadBlocks = mOffloadBlockCount;
+    stats.offloadBytes = mOffloadByteCount;
+    stats.intraDeviceCopyBlocks = mIntraDeviceCopyBlockCount;
+    stats.intraDeviceCopyBytes = mIntraDeviceCopyByteCount;
+    mOnboardBlockCount = 0;
+    mOnboardByteCount = 0;
+    mOffloadBlockCount = 0;
+    mOffloadByteCount = 0;
+    mIntraDeviceCopyBlockCount = 0;
+    mIntraDeviceCopyByteCount = 0;
+    return stats;
+}
+
+std::size_t KVCacheTransferManager::computeBlockTransferBytes(
+    std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy) const
+{
+    std::size_t totalBytes = 0;
+    for (auto const& pool : pools)
+    {
+        if (!pool.primaryPtr || pool.primaryPtr->getSize() == 0)
+        {
+            continue;
+        }
+
+        auto const dataType = pool.primaryPtr->getDataType();
+        auto const numElements = static_cast<std::size_t>(pool.primaryPtr->getSize());
+        if (numElements == 0)
+        {
+            continue; // empty pool contributes 0 bytes; avoids divide-by-zero
+        }
+        auto const bytesPerElement = pool.primaryPtr->getSizeInBytes() / numElements;
+
+        // Mirror the logic in copyBlock: a partial copy only happens when numTokensToCopy > 0,
+        // the data type supports it (not kINT4/kFP4), not block scales, and numTokensToCopy < tokensPerBlock.
+        bool const isPartialCopy = numTokensToCopy > 0 && dataType != tensorrt_llm::DataType::kINT4
+            && dataType != tensorrt_llm::DataType::kFP4 && !pool.containsBlockScales
+            && numTokensToCopy < pool.tokensPerBlock;
+
+        if (isPartialCopy)
+        {
+            // Partial copy transfers: numLayers * kvFactor * numKvHeads * sizePerHead * numTokensToCopy elements
+            totalBytes += static_cast<std::size_t>(pool.numLayers) * pool.kvFactor * pool.numKvHeads * pool.sizePerHead
+                * numTokensToCopy * bytesPerElement;
+        }
+        else
+        {
+            // Full block copy: numLayers * kvFactor * blockSize elements
+            // where blockSize = numKvHeads * sizePerHead * tokensPerBlock
+            totalBytes += static_cast<std::size_t>(pool.numLayers) * pool.kvFactor * pool.blockSize * bytesPerElement;
+        }
+    }
+    return totalBytes;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

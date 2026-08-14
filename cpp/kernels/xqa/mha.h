@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -21,9 +26,16 @@
 #endif
 using CacheElem = ElemType<CACHE_ELEM_ENUM>;
 constexpr uint32_t validElemsPerHead = HEAD_ELEMS;
-static_assert(validElemsPerHead <= 256 && (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
-constexpr uint32_t headElems = validElemsPerHead <= 64 ? 64 : (validElemsPerHead <= 128 ? 128 : 256);
-static_assert(headElems == 64 || headElems == 128 || headElems == 256, "not implemented");
+constexpr bool isMLA = IS_MLA;
+static_assert((isMLA || validElemsPerHead <= 256) && (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
+constexpr uint32_t headElems = validElemsPerHead <= 64 ? 64 : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : 256));
+static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 576, "not implemented");
+// Number of head elements RoPE is applied to. Equals validElemsPerHead for full rotary; smaller for
+// partial rotary, in which case [validRopeElemsPerHead, validElemsPerHead) is passed through unrotated.
+constexpr uint32_t validRopeElemsPerHead = ROPE_ELEMS;
+static_assert(validRopeElemsPerHead > 0 && validRopeElemsPerHead <= validElemsPerHead && validRopeElemsPerHead % 2 == 0
+        && (sizeof(CacheElem) * validRopeElemsPerHead) % 16 == 0,
+    "ROPE_ELEMS must be a positive, even multiple yielding 16B-aligned rope region and not exceed the head size");
 constexpr uint32_t beamWidth = BEAM_WIDTH;
 constexpr uint32_t headGrpSize = HEAD_GRP_SIZE;
 #if SPEC_DEC
@@ -34,7 +46,9 @@ inline constexpr bool useSpecDec = SPEC_DEC;
 
 using InputElem = INPUT_ELEM;
 using InputElem2 = INPUT_ELEM2;
+#if !(SPEC_DEC)
 constexpr uint32_t inputSeqLen = 1; // speculative decoding if > 1
+#endif
 
 constexpr bool useKVCache = USE_KV_CACHE;
 
@@ -47,8 +61,17 @@ using IOHead = Vec<InputElem, validElemsPerHead>;
 using InputHead = IOHead;
 using GMemCacheHead = Vec<CacheElem, validElemsPerHead>;
 
+constexpr uint32_t validElemsPerKHead = validElemsPerHead;
 constexpr bool lowPrecOutput = LOW_PREC_OUTPUT;
+
+#if IS_MLA
+constexpr uint32_t validElemsPerVHead = 512;
+static_assert(lowPrecOutput == false);
+using OutputHead = Vec<__nv_bfloat16, validElemsPerVHead>;
+#else
+constexpr uint32_t validElemsPerVHead = validElemsPerHead;
 using OutputHead = mha::conditional_t<lowPrecOutput, GMemCacheHead, InputHead>;
+#endif
 using OutputElem = OutputHead::Elem;
 
 using PaddedInputHead = Vec<InputElem, headElems>;
@@ -73,6 +96,9 @@ struct BeamSearchParams
                                              // match trt-llm API.
 };
 
+uint32_t computeNbSubSeqPerSeqMHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen);
+
 void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SLIDING_WINDOW
     uint32_t slidingWinSize,
@@ -89,8 +115,13 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #else
     InputHead const* q,
 #endif
+    float const* attentionSinks, // [headGrpSize]
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
     GMemCacheHead* pool, // global pool of pages
+#endif
     KVCachePageIndex const*
         kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
 #else
@@ -106,7 +137,16 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t const nbKHeads,
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+    float const skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
+#endif
+#endif
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
+
+uint32_t computeNbSubSeqPerSeqHopperF8MHA(
+    cudaDeviceProp const& prop, uint32_t batchSize, uint32_t nbKHeads, uint32_t maxSeqLen);
 
 void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SLIDING_WINDOW
@@ -119,13 +159,18 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if USE_INPUT_KV
     InputHead const* qkv,
 #if ROPE_STYLE != 0
-    Vec<float, validElemsPerHead> const* ropeCosSin,
+    Vec<float, validRopeElemsPerHead> const* ropeCosSin,
 #endif
 #else
     InputHead const* q,
 #endif
+    float const* attentionSinks, // [headGrpSize]
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
     GMemCacheHead* pool, // global pool of pages
+#endif
     KVCachePageIndex const*
         kvCachePageList, // device pointer. shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
 #else
@@ -141,6 +186,32 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif
+#if SKIP_SOFTMAX_ATTN
+    float const skipSoftmaxThresholdScaleFactor,
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS
+    uint32_t* __restrict__ skippedBlockCount, uint32_t* __restrict__ totalBlockCount,
+#endif
+#endif
+    uint32_t* semaphores, void* scratch, cudaStream_t stream);
+
+void launchMLA(cudaDeviceProp const& prop,
+    uint32_t inputSeqLen, // uniform for all requests and causal mask is assumed
+    float qScale, OutputHead* output, InputHead const* q,
+#if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
+    GMemCacheHead* pool, // global pool of pages
+#endif
+    KVCachePageIndex const*
+        kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq] (Layout 0) or
+                         // [batchSize][maxNbPagesPerSeq] (Layout 1)
+#else
+    GMemKVCacheHead* kvCacheData,
+#endif
+    uint32_t maxSeqLen, uint32_t const* seqLen, uint32_t batchSize,
+    float const* __restrict__ kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used only for
+                                            // int8/fp8 KV cache.
     uint32_t* semaphores, void* scratch, cudaStream_t stream);
 
 #if STATIC_NB_K_HEADS
@@ -165,7 +236,8 @@ constexpr bool allowMultiBlockMode = ALLOW_MULTI_BLOCK_MODE;
 enum class XQAKernelType : int32_t
 {
     kAMPERE_WARP_SPECIALIZED = 0,
-    kHOPPER_WARP_SPECIALIZED = 1
+    kHOPPER_WARP_SPECIALIZED = 1,
+    kSM120_MLA = 2
 };
 
 #ifdef GENERATE_CUBIN

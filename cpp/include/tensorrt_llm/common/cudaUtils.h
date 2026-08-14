@@ -16,9 +16,13 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
+#if ENABLE_FP4
+#include <cuda_fp4.h>
+#endif
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include <algorithm>
@@ -35,6 +39,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #ifndef _WIN32 // Linux
 #include <sys/sysinfo.h>
 #endif         // not WIN32
@@ -45,7 +50,9 @@
                // this undef.
 #endif         // WIN32
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 // workspace for cublas gemm : 32MB
@@ -144,26 +151,6 @@ void checkEx(
 #define check_cuda_error(val) check((val), #val, __FILE__, __LINE__)
 #define check_cuda_error_2(val, file, line) check((val), #val, file, line)
 
-inline std::optional<bool> isCudaLaunchBlocking()
-{
-    thread_local bool firstCall = true;
-    thread_local std::optional<bool> result = std::nullopt;
-    if (!firstCall)
-    {
-        char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
-        if (env != nullptr && std::string(env) == "1")
-        {
-            result = true;
-        }
-        else
-        {
-            result = false;
-        }
-        firstCall = false;
-    }
-    return result;
-}
-
 inline bool isCapturing(cudaStream_t stream)
 {
     cudaStreamCaptureStatus status;
@@ -173,21 +160,23 @@ inline bool isCapturing(cudaStream_t stream)
 
 inline bool doCheckError(cudaStream_t stream)
 {
-    auto const cudaLaunchBlocking = isCudaLaunchBlocking();
-    if (cudaLaunchBlocking.has_value() && cudaLaunchBlocking.value())
+    // If we're capturing a CUDA graph we don't check.  Otherwise, we
+    // default to only checking in debug builds. But we always listen to
+    // the env variable.
+    static bool const doCheckIfNotCapturing = []()
     {
-        return !isCapturing(stream);
-    }
-
+        char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
+        if (env != nullptr)
+        {
+            return std::string(env) == "1";
+        }
 #ifndef NDEBUG
-    // Debug builds will sync when we're not capturing unless explicitly
-    // disabled.
-    bool const checkError = cudaLaunchBlocking.value_or(!isCapturing(stream));
+        return true;
 #else
-    bool const checkError = cudaLaunchBlocking.value_or(false);
+        return false;
 #endif
-
-    return checkError;
+    }();
+    return doCheckIfNotCapturing && !isCapturing(stream);
 }
 
 inline void syncAndCheck(cudaStream_t stream, char const* const file, int const line)
@@ -247,6 +236,8 @@ template<>                    struct packed_as<half,  2>          { using type =
 template<>                    struct packed_as<float,  2>         { using type = float2; };
 template<>                    struct packed_as<int8_t, 2>         { using type = int16_t; };
 template<>                    struct packed_as<int32_t, 2>        { using type = int2; };
+template<>                    struct packed_as<uint, 2>           { using type = uint2; };
+template<>                    struct packed_as<uint, 4>           { using type = uint4; };
 template<>                    struct packed_as<half2, 1>          { using type = half; };
 template<>                    struct packed_as<float2, 1>         { using type = float; };
 #ifdef ENABLE_BF16
@@ -295,7 +286,11 @@ struct CudaDataType<__nv_bfloat16>
 };
 #endif
 
-inline int getSMVersion()
+/// @brief Get the SM version of the current device.
+/// @param queryRealSmArch Whether to query the real SM architecture. example usage: use real sm arch when do LUT tuning
+/// and use fake sm arch when reuse sm120 code on sm121 devices.
+/// @return The SM version of the current device.
+inline int getSMVersion(bool queryRealSmArch = false)
 {
     int device{-1};
     check_cuda_error(cudaGetDevice(&device));
@@ -303,7 +298,20 @@ inline int getSMVersion()
     int sm_minor = 0;
     check_cuda_error(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
     check_cuda_error(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
-    return sm_major * 10 + sm_minor;
+    int sm = sm_major * 10 + sm_minor;
+    if (sm == 121 && !queryRealSmArch)
+    {
+        return 120;
+    }
+    return sm;
+}
+
+inline bool isSM100Family(std::optional<int> sm = std::nullopt)
+{
+    // Not value_or(): its argument is evaluated eagerly, so an explicit sm
+    // would still trigger a device query (which throws with no device present).
+    int smVersion = sm.has_value() ? *sm : getSMVersion();
+    return smVersion >= 100 && smVersion < 110;
 }
 
 inline int getDevice()
@@ -412,6 +420,21 @@ inline int getMaxSharedMemoryPerBlockOptin()
     check_cuda_error(
         cudaDeviceGetAttribute(&nByteMaxSharedMemoryPerBlockOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, deviceID));
     return nByteMaxSharedMemoryPerBlockOptin;
+}
+
+template <typename T>
+inline int getMaxActiveBlocksPerSM(T kernel, int blockSize, size_t dynamicSMemSize)
+{
+    static std::unordered_map<T, int> cache;
+    auto it = cache.find(kernel);
+    if (it != cache.end())
+    {
+        return it->second;
+    }
+    int numBlocks;
+    check_cuda_error(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, kernel, blockSize, dynamicSMemSize));
+    cache[kernel] = numBlocks;
+    return numBlocks;
 }
 
 template <typename T1, typename T2>
@@ -529,6 +552,9 @@ template void printArrayInfo(__nv_bfloat16 const* ptr, uint64_t nElement, std::s
 #endif
 #ifdef ENABLE_FP8
 template void printArrayInfo(__nv_fp8_e4m3 const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
+#endif
+#ifdef ENABLE_FP4
+template void printArrayInfo(__nv_fp4_e2m1 const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
 #endif
 template void printArrayInfo(uint32_t const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
 template void printArrayInfo(uint64_t const* ptr, uint64_t nElement, std::string name, bool const bPrintElement);
@@ -1339,10 +1365,10 @@ struct ConstExprWrapper
 };
 
 template <int VALUE>
-using Int = ConstExprWrapper<int, VALUE>;
+using ConstInt = ConstExprWrapper<int, VALUE>;
 
 template <bool VALUE>
-using Bool = ConstExprWrapper<bool, VALUE>;
+using ConstBool = ConstExprWrapper<bool, VALUE>;
 
 template <typename T>
 struct TmaDescType;
@@ -1380,7 +1406,9 @@ DEFINE_MEMBER_CHECKER(deq)
 DEFINE_MEMBER_CHECKER(qua)
 DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END
 
 /*
  * Macros compliant with TensorRT coding conventions
@@ -1399,4 +1427,17 @@ DEFINE_MEMBER_CHECKER(high_preciecion_normed_output)
     do                                                                                                                 \
     {                                                                                                                  \
         tensorrt_llm::common::checkEx((stat), {cudaSuccess, cudaErrorCudartUnloading}, #stat, __FILE__, __LINE__);     \
+    } while (0)
+
+// Warn-only variant: log a warning on failure but do not throw or abort.
+// Use for cleanup/secondary operations where a CUDA error is non-fatal (e.g. free on an error path).
+#define TLLM_CUDA_CHECK_WARN(stat)                                                                                     \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        cudaError_t const _tllm_cuda_warn_err = (stat);                                                                \
+        if (TLLM_UNLIKELY(_tllm_cuda_warn_err != cudaSuccess))                                                         \
+        {                                                                                                              \
+            TLLM_LOG_WARNING(                                                                                          \
+                "CUDA error in %s (%s:%d): %s", #stat, __FILE__, __LINE__, cudaGetErrorString(_tllm_cuda_warn_err));   \
+        }                                                                                                              \
     } while (0)

@@ -3,13 +3,92 @@ import contextlib
 import logging
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
 import time
 import warnings
+from collections.abc import Generator
+from typing import List, Optional
 
 import psutil
+
+# Match env-var names / CLI flag names that carry credentials, used to redact
+# values from subprocess invocation logs (env dumps + `--flag=value` args).
+# Patterns matched as case-insensitive substrings of the key/flag name.
+_SENSITIVE_NAME_RE = re.compile(
+    r"(?i)(secret|token|password|passwd|psw|credential"
+    r"|api[_-]?key|private[_-]?key|access[_-]?key)")
+_REDACTED = "***"
+
+
+def _is_sensitive_name(name: str) -> bool:
+    return isinstance(name, str) and bool(_SENSITIVE_NAME_RE.search(name))
+
+
+def redact_env(env):
+    """Return a shallow copy of ``env`` with sensitive values masked."""
+    if env is None:
+        return env
+    try:
+        items = env.items()
+    except AttributeError:
+        return env
+    return {k: (_REDACTED if _is_sensitive_name(k) else v) for k, v in items}
+
+
+def redact_args(args):
+    """Return a copy of ``args`` (list of CLI tokens) with sensitive values masked.
+
+    Handles both ``--flag=value`` and ``--flag value`` forms.
+    """
+    if not args:
+        return args
+    try:
+        seq = list(args)
+    except TypeError:
+        return args
+    out = []
+    i = 0
+    while i < len(seq):
+        a = seq[i]
+        if isinstance(a, str) and a.startswith("-") and "=" in a:
+            flag, sep, _ = a.partition("=")
+            if _is_sensitive_name(flag):
+                out.append(f"{flag}{sep}{_REDACTED}")
+                i += 1
+                continue
+        if (isinstance(a, str) and a.startswith("-") and _is_sensitive_name(a)
+                and i + 1 < len(seq)):
+            out.append(a)
+            out.append(_REDACTED)
+            i += 2
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def redact_popenargs(popenargs):
+    """Return a copy of ``popenargs`` with the first arg (the command list) redacted."""
+    if not popenargs:
+        return popenargs
+    first = popenargs[0]
+    if isinstance(first, (list, tuple)):
+        return (redact_args(first), ) + tuple(popenargs[1:])
+    return popenargs
+
+
+def redact_kwargs(kwargs):
+    """Return a copy of ``kwargs`` with ``env`` redacted."""
+    if not kwargs:
+        return kwargs
+    new_kw = dict(kwargs)
+    if "env" in new_kw:
+        new_kw["env"] = redact_env(new_kw["env"])
+    return new_kw
+
 
 general_logger = logging.getLogger("general")
 general_logger.setLevel(logging.CRITICAL)
@@ -91,15 +170,35 @@ if is_linux():
             time.sleep(5)
 
             lines = []
+            torch_inductors = []
+
             for pid in sorted(target_pids):
                 try:
                     sp = psutil.Process(pid)
                     if verbose_message:
                         cmdline = sp.cmdline()
+
+                        # Detect repetitive torch inductor worker processes
+                        if len(cmdline) > 3 and \
+                            'python' in cmdline[0] and \
+                            'torch/_inductor/compile_worker/__main__.py' in cmdline[1] and \
+                            '--pickler=torch._inductor.compile_worker.subproc_pool.SubprocPickler' == cmdline[2]:
+                            torch_inductors.append(pid)
+                            continue
+
+                        # Readability for ray processes. They have a lot of empty args
+                        if cmdline and cmdline[0].startswith('ray::'):
+                            cmdline = [arg for arg in cmdline if arg]
+
                         lines.append(f"{pid}: {cmdline}")
                     persist_pids.append(pid)
                 except psutil.Error:
                     pass
+
+            if torch_inductors:
+                lines.append(
+                    f"{len(torch_inductors)}*torch inductor workers: {torch_inductors}"
+                )
 
             if persist_pids:
                 msg = f"Found leftover subprocesses: {persist_pids} launched by {p.args}"
@@ -177,9 +276,10 @@ elif is_windows():
 def popen(*popenargs,
           start_new_session=True,
           suppress_output_info=False,
-          **kwargs):
+          **kwargs) -> Generator[subprocess.Popen]:
     if not suppress_output_info:
-        print(f"Start subprocess with popen({popenargs}, {kwargs})")
+        print(f"Start subprocess with popen({redact_popenargs(popenargs)}, "
+              f"{redact_kwargs(kwargs)})")
 
     with Popen(*popenargs, start_new_session=start_new_session, **kwargs) as p:
         try:
@@ -197,21 +297,38 @@ def popen(*popenargs,
 
 
 def call(*popenargs,
-         timeout=None,
+         timeout: Optional[float] = None,
          start_new_session=True,
          suppress_output_info=False,
+         spin_time: float = 1.0,
+         poll_procs: Optional[List[subprocess.Popen]] = None,
          **kwargs):
+    poll_procs = poll_procs or []
     if not suppress_output_info:
-        print(f"Start subprocess with call({popenargs}, {kwargs})")
+        print(f"Start subprocess with call({redact_popenargs(popenargs)}, "
+              f"{redact_kwargs(kwargs)})")
     with popen(*popenargs,
                start_new_session=start_new_session,
                suppress_output_info=True,
                **kwargs) as p:
-        return p.wait(timeout=timeout)
+        elapsed_time = 0
+        while True:
+            try:
+                return p.wait(timeout=spin_time)
+            except subprocess.TimeoutExpired as e:
+                elapsed_time += spin_time
+                if timeout is not None and elapsed_time >= timeout:
+                    e.timeout = timeout
+                    raise
+            for p_poll in poll_procs:
+                if p_poll.poll() is None:
+                    continue
+                raise RuntimeError("A sub-process has exited.")
 
 
 def check_call(*popenargs, **kwargs):
-    print(f"Start subprocess with check_call({popenargs}, {kwargs})")
+    print(f"Start subprocess with check_call({redact_popenargs(popenargs)}, "
+          f"{redact_kwargs(kwargs)})")
     retcode = call(*popenargs, suppress_output_info=True, **kwargs)
     if retcode:
         cmd = kwargs.get("args")
@@ -222,7 +339,8 @@ def check_call(*popenargs, **kwargs):
 
 
 def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
-    print(f"Start subprocess with check_output({popenargs}, {kwargs})")
+    print(f"Start subprocess with check_output({redact_popenargs(popenargs)}, "
+          f"{redact_kwargs(kwargs)})")
     with Popen(*popenargs,
                stdout=subprocess.PIPE,
                start_new_session=start_new_session,
@@ -289,9 +407,8 @@ def print_error(message: str) -> None:
 
 # custom test checker
 def check_call_negative_test(*popenargs, **kwargs):
-    print(
-        f"Start subprocess with check_call_negative_test({popenargs}, {kwargs})"
-    )
+    print(f"Start subprocess with check_call_negative_test("
+          f"{redact_popenargs(popenargs)}, {redact_kwargs(kwargs)})")
     retcode = call(*popenargs, suppress_output_info=True, **kwargs)
     if retcode:
         return 0

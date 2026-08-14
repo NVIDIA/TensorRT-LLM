@@ -16,17 +16,21 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Fallbacks.cuh"
 #include "tensorrt_llm/common/cudaBufferUtils.cuh"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/archCondition.h"
 #include "tensorrt_llm/kernels/fusedLayernormKernels/ws_layernorm.cuh"
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 template <uint32_t N_THREADS, typename T, size_t N>
@@ -111,8 +115,6 @@ struct LowLatencyLayerNorm
 
         uint32_t work_id = blockIdx.x;
 
-        FusedOperator fused_operator(param);
-
         constexpr auto PACKED_PER_N_BLOCK = Traits::N_BLOCK / N_THREADS / Traits::PACKED_ELEMS_PER_COMPUTE;
 
         typename Traits::AccumulatorType data[PACKED_PER_N_BLOCK][Traits::PACKED_ELEMS_PER_COMPUTE];
@@ -135,7 +137,7 @@ struct LowLatencyLayerNorm
             for (int i = 0; i < PACKED_PER_N_BLOCK; i++)
             {
                 auto offset = (thread_id + i * N_THREADS) * Traits::PACKED_ELEMS_PER_COMPUTE;
-                if (offset <= sz)
+                if (offset < sz)
                 {
                     data[i] = *reinterpret_cast<PackedType const*>(&g_data[offset]);
                 }
@@ -150,6 +152,14 @@ struct LowLatencyLayerNorm
         };
 
         static_assert(Traits::OUTPUT_SCALE != SCALE_TYPE::VECTOR);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+        if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
+        {
+            cudaGridDependencySynchronize();
+        }
+#endif
+        FusedOperator fused_operator(param);
 
         if constexpr (Traits::BIAS == SCALE_TYPE::VECTOR)
         {
@@ -170,12 +180,7 @@ struct LowLatencyLayerNorm
         {
             load_to_register(param.beta, r_beta, param.n);
         }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
-#if (defined(__CUDA_ARCH_FEAT_SM90_ALL) || defined(__CUDA_ARCH_FEAT_SM100_ALL))
-        asm volatile("griddepcontrol.wait;\n");
-        asm volatile("griddepcontrol.launch_dependents;\n");
-#endif
-#endif
+
         load_to_register(&param.input[work_id * param.n], data, param.n);
 
         if constexpr (Traits::RESIDUAL)
@@ -253,25 +258,30 @@ struct LowLatencyLayerNorm
         if constexpr (!Traits::RMS_NORM)
         {
             mean = var_and_mean[1] / param.n;
-            variance = rsqrtf(
-                var_and_mean[0] / param.n - var_and_mean[1] * var_and_mean[1] + (Traits::AccumulatorType)(1e-5));
+            variance = rsqrtf(var_and_mean[0] / param.n - var_and_mean[1] * var_and_mean[1]
+                + (Traits::AccumulatorType)(param.layernorm_eps));
         }
         else
         {
-            variance = rsqrtf(var_and_mean[0] / param.n + (Traits::AccumulatorType)(1e-5));
+            variance = rsqrtf(var_and_mean[0] / param.n + (Traits::AccumulatorType)(param.layernorm_eps));
         }
 
         for (int i = 0; i < PACKED_PER_N_BLOCK; i++)
         {
             auto n_base = (thread_id + i * N_THREADS) * Traits::PACKED_ELEMS_PER_COMPUTE;
             auto in_bound = n_base < param.n;
-            if (!in_bound)
+
+            // FP4Converter uses __shfl_xor_sync — all warp threads must stay converged.
+            if constexpr (std::is_same_v<typename Traits::FusedOperator, void>)
             {
-                break;
+                if (!in_bound)
+                {
+                    break;
+                }
             }
 
             typename PackType<typename Traits::OutputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type normed_output;
-            typename PackType<typename Traits::AccumulatorType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
+            typename PackType<typename Traits::InputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
                 high_precision_normed_output;
             for (int j = 0; j < Traits::PACKED_ELEMS_PER_COMPUTE; j++)
             {
@@ -295,7 +305,7 @@ struct LowLatencyLayerNorm
                 }
                 if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
                 {
-                    high_precision_normed_output.array[j] = normed_out;
+                    high_precision_normed_output.array[j] = (typename Traits::InputType) normed_out;
                 }
                 if constexpr (Traits::OUTPUT_SCALE == SCALE_TYPE::SCALAR)
                 {
@@ -312,13 +322,16 @@ struct LowLatencyLayerNorm
             else
             {
                 fused_operator.template post_process<Traits::PACKED_ELEMS_PER_COMPUTE, decltype(normed_output)>(
-                    work_id, n_base, normed_output);
+                    work_id, n_base, normed_output, in_bound);
             }
             if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
             {
-                reinterpret_cast<decltype(high_precision_normed_output)*>(
-                    &param.high_precision_normed_output[work_id * param.n + n_base])[0]
-                    = high_precision_normed_output;
+                if (in_bound)
+                {
+                    reinterpret_cast<decltype(high_precision_normed_output)*>(
+                        &param.high_precision_normed_output[work_id * param.n + n_base])[0]
+                        = high_precision_normed_output;
+                }
             }
         }
     }
@@ -327,7 +340,17 @@ struct LowLatencyLayerNorm
     {
         __shared__ Shared shared;
         compute(param, &shared);
+        __syncthreads();
+        asm volatile("membar.gl;" : : : "memory");
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 12))
+        if constexpr (arch::is_major_v<9> || arch::is_major_v<10>)
+        {
+            cudaTriggerProgrammaticLaunchCompletion();
+        }
+#endif
     }
 };
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

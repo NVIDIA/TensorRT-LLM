@@ -1,17 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
+import functools
 import os
 import threading
 from dataclasses import dataclass
-from enum import Enum
-from typing import Dict, List
+from enum import Enum, IntEnum
+from typing import Dict, List, Optional
 
 import torch
+from torch.nn import functional as F
 
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
+                                 get_sm_version, torch_dtype_to_str)
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import ceil_div, pad_up
+from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
+is_piecewise_running_flag = False
 
-aux_stream_name_list = ['Attention', 'MoeShared', 'MoeChunkingOverlap']
+aux_stream_name_list = [
+    'Attention',
+    'MoeShared',
+    'MoeChunkingOverlap',
+    'MoeBalancer',
+    'MoeOutputMemset',
+    'MoeFc2Alpha',
+    'EngramPrecompute',
+    'MlaIndexer',
+    'MlaIndexerAux',
+    'MlaCompressor',
+]
 AuxStreamType = Enum(
     'AuxStreamType',
     aux_stream_name_list,
@@ -23,6 +44,48 @@ EventType = Enum(
 )
 
 
+def is_gdn_replay_enabled() -> bool:
+    """Return whether GDN replay is enabled (default: enabled)."""
+    return os.environ.get("TRTLLM_USE_GDN_REPLAY", "1") == "1"
+
+
+# IMPORTANT: Keep the same order of activation functions in this enum and the enum in
+# cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+class ActivationType(IntEnum):
+    InvalidType = 0
+    Identity = 1
+    Gelu = 2
+    Relu = 3
+    Silu = 4
+    Swiglu = 5
+    Geglu = 6
+    SwigluBias = 7
+    Relu2 = 8
+
+
+# Keep this in sync with the ActType enum in
+# cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
+class ActType_TrtllmGen(IntEnum):
+    # act = x0 * x1 * sigmoid(x1)
+    SwiGlu = 0
+    # act = relu(x0) ^ 2
+    Relu2 = 1
+    # act = x0 * sigmoid(x0)
+    Silu = 2
+    # SiTu gated activation (Kimi K3), gate on x1:
+    #   act = (beta * tanh(x0 / beta)) * (alpha * tanh(x1 / alpha) * sigmoid(x1))
+    # alpha/beta come from the per-expert gemm1_alpha/gemm1_beta runtime buffers.
+    SiTu = 3
+
+
+# IMPORTANT: when adding a new activation type, please update this function.
+# And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
+def is_gated_activation(activation_type: ActivationType) -> bool:
+    return activation_type in [
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+    ]
+
+
 def set_torch_compiling(enable: bool):
     global is_torch_compiling_flag
     is_torch_compiling_flag = enable
@@ -31,6 +94,16 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+def set_piecewise_running(enable: bool):
+    global is_piecewise_running_flag
+    is_piecewise_running_flag = enable
+
+
+def is_piecewise_running() -> bool:
+    global is_piecewise_running_flag
+    return is_piecewise_running_flag
 
 
 _global_attrs = threading.local()
@@ -45,6 +118,22 @@ _model_extra_attrs = threading.local()
 
 def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
+
+
+def is_nvfp4_marlin_supported_sm(sm_version: int | None = None) -> bool:
+    """Return True on Ada Lovelace (SM89, e.g. L40S) and Hopper (SM90-99)."""
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return 89 <= sm_version < 100
+
+
+def is_nvfp4_marlin_enabled() -> bool:
+    is_supported_sm = is_nvfp4_marlin_supported_sm()
+    has_marlin_kernel = hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
+    attrs = get_model_extra_attrs()
+    is_marlin_specified = attrs is not None and "marlin" in attrs.get(
+        'nvfp4_gemm_allowed_backends', [])
+    return is_supported_sm and has_marlin_kernel and is_marlin_specified
 
 
 @contextlib.contextmanager
@@ -74,7 +163,8 @@ def make_weak_ref(x):
 
     if isinstance(x, torch.Tensor):
         return convert_to_torch_tensor(
-            TensorWrapper(x.data_ptr(), x.dtype, x.shape)) if x.is_cuda else x
+            TensorWrapper(x.data_ptr(), x.dtype, x.shape,
+                          x.stride())) if x.is_cuda else x
     elif isinstance(x, tuple):
         return tuple(make_weak_ref(i) for i in x)
     elif isinstance(x, list):
@@ -91,90 +181,127 @@ def make_weak_ref(x):
 class Fp4QuantizedTensor:
     fp4_tensor: torch.Tensor
     scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = True
+    # Optional un-quantized (BF16/FP16) hidden-state view of the same logical
+    # activation. When the FP4 tensor is produced by a fused
+    # (add+)RMSNorm+NVFP4-quant that also returns the un-quantized
+    # (post-RMSNorm) value, this carries that tensor so downstream consumers
+    # needing the un-quantized form (e.g. DSv3.2's DSA indexer at
+    # sparse/dsa.py:pre_indexer_proj) can use it without dequantizing FP4.
+    unquantized_hidden_states: Optional[torch.Tensor] = None
 
     @property
     def shape(self):
         return self.fp4_tensor.shape
 
 
-_disable_fp4_allgather = os.getenv("TLLM_DISABLE_FP4_ALLGATHER", "0") == "1"
-
-
-def disable_fp4_allgather():
-    return _disable_fp4_allgather
+def compute_swizzled_sf_shape(row: int, col: int):
+    padded_row = pad_up(row, 128)
+    padded_col = pad_up(col, 4)
+    return padded_row, padded_col
 
 
 def swizzle_sf(sf: torch.Tensor,
-               row: int,
-               col: int,
+               rows: int,
+               cols: int,
                scaling_vector_size: int = 16):
-    factor = scaling_vector_size * 4
-    num_m_tiles = (row + 128 - 1) // 128
-    num_k_tiles = (col + factor - 1) // factor
-    # SF layout [num_m_tiles, num_k_tiles, 32 (m_tile column major), 4 (m_tile column major), 4(k_tile)]
-    sf_full = torch.zeros(num_m_tiles * 32 * 4,
-                          num_k_tiles * 4,
-                          dtype=sf.dtype,
-                          device=sf.device)
-    sf_full[:row, :(col //
-                    scaling_vector_size)] = sf[:row, :(col //
-                                                       scaling_vector_size)]
-    sf_full_reshaped = sf_full.view(num_m_tiles, 4, 32, num_k_tiles, 4)
-    sf_full_swizzle = sf_full_reshaped.transpose(1, 3)
-    sf_swizzle = sf_full_swizzle.reshape(-1)
-    return sf_swizzle
+    """Swizzle FP4 scaling factors using C++ torch op implementation
+    Args:
+        sf: [b, rows, cols_sf] or [rows, cols_sf]. The original unswizzled scaling factors.
+        rows: rows of the original unquantized tensor
+        cols_sf: ceil_div(cols, scaling_vector_size) where cols is the number of columns of the original unquantized tensor
+        scaling_vector_size: the size of the scaling vector
+    Returns:
+        [b * pad_up(rows, 128) * pad_up(cols_sf, 4), ] 1D swizzled scaling factors, possibly with rows and cols padded.
+    """
+    sf_cols = ceil_div(cols, scaling_vector_size)
+    sf = sf.view(-1, rows, sf_cols)
+    return torch.ops.trtllm.block_scale_interleave(sf)
 
 
 def unswizzle_sf(sf: torch.Tensor,
-                 row: int,
-                 col: int,
+                 rows: int,
+                 cols: int,
                  scaling_vector_size: int = 16):
-    factor = scaling_vector_size * 4
-    num_m_tiles = (row + 128 - 1) // 128
-    num_k_tiles = (col + factor - 1) // factor
-    # SF layout [num_m_tiles, num_k_tiles, 32 (m_tile column major), 4 (m_tile column major), 4(k_tile)]
-    sf_reshaped = sf.view(num_m_tiles, num_k_tiles, 32, 4, 4)
-    sf_unswizzle = sf_reshaped.transpose(1, 3)
-    sf_unswizzle = sf_unswizzle.reshape(num_m_tiles * 32 * 4, num_k_tiles * 4)
-    sf_unswizzle_sliced = sf_unswizzle[:row, :(col // scaling_vector_size)]
-    return sf_unswizzle_sliced.contiguous()
+    """Swizzle FP4 scaling factors using C++ torch op implementation
+    Args:
+        sf: The (padded and) swizzled scaling factors.
+        rows: rows of the original unquantized tensor
+        cols: cols of the original unquantized tensor
+        scaling_vector_size: the size of the scaling vector
+    Returns:
+        2D unswizzled scaling factors
+    """
+    sf_cols = ceil_div(cols, scaling_vector_size)
+    sf = sf.view(-1, rows, sf_cols)
+    return torch.ops.trtllm.block_scale_interleave_reverse(sf).view(-1, sf_cols)
 
 
+@torch.library.custom_op("trtllm::reswizzle_sf", mutates_args=())
 def reswizzle_sf(sf: torch.Tensor,
-                 row: int,
-                 col: int,
-                 scaling_vector_size: int = 16):
-    factor = scaling_vector_size * 4
-    num_m_tiles = (row + 128 - 1) // 128
-    num_k_tiles = (col + factor - 1) // factor
-    partition_size = num_m_tiles * num_k_tiles * 32 * 4 * 4
-    num_partitions = sf.numel() // partition_size
-    sf_reshaped = sf.view(num_partitions, num_m_tiles, num_k_tiles, 32, 4, 4)
-    sf_unswizzle = sf_reshaped.transpose(2, 4)
-    sf_unswizzle = sf_unswizzle.reshape(num_partitions, num_m_tiles * 32 * 4,
-                                        num_k_tiles * 4)
-    total_rows = num_partitions * row
-    num_m_tiles_out = (total_rows + 128 - 1) // 128
-    sf_out = torch.zeros(
-        num_m_tiles_out,
-        4,
-        32,
-        num_k_tiles,
-        4,
-        dtype=sf.dtype,
-        device=sf.device,
-    )
-    sf_out_reshaped = sf_out.view(num_m_tiles_out * 32 * 4, num_k_tiles * 4)
-    sf_out_reshaped[:total_rows] = sf_unswizzle[:, :row].reshape(total_rows, -1)
-    sf_out_swizzle = sf_out.transpose(1, 3).reshape(-1)
-    return sf_out_swizzle
+                 rows: int,
+                 cols: int,
+                 scaling_vector_size: int = 16) -> torch.Tensor:
+    """Reswizzle FP4 scaling factors using C++ torch op implementation.
+       It unswizzles the scaling factors in each partition first, then concatenates them together, and finally swizzles them back.
+    Args:
+        sf: The (padded and) swizzled scaling factors.
+        rows: rows of the original unquantized tensor
+        cols: cols of the original unquantized tensor
+        scaling_vector_size: the size of the scaling vector
+    Returns:
+        1D reswizzled scaling factors
+    """
+    sf_cols = ceil_div(cols, scaling_vector_size)
+    padded_rows, padded_sf_cols = compute_swizzled_sf_shape(rows, sf_cols)
+    padded_cols = padded_sf_cols * scaling_vector_size
+
+    assert sf.numel() % (padded_rows * padded_sf_cols) == 0
+    num_partitions = sf.numel() // (padded_rows * padded_sf_cols)
+
+    sf_reshaped = sf.view(num_partitions, padded_rows, padded_sf_cols)
+
+    # Unswizzle each partition
+    sf_unswizzled = unswizzle_sf(sf_reshaped, padded_rows, padded_cols,
+                                 scaling_vector_size)
+
+    # Brings the unswizzled scaling factors in each partition together
+    total_rows = num_partitions * rows
+    sf_unswizzled = sf_unswizzled.view(num_partitions, padded_rows,
+                                       padded_sf_cols)
+    sf_concatenated = sf_unswizzled[:, :rows, :sf_cols].contiguous(
+    )  # TODO: This will incur a elementwise kernel
+    sf_concatenated = sf_concatenated.view(total_rows, sf_cols)
+
+    # Finally swizzle the concatenated scaling factors
+    return swizzle_sf(sf_concatenated, total_rows, cols, scaling_vector_size)
+
+
+@torch.library.register_fake("trtllm::reswizzle_sf")
+def _(sf, rows, cols, scaling_vector_size=16):
+    sf_cols = ceil_div(cols, scaling_vector_size)
+    padded_rows, padded_sf_cols = compute_swizzled_sf_shape(rows, sf_cols)
+    num_partitions = sf.numel() // (padded_rows * padded_sf_cols)
+    total_rows = num_partitions * rows
+    sz = pad_up(total_rows, 128) * pad_up(cols, 4)
+    return sf.new_empty(sz)
 
 
 def next_positive_power_of_2(x: int) -> int:
     if x < 1:
         return 1
 
-    return 1 << (x - 1).bit_length()
+    # Following code is equivalent to 1 << (x - 1).bit_length()
+    # But this impl does not contain bit_length() so can be used by torch compile.
+    # It can correctly handle 64bit number which should be enough for now.
+    n = x - 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    return n + 1
 
 
 def last_positive_power_of_2(x: int) -> int:
@@ -197,7 +324,7 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
 
-    return tuple(num_token_buckets)
+    return tuple(num_token_buckets[::-1])
 
 
 def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
@@ -207,7 +334,44 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     while m >= 1:
         num_token_buckets.append(m)
         m //= 2
-    return num_token_buckets
+    return tuple(num_token_buckets[::-1])
+
+
+def deep_gemm_gen_tuning_buckets(x: int):
+    buckets = tuple(range(8, 128, 8))
+    # Clamp x to be between 4096 and 8192.
+    if x >= 128:
+        x = min(x, 8192)
+        x = max(x, 4096)
+        buckets += tuple(range(128, x, 128))
+    return buckets
+
+
+def fp4_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
+                                                     sf_vec_size=16)
+    return scale_shape * 2
+
+
+def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
+                                                     sf_vec_size=16,
+                                                     is_swizzled_layout=False)
+    return scale_shape * 2
+
+
+def fp8_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp8 scale tensor.
+    """
+    input_shape = input_shapes[0]
+    assert len(input_shape) == 2 or len(input_shape) == 3
+    has_batch = len(input_shape) == 3
+    m = input_shape[-2]
+    return pad_up(m, 4) if has_batch else m
 
 
 _enable_piecewise_cuda_graph = True
@@ -221,3 +385,290 @@ def set_piecewise_cuda_graph_flag(enable: bool):
 def get_piecewise_cuda_graph_flag() -> bool:
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
+
+
+@contextlib.contextmanager
+def piecewise_cuda_graph(enable: bool):
+    prev_enable = get_piecewise_cuda_graph_flag()
+    set_piecewise_cuda_graph_flag(enable)
+    try:
+        yield
+    finally:
+        set_piecewise_cuda_graph_flag(prev_enable)
+
+
+def set_per_request_piecewise_cuda_graph_flag(enable: bool):
+    _global_attrs.per_request_piecewise_cuda_graph_flag = enable
+
+
+def get_per_request_piecewise_cuda_graph_flag() -> bool:
+    return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
+
+
+def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
+    # We use heuristic to determine the lm_head_tp_size
+    # Since token_count=256 will hit the boundary of math-bound problem
+    # We use 256 // token_count to determine the lm_head_tp_size
+    # For more details, refer to the blog: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md#mtp-lm-head-tensor-parallelism
+    lm_head_tp_size_raw = 256 // token_count
+    # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
+    lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
+    lm_head_tp_size = int(
+        os.getenv(
+            'LM_HEAD_TP_SIZE',
+            nearest_in_buckets(lm_head_tp_size_raw,
+                               [1, lm_head_tp_size_upper_bound])))
+    assert mapping.tp_size % lm_head_tp_size == 0, f"mapping.tp_size: {mapping.tp_size}, lm_head_tp_size: {lm_head_tp_size}"
+    lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
+
+    return Mapping(
+        world_size=lm_head_tp_size * lm_head_pp_size,
+        rank=mapping.rank,
+        gpus_per_node=mapping.gpus_per_node,
+        tp_size=lm_head_tp_size,
+        pp_size=lm_head_pp_size,
+        enable_attention_dp=mapping.enable_attention_dp,
+        enable_lm_head_tp_in_adp=mapping.enable_lm_head_tp_in_adp,
+    )
+
+
+def get_device_uuid(device_idx: int) -> str:
+    """Get the UUID of a CUDA device using torch cuda api"""
+
+    property = torch.cuda.get_device_properties(device_idx)
+    uuid = "GPU-" + str(property.uuid)
+    return uuid
+
+
+def maybe_compile(func=None, **compile_kwargs):
+    """
+    Conditionally compile a function with torch.compile.
+    If is_piecewise_running() is True, the function will not be compiled to avoid host overhead in attention op.
+    Args:
+        func: The function to decorate (optional, for direct decoration).
+        **compile_kwargs: Keyword arguments for torch.compile.
+    Returns:
+        The conditionally compiled function..
+    """
+
+    def decorator(f):
+        compiled_func = torch.compile(f, **compile_kwargs)
+
+        def wrapper(*args, **kwargs):
+            if is_piecewise_running():
+                return f(*args, **kwargs)
+            return compiled_func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator(func) if func else decorator
+
+
+# This decorator selectively disables inference_mode() to avoid conflicts with torch.dynamo tracing.
+def inference_mode_unless_compiling(func):
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if torch.compiler.is_compiling():
+            return func(*args, **kwargs)
+        with torch.inference_mode():
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+def split(x: torch.Tensor,
+          tp_size: int,
+          idx: int,
+          dim: int = 0) -> torch.Tensor:
+    assert x.shape[dim] % tp_size == 0
+    split_size = x.shape[dim] // tp_size
+    if tp_size == 1:
+        return x
+    return torch.split(x, split_size, dim=dim)[idx]
+
+
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    return torch.square(F.relu(x))
+
+
+def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
+    return F.gelu(x, approximate="tanh")
+
+
+def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
+    # Pass num_elements=-1 will print the whole tensor
+    if num_elements < 0:
+        num_elements = torch.numel(x)
+    if x.dtype in (torch.int32, torch.int64):
+        float_x = x.to(dtype=float)
+    else:
+        float_x = x
+    return ("Tensor("
+            f"shape={tuple(x.shape)}, "
+            f"dtype={torch_dtype_to_str(x.dtype)}, "
+            f"device={x.device}, "
+            f"stats=("
+            f"abs_mean={float_x.abs().mean().item():.3f}, "
+            f"mean={float_x.mean().item():.3f}, "
+            f"std={float_x.std().item():.3f}, "
+            f"max={x.max().item():.3f}, "
+            f"min={x.min().item():.3f}"
+            "), "
+            f"values={x.flatten()[:num_elements].tolist()}"
+            ")")
+
+
+@maybe_compile
+def maybe_compiled_copy_(dst, src):
+    dst.copy_(src)
+
+
+@maybe_compile
+def maybe_compiled_cat(tensors, dim):
+    return torch.cat(tensors, dim)
+
+
+def replace_parameter_and_save_metadata(
+        module: torch.nn.Module, param_name: str,
+        new_param: torch.nn.Parameter | torch.Tensor, metadata_dict: Dict):
+    """
+    Replace a parameter in a module and save the metadata of the original parameter.
+    On first call: saves original param's meta tensor and new param's tensor, then replaces.
+    On subsequent calls: copies new_param data into the saved tensor, then registers it.
+    """
+    saved_param = None
+    if param_name not in metadata_dict:
+        # First time: save original meta tensor and the new param tensor reference
+        original_meta = getattr(module, param_name).to("meta")
+        # Convert new_param to Parameter if it's a Tensor, otherwise use directly
+        if isinstance(new_param, torch.nn.Parameter):
+            saved_param = new_param
+        elif isinstance(new_param, torch.Tensor):
+            saved_param = torch.nn.Parameter(new_param, requires_grad=False)
+        else:
+            raise ValueError(f"Invalid type {type(new_param)} for new_param")
+        metadata_dict[param_name] = {
+            'meta': original_meta,
+            'param': saved_param
+        }
+    else:
+        # Subsequent calls: copy new_param into the saved tensor
+        saved_param = metadata_dict[param_name]['param']
+        if isinstance(new_param, torch.nn.Parameter):
+            saved_param.data.copy_(new_param.data)
+        elif isinstance(new_param, torch.Tensor):
+            saved_param.data.copy_(new_param)
+        else:
+            raise ValueError(f"Invalid type {type(new_param)} for new_param")
+
+    module.register_parameter(param_name, saved_param)
+
+
+class _AcceptSyncCompute:
+    pass
+
+
+ACCEPT_SYNC_COMPUTE = _AcceptSyncCompute()
+
+
+# Inspired by https://github.com/pytorch/pytorch/issues/80577; note also the
+# suggestion to consider torch.nested.
+def torch_multi_arange(
+    ends: torch.Tensor,
+    *,
+    output_length: int | _AcceptSyncCompute,
+    starts: torch.Tensor | None = None,
+    steps: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Efficiently compute torch.cat([torch.arange(b, e, d) for b, e, d in zip(starts, ends, steps)]).
+
+    Starts, ends, steps need to share dtype and shape. Invalid ranges like range(1, 2, -1) are
+    silently discarded. 'steps' defaults to 1 and 'starts' defaults to 0.
+
+    Provide 'output_length' to avoid synchronization when using device tensors or pass
+    `ACCEPT_SYNC_COMPUTE` to explicitly accept the possibility of a device sync (for device tensors)
+    or when tensors are known to reside on the host.
+    """
+    if not ((steps is None or
+             (ends.dtype == steps.dtype and ends.shape == steps.shape
+              and ends.device == steps.device)) and
+            (starts is None or
+             (ends.dtype == starts.dtype and ends.shape == starts.shape
+              and ends.device == starts.device))):
+        raise ValueError("Incompatible input tensors")
+    output_length_arg = None if isinstance(
+        output_length, _AcceptSyncCompute) else output_length
+
+    if ends.numel() == 0:
+        return ends.clone()
+
+    # This algorithm combines torch.repeat_interleaved() and torch.cumsum() to
+    # construct the result.
+    #
+    # 1. Given N ranges (characterized by starts, ends, steps), construct a sequence
+    #    of 2N numbers, in which the non-overlapping pairs of consecutive numbers
+    #    correspond to the ranges. For a given range, the pair (a, b) is chosen such
+    #    that upon torch.cumsum() application 'a' turns the last element of the
+    #    preceding range into the start element for the current range and 'b' is
+    #    simply the step size for the current range.
+    #
+    repeats = ends - starts if starts is not None else ends
+    if steps is not None:
+        if repeats is not ends:
+            repeats *= steps.sign()
+        else:
+            repeats = repeats * steps.sign()
+        steps_abs = steps.abs()
+        repeats = (repeats + steps_abs - 1).div(steps_abs,
+                                                rounding_mode="floor")
+    repeats = repeats.clip(min=0)  # ignore invalid ranges
+    ones = torch.ones((), dtype=ends.dtype, device=ends.device)
+    zeros = torch.zeros((), dtype=ends.dtype, device=ends.device)
+    if steps is None:
+        steps = ones.broadcast_to(ends.shape)
+
+    range_ends = repeats - 1  # last element in each range
+    if steps is not None:
+        range_ends *= steps
+    if starts is not None:
+        range_ends += starts
+    #
+    # Handling of zero-repeats requires extra care. Need to track index of last non-zero
+    # repeat for each non-zero repeat.
+    #   pad values: repeats.size(0) for scatter, 0 for gather
+    nz_repeats_idx = torch.nonzero_static(
+        repeats, size=repeats.size(0), fill_value=repeats.size(0)).squeeze(-1)
+    next_nz_repeats_idx = nz_repeats_idx.roll(-1)
+    next_nz_repeats_idx[-1].fill_(repeats.size(0))
+    nz_repeats_idx.masked_fill_(nz_repeats_idx == repeats.size(0), 0)
+    #
+    # contains end of last non-empty range for each index with non-zero repeat (other
+    # entries zero)
+    last_nonempty_range_ends = torch.zeros(
+        device=range_ends.device,
+        dtype=range_ends.dtype,
+        size=(repeats.size(0) + 1, ),
+    ).scatter(
+        dim=0,
+        index=next_nz_repeats_idx,
+        src=range_ends.gather(dim=0, index=nz_repeats_idx),
+    )[:-1]
+
+    jumps = -last_nonempty_range_ends  # delta from one non-empty range to the next
+    if starts is not None:
+        jumps += starts
+    seq = torch.cat((jumps.unsqueeze(-1), steps.unsqueeze(-1)), dim=1).view(-1)
+    #
+    # 2. Construct output via torch.repeat_interleave() and torch.cumsum()
+    #     NB: For a resulting empty range, repeats - 1 == -1. In this case, we
+    #         should set repeats for delta and increment both to 0 instead.
+    zero_repeats_mask = (repeats == 0)
+    jump_repeats = torch.where(zero_repeats_mask, zeros, ones)
+    step_repeats = torch.where(zero_repeats_mask, zeros, repeats - 1)
+    seq_repeats = torch.cat(
+        (jump_repeats.unsqueeze(-1), step_repeats.unsqueeze(-1)),
+        dim=1).view(-1)
+    seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
+    seq = seq.cumsum(0, dtype=ends.dtype)
+    return seq

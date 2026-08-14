@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,24 +16,28 @@
  */
 
 #pragma once
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include <cstdint>
+#include <cuda_runtime.h>
 #include <optional>
 #include <string>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 // Useful when you want to inject some debug code controllable with env var.
 std::optional<int32_t> getIntEnv(char const* name);
 
 std::optional<size_t> getUInt64Env(char const* name);
 
+std::optional<float> getFloatEnv(char const* name);
+
+bool getBoolEnv(char const* name);
+
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
-
-// Whether XQA JIT is enabled.
-//
-// Returns the value of TRTLLM_ENABLE_XQA_JIT env var. If such env var doesn't exist, std::nullopt is returned.
-std::optional<bool> getEnvEnableXQAJIT();
 
 // 0 means to use heuristics.
 std::optional<int32_t> getEnvXqaBlocksPerSequence();
@@ -51,12 +55,51 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+// Whether the experimental cascade attention kernel is enabled (replaces
+// masked_multihead_attention_kernel for beam-search decoding).
+// Controlled by env var TRTLLM_ENABLE_CASCADE_MMHA (default: false).
+bool getEnvEnableCascadeMmha();
+
+// Whether PDL is enabled for MoE Renormalize routing kernel.
+// Disabled by default to avoid NaN corruption (https://nvbugs/5955170).
+// Set TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL=1 to re-enable.
+bool getEnvEnableTrtllmgenMoeRoutingRenormPDL();
+
+template <typename KernelFn, typename... Args>
+inline void launchWithPdlWhenEnabled(char const* name, KernelFn kernelFn, dim3 grid, dim3 block, size_t dynamicShmSize,
+    cudaStream_t stream, Args&&... args)
+{
+    TLLM_LOG_DEBUG("Enable PDL in %s", name);
+    cudaLaunchConfig_t kernelConfig;
+    kernelConfig.gridDim = grid;
+    kernelConfig.blockDim = block;
+    kernelConfig.dynamicSmemBytes = dynamicShmSize;
+    kernelConfig.stream = stream;
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    kernelConfig.attrs = attrs;
+    kernelConfig.numAttrs = 1;
+
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&kernelConfig, kernelFn, std::forward<Args>(args)...));
+}
+
 bool getEnvUseUCXKvCache();
 
 bool getEnvUseMPIKvCache();
+
 bool getEnvUseNixlKvCache();
 
+bool getEnvUseMooncakeKvCache();
+
 std::string getEnvUCXInterface();
+
+std::string getEnvNixlInterface();
+
+std::string getEnvNixlBackend();
+
+std::string getEnvMooncakeInterface();
 
 bool getEnvDisaggLayerwise();
 
@@ -68,15 +111,21 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvEnableReceiveKVCacheParallel();
 
-std::string getEnvKVCacheTransferOutputPath();
+std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
+
+// Opt-in for disaggregated KV transfer in-flight cancellation and fail-closed transfer-buffer quarantine.
+bool getEnvDisaggEnableInflightCancel();
 
 // Force deterministic behavior for all kernels.
 bool getEnvForceDeterministic();
 
 // Force deterministic behavior for MoE plugin.
 bool getEnvForceDeterministicMOE();
+
+// Disable finalize fusion in MoE plugin
+bool getEnvMOEDisableFinalizeFusion();
 
 // Force deterministic behavior for attention plugin.
 bool getEnvForceDeterministicAttention();
@@ -92,12 +141,34 @@ size_t getEnvKVCacheRecvBufferCount();
 
 bool getEnvKVCacheTransferUseAsyncBuffer();
 
+bool getEnvKVCacheTransferUseSyncBuffer();
+
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
-uint16_t getEnvNixlPort();
+bool getEnvKVCachePoolUseFabricMemory();
+
+// Whether to disable coalescing of contiguous NIXL transfer descriptors (coalescing is on by default).
+bool getEnvNixlDisableCoalesce();
 
 bool getEnvDisaggBenchmarkGenOnly();
 
-} // namespace tensorrt_llm::common
+// Whether to disable the chunked-attention in the generation phase.
+bool getEnvDisableChunkedAttentionInGenPhase();
+
+// TODO: For DEV purpose temporarily.
+// Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
+int getEnvMoeA2ADispatchBlockSize();
+// Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
+int getEnvMoeA2ACombineBlockSize();
+
+bool getEnvKVCacheTransferAllBlocksForWindow();
+
+bool getEnvEplbForceGdrcopy();
+
+bool getEnvPrintSkipSoftmaxStat();
+
+} // namespace common
+
+TRTLLM_NAMESPACE_END

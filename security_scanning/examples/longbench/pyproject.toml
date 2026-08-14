@@ -1,0 +1,18 @@
+[project]
+name = "longbench-examples"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
+]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "jieba (>=0.42.1,<0.43.0)",
+    "fuzzywuzzy (>=0.18.0,<0.19.0)",
+    "rouge (>=1.0.1,<2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

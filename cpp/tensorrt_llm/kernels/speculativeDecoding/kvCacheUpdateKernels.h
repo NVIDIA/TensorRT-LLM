@@ -16,12 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cstdint>
 #include <cuda_runtime_api.h>
 
-namespace tensorrt_llm::kernels::speculative_decoding
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::speculative_decoding
 {
 
 using IndexType = int;
@@ -205,4 +208,21 @@ void updateKVBlockArrayDraftTokenLocation(runtime::SizeType32 const* seqAccepted
     runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq, runtime::SizeType32 tokensPerBlock,
     bool canUseOneMoreBlock, cudaStream_t stream);
 
-} // namespace tensorrt_llm::kernels::speculative_decoding
+/*!
+ * Update Block KV cache using 2D indices tensor (CUDA graph compatible).
+ * Accepts a fixed-size 2D tensor where each row contains accepted draft token indices,
+ * padded with -1. The kernel computes draft count as max(numAcceptedTokens[i] - 1, 0).
+ * Context requests naturally have numAcceptedTokens=1 → 0 draft tokens.
+ */
+void updateKVBlockArrayDraftTokenLocation2D(IndexType const* acceptedDraftTokensIndices2D,
+    runtime::SizeType32 const* numAcceptedTokens, runtime::SizeType32 maxDraftLen,
+    runtime::SizeType32 const* pastKeyValueLengths, void* const* pointerArray, KVBlockArray::DataType* offsetArray,
+    runtime::SizeType32 layerCount, runtime::SizeType32 seqCount, runtime::SizeType32 numKVHeads,
+    runtime::SizeType32 sizeInBytesPerKVHead, runtime::SizeType32 rewindDraftTokenCommonCount,
+    runtime::SizeType32 const* rewindDraftTokenSeparateAdjustments, runtime::SizeType32 const* seqSlotRemapping,
+    runtime::SizeType32 const* batchSlots, runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq,
+    runtime::SizeType32 tokensPerBlock, bool canUseOneMoreBlock, cudaStream_t stream);
+
+} // namespace kernels::speculative_decoding
+
+TRTLLM_NAMESPACE_END

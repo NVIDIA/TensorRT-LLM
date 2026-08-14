@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,10 +17,15 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include <fcntl.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -36,6 +41,8 @@ enum class MemoryType : uint8_t
     kFILE
 };
 
+// `MemoryDesc` is used to describe a memory region, which can then be designated
+// as the source or destination of read/write operations.
 class MemoryDesc
 {
 public:
@@ -109,11 +116,144 @@ private:
     std::vector<MemoryDesc> mDescs;
 };
 
+class FileDesc
+{
+public:
+    FileDesc(std::string const& filename, int flags, mode_t mode, size_t len)
+        : mLen{len}
+    {
+        int fd = ::open(filename.c_str(), flags, mode);
+        TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' (GDS)", filename.c_str());
+        this->fd = fd;
+    }
+
+    FileDesc(FileDesc&& other) noexcept
+        : fd(other.fd)
+        , mLen(other.mLen)
+    {
+        other.fd = -1;
+        other.mLen = 0;
+    }
+
+    FileDesc& operator=(FileDesc&& other) noexcept
+    {
+        if (this != &other)
+        {
+            if (fd != -1)
+                ::close(fd);
+            fd = other.fd;
+            mLen = other.mLen;
+            other.fd = -1;
+            other.mLen = 0;
+        }
+        return *this;
+    }
+
+    ~FileDesc()
+    {
+        if (fd != -1)
+            ::close(fd);
+    }
+
+    [[nodiscard]] uint64_t getFd() const noexcept
+    {
+        return fd;
+    }
+
+    [[nodiscard]] size_t getLen() const noexcept
+    {
+        return mLen;
+    }
+
+    FileDesc(FileDesc const&) = delete;
+    FileDesc& operator=(FileDesc const&) = delete;
+
+private:
+    int fd;
+    size_t mLen;
+};
+
+class FileDescs
+{
+public:
+    FileDescs(std::vector<FileDesc>&& descs)
+        : mDescs(std::move(descs))
+    {
+    }
+
+    [[nodiscard]] std::vector<FileDesc> const& getDescs() const noexcept
+    {
+        return mDescs;
+    }
+
+private:
+    std::vector<FileDesc> mDescs;
+};
+
 using TransferDescs = MemoryDescs;
 using RegisterDescs = MemoryDescs;
 using SyncMessage = std::string;
 using ConnectionInfoType = std::string;
 
+/// Per-region VMM chunk info used for splitting descriptors at chunk boundaries.
+struct VramRegionInfo
+{
+    size_t totalLen;
+    size_t chunkSize; ///< 0 = cudaMalloc (no split), >0 = VMM chunk size
+};
+
+/// Region map: virtual base address → region info.
+using VramRegionMap = std::map<uintptr_t, VramRegionInfo>;
+
+/// Backend-agnostic VMM descriptor split utilities (no NIXL dependency).
+struct VmmDescSplitter
+{
+    /// @brief Look up VMM chunk info for an address from a region map.
+    /// @return {chunkSize, regionBase}. Returns {0, 0} if address is not in any region.
+    [[nodiscard]] static std::pair<size_t, uintptr_t> lookupChunkInfo(uintptr_t addr, VramRegionMap const& regionMap);
+
+    /// @brief Split VRAM descs at chunk boundaries using a pre-built region map.
+    /// For non-VRAM or addresses not in the map, descs pass through unchanged.
+    [[nodiscard]] static MemoryDescs splitDescsWithRegionMap(MemoryDescs const& descs, VramRegionMap const& regionMap);
+
+    /// @brief Split paired src/dst descs at chunk boundaries, then coalesce contiguous pieces.
+    /// src is split by localRegionMap, dst is split by remoteRegionMap; each piece size is
+    /// min(srcPiece, dstPiece, remaining). Pairs are sorted by src address, and adjacent pieces
+    /// whose src AND dst are both contiguous (same deviceId) are merged — but a merged desc never
+    /// crosses a chunk boundary on either side, and never spans two distinct regions, so every
+    /// output desc stays within a single registered memory region. Merging requires region
+    /// metadata: a piece whose address misses the region map on either side is never merged,
+    /// because two unknown regions are indistinguishable and a merge could cross a chunk or
+    /// registration boundary. With no region metadata the result is split-only. Non-kVRAM descs
+    /// pass through unchanged (no region info is available to bound the merge).
+    /// @param enableCoalesce When false, only split at chunk boundaries without merging pieces.
+    [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> splitAndCoalesceTransferDescs(MemoryDescs const& srcDescs,
+        MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap, VramRegionMap const& remoteRegionMap,
+        bool enableCoalesce = true);
+
+    /// @brief Split VRAM descs at VMM chunk boundaries detected via cuMemGetAddressRange.
+    /// For cudaMalloc memory (single allocation), descs pass through unchanged.
+    /// @param[out] detectedChunkSize Set to the VMM chunk size if detected, 0 otherwise.
+    [[nodiscard]] static MemoryDescs splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize);
+
+    /// @brief Build a VramRegionMap by probing each VRAM descriptor with cuMemGetAddressRange.
+    /// For each descriptor, detects whether it spans multiple VMM chunks and records {totalLen, chunkSize}.
+    /// @param descs VRAM memory descriptors to probe.
+    /// @return Region map with per-descriptor VMM info (chunkSize=0 for cudaMalloc memory).
+    [[nodiscard]] static VramRegionMap detectVramRegionMap(MemoryDescs const& descs);
+};
+
+/// VMM region metadata exchanged between agents for chunk boundary calculations.
+struct VramRegionMeta
+{
+    uintptr_t baseAddr;
+    size_t totalLen;
+    size_t chunkSize; ///< 0 = cudaMalloc (no split), >0 = VMM chunk size
+};
+
+// `AgentDesc` represents the unique identifier for reading and writing to the agent.
+// By accessing this identifier, the backend can establish the correct connection.
+// It also carries VMM region metadata so that remote agents can split at chunk boundaries.
 class AgentDesc final
 {
 public:
@@ -122,24 +262,51 @@ public:
     {
     }
 
+    AgentDesc(std::string backendAgentDesc, std::vector<VramRegionMeta> vramRegions)
+        : mBackendAgentDesc{std::move(backendAgentDesc)}
+        , mVramRegions{std::move(vramRegions)}
+    {
+    }
+
     [[nodiscard]] std::string const& getBackendAgentDesc() const noexcept
     {
         return mBackendAgentDesc;
     }
 
+    [[nodiscard]] std::vector<VramRegionMeta> const& getVramRegions() const noexcept
+    {
+        return mVramRegions;
+    }
+
+    /// Serialize the entire AgentDesc (backend blob + VMM regions) into an opaque string.
+    [[nodiscard]] std::string serialize() const;
+
+    /// Deserialize an opaque string back into an AgentDesc.
+    [[nodiscard]] static AgentDesc deserialize(std::string const& data);
+
 private:
     std::string mBackendAgentDesc;
+    std::vector<VramRegionMeta> mVramRegions;
 };
 
+// `TransferOp` is an enumeration that represents the types of transfer operations.
+// Currently, it supports two operations: `read` and `write`.
 enum class TransferOp : uint8_t
 {
     kREAD,
     kWRITE,
 };
 
+// `TransferRequest` is used to represent the transfer requests supported by the underlying agent.
 class TransferRequest
 {
 public:
+    /// @brief The constructor of `TransferRequest`.
+    /// @param op Source data arrangement.
+    /// @param srcDescs Description of the source memory region.
+    /// @param dstDescs Description of the destination memory region.
+    /// @param remoteName Name of the remote counterpart.
+    /// @param syncMessage Synchronization information for the end of the transfer.
     TransferRequest(TransferOp op, TransferDescs srcDescs, TransferDescs dstDescs, std::string const& remoteName,
         std::optional<SyncMessage> syncMessage = std::nullopt)
         : mOp{op}
@@ -183,18 +350,39 @@ private:
     std::optional<SyncMessage> mSyncMessage;
 };
 
+enum class TransferState : uint8_t
+{
+    kIN_PROGRESS,
+    kSUCCESS,
+    kFAILURE,
+};
+
+// Data structure for checking the status of active transfer operations.
 class TransferStatus
 {
 public:
     virtual ~TransferStatus() = default;
     [[nodiscard]] virtual bool isCompleted() const = 0;
-    virtual void wait() const = 0;
+    virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
+
+    /// Release the backend transfer request handle. A true return means the backend accepted the handle release; it
+    /// does not prove remote memory quiescence.
+    [[nodiscard]] virtual bool release()
+    {
+        return false;
+    }
 };
 
 struct BaseAgentConfig
 {
     std::string mName;
     bool useProgThread;
+    bool multiThread;
+    bool useListenThread;
+    bool enableTelemetry;
+    std::unordered_map<std::string, std::string> backendParams;
+    std::optional<int> rank;
+    std::optional<int> worldSize;
 };
 
 class BaseTransferAgent
@@ -202,24 +390,69 @@ class BaseTransferAgent
 public:
     virtual ~BaseTransferAgent() = default;
 
+    /// @brief Register a memory region.
+    /// @param descs Describe the memory regions to be registered.
     virtual void registerMemory(RegisterDescs const& descs) = 0;
 
+    /// @brief Unregister a memory region.
+    /// @param descs Describe the memory regions to be unregistered.
     virtual void deregisterMemory(RegisterDescs const& descs) = 0;
 
+    /// @brief Initialize and establish a connection with a remote agent.
+    /// @param name Specify the name of the remote agent.
+    /// @param agentDesc Provide the necessary communication details for connecting to the remote agent.
     virtual void loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc) = 0;
-    virtual AgentDesc getLocalAgentDesc() = 0;
 
+    /// @brief Initialize and establish a connection with a remote agent.
+    /// @param name Specify the name of the remote agent.
+    /// @param connectionInfo Provide the necessary communication details for connecting to the remote agent.
+    virtual void loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) = 0;
+
+    /// @brief Invalidate a connection with a remote agent.
+    /// @param name Specify the name of the remote agent.
     virtual void invalidateRemoteAgent(std::string const& name) = 0;
 
+    /// @brief Fetch the descriptor of the local agent.
+    /// @return The descriptor of the local agent.
+    virtual AgentDesc getLocalAgentDesc() = 0;
+
+    /// @brief Fetch the descriptor of the local agent.
+    /// @return The descriptor of the local agent.
+    virtual ConnectionInfoType getLocalConnectionInfo() = 0;
+
+    /// @brief Initiate the transfer by submitting the request.
+    /// @param request Specify the transmission request.
+    /// @return The status of the requests.
     [[nodiscard]] virtual std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) = 0;
+
+    /// @brief Generate a notification, not bound to a transfer, e.g., for control.
+    /// @param name Specify the name of the remote agent to which the information should be sent.
+    /// @param syncMessage The data or message intended for synchronization.
     virtual void notifySyncMessage(std::string const& name, SyncMessage const& syncMessage) = 0;
 
+    /// @brief Retrieve notification messages sent by other agents.
+    /// @return A mapping from remote agent names to their respective notification messages.
     virtual std::unordered_map<std::string, std::vector<SyncMessage>> getNotifiedSyncMessages() = 0;
 
-    virtual ConnectionInfoType getConnectionInfo() = 0;
-    virtual void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) = 0;
+    /// @brief Check if metadata is available for a remote agent.
+    /// @return Whether the metadata is available for a remote agent.
     virtual bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) = 0;
 };
+
+class BaseLoopbackAgent
+{
+public:
+    virtual ~BaseLoopbackAgent() = default;
+    virtual void executeLoopbackRequest(MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) = 0;
+};
+
+/// @brief Promote the shared library containing this code (libtensorrt_llm.so) to the
+/// process's global symbol scope. The KV cache transfer-agent wrapper libraries
+/// (libtensorrt_llm_{nixl,ucx,mooncake}_wrapper.so) intentionally carry no DT_NEEDED on
+/// libtensorrt_llm.so (the dependency would be circular) and resolve its symbols from the
+/// global symbol table, while Python extension modules and their dependencies load with
+/// RTLD_LOCAL. Idempotent; a no-op when the code is statically linked (e.g. unit tests).
+void promoteHostLibraryToGlobalScope();
 
 class DynLibLoader final
 {
@@ -259,6 +492,28 @@ template <typename... Args>
         using CreateNixlFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
         auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
             "libtensorrt_llm_nixl_wrapper.so", "createNixlTransferAgent");
+        return func(std::forward<Args>(args)...);
+    }
+    if (backend == "mooncake")
+    {
+        auto& loader = DynLibLoader::getInstance();
+        using CreateMooncakeFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
+        auto* func = loader.getFunctionPointer<CreateMooncakeFuncType>(
+            "libtensorrt_llm_mooncake_wrapper.so", "createMooncakeTransferAgent");
+        return func(std::forward<Args>(args)...);
+    }
+    TLLM_THROW("Unknown backend name.");
+}
+
+template <typename... Args>
+[[nodiscard]] std::shared_ptr<BaseLoopbackAgent> makeLoopbackAgent(std::string const& backend, Args&&... args)
+{
+    if (backend == "nixl")
+    {
+        auto& loader = DynLibLoader::getInstance();
+        using CreateNixlFuncType = std::shared_ptr<BaseLoopbackAgent> (*)(BaseAgentConfig const*);
+        auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
+            "libtensorrt_llm_nixl_wrapper.so", "createNixlLoopbackAgent");
         return func(std::forward<Args>(args)...);
     }
     TLLM_THROW("Unknown backend name.");

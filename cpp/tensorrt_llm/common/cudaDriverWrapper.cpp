@@ -18,6 +18,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+
 #define dllOpen(name) LoadLibrary("nv" name ".dll")
 #define dllClose(handle) FreeLibrary(static_cast<HMODULE>(handle))
 #define dllGetSym(handle, name) static_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle), name))
@@ -29,6 +30,7 @@
 #endif // defined(_WIN32)
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/logger.h"
 #include <cuda.h>
@@ -36,7 +38,9 @@
 #include <cstdio>
 #include <mutex>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 std::shared_ptr<CUDADriverWrapper> CUDADriverWrapper::getInstance()
@@ -81,6 +85,12 @@ CUDADriverWrapper::CUDADriverWrapper()
     *reinterpret_cast<void**>(&_cuLinkCreate) = load_sym(handle, "cuLinkCreate_v2");
     *reinterpret_cast<void**>(&_cuModuleGetFunction) = load_sym(handle, "cuModuleGetFunction");
     *reinterpret_cast<void**>(&_cuModuleGetGlobal) = load_sym(handle, "cuModuleGetGlobal_v2");
+    *reinterpret_cast<void**>(&_cuLibraryGetKernel) = load_sym(handle, "cuLibraryGetKernel");
+    *reinterpret_cast<void**>(&_cuLibraryLoadData) = load_sym(handle, "cuLibraryLoadData");
+    *reinterpret_cast<void**>(&_cuLibraryGetGlobal) = load_sym(handle, "cuLibraryGetGlobal");
+    *reinterpret_cast<void**>(&_cuLibraryUnload) = load_sym(handle, "cuLibraryUnload");
+    *reinterpret_cast<void**>(&_cuKernelSetAttribute) = load_sym(handle, "cuKernelSetAttribute");
+    *reinterpret_cast<void**>(&_cuCtxGetDevice) = load_sym(handle, "cuCtxGetDevice");
     *reinterpret_cast<void**>(&_cuLinkAddFile) = load_sym(handle, "cuLinkAddFile_v2");
     *reinterpret_cast<void**>(&_cuLinkAddData) = load_sym(handle, "cuLinkAddData_v2");
     *reinterpret_cast<void**>(&_cuLaunchCooperativeKernel) = load_sym(handle, "cuLaunchCooperativeKernel");
@@ -146,6 +156,41 @@ CUresult CUDADriverWrapper::cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod
 CUresult CUDADriverWrapper::cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, char const* name) const
 {
     return (*_cuModuleGetGlobal)(dptr, bytes, hmod, name);
+}
+
+CUresult CUDADriverWrapper::cuLibraryGetKernel(CUkernel* pKernel, CUlibrary library, char const* name) const
+{
+    return (*_cuLibraryGetKernel)(pKernel, library, name);
+}
+
+CUresult CUDADriverWrapper::cuLibraryLoadData(CUlibrary* library, void const* code, CUjit_option* jitOptions,
+    void** jitOptionsValues, unsigned int numJitOptions, CUlibraryOption* libraryOptions, void** libraryOptionValues,
+    unsigned int numLibraryOptions) const
+{
+    return (*_cuLibraryLoadData)(library, code, jitOptions, jitOptionsValues, numJitOptions, libraryOptions,
+        libraryOptionValues, numLibraryOptions);
+}
+
+CUresult CUDADriverWrapper::cuLibraryGetGlobal(
+    CUdeviceptr* dptr, size_t* bytes, CUlibrary library, char const* name) const
+{
+    return (*_cuLibraryGetGlobal)(dptr, bytes, library, name);
+}
+
+CUresult CUDADriverWrapper::cuLibraryUnload(CUlibrary library) const
+{
+    return (*_cuLibraryUnload)(library);
+}
+
+CUresult CUDADriverWrapper::cuKernelSetAttribute(
+    CUfunction_attribute attrib, int val, CUkernel kernel, CUdevice dev) const
+{
+    return (*_cuKernelSetAttribute)(attrib, val, kernel, dev);
+}
+
+CUresult CUDADriverWrapper::cuCtxGetDevice(CUdevice* device) const
+{
+    return (*_cuCtxGetDevice)(device);
 }
 
 CUresult CUDADriverWrapper::cuLinkAddFile(CUlinkState state, CUjitInputType type, char const* path,
@@ -254,4 +299,6 @@ CUresult CUDADriverWrapper::cuOccupancyMaxActiveClusters(
     return (*_cuOccupancyMaxActiveClusters)(maxActiveClusters, f, config);
 }
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

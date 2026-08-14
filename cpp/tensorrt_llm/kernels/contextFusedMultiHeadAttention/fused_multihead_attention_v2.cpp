@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,14 +15,45 @@
  */
 
 #include "fused_multihead_attention_v2.h"
+#include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <cmath>
+#include <cuda_runtime_api.h>
 #include <iomanip>
 #include <sstream>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
+
+namespace
+{
+
+constexpr uint64_t kUnrollShift = 0;
+constexpr uint64_t kInterleavedShift = 1;
+constexpr uint64_t kFlashAttentionShift = 2;
+constexpr uint64_t kForceFp32AccumShift = 3;
+constexpr uint64_t kTiledShift = 4;
+constexpr uint64_t kWarpSpecializationShift = 5;
+constexpr uint64_t kAlibiSupportedShift = 6;
+constexpr uint64_t kAttnLogitSoftcappingShift = 7;
+constexpr uint64_t kReturnSoftmaxShift = 8;
+constexpr uint64_t kInputLayoutShift = 9;
+constexpr uint64_t kAttentionMaskTypeShift = 11;
+constexpr uint64_t kEnableSkipSoftmaxShift = 14;
+constexpr uint64_t kDvShift = 17;
+constexpr uint64_t kDShift = 27;
+constexpr uint64_t kSequenceShift = 37;
+
+static_assert(static_cast<int>(AttentionInputLayout::SEPARATE_Q_K_V) < (1 << 2),
+    "AttentionInputLayout requires more than two bits in the FMHA kernel hash.");
+static_assert(static_cast<int>(ContextAttentionMaskType::CUSTOM_MASK) < (1 << 3),
+    "ContextAttentionMaskType requires more than three bits in the FMHA kernel hash.");
+
+} // namespace
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Template Implementations
@@ -77,14 +108,20 @@ void TFusedMultiHeadAttentionXMMAKernel<TKernelMeta, TKernelParam>::loadXMMAKern
             }
             else
             {
-                TLLM_CU_CHECK(mDriver->cuModuleLoadData(&hmod, kernelMeta.mCubin));
+                if (kernelMeta.mCubin != nullptr)
+                {
+                    TLLM_CU_CHECK(mDriver->cuModuleLoadData(&hmod, kernelMeta.mCubin));
+                }
                 mModules.insert(std::make_pair(kernelMeta.mCubin, hmod));
             }
 
             FusedMultiHeadAttentionKernelInfo funcInfo;
             funcInfo.mMetaInfoIndex = i;
-            TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
-            if (kernelMeta.mSharedMemBytes >= 48 * 1024)
+            if (kernelMeta.mCubin != nullptr)
+            {
+                TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
+            }
+            if (kernelMeta.mSharedMemBytes >= 48 * 1024 && kernelMeta.mCubin != nullptr)
             {
                 TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
                     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes));
@@ -142,10 +179,9 @@ TFusedMHAKernelList const* TFusedMHAKernelFactory<TFusedMHAKernelList>::getXMMAK
 template <typename TFusedMHAKernelList>
 TFusedMHAKernelFactory<TFusedMHAKernelList>& TFusedMHAKernelFactory<TFusedMHAKernelList>::Get()
 {
-    int device_id;
-    cudaGetDevice(&device_id);
     static std::unique_ptr<TFusedMHAKernelFactory<TFusedMHAKernelList>> s_factory[32] = {nullptr};
-    TLLM_CHECK(device_id <= 32);
+    int const device_id = tensorrt_llm::common::getDevice();
+    TLLM_CHECK_WITH_INFO(device_id < 32, "Invalid device_id %d (must be < 32)", device_id);
     if (s_factory[device_id] == nullptr)
     {
         s_factory[device_id] = std::make_unique<TFusedMHAKernelFactory<TFusedMHAKernelList>>(
@@ -185,8 +221,8 @@ FusedMultiHeadAttentionXMMAKernelV2::FusedMultiHeadAttentionXMMAKernelV2(
 uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(unsigned int s, unsigned int d, unsigned int dv, bool interleaved,
     bool unroll, bool force_fp32_acc, bool flash_attention, bool warp_specialization, bool is_alibi_supported,
     int attention_mask_type, int input_layout, bool tiled, bool enable_attn_logit_softcapping,
-    unsigned int sage_block_size_q, unsigned int sage_block_size_k, unsigned int sage_block_size_v,
-    bool return_softmax) const
+    unsigned int sage_block_size_q, unsigned int sage_block_size_k, unsigned int sage_block_size_v, bool return_softmax,
+    bool enable_skip_softmax) const
 {
     unsigned int log_block_size_q = (unsigned int) std::log2(sage_block_size_q);
     unsigned int log_block_size_k = (unsigned int) std::log2(sage_block_size_k);
@@ -194,17 +230,26 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(unsigned int s, unsigned in
     unsigned int hash = 0;
     if (flash_attention)
     {
-        hash = (uint64_t(log_block_size_q) << 12) | (uint64_t(log_block_size_k) << 6) | uint64_t(log_block_size_v);
+        hash = (static_cast<uint64_t>(log_block_size_q) << 12) | (static_cast<uint64_t>(log_block_size_k) << 6)
+            | static_cast<uint64_t>(log_block_size_v);
     }
     else
     {
         hash = s;
     }
-    return (uint64_t(hash) << 37) | (uint64_t(d) << 27) | (dv << 17) | (attention_mask_type << 11) | (input_layout << 9)
-        | (return_softmax ? 256ull : 0ull) | (enable_attn_logit_softcapping ? 128ull : 0ull)
-        | (is_alibi_supported ? 64ull : 0ull) | (warp_specialization ? 32ull : 0ull) | (tiled ? 16ull : 0ull)
-        | (force_fp32_acc ? 8ull : 0ull) | (flash_attention ? 4ull : 0ull) | (interleaved ? 2ull : 0ull)
-        | (unroll ? 1ull : 0ull);
+    return (static_cast<uint64_t>(hash) << kSequenceShift) | (static_cast<uint64_t>(d) << kDShift)
+        | (static_cast<uint64_t>(dv) << kDvShift)
+        | (static_cast<uint64_t>(enable_skip_softmax) << kEnableSkipSoftmaxShift)
+        | (static_cast<uint64_t>(attention_mask_type) << kAttentionMaskTypeShift)
+        | (static_cast<uint64_t>(input_layout) << kInputLayoutShift)
+        | (static_cast<uint64_t>(return_softmax) << kReturnSoftmaxShift)
+        | (static_cast<uint64_t>(enable_attn_logit_softcapping) << kAttnLogitSoftcappingShift)
+        | (static_cast<uint64_t>(is_alibi_supported) << kAlibiSupportedShift)
+        | (static_cast<uint64_t>(warp_specialization) << kWarpSpecializationShift)
+        | (static_cast<uint64_t>(tiled) << kTiledShift)
+        | (static_cast<uint64_t>(force_fp32_acc) << kForceFp32AccumShift)
+        | (static_cast<uint64_t>(flash_attention) << kFlashAttentionShift)
+        | (static_cast<uint64_t>(interleaved) << kInterleavedShift) | (static_cast<uint64_t>(unroll) << kUnrollShift);
 }
 
 uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(KernelMeta const& kernelMeta) const
@@ -213,12 +258,55 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashID(KernelMeta const& kernelMet
         kernelMeta.mFP32Accumulation, kernelMeta.mFlashAttention, kernelMeta.mWarpSpecialization,
         kernelMeta.mAlibiSupported, kernelMeta.mAttentionMaskType, kernelMeta.mAttentionInputLayout, kernelMeta.mTiled,
         kernelMeta.mEnableAttnLogitSoftcapping, kernelMeta.mSageBlockSizeQ, kernelMeta.mSageBlockSizeK,
-        kernelMeta.mSageBlockSizeV, kernelMeta.mReturnSoftmaxStats);
+        kernelMeta.mSageBlockSizeV, kernelMeta.mReturnSoftmaxStats, kernelMeta.mEnableSkipSoftmax);
 }
+
+#if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
+// Skip_softmax (TMA-load + sync-MMA warp-specialized FMHA for sm_120 / sm_121)
+// launch bridges, defined in the skip_softmax TU
+// (skip_softmax_sm120/fused_multihead_flash_attention_ws_sm120.cu). One bridge per
+// supported head dim. Only declared when sm_120 is built, so non-sm_120 builds
+// neither reference nor link the (then-absent) symbols.
+void run_skip_softmax_bf16_d256_causal_sm120(
+    Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
+void run_skip_softmax_bf16_d128_causal_sm120(
+    Fused_multihead_attention_params_v2& params, Launch_params const& launch_params, cudaStream_t stream);
+#endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
 
 void FusedMultiHeadAttentionXMMAKernelV2::run(
     Fused_multihead_attention_params_v2& params, Launch_params& launch_params, cudaStream_t stream) const
 {
+#if defined(TLLM_ENABLE_SKIP_SOFTMAX_SM120)
+    // Default sm_120 / sm_121 context FMHA. Every supported prefill is routed to
+    // the TMA-load + sync-MMA warp-specialized kernel, which carries the per-tile
+    // skip-softmax optimization. Skipping is active only when a threshold is set
+    // (enableSkipSoftmax == threshold > 0); with no threshold the kernel runs a
+    // plain full-softmax prefill. Shapes / features it does not implement fall
+    // through to the cubin/launcher path: non-BF16 (incl. fp8), head_dim not in
+    // {128, 256} or head_dim != head_dim_v, non-causal / sliding-window / custom
+    // mask, non-PACKED_QKV layout, alibi, logit softcapping, sage attention,
+    // interleaved, and returning softmax stats.
+    if ((mSM == kSM_120 || mSM == kSM_121) && launch_params.flash_attention && mInputDataType == DATA_TYPE_BF16
+        && mOutputDataType == DATA_TYPE_BF16 && params.d == params.dv && (params.d == 128 || params.d == 256)
+        && launch_params.attention_mask_type == ContextAttentionMaskType::CAUSAL
+        && launch_params.attention_input_layout == AttentionInputLayout::PACKED_QKV && !params.has_alibi
+        && !launch_params.enableAttnLogitSoftcapping && !launch_params.interleaved
+        && params.softmax_stats_ptr == nullptr && launch_params.sage_block_size_q == 0
+        && launch_params.sage_block_size_k == 0 && launch_params.sage_block_size_v == 0)
+    {
+        if (params.d == 256)
+        {
+            run_skip_softmax_bf16_d256_causal_sm120(params, launch_params, stream);
+            return;
+        }
+        if (params.d == 128)
+        {
+            run_skip_softmax_bf16_d128_causal_sm120(params, launch_params, stream);
+            return;
+        }
+    }
+#endif // TLLM_ENABLE_SKIP_SOFTMAX_SM120
+
     bool forceUnroll = useForceUnroll(params, launch_params);
     auto const findIter = mFunctions.find(hashFromParams(params, launch_params));
 
@@ -241,6 +329,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
            << "  FlashAttention        : " << (launch_params.flash_attention ? 1 : 0) << "\n"
            << "  Interleaved           : " << (launch_params.interleaved ? 1 : 0) << "\n"
            << "  ReturnSoftmaxStats    : " << (launch_params.supportReturnSoftmaxStats ? 1 : 0) << "\n"
+           << "  EnableSkipSoftmax    : " << (launch_params.enableSkipSoftmax ? 1 : 0) << "\n"
            << "  Unroll                : " << (forceUnroll ? 1 : 0) << "\n"
            << "  Hash                  : 0x" << std::hex << std::setfill('0') << std::setw(16) << hash << std::dec
            << "\n\n"
@@ -263,6 +352,7 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
                << "    FlashAttention        : " << meta.mFlashAttention << "\n"
                << "    Interleaved           : " << meta.mInterleaved << "\n"
                << "    ReturnSoftmaxStats    : " << meta.mReturnSoftmaxStats << "\n"
+               << "    EnableSkipSoftmax     : " << meta.mEnableSkipSoftmax << "\n"
                << "    Unroll                : " << (meta.mUnrollStep == 0 ? 0 : 1) << "\n"
                << "    Hash                  : 0x" << std::hex << std::setfill('0') << std::setw(16) << func.first
                << std::dec << "\n\n";
@@ -272,6 +362,11 @@ void FusedMultiHeadAttentionXMMAKernelV2::run(
     }
 
     auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
+    if (kernelMeta.launcher != nullptr)
+    {
+        kernelMeta.launcher(params, launch_params, stream);
+        return;
+    }
     const CUfunction func = findIter->second.mDeviceFunction;
 
     void* kernelParams[] = {&params, nullptr};
@@ -376,7 +471,7 @@ bool FusedMultiHeadAttentionXMMAKernelV2::checkIfKernelExist(MHARunnerFixedParam
     uint64_t id = hashID(0, params.headSize, params.headSizeV, 0, 0, params.forceFp32Acc, false, false, false,
         static_cast<int>(params.attentionMaskType), static_cast<int>(params.attentionInputLayout), false,
         params.attnLogitSoftcappingScale != 0.f, params.sageBlockSizeQ, params.sageBlockSizeK, params.sageBlockSizeV,
-        false);
+        false, /*We do not support enable_skip_softmax with the legacy TRT path.*/ false);
     auto const findIter = std::find_if(mFunctions.begin(), mFunctions.end(), KernelExistPredicate(id));
     bool found = findIter != mFunctions.end();
     if (!found)
@@ -536,12 +631,23 @@ uint64_t FusedMultiHeadAttentionXMMAKernelV2::hashFromParams(
         !launch_params.useKernelWithoutAlibi, static_cast<int>(launch_params.attention_mask_type),
         static_cast<int>(launch_params.attention_input_layout), launch_params.granular_tiling,
         launch_params.enableAttnLogitSoftcapping, launch_params.sage_block_size_q, launch_params.sage_block_size_k,
-        launch_params.sage_block_size_v, launch_params.supportReturnSoftmaxStats);
+        launch_params.sage_block_size_v, launch_params.supportReturnSoftmaxStats, launch_params.enableSkipSoftmax);
 }
 
 FusedMultiHeadAttentionXMMAKernelV2 const* getXMMAKernelsV2(Data_type inputType, Data_type outputType, unsigned int sm)
 {
-    return FusedMHAKernelFactoryV2::Get().getXMMAKernels(sMhaKernelMetaInfosV2,
-        sizeof(sMhaKernelMetaInfosV2) / sizeof(sMhaKernelMetaInfosV2[0]), inputType, outputType, sm);
+    if (sm == kSM_121)
+    {
+        sm = kSM_120;
+    }
+    // SM103 uses SM100 FMHA v2 kernels
+    if (sm == kSM_103)
+    {
+        sm = kSM_100;
+    }
+    return FusedMHAKernelFactoryV2::Get().getXMMAKernels(
+        sMhaKernelMetaInfosV2, sMhaKernelMetaInfosV2Size, inputType, outputType, sm);
 }
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

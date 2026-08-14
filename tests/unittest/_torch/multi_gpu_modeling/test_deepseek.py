@@ -7,9 +7,8 @@ import torch
 from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
@@ -64,41 +63,40 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
 
     pytorch_config = dict(
         disable_overlap_scheduler=True,
-        use_cuda_graph=False,
-        kv_cache_dtype="auto",
         attn_backend=backend,
-        moe_max_num_tokens=moe_max_num_tokens,
     )
-
+    moe_config = MoeConfig(max_num_tokens=moe_max_num_tokens)
     model_dir = str(llm_models_root() / model_name / model_path[quant])
 
     assert Path(model_dir).exists()
 
-    llm = LLM(model=model_dir,
-              tensor_parallel_size=tp_size,
-              enable_chunked_prefill=False,
-              **pytorch_config,
-              moe_expert_parallel_size=-1,
-              moe_tensor_parallel_size=-1,
-              enable_attention_dp=enable_attention_dp,
-              kv_cache_config=KvCacheConfig(enable_block_reuse=False))
+    with LLM(model=model_dir,
+             tensor_parallel_size=tp_size,
+             enable_chunked_prefill=False,
+             **pytorch_config,
+             moe_config=moe_config,
+             moe_expert_parallel_size=-1,
+             moe_tensor_parallel_size=-1,
+             enable_attention_dp=enable_attention_dp,
+             kv_cache_config=KvCacheConfig(enable_block_reuse=False)) as llm:
 
-    sampling_params = SamplingParams(max_tokens=10)
+        sampling_params = SamplingParams(max_tokens=10)
 
-    async def task(prompt: str):
-        future = llm.generate_async(prompt,
-                                    streaming=True,
-                                    sampling_params=sampling_params)
-        output = await future.aresult()
-        return output.outputs[0].text
+        async def task(prompt: str):
+            future = llm.generate_async(prompt,
+                                        streaming=True,
+                                        sampling_params=sampling_params)
+            output = await future.aresult()
+            return output.outputs[0].text
 
-    async def test():
-        tasks = [task(prompt) for prompt in prompts]
-        results = await asyncio.gather(*tasks)
+        async def test():
+            tasks = [task(prompt) for prompt in prompts]
+            results = await asyncio.gather(*tasks)
 
-        assert len(results) == len(expected_outputs), "Output length mismatch"
-        for result, expected in zip(results, expected_outputs):
-            assert similar(result, expected,
-                           1.0), f"Expected '{expected}' but get '{result}'"
+            assert len(results) == len(
+                expected_outputs), "Output length mismatch"
+            for result, expected in zip(results, expected_outputs):
+                assert similar(result, expected,
+                               1.0), f"Expected '{expected}' but get '{result}'"
 
-    asyncio.run(test())
+        asyncio.run(test())

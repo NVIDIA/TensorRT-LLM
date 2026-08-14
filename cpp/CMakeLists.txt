@@ -26,12 +26,28 @@ include(sanitizers)
 
 project(tensorrt_llm LANGUAGES CXX)
 
+# Single source of truth for the inline ABI namespace. Read by both the C++ side
+# (via tensorrt_llm/common/config.h's `#ifndef TRTLLM_ABI_NAMESPACE` guard) and
+# the cubin INCBIN aggregator (cpp/cmake/modules/ tllm_cubin_archive.cmake bakes
+# the same value into Itanium-mangled linker names). Override at configure time
+# with `-DTRTLLM_ABI_NAMESPACE=_v2` to ship a parallel ABI version that won't
+# collide at static-link time. The compile definition propagates to every C++ TU
+# under this directory so the macro expansion stays in sync with the CMake
+# variable.
+set(TRTLLM_ABI_NAMESPACE
+    "_v1"
+    CACHE
+      STRING
+      "Inline namespace used to version the TRT-LLM ABI (see tensorrt_llm/common/config.h)."
+)
+add_compile_definitions(TRTLLM_ABI_NAMESPACE=${TRTLLM_ABI_NAMESPACE})
+
 # Build options
 option(BUILD_PYT "Build in PyTorch TorchScript class mode" ON)
-option(BUILD_PYBIND "Build Python bindings for C++ runtime and batch manager"
-       ON)
 option(BUILD_TESTS "Build Google tests" ON)
-option(BUILD_BENCHMARKS "Build benchmarks" ON)
+option(BUILD_DEEP_EP "Build the Deep EP module" ON)
+option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
+option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
@@ -39,10 +55,37 @@ option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
 option(FAST_MATH "Compiling in fast math mode" OFF)
 option(INDEX_RANGE_CHECK "Compiling with index range checks" OFF)
 option(COMPRESS_FATBIN "Compress everything in fatbin" ON)
+option(TIMING_NVCC "Enable nvcc build timing report" OFF)
 option(ENABLE_MULTI_DEVICE
        "Enable building with multi device support (requires NCCL, MPI,...)" ON)
 option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
        ON)
+option(NVRTC_DYNAMIC_LINKING "Link against the dynamic NVRTC libraries" OFF)
+option(CUBLAS_DYNAMIC_LINKING
+       "Link against the dynamic cublas/cublasLt libraries" ON)
+option(CURAND_DYNAMIC_LINKING "Link against the dynamic curand library" ON)
+
+option(ENABLE_NVSHMEM "Enable building with NVSHMEM support" OFF)
+option(USING_OSS_CUTLASS_LOW_LATENCY_GEMM
+       "Using open sourced Cutlass low latency gemm kernel" ON)
+option(USING_OSS_CUTLASS_FP4_GEMM "Using open sourced Cutlass fp4 gemm kernel"
+       ON)
+option(ENABLE_CUBLASLT_FP4_GEMM "Enable cuBLASLt FP4 GEMM support" ON)
+if(NOT ${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
+  set(ENABLE_CUBLASLT_FP4_GEMM
+      OFF
+      CACHE BOOL "" FORCE)
+  message(
+    STATUS
+      "CUDA ${CUDAToolkit_VERSION} < 12.8: disabling ENABLE_CUBLASLT_FP4_GEMM")
+endif()
+option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
+       ON)
+option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
+       "Using open sourced Cutlass AR gemm kernel" ON)
+option(SKIP_SOFTMAX_STAT "Enable Statistics of Skip-Softmax" OFF)
+
+message(STATUS "ENABLE_NVSHMEM is ${ENABLE_NVSHMEM}")
 
 if(NVTX_DISABLE)
   add_compile_definitions("NVTX_DISABLE")
@@ -51,7 +94,7 @@ else()
   message(STATUS "NVTX is enabled")
 endif()
 
-# Add TensorRT-LLM Gen export interface and CUDA support
+# Add TensorRT LLM Gen export interface and CUDA support
 add_compile_definitions("TLLM_GEN_EXPORT_INTERFACE")
 add_compile_definitions("TLLM_ENABLE_CUDA")
 
@@ -82,12 +125,6 @@ else()
   message(STATUS "Not building Google tests")
 endif()
 
-if(BUILD_BENCHMARKS)
-  message(STATUS "Building benchmarks")
-else()
-  message(STATUS "Not building benchmarks")
-endif()
-
 if(BUILD_MICRO_BENCHMARKS)
   message(STATUS "Building C++ micro benchmarks")
 else()
@@ -116,9 +153,9 @@ execute_process(
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 if(TRTLLM_VERSION_RESULT EQUAL 0)
-  message(STATUS "TensorRT-LLM version: ${TRTLLM_VERSION}")
+  message(STATUS "TensorRT LLM version: ${TRTLLM_VERSION}")
 else()
-  message(FATAL_ERROR "Failed to determine Tensorrt-LLM version")
+  message(FATAL_ERROR "Failed to determine TensorRT LLM version")
 endif()
 
 configure_file(
@@ -126,21 +163,61 @@ configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/include/tensorrt_llm/executor/version.h)
 
 setup_cuda_compiler()
-setup_cuda_architectures()
 
 enable_language(C CXX CUDA)
 
-find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS cudart_static cuda_driver
-                                                  cublas cublasLt curand nvml)
+# Configure CUDA Architectures after enabling CUDA.
 
-set(CUBLAS_LIB CUDA::cublas)
-set(CUBLASLT_LIB CUDA::cublasLt)
-set(CURAND_LIB CUDA::curand)
+# Old CMake rejects family conditional architectures during enable_language, But
+# after that CMake handles it just fine.
+setup_cuda_architectures()
+
 set(CUDA_DRV_LIB CUDA::cuda_driver)
 set(CUDA_NVML_LIB CUDA::nvml)
 set(CUDA_RT_LIB CUDA::cudart_static)
-set(NVRTC_LIB CUDA::nvrtc_static)
-set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+
+set(CUDA_TOOLKIT_COMPONENTS cudart_static cuda_driver nvml)
+
+if(CUBLAS_DYNAMIC_LINKING)
+  set(CUBLAS_LIB CUDA::cublas)
+  set(CUBLASLT_LIB CUDA::cublasLt)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS cublas cublasLt)
+else()
+  if(WIN32)
+    message(FATAL_ERROR "Static cublas not available on windows")
+  endif()
+  message(DEBUG "Linking with static cublas libs")
+
+  set(CUBLAS_LIB CUDA::cublas_static)
+  set(CUBLASLT_LIB CUDA::cublasLt_static)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS cublas_static cublasLt_static)
+endif()
+
+if(CURAND_DYNAMIC_LINKING)
+  set(CURAND_LIB CUDA::curand)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS curand)
+else()
+  if(WIN32)
+    message(FATAL_ERROR "Static curand not available on windows")
+  endif()
+  message(DEBUG "Linking with static curand lib")
+
+  set(CURAND_LIB CUDA::curand_static)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS curand_static)
+endif()
+
+if(NVRTC_DYNAMIC_LINKING)
+  set(NVRTC_LIB CUDA::nvrtc)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc nvrtc_builtins)
+else()
+  set(NVRTC_LIB CUDA::nvrtc_static)
+  set(NVRTC_BUILTINS_LIB CUDA::nvrtc_builtins_static)
+  list(APPEND CUDA_TOOLKIT_COMPONENTS nvrtc_static nvrtc_builtins_static)
+endif()
+
+find_package(CUDAToolkit 11.2 REQUIRED COMPONENTS ${CUDA_TOOLKIT_COMPONENTS})
+
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 resolve_dirs(CUDAToolkit_INCLUDE_DIRS "${CUDAToolkit_INCLUDE_DIRS}")
@@ -149,6 +226,7 @@ message(STATUS "CUDA library status:")
 message(STATUS "    version: ${CUDAToolkit_VERSION}")
 message(STATUS "    libraries: ${CUDAToolkit_LIBRARY_DIR}")
 message(STATUS "    include path: ${CUDAToolkit_INCLUDE_DIRS}")
+message(STATUS "CUDA_NVML_LIB: ${CUDA_NVML_LIB}")
 
 # Prevent CMake from creating a response file for CUDA compiler, so clangd can
 # pick up on the includes
@@ -157,31 +235,57 @@ set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 find_library(RT_LIB rt)
 
 if(ENABLE_MULTI_DEVICE)
-  # NCCL dependencies
-  find_package(NCCL 2 REQUIRED)
+  # NCCL dependencies NCCL >= 2.29 is required for NCCLWindowAllocator used
+  # unconditionally in allreduceOp.cpp
+  find_package(NCCL 2.29 REQUIRED)
   set(NCCL_LIB NCCL::nccl)
 endif()
 
 # TRT dependencies
-find_package(TensorRT 10 REQUIRED COMPONENTS OnnxParser)
-set(TRT_LIB TensorRT::NvInfer)
 
 get_filename_component(TRT_LLM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR} PATH)
 
 set(3RDPARTY_DIR ${TRT_LLM_ROOT_DIR}/3rdparty)
-add_subdirectory(${3RDPARTY_DIR}/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/pybind11)
+add_subdirectory(${3RDPARTY_DIR} 3rdparty)
+
+if(BUILD_DEEP_EP
+   OR BUILD_DEEP_GEMM
+   OR BUILD_FLASH_MLA)
+  FetchContent_MakeAvailable(pybind11)
+  include_directories(${CMAKE_BINARY_DIR}/_deps/pybind11-src/include)
+endif()
+
+FetchContent_MakeAvailable(nanobind)
+include_directories(${CMAKE_BINARY_DIR}/_deps/nanobind-src/include)
+
+FetchContent_MakeAvailable(cutlass cxxopts flashmla json xgrammar)
+
+if(ENABLE_UCX)
+  FetchContent_MakeAvailable(cppzmq ucxx)
+endif()
+
+if(NOT NVTX_DISABLE)
+  FetchContent_MakeAvailable(nvtx)
+endif()
+
+if(BUILD_DEEP_GEMM)
+  FetchContent_MakeAvailable(deepgemm)
+endif()
+
+if(NOT NVTX_DISABLE)
+  set(maybe_nvtx_includedir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
+endif()
 
 # include as system to suppress warnings
 include_directories(
   SYSTEM
   ${CUDAToolkit_INCLUDE_DIRS}
+  ${CUDAToolkit_INCLUDE_DIRS}/cccl
   ${CUDNN_ROOT_DIR}/include
-  $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
-  ${3RDPARTY_DIR}/cutlass/include
-  ${3RDPARTY_DIR}/cutlass/tools/util/include
-  ${3RDPARTY_DIR}/NVTX/include
-  ${3RDPARTY_DIR}/json/include
-  ${3RDPARTY_DIR}/pybind11/include)
+  ${maybe_nvtx_includedir}
+  ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
+  ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
+  ${CMAKE_BINARY_DIR}/_deps/json-src/include)
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
@@ -225,24 +329,52 @@ if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
 endif()
 
-# Note: The following are desirable settings that should be enabled if we
-# decrease shared library size. See e.g.
-# https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
-# project.
-
-# set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}
-# --generate-line-info")
-
-# set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
+# Emit CUDA line info for Debug and RelWithDebInfo so nsys/ncu can map samples
+# back to source. This inflates section sizes significantly, so building these
+# configurations for all CUDA architectures at once will fail to link --
+# build_wheel.py enforces that a specific --cuda_architectures must be passed in
+# that case. Note: full device debug info (-G) is intentionally NOT enabled by
+# default for Debug -- it can make ptxas memory usage explode on some kernels
+# and get OOM-killed in CI. Developers who need cuda-gdb stepping can opt in via
+# `build_wheel.py --extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` on a host with
+# enough memory for ptxas.
+# cmake-format: off
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} --generate-line-info")
+# cmake-format: on
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
+
+# Generate dependency files (.d) to track all header dependencies This creates
+# .d files alongside .o files showing all headers used
+if(NOT WIN32)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -MD -MP")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -MD -MP")
+endif()
 
 # note: cmake expr generation $<BOOL:${ENABLE_MULTI_DEVICE}> is a build time
 # evaluation so hard to debug at cmake time
 if(ENABLE_MULTI_DEVICE)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=1")
+  # Add target definitions for both C++ and CUDA
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_MULTI_DEVICE=1>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_MULTI_DEVICE=1>)
 else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_MULTI_DEVICE=0")
+  # Add target definitions for both C++ and CUDA
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_MULTI_DEVICE=0>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_MULTI_DEVICE=0>)
+endif()
+
+if(ENABLE_NVSHMEM)
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=1>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=1>)
+else()
+  add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:ENABLE_NVSHMEM=0>
+                          $<$<COMPILE_LANGUAGE:CUDA>:ENABLE_NVSHMEM=0>)
+endif()
+
+if(SKIP_SOFTMAX_STAT)
+  add_compile_definitions("SKIP_SOFTMAX_STAT")
+  message(STATUS "SKIP_SOFTMAX_STAT is enabled")
 endif()
 
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can
@@ -252,6 +384,48 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcmodel=medium")
   set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--no-relax")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--no-relax")
+endif()
+
+# ==== BOLT Compatible Flags ====
+# These flags enable LLVM BOLT binary compatible:
+# -fno-reorder-blocks-and-partition: Prevents compiler from splitting hot/cold
+# blocks -fno-plt: Removes PLT stubs for additional performance
+# -Wl,--emit-relocs (or -Wl,-q): Preserves relocation info for BOLT Note:
+# Binaries should NOT be stripped for BOLT to work Usage: cmake
+# -DENABLE_BOLT_COMPATIBLE=ON ...
+option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" OFF)
+if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
+  message(STATUS "BOLT compatible flags enabled")
+  # Compiler flags for C/C++ -fno-reorder-blocks-and-partition is GCC-only
+  # (required for GCC 8+ per BOLT docs). Clang does not support this flag and
+  # does not enable the corresponding optimization by default.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-fno-reorder-blocks-and-partition)
+  endif()
+  add_compile_options(-fno-plt)
+  # Linker flags - applies to shared, module, and executable targets
+  add_link_options(-Wl,--emit-relocs)
+  # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)
+  set(CMAKE_STRIP
+      ""
+      CACHE STRING "Disabled for BOLT compatibility" FORCE)
+  message(STATUS "BOLT: Disabled CMAKE_STRIP to prevent binary stripping")
+endif()
+# Note: For nanobind modules, use NOSTRIP option in nanobind_add_module()
+# ==== End BOLT Compatible Flags ====
+
+# Generate linker dependency files (link.d) for dependency scanning. These files
+# contain the resolved paths of all libraries used during linking.
+option(GENERATE_LINKER_DEPFILES
+       "Generate linker dependency files for dependency scanning" ON)
+if(GENERATE_LINKER_DEPFILES)
+  # Modify linker rules to add --dependency-file flag <TARGET> is a CMake
+  # placeholder that gets replaced with the output path
+  string(APPEND CMAKE_CXX_CREATE_SHARED_LIBRARY
+         " -Wl,--dependency-file,<TARGET>.d")
+  string(APPEND CMAKE_CXX_CREATE_SHARED_MODULE
+         " -Wl,--dependency-file,<TARGET>.d")
+  string(APPEND CMAKE_CXX_LINK_EXECUTABLE " -Wl,--dependency-file,<TARGET>.d")
 endif()
 
 # Disable deprecated declarations warnings
@@ -307,6 +481,10 @@ endif()
 if(COMPRESS_FATBIN)
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --fatbin-options -compress-all")
 endif()
+if(NVCC_TIMING)
+  set(CMAKE_CUDA_FLAGS
+      "${CMAKE_CUDA_FLAGS} --time ${CMAKE_CURRENT_BINARY_DIR}/nvcc-timing.csv")
+endif()
 message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
@@ -329,15 +507,6 @@ if(NOT WIN32 AND NOT DEFINED USE_CXX11_ABI)
 endif()
 
 if(BUILD_PYT)
-  # Build TORCH_CUDA_ARCH_LIST
-  set(TORCH_CUDA_ARCH_LIST "")
-  foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-    string(REGEX REPLACE "^([1-9][0-9]*)([0-9]a?)-real$" "\\1.\\2" TORCH_ARCH
-                         ${CUDA_ARCH})
-    list(APPEND TORCH_CUDA_ARCH_LIST ${TORCH_ARCH})
-  endforeach()
-
-  message(STATUS "TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}")
   # ignore values passed from the environment
   if(DEFINED ENV{TORCH_CUDA_ARCH_LIST})
     message(
@@ -346,6 +515,20 @@ if(BUILD_PYT)
     )
   endif()
   unset(ENV{TORCH_CUDA_ARCH_LIST})
+  # Torch maintains custom logic to add CUDA architecture flags into
+  # CMAKE_CUDA_FLAGS based on TORCH_CUDA_ARCH_LIST variable, instead of using
+  # the native support introduced in newer CMake versions. And it always tries
+  # to add some flags, even given empty TORCH_CUDA_ARCH_LIST.
+
+  # We prefer CMake's native support to be able to easily customize the CUDA
+  # architectures to be compiled for, for each kernel individually. So we set
+  # TORCH_CUDA_ARCH_LIST to a placeholder value and remove the generated flags
+  # then to effectively prevent Torch from adding CUDA architecture flags.
+  message(
+    STATUS
+      "Set TORCH_CUDA_ARCH_LIST to placeholder value \"8.0\" to make Torch happy. "
+      "This is NOT the list of architectures that will be compiled for.")
+  set(TORCH_CUDA_ARCH_LIST "8.0")
 
   find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
   message(STATUS "Found Python executable at ${Python3_EXECUTABLE}")
@@ -369,30 +552,46 @@ if(BUILD_PYT)
 print(os.path.dirname(torch.__file__),end='');"
     RESULT_VARIABLE _PYTHON_SUCCESS
     OUTPUT_VARIABLE TORCH_DIR)
-  if(NOT _PYTHON_SUCCESS MATCHES 0)
+  if(NOT _PYTHON_SUCCESS EQUAL 0)
     message(FATAL_ERROR "Torch config Error.")
   endif()
   list(APPEND CMAKE_PREFIX_PATH ${TORCH_DIR})
   set(USE_SYSTEM_NVTX ON)
-  set(nvtx3_dir ${3RDPARTY_DIR}/NVTX/include)
+  set(nvtx3_dir ${CMAKE_BINARY_DIR}/_deps/nvtx-src/include)
+  set(CMAKE_CUDA_ARCHITECTURES_BACKUP ${CMAKE_CUDA_ARCHITECTURES})
   find_package(Torch REQUIRED)
+  set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_BACKUP})
+  message(
+    STATUS
+      "Removing Torch generated placeholder CUDA architecture flags: -gencode arch=compute_80,code=sm_80."
+  )
+  string(REPLACE "-gencode arch=compute_80,code=sm_80 " "" CMAKE_CUDA_FLAGS_NEW
+                 "${CMAKE_CUDA_FLAGS}")
+  if("${CMAKE_CUDA_FLAGS_NEW}" STREQUAL "${CMAKE_CUDA_FLAGS}")
+    message(
+      FATAL_ERROR
+        "Torch didn't generate expected placeholder CUDA architecture flags.")
+  endif()
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS_NEW}")
 
-  message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
-  add_compile_options(${TORCH_CXX_FLAGS})
   add_compile_definitions(TORCH_CUDA=1)
 
-  if(DEFINED USE_CXX11_ABI)
-    parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
-    if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
-       AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL ${USE_CXX11_ABI})
-      message(
-        WARNING
-          "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
-          "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
-          "setting will be discarded.")
+  if(DEFINED TORCH_CXX_FLAGS)
+    message(STATUS "TORCH_CXX_FLAGS: ${TORCH_CXX_FLAGS}")
+    add_compile_options(${TORCH_CXX_FLAGS})
+    if(DEFINED USE_CXX11_ABI)
+      parse_make_options(${TORCH_CXX_FLAGS} "TORCH_CXX_FLAGS")
+      if(DEFINED TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI
+         AND NOT ${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} EQUAL
+             ${USE_CXX11_ABI})
+        message(
+          WARNING
+            "The libtorch compilation options _GLIBCXX_USE_CXX11_ABI=${TORCH_CXX_FLAGS__GLIBCXX_USE_CXX11_ABI} "
+            "found by CMake conflict with the project setting USE_CXX11_ABI=${USE_CXX11_ABI}, and the project "
+            "setting will be discarded.")
+      endif()
     endif()
   endif()
-
 else()
   if(NOT WIN32)
     if(NOT USE_CXX11_ABI)
@@ -410,6 +609,18 @@ if(ENABLE_UCX)
   if(NOT ${ucx_FOUND})
     set(ENABLE_UCX 0)
   else()
+    set(ucxx_source_dir ${CMAKE_BINARY_DIR}/_deps/ucxx-src)
+    if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
+      if(EXISTS "${ucxx_source_dir}/fetch_rapids.cmake")
+        file(READ "${ucxx_source_dir}/fetch_rapids.cmake" FILE_CONTENTS)
+        string(
+          REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
+                  "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
+                  FILE_CONTENTS "${FILE_CONTENTS}")
+        file(WRITE "${ucxx_source_dir}/fetch_rapids.cmake" "${FILE_CONTENTS}")
+        message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
+      endif()
+    endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
     # error, thus using their installation script to isolate the installation
     # process until the issue is understood. And always trigger the build so
@@ -417,18 +628,19 @@ if(ENABLE_UCX)
     execute_process(
       COMMAND
         ${CMAKE_COMMAND} -E env LIB_BUILD_DIR=${CMAKE_BINARY_DIR}/ucxx/build
-        ${3RDPARTY_DIR}/ucxx/build.sh libucxx -n
+        ${ucxx_source_dir}/build.sh libucxx -n
         --cmake-args=\"-DBUILD_SHARED_LIBS=OFF
         -DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}\"
       OUTPUT_VARIABLE UCXX_BUILD_OUTPUT
       RESULT_VARIABLE UCXX_BUILD_RESULT)
     if(UCXX_BUILD_RESULT)
-      message(${UCXX_BUILD_OUTPUT})
+      message("ucxx build: ${UCXX_BUILD_OUTPUT}")
       message(FATAL_ERROR "ucxx build failed")
     endif()
     find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build
                  NO_DEFAULT_PATH)
   endif()
+  find_package(NIXL)
 endif()
 if(ENABLE_UCX)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_UCX=1")
@@ -447,11 +659,6 @@ if(BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-if(BUILD_BENCHMARKS)
-  add_subdirectory(${TRT_LLM_ROOT_DIR}/benchmarks/cpp
-                   ${CMAKE_BINARY_DIR}/benchmarks)
-endif()
-
 if(BUILD_MICRO_BENCHMARKS)
   add_subdirectory(${TRT_LLM_ROOT_DIR}/cpp/micro_benchmarks
                    ${CMAKE_BINARY_DIR}/micro_benchmarks)
@@ -466,6 +673,6 @@ if(MEASURE_BUILD_TIME)
 endif()
 
 set(BUILD_WHEEL_TARGETS
-    tensorrt_llm;nvinfer_plugin_tensorrt_llm
+    tensorrt_llm
     CACHE STRING "Targets used to build wheel")
 add_custom_target(build_wheel_targets DEPENDS ${BUILD_WHEEL_TARGETS})

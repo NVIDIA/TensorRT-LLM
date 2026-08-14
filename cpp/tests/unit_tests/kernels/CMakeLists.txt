@@ -1,32 +1,63 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION &
-# AFFILIATES. All rights reserved. SPDX-License-Identifier: NVIDIA TensorRT
-# Source Code License Agreement
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related documentation
-# and any modifications thereto. Any use, reproduction, disclosure or
-# distribution of this material and related documentation without an express
-# license agreement from NVIDIA CORPORATION or its affiliates is strictly
-# prohibited.
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not
+# use this file except in compliance with the License. You may obtain a copy of
+# the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations under
+# the License.
 
 add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
 add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
+add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
+add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
+
+macro(remove_compile_definition TARGET_NAME DEFINITION)
+  get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
+  if(DEFS)
+    list(REMOVE_ITEM DEFS ${DEFINITION})
+    set_target_properties(${TARGET_NAME} PROPERTIES COMPILE_DEFINITIONS
+                                                    "${DEFS}")
+  endif()
+endmacro()
+
 add_gtest(mixtureOfExpertsTest mixtureOfExpertsTest.cu)
+
+# If we are using oss cutlass, build an explicit internal test
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_compile_definitions(mixtureOfExpertsTest
+                             PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
+
+  # The internal-path variant includes headers (quantization.h) that only ship
+  # with the internal cutlass kernels sources; the prebuilt tarball provides the
+  # library and a reduced header set only.
+  if(INTERNAL_CUTLASS_KERNELS_PATH)
+    add_gtest(mixtureOfExpertsInternalTest mixtureOfExpertsTest.cu)
+    remove_compile_definition(mixtureOfExpertsInternalTest
+                              USING_OSS_CUTLASS_MOE_GEMM)
+  endif()
+endif()
+
 add_gtest(ropeTest ropeTest.cu)
 add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(stopCriteriaKernelsTest stopCriteriaKernelsTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
+add_gtest(sparseAttentionKernelsTest sparseAttentionKernelsTest.cpp)
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
-if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
-  add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
-  add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
-  # add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
-endif()
+add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
+
+add_gtest(fusedMoeCommKernelTest fusedMoeCommKernelTest.cpp)
 
 add_gtest(
   gemmSwigluRunnerTest
@@ -61,5 +92,24 @@ set(SAMPLING_KERNEL_TEST_SRC
     sampling/samplingTest.cpp sampling/samplingTopKTest.cpp
     sampling/samplingTopPTest.cpp sampling/samplingAirTopPTest.cpp
     sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
-
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
+
+set(ROUTING_KERNEL_TEST_SRC
+    routing/routingTest.cpp routing/routingLlama4Test.cpp
+    routing/routingCustomTest.cpp routing/routingDeepSeekTest.cpp)
+add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
+target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
+
+add_gtest(blockScaleMoeActivationTest blockScaleMoeActivationTest.cu)
+
+add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  add_gtest(moeLoraPointerExpandTest moeLoraPointerExpandTest.cu)
+  add_gtest(moeLoraProblemBuilderTest moeLoraProblemBuilderTest.cu)
+  add_gtest(moeLoraSlotExpandTest moeLoraSlotExpandTest.cu)
+endif()
+
+add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
+add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
+add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)

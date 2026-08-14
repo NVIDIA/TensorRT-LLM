@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -26,8 +27,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -102,6 +103,10 @@ struct Multihead_attention_params_base
     int batch_size = 0;
     // The beam width
     int beam_width = 0;
+    // The chunked attention size.
+    int chunked_attention_size = INT_MAX;
+    // The chunked attention size in log2.
+    int chunked_attention_size_log2 = 0;
     // By default, max_attention_window_size == cyclic_attention_window_size
     // unless each layer has different cyclic kv cache length.
     // Max cache capacity (used to allocate KV cache)
@@ -125,6 +130,8 @@ struct Multihead_attention_params_base
     float rotary_embedding_scale = 1.0f;
     // The pre-computed rotary inv freq when building the engines (as constant weights).
     float const* rotary_embedding_inv_freq_cache = nullptr;
+    // The pre-computed cos/sin cache.
+    float2 const* rotary_embedding_cos_sin_cache = nullptr;
     float rotary_embedding_short_m_scale = 1.0f;
     float rotary_embedding_long_m_scale = 1.0f;
     int rotary_embedding_max_positions = 0;
@@ -147,6 +154,9 @@ struct Multihead_attention_params_base
     // The attention mask [batch_size, attention_mask_stride (i.e. max_kv_seqlen)]
     bool const* attention_mask = nullptr;
     int attention_mask_stride = 0;
+
+    // The attention sinks [num_heads_q].
+    float const* attention_sinks = nullptr;
 
     // If relative position embedding is used
     T const* relative_attention_bias = nullptr;
@@ -198,6 +208,10 @@ struct Multihead_attention_params_base
     float* partial_max = nullptr;
     // threadblock counter to identify the complete of partial attention computations
     int* block_counter = nullptr;
+
+    float* cascade_partial_out = nullptr; // [batch_beam x num_heads x head_size]
+    float* cascade_partial_max = nullptr; // [batch_beam x num_heads]
+    float* cascade_partial_sum = nullptr; // [batch_beam x num_heads]
 
     int const* memory_length_per_sample = nullptr;
     int32_t const* mrope_position_deltas = nullptr;
@@ -285,4 +299,5 @@ inline int estimate_min_multi_block_count(int max_timesteps, int max_dynamic_shm
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

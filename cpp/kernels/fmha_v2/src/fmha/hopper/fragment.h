@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2011-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2011-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #pragma once
@@ -465,8 +470,7 @@ struct Softmax_saver_tma
         , softmax_sum_ptr_(reinterpret_cast<char*>(params.softmax_stats_ptr))
         , softmax_stats_stride_in_bytes_(params.softmax_stats_stride_in_bytes)
     {
-        size_t softmax_max_off = sizeof(float) * params.b * params.s * params.h;
-        softmax_max_ptr_ = reinterpret_cast<char*>(params.softmax_stats_ptr) + softmax_max_off;
+        softmax_max_ptr_ = reinterpret_cast<char*>(params.softmax_stats_ptr);
         int warp = (threadIdx.x % 128) / Cta_tile::THREADS_PER_WARP;
         int lane = threadIdx.x % Cta_tile::THREADS_PER_WARP;
         // MMA row0 index (8x4 thread layout)
@@ -474,9 +478,9 @@ struct Softmax_saver_tma
 
         int sum_s = params.is_s_padded ? params.s * head_info.bidb : params.cu_q_seqlens[head_info.bidb];
         int token_id = sum_s * params.h + head_info.bidh;
-        size_t const bh_offset = token_id * sizeof(float) + local_q_tile_offset_ * softmax_stats_stride_in_bytes_;
-        softmax_sum_ptr_ += bh_offset + row0_ * softmax_stats_stride_in_bytes_;
+        size_t const bh_offset = token_id * sizeof(float) * 2 + local_q_tile_offset_ * softmax_stats_stride_in_bytes_;
         softmax_max_ptr_ += bh_offset + row0_ * softmax_stats_stride_in_bytes_;
+        softmax_sum_ptr_ += bh_offset + row0_ * softmax_stats_stride_in_bytes_ + sizeof(float);
     };
 
     inline __device__ void store(float* p_sum, float* p_max, float sqrt_d, int row_offset, bool valid_run)
@@ -487,7 +491,7 @@ struct Softmax_saver_tma
         int lane = threadIdx.x % Cta_tile::THREADS_PER_WARP;
         if (lane % 4 < 2)
         {
-            values = p_sum[lane % 2] == 0.f ? 1.f : 1.0f / p_sum[lane % 2];
+            values = p_sum[lane % 2];
         }
         else
         {

@@ -60,7 +60,7 @@ def main():
     prompts = [query]
 
     results = llm.generate(prompts)
-    print(results[0].output.output_str)
+    print(results[0].outputs[0].text)
     llm.shutdown(shutdown_workers=True)
     print(f'main shut down done')
 

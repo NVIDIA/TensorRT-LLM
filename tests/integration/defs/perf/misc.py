@@ -14,11 +14,28 @@
 # limitations under the License.
 # -*- coding: utf-8 -*-
 """
-Miscellaneous utility code used by trt_test. Should contain all code that is agnostic to remote mode vs local mode of TURTLE.
+Miscellaneous utility code used by trt_test. Should contain all code that is agnostic to remote mode vs local mode.
 """
 import subprocess as sp
 
 _GPU_DEVICE_PRODUCT_NAME_MAPPING = {"A100-PCIE-80GB": "A100 80GB PCIe"}
+
+
+def get_device_subtype(device_product_name: str) -> str:
+    """
+    Get device subtype based on device product name.
+
+    Simply converts the cleaned device product name to a consistent format
+    by replacing spaces and hyphens with underscores.
+
+    Args:
+        device_product_name: Cleaned device product name from NVML
+
+    Returns:
+        Device subtype string with consistent formatting
+    """
+    # Convert device name to consistent subtype format (replace spaces and hyphens with underscores)
+    return device_product_name.replace(" ", "_").replace("-", "_")
 
 
 def clean_device_product_name(device_product_name):

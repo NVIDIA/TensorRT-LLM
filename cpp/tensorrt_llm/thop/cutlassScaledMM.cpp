@@ -14,16 +14,28 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#if defined(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
+#include "tensorrt_llm/kernels/cutlass_kernels/include/low_latency_gemm.h"
+#else
 #include "low_latency_gemm.h"
+#endif
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <torch/extension.h>
 
 using torch::Tensor;
+#if defined(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
+using tensorrt_llm::kernels::cutlass_kernels::CutlassLowLatencyFp8GemmRunner;
+using tensorrt_llm::kernels::cutlass_kernels::CutlassLowLatencyFp8GemmRunnerInterface;
+using tensorrt_llm::kernels::cutlass_kernels::LowLatencyCutlassGemmConfig;
+using tensorrt_llm::kernels::cutlass_kernels::KernelScheduleType;
+#else
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassLowLatencyFp8GemmRunner;
 using tensorrt_llm::kernels::internal_cutlass_kernels::CutlassLowLatencyFp8GemmRunnerInterface;
 using tensorrt_llm::kernels::internal_cutlass_kernels::LowLatencyCutlassGemmConfig;
 using tensorrt_llm::kernels::internal_cutlass_kernels::KernelScheduleType;
+#endif
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -38,7 +50,6 @@ using FP8Type = __nv_fp8_e4m3;
 void cutlass_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     torch::Tensor const& scale_a, torch::Tensor const& scale_b)
 {
-
     int32_t m = a.sizes()[0];
     int32_t n = b.sizes()[1];
     int32_t k = a.sizes()[1];
@@ -162,6 +173,8 @@ Tensor cutlass_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const&
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
@@ -171,5 +184,5 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("cutlass_scaled_mm", &torch_ext::cutlass_scaled_mm);
+    m.impl("cutlass_scaled_mm", &tensorrt_llm::torch_ext::cutlass_scaled_mm);
 }

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["uv_build>=0.9.4"]
+build-backend = "uv_build"
+
+[project]
+name = "trtllm-sbom"
+version = "0.1.0"
+description = "Track and validate C++ dependency attributions and generate SBOMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = [
+  "pydantic>=2.12.3",
+  "pyyaml>=6.0.3",
+  "click>=8.3.0",
+  "requests>=2.32.5",
+]
+
+[dependency-groups]
+test = [
+  "pytest>=8.0.0",
+  "jsonschema>=4.23.0",
+]
+
+[project.scripts]
+trtllm-sbom = "trtllm_sbom.cli:main"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.uv]
+default-groups = ["test"]

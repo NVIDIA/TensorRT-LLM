@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "userbuffersManager.h"
+#include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::runtime::ub
 {

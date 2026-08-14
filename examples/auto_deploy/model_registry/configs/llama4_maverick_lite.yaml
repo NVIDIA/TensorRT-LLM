@@ -1,0 +1,5 @@
+# Configuration for Llama 4 Maverick with reduced layers
+# Full model is too large for testing
+model_kwargs:
+  text_config:
+    num_hidden_layers: 5

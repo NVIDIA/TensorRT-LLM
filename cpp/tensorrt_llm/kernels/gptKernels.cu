@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -26,8 +27,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -78,8 +79,13 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     // Fixed Q sequence lengths.
     bool const fixed_q_seqlen = params.seqQLengths == nullptr;
 
+    // Whether to reuse externally computed cumulative Q/KV sequence lengths.
+    bool const usePrecomputedQOffsets = params.precomputedSeqQOffsets != nullptr;
+    bool const usePrecomputedKVOffsets = params.precomputedSeqKVOffsets != nullptr;
+
     // Whether to calculate cumulative KV sequence lengths.
-    bool const calculate_kv_offsets = params.seqKVOffsets != nullptr;
+    bool const calculate_kv_offsets = params.seqKVOffsets != nullptr && !usePrecomputedKVOffsets;
+    bool const needKVOffsets = calculate_kv_offsets || usePrecomputedKVOffsets;
 
     // Whether to calculate cumulative packed mask rows.
     bool const calculate_packed_mask_row_offsets = params.packedMaskRowOffsets != nullptr;
@@ -89,7 +95,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     bool const calculate_cp_offsets = cpSize > 1 && params.seqCpPartialOffsets != nullptr;
 
     // Compute the padding offsets for Encoder Inputs.
-    bool const need_encoder_padding_offsets = (params.encoderPaddingOffsets != nullptr) && calculate_kv_offsets;
+    bool const need_encoder_padding_offsets = (params.encoderPaddingOffsets != nullptr) && needKVOffsets;
     [[maybe_unused]] int* smemEncoderSeqQOffsets;
 
     // The implementation of the parallel scan in the thread block (see CUB for details).
@@ -141,11 +147,21 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         }
 
         // Do the prefix-scan (it calls syncthreads internally).
-        int seqQOffset;
+        int seqQOffset = 0;
         [[maybe_unused]] int packedMaskRowOffset;
-        [[maybe_unused]] int seqKVOffset;
+        [[maybe_unused]] int seqKVOffset = 0;
         [[maybe_unused]] int seqCpPartialOffset;
-        BlockScan(tempQStorage).ExclusiveSum(seqQLength, seqQOffset, prefixQOp);
+        if (usePrecomputedQOffsets)
+        {
+            if (batchIdx <= batchSizeBound)
+            {
+                seqQOffset = params.precomputedSeqQOffsets[batchIdx];
+            }
+        }
+        else
+        {
+            BlockScan(tempQStorage).ExclusiveSum(seqQLength, seqQOffset, prefixQOp);
+        }
         if (calculate_packed_mask_row_offsets)
         {
             BlockScan(tempMaskStorage).ExclusiveSum(packedMaskRows, packedMaskRowOffset, prefixMaskOp);
@@ -153,6 +169,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         if (calculate_kv_offsets)
         {
             BlockScan(tempKVStorage).ExclusiveSum(seqKVLength, seqKVOffset, prefixKVOp);
+        }
+        else if (usePrecomputedKVOffsets && batchIdx <= batchSizeBound)
+        {
+            seqKVOffset = params.precomputedSeqKVOffsets[batchIdx];
         }
         if (calculate_cp_offsets)
         {
@@ -172,7 +192,10 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         // Store the result.
         if (batchIdx <= batchSizeBound && storeSeqOffsets)
         {
-            params.seqQOffsets[batchIdx] = seqQOffset;
+            if (!usePrecomputedQOffsets)
+            {
+                params.seqQOffsets[batchIdx] = seqQOffset;
+            }
             if (calculate_packed_mask_row_offsets)
             {
                 params.packedMaskRowOffsets[batchIdx] = packedMaskRowOffset;
@@ -276,13 +299,18 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
             params.fmhaTileCounter[0] = 0u;
         }
         // Take the quantization scales into consideration.
-        float dequantScaleQ = params.dequantScaleQ ? params.dequantScaleQ[0] : 1.f;
-        float dequantScaleKv = params.dequantScaleKv ? params.dequantScaleKv[0] : 1.f;
+        int const q_scale_idx = 0;
+        int const k_scale_idx = params.separateQkvScales ? 1 : 0;
+        int const v_scale_idx = params.separateQkvScales ? 2 : 0;
+        float dequantScaleQ = params.dequantScaleQkv ? params.dequantScaleQkv[q_scale_idx] : 1.f;
+        float dequantScaleK = params.dequantScaleQkv ? params.dequantScaleQkv[k_scale_idx] : 1.f;
+        float dequantScaleV = params.dequantScaleQkv ? params.dequantScaleQkv[v_scale_idx] : 1.f;
+
         float quantScaleO = params.quantScaleO ? params.quantScaleO[0] : 1.f;
         if (params.fmhaBmm1Scale)
         {
             // The scale after fmha bmm1.
-            params.fmhaBmm1Scale[0] = dequantScaleQ * dequantScaleKv * params.fmhaHostBmm1Scale;
+            params.fmhaBmm1Scale[0] = dequantScaleQ * dequantScaleK * params.fmhaHostBmm1Scale;
             // The scale prepared for log2 optimization.
             constexpr float kLog2e = 1.4426950408889634074f;
             params.fmhaBmm1Scale[1] = params.fmhaBmm1Scale[0] * kLog2e;
@@ -290,7 +318,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         if (params.fmhaBmm2Scale)
         {
             // The scale after fmha bmm2.
-            params.fmhaBmm2Scale[0] = quantScaleO * dequantScaleKv;
+            params.fmhaBmm2Scale[0] = quantScaleO * dequantScaleV;
         }
     }
 }
@@ -304,8 +332,8 @@ void invokeBuildDecoderInfo(BuildDecoderInfoParams<T> const& params, cudaStream_
         "Rotary embedding dim is assumed to be smaller than 512 and multiple of 2.");
     TLLM_CHECK_WITH_INFO(
         !(params.seqKVLengths == nullptr && params.rotaryEmbeddingDim > 0), "KV sequence lengths buffer is invalid.");
-    bool const need_encoder_padding_offsets
-        = (params.encoderPaddingOffsets != nullptr) && (params.seqKVOffsets != nullptr);
+    bool const needKVOffsets = params.seqKVOffsets != nullptr || params.precomputedSeqKVOffsets != nullptr;
+    bool const need_encoder_padding_offsets = (params.encoderPaddingOffsets != nullptr) && needKVOffsets;
     const size_t smem_size
         = (need_encoder_padding_offsets ? (params.batchSize + 1) * 2 : (params.batchSize + 1)) * sizeof(int);
     computeSeqAndPaddingOffsets<T, THREADS_PER_BLOCK>
@@ -353,4 +381,5 @@ __global__ void updatePaddingCountKernel(int* paddingPerSeq, int const* seqLengt
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

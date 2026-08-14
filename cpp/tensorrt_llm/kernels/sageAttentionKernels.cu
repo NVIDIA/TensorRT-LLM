@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -24,8 +25,8 @@
 
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -250,7 +251,7 @@ __global__ void sage_quant_kernel(void const* q, void const* k, void const* v, i
 
         // Compute the block-wide max for thread0
         // cuda::maximum<>{}
-        float aggregate = BlockReduce(temp_storage).Reduce(local_amax, cub::Max{});
+        float aggregate = BlockReduce(temp_storage).Reduce(local_amax, cuda::maximum{});
 
         if (row_id == 0 && col_id == 0)
             s_block_amax = static_cast<float>(aggregate);
@@ -429,7 +430,7 @@ __global__ void sage_quant_kernel(void const* q, void const* k, void const* v, i
 
         // Compute the block-wide max for thread0
         // cuda::maximum<>{}
-        float aggregate = BlockReduce(temp_storage).Reduce(local_amax, cub::Max{});
+        float aggregate = BlockReduce(temp_storage).Reduce(local_amax, cuda::maximum{});
 
         if (row_id == 0 && col_id == 0)
             s_block_amax = static_cast<float>(aggregate);
@@ -610,4 +611,5 @@ void unpadding(
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

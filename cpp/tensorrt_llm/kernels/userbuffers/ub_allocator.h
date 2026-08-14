@@ -15,8 +15,13 @@
  */
 #pragma once
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include <memory>
 #if ENABLE_MULTI_DEVICE
+#include "nccl.h"
 #include "userbuffers.h"
+#else
+
+using ncclWindow_t = void*;
 #endif
 
 namespace tensorrt_llm::runtime::ub
@@ -28,11 +33,13 @@ struct UBBuffer
     void* addr;
     int handle;
     size_t size;
+    ncclWindow_t window;
 
-    UBBuffer(void* a = nullptr, int h = -1, size_t s = 0)
+    UBBuffer(void* a = nullptr, int h = -1, size_t s = 0, ncclWindow_t w = nullptr)
         : addr(a)
         , handle(h)
         , size(s)
+        , window(w)
     {
     }
 
@@ -41,6 +48,7 @@ struct UBBuffer
         return (addr == nullptr) || (handle == -1) || (size == 0);
     }
 };
+
 #if ENABLE_MULTI_DEVICE
 class UserBufferAllocator
 {
@@ -49,21 +57,23 @@ public:
 
     UserBufferAllocator() = default;
 
-    void initialize(tensorrt_llm::runtime::WorldConfig const& world_config);
-    bool is_initialized();
+    virtual void initialize(::tensorrt_llm::runtime::WorldConfig const& worldConfig);
+    bool isInitialized();
     UBBuffer allocate(size_t bytes);
     void deallocate(void* addr);
     UBBuffer get(int idx);
     communicator* comm();
+    virtual UBBuffer registerUBBuffer(size_t bytes);
 
 private:
-    UBBuffer register_ub_buffer(size_t bytes);
+    communicator* mUbComm;
 
-    communicator* ub_comm_;
-    std::vector<UBBuffer> buffers_;
-    bool is_initialized_;
-    tensorrt_llm::runtime::WorldConfig world_config_;
+protected:
+    std::vector<UBBuffer> mBuffers;
+    bool mIsInitialized;
+    ::tensorrt_llm::runtime::WorldConfig mWorldConfig;
 };
+
 #else
 using communicator = void;
 #endif

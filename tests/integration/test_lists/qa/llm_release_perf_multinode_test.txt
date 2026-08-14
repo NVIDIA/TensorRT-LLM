@@ -1,2 +1,0 @@
-perf/test_perf.py::test_perf[llama_v3.1_70b-cppmanager-exe-plugin_ifb-float16-input_output_len:1024,1024-quant:fp8-tp:8-pp:2]
-perf/test_perf.py::test_perf[mixtral_8x7b_v0.1-cppmanager-exe-plugin_ifb-float16-input_output_len:512,512-quant:fp8-tp:8-pp:2]

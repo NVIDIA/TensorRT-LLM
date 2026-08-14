@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._utils import nvtx_range
+
 from ..attention_backend import AttentionMetadata
 from .linear import Linear
 
@@ -10,6 +12,7 @@ class LogitsProcessor(nn.Module):
     def __init__(self):
         super().__init__()
 
+    @nvtx_range("LogitsProcessor")
     def forward(self,
                 hidden_states: torch.Tensor,
                 lm_head: Linear,

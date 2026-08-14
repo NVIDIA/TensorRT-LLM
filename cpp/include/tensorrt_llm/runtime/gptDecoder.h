@@ -20,10 +20,9 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
-#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <curand_kernel.h>
 
 #include <memory>
@@ -53,9 +52,12 @@ public:
 
     virtual ~IGptDecoder() = default;
 
+    /// @param explicitDraftTokensDType is only used by ExplicitDraftTokens model to WAR the lack of bf16 decoder.
     virtual void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
         std::optional<DecodingOutput> const& output = std::nullopt,
-        std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt)
+        std::optional<tensorrt_llm::DataType> explicitDraftTokensDType = std::nullopt,
+        std::optional<std::vector<TensorConstPtr>> const& lookaheadPrompt = std::nullopt,
+        std::optional<std::vector<executor::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs = std::nullopt)
         = 0;
 
     virtual void forwardAsync(DecodingOutput& output, DecodingInput const& input) = 0;
@@ -68,8 +70,8 @@ public:
         std::optional<SamplingConfig> const& samplingConfig, SizeType32 batchSize, TensorConstPtr batchSlots)
         = 0;
 
-    static std::unique_ptr<IGptDecoder> create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
-        size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
+    static std::unique_ptr<IGptDecoder> create(executor::DecodingMode const& mode, tensorrt_llm::DataType dtype,
+        size_t maxNumSequences, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded,
         BufferManager::CudaStreamPtr const& stream,
         std::shared_ptr<SpeculativeDecodingModule const> const& speculativeDecodingModule = nullptr);
 };
@@ -82,13 +84,16 @@ public:
     using CudaStreamPtr = BufferManager::CudaStreamPtr;
     using TensorPtr = std::shared_ptr<ITensor>;
 
-    GptDecoder(executor::DecodingMode const& mode, size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize,
-        size_t vocabSizePadded, size_t maxSequenceLength, CudaStreamPtr const& stream,
+    GptDecoder(executor::DecodingMode const& mode, size_t maxNumSequences, size_t maxBeamWidth, size_t vocabSize,
+        size_t vocabSizePadded, CudaStreamPtr const& stream,
         std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModule = nullptr);
 
     void setup(SamplingConfig const& samplingConfig, size_t batchSize, TensorConstPtr const& batchSlots,
         std::optional<DecodingOutput> const& output = std::nullopt,
-        std::optional<std::vector<decoder_batch::Request> const> const& requests = std::nullopt) override;
+        std::optional<tensorrt_llm::DataType> explicitDraftTokensDType = std::nullopt,
+        std::optional<std::vector<TensorConstPtr>> const& lookaheadPrompt = std::nullopt,
+        std::optional<std::vector<executor::LookaheadDecodingConfig>> const& lookaheadAlgoConfigs
+        = std::nullopt) override;
 
     void forwardAsync(DecodingOutput& output, DecodingInput const& input) override;
 
@@ -109,26 +114,26 @@ private:
 
     SamplingConfig mSamplingConfig;
 
-    size_t mMaxBatchSize;
+    size_t mMaxNumSequences;
     size_t mVocabSize;
     size_t mVocabSizePadded;
 
     executor::DecodingMode mDecodingMode;
 };
 
-inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode const& mode, nvinfer1::DataType dtype,
-    size_t maxBatchSize, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded, size_t maxSequenceLength,
+inline std::unique_ptr<IGptDecoder> IGptDecoder::create(executor::DecodingMode const& mode,
+    tensorrt_llm::DataType dtype, size_t maxNumSequences, size_t maxBeamWidth, size_t vocabSize, size_t vocabSizePadded,
     BufferManager::CudaStreamPtr const& stream,
     std::shared_ptr<SpeculativeDecodingModule const> const& speculativeDecodingModule)
 {
     switch (dtype)
     {
-    case nvinfer1::DataType::kFLOAT:
-        return std::make_unique<GptDecoder<float>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
-            maxSequenceLength, stream, speculativeDecodingModule);
-    case nvinfer1::DataType::kHALF:
-        return std::make_unique<GptDecoder<half>>(mode, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded,
-            maxSequenceLength, stream, speculativeDecodingModule);
+    case tensorrt_llm::DataType::kFLOAT:
+        return std::make_unique<GptDecoder<float>>(
+            mode, maxNumSequences, maxBeamWidth, vocabSize, vocabSizePadded, stream, speculativeDecodingModule);
+    case tensorrt_llm::DataType::kHALF:
+        return std::make_unique<GptDecoder<half>>(
+            mode, maxNumSequences, maxBeamWidth, vocabSize, vocabSizePadded, stream, speculativeDecodingModule);
     default:
         TLLM_THROW("Unsupported decoder data type: %d. Use either kFLOAT or kHALF.", static_cast<int>(dtype));
         return nullptr;

@@ -1,12 +1,18 @@
 import asyncio
+import logging
 import threading
 import traceback
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Generator, List, Mapping, Union
 
-from .controller import Controller, ParallelProcess, ScaffoldingOutput
+from .controller import Controller, ParallelProcess
+from .execution_scope import ExecutionScope, current_scope
+from .result import ScaffoldingResult
+from .task import Task
 from .worker import Worker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -17,51 +23,13 @@ class ScaffoldingRequest:
     result: "ScaffoldingResult"
 
 
-class ScaffoldingResult:
-
-    def __init__(self):
-        self._done = False
-        self.aqueue = asyncio.Queue()
-        self.output = None
-        self.task_collections = None
-
-    def set_output(self, output: ScaffoldingOutput):
-        self.aqueue.put_nowait(output)
-
-    def set_task_collections(self, task_collections: Mapping[str,
-                                                             "TaskCollection"]):
-        self.task_collections = task_collections
-
-    async def aresult_step(self):
-        # TODO: error handling or raise exception?
-        self.output = await self.aqueue.get()
-        if self.output is None:
-            raise Exception("ScaffoldingLlm execution failed")
-        self._done = True
-
-    def result(self) -> "ScaffoldingResult":
-        if not self._done:
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(self.aresult(), loop).result()
-        return self
-
-    async def aresult(self) -> "ScaffoldingResult":
-        while not self._done:
-            await self.aresult_step()
-
-        return self
-
-    def __await__(self):
-        return self.aresult().__await__()
-
-
 class ScaffoldingLlm:
 
     def __init__(
-            self,
-            prototype_controller: Controller,
-            workers: Mapping[
-                str, Worker],  # map of role of Crontroller to a worker instance
+        self,
+        prototype_controller: Controller,
+        workers: Mapping[str, Worker],  # map of role to worker instance,
+        max_parallel_requests: int = 64,
     ):
         self.prototype_controller = prototype_controller
         self.workers = workers
@@ -78,7 +46,7 @@ class ScaffoldingLlm:
 
         # For top scheduler
         self.running_req_count = 0
-        self.max_parallel_requests = 64
+        self.max_parallel_requests = max_parallel_requests
         self.pending_queue = deque()
 
         self.output_task_collection = False
@@ -86,7 +54,7 @@ class ScaffoldingLlm:
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
     def _get_loop(self):
@@ -98,83 +66,150 @@ class ScaffoldingLlm:
             return asyncio.new_event_loop()
         return None
 
-    async def _main_loop_async_func(self):
+    async def _handle_controller_generator(self,
+                                           gen: Generator,
+                                           request: ScaffoldingRequest = None):
+        """Handle a controller generator, processing tasks and parallel processes."""
+        for obj in gen:
+            if isinstance(obj, ParallelProcess):
+                await self._handle_parallel_process(obj, request)
+            else:
+                await self._handle_task_list(obj, request)
 
-        async def handle_controller_generator(gen: Generator):
-            for obj in gen:
-                if isinstance(obj, ParallelProcess):
-                    await handle_parallel_process(obj)
-                else:
-                    task_list = obj
-                    async_tasks = []
-                    for task in task_list:
-                        task_worker_tag = task.worker_tag
-                        assert task_worker_tag in self.workers.keys()
-                        worker = self.workers[task_worker_tag]
-                        async_tasks.append(
-                            asyncio.create_task(worker.run_task(task)))
-                    await asyncio.gather(*async_tasks)
+    async def _handle_task_list(self,
+                                tasks: List[Task],
+                                request: ScaffoldingRequest = None):
+        """Execute a list of tasks concurrently."""
+        async_tasks = [
+            asyncio.create_task(self.workers[task.worker_tag].run_task(task))
+            for task in tasks
+        ]
+        await asyncio.gather(*async_tasks)
+        for task in tasks:
+            if task.streaming_output_flag:
+                for output in task.streaming_output_list:
+                    request.result.set_output_streaming(output)
+                task.streaming_output_list = []
 
-        async def handle_parallel_process(request: ParallelProcess):
-            async_tasks = []
-            for sub_gen in request.sub_gens:
-                async_task = asyncio.create_task(
-                    handle_controller_generator(sub_gen))
-                async_tasks.append(async_task)
-            await asyncio.gather(*async_tasks)
+    async def _handle_parallel_process(self,
+                                       tasks: ParallelProcess,
+                                       request: ScaffoldingRequest = None):
+        """Handle parallel execution of multiple generators.
 
-        async def handle_single_request(request: ScaffoldingRequest):
-            # warp to a generator without return value
-            def controller_generator_wrapper(request: ScaffoldingRequest):
-                scaffolding_output = yield from request.controller.generate(
-                    request.prompt, **request.kwargs)
-                if self.output_task_collection:
-                    request.result.set_task_collections(
-                        request.controller.task_collections)
-                request.result.set_output(scaffolding_output)
+        Creates a child :class:`ExecutionScope` for each branch so that
+        downstream code (workers, tracers, replay) can distinguish
+        concurrent branches.  Resources acquired under a child scope are
+        automatically released when the branch completes.
+        """
+        parent_scope = current_scope.get()
+        async_tasks = [
+            asyncio.create_task(
+                self._handle_branch(
+                    sub_gen,
+                    request,
+                    self._get_parallel_branch_scope(tasks, parent_scope, idx),
+                )) for idx, sub_gen in enumerate(tasks.sub_gens)
+        ]
+        await asyncio.gather(*async_tasks)
 
+    @staticmethod
+    def _get_parallel_branch_scope(tasks: ParallelProcess,
+                                   parent_scope: ExecutionScope,
+                                   branch_index: int) -> ExecutionScope:
+        if tasks.branch_paths is None:
+            return parent_scope.child(branch_index)
+        return parent_scope.with_branch_path(tasks.branch_paths[branch_index])
+
+    async def _handle_branch(self, gen: Generator, request: ScaffoldingRequest,
+                             scope: ExecutionScope):
+        """Run a single parallel branch under its own scope."""
+        token = current_scope.set(scope)
+        try:
+            await self._handle_controller_generator(gen, request)
+        finally:
+            current_scope.reset(token)
+            await self._notify_scope_end(scope)
+
+    async def _notify_scope_end(self, scope: ExecutionScope):
+        """Inform all workers that *scope* has finished."""
+        for worker in self.workers.values():
             try:
-                gen = controller_generator_wrapper(request)
-                await handle_controller_generator(gen)
-            except Exception as e:
-                # Catch the exception and set output to avoid the user thread to be hang
-                print('scaffoldingLlm handle request exception:', str(e))
-                traceback.print_exc()
-                request.result.set_output(None)
-                raise e
-            finally:
-                self.running_req_count -= 1
-                maybe_schedule()
+                await worker.on_scope_end(scope.scope_id)
+            except Exception:
+                logger.warning(
+                    "Worker %s.on_scope_end(%s) failed",
+                    type(worker).__name__,
+                    scope.scope_id,
+                    exc_info=True,
+                )
 
-        def schedule_request(request: ScaffoldingRequest):
-            asyncio.create_task(handle_single_request(request))
-            self.running_req_count += 1
+    async def _handle_single_request(self, request: ScaffoldingRequest):
+        """Process a single scaffolding request.
 
-        def maybe_schedule(request: ScaffoldingRequest = None):
-            if self.shutdown_event.is_set():
+        Sets :data:`current_scope` so that every downstream
+        ``asyncio.create_task`` (workers, parallel sub-generators, etc.)
+        inherits the per-request execution scope.
+        """
+        scope = ExecutionScope(request_id=request.result.id)
+        token = current_scope.set(scope)
+        try:
+            gen = self._create_controller_generator(request)
+            await self._handle_controller_generator(gen, request)
+        except Exception as e:
+            print(f'ScaffoldingLLM request exception: {e}')
+            traceback.print_exc()
+            request.result.set_output(None)
+            raise
+        finally:
+            current_scope.reset(token)
+            await self._notify_scope_end(scope)
+            self.running_req_count -= 1
+            self._maybe_schedule()
+
+    def _create_controller_generator(self, request: ScaffoldingRequest):
+        """Create a generator wrapper for the controller."""
+        scaffolding_output = yield from request.controller.generate(
+            request.prompt, **request.kwargs)
+
+        if self.output_task_collection:
+            request.result.set_task_collections(
+                request.controller.task_collections)
+        request.result.set_output(scaffolding_output)
+
+    def _schedule_request(self, request: ScaffoldingRequest):
+        """Schedule a single request for execution."""
+        asyncio.create_task(self._handle_single_request(request))
+        self.running_req_count += 1
+
+    def _maybe_schedule(self, request: ScaffoldingRequest = None):
+        """Schedule pending requests if capacity allows."""
+        if self.shutdown_event.is_set():
+            return
+
+        if request is not None:
+            self.pending_queue.append(request)
+
+        while (self.running_req_count < self.max_parallel_requests
+               and self.pending_queue):
+            next_request = self.pending_queue.popleft()
+            self._schedule_request(next_request)
+
+    async def _handle_event_loop(self):
+        """Main event handling loop."""
+        while True:
+            item = await self.task_queue.get()
+
+            if item is None:
                 return
+            elif isinstance(item, ScaffoldingRequest):
+                self._maybe_schedule(item)
+            else:
+                raise ValueError(
+                    f'Unsupported task_queue item type: {type(item)}')
 
-            if request is not None:
-                self.pending_queue.append(request)
-
-            while self.running_req_count < self.max_parallel_requests and len(
-                    self.pending_queue) > 0:
-                first_request = self.pending_queue.popleft()
-                schedule_request(first_request)
-
-        async def handle_event():
-            while True:
-                item = await self.task_queue.get()
-                if item is None:
-                    return
-                elif isinstance(item, ScaffoldingRequest):
-                    maybe_schedule(item)
-                else:
-                    raise ValueError(
-                        f'type of task_queue item ({type(item)}) is not supported'
-                    )
-
-        handle_event_task = asyncio.create_task(handle_event())
+    async def _main_loop_async_func(self):
+        """Main async loop function with reduced complexity."""
+        handle_event_task = asyncio.create_task(self._handle_event_loop())
         await handle_event_task
         self.main_loop_stop_event.set()
 
@@ -191,16 +226,34 @@ class ScaffoldingLlm:
         self.main_loop_thread.start()
 
     def generate_async(self, prompt: str) -> ScaffoldingResult:
+        """Submit a prompt for asynchronous scaffolding execution.
+
+        Args:
+            prompt: The user prompt to process.
+
+        Returns:
+            A :class:`ScaffoldingResult` whose ``aresult()`` /
+            ``result()`` methods block until execution completes.
+            The result carries a unique :pyattr:`ScaffoldingResult.id`
+            that workers can read via :data:`current_scope`.
+        """
         result = ScaffoldingResult()
 
         async def put_request():
-            request = ScaffoldingRequest(
-                prompt=prompt,
-                kwargs={},
-                result=result,
-                controller=self.prototype_controller.clone())
-
-            await self.task_queue.put(request)
+            try:
+                request = ScaffoldingRequest(
+                    prompt=prompt,
+                    kwargs={},
+                    result=result,
+                    controller=self.prototype_controller.clone(),
+                )
+            except Exception as e:
+                self.task_queue.put(None)
+                print(
+                    f"Error: build ScaffoldingRequest failed: {e} \n {traceback.format_exc()}"
+                )
+            else:
+                await self.task_queue.put(request)
 
         asyncio.run_coroutine_threadsafe(put_request(), self.loop)
 
@@ -227,7 +280,7 @@ class ScaffoldingLlm:
 
     def shutdown(self, shutdown_workers=False):
 
-        def shutdown_workers():
+        def shutdown_workers_func():
             for worker in self.workers.values():
                 worker.shutdown()
 
@@ -235,6 +288,8 @@ class ScaffoldingLlm:
         async def stop_task_on_loop():
             await self.task_queue.put(None)
             await self.main_loop_stop_event.wait()
+            for worker in self.workers.values():
+                await worker.async_shutdown()
 
         asyncio.run_coroutine_threadsafe(stop_task_on_loop(), self.loop)
 
@@ -247,4 +302,4 @@ class ScaffoldingLlm:
             self.shutdown_event.set()
 
         if shutdown_workers:
-            shutdown_workers()
+            shutdown_workers_func()

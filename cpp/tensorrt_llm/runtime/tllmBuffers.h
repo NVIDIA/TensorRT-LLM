@@ -25,8 +25,9 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
+#include "tensorrt_llm/runtime/virtualMemory.h"
 
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
@@ -500,6 +501,36 @@ protected:
 
 using PinnedPoolAllocator = PoolAllocator<PinnedAllocator>;
 
+class CudaVirtualMemoryAllocatorAdaptor
+    : public BaseAllocator<CudaVirtualMemoryAllocatorAdaptor, MemoryType::kGPU, /* count */ false>,
+      CudaVirtualMemoryAllocator
+{
+    // Update to MemoryCounters is done in Creator to more precisely reflect the memory usage.
+    using Base = BaseAllocator<CudaVirtualMemoryAllocatorAdaptor, MemoryType::kGPU, false>;
+    friend Base;
+
+public:
+    // No explicit, to allow implicit conversion from CudaVirtualMemoryAllocator
+    CudaVirtualMemoryAllocatorAdaptor(CudaVirtualMemoryAllocator const& allocator)
+        : CudaVirtualMemoryAllocator(allocator)
+    {
+    }
+
+    using Base::allocate;
+    using Base::deallocate;
+
+protected:
+    void allocateImpl(PointerType* ptr, std::size_t n) const
+    {
+        this->CudaVirtualMemoryAllocator::allocate(ptr, n, tensorrt_llm::common::getDevice());
+    }
+
+    void deallocateImpl(PointerType ptr, std::size_t n) const
+    {
+        this->CudaVirtualMemoryAllocator::deallocate(ptr, n);
+    }
+};
+
 // Adopted from https://github.com/NVIDIA/TensorRT/blob/release/8.6/samples/common/buffers.h
 
 //!
@@ -508,17 +539,10 @@ using PinnedPoolAllocator = PoolAllocator<PinnedAllocator>;
 //! \details This templated RAII (Resource Acquisition Is Initialization) class handles the allocation,
 //!          deallocation, querying of buffers on both the device and the host.
 //!          It can handle data of arbitrary types because it stores byte buffers.
-//!          The template parameters AllocFunc and FreeFunc are used for the
-//!          allocation and deallocation of the buffer.
-//!          AllocFunc must be a functor that takes in (void** ptr, size_t size)
-//!          and returns bool. ptr is a pointer to where the allocated buffer address should be stored.
-//!          size is the amount of memory in bytes to allocate.
-//!          The boolean indicates whether or not the memory allocation was successful.
-//!          FreeFunc must be a functor that takes in (void* ptr) and returns void.
-//!          ptr is the allocated buffer address. It must work with nullptr input.
+//!          The template parameter TAllocator must inherit from BaseAllocator.
 //!
 template <typename TAllocator>
-class GenericBuffer : virtual public IBuffer
+class GenericBuffer : virtual public IBuffer, TAllocator // Inherit from TAllocator for EBO
 {
 public:
     using AllocatorType = TAllocator;
@@ -526,21 +550,28 @@ public:
     //!
     //! \brief Construct an empty buffer.
     //!
-    explicit GenericBuffer(nvinfer1::DataType type, TAllocator allocator = {}) // NOLINT(*-pro-type-member-init)
-        : GenericBuffer{0, type, std::move(allocator)} {};
+    explicit GenericBuffer(tensorrt_llm::DataType type, TAllocator allocator = {}) // NOLINT(*-pro-type-member-init)
+        : GenericBuffer{0, type, std::move(allocator)}
+    {
+    }
 
     //!
     //! \brief Construct a buffer with the specified allocation size in number of elements.
     //!
     explicit GenericBuffer( // NOLINT(*-pro-type-member-init)
-        std::size_t size, nvinfer1::DataType type, TAllocator allocator = {})
-        : GenericBuffer{size, size, type, std::move(allocator)} {};
+        std::size_t size, tensorrt_llm::DataType type, TAllocator allocator = {})
+        : GenericBuffer{size, size, type, std::move(allocator)}
+    {
+    }
+
+    GenericBuffer(GenericBuffer const& other) = delete;
+    GenericBuffer& operator=(GenericBuffer const& buf) = delete;
 
     GenericBuffer(GenericBuffer&& buf) noexcept
-        : mSize{buf.mSize}
+        : TAllocator(static_cast<TAllocator&&>(buf))
+        , mSize{buf.mSize}
         , mCapacity{buf.mCapacity}
         , mType{buf.mType}
-        , mAllocator{std::move(buf.mAllocator)}
         , mBuffer{buf.mBuffer}
     {
         buf.mSize = 0;
@@ -552,11 +583,11 @@ public:
     {
         if (this != &buf)
         {
-            mAllocator.deallocate(mBuffer, toBytes(mCapacity));
+            this->TAllocator::deallocate(mBuffer, toBytes(mCapacity));
             mSize = buf.mSize;
             mCapacity = buf.mCapacity;
             mType = buf.mType;
-            mAllocator = std::move(buf.mAllocator);
+            *static_cast<TAllocator*>(this) = static_cast<TAllocator&&>(buf);
             mBuffer = buf.mBuffer;
             // Reset buf.
             buf.mSize = 0;
@@ -605,7 +636,7 @@ public:
     //!
     //! \brief Returns the type of the buffer.
     //!
-    [[nodiscard]] nvinfer1::DataType getDataType() const override
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const override
     {
         return mType;
     }
@@ -615,7 +646,7 @@ public:
     //!
     [[nodiscard]] MemoryType getMemoryType() const override
     {
-        return mAllocator.getMemoryType();
+        return this->TAllocator::getMemoryType();
     }
 
     //!
@@ -625,8 +656,8 @@ public:
     {
         if (mCapacity < newSize)
         {
-            mAllocator.deallocate(mBuffer, toBytes(mCapacity));
-            mBuffer = mAllocator.allocate(toBytes(newSize));
+            this->TAllocator::deallocate(mBuffer, toBytes(mCapacity));
+            mBuffer = this->TAllocator::allocate(toBytes(newSize));
             mCapacity = newSize;
         }
         mSize = newSize;
@@ -637,7 +668,7 @@ public:
     //!
     void release() override
     {
-        mAllocator.deallocate(mBuffer, toBytes(mCapacity));
+        this->TAllocator::deallocate(mBuffer, toBytes(mCapacity));
         mSize = 0;
         mCapacity = 0;
         mBuffer = nullptr;
@@ -647,7 +678,7 @@ public:
     {
         try
         {
-            mAllocator.deallocate(mBuffer, toBytes(mCapacity));
+            this->TAllocator::deallocate(mBuffer, toBytes(mCapacity));
         }
         catch (std::exception const& e)
         {
@@ -656,12 +687,13 @@ public:
     }
 
 protected:
-    explicit GenericBuffer(std::size_t size, std::size_t capacity, nvinfer1::DataType type, TAllocator allocator = {})
-        : mSize{size}
+    explicit GenericBuffer(
+        std::size_t size, std::size_t capacity, tensorrt_llm::DataType type, TAllocator allocator = {})
+        : TAllocator{std::move(allocator)}
+        , mSize{size}
         , mCapacity{capacity}
         , mType{type}
-        , mAllocator{std::move(allocator)}
-        , mBuffer{capacity > 0 ? mAllocator.allocate(toBytes(capacity)) : nullptr}
+        , mBuffer{capacity > 0 ? this->TAllocator::allocate(toBytes(capacity)) : nullptr}
     {
         TLLM_CHECK(size <= capacity);
         TLLM_CHECK(capacity == 0 || size > 0);
@@ -669,15 +701,14 @@ protected:
 
 private:
     std::size_t mSize{0}, mCapacity{0};
-    nvinfer1::DataType mType;
-    TAllocator mAllocator;
+    tensorrt_llm::DataType mType;
     void* mBuffer;
 };
 
 class MulticastBuffer : virtual public IBuffer
 {
 public:
-    explicit MulticastBuffer(nvinfer1::DataType type, std::set<int> const& ranks)
+    explicit MulticastBuffer(tensorrt_llm::DataType type, std::set<int> const& ranks)
         : mSize(0)
         , mCapacity(0)
         , mType(type)
@@ -686,7 +717,7 @@ public:
         TLLM_CHECK(ranks.size() > 1);
     }
 
-    explicit MulticastBuffer(size_t size, nvinfer1::DataType type, std::set<int> const& ranks)
+    explicit MulticastBuffer(size_t size, tensorrt_llm::DataType type, std::set<int> const& ranks)
         : mSize(0)
         , mCapacity(0)
         , mType(type)
@@ -787,7 +818,7 @@ public:
         return mCapacity;
     }
 
-    [[nodiscard]] nvinfer1::DataType getDataType() const override
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const override
     {
         return mType;
     }
@@ -803,7 +834,6 @@ public:
         if (mCapacity < newSize)
         {
             release();
-            printf("MulticastBuffer resize: %d B\n", int(toBytes(newSize)));
             mHandle = ipcNvlsAllocate(toBytes(newSize), mRanks);
 
             TLLM_CHECK(mHandle->size % BufferDataType(mType).getSize() == 0);
@@ -824,7 +854,7 @@ public:
 private:
     std::size_t mSize = 0;
     std::size_t mCapacity = 0;
-    nvinfer1::DataType mType;
+    tensorrt_llm::DataType mType;
     std::set<int> mRanks;
     IpcNvlsHandle* mHandle;
 };
@@ -835,6 +865,7 @@ using HostBuffer = GenericBuffer<HostAllocator>;
 using PinnedBuffer = GenericBuffer<PinnedAllocator>;
 using PinnedPoolBuffer = GenericBuffer<PinnedPoolAllocator>;
 using UVMBuffer = GenericBuffer<UVMAllocator>;
+using VirtualAddressDeviceBuffer = GenericBuffer<CudaVirtualMemoryAllocatorAdaptor>;
 
 template <typename T>
 std::make_unsigned_t<T> nonNegative(T value)
@@ -852,7 +883,7 @@ public:
     //!
     //! \brief Construct an empty tensor.
     //!
-    explicit GenericTensor(nvinfer1::DataType type, TAllocator allocator = {})
+    explicit GenericTensor(tensorrt_llm::DataType type, TAllocator allocator = {})
         : Base{type, std::move(allocator)}
     {
         mDims.nbDims = 0;
@@ -861,14 +892,14 @@ public:
     //!
     //! \brief Construct a tensor with the specified allocation dimensions.
     //!
-    explicit GenericTensor(nvinfer1::Dims const& dims, nvinfer1::DataType type, TAllocator allocator = {})
+    explicit GenericTensor(tensorrt_llm::Dims const& dims, tensorrt_llm::DataType type, TAllocator allocator = {})
         : Base{nonNegative(volume(dims)), type, std::move(allocator)}
         , mDims{dims}
     {
     }
 
     explicit GenericTensor(
-        nvinfer1::Dims const& dims, std::size_t capacity, nvinfer1::DataType type, TAllocator allocator = {})
+        tensorrt_llm::Dims const& dims, std::size_t capacity, tensorrt_llm::DataType type, TAllocator allocator = {})
         : Base{nonNegative(volume(dims)), capacity, type, std::move(allocator)}
         , mDims{dims}
     {
@@ -893,12 +924,12 @@ public:
         return *this;
     }
 
-    [[nodiscard]] nvinfer1::Dims const& getShape() const override
+    [[nodiscard]] tensorrt_llm::Dims const& getShape() const override
     {
         return mDims;
     }
 
-    void reshape(nvinfer1::Dims const& dims) override
+    void reshape(tensorrt_llm::Dims const& dims) override
     {
         Base::resize(nonNegative(volume(dims)));
         mDims = dims;
@@ -916,7 +947,7 @@ public:
     }
 
 private:
-    nvinfer1::Dims mDims{};
+    tensorrt_llm::Dims mDims{};
 };
 
 // Forward declaration
@@ -941,9 +972,9 @@ public:
     /////////////////////
     // ITensor methods
     /////////////////////
-    [[nodiscard]] nvinfer1::Dims const& getShape() const override;
+    [[nodiscard]] tensorrt_llm::Dims const& getShape() const override;
 
-    void reshape(nvinfer1::Dims const& dims) override;
+    void reshape(tensorrt_llm::Dims const& dims) override;
 
     /////////////////////
     // IBuffer methods
@@ -953,7 +984,7 @@ public:
 
     [[nodiscard]] std::size_t getCapacity() const override;
 
-    [[nodiscard]] nvinfer1::DataType getDataType() const override;
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const override;
 
     [[nodiscard]] MemoryType getMemoryType() const override;
 
@@ -986,7 +1017,7 @@ private:
 
     std::weak_ptr<MulticastTensor> mTensor;
     ViewType mViewType;
-    nvinfer1::Dims mDims{};
+    tensorrt_llm::Dims mDims{};
 };
 
 class MulticastTensor : virtual public ITensor,
@@ -996,13 +1027,13 @@ class MulticastTensor : virtual public ITensor,
 public:
     using Base = MulticastBuffer;
 
-    explicit MulticastTensor(nvinfer1::DataType type, std::set<int> const& ranks)
+    explicit MulticastTensor(tensorrt_llm::DataType type, std::set<int> const& ranks)
         : Base(type, ranks)
     {
         mDims.nbDims = 0;
     }
 
-    explicit MulticastTensor(nvinfer1::Dims const& dims, nvinfer1::DataType type, std::set<int> const& ranks)
+    explicit MulticastTensor(tensorrt_llm::Dims const& dims, tensorrt_llm::DataType type, std::set<int> const& ranks)
         : Base(nonNegative(volume(dims)), type, ranks)
         , mDims(dims)
     {
@@ -1038,12 +1069,12 @@ public:
     /////////////////////
     // ITensor methods
     /////////////////////
-    [[nodiscard]] nvinfer1::Dims const& getShape() const override
+    [[nodiscard]] tensorrt_llm::Dims const& getShape() const override
     {
         return mDims;
     }
 
-    void reshape(nvinfer1::Dims const& dims) override
+    void reshape(tensorrt_llm::Dims const& dims) override
     {
         Base::resize(nonNegative(volume(dims)));
         mDims = dims;
@@ -1061,7 +1092,7 @@ public:
     }
 
 private:
-    nvinfer1::Dims mDims{};
+    tensorrt_llm::Dims mDims{};
 };
 
 using DeviceTensor = GenericTensor<CudaAllocatorAsync>;
@@ -1070,5 +1101,6 @@ using HostTensor = GenericTensor<HostAllocator>;
 using PinnedTensor = GenericTensor<PinnedAllocator>;
 using PinnedPoolTensor = GenericTensor<PinnedPoolAllocator>;
 using UVMTensor = GenericTensor<UVMAllocator>;
+using VirtualAddressDeviceTensor = GenericTensor<CudaVirtualMemoryAllocatorAdaptor>;
 
 } // namespace tensorrt_llm::runtime

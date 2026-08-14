@@ -118,6 +118,12 @@ input [
     dims: [ 1 ]
     optional: true
   },
+  {
+    name: "sampling_param_return_perf_metrics"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
   ## Arguments for Controlling Response Output Fields ##
   {
     name: "return_finish_reason"
@@ -135,6 +141,45 @@ input [
     name: "return_cumulative_logprob"
     data_type: TYPE_BOOL
     dims: [1]
+    optional: true
+  },
+  {
+    name: "stop"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+    optional: true
+  },
+  ## LoRA Adapter Selection ##
+  # All three of lora_id, lora_name, and lora_path must be provided together
+  # (lora_ckpt_source is optional and defaults to "hf").
+  # Adapter weights are read from lora_path on first use and cached by the
+  # LLM executor keyed on lora_id; subsequent requests sharing the same
+  # lora_id reuse the cached adapter. If a cached lora_id is evicted, the
+  # adapter is transparently reloaded from lora_path on next use.
+  # Note: lora_path must be readable on the Triton server's filesystem
+  # (e.g. a shared mount), not uploaded inline with the request.
+  {
+    name: "lora_id"
+    data_type: TYPE_UINT64
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "lora_name"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "lora_path"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "lora_ckpt_source"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
     optional: true
   }
 ]
@@ -161,5 +206,65 @@ output [
     name: "cumulative_logprob"
     data_type: TYPE_FP32
     dims: [-1]
+  },
+  {
+    name: "kv_cache_reused_block"
+    data_type: TYPE_INT32
+    dims: [-1]
+  },
+  {
+    name: "kv_cache_missed_block"
+    data_type: TYPE_INT32
+    dims: [-1]
+  },
+  {
+    name: "kv_cache_alloc_new_blocks"
+    data_type: TYPE_INT32
+    dims: [-1]
+  },
+  {
+    name: "kv_cache_alloc_total_blocks"
+    data_type: TYPE_INT32
+    dims: [-1]
+  },
+  {
+    name: "kv_cache_hit_rate"
+    data_type: TYPE_FP32
+    dims: [-1]
+  },
+  {
+    name: "arrival_time_ns"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "first_scheduled_time_ns"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "first_token_time_ns"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "last_token_time_ns"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "acceptance_rate"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "total_accepted_draft_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+  },
+  {
+    name: "total_draft_tokens"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
   }
 ]

@@ -14,23 +14,12 @@
         },
         {
             "include_re": "^tensorrt_llm/",
-            "exclude_re": [
-                "^tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/src/",
-                "^tensorrt_llm/kernels/internal_cutlass_kernels/src/"
-            ],
             "license_name": "apache"
-        },
-        {
-            "include_re": "^tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/nvrtcWrapper/src/",
-            "license_name": "nvidia"
-        },
-        {
-            "include_re": "^tensorrt_llm/kernels/internal_cutlass_kernels/src/",
-            "license_name": "nvidia"
         }
     ],
     "skip": {
         "<filename>": "<description>",
+        "tensorrt_llm/deep_ep/strip_nvshmem_helper.py": "py",
         "tensorrt_llm/kernels/selectiveScan/selectiveScan.h": "external",
         "tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py": "py",
         "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm_kernel_template_sm90.h": "dual license",
@@ -51,6 +40,16 @@
         "include/tensorrt_llm/deep_gemm/scheduler.cuh": "dual license",
         "include/tensorrt_llm/deep_gemm/tma_utils.cuh": "dual license",
         "include/tensorrt_llm/deep_gemm/utils.cuh": "dual license",
+        "tensorrt_llm/kernels/causalConv1d/causalConv1d.cu": "dual license",
+        "tensorrt_llm/kernels/causalConv1d/causalConv1d.h": "dual license",
+        "tensorrt_llm/thop/causalConv1dOp.cpp": "dual license",
+        "tensorrt_llm/common/vec_dtypes.cuh": "dual license",
+        "tensorrt_llm/common/sha256/attributes.h": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256.cpp": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256.h": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256_arm_shani.cpp": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256_endian.h": "external (Bitcoin Core MIT)",
+        "tensorrt_llm/common/sha256/sha256_x86_shani.cpp": "external (Bitcoin Core MIT)",
         "_": "don't remove, for trailing comma"
     }
 }

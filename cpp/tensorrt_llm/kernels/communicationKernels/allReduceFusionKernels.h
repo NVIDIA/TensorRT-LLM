@@ -15,16 +15,19 @@
  */
 
 #pragma once
-#include <NvInferRuntime.h>
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/ipcUtils.h"
 
-namespace tensorrt_llm::kernels::ar_fusion
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion
 {
 template <typename DType>
 struct ElemsPerAccess;
@@ -61,7 +64,10 @@ enum class AllReduceFusionPattern : int
     // The difference between these two and the standard version is that the NormOut version outputs the result of the
     // norm.
     kARResidualRMSNormOutFP8Quant = 4,
-    kARResidualRMSNormOutFP4Quant = 5
+    kARResidualRMSNormOutFP4Quant = 5,
+    // AllReduce + RMSNorm without residual addition. Useful when there is no
+    // external residual to add (e.g. models where residual is handled externally).
+    kARRMSNorm = 6,
 };
 
 enum class QuantType : int
@@ -98,6 +104,7 @@ DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant, false, true, true, true, true, QuantType::kFP8);
 DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant, false, true, true, true, true, QuantType::kFP4);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARRMSNorm, false, false, false, true, true, QuantType::kNone);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -117,7 +124,7 @@ struct AllReduceFusionParams
 {
     int nranks;
     int rank;
-    nvinfer1::DataType dtype;
+    tensorrt_llm::DataType dtype;
     int size;
     int hidden_dim;
     void** workspace;
@@ -132,10 +139,13 @@ struct AllReduceFusionParams
     float rms_eps;
     float* scale_factor;
     bool use_oneshot;
-    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
+    QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
     AllReduceFusionPattern pattern;
+    bool trigger_completion_at_end = true;
 };
 
 void allreduce_fusion_op(AllReduceFusionParams const& params);
-} // namespace tensorrt_llm::kernels::ar_fusion
+} // namespace kernels::ar_fusion
+
+TRTLLM_NAMESPACE_END
