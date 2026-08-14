@@ -579,8 +579,6 @@ def multimodal_model_root(request, llm_venv):
 
     if "llava-onevision" in tllm_model_name and "video" in tllm_model_name:
         multimodal_model_root = multimodal_model_root[:-6]
-    elif "llava-v1.6" in tllm_model_name and "vision-trtllm" in tllm_model_name:
-        multimodal_model_root = multimodal_model_root[:-14]
 
     assert os.path.exists(
         multimodal_model_root
