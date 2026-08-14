@@ -15,7 +15,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
     MODEL_CLASS_MAPPER_MAPPING,
     MODEL_CLASS_MAPPING,
     MODEL_CLASS_VISION_ENCODER_MAPPING,
-    get_model_class,
+    get_registered_model_class,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
@@ -208,7 +208,7 @@ def test_qwen3_8_dense_vlm_config_keeps_generic_arch(tmp_path):
 
     assert config.architectures == ["Qwen3_5ForConditionalGeneration"]
     assert config.text_config.architectures == ["Qwen3_5ForCausalLM"]
-    assert get_model_class(config.architectures[0]) is Qwen3_5VLModel
+    assert get_registered_model_class(config.architectures[0]) is Qwen3_5VLModel
 
 
 def test_qwen3_8_dense_vlm_config_is_not_image_bench():
