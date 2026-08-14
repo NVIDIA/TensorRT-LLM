@@ -20,6 +20,7 @@ from ...utils import (
     swizzle_sf,
     unswizzle_sf,
 )
+from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (
     MoEDeployment,
     MoEEligibility,
@@ -29,7 +30,7 @@ from .impl_contract import (
     MoERunContext,
     require_comm_plan,
 )
-from .interface import MoE, MoEWeightLoadingMode, _reject
+from .interface import MoEWeightLoadingMode, _reject
 from .quantization import NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
@@ -100,7 +101,7 @@ def gen_fc2_alpha_fused(
 _FC2_MMA_TILE_K = 256
 
 
-class DenseGEMMFusedMoE(MoE):
+class DenseGEMMFusedMoE(MoEImplBase):
     """CuteDSL DenseGEMM flow of fused mixture of experts (MoE) Layer.
 
     This backend uses CuTe DSL dense GEMM kernels with fused SwiGLU for MoE
@@ -201,11 +202,21 @@ class DenseGEMMFusedMoE(MoE):
         if activation_type is None:
             activation_type = ActivationType.Swiglu
 
-        # Call MoE base class directly (not CutlassFusedMoE).
-        # Note: `apply_router_weight_on_input` is accepted for API
-        # compatibility with create_moe_backend() but is not passed to
-        # MoE.__init__().
-        super().__init__(
+        # `apply_router_weight_on_input` is accepted for create_moe_backend()
+        # API compatibility. It is not a field of MoEProblem/MoEDeployment, so
+        # ``can_implement`` cannot reject it and the check has to live here.
+        if apply_router_weight_on_input:
+            raise ValueError(
+                "DenseGEMMFusedMoE does not support apply_router_weight_on_input. "
+                "The routing weight is folded into the FC2 dequant alpha, which "
+                "scales the MoE output rather than pre-scaling the input — the "
+                "two paths are not equivalent. Use a different MoE backend for "
+                "models that require pre-scaling."
+            )
+
+        super().__init__(eplb=None)
+        apply_moe_impl_construction_state(
+            self,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,

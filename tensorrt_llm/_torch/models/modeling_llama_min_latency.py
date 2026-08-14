@@ -29,8 +29,8 @@ from ...models.modeling_utils import QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
-                                 FusedMoEQuantScalesFP8,
+from ..modules.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
+                                 CutlassFusedMoE, FusedMoEQuantScalesFP8,
                                  Llama4RenormalizeMoeRoutingMethod,
                                  MoEWeightLoadingMode)
 from ..modules.gated_mlp import GatedMLP, swiglu
@@ -445,7 +445,14 @@ class Llama4MinLatencyAttention(Llama4Attention):
                                      skip_attn_scaling)
 
 
-class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
+class Llama4MinLatencyFusedMoE(ConfigurableMoE):
+    """Cutlass MoE layer with a min-latency FP8 fast path.
+
+    Subclasses the wrapper rather than ``CutlassFusedMoE``: the latter is an
+    execution unit (``MoEImplBase``) with no ``forward``, so it can only be
+    reached as ``ConfigurableMoE.backend``. ``moe_cls`` pins that backend
+    because the min-latency op below reads the Cutlass weight layout.
+    """
 
     def __init__(
         self,
@@ -465,6 +472,7 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
     ):
 
         super().__init__(
+            moe_cls=CutlassFusedMoE,
             routing_method=routing_method,
             num_experts=num_experts,
             hidden_size=hidden_size,
@@ -591,12 +599,15 @@ class Llama4MinLatencyMoE(Llama4MoE):
         if self.experts.enable_min_latency_fused_moe and hasattr(
                 self.shared_expert.gate_up_proj, "input_scale"):
             pre_score_scaling_input_scale = self.shared_expert.gate_up_proj.input_scale
+            # FP8 dequant scales are created by the quant method on the weight
+            # owner, which is the backend execution unit, not the wrapper.
+            experts_impl = self.experts.backend
             self.experts.min_latency_quant_scales = FusedMoEQuantScalesFP8(
-                fc1_dequant=self.experts.fc31_dequant.data /
-                self.experts.fc31_input_dequant.data *
+                fc1_dequant=experts_impl.fc31_dequant.data /
+                experts_impl.fc31_input_dequant.data *
                 pre_score_scaling_input_scale,
-                fc2_quant=self.experts.fc2_quant,
-                fc2_dequant=self.experts.fc2_dequant,
+                fc2_quant=experts_impl.fc2_quant,
+                fc2_dequant=experts_impl.fc2_dequant,
                 fc1_input_dequant=pre_score_scaling_input_scale,
             )
 
