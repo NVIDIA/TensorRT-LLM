@@ -217,7 +217,7 @@ SLURM_NON_TERMINAL_STATES = [
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
-COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+COMMON_SSH_OPTIONS = Utils.DEFAULT_CUSTOM_SSH_OPTIONS
 
 // Per-stage CBTS coverage exclusions applied on top of the upstream eligibility decision.
 CBTS_EXCLUDE_STAGES = [] as Set
