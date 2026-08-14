@@ -410,7 +410,10 @@ def test_runtime_config_is_captured_from_final_model_config() -> None:
     )
 
     assert PostTransformRuntimeConfig.from_model_config(model_config) == _runtime_config(
-        tp_size=2, moe_tp_size=2, attention_tp_size=2
+        tp_size=2,
+        moe_tp_size=2,
+        attention_tp_size=2,
+        rope_fusion=None,
     )
 
 

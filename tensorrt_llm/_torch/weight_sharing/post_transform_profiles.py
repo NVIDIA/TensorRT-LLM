@@ -165,10 +165,7 @@ class PostTransformRuntimeConfig:
         else:
             rope_type = None
 
-        disable_fuse_rope = getattr(pretrained_config, "disable_fuse_rope", False)
-        rope_fusion = not disable_fuse_rope if isinstance(disable_fuse_rope, bool) else None
-        if model is not None:
-            rope_fusion = _realized_rope_fusion(model)
+        rope_fusion = _realized_rope_fusion(model) if model is not None else None
 
         return cls(
             dtype=_canonical_string(getattr(model_config, "torch_dtype", None)),

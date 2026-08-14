@@ -707,7 +707,7 @@ def test_default_profile_qualifies_real_tiny_llama_lifecycle(
     producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
 
     assert (
-        PostTransformRuntimeConfig.from_model_config(producer.model_config)
+        PostTransformRuntimeConfig.from_model_config(producer.model_config, model=producer)
         == _bf16_dense_runtime_config()
     )
 
@@ -745,7 +745,7 @@ def test_default_profile_qualifies_real_tiny_llama_tp2_rank_lifecycle(
     producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
 
     assert PostTransformRuntimeConfig.from_model_config(
-        producer.model_config
+        producer.model_config, model=producer
     ) == _bf16_dense_runtime_config(
         tp_size=2,
         moe_tp_size=2,
@@ -776,7 +776,7 @@ def test_qwen2_dense_profile_qualifies_full_staged_lifecycle() -> None:
     producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
 
     assert (
-        PostTransformRuntimeConfig.from_model_config(producer.model_config)
+        PostTransformRuntimeConfig.from_model_config(producer.model_config, model=producer)
         == _bf16_dense_runtime_config()
     )
     assert _qwen2_layout_state(producer) == {
@@ -839,7 +839,7 @@ def test_qwen2_dense_profile_qualifies_tp2_rank_lifecycle(
     producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
 
     assert PostTransformRuntimeConfig.from_model_config(
-        producer.model_config
+        producer.model_config, model=producer
     ) == _bf16_dense_runtime_config(
         tp_size=2,
         moe_tp_size=2,
