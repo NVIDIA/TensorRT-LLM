@@ -28,11 +28,11 @@ class MoEOp(ABC):
     """Abstract base class for MoE computation ops.
 
     This class provides a strategy pattern for different MoE computation implementations.
-    It is used by MoE modules (like WideEPMoE) to delegate the actual computation.
+    It is used by MoE modules to delegate the actual computation.
 
     Note: MoEOp is NOT a MoE module itself, but a computation strategy.
-    The actual MoE module (e.g., WideEPMoE) inherits from MoE and uses MoEOp
-    for the computation implementation.
+    The actual MoE module inherits from MoE and uses MoEOp for the computation
+    implementation.
     """
 
     # Op-specific abstract methods

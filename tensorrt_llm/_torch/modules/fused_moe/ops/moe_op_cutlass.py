@@ -190,7 +190,7 @@ class CutlassMoEOp(MoEOp):
 
         # Get unpadded_hidden_size from module if available, otherwise use hidden_size
         # For now it is the user's responsibility to set unpadded_hidden_size.
-        # DeepGemmFusedMoE and WideEPMoE both have unpadded_hidden_size.
+        # DeepGemmFusedMoE has unpadded_hidden_size.
         unpadded_hidden_size = getattr(module, 'unpadded_hidden_size',
                                        x.shape[1])
 

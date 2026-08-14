@@ -20,7 +20,6 @@ from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
-from .fused_moe_wide_ep import WideEPMoE
 from .interface import MoE, MoEWeightLoadingMode
 from .mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from .moe_load_balancer import get_moe_load_balancer
@@ -322,9 +321,6 @@ def create_moe_backend(
     Returns:
         MoE: MoE backend instance
     """
-    if moe_cls is WideEPMoE:
-        raise ValueError(WIDEEP_DEPRECATION_MESSAGE)
-
     # Get parameters from pretrained_config if not explicitly provided
     pretrained_config = model_config.pretrained_config
     if num_experts is None:
@@ -672,7 +668,7 @@ def create_moe(
             communication_method=communication_method,
         )
 
-    # WideEPMoE, TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
+    # TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
     # and own their communication and forward paths.
     if communication_method is not None:
         raise ValueError("communication_method requires ConfigurableMoE.")
