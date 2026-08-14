@@ -436,7 +436,8 @@ def test_fp8_quantize_1x128_packed_ue8m0_r128c4(m, k):
     torch.manual_seed(0)
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
 
-    fused_fp8, fused_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x)
+    fused_fp8, fused_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+        x, True)
 
     # Legacy quantization is the value/scale reference. Convert its MN-major
     # packed scales to the standard byte layout for a physical-layout check.
@@ -466,7 +467,8 @@ def test_fp8_quantize_1x128_packed_ue8m0_r128c4_zero_blocks(m, k):
     from tensorrt_llm.quantization.utils import fp8_utils
 
     x = torch.zeros((m, k), device="cuda", dtype=torch.bfloat16)
-    fused_fp8, fused_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x)
+    fused_fp8, fused_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+        x, True)
     ref_fp8, ref_scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0=True)
     ref_packed = fp8_utils.get_col_major_tma_aligned_packed_tensor(
         ref_scale[:, :m].t().contiguous().to(torch.float32))
@@ -494,7 +496,7 @@ def test_fp8_quantize_1x128_packed_ue8m0_r128c4_padding_is_zero(m, k):
     """R128c4 M padding is initialized and every K32 slot is populated."""
     torch.manual_seed(0)
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
-    _, scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x)
+    _, scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(x, True)
 
     num_sf_k = k // 32
     num_packed_sf_k = (num_sf_k + 3) // 4
