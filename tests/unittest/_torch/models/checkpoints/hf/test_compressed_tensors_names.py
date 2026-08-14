@@ -146,3 +146,19 @@ def test_invert_global_scale_mixed_vector() -> None:
     assert torch.isfinite(out).all()
     assert out.max().item() == pytest.approx(0.25)
     torch.testing.assert_close(out, torch.tensor([0.25, 0.0, 0.125]))
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_dense_global_scale_must_be_positive_and_finite(value: float) -> None:
+    weights = {f"{_NVFP4}.weight_global_scale": torch.tensor([value])}
+
+    with pytest.raises(ValueError, match="dense NVFP4 layers require"):
+        normalize_compressed_tensors_nvfp4_names(weights)
+
+
+def test_moe_global_scale_sentinel_can_remain_zero() -> None:
+    weights = {f"{_NVFP4}.weight_global_scale": torch.tensor([0.0])}
+
+    out = normalize_compressed_tensors_nvfp4_names(weights, allow_zero_global_scales=True)
+
+    assert out[f"{_NVFP4}.weight_scale_2"].item() == 0.0
