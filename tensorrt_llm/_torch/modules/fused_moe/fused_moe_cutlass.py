@@ -162,22 +162,29 @@ class CutlassFusedMoE(MoE):
         },
     }
 
-    _GPTOSS_SUPPORTED_ALGOS = frozenset({
+    _GPTOSS_SUPPORTED_ALGOS: frozenset[Optional[QuantAlgo]] = frozenset({
+        None,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_FP8,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     })
-    """set[QuantAlgo]: algorithms whose weight methods can load a gpt-oss bias.
+    """Algorithms whose weight methods can serve gpt-oss SwiGLU (bias + alpha/beta/limit).
 
-    gpt-oss SwiGLU always comes with per-expert bias, and
-    ``FusedMoEMethodBase.load_expert_weights_to_dst`` feeds that bias through the
-    *weight* loaders. Only the MXFP4 family satisfies both halves of that
-    contract: ``MXFP4WeightFusedMoEMethod.create_weights`` computes a real bias
-    shape, and its loaders carry an explicit 1-D bias branch. Every other
-    algorithm either inherits the base ``w3_w1_weight_shape[:2]`` default (wrong
-    for transposed layouts such as W8A16 / W4A8_AWQ) or hard-asserts 2-D in
-    padding (NVFP4). Widening this set without adding that plumbing turns a
-    selection-time rejection into a weight-loading crash.
+    The CUDA kernel is not the constraint: ``torch.ops.trtllm.fused_moe`` takes
+    ``swiglu_alpha`` / ``swiglu_beta`` / ``swiglu_limit`` on every path, and
+    ``moeOp.cpp`` promotes ``ActivationType::SwigluBias`` from those tensors
+    alone. ``None`` (unquantized BF16/FP16) is included because
+    ``UnquantizedFusedMoEMethod`` registers a 2-D ``(E, 2I)`` bias that matches
+    the op's ``fc1_expert_biases`` contract, and the TMA-WS / Ampere-unfused
+    activation kernels apply that bias plus ``SwigluBiasAdaptor``.
+
+    The remaining members are the MXFP4 family:
+    ``MXFP4WeightFusedMoEMethod.create_weights`` computes a real bias shape and
+    its loaders tolerate a 1-D checkpoint tensor. Every other algorithm either
+    inherits the base ``w3_w1_weight_shape[:2]`` default (wrong for transposed
+    layouts such as W8A16 / W4A8_AWQ) or hard-asserts 2-D in padding (NVFP4).
+    Widening this set without adding that plumbing turns a selection-time
+    rejection into a weight-loading crash.
     """
 
     @classmethod
@@ -197,11 +204,12 @@ class CutlassFusedMoE(MoE):
                 f"CutlassFusedMoE requires SM >= 80, got SM{sm_version}")
 
         if p.swiglu_gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+            supported = sorted("unquantized" if a is None else a.name
+                               for a in cls._GPTOSS_SUPPORTED_ALGOS)
             return _reject(
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
                 f"CutlassFusedMoE cannot load a gpt-oss bias for "
-                f"quant_algo={quant_algo}; supported: "
-                f"{sorted(a.name for a in cls._GPTOSS_SUPPORTED_ALGOS)}")
+                f"quant_algo={quant_algo}; supported: {supported}")
 
         # Check if quant_algo is supported
         if quant_algo not in cls._QUANT_SUPPORT_TABLE:

@@ -375,12 +375,16 @@ every specialized backend — `CuteDslFusedMoE`, `CuteDslB12xFusedMoE`,
 `DeepGemmFusedMoE`, `DenseGEMMFusedMoE`, `MarlinFusedMoE` — while
 `TRTLLMGenFusedMoE` accepts only the algorithms in its `_GPTOSS_SUPPORTED_ALGOS`.
 
-Cutlass gates gpt-oss on the MXFP4 family (`CutlassFusedMoE._GPTOSS_SUPPORTED_ALGOS`
-= `W4A16_MXFP4`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`). The binding constraint is
-not the CUDA kernel — `torch.ops.trtllm.fused_moe` takes `swiglu_alpha` /
-`swiglu_beta` / `swiglu_limit` on the same call for every quantized path, and the
-C++ side derives `ActivationType::SwigluBias` purely from whether those tensors
-are present. The constraint is the Python bias plumbing:
+Cutlass gates gpt-oss on unquantized plus the MXFP4 family
+(`CutlassFusedMoE._GPTOSS_SUPPORTED_ALGOS` = `None`, `W4A16_MXFP4`,
+`W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`). The CUDA kernel is not the constraint —
+`torch.ops.trtllm.fused_moe` takes `swiglu_alpha` / `swiglu_beta` /
+`swiglu_limit` on the same call for every path, and the C++ side derives
+`ActivationType::SwigluBias` purely from whether those tensors are present.
+Unquantized is eligible because `UnquantizedFusedMoEMethod` registers a 2-D
+`(E, 2I)` bias that matches the op's `fc1_expert_biases` contract; H100/B200
+TMA-WS GEMM1 then applies that bias in `doActivation` via `SwigluBiasAdaptor`.
+The remaining constraint is the Python bias plumbing for *quantized* methods:
 `FusedMoEMethodBase.load_expert_weights_to_dst` routes the per-expert bias
 through the *weight* loaders, so a method must both compute a real bias shape and
 tolerate a 1-D tensor there. Only `MXFP4WeightFusedMoEMethod` does both; everyone
@@ -389,14 +393,16 @@ W8A16 / W4A8_AWQ layouts) or hard-asserts 2-D while padding (NVFP4). Widening th
 set without adding that plumbing converts a selection-time rejection into a
 weight-loading crash.
 
-Two things make this easy to get wrong in either direction. First, the SM
+Three things make this easy to get wrong in either direction. First, the SM
 asymmetry: `ModelConfig.get_mxfp4_quant_algo` maps a gpt-oss checkpoint to
 `W4A16_MXFP4` below SM100 and to the `W4A8_MXFP4_*` pair at SM100+, so a gate
 keyed on `W4A8_MXFP4_MXFP8` alone excludes Hopper entirely and — because Cutlass
 is `FALLBACK_IMPL` and every other backend abstains — leaves gpt-oss unservable
 there. Second, dropping the gate altogether is equally wrong: it un-skips the
 `test_configurable_moe_single_gpu` gpt-oss × CUTLASS matrix, which then fails
-inside weight loading rather than being rejected up front.
+inside weight loading rather than being rejected up front. Third, omitting
+`None` rejects dummy / unquantized gpt-oss (`test_gpt_oss_trtllmgen[CUTLASS]`)
+even though the kernel path is valid.
 
 ### Scheduler / EPLB Constraints
 
