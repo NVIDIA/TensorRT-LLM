@@ -57,20 +57,27 @@ def _parse_linux_physical_cpu_count(
 
     def add_current_cpu() -> bool:
         processor = current_cpu.get("processor")
-        physical_id = current_cpu.get("physical id")
-        core_id = current_cpu.get("core id")
-        if processor is None or physical_id is None or core_id is None:
+        if processor is None:
             return False
 
         try:
             processor_id = int(processor)
-            physical_id = int(physical_id)
-            core_id = int(core_id)
         except ValueError:
             return True
 
         if available_cpus is not None and processor_id not in available_cpus:
             return False
+
+        physical_id = current_cpu.get("physical id")
+        core_id = current_cpu.get("core id")
+        if physical_id is None or core_id is None:
+            return True
+
+        try:
+            physical_id = int(physical_id)
+            core_id = int(core_id)
+        except ValueError:
+            return True
 
         physical_cores.add((physical_id, core_id))
         return False
@@ -95,9 +102,10 @@ def _parse_linux_physical_cpu_count(
     if not physical_cpu_count:
         return None
 
-    if (available_cpus is not None
-            and physical_cpu_count * 8 < len(available_cpus)):
-        return None
+    if available_cpus is not None:
+        minimum_physical_count = max(1, len(available_cpus) // 2)
+        if physical_cpu_count < minimum_physical_count:
+            return None
 
     return physical_cpu_count
 

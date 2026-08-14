@@ -117,18 +117,40 @@ core id     : 1
     )
 
 
-def test_parse_linux_physical_cpu_count_rejects_implausible_smt_ratio(
+def test_parse_linux_physical_cpu_count_rejects_missing_topology_record(
+    build_wheel_module: ModuleType,
+) -> None:
+    cpuinfo = """
+processor   : 0
+physical id : 0
+core id     : 0
+
+processor   : 1
+model name  : Example CPU
+
+processor   : 2
+physical id : 0
+core id     : 1
+"""
+
+    assert (
+        build_wheel_module._parse_linux_physical_cpu_count(cpuinfo, available_cpus={0, 1, 2})
+        is None
+    )
+
+
+def test_parse_linux_physical_cpu_count_rejects_too_low_physical_count(
     build_wheel_module: ModuleType,
 ) -> None:
     cpuinfo = "\n\n".join(
         f"""processor   : {processor}
 physical id : 0
 core id     : 0"""
-        for processor in range(9)
+        for processor in range(8)
     )
 
     assert (
-        build_wheel_module._parse_linux_physical_cpu_count(cpuinfo, available_cpus=set(range(9)))
+        build_wheel_module._parse_linux_physical_cpu_count(cpuinfo, available_cpus=set(range(8)))
         is None
     )
 
