@@ -18,9 +18,9 @@ import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.utils import torch_multi_arange
-from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
-                                 prefer_pinned, release_gc, torch_dtype_to_str,
-                                 trace_func)
+from tensorrt_llm._utils import (global_mpi_rank, is_trace_enabled,
+                                 maybe_pin_memory, nvtx_range, prefer_pinned,
+                                 release_gc, torch_dtype_to_str, trace_func)
 from tensorrt_llm.bindings.internal import \
     batch_manager as batch_manager_bindings
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -76,6 +76,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
+from . import hang_detector
 from .config_utils import is_mla
 from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 CUDAGraphRunner, CUDAGraphRunnerConfig,
@@ -1562,6 +1563,21 @@ class PyTorchModelEngine(ModelEngine):
         with self.no_cuda_graph():
             self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
+    def _is_distributed_forward(self) -> bool:
+        """Return whether model forward can communicate with peer workers."""
+        return self.dist.world_size > 1 or self.mapping.dwdp_enabled
+
+    def _terminate_distributed_warmup(self, warmup_kind: str, shape: str,
+                                      error: BaseException) -> None:
+        try:
+            logger.error(
+                f"Fatal {type(error).__name__} during distributed {warmup_kind} warmup "
+                f"on global_rank={global_mpi_rank()}, model_rank={self.dist.rank}, "
+                f"shape=({shape}). Terminating all worker ranks.")
+        except Exception:  # noqa: BLE001 - diagnostics must not block hard kill
+            pass
+        hang_detector.propagate_hard_kill()
+
     def _assert_all_tp_ranks_have_warmup_batch(self, batch,
                                                num_tokens: int) -> None:
         """Assert every TP rank has a valid warmup batch, or raise with diagnostics.
@@ -1623,7 +1639,12 @@ class PyTorchModelEngine(ModelEngine):
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
                     torch.cuda.synchronize()
-            except torch.OutOfMemoryError:
+            except torch.OutOfMemoryError as e:
+                if self._is_distributed_forward():
+                    self._terminate_distributed_warmup(
+                        "general", f"num_tokens={num_tokens}, "
+                        f"num_gen_tokens={num_gen_tokens}", e)
+                    raise
                 logger.warning(
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping.")
@@ -1897,13 +1918,54 @@ class PyTorchModelEngine(ModelEngine):
                  force_init_i) in mamba_warmup_shapes:
                 init_ctx = (Mamba2Metadata.force_initial_states_for_warmup()
                             if force_init_i else contextlib.nullcontext())
-                try:
-                    with init_ctx:
+                with init_ctx:
+                    try:
                         warmup_request = self._create_warmup_request(
                             resource_manager,
                             num_tokens_i,
                             num_gen_requests_i,
                             least_requests=least_req_i)
+                    except torch.OutOfMemoryError as e:
+                        if self._is_distributed_forward():
+                            self._terminate_distributed_warmup(
+                                "Mamba hybrid pre-forward",
+                                f"num_tokens={num_tokens_i}, "
+                                f"num_gen_requests={num_gen_requests_i}, "
+                                f"force_initstates={force_init_i}", e)
+                            raise
+                        logger.warning(
+                            f"Mamba hybrid warmup skipped for shape "
+                            f"num_tokens={num_tokens_i}, "
+                            f"num_gen_requests={num_gen_requests_i}, "
+                            f"force_initstates={force_init_i}: "
+                            f"{type(e).__name__}: {e}")
+                        self._reset_moe_alltoall_state()
+                        torch.cuda.empty_cache()
+                        continue
+                    except RuntimeError as e:
+                        # This known KV allocation failure happens before
+                        # forward, but is locally recoverable only when there
+                        # are no peer workers that can advance independently.
+                        if self._is_distributed_forward():
+                            self._terminate_distributed_warmup(
+                                "Mamba hybrid pre-forward",
+                                f"num_tokens={num_tokens_i}, "
+                                f"num_gen_requests={num_gen_requests_i}, "
+                                f"force_initstates={force_init_i}", e)
+                            raise
+                        if "Can't allocate new blocks for window size" not in str(
+                                e):
+                            raise
+                        logger.warning(
+                            f"Mamba hybrid warmup skipped for shape "
+                            f"num_tokens={num_tokens_i}, "
+                            f"num_gen_requests={num_gen_requests_i}, "
+                            f"force_initstates={force_init_i}: "
+                            f"{type(e).__name__}: {e}")
+                        torch.cuda.empty_cache()
+                        continue
+
+                    try:
                         with self._release_batch_context(
                                 warmup_request, resource_manager) as batch:
                             if batch is None and self.mapping.tp_size <= 1:
@@ -1929,24 +1991,31 @@ class PyTorchModelEngine(ModelEngine):
                                 AutoTuner.get().clean_pp_flag()
 
                             torch.cuda.synchronize()
-                except (torch.OutOfMemoryError, RuntimeError) as e:
-                    # Catch both OOM and RuntimeError. C++ KV cache block
-                    # allocation ("Can't allocate new blocks for window size
-                    # N") surfaces as RuntimeError, not torch.OutOfMemoryError.
-                    # This warmup is a pure perf optimization: if a shape
-                    # doesn't fit for any reason, log and skip; the model then
-                    # JIT-compiles the missing kernel variants lazily on the
-                    # first real request (i.e. the pre-fix behavior).
-                    logger.warning(f"Mamba hybrid warmup skipped for shape "
-                                   f"num_tokens={num_tokens_i}, "
-                                   f"num_gen_requests={num_gen_requests_i}, "
-                                   f"force_initstates={force_init_i}: "
-                                   f"{type(e).__name__}: {e}")
-                    # Mirror _general_warmup_impl: an OOM between dispatch()
-                    # and combine() leaves MoE A2A state in ``dispatched``,
-                    # tripping ``dispatch called twice`` on the next forward.
-                    self._reset_moe_alltoall_state()
-                    torch.cuda.empty_cache()
+                    # Once peers can enter warmup synchronization or forward,
+                    # any rank-local exception can strand them in a collective.
+                    except Exception as e:  # noqa: BLE001
+                        if self._is_distributed_forward():
+                            self._terminate_distributed_warmup(
+                                "Mamba hybrid", f"num_tokens={num_tokens_i}, "
+                                f"num_gen_requests={num_gen_requests_i}, "
+                                f"force_initstates={force_init_i}", e)
+                            raise
+                        if not isinstance(
+                                e, (torch.OutOfMemoryError, RuntimeError)):
+                            raise
+                        # A single-rank warmup is a pure perf optimization. If
+                        # a forward shape does not fit, it can be compiled
+                        # lazily on the first real request.
+                        logger.warning(
+                            f"Mamba hybrid warmup skipped for shape "
+                            f"num_tokens={num_tokens_i}, "
+                            f"num_gen_requests={num_gen_requests_i}, "
+                            f"force_initstates={force_init_i}: "
+                            f"{type(e).__name__}: {e}")
+                        # An OOM between dispatch() and combine() leaves the
+                        # local MoE A2A state in ``dispatched``.
+                        self._reset_moe_alltoall_state()
+                        torch.cuda.empty_cache()
 
         clear_memory_buffers()
         torch.cuda.empty_cache()
@@ -6853,7 +6922,11 @@ class PyTorchModelEngine(ModelEngine):
                         f"Encoder general warmup: bs={bs}, nt={nt}, sl={sl}")
                     self.encoder_forward(inputs)
                     torch.cuda.synchronize()
-                except torch.OutOfMemoryError:
+                except torch.OutOfMemoryError as e:
+                    if self._is_distributed_forward():
+                        self._terminate_distributed_warmup(
+                            "encoder general", f"bs={bs}, nt={nt}, sl={sl}", e)
+                        raise
                     logger.warning(f"OOM during encoder general warmup with "
                                    f"bs={bs}, nt={nt}, sl={sl}. Skipping.")
                     torch.cuda.empty_cache()
