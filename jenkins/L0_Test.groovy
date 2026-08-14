@@ -3487,6 +3487,8 @@ def runLLMDocBuild(pipeline, config)
                 pip3 install -r requirements.txt && \
                 pip3 install git+https://github.com/sphinx-doc/sphinx.git@v7.4.7 && \
                 doxygen Doxygen && \
+                export TRTLLM_DOCS_REQUIRE_IMPORT=1 && \
+                export LD_LIBRARY_PATH=\$(python3 ../scripts/cuda_driver_stub.py) && \
                 make html && \
                 cd build/html && \
                 touch .nojekyll
@@ -5855,9 +5857,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         parallelJobs += parallelMultiNodesSBSAJobs
     }
 
-    docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10")
+    // Doc build is pure CPU work (checkout + wheel install + doxygen/sphinx
+    // `make html` + upload); it never touches a GPU, so run it on the CPU
+    // "build" pod. Mirrors the CPU-only agent-flow job below.
+    docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     docBuildConfigs = [
-        "A10-Build_Docs": [docBuildSpec, {
+        "CPU-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
             runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
         }],
