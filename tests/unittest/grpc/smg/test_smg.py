@@ -844,7 +844,7 @@ def grpc_vlm_service():
     model_path = get_model_path(vlm_model_name)
     llm = LLM(
         model=model_path,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6),
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         load_format="dummy",
     )
     tokenizer = llm.tokenizer
