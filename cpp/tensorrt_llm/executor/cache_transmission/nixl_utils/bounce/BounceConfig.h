@@ -43,8 +43,19 @@ struct BounceConfig
     std::uint32_t scatterWorkerCount{4};                     // TRTLLM_NIXL_BOUNCE_SCATTER_WORKER_COUNT
     std::size_t minDescriptorCount{1024};                    // TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT
     std::size_t maxAverageDescriptorSizeBytes{16ULL << 10};  // TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES
-    int requestTimeoutMs{30000};     // TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS; <=0 DISABLES the timeout
-                                     // (checkTimeouts no-ops; used by tests that intentionally wait)
+    int requestTimeoutMs{30000}; // TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS; <=0 DISABLES the timeout
+                                 // (checkTimeouts no-ops; used by tests that intentionally wait)
+    // TRTLLM_NIXL_BOUNCE_RECEIVER_FLOW_TIMEOUT_MS: receiver-side lease on granted regions. A dead
+    // sender emits neither DATA nor a cancel, which is unobservable through the protocol alone — so
+    // a flow whose grants see no progress (no GRANT sent, no DATA received) for this long is
+    // reclaimed and its regions quarantined (below) before reuse. Must EXCEED the peers'
+    // requestTimeoutMs (a live sender abandons + cancels first, so only dead/unreachable peers ever
+    // hit this); if peers disable their request timeout, raise or disable (<=0) this accordingly.
+    int receiverFlowTimeoutMs{60000};
+    // TRTLLM_NIXL_BOUNCE_QUARANTINE_MS: how long a receiver-reclaimed, possibly-still-being-written
+    // region stays out of the arena before reuse. A one-sided RDMA write cannot be aborted, so time
+    // is the only barrier against re-granting a region a gone peer's NIC may still be writing.
+    int quarantineMs{30000};
     bool disableFabricMemory{false}; // TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY
     // TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER: launch a chunk's gather at submit() time, before the
     // receiver's GRANT arrives, overlapping the WANT->GRANT control round-trip with the gather
@@ -208,6 +219,8 @@ struct BounceConfig
         cfg.maxAverageDescriptorSizeBytes
             = envSizeBytes("TRTLLM_NIXL_BOUNCE_MAX_AVERAGE_DESCRIPTOR_SIZE_BYTES", cfg.maxAverageDescriptorSizeBytes);
         cfg.requestTimeoutMs = envInt("TRTLLM_NIXL_BOUNCE_REQUEST_TIMEOUT_MS", cfg.requestTimeoutMs);
+        cfg.receiverFlowTimeoutMs = envInt("TRTLLM_NIXL_BOUNCE_RECEIVER_FLOW_TIMEOUT_MS", cfg.receiverFlowTimeoutMs);
+        cfg.quarantineMs = envInt("TRTLLM_NIXL_BOUNCE_QUARANTINE_MS", cfg.quarantineMs);
         cfg.disableFabricMemory = envBool("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", cfg.disableFabricMemory);
         cfg.useCubCopy = envBool("TRTLLM_NIXL_BOUNCE_USE_CUB_COPY", cfg.useCubCopy);
         cfg.useZeroCopyArguments = envBool("TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS", cfg.useZeroCopyArguments);
