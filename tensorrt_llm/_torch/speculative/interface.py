@@ -774,17 +774,20 @@ class SpecMetadata:
             flat_seeds.extend(seed for _ in range(num_tokens))
             flat_offsets.extend(offset for _ in range(num_tokens))
 
-        # Size by the actual request count as well as max_num_requests: CUDA
-        # graph warmup can pass max_batch_size > max_num_requests, and this
-        # runs before the all-greedy early return that shields the other
-        # per-request copies below.
-        required_requests = max(self.max_num_requests, len(requests))
+        # A batch wider than the buffers would silently truncate the copies
+        # below, so assert rather than grow: CUDA graph batch sizes are already
+        # clamped to the executor's batch size (_filter_cuda_graph_batch_sizes),
+        # and graph padding refuses to cross it, so exceeding it here means the
+        # invariant broke upstream and should surface.
+        assert len(requests) <= self.max_num_requests, (
+            f"batch has {len(requests)} requests but max_num_requests is "
+            f"{self.max_num_requests}")
         if (self.request_seeds is None
-                or self.request_seeds.numel() < required_requests):
-            self.request_seeds = torch.zeros(required_requests,
+                or self.request_seeds.numel() < self.max_num_requests):
+            self.request_seeds = torch.zeros(self.max_num_requests,
                                              dtype=torch.int64,
                                              device='cuda')
-            self.request_offsets = torch.zeros(required_requests,
+            self.request_offsets = torch.zeros(self.max_num_requests,
                                                dtype=torch.int64,
                                                device='cuda')
         if self.seeds is None or self.seeds.numel() < len(flat_seeds):
