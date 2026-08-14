@@ -103,9 +103,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         for call in ("renderTestDB(", "processShardTestList(", "getPytestBaseCommandLine("):
             self.assertIn(call, prepared)
         self.assertIn("--test-list=${preprocessedLists.regular}", prepared)
-        self.assertIn(
-            'withEnv(["stageName=${stageName}", "TRTLLM_INFRA_DRY_RUN=true"])', prepared
-        )
+        self.assertIn('withEnv(["stageName=${stageName}", "TRTLLM_INFRA_DRY_RUN=true"])', prepared)
         self.assertNotIn("test_infra_dry_run_benchmark.py", prepared)
         self.assertLess(docs.index("if (isInfraDryRun())"), docs.index("make html"))
         conditional_properties = _conditional_workflow_properties(prepared)
@@ -125,9 +123,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout mako"
         )
         self.assertIn(infra_pytest_install, body)
-        self.assertIn(
-            "runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)", body
-        )
+        self.assertIn("runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)", body)
         self.assertLess(
             body.index(infra_pytest_install),
             body.index("runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)"),
