@@ -192,7 +192,7 @@ def test_the_conv_seeding_site_warns_against_a_partial_fix():
     reintroduces the bug in a form that no longer raises."""
     import inspect
 
-    from tensorrt_llm._torch.models.modeling_inkling import InklingConvRuntime
+    from tensorrt_llm._torch.attention_backend.inkling import InklingConvRuntime
 
     src = inspect.getsource(InklingConvRuntime.build)
     assert "not sufficient" in src.lower(), src
@@ -1098,7 +1098,7 @@ def test_dense_mlp_still_tp_shards_and_reduces_without_attention_dp(no_collectiv
 def _conv_pool(tp_size, kv_heads=16, head_dim=8):
     import torch
 
-    from tensorrt_llm._torch.models.modeling_inkling import InklingConvStateCache
+    from tensorrt_llm._torch.attention_backend.inkling import InklingConvStateCache
 
     cfg = SimpleNamespace(
         num_hidden_layers=2,
@@ -1136,7 +1136,6 @@ def test_cache_manager_sizes_the_conv_pool_by_attention_tp(monkeypatch):
     import torch
 
     from tensorrt_llm._torch.attention_backend.inkling import cache_manager as cm
-    from tensorrt_llm._torch.models import modeling_inkling as mi
 
     seen = {}
 
@@ -1145,7 +1144,7 @@ def test_cache_manager_sizes_the_conv_pool_by_attention_tp(monkeypatch):
             seen["tp_size"] = tp_size
 
     monkeypatch.setattr(cm.KVCacheManagerV2, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(mi, "InklingConvStateCache", _FakePool)
+    monkeypatch.setattr(cm, "InklingConvStateCache", _FakePool)
     cfg = SimpleNamespace(torch_dtype=torch.bfloat16)
 
     cm.InklingHybridCacheManager(

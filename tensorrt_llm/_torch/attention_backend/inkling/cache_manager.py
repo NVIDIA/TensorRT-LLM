@@ -27,6 +27,7 @@ model appears, widen that hook rather than adding another beside it.
 import torch
 
 from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from .conv_state import InklingConvRuntime, InklingConvStateCache
 
 
 class InklingHybridCacheManager(KVCacheManagerV2):
@@ -45,11 +46,6 @@ class InklingHybridCacheManager(KVCacheManagerV2):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Imported here, not at module scope: modeling_inkling imports from
-        # _torch.attention_backend and _torch.modules, and a top-level import
-        # would close a cycle back through pyexecutor at model-load time.
-        from ...models.modeling_inkling import InklingConvStateCache
-
         pretrained_config = kwargs["pretrained_config"]
         mapping = kwargs["mapping"]
         max_batch_size = kwargs["max_batch_size"]
@@ -78,8 +74,6 @@ class InklingHybridCacheManager(KVCacheManagerV2):
 
     # ---- model-facing -----------------------------------------------------
     def prepare_conv_runtime(self, attn_metadata):
-        from ...models.modeling_inkling import InklingConvRuntime
-
         return self._conv_cache, InklingConvRuntime.build(attn_metadata, self._conv_cache)
 
     def free_conv_state(self, request_ids) -> None:

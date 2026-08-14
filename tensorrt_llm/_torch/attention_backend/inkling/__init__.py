@@ -22,6 +22,12 @@ layers, a sliding window on local ones -- with a learned relative-bias
 
 from .backend import InklingTritonAttention
 from .cache_manager import InklingHybridCacheManager
+from .conv_state import (
+    InklingConvRuntime,
+    InklingConvState,
+    InklingConvStateCache,
+    apply_short_conv,
+)
 from .kernels import (
     build_page_table,
     inkling_decode_attention,
@@ -32,8 +38,12 @@ from .metadata import InklingAttentionMetadata
 
 __all__ = [
     "InklingAttentionMetadata",
+    "InklingConvRuntime",
+    "InklingConvState",
+    "InklingConvStateCache",
     "InklingHybridCacheManager",
     "InklingTritonAttention",
+    "apply_short_conv",
     "build_page_table",
     "inkling_decode_attention",
     "inkling_prefill_attention",
