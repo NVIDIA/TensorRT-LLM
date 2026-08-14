@@ -130,6 +130,13 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         )
         self.assertLess(body.index("if (isInfraDryRun())"), body.index("pip3 install -e"))
 
+    def test_prepared_workspace_sets_dry_environment_before_collection(self):
+        body = _function_body(L0_TEST, "runInfraDryRunInPreparedWorkspace", "runLLMDocBuild")
+        dry_environment = 'withEnv(["stageName=${stageName}", "TRTLLM_INFRA_DRY_RUN=true"])'
+        self.assertEqual(body.count(dry_environment), 1)
+        self.assertLess(body.index(dry_environment), body.index("processShardTestList("))
+        self.assertLess(body.index(dry_environment), body.index("${pytestCommand.join"))
+
     def test_dry_run_conftest_does_not_require_product_bindings(self):
         dry_guard = '_INFRA_DRY_RUN = os.environ.get("TRTLLM_INFRA_DRY_RUN", "").lower() == "true"'
         self.assertIn(dry_guard, CONFTEST)
