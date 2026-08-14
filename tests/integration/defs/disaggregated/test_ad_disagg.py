@@ -682,6 +682,16 @@ def get_ucx_tls():
     return "^ib,gdr_copy"
 
 
+# get_ucx_tls() above allows IB transports on SM90. Some CI clusters inject
+# UCX_IB_ROCE_LOCAL_SUBNET=y container-wide (via enroot); on multi-rail RoCE
+# fabrics with one subnet per rail (e.g. OCI) it makes UCX UD wireup build
+# address handles to cross-rail peers and time out, hanging the workers.
+# Drop it at import time so worker environments (copied from os.environ)
+# fall back to standard GID-based address resolution; no-op when absent.
+if get_sm_version() == 90:
+    os.environ.pop("UCX_IB_ROCE_LOCAL_SUBNET", None)
+
+
 def worker_cuda_devices(worker_world_sizes, visible_devices):
     required_devices = sum(worker_world_sizes)
     if visible_devices:
