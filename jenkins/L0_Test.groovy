@@ -3877,7 +3877,7 @@ def runLLMAgentFlowTest(pipeline, stageName)
         // and its product dependencies out of this path.
         trtllm_utils.llmExecStepWithRetry(
             pipeline,
-            script: "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout mako"
+            script: "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout pytest-unused-fixtures mako"
         )
         runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)
         return
