@@ -26,6 +26,7 @@ Design Goals:
 4. Support autotune and tactic capture testing
 """
 
+import importlib
 import itertools
 import logging
 import os
@@ -87,6 +88,32 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
+    import tensorrt_llm
+    import tensorrt_llm._torch.modules.fused_moe.quantization as quantization_module
+
+    def fp8_fp4_mega_moe():
+        pass
+
+    def per_token_cast_to_fp8(*, use_packed_ue8m0=False):
+        pass
+
+    deep_gemm = SimpleNamespace(
+        fp8_fp4_mega_moe=fp8_fp4_mega_moe,
+        get_symm_buffer_for_mega_moe=lambda: None,
+        transform_sf_into_required_layout=lambda: None,
+        transform_weights_for_mega_moe=lambda: None,
+        per_token_cast_to_fp8=per_token_cast_to_fp8,
+    )
+    monkeypatch.setattr(tensorrt_llm, "deep_gemm", deep_gemm)
+
+    with pytest.raises(
+        quantization_module._MegaMoEUnavailable,
+        match="fp8_fp4_mega_moe does not accept.*situ_beta",
+    ):
+        quantization_module._import_deep_gemm()
 
 
 def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
@@ -479,6 +506,41 @@ def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
         assert getattr(module, attr) is None
 
 
+def test_megamoe_streaming_reload_resets_slot_claims():
+    method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
+    method._clear_transformed_weight_cache = MagicMock()
+    module = SimpleNamespace(
+        rebuild_tensor_metadata={},
+        _packed_mxfp4_loaded_slots={0},
+        expert_size_per_partition=1,
+        initial_local_expert_ids=[0],
+        w3_w1_weight=torch.empty(1, 2, 1, dtype=torch.uint8),
+        w3_w1_weight_scale=torch.empty(1, 2, 1, dtype=torch.uint8),
+        w2_weight=torch.empty(1, 1, 1, dtype=torch.uint8),
+        w2_weight_scale=torch.empty(1, 1, 1, dtype=torch.uint8),
+    )
+
+    method.pre_reload_weights(module)
+
+    assert module._packed_mxfp4_loaded_slots == set()
+
+    weight = torch.ones(1, 1, dtype=torch.uint8)
+    method.load_packed_mxfp4_expert(
+        module,
+        global_expert_id=0,
+        local_slot_id=0,
+        w1_weight=weight,
+        w1_weight_scale=weight,
+        w2_weight=weight,
+        w2_weight_scale=weight,
+        w3_weight=weight,
+        w3_weight_scale=weight,
+    )
+
+    assert module._packed_mxfp4_loaded_slots == {0}
+    method._clear_transformed_weight_cache.assert_called_once_with(module)
+
+
 def test_megamoe_cache_derived_state_sets_initial_assignments_once():
     method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
     method.setup_quant_scales = MagicMock()
@@ -505,6 +567,71 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
 
     moe._alloc_symm_buffer.assert_called_once_with()
     quant_method.cache_derived_state.assert_called_once_with(moe)
+
+
+def test_megamoe_deepgemm_infers_kimi_situ_from_pretrained_config():
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                activation_situ_beta=4.0,
+                activation_situ_linear_beta=25.0,
+            )
+        )
+    )
+
+    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
+        model_config,
+        activation=None,
+        situ_beta=None,
+        situ_linear_beta=None,
+    )
+
+    assert activation == "situ"
+    assert situ_beta == 4.0
+    assert situ_linear_beta == 25.0
+
+
+def test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config():
+    model_config = ModelConfig(pretrained_config=SimpleNamespace())
+
+    activation, situ_beta, situ_linear_beta = MegaMoEDeepGemm._resolve_activation_config(
+        model_config,
+        activation=None,
+        situ_beta=None,
+        situ_linear_beta=None,
+    )
+
+    assert activation == "swiglu"
+    assert situ_beta is None
+    assert situ_linear_beta is None
+
+
+def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
+    create_moe_module = importlib.import_module("tensorrt_llm._torch.modules.fused_moe.create_moe")
+    configurable_moe = MagicMock(return_value=object())
+    monkeypatch.setattr(create_moe_module, "ConfigurableMoE", configurable_moe)
+    monkeypatch.setattr(
+        create_moe_module,
+        "resolve_moe_cls",
+        MagicMock(return_value=MegaMoEDeepGemm),
+    )
+
+    result = create_moe_module.create_moe(
+        routing_method=MagicMock(),
+        num_experts=8,
+        hidden_size=512,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        model_config=ModelConfig(),
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    assert result is configurable_moe.return_value
+    assert configurable_moe.call_args.kwargs["activation"] == "situ"
+    assert configurable_moe.call_args.kwargs["situ_beta"] == 4.0
+    assert configurable_moe.call_args.kwargs["situ_linear_beta"] == 25.0
 
 
 def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
