@@ -25,10 +25,12 @@ Simulates two chained speculative-verification rounds through
   commit after the golden token, and only the accepted-draft count
   recorded between rounds.
 
-Identical hidden states are fed to both worlds; with mixed per-request
-acceptance between rounds, matching round-2 outputs proves the fused
-path's replay bookkeeping (shifted ``cu_seqlens`` layout, conv-window
-seeding, pending-count plumbing) reproduces the promoted-state semantics.
+Identical hidden states are fed to both worlds; the fused world additionally
+uses fused QKVG and [f_a|b] projections with multi-stream overlap. With mixed
+per-request acceptance between rounds, matching round-2 outputs proves the
+projection fusion and replay bookkeeping (shifted ``cu_seqlens`` layout,
+conv-window seeding, pending-count plumbing) reproduce the promoted-state
+semantics.
 
 Requires 1 Blackwell GPU, fla-core, nvidia-cutlass-dsl. Skips otherwise.
 """
@@ -44,6 +46,11 @@ try:
     import cuda.bindings.driver  # noqa: F401
     import cutlass  # noqa: F401
     from fla.ops.kda import fused_recurrent_kda  # noqa: F401
+
+    # The model module transitively imports the optional deps above, so it
+    # must stay behind the guard too or collection fails instead of skipping.
+    from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
 except ImportError as e:
     _HAVE_DEPS = False
     _DEP_ERR = str(e)
@@ -70,13 +77,18 @@ M = 2  # draft tokens per round
 LB = -5.0
 
 
-def _make_runtime(seed):
-    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiKDARuntime
-
-    cfg = SimpleNamespace(
+@torch.no_grad()
+def _make_runtime(seed, aux_stream=None):
+    # A real KimiLinearConfig (not a SimpleNamespace) so the runtime sees the
+    # same config surface it does in production. ``linear_attn_config`` carries
+    # the per-layer KDA params the runtime reads plus the (unused here)
+    # kda_layers/full_attn_layers schedule the config's own validation requires.
+    cfg = KimiLinearConfig(
         hidden_size=HIDDEN,
         rms_norm_eps=1e-5,
         linear_attn_config=dict(
+            kda_layers=[1],
+            full_attn_layers=[],
             num_heads=H,
             head_dim=K,
             short_conv_kernel_size=W,
@@ -84,25 +96,19 @@ def _make_runtime(seed):
             gate_lower_bound=LB,
         ),
     )
-    rt = KimiKDARuntime(cfg, layer_idx=0).to("cuda")
+    rt = KimiKDARuntime(cfg, layer_idx=0, aux_stream=aux_stream).to("cuda")
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    with torch.no_grad():
-        for name, p in rt.named_parameters():
-            if name.endswith("A_log"):
-                p.copy_(
-                    torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.5
+    for name, p in rt.named_parameters():
+        if name.endswith("A_log"):
+            p.copy_(torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.5)
+        elif name.endswith("dt_bias"):
+            p.copy_(torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.1)
+        else:
+            p.copy_(
+                (torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.03).to(
+                    p.dtype
                 )
-            elif name.endswith("dt_bias"):
-                p.copy_(
-                    torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32) * 0.1
-                )
-            else:
-                p.copy_(
-                    (
-                        torch.randn(p.shape, generator=gen, device="cuda", dtype=torch.float32)
-                        * 0.03
-                    ).to(p.dtype)
-                )
+            )
     # The fused-verify conv constants are prebuilt at weight-load finalize
     # time in production; the runtime never computes them lazily. Mirror
     # that here (after the random init above, which they snapshot).
@@ -173,11 +179,18 @@ def _rep(name, a, b):
     return cos > 0.999 and rel < 3e-2
 
 
+@torch.no_grad()
 def test_fused_vs_sequential_two_rounds():
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
     torch.manual_seed(0)
     B = 4
     T = M + 1
-    rt = _make_runtime(seed=1)
+    rt_seq = _make_runtime(seed=1)
+    rt_fused = _make_runtime(seed=1, aux_stream=torch.cuda.Stream())
+    rt_fused.finalize_decode_weights()
+    assert rt_fused._qkvg_proj_weight is not None
+    assert rt_fused._bfa_proj_weight is not None
     slot_indices = torch.arange(B, dtype=torch.long, device="cuda")
 
     conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2)
@@ -194,46 +207,41 @@ def test_fused_vs_sequential_two_rounds():
         ).to(torch.bfloat16)
 
     ok = True
-    with torch.no_grad():
-        # ---- Round 1 (no pending drafts) ----
-        x1 = tokens()
-        out1_seq = rt._forward_verify_sequential(
-            x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
-        )
-        out1_fused = rt._forward_verify(
+    # ---- Round 1 (no pending drafts) ----
+    x1 = tokens()
+    out1_seq = rt_seq._forward_verify_sequential(
+        x1, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
+    )
+    with with_multi_stream(True):
+        out1_fused = rt_fused._forward_verify(
             x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
-        print("round 1:")
-        ok &= _rep("out", out1_fused, out1_seq)
+    print("round 1:")
+    ok &= _rep("out", out1_fused, out1_seq)
 
-        # ---- Acceptance: 0, 1, 2, 0 drafts across the 4 requests ----
-        accept = torch.tensor([0, 1, 2, 0], dtype=torch.long, device="cuda")
-        _promote_sequential(cache_seq, conv_pool_seq, ssm_pool_seq, accept)
-        cache_fused.prev_num_accepted_tokens.copy_(accept.to(torch.int32))
+    # ---- Acceptance: 0, 1, 2, 0 drafts across the 4 requests ----
+    accept = torch.tensor([0, 1, 2, 0], dtype=torch.long, device="cuda")
+    _promote_sequential(cache_seq, conv_pool_seq, ssm_pool_seq, accept)
+    cache_fused.prev_num_accepted_tokens.copy_(accept.to(torch.int32))
 
-        # ---- Round 2 (fused path replays the accepted drafts) ----
-        x2 = tokens()
-        out2_seq = rt._forward_verify_sequential(
-            x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
-        )
-        out2_fused = rt._forward_verify(
+    # ---- Round 2 (fused path replays the accepted drafts) ----
+    x2 = tokens()
+    out2_seq = rt_seq._forward_verify_sequential(
+        x2, T, cache_seq, conv_pool_seq, ssm_pool_seq, slot_indices
+    )
+    with with_multi_stream(True):
+        out2_fused = rt_fused._forward_verify(
             x2, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
         )
-        print("round 2 (mixed replay):")
-        ok &= _rep("out", out2_fused, out2_seq)
+    print("round 2 (mixed replay):")
+    ok &= _rep("out", out2_fused, out2_seq)
 
-        # Committed pool state cross-check: fused pool holds the state after
-        # round-2's golden token; reproduce it in the sequential world by
-        # promoting with accept=0 (golden only).
-        _promote_sequential(
-            cache_seq, conv_pool_seq, ssm_pool_seq, torch.zeros(B, dtype=torch.long, device="cuda")
-        )
-        ok &= _rep("committed ssm", ssm_pool_fused, ssm_pool_seq)
+    # Committed pool state cross-check: fused pool holds the state after
+    # round-2's golden token; reproduce it in the sequential world by
+    # promoting with accept=0 (golden only).
+    _promote_sequential(
+        cache_seq, conv_pool_seq, ssm_pool_seq, torch.zeros(B, dtype=torch.long, device="cuda")
+    )
+    ok &= _rep("committed ssm", ssm_pool_fused, ssm_pool_seq)
 
     assert ok
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__, "-v", "-x", "-s"]))

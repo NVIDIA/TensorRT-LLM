@@ -690,7 +690,8 @@ MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
         placeholder_map={"image": "[IMG]"},
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.PASSTHROUGH,
-    ))
+    ),
+    registrant_module=__name__)
 MistralNativeInputProcessor._registered_model_type = "mistral_common"
 
 

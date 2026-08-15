@@ -173,7 +173,11 @@ def run_lora_test(
     """End-to-end helper: create adapter, run inference, assert output differs."""
     with tempfile.TemporaryDirectory() as tmpdir:
         lora_dir = create_lora_adapter(
-            os.path.join(tmpdir, "lora"), model_path, target_modules, dtype=dtype
+            os.path.join(tmpdir, "lora"),
+            model_path,
+            target_modules,
+            lora_rank=16 if dtype == torch.float8_e4m3fn else 8,
+            dtype=dtype,
         )
         lora_config = LoraConfig(
             lora_dir=[lora_dir],

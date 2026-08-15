@@ -335,11 +335,12 @@ class RunnerBase
 public:
     int32_t beam_width;
     int32_t max_num_requests;
+    int32_t max_num_sequences;
     int32_t attention_window_size;
 
     auto data() const
     {
-        return std::make_tuple(beam_width, max_num_requests, attention_window_size);
+        return std::make_tuple(beam_width, max_num_requests, max_num_sequences, attention_window_size);
     };
 
     virtual ~RunnerBase() = default;
@@ -406,7 +407,7 @@ public:
         // is not enough.
         // The attention kernel might split the heads into multiple blocks, so we might need to reserve more semaphores.
         // Use mMultiProcessorCount as the lower-bound to make sure we reserve enough semaphores.
-        op.reserveSemaphoreArray(std::max(op.mNumHeads * max_num_requests, op.getMultiProcessorCount()));
+        op.reserveSemaphoreArray(std::max(op.mNumHeads * max_num_sequences, op.getMultiProcessorCount()));
     }
 
     int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
@@ -415,7 +416,7 @@ public:
         size_t const context_workspace_size = op.getWorkspaceSizeForContext(
             op.mType, max_num_requests, op.mMaxContextLength, 0, num_tokens, ctx_total_kv_len);
         size_t const generation_workspace_size = op.getWorkspaceSizeForGeneration(
-            op.mType, max_num_requests, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
+            op.mType, max_num_sequences, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
 
         return std::max(context_workspace_size, generation_workspace_size);
     }
@@ -1113,7 +1114,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask)
+    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1193,6 +1194,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 #endif
     runner->beam_width = beam_width;
     runner->max_num_requests = max_num_requests;
+    runner->max_num_sequences = max_num_sequences.value_or(max_num_requests);
     runner->attention_window_size = attention_window_size;
 
     auto op = std::make_shared<AttentionOp>();

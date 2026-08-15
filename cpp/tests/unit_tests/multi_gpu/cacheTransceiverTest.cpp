@@ -994,10 +994,6 @@ protected:
             }
             else if (isNixl)
             {
-                constexpr auto port = 22345;
-
-                setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
-
                 std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> baseBufferManagers(
                     bufferManagers.begin(), bufferManagers.end());
                 mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(

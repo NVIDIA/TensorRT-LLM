@@ -291,16 +291,6 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Model-specific cases with attention_dp disabled to prevent hangs
-        {
-            'patterns': [
-                'deepseek_r1_distill_llama_70b',
-            ],
-            'config': {
-                # True causes hang, needs model-specific fix.
-                'enable_attention_dp': False,
-            }
-        },
         # Qwen3 models with fp4 quantization on B200 and fp8 quantization on H200/H20
         {
             'patterns': [
@@ -321,6 +311,17 @@ def get_model_yaml_config(model_label: str,
                 },
                 'kv_cache_config': {
                     'enable_block_reuse': False,
+                },
+            }
+        },
+        # Qwen3.5-9B hybrid GDN: V2 KV/SSM pool split needs the real seq len.
+        {
+            'patterns': [
+                'qwen3.5_9b-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:500,2000',
+            ],
+            'config': {
+                'kv_cache_config': {
+                    'avg_seq_len': 2500,
                 },
             }
         },
@@ -599,6 +600,17 @@ def get_model_yaml_config(model_label: str,
                     'mamba_ssm_stochastic_rounding': True,
                     'mamba_ssm_philox_rounds': 5,
                 },
+            }
+        },
+        # Disable iter logs for long-running cases to reduce storage.
+        {
+            'patterns': [
+                'nemotron_3_super_120b_nvfp4-serve-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.8-input_output_len:1024,1024-reqs:160-con:32',
+                'deepseek_r1_0528_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-kv_frac:0.85-input_output_len:8000,1000-reqs:20000-ep:8-gpus:8',
+                'deepseek_r1_0528_fp4-bench-pytorch-float4-maxbs:1000-maxnt:5000-kv_frac:0.85-input_output_len:5000,500-reqs:20000-ep:4-gpus:4',
+            ],
+            'config': {
+                'print_iter_log': False,
             }
         },
     ]

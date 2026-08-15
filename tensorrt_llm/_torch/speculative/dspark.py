@@ -111,6 +111,8 @@ class DSparkSpecMetadata(SpecMetadata):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
                     worker._ctx_len[slot] = 0
+                    worker._valid_len[slot] = 0
+                    worker._position_initialized[slot] = False
                     worker._kv_windows[slot].zero_()
                     worker._free_slots.append(slot)
             # Assign a persistent rolling-window slot to every real generation
@@ -225,6 +227,8 @@ class DSparkWorker(SpecWorkerBase):
         self._win_inited = False
         self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
+        self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
+        self._position_initialized: Optional[torch.Tensor] = None  # [max_batch] bool
         self._win = 0
 
         # Slot management. ``_req_to_slot`` (python dict) + ``_free_slots`` are the
@@ -298,6 +302,8 @@ class DSparkWorker(SpecWorkerBase):
             device="cuda",
         )
         self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+        self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+        self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
@@ -313,6 +319,8 @@ class DSparkWorker(SpecWorkerBase):
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
             self._ctx_len[old] = 0
+            self._valid_len[old] = 0
+            self._position_initialized[old] = False
             self._kv_windows[old].zero_()
             self._free_slots.append(old)
         if req_id not in self._req_to_slot:
@@ -324,6 +332,8 @@ class DSparkWorker(SpecWorkerBase):
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
             self._ctx_len[slot] = 0
+            self._valid_len[slot] = 0
+            self._position_initialized[slot] = False
             self._kv_windows[slot].zero_()
         return self._req_to_slot[req_id]
 
@@ -355,8 +365,12 @@ class DSparkWorker(SpecWorkerBase):
             first_position = int(chunk_positions[0].item())
             slot = self._assign_slot(req_id, reset=first_position == 0)
             self._ctx_len[slot] = chunk_positions[-1] + 1
+            self._position_initialized[slot] = True
 
             if captured is not None:
+                self._valid_len[slot] = torch.clamp(
+                    self._valid_len[slot] + chunk_len, max=self._win
+                )
                 keep = min(self._win, chunk_len)
                 hidden = captured[context_offset + chunk_len - keep : context_offset + chunk_len]
                 # A prompt token at absolute position p is stored in frame p+1,
@@ -364,6 +378,22 @@ class DSparkWorker(SpecWorkerBase):
                 window_positions = chunk_positions[-keep:] + 1
                 draft_model.write_context_windows(hidden, window_positions, self._kv_windows[slot])
             context_offset += chunk_len
+
+    def _advance_generation_state(
+        self,
+        slots: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        input_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Bootstrap and advance per-slot decode state without host synchronization."""
+        old = torch.where(self._position_initialized[slots], self._ctx_len[slots], input_positions)
+        start_pos = old + num_accepted_tokens
+        self._ctx_len[slots] = start_pos
+        self._valid_len[slots] = torch.clamp(
+            self._valid_len[slots] + num_accepted_tokens, max=self._win
+        )
+        self._position_initialized[slots] = torch.ones_like(slots, dtype=torch.bool)
+        return old, start_pos
 
     def _draft_gen_block_batched(
         self,
@@ -375,6 +405,7 @@ class DSparkWorker(SpecWorkerBase):
         num_contexts: int,
         batch_size: int,
         total_target_tokens: int,
+        position_ids: torch.Tensor,
         all_rank_num_tokens: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """CUDA-graph-safe batched gen draft (all gen requests in one forward).
@@ -390,7 +421,6 @@ class DSparkWorker(SpecWorkerBase):
         """
         num_gens = batch_size - num_contexts
         K = self.max_draft_len
-        Kp1 = K + 1
         device = accepted_tokens.device
 
         if num_gens == 0:
@@ -411,16 +441,23 @@ class DSparkWorker(SpecWorkerBase):
             accepted_tokens[num_contexts:batch_size].gather(1, gidx.unsqueeze(1)).squeeze(1).long()
         )  # [G]
 
-        # Captured target hidden at the bonus position within each request's Kp1
-        # processed tokens.
+        # Bootstrap iterations can process one target token per request, while
+        # normal speculative verification processes K+1. Use the actual accepted
+        # row width to index both captured hidden states and position IDs.
+        target_width = accepted_tokens.shape[1]
         arange_g = torch.arange(num_gens, device=device)
-        base = gen_start + arange_g * Kp1  # [G]
+        base = gen_start + arange_g * target_width  # [G]
         main_hidden = captured[base + gidx]  # [G, ncap*hidden]
 
         # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
         # (everything but the bonus) into the rolling window — same frames as the
         # eager path (old+1 .. old+nacc-1), with j >= nacc-1 masked out.
-        old = self._ctx_len[slots]  # [G] pre-increment decode position
+        # A disaggregated generation worker never sees prompt prefill, so a new
+        # slot has no absolute decode position. Bootstrap it once from the first
+        # target input position; locally-prefilled and existing slots keep their
+        # monotonically advanced position.
+        input_positions = position_ids.reshape(-1)[base].long()
+        old, start_pos = self._advance_generation_state(slots, nacc, input_positions)
         j = torch.arange(K, device=device)  # [K]
         interim_valid = j.unsqueeze(0) < (nacc.unsqueeze(1) - 1)  # [G, K]
         interim_pos = old.unsqueeze(1) + 1 + j.unsqueeze(0)  # [G, K]
@@ -432,11 +469,6 @@ class DSparkWorker(SpecWorkerBase):
             interim_hidden, interim_pos, slots, interim_valid, self._kv_windows
         )
 
-        # Advance the decode position by the accepted count; start_pos (= post-
-        # increment ctx_len) matches the eager path's frame value.
-        start_pos = old + nacc  # [G]
-        self._ctx_len[slots] = start_pos
-
         # Surface the per-position corrected block logits ([num_gens, K, vocab])
         # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
         # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
@@ -446,12 +478,51 @@ class DSparkWorker(SpecWorkerBase):
             start_pos,
             kv_windows=self._kv_windows,
             slots=slots,
+            valid_len=self._valid_len[slots],
             temperature=0.0,
             confidence_threshold=0.0,
             return_logits=True,
             all_rank_num_tokens=all_rank_num_tokens,
         )
         return block_logits
+
+    def _sample_draft_tokens_guided(
+        self,
+        gen_logits: torch.Tensor,
+        spec_metadata: "DSparkSpecMetadata",
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        K: int,
+    ):
+        """
+        Grammar-constrained draft sampling for the guided-decoding path.
+        """
+        vocab = gen_logits.shape[-1]
+        # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
+        # a contiguous [batch, vocab] tensor.
+        if num_contexts > 0:
+            full_logits = gen_logits.new_zeros((K, batch_size, vocab))
+            full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
+        else:
+            full_logits = gen_logits.transpose(0, 1).contiguous()
+
+        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1).long()
+        new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
+
+        gen_draft_tokens = []
+        for k in range(K):
+            self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
+            step_logits = full_logits[k]
+            self.guided_decoder.execute_draft_batch(step_logits, draft_step=k)
+            step_tokens = self.sample_draft_tokens(
+                step_logits, spec_metadata, batch_size, draft_step=k
+            )
+            gen_draft_tokens.append(step_tokens[num_contexts:])
+            new_tokens = step_tokens
+        gen_draft_tokens = torch.stack(gen_draft_tokens, dim=1)
+        return gen_draft_tokens
 
     def _forward_impl(
         self,
@@ -500,6 +571,8 @@ class DSparkWorker(SpecWorkerBase):
         )
         if is_warmup:
             saved_ctx_len = self._ctx_len.clone()
+            saved_valid_len = self._valid_len.clone()
+            saved_position_initialized = self._position_initialized.clone()
             saved_windows = self._kv_windows.clone()
 
         # Assign / reset window slots for context (prefill) requests and seed each
@@ -554,15 +627,25 @@ class DSparkWorker(SpecWorkerBase):
                 num_contexts,
                 batch_size,
                 total_target_tokens,
+                position_ids,
                 all_rank_num_tokens=all_rank_draft_tokens,
             )
             if gen_logits is not None:
-                # SpecWorkerBase samples the draft tokens (greedy argmax, or
-                # rejection sampling for a non-greedy batch), performs the TP
-                # gather, and scatters the proposal distribution into draft_probs.
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
-                )
+                if self.guided_decoder is not None:
+                    gen_draft_tokens = self._sample_draft_tokens_guided(
+                        gen_logits,
+                        spec_metadata,
+                        accepted_tokens,
+                        num_accepted_tokens,
+                        num_contexts,
+                        batch_size,
+                        K,
+                    )
+                else:
+                    # SpecWorkerBase samples the draft tokens.
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+                    )
                 # The context one-hot must match the width the gen scatter just
                 # published to draft_probs, NOT gen_logits.shape[-1]: under TP the
                 # draft logits are vocab-sharded and sample_draft_tokens gathers
@@ -602,6 +685,8 @@ class DSparkWorker(SpecWorkerBase):
 
         if is_warmup:
             self._ctx_len.copy_(saved_ctx_len)
+            self._valid_len.copy_(saved_valid_len)
+            self._position_initialized.copy_(saved_position_initialized)
             self._kv_windows.copy_(saved_windows)
 
         return {
