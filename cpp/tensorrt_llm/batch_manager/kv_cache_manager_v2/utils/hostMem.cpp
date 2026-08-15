@@ -33,7 +33,6 @@
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
-#include <sys/utsname.h>
 #include <system_error>
 #include <thread>
 #include <unistd.h>
@@ -156,28 +155,6 @@ void hostPrefaultChunk(MemAddress ptr, size_t size, HostMadviseFn madviseFn, Hos
 // ---------------------------------------------------------------------------
 // HostMem implementation
 // ---------------------------------------------------------------------------
-
-bool HostMem::shouldUseChunkedRegistration()
-{
-    struct utsname u
-    {
-    };
-
-    if (::uname(&u) != 0)
-    {
-        return false;
-    }
-    // Check for Linux kernel 6.11, 6.12, 6.13 prefix.
-    std::string_view rel{u.release};
-    for (auto prefix : {"6.11", "6.12", "6.13"})
-    {
-        if (rel.substr(0, 4) == prefix)
-        {
-            return true;
-        }
-    }
-    return false;
-}
 
 HostMem::HostMem(size_t size)
     : mUseThp(hostUseThp())
@@ -306,9 +283,7 @@ void HostMem::parallelPrefault(int numThreads)
 void HostMem::registerToCuda()
 {
     TLLM_CHECK_DEBUG(mNumRegisteredChunks == 0);
-    static bool chunked = shouldUseChunkedRegistration();
-
-    size_t chunkSize = (chunked && mSize > kChunkSize) ? kChunkSize : mSize;
+    size_t chunkSize = std::min(kChunkSize, mSize);
     for (size_t offset = 0; offset < mSize; offset += chunkSize)
     {
         size_t sz = std::min(chunkSize, mSize - offset);
@@ -321,8 +296,7 @@ void HostMem::registerToCuda()
 
 void HostMem::unregisterFromCuda()
 {
-    static bool chunked = shouldUseChunkedRegistration();
-    size_t chunkSize = (chunked && mSize > kChunkSize) ? kChunkSize : mSize;
+    size_t chunkSize = std::min(kChunkSize, mSize);
     for (size_t offset = 0; offset < mSize && mNumRegisteredChunks > 0; offset += chunkSize)
     {
         cuMemHostUnregister(reinterpret_cast<void*>(mAddr + offset));
