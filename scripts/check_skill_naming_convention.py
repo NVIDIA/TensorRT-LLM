@@ -48,6 +48,8 @@ def load_frontmatter_name(path: Path) -> str | None:
     if not m:
         return None
     data = yaml.safe_load(m.group(1)) or {}
+    if not isinstance(data, dict):
+        raise yaml.YAMLError("frontmatter root must be a mapping")
     name = data.get("name")
     return name if isinstance(name, str) else None
 
