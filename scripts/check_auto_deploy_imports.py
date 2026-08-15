@@ -38,8 +38,8 @@ def _file_package_parts(path: pathlib.Path) -> list[str]:
 def _check_file(path: pathlib.Path) -> list[tuple[int, str]]:
     try:
         source = path.read_text()
-    except (OSError, UnicodeDecodeError):
-        return []
+    except (OSError, UnicodeDecodeError) as exc:
+        return [(1, f"failed to read file: {exc}")]
     try:
         tree = ast.parse(source, filename=str(path))
     except SyntaxError as exc:
