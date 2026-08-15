@@ -17,6 +17,7 @@
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
 import math
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -820,7 +821,24 @@ class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
     reasoning_content: Optional[str]
 
 
-ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
+class DynamicToolsSystemMessageParam(TypedDict, total=False):
+    """System message carrying message-level (dynamic) tool declarations.
+
+    Kimi-style templates render such messages as an in-conversation tool
+    declare block. Must come first in ``ChatCompletionMessageParam``: the
+    stock OpenAI system-message TypedDict otherwise wins smart-union scoring
+    and silently drops the ``tools`` key.
+    """
+    __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
+
+    role: Required[Literal["system"]]
+    tools: Required[List[dict]]
+    content: Union[str, List[ChatCompletionContentPartParam], None]
+    name: str
+
+
+ChatCompletionMessageParam = Union[DynamicToolsSystemMessageParam,
+                                   OpenAIChatCompletionMessageParam,
                                    CustomChatCompletionMessageParam,
                                    ReasoningAssistantMessage]
 
@@ -904,6 +922,11 @@ class ChatCompletionNamedFunction(OpenAIBaseModel):
 class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     function: ChatCompletionNamedFunction
     type: Literal["function"] = "function"
+
+
+# Valid function-tool name: no leading digit, word chars/dash only, at most
+# 256 chars (Kimi Vendor Verifier contract for message-level tools).
+_DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}$")
 
 
 class ChatCompletionThinkingParam(OpenAIBaseModel):
@@ -1158,15 +1181,82 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_tool_choice(cls, data):
-        if "tool_choice" not in data and data.get("tools"):
+        if not isinstance(data, dict):
+            return data
+        has_dynamic_tools = any(
+            isinstance(msg, dict) and msg.get("role") == "system"
+            and msg.get("tools") for msg in data.get("messages") or [])
+        if "tool_choice" not in data and (data.get("tools")
+                                          or has_dynamic_tools):
             data["tool_choice"] = "auto"
         # "none" and "auto" are meaningful without tools; "required" and a
-        # named function must have a non-empty tools list to pick from.
+        # named function must have a non-empty tool set to pick from —
+        # request-level or message-level (dynamic) tools both count.
         if "tool_choice" in data and data["tool_choice"] not in ("none",
                                                                  "auto"):
-            if not data.get("tools"):
+            if not (data.get("tools") or has_dynamic_tools):
                 raise ValueError(
                     "When using `tool_choice`, `tools` must be set.")
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_dynamic_tools(cls, data):
+        """Validate message-level (dynamic) tool declarations.
+
+        Kimi-style dynamic tools ride on system messages. Enforce the
+        contract checked by the Kimi Vendor Verifier: system-only carrier,
+        empty content, well-formed function tools with valid unique names
+        (unique also against request-level tools).
+        """
+        if not isinstance(data, dict):
+            return data
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+        seen_names = set()
+        tools = data.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                if isinstance(tool, dict) and isinstance(
+                        tool.get("function"), dict):
+                    name = tool["function"].get("name")
+                    if isinstance(name, str):
+                        seen_names.add(name)
+        for message in messages:
+            if not isinstance(message, dict) or "tools" not in message:
+                continue
+            if message.get("role") != "system":
+                raise ValueError(
+                    "Message-level `tools` are only allowed on system "
+                    "messages.")
+            if message.get("content"):
+                raise ValueError(
+                    "A system message carrying `tools` must have empty "
+                    "content.")
+            message_tools = message["tools"]
+            if not isinstance(message_tools, list):
+                raise ValueError("Message-level `tools` must be an array.")
+            for tool in message_tools:
+                if not isinstance(tool, dict):
+                    raise ValueError(
+                        "Each message-level tool must be an object.")
+                if tool.get("type") != "function":
+                    raise ValueError(
+                        f"Unsupported message-level tool type: "
+                        f"{tool.get('type')!r}.")
+                function = tool.get("function")
+                if not isinstance(function, dict):
+                    raise ValueError(
+                        "Message-level tools must carry a `function` object.")
+                name = function.get("name")
+                if not isinstance(
+                        name, str) or not _DYNAMIC_TOOL_NAME_RE.match(name):
+                    raise ValueError(
+                        f"Invalid message-level tool name: {name!r}.")
+                if name in seen_names:
+                    raise ValueError(f"Duplicate tool name: {name!r}.")
+                seen_names.add(name)
         return data
 
     @model_validator(mode="before")
