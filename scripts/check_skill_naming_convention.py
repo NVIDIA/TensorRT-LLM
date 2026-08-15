@@ -40,7 +40,7 @@ NAMING_DOC = REPO_ROOT / ".claude" / "README.md"
 AGENTS_DIR = REPO_ROOT / ".claude" / "agents"
 SKILLS_DIR = REPO_ROOT / ".claude" / "skills"
 
-FRONTMATTER_RE = re.compile(r"\A(?:<!--.*?-->\s*)*---\n(.*?)\n---\n?", re.DOTALL)
+FRONTMATTER_RE = re.compile(r"\A(?:<!--.*?-->\s*)*---\r?\n(.*?)\r?\n---\r?\n?", re.DOTALL)
 
 
 def load_frontmatter_name(path: Path) -> str | None:
