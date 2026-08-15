@@ -78,8 +78,8 @@ def _enable_disagg_inflight_cancel_by_default(
     _disagg_inflight_cancel_enabled_cache = None
     logger.info(
         "Enabling disaggregated in-flight KV transfer cancellation by default "
-        "for the supported NIXL/UCX configuration. Set %s=0 to opt out.",
-        _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV,
+        f"for the supported NIXL/UCX configuration. Set "
+        f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=0 to opt out."
     )
 
 
