@@ -124,15 +124,14 @@ def reject_unsupported_inkling_kv_cache_features(
         enable_cache_transceiver: bool = False):
     """Refuse the features Inkling's context path cannot serve correctly.
 
-    The first two leave a *context* request with history it is supposed to
-    attend to and convolve against; the third moves a request between instances
-    without its short-conv state.
+    Block reuse and chunked prefill leave a *context* request with history it is
+    supposed to attend to and convolve against -- ``num_cached_tokens_per_seq >
+    0`` on a context request -- and Inkling gets that wrong in two independent
+    places, described below. Disaggregated serving fails a third way: it moves a
+    request between instances without its short-conv state at all.
 
-    Both leave a *context* request with history it is supposed to attend to and
-    convolve against -- ``num_cached_tokens_per_seq > 0`` on a context request --
-    and Inkling gets that wrong in two independent places. Neither raises today;
-    both silently emit wrong logits, which is why they are refused here rather
-    than left to the caller.
+    None of the three raises today; all three silently emit wrong logits, which
+    is why they are refused here rather than left to the caller.
 
     **1. The prefill attention never reads back the cached KV.**
     ``InklingAttention._run_context`` writes the new K/V into the paged cache at
