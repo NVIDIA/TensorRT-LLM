@@ -3894,12 +3894,12 @@ def runLLMAgentFlowTest(pipeline, stageName)
     // selected stage; it must not install or execute this product test suite.
     if (isInfraDryRun()) {
         // The build pod used by AgentFlow does not run the normal TRT-LLM test
-        // environment setup, so install only the pytest and test-list tooling
-        // consumed by the shared dry-run adapter. Keep the AgentFlow package
-        // and its product dependencies out of this path.
+        // environment setup, so install only the pytest, test-list, and upload
+        // tooling consumed by the shared dry-run adapter. Keep the AgentFlow
+        // package and its product dependencies out of this path.
         trtllm_utils.llmExecStepWithRetry(
             pipeline,
-            script: "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout pytest-unused-fixtures mako"
+            script: "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout pytest-unused-fixtures mako boto3"
         )
         runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)
         return
