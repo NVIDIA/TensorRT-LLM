@@ -9,7 +9,7 @@
     ],
     "$schema": "http://json-schema.org/draft-07/schema#",
     "schemaMeta": {
-        "schemaVersion": "0.1",
+        "schemaVersion": "0.2",
         "clientId": "616561816355034",
         "clientName": "TrtllmTelemetry",
         "definitionVersion": "2.0"
@@ -107,7 +107,15 @@
                     },
                     "featuresJson": {
                         "type": "string",
-                        "description": "JSON-serialized dict of feature flags (lora, speculative_decoding, prefix_caching, cuda_graphs, chunked_context, data_parallel_size)"
+                        "description": "Legacy JSON-serialized summary of feature flags (lora, speculative_decoding, prefix_caching, cuda_graphs, chunked_context, data_parallel_size)"
+                    },
+                    "llmApiConfigJson": {
+                        "type": "string",
+                        "description": "JSON-serialized sanitized, opt-in subset of effective LLM API configuration"
+                    },
+                    "llmApiConfigMetaJson": {
+                        "type": "string",
+                        "description": "JSON-serialized metadata for LLM API configuration capture, including digests, field counts, capture success, and unsafe-exclusion status"
                     },
                     "disaggRole": {
                         "$ref": "#/definitions/types/ShortString"
@@ -138,6 +146,8 @@
                     "kvCacheDtype",
                     "ingressPoint",
                     "featuresJson",
+                    "llmApiConfigJson",
+                    "llmApiConfigMetaJson",
                     "disaggRole",
                     "deploymentId"
                 ]

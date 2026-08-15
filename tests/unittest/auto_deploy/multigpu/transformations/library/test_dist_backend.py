@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Test dist_backend configuration for sharding transformations."""
 
 from typing import Optional
@@ -7,6 +21,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.distributed.trtllm_dist import (
+    is_trtllm_op_available,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -139,6 +156,27 @@ def test_dist_backend_auto_and_default(dist_backend):
     model = SimpleMLP()
     gm_transformed = _create_and_transform_model(model, dist_backend=dist_backend, world_size=2)
     _check_dist_ops(gm_transformed, expected_backend="any")
+
+
+def test_trtllm_ops_available_with_llmapi_launch_env(monkeypatch):
+    """LLMAPI launcher strips OMPI env but still provides TRT-LLM worker ranks."""
+    monkeypatch.delenv("OMPI_COMM_WORLD_SIZE", raising=False)
+    monkeypatch.setenv("TLLM_SPAWN_PROXY_PROCESS", "1")
+    monkeypatch.setenv("tllm_mpi_size", "2")
+
+    assert is_trtllm_op_available()
+
+
+@pytest.mark.parametrize("dist_backend", ["auto", None])
+def test_dist_backend_auto_uses_trtllm_with_llmapi_launch_env(monkeypatch, dist_backend):
+    """AUTO should select TRT-LLM ops under trtllm-llmapi-launch."""
+    monkeypatch.delenv("OMPI_COMM_WORLD_SIZE", raising=False)
+    monkeypatch.setenv("TLLM_SPAWN_PROXY_PROCESS", "1")
+    monkeypatch.setenv("tllm_mpi_size", "2")
+
+    model = SimpleMLP()
+    gm_transformed = _create_and_transform_model(model, dist_backend=dist_backend, world_size=2)
+    _check_dist_ops(gm_transformed, expected_backend="trtllm")
 
 
 @pytest.mark.parametrize("dist_backend", ["torch", "trtllm"])

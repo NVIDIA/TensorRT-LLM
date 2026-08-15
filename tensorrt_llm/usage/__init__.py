@@ -22,7 +22,7 @@ Opt-out:
   - Set environment variable TELEMETRY_DISABLED=true or TELEMETRY_DISABLED=1
   - Set environment variable DO_NOT_TRACK=1
   - Create file ~/.config/trtllm/do_not_track
-  - Pass TelemetryConfig(disabled=True) to LLM() or --telemetry-disabled via CLI
+  - Pass TelemetryConfig(disabled=True) to LLM() or --no-telemetry via CLI
   - Automatically disabled in CI/test environments (override with TRTLLM_USAGE_FORCE_ENABLED=1)
 """
 
@@ -30,12 +30,14 @@ from tensorrt_llm.usage import config as _config
 from tensorrt_llm.usage import usage_lib as _usage_lib
 
 TelemetryConfig = _config.TelemetryConfig
+TelemetryField = _config.TelemetryField
 UsageContext = _config.UsageContext
 report_usage = _usage_lib.report_usage
 is_usage_stats_enabled = _usage_lib.is_usage_stats_enabled
 
 __all__ = [
     "TelemetryConfig",
+    "TelemetryField",
     "UsageContext",
     "report_usage",
     "is_usage_stats_enabled",

@@ -334,3 +334,47 @@ def test_low_latency_layernorm_hp_output_consistency(dtype):
     sf_out_hp_valid = sf_out_hp[valid_sf_indices]
     sf_out_no_hp_valid = sf_out_no_hp[valid_sf_indices]
     torch.testing.assert_close(sf_out_hp_valid, sf_out_no_hp_valid, rtol=0, atol=0)
+
+
+@skip_unsupported
+@pytest.mark.parametrize("m,n", [(1, 5120), (4, 7168), (64, 2560)])
+def test_fused_add_rms_norm_quant_non_power_of_2_hidden(m, n):
+    """Non-power-of-2 hidden sizes must not hang or corrupt output."""
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    eps = 1e-6
+
+    hidden_states = torch.randn(m, n, dtype=dtype, device=device)
+    residual = torch.randn(m, n, dtype=dtype, device=device)
+    gamma = torch.randn(n, dtype=dtype, device=device) * 0.5 + 1.0
+
+    normed_ref, residual_ref = rms_norm_ref(hidden_states, residual, gamma, eps)
+    sf_scale = (normed_ref.abs().amax().float() / (6.0 * 448.0)).view(1)
+
+    # Run without hp_output
+    results_no_hp = torch.ops.trtllm.fused_add_rms_norm_quant(
+        hidden_states, residual, gamma, sf_scale, True, eps=eps, output_hp_norm=False
+    )
+    assert results_no_hp[3] is None
+    normed_fp4_no_hp, residual_out_no_hp, sf_out_no_hp = results_no_hp[:3]
+
+    # Run with hp_output
+    results_hp = torch.ops.trtllm.fused_add_rms_norm_quant(
+        hidden_states, residual, gamma, sf_scale, True, eps=eps, output_hp_norm=True
+    )
+    normed_fp4_hp, residual_out_hp, sf_out_hp, hp_normed_output = results_hp
+
+    # Verify residual and HP norm against references
+    torch.testing.assert_close(residual_out_no_hp, residual_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(residual_out_hp, residual_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(hp_normed_output, normed_ref, rtol=1e-2, atol=1e-2)
+
+    # Quantized outputs must be identical regardless of hp_output flag
+    torch.testing.assert_close(normed_fp4_hp, normed_fp4_no_hp, rtol=0, atol=0)
+    torch.testing.assert_close(residual_out_hp, residual_out_no_hp, rtol=0, atol=0)
+    # Compare only valid SF indices (swizzled layout pads rows to 128)
+    valid_sf_indices = get_swizzled_sf_indices(m, n)
+    sf_out_hp_valid = sf_out_hp[valid_sf_indices]
+    sf_out_no_hp_valid = sf_out_no_hp[valid_sf_indices]
+    torch.testing.assert_close(sf_out_hp_valid, sf_out_no_hp_valid, rtol=0, atol=0)

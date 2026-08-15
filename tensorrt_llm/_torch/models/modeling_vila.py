@@ -1,4 +1,4 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+# Copyright 2024-2026 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -47,11 +47,15 @@ from ..modules.embedding import Embedding, LMHead
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
                                           VisionTowerS2)
+# yapf: disable
 from .modeling_multimodal_utils import (dynamic_preprocess_dispatch,
                                         dynamic_s2_preprocess_dispatch,
-                                        fuse_input_embeds, merge_chessboard,
+                                        filter_mm_token_from_input_ids,
+                                        find_input_mm_embeds, fuse_input_embeds,
+                                        merge_chessboard,
                                         merge_features_for_dynamic_s2,
                                         preprocess_dispatch, split_chessboard)
+# yapf: enable
 from .modeling_utils import ModelConfig, register_auto_model
 
 SENTINEL_TOKEN = "<vila/sentinel>"  # nosec B105
@@ -59,6 +63,31 @@ MEDIA_TOKENS = {
     "image": "<image>",
     "video": "<vila/video>",
 }
+
+
+def _validate_vila_mm_alignment(
+    input_ids: torch.IntTensor,
+    embedding_layer: Embedding,
+    mm_embeds: List[torch.Tensor],
+    mm_token_ids: Optional[torch.IntTensor] = None,
+) -> Tuple[torch.IntTensor, torch.IntTensor]:
+    # VILA expands multimodal placeholders into the in-vocab media token id
+    # during preprocessing, so counting positions that match ``mm_token_ids``
+    # (via ``torch.isin``) gives the active multimodal span for the current
+    # chunk. Reuse the indices for fusion to avoid an extra sync.
+    text_token_indices, mm_token_indices = filter_mm_token_from_input_ids(
+        input_ids=input_ids,
+        vocab_size=embedding_layer.num_embeddings,
+        mm_token_ids=mm_token_ids,
+    )
+    expected_tokens = mm_token_indices.shape[0]
+    actual_embeds = sum(embed.shape[0] for embed in mm_embeds)
+    if expected_tokens != actual_embeds:
+        raise ValueError(
+            "[VILA] Multimodal token count mismatch after slicing: "
+            f"found {expected_tokens} image tokens in input_ids but received "
+            f"{actual_embeds} image embeddings.")
+    return text_token_indices, mm_token_indices
 
 
 def _convert_dtype(dtype):
@@ -219,7 +248,7 @@ def process_images(images: Union[List[Image.Image], List[torch.Tensor]],
     block_sizes = None
     if isinstance(images[0], tuple):
         # VILA 2.0 dynamic S2 has block_sizes parameter
-        images, block_sizes = zip(*images)
+        images, block_sizes = zip(*images, strict=True)
         block_sizes = list(block_sizes)
 
     if all(x.shape[1:] == images[0].shape[1:] for x in images):
@@ -465,6 +494,7 @@ class VilaMultimodalProjector(PreTrainedModel):
                 self.layers = nn.Sequential(*modules)
             else:
                 raise ValueError(f"Unknown projector type: {mm_projector_type}")
+        self.post_init()
 
     def forward(self, x, *args, **kwargs):
         return self.layers(x)
@@ -913,6 +943,16 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        """Surface the in-vocab media token IDs so
+        ``maybe_compute_mm_embed_cumsum`` builds ``embed_mask_cumsum`` via
+        ``torch.isin(input_ids, mm_token_ids)`` instead of the OOV
+        ``>= vocab_size`` fallback (which would miss all positions now that
+        the OOV remap in _postprocess is gone).
+        """
+        media_ids = list(self.tokenizer.media_token_ids.values())
+        return torch.tensor(media_ids, dtype=torch.int32) if media_ids else None
+
     def model_path(self) -> str:
         return self._model_path
 
@@ -971,8 +1011,8 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
                 self.vision_tower, visual_features, block_sizes)
 
             visual_features = [
-                split_chessboard(x, block_size[0], block_size[1])
-                for x, block_size in zip(visual_features, new_block_sizes)
+                split_chessboard(x, block_size[0], block_size[1]) for x,
+                block_size in zip(visual_features, new_block_sizes, strict=True)
             ]  # list of B * C * H * W tensors
             visual_features = torch.cat(
                 [rearrange(x, "b c h w -> b (h w) c") for x in visual_features],
@@ -985,8 +1025,8 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
                 ],
                                       dim=0))
             visual_features = [
-                merge_chessboard(x, block_size[0], block_size[1])
-                for x, block_size in zip(visual_features, new_block_sizes)
+                merge_chessboard(x, block_size[0], block_size[1]) for x,
+                block_size in zip(visual_features, new_block_sizes, strict=True)
             ]  # list of 1 * C * H * W tensors
             visual_features = [
                 rearrange(x, "1 c h w -> (h w) c") for x in visual_features
@@ -1009,7 +1049,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         mm_tokens = torch.tensor([*self.tokenizer.media_token_ids.values()
                                   ]).to(input_ids.device)
         mm_token_positions = torch.where(torch.isin(input_ids, mm_tokens))[0]
-        num_medias = num_mm_tokens = len(mm_token_positions)
+        num_medias = num_mm_tokens = mm_token_positions.numel()
         if num_medias > 1 and isinstance(mm_features, torch.Tensor):
             mm_features = list(
                 mm_features.split(mm_features.shape[0] // num_medias))
@@ -1042,15 +1082,19 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         assert mm_hidden_dim == self.config.hidden_size, "Multimodal embedding_dim must match model hidden_size"
 
         ## split input_ids into segments by isolating mm tokens
-        vocab_size = len(self.tokenizer)  # vocab including special tokens
         mm_split_positions = torch.cat(
             [mm_token_positions, mm_token_positions + 1]).unique()
         input_ids_splits = list(input_ids.tensor_split(mm_split_positions.cpu(
         )))  # len(input_ids_splits) = num_segments after mm tokens are isolated
+        # Use the first in-vocab media token id repeated mm_total_length times
+        # instead of unique arange(vocab_size, vocab_size + L) OOV IDs — only
+        # the predicate that distinguishes mm vs text matters downstream
+        # (fuse_input_embeds uses ``torch.isin(input_ids, mm_token_ids)``).
         mm_ids_splits = list(
-            torch.arange(vocab_size,
-                         vocab_size + mm_total_length,
-                         device=input_ids.device).split(mm_lengths_per_split)
+            torch.full((mm_total_length, ),
+                       int(mm_tokens[0]),
+                       dtype=input_ids.dtype,
+                       device=input_ids.device).split(mm_lengths_per_split)
         )  # len(mm_ids_splits) = num_mm_segments
 
         # prepend & append start/end tokens around mm ids
@@ -1079,7 +1123,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
                     dim=1)
             mm_ids_splits[i] = mm_ids.flatten()
 
-        ## replace mm token ids with the expanded out-of-vocab ids
+        ## replace mm token ids with the expanded multimodal ids
         mm_split_idx = 0
         for i, split in enumerate(input_ids_splits):
             if torch.isin(split, mm_tokens).any().item():
@@ -1102,7 +1146,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         return fused_input_ids, mm_features
 
     @torch.inference_mode()  # critical to minimize memory footprint
-    def __call__(
+    def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
@@ -1191,7 +1235,17 @@ class VilaModel(PreTrainedModel):
         device = kwargs.get("device", "cuda")
         self.llm.to(device=device, dtype=self.model_dtype)
 
+        # Surface the in-vocab media token IDs (image, video, ...) to the
+        # model engine's ``_prepare_multimodal_indices``. ``init_llm`` populates
+        # ``self.tokenizer.media_token_ids`` as ``{name: id}``.
+        media_ids = list(self.tokenizer.media_token_ids.values())
+        self._mm_token_ids = torch.tensor(media_ids, dtype=torch.int32)
+
         self.post_config()
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
 
     @torch.inference_mode()
     def forward(
@@ -1208,16 +1262,42 @@ class VilaModel(PreTrainedModel):
         """
 
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
+        logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
         multimodal_params = kwargs.get("multimodal_params", [])
+        context_multimodal_params = multimodal_params[:num_context_requests]
         mm_embeds = []
-        if len(multimodal_params) > 0:
+        text_token_indices = None
+        mm_token_indices = None
+        if len(context_multimodal_params) > 0:
             mm_embeds = [
                 multimodal_param.multimodal_data["multimodal_embedding"]
-                for multimodal_param in multimodal_params
+                for multimodal_param in context_multimodal_params
             ]
+            # Other multimodal models already slice batched embeddings with
+            # find_input_mm_embeds() before fusion. VILA previously skipped
+            # that step and could feed the full cached embedding tensor into a
+            # chunked context batch, which breaks token/embed alignment.
+            mm_embeds = find_input_mm_embeds(mm_embeds,
+                                             context_multimodal_params)
+            if input_ids is not None:
+                text_token_indices, mm_token_indices = _validate_vila_mm_alignment(
+                    input_ids=input_ids,
+                    embedding_layer=self.llm.model.embed_tokens,
+                    mm_embeds=mm_embeds,
+                    mm_token_ids=self.mm_token_ids,
+                )
 
+        if text_token_indices is not None and mm_token_indices is not None:
+            kwargs["text_token_indices"] = text_token_indices
+            kwargs["mm_token_indices"] = mm_token_indices
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs)
+            self.llm.model.embed_tokens,
+            input_ids,
+            mm_embeds,
+            mm_token_ids=self.mm_token_ids,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
+        )
         logits = self.llm.forward(attn_metadata=attn_metadata,
                                   input_ids=input_ids,
                                   position_ids=position_ids,
@@ -1256,5 +1336,5 @@ class VilaModel(PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
 
 
-AutoConfig.register(VilaConfig.model_type, VilaConfig)
+AutoConfig.register(VilaConfig.model_type, VilaConfig, exist_ok=True)
 AutoModel.register(VilaConfig, VilaModel)

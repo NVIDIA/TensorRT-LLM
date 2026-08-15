@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <fcntl.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -194,8 +195,65 @@ using RegisterDescs = MemoryDescs;
 using SyncMessage = std::string;
 using ConnectionInfoType = std::string;
 
+/// Per-region VMM chunk info used for splitting descriptors at chunk boundaries.
+struct VramRegionInfo
+{
+    size_t totalLen;
+    size_t chunkSize; ///< 0 = cudaMalloc (no split), >0 = VMM chunk size
+};
+
+/// Region map: virtual base address → region info.
+using VramRegionMap = std::map<uintptr_t, VramRegionInfo>;
+
+/// Backend-agnostic VMM descriptor split utilities (no NIXL dependency).
+struct VmmDescSplitter
+{
+    /// @brief Look up VMM chunk info for an address from a region map.
+    /// @return {chunkSize, regionBase}. Returns {0, 0} if address is not in any region.
+    [[nodiscard]] static std::pair<size_t, uintptr_t> lookupChunkInfo(uintptr_t addr, VramRegionMap const& regionMap);
+
+    /// @brief Split VRAM descs at chunk boundaries using a pre-built region map.
+    /// For non-VRAM or addresses not in the map, descs pass through unchanged.
+    [[nodiscard]] static MemoryDescs splitDescsWithRegionMap(MemoryDescs const& descs, VramRegionMap const& regionMap);
+
+    /// @brief Split paired src/dst descs at chunk boundaries, then coalesce contiguous pieces.
+    /// src is split by localRegionMap, dst is split by remoteRegionMap; each piece size is
+    /// min(srcPiece, dstPiece, remaining). Pairs are sorted by src address, and adjacent pieces
+    /// whose src AND dst are both contiguous (same deviceId) are merged — but a merged desc never
+    /// crosses a chunk boundary on either side, and never spans two distinct regions, so every
+    /// output desc stays within a single registered memory region. Merging requires region
+    /// metadata: a piece whose address misses the region map on either side is never merged,
+    /// because two unknown regions are indistinguishable and a merge could cross a chunk or
+    /// registration boundary. With no region metadata the result is split-only. Non-kVRAM descs
+    /// pass through unchanged (no region info is available to bound the merge).
+    /// @param enableCoalesce When false, only split at chunk boundaries without merging pieces.
+    [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> splitAndCoalesceTransferDescs(MemoryDescs const& srcDescs,
+        MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap, VramRegionMap const& remoteRegionMap,
+        bool enableCoalesce = true);
+
+    /// @brief Split VRAM descs at VMM chunk boundaries detected via cuMemGetAddressRange.
+    /// For cudaMalloc memory (single allocation), descs pass through unchanged.
+    /// @param[out] detectedChunkSize Set to the VMM chunk size if detected, 0 otherwise.
+    [[nodiscard]] static MemoryDescs splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize);
+
+    /// @brief Build a VramRegionMap by probing each VRAM descriptor with cuMemGetAddressRange.
+    /// For each descriptor, detects whether it spans multiple VMM chunks and records {totalLen, chunkSize}.
+    /// @param descs VRAM memory descriptors to probe.
+    /// @return Region map with per-descriptor VMM info (chunkSize=0 for cudaMalloc memory).
+    [[nodiscard]] static VramRegionMap detectVramRegionMap(MemoryDescs const& descs);
+};
+
+/// VMM region metadata exchanged between agents for chunk boundary calculations.
+struct VramRegionMeta
+{
+    uintptr_t baseAddr;
+    size_t totalLen;
+    size_t chunkSize; ///< 0 = cudaMalloc (no split), >0 = VMM chunk size
+};
+
 // `AgentDesc` represents the unique identifier for reading and writing to the agent.
 // By accessing this identifier, the backend can establish the correct connection.
+// It also carries VMM region metadata so that remote agents can split at chunk boundaries.
 class AgentDesc final
 {
 public:
@@ -204,13 +262,31 @@ public:
     {
     }
 
+    AgentDesc(std::string backendAgentDesc, std::vector<VramRegionMeta> vramRegions)
+        : mBackendAgentDesc{std::move(backendAgentDesc)}
+        , mVramRegions{std::move(vramRegions)}
+    {
+    }
+
     [[nodiscard]] std::string const& getBackendAgentDesc() const noexcept
     {
         return mBackendAgentDesc;
     }
 
+    [[nodiscard]] std::vector<VramRegionMeta> const& getVramRegions() const noexcept
+    {
+        return mVramRegions;
+    }
+
+    /// Serialize the entire AgentDesc (backend blob + VMM regions) into an opaque string.
+    [[nodiscard]] std::string serialize() const;
+
+    /// Deserialize an opaque string back into an AgentDesc.
+    [[nodiscard]] static AgentDesc deserialize(std::string const& data);
+
 private:
     std::string mBackendAgentDesc;
+    std::vector<VramRegionMeta> mVramRegions;
 };
 
 // `TransferOp` is an enumeration that represents the types of transfer operations.
@@ -288,6 +364,13 @@ public:
     virtual ~TransferStatus() = default;
     [[nodiscard]] virtual bool isCompleted() const = 0;
     virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
+
+    /// Release the backend transfer request handle. A true return means the backend accepted the handle release; it
+    /// does not prove remote memory quiescence.
+    [[nodiscard]] virtual bool release()
+    {
+        return false;
+    }
 };
 
 struct BaseAgentConfig
@@ -298,6 +381,8 @@ struct BaseAgentConfig
     bool useListenThread;
     bool enableTelemetry;
     std::unordered_map<std::string, std::string> backendParams;
+    std::optional<int> rank;
+    std::optional<int> worldSize;
 };
 
 class BaseTransferAgent
@@ -360,6 +445,14 @@ public:
     virtual ~BaseLoopbackAgent() = default;
     virtual void executeLoopbackRequest(MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) = 0;
 };
+
+/// @brief Promote the shared library containing this code (libtensorrt_llm.so) to the
+/// process's global symbol scope. The KV cache transfer-agent wrapper libraries
+/// (libtensorrt_llm_{nixl,ucx,mooncake}_wrapper.so) intentionally carry no DT_NEEDED on
+/// libtensorrt_llm.so (the dependency would be circular) and resolve its symbols from the
+/// global symbol table, while Python extension modules and their dependencies load with
+/// RTLD_LOCAL. Idempotent; a no-op when the code is statically linked (e.g. unit tests).
+void promoteHostLibraryToGlobalScope();
 
 class DynLibLoader final
 {

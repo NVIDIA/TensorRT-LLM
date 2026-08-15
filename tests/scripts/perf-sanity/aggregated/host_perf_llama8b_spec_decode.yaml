@@ -30,6 +30,7 @@ server_configs:
   # The host overhead per iteration is ~2x non-spec-decode due to
   # draft token management and verification.
   - name: "llama8b_spec_bs1_128_128"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
     model_name: "llama_v3.1_8b_instruct"
     tensor_parallel_size: 1
     max_batch_size: 4
@@ -55,6 +56,7 @@ server_configs:
   # BS=8 with spec decode means 8 requests each generating 3 draft tokens,
   # stressing the scheduler, KV cache, and token verification paths.
   - name: "llama8b_spec_bs8_128_128"
+    server_env_var: "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=3"
     model_name: "llama_v3.1_8b_instruct"
     tensor_parallel_size: 1
     max_batch_size: 16

@@ -20,6 +20,8 @@
 
 #include <cuda_fp4.h>
 
+namespace btg = batchedGemm::trtllm::gen;
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
@@ -74,15 +76,19 @@ std::vector<torch::Tensor> moe_topk_sort_impl(torch::optional<torch::Tensor> con
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(
         routing_logits.has_value() ? routing_logits->get_device() : token_selected_experts->get_device());
-    routing_runner.run(routing_logits_ptr, routing_bias_ptr, num_tokens, num_experts, top_k, n_group.value_or(0),
-        topk_group.value_or(0), local_expert_offset, local_num_experts, routed_scaling_factor.value_or(1.0),
-        expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
+    auto const dtypeRoutingLogits = routing_logits.has_value()
+        ? (routing_logits->scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
+        : btg::Dtype::Bfloat16;
+    routing_runner.run(routing_logits_ptr, routing_bias_ptr, num_tokens, num_experts, top_k,
+        /* num_fused_shared_expert */ 0, n_group.value_or(0), topk_group.value_or(0), local_expert_offset,
+        local_num_experts, routed_scaling_factor.value_or(1.0), expert_indexes.data_ptr<int>(),
+        expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
         expanded_idx_to_permuted_idx.data_ptr<int>(), permuted_idx_to_expanded_idx.data_ptr<int>(),
         nullptr /*permuted_idx_to_token_idx.data_ptr<int>()*/, token_final_scales_ptr, token_selected_experts_ptr,
         num_tokens_per_expert.data_ptr<int>(), tile_idx_to_expert_idx.data_ptr<int>(),
         tile_idx_to_mn_limit.data_ptr<int>(), num_non_exiting_tiles.data_ptr<int>(),
         batchedGemm::trtllm::gen::Dtype::Void /* dtypeElt */, false /* use_routing_scales_on_input */,
-        false /* use_deep_seek_fp8 */, routing_method_type, stream);
+        false /* use_deep_seek_fp8 */, routing_method_type, stream, dtypeRoutingLogits);
 
     std::vector<torch::Tensor> results{tile_idx_to_expert_idx, tile_idx_to_mn_limit, expanded_idx_to_permuted_idx,
         permuted_idx_to_expanded_idx, total_num_padded_tokens, num_non_exiting_tiles};

@@ -480,7 +480,7 @@ char* const errStr = getErrorStr(status);        // const pointer to mutable cha
 Code should adhere to [PEP 8](https://peps.python.org/pep-0008/#fn-hi), unless otherwise noted.
 
 #### Python Standard
-1. The code developed for TensorRT-LLM should conform to Python 3.8+.
+1. The code developed for TensorRT-LLM should conform to Python 3.10+.
 
 #### Formatting
 
@@ -550,6 +550,9 @@ When defining any user-facing configuration classes (particularly `LlmArgs` or a
 - Use `Literal["value1", "value2"]` instead of `str` when a field should only accept certain values
 - Prefer `PositiveInt`, `NonNegativeInt`, `NonNegativeFloat`, `PositiveFloat`, `Field(gt=0)`, `Field(ge=0)`, etc. for numeric constraints instead of defining custom validators
 - Use `Field(min_length=1)` to enforce minimum length of a list
+
+- After changing LLM args or nested configs, run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
+  `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
 
 **Validation:**
 - Use `@field_validator` and `@model_validator` instead of manual `validate()` or `is_valid()` methods

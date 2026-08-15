@@ -20,6 +20,7 @@ import torch
 from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import (
     extract_transpose_xbc_prefill,
     fused_split_rearrange_after_conv1d,
+    ssd_output_transpose,
 )
 
 skip_no_cuda = pytest.mark.skipif(
@@ -151,3 +152,46 @@ def test_extract_transpose_large_input_no_overflow(dtype):
 
     assert out_fused.shape == out_ref.shape, f"Shape mismatch: {out_fused.shape} vs {out_ref.shape}"
     torch.testing.assert_close(out_fused, out_ref, rtol=1e-3, atol=1e-3)
+
+
+def ssd_output_transpose_ref(
+    out_contig: torch.Tensor,
+    num_prefill_tokens: int,
+) -> torch.Tensor:
+    """Reference implementation: permute+reshape+slice."""
+    B, H, D, NC, CS = out_contig.shape
+    seqlen = NC * CS
+    out_view = out_contig.permute(0, 3, 4, 1, 2).reshape(B, seqlen, H, D)
+    dst = out_view[:, :num_prefill_tokens].contiguous().view(num_prefill_tokens, H * D)
+    return dst
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "H,D,CS,num_prefill_tokens",
+    [
+        (32, 64, 256, 1),
+        (32, 64, 256, 128),
+        (32, 64, 256, 1024),
+        (32, 64, 256, 4096),
+        (32, 64, 256, 50176),  # exact multiple of CS
+        (32, 64, 256, 50224),  # trailing padding
+        (16, 64, 128, 8192),
+        (64, 64, 256, 16384),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_ssd_output_transpose(H, D, CS, num_prefill_tokens, dtype):
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    NC = (num_prefill_tokens + CS - 1) // CS
+    out_contig = torch.randn(1, H, D, NC, CS, dtype=dtype, device=device)
+
+    dst_ref = ssd_output_transpose_ref(out_contig, num_prefill_tokens)
+    dst = torch.empty(num_prefill_tokens, H * D, dtype=dtype, device=device)
+    ssd_output_transpose(out_contig, dst, num_prefill_tokens)
+
+    assert dst.shape == dst_ref.shape
+    # Pure data movement — must be bit-exact.
+    torch.testing.assert_close(dst, dst_ref, rtol=0, atol=0)

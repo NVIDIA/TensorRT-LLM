@@ -1,7 +1,7 @@
 from pathlib import Path
 from queue import Queue
 from threading import Event
-from typing import Optional, Union
+from typing import Optional
 
 import nvtx
 
@@ -10,7 +10,6 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from .._utils import mpi_rank
 from ..bindings import executor as tllm
-from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.tokenizer import TokenizerBase
 from ..logger import set_level
@@ -48,7 +47,7 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         is_llm_executor: Optional[bool] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
@@ -111,7 +110,7 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
     @staticmethod
     def main_task(
-        engine: Union[Path, Engine],
+        engine: Path,
         rpc_addr: str,
         *,
         executor_config: Optional[tllm.ExecutorConfig] = None,
@@ -155,7 +154,7 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
                 color="yellow")
             # Step 2: Create the RPC service, it will expose all the APIs of the worker as remote call to the client
             # Set num_workers to larger than 1 since there are some streaming tasks runs infinitely, such as await_responses_async.
-            hmac_key = kwargs.get("hmac_key")
+            hmac_key: bytes = kwargs["hmac_key"]
             rpc_server = RPCServer(worker,
                                    num_workers=worker.num_workers,
                                    hmac_key=hmac_key)

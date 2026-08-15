@@ -111,7 +111,7 @@ public:
     int k = 32 + shift_;
     uint64_t multiplier_large = ceil_div(uint64_t{1} << k, static_cast<uint64_t>(divisor_));
     multiplier_ = static_cast<uint32_t>(multiplier_large);
-    (void) add_;
+    (void)add_;
   }
 
   // Fast division

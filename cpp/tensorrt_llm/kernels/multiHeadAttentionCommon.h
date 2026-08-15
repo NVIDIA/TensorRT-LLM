@@ -38,7 +38,13 @@ enum Data_type
     DATA_TYPE_BF16,
     DATA_TYPE_E2M1,
     DATA_TYPE_E4M3,
-    DATA_TYPE_E5M2
+    DATA_TYPE_E5M2,
+    // Composite kv data types
+    DATA_TYPE_KV_FP16_E4M3,
+    DATA_TYPE_KV_BF16_E4M3,
+    DATA_TYPE_KV_INT8_E4M3,
+    // Unknown
+    DATA_TYPE_UNKNOWN
 };
 
 static inline std::string data_type_to_string(Data_type dtype)
@@ -55,7 +61,21 @@ static inline std::string data_type_to_string(Data_type dtype)
     case DATA_TYPE_E2M1: return "e2m1";
     case DATA_TYPE_E4M3: return "e4m3";
     case DATA_TYPE_E5M2: return "e5m2";
+    case DATA_TYPE_KV_FP16_E4M3: return "fp16+e4m3";
+    case DATA_TYPE_KV_BF16_E4M3: return "bf16+e4m3";
+    case DATA_TYPE_KV_INT8_E4M3: return "int8+e4m3";
     default: return std::to_string(static_cast<int>(dtype)) + " (unknown)";
+    }
+}
+
+static inline std::tuple<Data_type, Data_type> unpack_kv_data_type(Data_type dtype)
+{
+    switch (dtype)
+    {
+    case DATA_TYPE_KV_FP16_E4M3: return std::make_tuple(DATA_TYPE_FP16, DATA_TYPE_E4M3);
+    case DATA_TYPE_KV_BF16_E4M3: return std::make_tuple(DATA_TYPE_BF16, DATA_TYPE_E4M3);
+    case DATA_TYPE_KV_INT8_E4M3: return std::make_tuple(DATA_TYPE_INT8, DATA_TYPE_E4M3);
+    default: return std::make_tuple(dtype, dtype);
     }
 }
 

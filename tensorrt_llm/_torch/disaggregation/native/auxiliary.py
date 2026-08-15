@@ -34,6 +34,81 @@ class AuxBufferMeta:
         )
 
 
+@dataclass(frozen=True)
+class AuxTransferLayout:
+    """Static auxiliary memory layout shared by all transfers to one peer."""
+
+    src_base_ptrs: np.ndarray
+    dst_base_ptrs: np.ndarray
+    src_item_sizes: np.ndarray
+    dst_item_sizes: np.ndarray
+
+
+def _readonly(array: np.ndarray) -> np.ndarray:
+    """Return an array protected from accidental in-place updates."""
+    array.flags.writeable = False
+    return array
+
+
+def get_non_empty_aux_indices(ptrs: np.ndarray, sizes: np.ndarray, context: str) -> np.ndarray:
+    """Validate auxiliary memory descriptors and return their non-empty indices."""
+    if ptrs.shape != sizes.shape:
+        raise ValueError(f"{context}: pointer/size count mismatch: {ptrs.shape=} != {sizes.shape=}")
+
+    negative_sizes = sizes < 0
+    if negative_sizes.any():
+        indices = np.flatnonzero(negative_sizes).tolist()
+        raise ValueError(f"{context}: negative sizes at indices {indices}")
+
+    null_non_empty = (ptrs == 0) & (sizes > 0)
+    if null_non_empty.any():
+        indices = np.flatnonzero(null_non_empty).tolist()
+        raise ValueError(f"{context}: null pointers with non-zero sizes at indices {indices}")
+
+    return np.flatnonzero(sizes > 0)
+
+
+def build_aux_transfer_layout(
+    src_meta: AuxBufferMeta, dst_meta: AuxBufferMeta
+) -> AuxTransferLayout:
+    """Validate and build the static auxiliary transfer layout for one peer."""
+    src_item_sizes = src_meta.item_sizes.astype(np.int64, copy=False)
+    dst_item_sizes = dst_meta.item_sizes.astype(np.int64, copy=False)
+    src_indices = get_non_empty_aux_indices(
+        src_meta.ptrs, src_item_sizes, "source auxiliary transfer"
+    )
+    dst_indices = get_non_empty_aux_indices(
+        dst_meta.ptrs, dst_item_sizes, "destination auxiliary transfer"
+    )
+    if src_meta.ptrs.shape != dst_meta.ptrs.shape:
+        raise ValueError(
+            "Source and destination auxiliary layouts do not match: "
+            f"{src_meta.ptrs.shape=} != {dst_meta.ptrs.shape=}"
+        )
+
+    dst_non_empty = np.zeros(dst_meta.ptrs.shape, dtype=bool)
+    dst_non_empty[dst_indices] = True
+    missing_dst = src_indices[~dst_non_empty[src_indices]]
+    if missing_dst.size > 0:
+        raise ValueError(
+            "Destination auxiliary buffers are empty for non-empty source "
+            f"indices {missing_dst.tolist()}"
+        )
+
+    too_small = src_indices[dst_item_sizes[src_indices] < src_item_sizes[src_indices]]
+    if too_small.size > 0:
+        raise ValueError(
+            f"Destination auxiliary buffers are too small at indices {too_small.tolist()}"
+        )
+
+    return AuxTransferLayout(
+        src_base_ptrs=_readonly(src_meta.ptrs[src_indices]),
+        dst_base_ptrs=_readonly(dst_meta.ptrs[src_indices]),
+        src_item_sizes=_readonly(src_item_sizes[src_indices]),
+        dst_item_sizes=_readonly(dst_item_sizes[src_indices]),
+    )
+
+
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
 
@@ -79,6 +154,16 @@ class AuxBufferBase(ABC):
         """
         ...
 
+    @abstractmethod
+    def get_slot_data(self, slot: int) -> tuple[list[int], list[int], tuple[int, int]]:
+        """
+        Get the token data and prompt token counts from the specified slot.
+
+        Returns:
+            (first_gen_tokens, draft_tokens, (prompt_tokens, cached_tokens))
+        """
+        ...
+
 
 class AuxBuffer(AuxBufferBase):
     def __init__(self, max_slot_num: int, beam_width: int, max_draft_len: int, device: str = "cpu"):
@@ -108,6 +193,9 @@ class AuxBuffer(AuxBufferBase):
         self._token_counts_buffer = torch.zeros(
             self._max_slot_num, 2, dtype=data_type, device=self._device
         )
+        self._prompt_token_counts_buffer = torch.zeros(
+            self._max_slot_num, 2, dtype=data_type, device=self._device
+        )
 
         self._meta = AuxBufferMeta(
             ptrs=np.array(
@@ -115,6 +203,7 @@ class AuxBuffer(AuxBufferBase):
                     self._first_tokens_buffer.data_ptr(),
                     self._draft_tokens_buffer.data_ptr(),
                     self._token_counts_buffer.data_ptr(),
+                    self._prompt_token_counts_buffer.data_ptr(),
                 ],
                 dtype=np.int64,
             ),
@@ -123,6 +212,8 @@ class AuxBuffer(AuxBufferBase):
                     self._first_tokens_buffer.numel() * self._first_tokens_buffer.element_size(),
                     self._draft_tokens_buffer.numel() * self._draft_tokens_buffer.element_size(),
                     self._token_counts_buffer.numel() * self._token_counts_buffer.element_size(),
+                    self._prompt_token_counts_buffer.numel()
+                    * self._prompt_token_counts_buffer.element_size(),
                 ],
                 dtype=np.int64,
             ),
@@ -131,6 +222,8 @@ class AuxBuffer(AuxBufferBase):
                     self._first_tokens_buffer[0].numel() * self._first_tokens_buffer.element_size(),
                     self._draft_tokens_buffer[0].numel() * self._draft_tokens_buffer.element_size(),
                     self._token_counts_buffer[0].numel() * self._token_counts_buffer.element_size(),
+                    self._prompt_token_counts_buffer[0].numel()
+                    * self._prompt_token_counts_buffer.element_size(),
                 ],
                 dtype=np.int64,
             ),
@@ -204,6 +297,26 @@ class AuxBuffer(AuxBufferBase):
                 [len(first_gen_tokens), len(draft_tokens)], dtype=torch.int32, device=self._device
             )
         )
+        prompt_tokens, cached_tokens = self._resolve_prompt_token_counts(request)
+        self._prompt_token_counts_buffer[slot].copy_(
+            torch.tensor([prompt_tokens, cached_tokens], dtype=torch.int32, device=self._device)
+        )
+
+    @staticmethod
+    def _resolve_prompt_token_counts(request: LlmRequest) -> tuple[int, int]:
+        ctx_usage = (
+            request.py_disaggregated_params.ctx_usage
+            if request.py_disaggregated_params is not None
+            else None
+        )
+        if ctx_usage is not None:
+            prompt_tokens = ctx_usage.get("prompt_tokens", 0)
+            details = ctx_usage.get("prompt_tokens_details") or {}
+            cached_tokens = details.get("cached_tokens", 0)
+        else:
+            prompt_tokens = request.prompt_len
+            cached_tokens = request.cached_tokens
+        return int(prompt_tokens or 0), int(cached_tokens or 0)
 
     def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
         if slot not in self._occupied_slots:
@@ -213,3 +326,8 @@ class AuxBuffer(AuxBufferBase):
         draft_tokens = self._draft_tokens_buffer[slot][:draft_len].tolist()
 
         return first_gen_tokens, draft_tokens
+
+    def get_slot_data(self, slot: int) -> tuple[list[int], list[int], tuple[int, int]]:
+        first_gen_tokens, draft_tokens = self.get_slot_tokens(slot)
+        prompt_tokens, cached_tokens = self._prompt_token_counts_buffer[slot].tolist()
+        return first_gen_tokens, draft_tokens, (int(prompt_tokens), int(cached_tokens))

@@ -25,14 +25,12 @@ namespace tensorrt_llm::executor
 KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> const& maxTokens,
     std::optional<std::vector<SizeType32>> const& maxAttentionWindowVec,
     std::optional<SizeType32> const& sinkTokenLength, std::optional<FloatType> const& freeGpuMemoryFraction,
-    std::optional<size_t> const& hostCacheSize, bool onboardBlocks,
-    std::optional<FloatType> const& crossKvCacheFraction, std::optional<RetentionPriority> secondaryOffloadMinPriority,
-    size_t eventBufferMaxSize, bool enablePartialReuse, bool copyOnPartialReuse, bool useUvm,
-    SizeType32 attentionDpEventsGatherPeriodMs,
+    std::optional<size_t> const& hostCacheSize, std::optional<FloatType> const& crossKvCacheFraction,
+    std::optional<RetentionPriority> secondaryOffloadMinPriority, size_t eventBufferMaxSize, bool enablePartialReuse,
+    bool copyOnPartialReuse, bool useUvm, SizeType32 attentionDpEventsGatherPeriodMs,
     std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults, uint64_t const& maxGpuTotalBytes)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
-    , mOnboardBlocks(onboardBlocks)
     , mSecondaryOffloadMinPriority(secondaryOffloadMinPriority)
     , mEventBufferMaxSize{eventBufferMaxSize}
     , mEnablePartialReuse{enablePartialReuse}
@@ -116,11 +114,6 @@ std::optional<FloatType> KvCacheConfig::getCrossKvCacheFraction() const
 std::optional<size_t> KvCacheConfig::getHostCacheSize() const
 {
     return mHostCacheSize;
-}
-
-bool KvCacheConfig::getOnboardBlocks() const
-{
-    return mOnboardBlocks;
 }
 
 std::optional<RetentionPriority> KvCacheConfig::getSecondaryOffloadMinPriority() const
@@ -207,11 +200,6 @@ void KvCacheConfig::setCrossKvCacheFraction(FloatType crossKvCacheFraction)
 void KvCacheConfig::setHostCacheSize(size_t hostCacheSize)
 {
     mHostCacheSize = hostCacheSize;
-}
-
-void KvCacheConfig::setOnboardBlocks(bool onboardBlocks)
-{
-    mOnboardBlocks = onboardBlocks;
 }
 
 void KvCacheConfig::setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority)

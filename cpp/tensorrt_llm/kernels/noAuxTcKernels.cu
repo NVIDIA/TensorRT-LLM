@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,15 +32,13 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 static constexpr int WARP_SIZE = 32;
-static constexpr int NumNemotronExperts = 512;
-static constexpr int NumKimiK2Experts = 384;
 static constexpr int NumDeepseekExperts = 256;
-static constexpr int MaxSupportedExpertCount = std::max({NumNemotronExperts, NumKimiK2Experts, NumDeepseekExperts});
-static constexpr int MaxNumExpertsUnit = 128;
+static constexpr int MaxSupportedExpertCount = 1024;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int DefaultMaxNumTopExperts = 8;
-static constexpr int MaxSupportedTopExperts = 22;
-static constexpr int MaxNumTopGroups = 4;
+static constexpr int MaxSupportedTopExperts = 32;
+static constexpr int DefaultMaxNumTopGroups = 4;
+static constexpr int LargeMaxNumTopGroups = 8;
 
 static __device__ inline float sigmoid_accurate(float x)
 {
@@ -48,7 +46,7 @@ static __device__ inline float sigmoid_accurate(float x)
 }
 
 template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups,
-    int MaxNumTopExperts = DefaultMaxNumTopExperts>
+    int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups>
 __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, IdxT* topkIndices, BiasT* routingBias,
     int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
     int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor)
@@ -57,208 +55,137 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
     cudaGridDependencySynchronize();
 #endif
 
-    // declare shared memory structure
-    // number of experts is bounded by number of threads
     __shared__ float __attribute((aligned(128))) smemScoreSigmoid[MaxNumExperts];
     __shared__ float __attribute((aligned(128))) smemScoreBias[MaxNumExperts];
-    // number of expert groups is bounded by number of warps
-    int constexpr NumWarps = MaxNumExperts / WARP_SIZE;
-    __shared__ float __attribute((aligned(128))) smemGroupScores[NumWarps];
 
-    // needed for warp reduce
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
-    // for the final reduction of weight norm, only some lanes need to participate
     int32_t laneIdx = threadIdx.x % WARP_SIZE;
     int32_t warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WARP_SIZE, 0);
 
+    static constexpr float invalidScoreFloat = float{-INFINITY};
+
+    topkValues += blockIdx.x * topk;
+    topkIndices += blockIdx.x * topk;
+
     if constexpr (UseGroups)
     {
+        int constexpr NumWarps = MaxNumExperts / WARP_SIZE;
+        __shared__ float __attribute((aligned(128))) smemGroupScores[NumWarps];
+
         if (warpIdx >= numGroup)
         {
             return;
         }
-    }
 
-    // note that for invalid scores, we simply use a negative value:
-    // they work well even with the compacted format used in topK, and
-    // sigmoid / bias activated scores cannot be negative
-    static constexpr float invalidScoreFloat = float{-INFINITY};
-    const OutputT invalidScore = OutputT{invalidScoreFloat};
+        auto threadExpert = warpIdx * numExpertsPerGroup + laneIdx;
+        bool expertSelected = laneIdx < numExpertsPerGroup;
 
-    // load bias already; each warp represents one expert group
-    auto threadExpert = threadIdx.x;
-    bool expertSelected = threadExpert < numExperts;
-    if constexpr (UseGroups)
-    {
-        threadExpert = warpIdx * numExpertsPerGroup + laneIdx;
-        expertSelected = laneIdx < numExpertsPerGroup;
-    }
+        auto scoreIdx = int64_t{blockIdx.x} * int64_t{numExperts} + threadExpert;
+        auto biasVal = expertSelected ? static_cast<float>(routingBias[threadExpert]) : invalidScoreFloat;
+        float score = expertSelected ? static_cast<float>(scores[scoreIdx]) : invalidScoreFloat;
+        auto scoreSigmoid = sigmoid_accurate(score);
+        if (expertSelected)
+        {
+            smemScoreSigmoid[threadExpert] = scoreSigmoid;
+        }
+        auto scoreBias = float{scoreSigmoid + float{biasVal}};
+        if (expertSelected)
+        {
+            smemScoreBias[threadExpert] = scoreBias;
+        }
 
-    auto scoreIdx = int64_t{blockIdx.x} * int64_t{numExperts} + threadExpert;
-    auto biasVal = expertSelected ? static_cast<float>(routingBias[threadExpert]) : invalidScoreFloat;
-    topkValues += blockIdx.x * topk;
-    topkIndices += blockIdx.x * topk;
-
-    // get our assigned thread score; each warp represents one expert group
-    float score = expertSelected ? static_cast<float>(scores[scoreIdx]) : invalidScoreFloat;
-    auto scoreSigmoid = sigmoid_accurate(score);
-    // write the sigmoid score to shared for later use
-    if (expertSelected)
-    {
-        smemScoreSigmoid[threadExpert] = scoreSigmoid;
-    }
-
-    // get the score with bias
-    // note that with invalid values, because sigmoid is < 1 and bias is -1,
-    // we must get a negative value, which is smaller than any valid value
-    auto scoreBias = float{scoreSigmoid + float{biasVal}};
-
-    if (expertSelected)
-    {
-        smemScoreBias[threadExpert] = scoreBias;
-    }
-
-    // registers for top group score reduction
-    float topExpGroupScores[NumTopGroupScores];
-    [[maybe_unused]] int32_t topExpGroupIdx[NumTopGroupScores];
-    float topGroups[MaxNumTopGroups]; // bound of numGroup
-    int32_t topGroupIdx[MaxNumTopGroups];
-    float expertScoreGroup[MaxNumTopGroups];
-    int32_t expertIdxGroup[MaxNumTopGroups];
-    float topScores[MaxNumTopExperts]; // bound of topk
-    int32_t topExperts[MaxNumTopExperts];
-
-    if constexpr (UseGroups)
-    {
+        float topExpGroupScores[NumTopGroupScores];
+        [[maybe_unused]] int32_t topExpGroupIdx[NumTopGroupScores];
         reduce_topk::reduceTopK(warp, topExpGroupScores, topExpGroupIdx, scoreBias, threadExpert,
             /* minValue */ invalidScoreFloat);
 
-        // get the final group score and write it to shared
         if (warp.thread_rank() == 0)
         {
             auto groupScore = topExpGroupScores[0] + topExpGroupScores[1];
             smemGroupScores[warpIdx] = groupScore;
         }
-    }
 
-    // make group scores available to all warps
-    __syncthreads();
+        __syncthreads();
 
-    if constexpr (UseGroups)
-    {
+        float topScores[MaxNumTopExperts];
+        int32_t topExperts[MaxNumTopExperts];
+
         if (warpIdx == 0)
         {
-            // a single warp performs the selection of top groups, and goes on to select the final experts
+            float topGroups[MaxNumTopGroups];
+            int32_t topGroupIdx[MaxNumTopGroups];
             float groupScore = laneIdx < numGroup ? smemGroupScores[laneIdx] : invalidScoreFloat;
-
             reduce_topk::reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
                 /* minValue */ invalidScoreFloat);
-            // final expert selection: get relevant indexes and scores from shared
+
+            float expertScoreGroup[MaxNumTopGroups];
+            int32_t expertIdxGroup[MaxNumTopGroups];
 #pragma unroll
             for (int ii = 0; ii < MaxNumTopGroups; ++ii)
-            { // bound of numGroup
+            {
                 auto groupIdx = topGroupIdx[ii];
                 expertIdxGroup[ii] = groupIdx * numExpertsPerGroup + laneIdx;
-
                 expertScoreGroup[ii]
                     = (ii < topkGroup) && expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScoreFloat;
             }
 
-            tensorrt_llm::kernels::reduce_topk::reduceTopK(
+            reduce_topk::reduceTopK(
                 warp, topScores, topExperts, expertScoreGroup, expertIdxGroup, /* minValue */ invalidScoreFloat, topk);
-        }
-    }
-    else if constexpr (MaxNumExperts > MaxNumExpertsUnit)
-    {
-        // without groups, and the expert number is larger than MaxNumExpertsUnit,
-        // we need to use multiple warps to calculate the intermediate topk results
 
-        int constexpr NumExpertWarps = (MaxNumExperts - 1) / MaxNumExpertsUnit + 1;
-        int constexpr NumInterTopK = NumExpertWarps * MaxNumTopExperts;
-        __shared__ float __attribute((aligned(128))) smemInterTopScores[NumInterTopK];
-        __shared__ int32_t __attribute((aligned(128))) smemInterTopExperts[NumInterTopK];
-        if (warpIdx < NumExpertWarps)
-        {
-            int offset = warpIdx * WARP_SIZE * MaxNumTopGroups;
-#pragma unroll
-            for (int ii = 0; ii < MaxNumTopGroups; ++ii)
-            {
-                auto expertIdx = ii * WARP_SIZE + laneIdx;
-                expertIdxGroup[ii] = offset + expertIdx;
-                expertScoreGroup[ii]
-                    = offset + expertIdx < numExperts ? smemScoreBias[offset + expertIdx] : invalidScoreFloat;
-            }
-            reduce_topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
-                /* minValue */ invalidScoreFloat, topk);
-
+            int32_t expertIdx = laneIdx < topk ? topExperts[laneIdx] : MaxNumExperts - 1;
+            float scoreNorm = laneIdx < topk ? smemScoreSigmoid[expertIdx] : 0.F;
+            auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
+            auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
             if (laneIdx < topk)
             {
-                smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = topScores[laneIdx];
-                smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = topExperts[laneIdx];
+                topkValues[laneIdx] = static_cast<OutputT>(finalScore);
+                topkIndices[laneIdx] = expertIdx;
             }
-            else if (laneIdx >= topk && laneIdx < MaxNumTopExperts)
-            {
-                smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = invalidScoreFloat;
-                smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = MaxNumExperts - 1;
-            }
-        }
-        __syncthreads();
-        if (warpIdx == 0)
-        {
-            int constexpr NumInterTopKPerThread = (NumInterTopK - 1) / WARP_SIZE + 1;
-            float intermediateScore[NumInterTopKPerThread];
-            int32_t intermediateExpert[NumInterTopKPerThread];
-            for (int i = laneIdx; i < NumInterTopKPerThread * WARP_SIZE; i += WARP_SIZE)
-            {
-                int ii = i / WARP_SIZE;
-                if (i < NumInterTopK)
-                {
-                    intermediateScore[ii] = smemInterTopScores[i];
-                    intermediateExpert[ii] = smemInterTopExperts[i];
-                }
-                else
-                {
-                    intermediateScore[ii] = invalidScoreFloat;
-                    intermediateExpert[ii] = MaxNumExperts - 1;
-                }
-            }
-            reduce_topk::reduceTopK(warp, topScores, topExperts, intermediateScore, intermediateExpert,
-                /* minValue */ invalidScoreFloat, topk);
         }
     }
     else
     {
-        // without groups, and the expert number is smaller than MaxNumExpertsUnit
-        // each thread just takes `MaxNumTopGroups` experts
+        for (int e = threadIdx.x; e < numExperts; e += blockDim.x)
+        {
+            auto scoreIdx = int64_t{blockIdx.x} * int64_t{numExperts} + e;
+            auto biasVal = static_cast<float>(routingBias[e]);
+            float score = static_cast<float>(scores[scoreIdx]);
+            auto scoreSigmoid = sigmoid_accurate(score);
+            smemScoreSigmoid[e] = scoreSigmoid;
+            smemScoreBias[e] = scoreSigmoid + biasVal;
+        }
+
+        __syncthreads();
+
+        float topScores[MaxNumTopExperts];
+        int32_t topExperts[MaxNumTopExperts];
+
         if (warpIdx == 0)
         {
+            constexpr int NumChunks = (MaxNumExperts + WARP_SIZE - 1) / WARP_SIZE;
+            float localScores[NumChunks];
+            int32_t localIdx[NumChunks];
 #pragma unroll
-            for (int ii = 0; ii < MaxNumTopGroups; ++ii)
+            for (int ii = 0; ii < NumChunks; ++ii)
             {
                 auto expertIdx = ii * WARP_SIZE + laneIdx;
-                expertIdxGroup[ii] = expertIdx;
-                expertScoreGroup[ii] = expertIdx < numExperts ? smemScoreBias[expertIdx] : invalidScoreFloat;
+                localIdx[ii] = expertIdx;
+                localScores[ii] = expertIdx < numExperts ? smemScoreBias[expertIdx] : invalidScoreFloat;
             }
-            reduce_topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
+            reduce_topk::reduceTopK(warp, topScores, topExperts, localScores, localIdx,
                 /* minValue */ invalidScoreFloat, topk);
-        }
-    }
 
-    if (warpIdx == 0)
-    {
-        // determine our lane's expert index and write to output
-        int32_t expertIdx = laneIdx < topk ? topExperts[laneIdx] : MaxNumExperts - 1;
-        // norm the value
-        float scoreNorm = laneIdx < topk ? smemScoreSigmoid[expertIdx] : 0.F;
-        auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
-        auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
-        // store the topk scores and experts to output
-        if (laneIdx < topk)
-        {
-            topkValues[laneIdx] = static_cast<OutputT>(finalScore);
-            topkIndices[laneIdx] = expertIdx;
+            int32_t expertIdx = laneIdx < topk ? topExperts[laneIdx] : MaxNumExperts - 1;
+            float scoreNorm = laneIdx < topk ? smemScoreSigmoid[expertIdx] : 0.F;
+            auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
+            auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
+            if (laneIdx < topk)
+            {
+                topkValues[laneIdx] = static_cast<OutputT>(finalScore);
+                topkIndices[laneIdx] = expertIdx;
+            }
         }
     }
 
@@ -272,43 +199,57 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
     int64_t const num_experts, int64_t const n_group, int64_t const topk_group, int64_t const topk,
     double const routed_scaling_factor, cudaStream_t const stream)
 {
-
-    // Check if we can use the optimized deepseek_v3_topk_kernel
-    bool const is_single_group = (n_group <= 1) && (num_experts <= MaxSupportedExpertCount);
+    bool const is_single_group
+        = (n_group <= 1) && (num_experts <= MaxSupportedExpertCount) && (topk <= MaxSupportedTopExperts);
 
     int64_t const experts_per_group = num_experts / n_group;
     bool const is_multi_group = (n_group > 1) && (num_experts <= NumDeepseekExperts) && (experts_per_group <= WARP_SIZE)
-        && (experts_per_group * topk_group <= MaxNumExpertsUnit);
+        && (topk <= DefaultMaxNumTopExperts) && (experts_per_group * topk_group <= LargeMaxNumTopGroups * WARP_SIZE);
 
     if (is_single_group || is_multi_group)
     {
         cudaLaunchConfig_t config;
         auto* kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>;
         int num_threads = NumDeepseekExperts;
-        if (is_single_group)
+
+        if (is_multi_group)
         {
-            // Special case for Nemotron, which selects top 22 from 512 experts, and 1 group only.
-            if (num_experts == NumNemotronExperts && n_group == 1 && topk == MaxSupportedTopExperts)
+            if (experts_per_group * topk_group <= DefaultMaxNumTopGroups * WARP_SIZE)
             {
-                kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumNemotronExperts, false,
-                    MaxSupportedTopExperts>;
-                num_threads = NumNemotronExperts;
-            }
-            else if (num_experts > NumKimiK2Experts && num_experts <= MaxSupportedExpertCount)
-            {
-                kernel_instance
-                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, MaxSupportedExpertCount, false>;
-                num_threads = MaxSupportedExpertCount;
-            }
-            else if (num_experts > MaxNumExpertsUnit && num_experts <= NumKimiK2Experts)
-            {
-                kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumKimiK2Experts, false>;
-                num_threads = NumKimiK2Experts;
+                kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true>;
             }
             else
             {
-                kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, MaxNumExpertsUnit, false>;
-                num_threads = MaxNumExpertsUnit;
+                kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumDeepseekExperts, true,
+                    DefaultMaxNumTopExperts, LargeMaxNumTopGroups>;
+            }
+            num_threads = NumDeepseekExperts;
+        }
+        else if (is_single_group)
+        {
+            if (num_experts <= 128)
+            {
+                kernel_instance
+                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 128, false, MaxSupportedTopExperts>;
+                num_threads = 128;
+            }
+            else if (num_experts <= 256)
+            {
+                kernel_instance
+                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 256, false, MaxSupportedTopExperts>;
+                num_threads = 256;
+            }
+            else if (num_experts <= 512)
+            {
+                kernel_instance
+                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 512, false, MaxSupportedTopExperts>;
+                num_threads = 256;
+            }
+            else
+            {
+                kernel_instance
+                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 1024, false, MaxSupportedTopExperts>;
+                num_threads = 256;
             }
         }
 
@@ -328,11 +269,10 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
     }
     else
     {
-        // TODO: call the generic path (previous implementation) or signal unsupported config.
         TLLM_CHECK_WITH_INFO(false,
-            "invokeNoAuxTc: unsupported configuration (n_group=%ld, num_experts=%ld, topk_group=%ld). Please use "
-            "original pytorch implementation.",
-            n_group, num_experts, topk_group);
+            "invokeNoAuxTc: unsupported configuration (n_group=%ld, num_experts=%ld, topk_group=%ld, topk=%ld). "
+            "Please use original pytorch implementation.",
+            n_group, num_experts, topk_group, topk);
     }
 }
 

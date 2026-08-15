@@ -5,14 +5,9 @@
 This is the starting point to try out TensorRT LLM. Specifically, this Quick Start Guide enables you to quickly get set up and send HTTP requests using TensorRT LLM.
 
 
-## Launch Docker Container
+## Install TensorRT LLM
 
-The [TensorRT LLM container](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) maintained by NVIDIA contains all of the required dependencies pre-installed. You can start the container on a machine with NVIDIA GPUs via:
-
-```bash
-docker run --rm -it --ipc host --gpus all --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 nvcr.io/nvidia/tensorrt-llm/release:x.y.z
-```
-
+Follow the [Installation Guide](installation/installation-guide) to set up TensorRT LLM. The quickest option is to pull and run the pre-built release container from NGC.
 
 (deploy-with-trtllm-serve)=
 ## Deploy Online Serving with trtllm-serve

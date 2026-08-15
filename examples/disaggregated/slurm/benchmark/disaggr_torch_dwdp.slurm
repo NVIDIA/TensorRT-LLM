@@ -101,7 +101,7 @@ elif [ -d "${trtllm_repo}" ]; then
 
     if [ "${build_wheel}" = "true" ]; then
         echo "Building TensorRT-LLM wheel on one node..."
-        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --benchmarks --use_ccache --clean"
+        build_command="python3 ./scripts/build_wheel.py --trt_root /usr/local/tensorrt --use_ccache --clean"
         if [ -n "${cuda_architectures:-}" ]; then
             build_command="${build_command} --cuda_architectures \"${cuda_architectures}\""
         fi
@@ -155,6 +155,17 @@ mpi_worker_config_file=${full_logdir}/mpi_worker_config.yaml
 if [ -f "${mpi_worker_config_base_file}" ]; then
     replace_placeholder "${mpi_worker_config_base_file}" "${all_nodes_str}" "${mpi_worker_config_file}"
 fi
+
+# Per-worker hostfile / gpu_map for srun --distribution=arbitrary.
+# submit_dwdp.py writes *_base.txt with <nodeN_placeholder>; rewrite them
+# here once we know the real hostnames.  Each base file becomes a runtime
+# file with the same name minus the ``_base`` suffix.
+for base_file in "${full_logdir}"/hostfile_*_base.txt "${full_logdir}"/gpu_map_*_base.txt; do
+    [ -f "${base_file}" ] || continue
+    runtime_file="${base_file%_base.txt}.txt"
+    replace_placeholder "${base_file}" "${all_nodes_str}" "${runtime_file}"
+done
+
 client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"

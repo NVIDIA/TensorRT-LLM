@@ -93,6 +93,19 @@ enum class BiasType : uint32_t
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum class FusedBiasShuffleMode : uint32_t
+{
+    // BiasType::Mn layout is fully prepared by host preprocessing.
+    None = 0,
+    // The host skips only the bias shuffle and the kernel applies it while loading bias.
+    Shuffle,
+    // The host skips both the gated-act bias reorder and the bias shuffle; the kernel applies both
+    // while loading bias.
+    ReorderAndShuffle,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Type of the element-wise activation to apply after the Gemm
 enum class EltwiseActType
 {
@@ -129,6 +142,23 @@ enum class TileScheduler
     // Uses DynamicPersistentPipelinedTileSchedulerSm90 which enables work-stealing among CTAs
     // by atomically fetching work tile indices from a global counter.
     PersistentSm90,
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Which task to fuse the persistent scheduler with.
+enum class SchedHostTask
+{
+    // The persistent scheduler has its own dedicated task.
+    Self = 0,
+    // The persistent scheduler is fused with the task loading A.
+    LoadA,
+    // The persistent scheduler is fused with the task loading B.
+    LoadB,
+    // The persistent scheduler is fused with the task loading scaling factors for A.
+    LoadSfA,
+    // The persistent scheduler is fused with the task loading scaling factors for B.
+    LoadSfB,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -180,6 +210,34 @@ BIAS_TYPE_FUNCTION(M)
 BIAS_TYPE_FUNCTION(Mn)
 
 #undef BIAS_TYPE_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define FUSED_BIAS_SHUFFLE_MODE_FUNCTION(Mode)                                                                         \
+    inline bool isFusedBiasShuffleMode##Mode(FusedBiasShuffleMode mode)                                                \
+    {                                                                                                                  \
+        return (mode == FusedBiasShuffleMode::Mode);                                                                   \
+    }
+
+FUSED_BIAS_SHUFFLE_MODE_FUNCTION(None)
+FUSED_BIAS_SHUFFLE_MODE_FUNCTION(Shuffle)
+FUSED_BIAS_SHUFFLE_MODE_FUNCTION(ReorderAndShuffle)
+
+#undef FUSED_BIAS_SHUFFLE_MODE_FUNCTION
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool usesFusedBiasShuffle(FusedBiasShuffleMode mode)
+{
+    return !isFusedBiasShuffleModeNone(mode);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool usesFusedBiasReorder(FusedBiasShuffleMode mode)
+{
+    return isFusedBiasShuffleModeReorderAndShuffle(mode);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

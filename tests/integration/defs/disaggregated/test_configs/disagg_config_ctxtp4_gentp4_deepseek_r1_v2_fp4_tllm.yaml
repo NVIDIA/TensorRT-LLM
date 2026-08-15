@@ -6,7 +6,7 @@ context_servers:
   tensor_parallel_size: 4
   pipeline_parallel_size: 1
   moe_expert_parallel_size: 4
-  enable_attention_dp: false
+  enable_attention_dp: true
   max_num_tokens: 16640
   max_seq_len: 8232
   max_batch_size: 128
@@ -18,17 +18,25 @@ context_servers:
     dtype: fp8
   moe_config:
     backend: TRTLLM
+    # Chunk the MoE forward at half of max_num_tokens: the TRTLLM-Gen FP4
+    # MoE workspace for a full 16640-token chunk is a 7-8 GiB transient,
+    # which exceeds the headroom left after weights (~107.5 GiB/GPU) and the
+    # KV pool on 192GB B200 and intermittently OOMs the ctx worker under
+    # 512-concurrency 8k prefill load (memory estimation only observes
+    # ~10.8 GiB dynamic peak, so the KV pool leaves no slack for it).
+    max_num_tokens: 8320
   cuda_graph_config: null
   print_iter_log: true
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
     max_tokens_in_buffer: 16384
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 4
   pipeline_parallel_size: 1
   moe_expert_parallel_size: 4
-  enable_attention_dp: false
+  enable_attention_dp: true
   max_num_tokens: 10240
   max_seq_len: 10240
   max_batch_size: 128
@@ -57,5 +65,6 @@ generation_servers:
     - 1024
   print_iter_log: true
   cache_transceiver_config:
-    backend: DEFAULT
+    backend: NIXL
+    transceiver_runtime: PYTHON
     max_tokens_in_buffer: 16384

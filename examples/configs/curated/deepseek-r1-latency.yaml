@@ -9,7 +9,7 @@ moe_config:
   backend: TRTLLM
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 3
+  max_draft_len: 3
   use_relaxed_acceptance_for_thinking: true
   relaxed_topk: 10
   relaxed_delta: 0.6

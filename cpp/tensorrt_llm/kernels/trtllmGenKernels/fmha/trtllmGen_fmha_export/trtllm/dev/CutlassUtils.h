@@ -20,6 +20,8 @@
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_conversion.h>
 
+#include <cstdint>
+
 namespace trtllm {
 namespace dev {
 
@@ -177,6 +179,33 @@ inline __device__ cutlass::uint128_t convertBfloat16ToFp16(cutlass::uint128_t sr
 inline __device__ cutlass::uint128_t convertE4m3ToBfloat16(uint64_t src) {
   auto srcArray{castToArray<cutlass::float_e4m3_t, 8>(src)};
   return castFromArray<cutlass::uint128_t>(castArray<cutlass::bfloat16_t>(srcArray));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ cutlass::uint128_t convertE4m3ToBfloat16WithSassPatch(uint64_t src) {
+#ifndef TLLM_PUBLIC_RELEASE
+  cutlass::uint128_t dst;
+  auto srcB16 = reinterpret_cast<uint16_t const*>(&src);
+  auto srcB32 = reinterpret_cast<uint32_t const*>(&src);
+  auto dstB32 = reinterpret_cast<uint32_t*>(&dst);
+
+#pragma unroll
+  for (int ii = 0; ii < 4; ++ii) {
+    uint32_t srcPair = srcB16[ii];
+    // The second source keeps the placeholder instruction shape stable for the SASS patcher; the
+    // patched direct unpack uses only srcPair.
+    uint32_t dummy = srcB32[(ii >> 1) ^ 1];
+
+    // Placeholder for SASS patching. Replaced with:
+    //   F2FP.BF16.E4M3.UNPACK_B dst, srcPair, 4.5736980577097704378e-41.H0
+    asm volatile("lop3.b32 %0, %1, %1, %2, 0x77;" : "=r"(dstB32[ii]) : "r"(srcPair), "r"(dummy));
+  }
+
+  return dst;
+#else
+  return convertE4m3ToBfloat16(src);
+#endif // TLLM_PUBLIC_RELEASE
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -996,21 +1025,6 @@ inline __device__ uint32_t make_utcmma_desc_block(uint32_t fmtSf,
 // out.
 template <int GroupSize, int GroupStride>
 inline __device__ float reduce_group_max_abs_f32(float value, int laneIdx) {
-  // CREDUX is a whole warp reduction. Reduction for smaller group size N is emulated by:
-  //  - FSEL (only participating threads contribute to the reduction)
-  //  - CREDUX (actual reduction)
-  //  - IMAD.MOV (move the result)
-  // Times that with the number of groups in the warp to get rough number of instructions.
-  // On ther other hand, SHFL-based reduction is a log2(N) operation. In that sense:
-  //  - When N = 32, CREDUX 1 instruction. SHFL 5 instructions.
-  //  - When N = 16, CREDUX 3*2 instructions. SHFL 4 instructions.
-  //  - When N = 8, CREDUX 3*4 instructions. SHFL 3 instructions.
-  // And so on. Taking account of the actual IPC on SM100 where FSEL/CREDUX/IMAD take 2 cycles and
-  // SHFL takes 4 cycles:
-  //  - When N = 32, CREDUX 2 cycles. SHFL 20 cycles.
-  //  - When N = 16, CREDUX 12 cycles. SHFL 16 cycles.
-  //  - When N = 8, CREDUX 24 cycles. SHFL 12 cycles.
-  // As result, CREDUX is better when group size >= 16.
 #if __CUDA_HAS_ARCH_FAMILY_SPECIFIC(100)
   constexpr bool UseRedux = (GroupSize >= 16);
 #else

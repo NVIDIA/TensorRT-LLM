@@ -1,0 +1,48 @@
+# Dynamo-replica: agg Qwen3-32B FP8 TRT-LLM deployment.
+#
+# Source (upstream Dynamo recipe):
+#   https://github.com/ai-dynamo/dynamo/tree/main/recipes/qwen3-32b-fp8/trtllm/agg
+
+metadata:
+  model_name: qwen3_32b_fp8
+  supported_gpus:
+  - H200
+hardware:
+  gpus_per_node: 8
+server_configs:
+  - name: "qwen3_32b_fp8_tp2_6k1k"
+    model_name: "qwen3_32b_fp8"
+    tensor_parallel_size: 2
+    pipeline_parallel_size: 1
+    max_batch_size: 96
+    max_num_tokens: 7964
+    max_seq_len: 7964
+    attn_backend: "TRTLLM"
+    enable_attention_dp: false
+    enable_chunked_prefill: false
+    disable_overlap_scheduler: false
+    print_iter_log: false
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 96
+    kv_cache_config:
+      dtype: 'fp8'
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+    client_configs:
+      # ISL+OSL must stay within recipe's max_seq_len=7964, so use ~6.7k/1k.
+      - name: "con96_iter10_6k1k"
+        concurrency: 96
+        iterations: 10
+        isl: 6912
+        osl: 1024
+        backend: "openai"
+        dataset_file: <dataset_file>

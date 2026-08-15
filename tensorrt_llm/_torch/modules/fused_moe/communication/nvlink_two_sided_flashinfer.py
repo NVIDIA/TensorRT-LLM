@@ -21,16 +21,47 @@ This module implements the NVLINK two-sided comm AllToAll communication method f
 NVLINK Two-Sided supports post-quant dispatch for all quantization modes.
 """
 
+import functools
 import os
 from typing import List, Optional, Tuple
 
+import pynvml
 import torch
-from flashinfer.comm.mnnvl import MnnvlMemory as flashinfer_MnnvlMemory
-from flashinfer.comm.trtllm_alltoall import MnnvlMoe as flashinfer_MnnvlMoe
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from .base import Communication
+
+
+@functools.lru_cache(maxsize=1)
+def _flashinfer_mnnvl():
+    """Resolve FlashInfer's MNNVL symbols on first use.
+
+    Deliberately not a module-level import: ``flashinfer.comm`` does not import
+    on every interpreter this package supports. FlashInfer >= 0.6.16 annotates
+    ``array.array[int]`` at module scope in ``comm/fd_exchange.py``, and
+    ``array.array`` only became subscriptable in Python 3.12, so that annotation
+    raises ``TypeError`` on the 3.10/3.11 interpreters covered by our
+    ``python_requires`` (FlashInfer declares ``requires_python >= 3.10`` too, so
+    this is an upstream bug). At module scope that would break ``import
+    tensorrt_llm`` outright; resolving it lazily confines the damage to this one
+    alltoall strategy.
+
+    Returns ``(MnnvlMemory, MnnvlMoe)``, or ``None`` when unavailable.
+    """
+    try:
+        from flashinfer.comm.mnnvl import MnnvlMemory
+        from flashinfer.comm.trtllm_alltoall import MnnvlMoe
+    except (ImportError, TypeError) as e:
+        # TypeError covers the annotation-evaluation failure described above;
+        # it is not a generic catch-all.
+        logger.warning(
+            f"flashinfer.comm is unavailable ({e}); the NVLinkTwoSidedFlashinfer "
+            f"MoE alltoall strategy is disabled."
+        )
+        return None
+    return MnnvlMemory, MnnvlMoe
 
 
 class NVLinkTwoSidedFlashinfer(Communication):
@@ -76,10 +107,19 @@ class NVLinkTwoSidedFlashinfer(Communication):
         # CutlassFusedMoE kernels support any invalid value.
         self.invalid_token_expert_id: int = -1
 
+        mnnvl = _flashinfer_mnnvl()
+        if mnnvl is None:
+            raise RuntimeError(
+                "NVLinkTwoSidedFlashinfer requires flashinfer.comm, which failed "
+                "to import (see the preceding warning); select a different MoE "
+                "alltoall strategy or run on Python >= 3.12."
+            )
+        flashinfer_MnnvlMemory, self._mnnvl_moe = mnnvl
+
         # Initialize NVLINK workspaces
         flashinfer_MnnvlMemory.initialize()
-        self.alltoall_workspace = flashinfer_MnnvlMoe.get_moe_workspaces(mapping)
-        self.alltoall_prepare_workspace = flashinfer_MnnvlMoe.get_moe_prepare_workspace(mapping)
+        self.alltoall_workspace = self._mnnvl_moe.get_moe_workspaces(mapping)
+        self.alltoall_prepare_workspace = self._mnnvl_moe.get_moe_prepare_workspace(mapping)
 
         # Initialize dispatch state
         self._dispatch_state = {}
@@ -89,6 +129,18 @@ class NVLinkTwoSidedFlashinfer(Communication):
         """
         Check if NVLINK two-sided comm is supported on current hardware.
         """
+        mnnvl = _flashinfer_mnnvl()
+        if mnnvl is None:
+            return False
+        flashinfer_MnnvlMemory, _ = mnnvl
+
+        # flashinfer's MnnvlMemory.supports_mnnvl() queries NVML without
+        # initializing it (only its initialize() guards), so satisfy that
+        # precondition on our side of the boundary.
+        try:
+            pynvml.nvmlDeviceGetCount()
+        except pynvml.NVMLError_Uninitialized:
+            pynvml.nvmlInit()
         return flashinfer_MnnvlMemory.supports_mnnvl()
 
     def supports_post_quant_dispatch(self) -> bool:
@@ -120,7 +172,7 @@ class NVLinkTwoSidedFlashinfer(Communication):
 
         # Call NVLINK prepare to get alltoall_info and gather EPLB statistics
         alltoall_info, _, __, gathered_local_statistic_tensor = (
-            flashinfer_MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
+            self._mnnvl_moe.mnnvl_moe_alltoallv_prepare_without_allgather(
                 token_selected_slots,
                 None,
                 local_statistic_tensor,
@@ -157,7 +209,7 @@ class NVLinkTwoSidedFlashinfer(Communication):
             results = []
             for tensor in x:
                 if tensor is not None:
-                    result = flashinfer_MnnvlMoe.mnnvl_moe_alltoallv(
+                    result = self._mnnvl_moe.mnnvl_moe_alltoallv(
                         tensor, alltoall_info, workspace, ep_rank, ep_size
                     )
                     results.append(result)
@@ -213,7 +265,7 @@ class NVLinkTwoSidedFlashinfer(Communication):
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
 
-        final_hidden_states = flashinfer_MnnvlMoe.mnnvl_moe_alltoallv_combine(
+        final_hidden_states = self._mnnvl_moe.mnnvl_moe_alltoallv_combine(
             final_hidden_states,
             self._dispatch_state["alltoall_info"],
             self.alltoall_workspace,

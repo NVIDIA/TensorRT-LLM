@@ -11,7 +11,18 @@
         ],
         "kwargs": {
           "SOURCE_LIST": "1",
-          "TARGET": "1",
+          "ARCHS": "+"
+        }
+      },
+      "tllm_add_cubin_archive_sources": {
+        "pargs": 2,
+        "flags": [
+          "IMPLICIT_FAMILY"
+        ],
+        "kwargs": {
+          "SYMBOL_PREFIX": "1",
+          "SYMBOL_SUFFIX": "1",
+          "NAMESPACE": "+",
           "ARCHS": "+"
         }
       }

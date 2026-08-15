@@ -70,7 +70,7 @@ def backend(request):
     return request.param
 
 
-@pytest.fixture(scope="module", params=[0], ids=["disable_processpool"])
+@pytest.fixture(scope="module", params=[0, 1], ids=["disable_processpool", "enable_processpool"])
 def num_postprocess_workers(request):
     return request.param
 
