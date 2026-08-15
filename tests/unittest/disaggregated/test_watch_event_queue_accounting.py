@@ -5,7 +5,12 @@ import asyncio
 
 import pytest
 
-from tensorrt_llm.serve.cluster_storage import StorageItem, WatchEvent, WatchEventQueue, WatchEventType
+from tensorrt_llm.serve.cluster_storage import (
+    StorageItem,
+    WatchEvent,
+    WatchEventQueue,
+    WatchEventType,
+)
 
 pytestmark = pytest.mark.cpu_only
 
