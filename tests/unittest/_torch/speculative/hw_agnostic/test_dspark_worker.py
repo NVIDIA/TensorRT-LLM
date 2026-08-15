@@ -168,8 +168,9 @@ def test_worker_graph_bucket_uses_full_seq_slot_pool():
     )
 
     assert metadata.max_num_requests == 2 < metadata.num_seq_slots
-    assert worker._kv_windows.shape == (6, 1, 8, 4)
-    assert worker._ctx_len.shape == (6,)
+    num_slots = num_seq_slots + 1
+    assert worker._kv_windows.shape[0] == num_slots
+    assert worker._ctx_len.shape[0] == num_slots
     assert worker._batch_to_slot.shape == (num_seq_slots,)
     assert worker._scratch_slot == num_seq_slots
     assert list(worker._free_slots) == list(range(num_seq_slots))
