@@ -482,4 +482,13 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         default=None,
         description="Controls share the target frames' temporal mRoPE positions.",
     ),
+    "emphasize_control_in_prompt": ExtraParamSchema(
+        type="bool",
+        default=None,
+        description=(
+            "Append a one-sentence control-adherence directive naming the active "
+            "hints to the user prompt (default true). Set false for clean "
+            "baselines / ablations. The system prompt is unchanged."
+        ),
+    ),
 }

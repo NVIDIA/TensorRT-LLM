@@ -62,6 +62,7 @@ from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
 from .sampling import DISTILLED_GUIDANCE_SCALE, Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
+    TRANSFER_DEFAULTS,
     Cosmos3TransferConfig,
     decode_media_to_uint8_cthw,
     find_closest_target_size,
@@ -560,13 +561,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         Derived rather than fixed so a new family or mode table is picked up
         automatically: the per-mode generation tables, the checkpoint's own
-        shift, and V2V's stronger shift. Entries are still created lazily, so a
-        mode that is never served never builds one.
+        shift, V2V's stronger shift, and the per-hint transfer presets. Entries
+        are still created lazily, so a mode that is never served never builds
+        one.
+
+        Transfer's shifts are included even though every hint currently declares
+        the same value as V2V: tuning one off that value would otherwise drop it
+        out of the cache silently and rebuild a scheduler on every request for
+        that hint.
         """
         cached = getattr(self, "_cacheable_flow_shifts_cache", None)
         if cached is not None:
             return cached
-        shifts = {COSMOS3_V2V_FLOW_SHIFT}
+        shifts = {COSMOS3_V2V_FLOW_SHIFT, COSMOS3_V2V_DEFAULT_FLOW_SHIFT}
         checkpoint_shift = getattr(self.sampling, "checkpoint_flow_shift", None)
         if checkpoint_shift is not None:
             shifts.add(float(checkpoint_shift))
@@ -575,6 +582,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             mode_shift = table.get("flow_shift")
             if mode_shift is not None:
                 shifts.add(float(mode_shift))
+        for hint_defaults in TRANSFER_DEFAULTS.values():
+            hint_shift = hint_defaults.get("flow_shift")
+            if hint_shift is not None:
+                shifts.add(float(hint_shift))
         cached = self._cacheable_flow_shifts_cache = frozenset(shifts)
         return cached
 
@@ -2050,7 +2061,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         max_sequence_length = max_sequence_length or COSMOS3_720P_PARAMS["max_sequence_length"]
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
-        self._apply_flow_shift(flow_shift_target, use_karras_sigmas=False)
+        # forward() skips its own scheduler rebuild for transfer, so this is the
+        # only setup on this path: assigning is what keeps a previous request's
+        # scheduler from carrying over on a reused worker.
+        self.scheduler = self._scheduler_for(flow_shift_target, use_karras_sigmas=False)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -2061,7 +2075,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # Keep them verbatim; duration/resolution templates would change parity.
         prompt = [prompt] if isinstance(prompt, str) else list(prompt)
         prompt = prompt[0]
-        logger.info(f"Transfer prompt: '{prompt}'")
+        prompt = transfer_config.emphasized_prompt(prompt)
+        if self.rank == 0:
+            logger.info(f"Transfer prompt: '{prompt}'")
 
         # 1. Tokenize prompts (no separate text encoder — transformer embeds internally)
         logger.info("Tokenizing prompts...")

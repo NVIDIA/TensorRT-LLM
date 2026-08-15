@@ -68,7 +68,18 @@ TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
     "show_input": False,  # debug: also emit the input frames
     "num_first_chunk_conditional_frames": 0,  # chunk 0 has no prior chunk to condition on
     "share_vision_temporal_positions": True,  # control tokens reuse the video patches' positions
+    "emphasize_control_in_prompt": True,  # name the active hints in the user prompt
 }
+
+# Appended to the user prompt when ``emphasize_control_in_prompt`` is on, naming
+# the active hint modalities so the model is told which control it is following.
+# The system prompt is left alone, which keeps the text in the training
+# distribution.
+CONTROL_DIRECTIVE_TEMPLATE = (
+    " Follow the {hints} control video precisely: shape, contour, silhouette,"
+    " position, and motion of every visible structure must align with the {hints}"
+    " signal at every frame."
+)
 
 # Per-hint guidance tuning: text guidance_scale, control_guidance, and flow_shift,
 # chosen empirically per control modality.
@@ -157,10 +168,21 @@ class Cosmos3TransferConfig:
     share_vision_temporal_positions: bool = True
     num_frames: int | None = None
     fps: float | None = None
+    emphasize_control_in_prompt: bool = True
 
     @property
     def ordered_hints(self) -> list[Cosmos3TransferHint]:
         return [self.hints[key] for key in TRANSFER_HINT_KEYS if key in self.hints]
+
+    def emphasized_prompt(self, prompt: str) -> str:
+        """The user prompt with the control-adherence directive appended.
+
+        Returned unchanged when the directive is off or no hint is active.
+        """
+        if not self.emphasize_control_in_prompt or not self.hints:
+            return prompt
+        hint_names = ", ".join(hint.key for hint in self.ordered_hints)
+        return prompt.rstrip() + CONTROL_DIRECTIVE_TEMPLATE.format(hints=hint_names)
 
 
 def _as_interval(value: Any) -> tuple[float, float] | None:
@@ -241,6 +263,7 @@ def resolve_transfer_config(
             "show_control_condition",
             "show_input",
             "share_vision_temporal_positions",
+            "emphasize_control_in_prompt",
         )
         if any(extra_params.get(key, None) for key in transfer_only):
             raise ValueError(
@@ -248,17 +271,24 @@ def resolve_transfer_config(
             )
         return None
 
-    request_guidance_scale = getattr(req_params, "guidance_scale", None)
-    if request_guidance_scale is None:
-        # vLLM-compatible transfer guidance default: OmniDiffusionRequest
-        # materializes omitted guidance_scale to 1.0 before transfer defaults
-        # are resolved, so single-hint presets must not silently promote it.
-        request_guidance_scale = 1.0
-
-    # `frame_rate` and `num_frames` are advertised defaults the executor merges
-    # into every request, so only `model_fields_set` distinguishes a caller's
-    # value from a merged one.
+    # `guidance_scale`, `frame_rate` and `num_frames` are advertised defaults the
+    # executor merges into every request, so only `model_fields_set` distinguishes
+    # a caller's value from a merged one.
     specified = getattr(req_params, "model_fields_set", frozenset())
+
+    # Stays None unless the caller asked for a value, so the single-hint preset
+    # below can apply. Reading `req_params.guidance_scale` unconditionally would
+    # capture the executor-merged default and make every request look explicit,
+    # which pins transfer to the generic scale and never reaches the tuned
+    # per-hint presets. With no preset (multi-hint), `_forward_transfer` falls
+    # back to the generic video default -- matching the reference, where the
+    # per-task table applies only to a single hint.
+    guidance_scale_user_set = (
+        "guidance_scale" in specified or extra_params.get("guidance_scale", None) is not None
+    )
+    request_guidance_scale = (
+        getattr(req_params, "guidance_scale", None) if guidance_scale_user_set else None
+    )
 
     config = Cosmos3TransferConfig(
         hints=hints,
@@ -299,6 +329,11 @@ def resolve_transfer_config(
             "share_vision_temporal_positions",
             TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"],
         ),
+        emphasize_control_in_prompt=_extra_or_default(
+            extra_params,
+            "emphasize_control_in_prompt",
+            TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"],
+        ),
         num_frames=_extra_or_default(
             extra_params, "num_frames", getattr(req_params, "num_frames", None)
         ),
@@ -325,7 +360,7 @@ def resolve_transfer_config(
         hint_key = next(iter(hints))
         for field_name, default_value in TRANSFER_DEFAULTS[hint_key].items():
             if field_name == "guidance_scale":
-                user_set = config.guidance_scale is not None
+                user_set = guidance_scale_user_set
             elif field_name == "flow_shift":
                 user_set = extra_params.get("flow_shift", None) is not None
             elif field_name == "fps":

@@ -182,6 +182,21 @@ class StubSamplingPolicy:
         self.fixed_sigmas = fixed_sigmas
         self.set_timesteps_calls = []
         self.step_kwargs_calls = 0
+        self.flow_shift_calls = []
+
+    def set_flow_shift(self, scheduler, target_shift, use_karras_sigmas=None):
+        """Record the programmed shift and return the scheduler to install.
+
+        Returns a distinct instance, like the real policy: the base scheduler
+        is kept pristine so shifts never accumulate, which means the caller has
+        to assign the result. Implemented here so the tests drive the
+        pipeline's real ``_scheduler_for`` instead of a stand-in -- stubbing
+        the pipeline method would re-create the hole that let a call to a
+        deleted helper ship green.
+        """
+        del scheduler
+        self.flow_shift_calls.append(target_shift)
+        return StubScheduler()
 
     def set_timesteps(self, scheduler, num_inference_steps, device=None):
         self.set_timesteps_calls.append(num_inference_steps)
@@ -244,19 +259,43 @@ class TestTransferConfig:
         cfg = resolve_transfer_config({"edge": True}, _req())
         assert cfg is not None
         assert list(cfg.hints) == ["edge"]
-        # DELIBERATE deviation from the reference resolve-level test (which
-        # asserts the per-hint preset 3.0): TRT-LLM cannot distinguish an
-        # omitted request guidance_scale from a merged pipeline default, and
-        # mirrors vllm-omni's *serving* behavior where an omitted value
-        # materializes to 1.0 before resolve, leaving the preset unapplied.
-        assert cfg.guidance_scale == 1.0
+        # The per-hint preset applies when the caller omitted guidance_scale,
+        # matching both references. The executor merges a pipeline default into
+        # every request, so `model_fields_set` -- not "is the value None" -- is
+        # what separates caller intent from a merged default.
+        assert cfg.guidance_scale == 3.0
         assert (
             resolve_transfer_config({"edge": True}, _req(guidance_scale=6.0)).guidance_scale == 6.0
         )
+        # An executor-merged default must not read as caller intent, or the
+        # preset becomes unreachable for every request that goes through infer().
+        merged = resolve_transfer_config({"edge": True}, _merged_req(guidance_scale=7.0))
+        assert merged.guidance_scale == 3.0
         assert cfg.control_guidance == 1.5
         assert cfg.flow_shift == 10.0
         assert cfg.num_video_frames_per_chunk == 93
         assert cfg.share_vision_temporal_positions is True
+
+    def test_control_directive_is_appended_by_default(self):
+        """Reference parity: cosmos-framework names the active control modality
+        in the user prompt unless the caller opts out. The system prompt is
+        untouched, which keeps the text in the training distribution."""
+        cfg = resolve_transfer_config({"edge": True}, _req())
+        assert cfg.emphasize_control_in_prompt is True
+        emphasized = cfg.emphasized_prompt("a robot dancing")
+        assert emphasized.startswith("a robot dancing")
+        assert "Follow the edge control video precisely" in emphasized
+
+    def test_control_directive_names_every_active_hint(self):
+        cfg = resolve_transfer_config({"edge": True, "seg": b"clip"}, _req())
+        # Hint order is TRANSFER_HINT_KEYS order, not caller order, so the
+        # directive text is stable across equivalent requests.
+        assert "Follow the edge, seg control video precisely" in cfg.emphasized_prompt("x")
+
+    def test_control_directive_can_be_disabled(self):
+        cfg = resolve_transfer_config({"edge": True, "emphasize_control_in_prompt": False}, _req())
+        assert cfg.emphasize_control_in_prompt is False
+        assert cfg.emphasized_prompt("a robot dancing") == "a robot dancing"
 
     def test_no_hints_resolves_none(self):
         assert resolve_transfer_config({}, _req()) is None
@@ -766,11 +805,10 @@ class TestForwardTransferChunks:
 
     def test_multichunk_overlap_path(self, monkeypatch):
         pipeline = _make_pipeline()
-        captured = {"targets": [], "conditional_frames": [], "decode_calls": [], "flow_shifts": []}
+        captured = {"targets": [], "conditional_frames": [], "decode_calls": []}
 
         tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
         pipeline._tokenize_prompt = lambda *args, **kwargs: next(tokenized)
-        pipeline._apply_flow_shift = lambda target, **kwargs: captured["flow_shifts"].append(target)
 
         original_prepare = pipeline._prepare_transfer_latents
 
@@ -874,7 +912,6 @@ class TestTransferFrameRateResolution:
         monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
         tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
         pipeline._tokenize_prompt = lambda *a, **k: next(tokenized)
-        pipeline._apply_flow_shift = lambda *a, **k: None
         pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)
 
         params = _merged_req(frame_rate=COSMOS3_720P_PARAMS["frame_rate"], num_frames=5)
@@ -940,14 +977,13 @@ class TestTransferFrameRateResolution:
 class TestTransferSamplingAndSafety:
     """The transfer branch must not skip what every other mode goes through."""
 
-    def _run(self, pipeline, monkeypatch, *, use_guardrails=False, cfg_extra=None):
+    def _run(self, pipeline, monkeypatch, *, use_guardrails=False, cfg_extra=None, tokenize=None):
         monkeypatch.setattr(
             transfer_module, "decode_video_reference_window", _fake_decode_window(5)
         )
         monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
         tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
-        pipeline._tokenize_prompt = lambda *a, **k: next(tokenized)
-        pipeline._apply_flow_shift = lambda *a, **k: None
+        pipeline._tokenize_prompt = tokenize or (lambda *a, **k: next(tokenized))
         pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)
         cfg = resolve_transfer_config(
             {"edge": {"control": b"clip"}, "num_video_frames_per_chunk": 5, **(cfg_extra or {})},
@@ -971,6 +1007,45 @@ class TestTransferSamplingAndSafety:
             timer=_started_timer(),
             transfer_config=cfg,
             video=None,
+        )
+
+    def test_control_directive_reaches_the_tokenizer(self, monkeypatch):
+        """Resolving the directive is not enough -- it has to reach the text
+        the model actually conditions on, and only the positive prompt."""
+        pipeline = _make_pipeline()
+        seen = []
+        tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
+
+        def capture(prompt, *args, **kwargs):
+            seen.append(prompt)
+            return next(tokenized)
+
+        self._run(pipeline, monkeypatch, tokenize=capture)
+        assert "Follow the edge control video precisely" in seen[0]
+        assert "Follow the edge" not in seen[1], "directive leaked into the negative prompt"
+
+    def test_transfer_installs_a_shifted_scheduler(self, monkeypatch):
+        """Transfer owns its scheduler setup, so it must actually perform it.
+
+        ``forward()`` deliberately skips the scheduler rebuild when a transfer
+        config is present, which makes this the only place the shift is applied
+        -- and the only thing standing between a request and whatever schedule
+        the previous request left on the worker. Asserted through the real
+        ``_scheduler_for``: a rename of that helper breaks here rather than
+        being papered over by a stub.
+        """
+        sampling = StubSamplingPolicy()
+        pipeline = _make_pipeline(sampling=sampling)
+        pipeline.scheduler = StubScheduler()
+        baseline = pipeline.scheduler
+        self._run(pipeline, monkeypatch)
+        assert sampling.flow_shift_calls == [
+            transfer_module.TRANSFER_DEFAULTS["edge"]["flow_shift"]
+        ], "transfer did not program the hint's flow shift"
+        # Installed, not merely built: a bare call that drops the returned
+        # scheduler leaves the previous request's schedule in place.
+        assert pipeline.scheduler is not baseline, (
+            "transfer built a scheduler but never installed it"
         )
 
     def test_schedule_is_programmed_through_the_sampling_policy(self, monkeypatch):

@@ -998,7 +998,6 @@ class TestCosmos3TransferRouting:
         # __new__ skips __init__, where the real pipeline resolves this.
         pipeline.family = QWEN3_RECIPE.name
         pipeline.audio_gen = False
-        pipeline._apply_flow_shift = lambda *args, **kwargs: None
 
         class FakeSampling:
             is_distilled = False
@@ -1053,7 +1052,6 @@ class TestCosmos3TransferRouting:
         # __new__ skips __init__, where the real pipeline resolves this.
         pipeline.family = QWEN3_RECIPE.name
         pipeline.audio_gen = False
-        pipeline._apply_flow_shift = lambda *args, **kwargs: None
 
         class FakeSampling:
             is_distilled = False
