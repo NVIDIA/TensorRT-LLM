@@ -798,7 +798,6 @@ accuracy/test_llm_api_pytorch.py::TestInkling_Small_NVFP4::test_nvfp4
 accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8]
 accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm]
 accuracy/test_llm_api_pytorch_multimodal.py::TestMistralSmall24B::test_auto_dtype[forced_chunked_prefill]
-accuracy/test_llm_api_pytorch_multimodal.py::TestNVILA_8B::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
 accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[fp8]
 accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[fp8_mmmu_encoder_cuda_graph]
@@ -815,7 +814,6 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_fp8_block_scales[
 accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_fp8_block_scales[mtp_nextn=3] TIMEOUT (120)
 accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4[mtp_nextn=0] TIMEOUT (120)
 accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4[mtp_nextn=3] TIMEOUT (120)
-accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
 accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
 unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_v1_masked_dsa_indexer_across_asymmetric_pp
 disaggregated/test_ad_disagg.py::test_async_eagle3_full_model_handoff

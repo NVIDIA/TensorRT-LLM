@@ -249,13 +249,6 @@ _STANDARD = [
         head_dim=128,
     ),
     ModelAttnConfig(
-        "vila1_5_3b_mha",
-        "VILA1.5-3B LLM",
-        num_heads=20,
-        num_kv_heads=20,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
         "llama2_13b_qwen1_5_14b_mha",
         "Llama-2-13B, Qwen1.5-14B",
         num_heads=40,
