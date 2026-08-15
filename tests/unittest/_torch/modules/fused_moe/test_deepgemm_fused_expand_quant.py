@@ -216,11 +216,10 @@ def test_group_quant_fp8_under_torch_compile(kernel: str) -> None:
     propagates into ``output_s``, so pinning ``fp8_max`` alone still compiles to
     an fp64 ``output_s``.
 
-    Whether Inductor binds these scalars as fp64 depends on the torch/Inductor
-    version, not the SM version: torch 2.10 emits ``'fp8_max': 'fp32'`` in the
-    generated kernel signature, torch 2.11 and 2.13 emit ``'fp64'`` (checked on
-    both sm_120 and sm_121, and with the same triton 3.6.0 on either side of the
-    split). So this guard only bites on runners carrying torch >= 2.11.
+    On the validated torch/Inductor builds, these scalars are bound as fp64: the
+    generated kernel signature emits ``'fp8_max': 'fp64'`` on torch 2.11
+    (sm_120) and torch 2.12 (sm_121), both with triton 3.6.0. This guard ensures
+    the kernels remain valid when Inductor uses that scalar specialization.
 
     ``fullgraph=True`` keeps a future graph break from turning this into a silent
     pass that never reaches Inductor.
