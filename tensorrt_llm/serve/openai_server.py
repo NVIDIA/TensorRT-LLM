@@ -266,10 +266,21 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
             "json_object", "json_schema"):
         derived["response_format"] = response_format.type
         if response_format.type == "json_schema":
-            schema = response_format.json_schema
-            if isinstance(schema, dict) and "schema" in schema:
-                schema = schema["schema"]
-            derived["response_schema"] = schema
+            # Kimi requires the OpenAI wrapper shape: {name, schema[, strict]}.
+            json_schema = response_format.json_schema
+            if not isinstance(json_schema, dict) or not isinstance(
+                    json_schema.get("name"), str) or not json_schema["name"]:
+                raise ValueError(
+                    "response_format.json_schema requires a non-empty "
+                    "`name` string.")
+            if not isinstance(json_schema.get("schema"), dict):
+                raise ValueError(
+                    "response_format.json_schema requires a `schema` object.")
+            if "strict" in json_schema and not isinstance(
+                    json_schema["strict"], bool):
+                raise ValueError(
+                    "response_format.json_schema.strict must be a boolean.")
+            derived["response_schema"] = json_schema["schema"]
     if derived:
         request.chat_template_kwargs = {
             **derived,
