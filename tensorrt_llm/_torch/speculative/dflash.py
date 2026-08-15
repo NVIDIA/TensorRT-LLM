@@ -1002,10 +1002,12 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables = None
         self._ctx_block_counts = None
         # Worker-owned and allocated once, then reused for every later batch
-        # shape, so this must span the full seq-slot pool. max_num_requests is
-        # shrunk to the captured graph bucket by create_cuda_graph_metadata,
-        # which would pin the pool to whichever bucket drafts first and leave
-        # _dummy_slot aliasing a live request's row.
+        # shape, so this must span a stable upper bound. _free_slots assigns
+        # rows by request ID and only needs the pre-graph max_num_requests;
+        # num_seq_slots is the surviving proxy after max_num_requests is
+        # narrowed to a captured graph bucket. Under disagg-ADP it can be
+        # 2 * max_num_requests, so this deliberately overallocates the large
+        # context K/V buffers to keep one safe capacity across graph buckets.
         max_batch = spec_metadata.num_seq_slots
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
