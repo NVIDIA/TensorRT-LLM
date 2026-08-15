@@ -55,7 +55,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen3ForTextEmbedding`              | Qwen3-Embedding                    | `Qwen/Qwen3-Embedding-8B`                    |
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
-| `Qwen3_5MoeForCausalLM`              | Qwen3.5-MoE                        | `Qwen/Qwen3.5-397B-A17B`                     |
+| `Qwen3_5MoeForCausalLM`              | Qwen3.8-MoE, Qwen3.5-MoE           | `Qwen/Qwen3.8-2.4T-A95B`, `Qwen/Qwen3.5-397B-A17B` |
 | `SeedOssForCausalLM` [^5]            | Seed OSS, Seed-Coder               | `ByteDance-Seed/Seed-OSS-36B-Instruct`       |
 | `SkyworkR1V2ForConditionalGeneration` [^5] | Skywork R1V2, Skywork SWE    | `Skywork/Skywork-R1V2-38B`                   |
 | `SmolLM3ForCausalLM` [^5]            | SmolLM3                            | `HuggingFaceTB/SmolLM3-3B`                   |
@@ -206,6 +206,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
 
 ### Feature Matrix
 

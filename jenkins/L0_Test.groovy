@@ -32,6 +32,7 @@ import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 import trtllm.FailureClassifier
+import trtllm.ContextDeath
 import trtllm.exceptions.InfraFailure
 import trtllm.exceptions.PipelineInterruption
 import trtllm.exceptions.TrtllmCiException
@@ -156,6 +157,22 @@ SLURM_INFRA_RETRY_MAX = 1
 // For SLURM dispatcher pods this budget is bypassed (singleAttempt:true)
 // to avoid nesting with the inner SLURM retry.
 K8S_INFRA_RETRY_MAX = 1
+
+// Infra-scoped fail-fast master switch. When true, a branch whose post-retry
+// failure classifies as a positive K8s infra abort (via
+// FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its sibling
+// branches keep running instead of being SIGTERMed by failFast -- and a sub-job
+// that saw only infra aborts (no genuine failure) resolves to UNSTABLE. When
+// false, every failure rethrows and the original bare-boolean fail-fast is fully
+// restored. Kept separate from params.enableFailFast so the scoped behavior can
+// be disabled pipeline-wide without turning fail-fast itself off. Only K8s-scoped
+// aborts are deferred today; SLURM-scoped aborts fall back to today's fail-fast
+// (see runBranchesWithInfraDefer).
+//
+// Overridable without a code change by setting the ENABLE_INFRA_SCOPED_FAILFAST
+// env var on the job. Env values are strings ("false" is truthy in Groovy), so
+// the override goes through toBoolean() rather than the bare elvis.
+ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INFRA_SCOPED_FAILFAST.toBoolean() : true
 
 // Per-stage override of the above: set `infraRetryMax` in a stage's opts map (the
 // 3rd element of its parallel-jobs config tuple, alongside singleAttempt) to cap
@@ -774,7 +791,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         // `scontrol show job null`, whose "Invalid job id specified" output then
         // shows up in failure analysis as a bogus error signature.
         if (!isValidSlurmJobId(slurmJobID)) {
-            Utils.exec(pipeline, script: "echo No SLURM job ID captured for node ${nodeName}; skipping job cleanup dump")
+            Utils.exec(pipeline, script: "echo \"No SLURM job ID captured for node ${nodeName}; skipping job cleanup dump\"")
         } else {
             Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
@@ -814,108 +831,138 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 // A SLURM stage runs inside a K8s dispatcher pod that ssh-drives the job on the
 // login node. If that pod dies mid-run (eviction, container error, agent
 // offline), the in-pod cleanup can no longer reach the controller, so the SLURM
-// job and any Jenkins agent node leak. slurmResourceRegistry records the live
-// resources per stage -- the dispatcher pod spec (from the pod wrapper) and the
-// SLURM job / Jenkins node identity (from the stage body, re-registered per
-// inner attempt). Deregistering after a successful cleanup clears only the
-// per-attempt job/node identity and keeps the stage-level podSpec, so a *later*
-// attempt's dispatcher-pod death can still be reconciled off-pod (the pod spec
-// is registered once, before the inner retry loop). Only serializable
-// primitives are stored (no SlurmCluster/Throwable) so pipeline persistence is
-// unaffected; the cluster is rebuilt from clusterName. Plain maps: pipeline
-// Groovy runs single-threaded under CPS (parallel branches interleave at step
-// boundaries, never execute Groovy concurrently) and each stage writes its own
-// key, so no concurrent map corruption -- and the Jenkins script sandbox forbids
-// `new ConcurrentHashMap`. Keyed by stageName.
-@Field def slurmResourceRegistry = [:]
+// job and any Jenkins agent node leak. State + reconciliation live in the shared
+// `resourceLedger` (trtllm-jenkins-shared-lib). Each SLURM stage registers two
+// sibling entries -- "<stage>/dispatcher-pod" (the pod spec, from the pod
+// wrapper) and "<stage>/slurm" (the per-attempt SLURM job / Jenkins node, from
+// the stage body) -- so freeing the job/node after a successful in-pod cleanup
+// (markReclaimed) never disturbs the pod spec a *later* attempt's off-pod
+// reconciliation needs. The ledger stores only serializable primitives (it
+// rejects anything else) so pipeline persistence is unaffected; the SlurmCluster
+// is rebuilt from clusterName at reconcile time. The functions below are thin
+// SLURM-specific adapters over that generic ledger.
+//
+// Shared-library contract used below (trtllm-jenkins-shared-lib), documented here
+// for equivalence with the pre-shared inlined finalizer this replaced:
+//   * ContextDeath.isContextDeath(e) -- true when the flattened cause + suppressed
+//     chain contains a dispatcher-pod-death signal: "pod failed (reason:", "pod
+//     just failed", "pod failed because container terminated", "unable to create
+//     live filepath". Same pattern set the inlined isDispatcherPodFailure matched,
+//     now also traversing suppressed exceptions' own cause chains.
+//   * register(id, type, fields, ownerBuildTag) -- merges non-null fields into the
+//     id's entry; stores serializable primitives only (rejects anything else); a
+//     `fields` map may not overwrite the reserved id/type/ownerBuildTag keys.
+//   * markReclaimed(id) -- drops the entry (idempotent).
+//   * get(id) -- a deep-copied snapshot of the entry, or null.
+//   * reconcile(pipeline, select, reclaim) -- for each live entry matching
+//     select(entry), runs reclaim(pipeline, entry): deregisters entries whose
+//     reclaim returns truthy; leaves live those returning falsy or throwing (a
+//     throw is logged, never propagated). This is the equivalence backbone --
+//     "reconcile off-pod, deregister on success, leave for the sweep on failure."
 
+// Register a live SLURM resource. The pod wrapper passes a podSpec (recorded
+// under "<stage>/dispatcher-pod"); the stage body passes the SLURM job / Jenkins
+// node identity (recorded under "<stage>/slurm"). Keyed separately so they are
+// reclaimed independently. Absent fields are skipped by the ledger.
 void registerSlurmResource(String stageName, Map fields) {
     if (!stageName) {
         return
     }
-    def entry = slurmResourceRegistry.get(stageName)
-    if (entry == null) {
-        entry = [:]
-        slurmResourceRegistry.put(stageName, entry)
+    if (fields.containsKey('podSpec')) {
+        resourceLedger.register(id: "${stageName}/dispatcher-pod", type: 'k8sDispatcherPod',
+            fields: [podSpec: fields.podSpec, containerName: fields.containerName],
+            ownerBuildTag: env.BUILD_TAG)
+    } else {
+        resourceLedger.register(id: "${stageName}/slurm",
+            type: fields.usedSbatch ? 'slurmJob' : 'slurmNode',
+            fields: [clusterName: fields.clusterName, nodeName: fields.nodeName,
+                     jobUID: fields.jobUID, slurmJobId: fields.slurmJobId, usedSbatch: fields.usedSbatch],
+            ownerBuildTag: env.BUILD_TAG)
     }
-    // Skip absent fields. Writers for a given stage run sequentially (pod
-    // wrapper, then stage body), so no merge race.
-    fields.each { k, v -> if (v != null) { entry.put(k, v) } }
 }
 
 // Called once an attempt's resources are actually torn down: drop the per-attempt
-// job/node identity but keep the stage's podSpec (needed to launch a cleanup pod
-// for a later attempt). An entry left with only a podSpec is inert -- finalize
-// and the post-build sweep both skip entries with no job/node.
+// SLURM job/node entry. The stage's dispatcher-pod entry is a separate id and is
+// left intact (a later attempt's off-pod reconciliation still needs its pod spec).
 void deregisterSlurmResource(String stageName) {
     if (!stageName) {
         return
     }
-    def entry = slurmResourceRegistry.get(stageName)
-    if (entry != null) {
-        ["clusterName", "jobUID", "nodeName", "slurmJobId", "usedSbatch"].each { entry.remove(it) }
-    }
+    resourceLedger.markReclaimed("${stageName}/slurm")
 }
 
-// Reconcile one orphaned SLURM entry off the (dead) dispatcher pod: launch a
-// fresh short-lived pod and run the normal cleanup from there (scancel the job,
-// clean the workspace, and -- agent path -- drop the leaked Jenkins node), then
-// deregister. Best-effort: a finalizer failure is logged and the entry is left
-// for the post-build sweep to retry; it never masks the stage's own failure.
-def finalizeSlurmResourceEntry(pipeline, String stageName, def entry, def podSpecOverride = null) {
-    if (entry == null) {
-        return
+// Reclaim one orphaned SLURM entry off the (dead) dispatcher pod: launch a fresh
+// short-lived pod and run the normal cleanup from there (scancel the job, clean
+// the workspace, and -- agent path -- drop the leaked Jenkins node). Returns true
+// when the entry is reconciled (so resourceLedger deregisters it) and false when
+// it cannot be (left for the post-build sweep / manual cleanup). The pod spec and
+// container come from the sibling "<stage>/dispatcher-pod" entry; an in-catch
+// caller may pass podSpecOverride to use the failing attempt's spec directly.
+// Best-effort: a launch/cleanup failure is logged and the entry left live; it
+// never masks the stage's own failure. Used as the reclaim body for both the
+// in-catch finalize and the post-build sweep.
+def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
+    // The ledger is shared build-wide; only SLURM job/node entries are
+    // reconcilable here. Never touch (or deregister) another subsystem's entry a
+    // selector might pass in -- return false to leave it live and untouched.
+    if (entry.type != 'slurmJob' && entry.type != 'slurmNode') {
+        return false
     }
     // Pod died before any job/node was provisioned: nothing to reconcile.
     if (!entry.jobUID && !entry.nodeName) {
-        deregisterSlurmResource(stageName)
-        return
+        return true
     }
-    def podSpec = podSpecOverride ?: entry.podSpec
+    def podEntry = resourceLedger.get(((entry.id ?: "") as String).replaceFirst(/\/slurm$/, "/dispatcher-pod"))
+    def podSpec = podSpecOverride ?: podEntry?.podSpec
+    def containerName = podEntry?.containerName ?: "trt-llm"
     def cluster = entry.clusterName ? SlurmConfig.clusterConfig[entry.clusterName] : null
     if (!podSpec || !cluster) {
-        echo "[SLURM-FINALIZER] ${stageName}: cannot reconcile off-pod (missing pod spec or unknown cluster " +
+        echo "[SLURM-FINALIZER] ${entry.id}: cannot reconcile off-pod (missing pod spec or unknown cluster " +
              "'${entry.clusterName}'); SLURM job=${entry.slurmJobId ?: entry.jobUID ?: 'unknown'} " +
              "node=${entry.nodeName ?: 'n/a'} may need manual cleanup."
-        return
+        return false
     }
     try {
-        echo "[SLURM-FINALIZER] ${stageName}: reconciling orphaned SLURM resources off-pod " +
+        echo "[SLURM-FINALIZER] ${entry.id}: reconciling orphaned SLURM resources off-pod " +
              "(job=${entry.slurmJobId ?: entry.jobUID}, node=${entry.nodeName ?: 'n/a'})."
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, entry.containerName ?: "trt-llm", {
+        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, {
             if (entry.usedSbatch) {
                 cleanUpSlurmResources(pipeline, cluster, entry.clusterName, entry.jobUID)
             } else {
                 cleanUpNodeResources(pipeline, cluster, entry.clusterName, entry.nodeName, entry.slurmJobId)
             }
         })
-        deregisterSlurmResource(stageName)
-        echo "[SLURM-FINALIZER] ${stageName}: off-pod reconciliation complete."
+        echo "[SLURM-FINALIZER] ${entry.id}: off-pod reconciliation complete."
+        return true
     } catch (Exception e) {
-        echo "[SLURM-FINALIZER] ${stageName}: off-pod reconciliation failed (${e.toString()}); leaving entry for post-build sweep."
+        echo "[SLURM-FINALIZER] ${entry.id}: off-pod reconciliation failed (${e.toString()}); leaving entry for post-build sweep."
+        return false
     }
 }
 
+// Reconcile this stage's orphaned SLURM job/node off-pod (in-catch, on a detected
+// dispatcher-pod death). podSpecOverride is the failing attempt's pod spec so
+// reconciliation never depends on the sibling entry surviving.
 def finalizeOrphanedSlurmResource(pipeline, String stageName, def podSpecOverride = null) {
-    finalizeSlurmResourceEntry(pipeline, stageName, slurmResourceRegistry.get(stageName), podSpecOverride)
-}
-
-// Post-build backstop: reconcile any SLURM resources still registered at the end
-// of the build (a dispatcher-pod death whose in-catch finalize also failed, or a
-// failure mode the catch never saw). Runs off-pod from a fresh cleanup pod.
-def sweepOrphanedSlurmResources(pipeline) {
-    def orphans = slurmResourceRegistry.keySet().collect { it }.findAll {
-        def e = slurmResourceRegistry.get(it)
-        e != null && (e.jobUID || e.nodeName)
-    }
-    if (orphans.isEmpty()) {
+    if (!stageName) {
         return
     }
-    echo "[SLURM-FINALIZER] post-build sweep: ${orphans.size()} SLURM resource(s) were not cleaned up " +
-         "in-stage; reconciling off-pod: ${orphans.join(', ')}"
-    orphans.each { sName ->
-        finalizeSlurmResourceEntry(pipeline, sName, slurmResourceRegistry.get(sName))
-    }
+    resourceLedger.reconcile(pipeline,
+        { it.id == "${stageName}/slurm" },
+        { p, entry -> reconcileSlurmResource(p, entry, podSpecOverride) })
+}
+
+// Post-build backstop: reconcile any SLURM job/node still registered at the end of
+// the build (a dispatcher-pod death whose in-catch finalize also failed, or a
+// failure mode the catch never saw). Runs off-pod from a fresh cleanup pod; inert
+// dispatcher-pod-only entries are skipped by the selector.
+def sweepOrphanedSlurmResources(pipeline) {
+    // Scope to this subsystem's SLURM job/node entries: the ledger is shared
+    // build-wide, so filter by type as well as a live job/node handle rather than
+    // passing any entry that merely happens to carry a jobUID/nodeName field.
+    resourceLedger.reconcile(pipeline,
+        { (it.type == 'slurmJob' || it.type == 'slurmNode') && (it.jobUID || it.nodeName) },
+        { p, entry -> reconcileSlurmResource(p, entry) })
 }
 
 // Authoritative timeout signal: ask the SLURM controller (via sacct on the
@@ -1379,7 +1426,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(stageName, {
             try {
-                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, false, postTag, useClusterDurations)
+                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -1514,6 +1561,7 @@ def getPytestBaseCommandLine(
         "--periodic-junit-xmlpath ${outputPath}/results.xml",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        "--periodic-hang-traceback",
     ]
 
     if (perfMode) {
@@ -2396,18 +2444,14 @@ def cbtsResizeSplits(configs) {
 // agent otherwise going offline. Retrying inside such a pod is futile (every
 // step runs on the dead agent and fails immediately) and its in-pod cleanup can
 // no longer reach the SLURM controller, so callers stop retrying in place and
-// reconcile the orphaned SLURM job / Jenkins node off-pod. Matches the flattened
-// cause chain so the signal is still recognized when wrapped by the cleanup's
-// AbortException (e.g. "Error during clean up SLURM resources: ... marked
-// offline: Pod failed (Reason: Evicted ...)").
+// reconcile the orphaned SLURM job / Jenkins node off-pod. Delegates to the shared
+// ContextDeath.isContextDeath, which matches the same pattern set the inlined
+// version used (see the contract block above) across the flattened cause chain --
+// so the signal is still recognized when wrapped by the cleanup's AbortException
+// (e.g. "Error during clean up SLURM resources: ... marked offline: Pod failed
+// (Reason: Evicted ...)") -- and additionally traverses suppressed causes.
 boolean isDispatcherPodFailure(Throwable e) {
-    def text = FailureClassifier.flattenThrowable(e).collect { it.toString() }.join(" ").toLowerCase()
-    return [
-        "pod failed (reason:",
-        "pod just failed",
-        "pod failed because container terminated",
-        "unable to create live filepath",
-    ].any { text.contains(it) }
+    return ContextDeath.isContextDeath(e)
 }
 
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
@@ -3459,6 +3503,8 @@ def runLLMDocBuild(pipeline, config)
                 pip3 install -r requirements.txt && \
                 pip3 install git+https://github.com/sphinx-doc/sphinx.git@v7.4.7 && \
                 doxygen Doxygen && \
+                export TRTLLM_DOCS_REQUIRE_IMPORT=1 && \
+                export LD_LIBRARY_PATH=\$(python3 ../scripts/cuda_driver_stub.py) && \
                 make html && \
                 cd build/html && \
                 touch .nojekyll
@@ -3472,6 +3518,43 @@ def runLLMDocBuild(pipeline, config)
         "doc-html-preview.tar.gz",
         "${UPLOAD_PATH}/test-results/"
     )
+}
+
+def runLLMAgentFlowTest(pipeline, stageName)
+{
+    // agent-flow is a self-contained, pure-CPU sub-project: it needs neither a
+    // GPU nor the TRT-LLM wheel, only its own dependencies (pure-Python wheels
+    // declared in agent-flow/pyproject.toml).
+    sh "pwd && ls -alh"
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
+
+    def agentFlowRoot = "${LLM_ROOT}/agent-flow"
+
+    // Install agent-flow with its test extras (pytest, pytest-asyncio) and the
+    // runtime deps from pyproject.toml (claude-agent-sdk, openai-codex, ...).
+    // These resolve from the container's default PyPI mirror.
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${agentFlowRoot} && pip3 install -e \".[test]\"")
+
+    sh "mkdir -p ${WORKSPACE}/${stageName}"
+
+    // test_workflow_entrypoint_modules_run_without_import_warnings is deselected
+    // because importing agent_flow.workflows.modeling_bringup runs a live skill
+    // probe (a real Claude/Codex session) at module-import time, which stalls in
+    // headless CI. This is a known agent-flow bug slated for an upstream fix;
+    // remove the --deselect once that lands. The outer `timeout` guards against
+    // the same probe stalling the whole stage in-process.
+    def deselect = "--deselect tests/test_examples.py::test_workflow_entrypoint_modules_run_without_import_warnings"
+    sh """
+        cd ${agentFlowRoot} && \
+        timeout 1200 python3 -m pytest tests -v ${deselect} \
+            --junitxml=${WORKSPACE}/${stageName}/results.xml
+    """
+
+    // Rename the JUnit testsuite from pytest's default "pytest" to the stage
+    // name so CI reporting attributes these cases to this stage (mirrors the
+    // unittest path in runLLMTestlistOnPlatformImpl).
+    sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' results.xml || true"
 }
 
 def launchTestListCheck(pipeline)
@@ -4266,7 +4349,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", typeCheck=false, String postTag="", boolean useClusterDurations=false)
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -4331,6 +4414,20 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
+            // Gateway adapters are opt-in extras excluded from requirements.txt;
+            // each gateway declares its pins in a dedicated
+            // requirements-<gateway>.txt, and a test stage installs exactly
+            // zero or one gateway file so every adapter is tested under the
+            // dependency set its real opt-in users receive. A gateway whose
+            // pins co-resolve with the default environment (SMG today) is
+            // installed in the shared stages so its unit tests run from the
+            // regular shard pool instead of being skipped at collection; a
+            // gateway whose pins conflict with the default environment (for
+            // example a protobuf major-version floor or a custom package
+            // index) must instead install its file behind a dedicated stage
+            // guard and skip this one (see the Ray install below for the
+            // stage-scoped pattern).
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
@@ -4640,53 +4737,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
     }
 
-    // Run type checking
-    if (typeCheck && cpver != "cp310") {
-        stage ("[${stageName}] Run type check")
-        {
-            // Type checking tests if 'tensorrt_llm.bindings' can be imported. This requires
-            // a GPU which is not available during the Build stage. The cpver check ensures
-            // type checking uses the same Python version which is used in the dev containers,
-            // '!=' avoids silent regression upon future Python upgrades.
-
-            echo "-- Running mypy type check with compiled bindings..."
-	    // copy build artifacts to make sure 'tensorrt_llm' is importable from ${llmSrc}
-            sh """
-                TRTLLM_PATH=`python3 -c 'import tensorrt_llm; print(tensorrt_llm.__path__[0])' | tail -n 1`
-                echo "\$TRTLLM_PATH"
-                # https://superuser.com/a/266429
-                cd "\$TRTLLM_PATH" && tar -c \
-                    libs/ bindings/ bindings.*.so \
-                    runtime/kv_cache_manager_v2/rawref/_rawref.*.so \
-                    runtime/kv_cache_manager_v2/rawref/*.pyi \
-                    deep_gemm_cpp_tllm.*.so \
-                    deep_gemm_cpp_tllm.pyi \
-                    tensorrt_llm_transfer_agent_binding.*.so \
-                    deep_gemm/ \
-                    | tar -C "${llmSrc}/tensorrt_llm" -xv
-            """
-            withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
-                // Strip the wheel's tensorrt_llm/libs (and its ucx/ subdir) out of
-                // LD_LIBRARY_PATH for this stage. The tar above populated
-                // ${llmSrc}/tensorrt_llm/{libs,bindings.*.so} from the wheel, so the
-                // source tree now has its own copies. With the wheel libs path on
-                // LD_LIBRARY_PATH, bindings.so's DT_NEEDED resolves libth_common.so
-                // to <wheel>/tensorrt_llm/libs/ while _common.py explicitly loads
-                // <src>/tensorrt_llm/libs/libth_common.so via torch.classes.load_library
-                // — two different absolute paths register the same Torch op twice
-                // and PyTorch aborts. Removing the wheel paths lets DT_NEEDED fall
-                // back to bindings.so's RUNPATH ($ORIGIN/libs = <src>/tensorrt_llm/libs/),
-                // matching the explicit load. This restores pre-#722cbdd071 behavior
-                // for type-check only; UCX/NIXL kv_cache_transceiver tests above
-                // still see the new LD_LIBRARY_PATH.
-                sh """
-                    TRTLLM_WHEEL_LIBS=\$(pip3 show tensorrt_llm | awk -F': ' '/^Location:/ { print \$2 }')/tensorrt_llm/libs
-                    export LD_LIBRARY_PATH=\$(echo "\$LD_LIBRARY_PATH" | tr ':' '\\n' | grep -vxF "\$TRTLLM_WHEEL_LIBS" | grep -vxF "\$TRTLLM_WHEEL_LIBS/ucx" | paste -sd:)
-                    cd ${llmSrc} && python3 -m pre_commit run type-check --all-files || (cat /root/.cache/pre-commit/pre-commit.log && /bin/false)
-                """
-            }
-	}
-    }
 }
 
 
@@ -4697,10 +4747,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck, postTag, useClusterDurations)
+        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -4872,6 +4922,7 @@ def runLLMBuild(
     }
 
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-dev.txt")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-grpc-smg.txt")
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
     }
@@ -5151,11 +5202,16 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
         while (true) {
             launchAttempt++
             Map attemptPlacementContext = [runnerStarted: false]
+            // Declared above the try so the catch can reference it when reconciling
+            // a dispatcher-pod death: Groovy block-scopes a try-local `def`, so a
+            // declaration inside the try is not visible in the catch (it would
+            // resolve as an undefined property and throw MissingPropertyException).
+            def attemptPodSpec = null
             try {
                 if (launchAttempt > 1 && !avoidedKubernetesHostNodes.isEmpty()) {
                     echo "[INFRA-RETRY] ${stageName}: relaunching pod (attempt ${launchAttempt}), avoiding prior host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
                 }
-                def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+                attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
                 if (slurmDispatcher) {
                     // Record the dispatcher pod spec so the off-pod finalizer/sweep can
                     // launch a fresh cleanup pod if this pod dies mid-run.
@@ -5321,6 +5377,61 @@ def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCo
     return configs
 }
 
+// Infra-scoped fail-fast (inner/branch layer). Runs `jobs` under `parallel` so a
+// branch whose post-retry failure is a positive K8s infra abort
+// (FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its siblings
+// keep running instead of being SIGTERMed by failFast. A genuine test/build
+// failure (or an unclassified one) is rethrown unchanged, so failFast stays fully
+// active for real failures; an interrupt (e.g. a sibling's own fail-fast SIGTERM)
+// is also rethrown and never swallowed. After the join, a sub-job that saw ONLY
+// infra aborts and no real failure resolves to UNSTABLE (coverage incomplete, not
+// a failure) so the parent layer (L0_MergeRequest.launchJob) can spare the healthy
+// sibling architecture; a mixed sub-job already threw on its real failure and is
+// FAILURE (currentBuild.result worst-of semantics won't downgrade it).
+//
+// Scope: classify() is scope-filtered, so this passes K8S -- the motivating
+// pod-scheduling abort (KubernetesClientTimeoutException) is K8S-scoped. SLURM-only
+// aborts do NOT match here and keep today's fail-fast; deferring those too means
+// threading each stage's scope (opts.slurmDispatcher) in -- a follow-up, not this
+// change. Gated on ENABLE_INFRA_SCOPED_FAILFAST; off restores today's behavior
+// exactly (plain failFast + parallel, no wrapping, no UNSTABLE).
+def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
+    if (!ENABLE_INFRA_SCOPED_FAILFAST) {
+        jobs.failFast = failFast
+        parallel jobs
+        return
+    }
+    // CPS serializes parallel-branch continuations onto a single VM thread, so a
+    // plain list append from the catch blocks below is safe -- there is no
+    // JVM-level concurrency to guard against here.
+    def deferred = []
+    def wrapped = jobs.collectEntries { stageName, body ->
+        [(stageName), {
+            try {
+                body()
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                if (FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)) {
+                    deferred.add([stage: stageName])
+                    echo "[INFRA-DEFER] ${stageName}: K8s infra abort recorded; " +
+                         "siblings continue instead of fail-fast. ${e.toString()}"
+                    return
+                }
+                throw e
+            }
+        }]
+    }
+    wrapped.failFast = failFast
+    parallel wrapped
+    if (deferred) {
+        echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
+             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
+             "(coverage incomplete, no genuine test failure)."
+        currentBuild.result = 'UNSTABLE'
+    }
+}
+
 def launchTestJobs(pipeline, testFilter, globalVars)
 {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
@@ -5400,7 +5511,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext)
     }]]}
     fullSet = parallelJobs.keySet()
 
@@ -5555,9 +5666,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 5, 4, 1, true, false],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -5577,7 +5690,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
-        9,
+        6,
         8,
         2
     )
@@ -5622,7 +5735,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        3,
+        1,
         12,
         3
     )
@@ -5631,7 +5744,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
-        2,
+        1,
         16,
         4
     )
@@ -5640,7 +5753,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        4,
+        2,
         20,
         5
     )
@@ -5658,7 +5771,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        8,
+        1,
         36,
         9
     )
@@ -5673,21 +5786,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         2
     )
     // GB300 PerfSanity post-merge disaggregated
-    // 3 Nodes (pre-merge, functional-only)
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        1,
-        12,
-        3
-    )
     // 3 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        2,
+        4,
         12,
         3
     )
@@ -5696,18 +5800,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "gb300-flex-aws-cmh",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        4,
+        2,
         20,
         5
-    )
-    // 9 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        1,
-        36,
-        9
     )
     // GB300 GLM-5 disaggregated (ctx DEP2)
     // 3 Nodes (pre-merge, functional-only)
@@ -5773,12 +5868,42 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         56,
         14
     )
+    // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
+        2,
+        8,
+        2
+    )
+    // Nemotron-Ultra-V3 50k2k con12: ctx1 (1 node, 4 GPUs) + gen6 (6 nodes, 4 GPUs each) = 28 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge",
+        "gb300-flex-aws-cmh",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen6_node1_gpu4",
+        2,
+        28,
+        7
+    )
+    // Nemotron-Ultra-V3 50k2k con178: ctx5 (5 nodes, 4 GPUs each) + gen1 dep4 (1 node, 4 GPUs) = 24 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX5-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
+        "gb300-flex-aws-cmh",
+        "l0_gb300_multi_nodes_perf_sanity_ctx5_node1_gpu4_gen1_node1_gpu4",
+        2,
+        24,
+        6
+    )
+    // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
+    // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
+    // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext, values[4] ?: false)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
         }]]}
 
         // Add SBSA Slurm jobs
@@ -5817,9 +5942,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         parallelJobs += parallelMultiNodesSBSAJobs
     }
 
-    docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10")
+    // Doc build is pure CPU work (checkout + wheel install + doxygen/sphinx
+    // `make html` + upload); it never touches a GPU, so run it on the CPU
+    // "build" pod. Mirrors the CPU-only agent-flow job below.
+    docBuildSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     docBuildConfigs = [
-        "A10-Build_Docs": [docBuildSpec, {
+        "CPU-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
             runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
         }],
@@ -5837,6 +5965,39 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // and junit() on intermediate retryable infra failures.
         stage("[${key}] Run") {
             cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
+        }
+    }]]}
+
+    // agent-flow: pure-CPU pytest suite for the imported agent-flow sub-project.
+    // Runs on a CPU node ("build" pod type, kubernetes-cpu cloud) — it needs no
+    // GPU and no TRT-LLM wheel, only its own `pip install -e agent-flow[test]`.
+    // CBTS narrows this to agent-flow-only changes via
+    // jenkins/scripts/cbts/rules/agent_flow_rule.py; AGENT_FLOW_STAGE in that
+    // rule MUST equal the stage name below or CBTS Layer 2 will drop it.
+    agentFlowTestSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
+    // Single source of truth for the stage name: it is both the map key (which
+    // cacheErrorAndUploadResult uses for the results dir it tars and feeds to
+    // junit) and the name passed to runLLMAgentFlowTest (which writes
+    // results.xml into that dir). If the two ever diverge, junit finds no
+    // report ("No test report files were found").
+    def agentFlowStageName = "CPU-AgentFlow-UnitTest"
+    agentFlowTestConfigs = [
+        (agentFlowStageName): [agentFlowTestSpec, {
+            sh "rm -rf **/*.xml *.tar.gz"
+            runLLMAgentFlowTest(pipeline, agentFlowStageName)
+        }],
+    ]
+
+    fullSet += agentFlowTestConfigs.keySet()
+
+    // agent-flow tests are architecture-independent; run them once on x86 only.
+    if (env.targetArch == AARCH64_TRIPLE) {
+        agentFlowTestConfigs = [:]
+    }
+
+    agentFlowTestJobs = agentFlowTestConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt, retryContext = null ->
+        stage("[${key}] Run") {
+            cacheErrorAndUploadResult("${key}", values[1], {}, false, attemptTag, isFinalAttempt, retryContext)
         }
     }]]}
 
@@ -6043,7 +6204,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, true, isFinalAttempt, retryContext)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
                         }
                     })
                 }
@@ -6057,6 +6218,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
+    parallelJobs += agentFlowTestJobs
 
     postMergeJobs = parallelJobs.findAll {it.key.contains("Post-Merge")}
 
@@ -6326,7 +6488,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, true, isFinalAttempt, retryContext)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
                 })
             }
         } else {
@@ -6455,31 +6617,27 @@ pipeline {
                                 echo "Skip multi-GPU testing. No test to run."
                             }
                             if (singleGpuJobs.size() > 0) {
-                                singleGpuJobs.failFast = params.enableFailFast
-                                parallel singleGpuJobs
+                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast)
                             } else {
                                 echo "Skip single-GPU testing. No test to run."
                             }
                         } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
                             echo "Only run multi-GPU tests."
                             if (dgxJobs.size() > 0) {
-                                dgxJobs.failFast = params.enableFailFast
-                                parallel dgxJobs
+                                runBranchesWithInfraDefer(dgxJobs, params.enableFailFast)
                             } else {
                                 error "Skip multi-GPU testing. No test to run."
                             }
                         } else {
                             if (singleGpuJobs.size() > 0) {
-                                singleGpuJobs.failFast = params.enableFailFast
-                                parallel singleGpuJobs
+                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast)
                             } else {
                                 echo "Skip single-GPU testing. No test to run."
                             }
 
                             if (dgxJobs.size() > 0) {
                                 stage(testPhase2StageName) {
-                                    dgxJobs.failFast = params.enableFailFast
-                                    parallel dgxJobs
+                                    runBranchesWithInfraDefer(dgxJobs, params.enableFailFast)
                                 }
                             }
                         }

@@ -13,6 +13,7 @@ from tensorrt_llm.quantization.utils import fp4_utils
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, swizzle_sf, unswizzle_sf
+from .impl_contract import MoEInputRequirement, MoERunContext, require_comm_plan
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
@@ -100,6 +101,8 @@ class DenseGEMMFusedMoE(MoE):
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
     """
+
+    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
 
     # Memory buffer pool for CUDA graph compatibility
     buffers = get_memory_buffers()
@@ -500,28 +503,23 @@ class DenseGEMMFusedMoE(MoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: Optional[torch.Tensor],
-        x_sf: Optional[torch.Tensor] = None,
-        enable_alltoall: bool = False,
-        **kwargs,
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Run MoE computation with DenseGEMM backend (NVFP4 only).
 
-        Args:
-            x: Input hidden states (pre-quantized to NVFP4)
-            token_selected_experts: Expert IDs [num_tokens, top_k]. If EPLB is enabled,
-                                    this represents expert slots [num_tokens, top_k] instead.
-            token_final_scales: Final scaling factors for each token
-            x_sf: Input scale factors for NVFP4
-            enable_alltoall: Whether alltoall communication is enabled.
-            **kwargs: Additional arguments for forward compatibility.
-
         Returns:
             final_hidden_states tensor.
         """
+        del workspace  # DenseGEMM allocates its own intermediates.
+        plan = require_comm_plan(self, ctx)
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        enable_alltoall = plan.enable_alltoall
         assert self.has_nvfp4, (
             f"{self.__class__.__name__} only supports nvfp4 quantization, "
             f"got {self.quant_config.quant_mode}."

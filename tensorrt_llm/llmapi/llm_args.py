@@ -1739,7 +1739,9 @@ class DecodingBaseConfig(StrictBaseModel):
                                       "speculative_model_dir"),
         description=
         "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'), "
-        "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory."
+        "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory. "
+        "For MTP, when set to a checkpoint other than the target model, loads MTP heads from it instead of any "
+        "embedded mtp.* weights in the target; pointing it at the target model keeps the embedded heads."
     )
 
     max_concurrency: Optional[PositiveInt] = Field(
@@ -1819,6 +1821,9 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
     # If set, the draft model attends directly over the target model KV cache.
     _use_shared_kv_cache: bool = PrivateAttr(False)
+    # If set, speculative_model resolves to the target checkpoint, so one-model
+    # MTP loads its heads from the target weights instead of a separate file.
+    _mtp_heads_in_target_checkpoint: bool = PrivateAttr(False)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
@@ -1928,6 +1933,30 @@ class DecodingBaseConfig(StrictBaseModel):
         a subset of the possible backends.
         """
         return True
+
+    @property
+    def loads_mtp_from_separate_checkpoint(self) -> bool:
+        """Whether one-model MTP heads come from ``speculative_model``.
+
+        False when ``speculative_model`` resolves to the target checkpoint:
+        the heads are then loaded from the target weights, as they were
+        before separate MTP checkpoints were supported.
+        """
+        return (self.spec_dec_mode.is_mtp_one_model()
+                and self.speculative_model is not None
+                and not self._mtp_heads_in_target_checkpoint)
+
+    @property
+    def needs_separate_draft_weights(self) -> bool:
+        """Whether draft weights must be loaded from ``speculative_model``.
+
+        True for Eagle3 one-model / external drafters, Gemma4 shared-KV, and
+        one-model MTP when MTP heads live in a separate checkpoint.
+        """
+        if (self.spec_dec_mode.need_load_draft_weights()
+                or self._use_shared_kv_cache):
+            return True
+        return self.loads_mtp_from_separate_checkpoint
 
     @property
     def spec_dec_mode(self):
@@ -2101,8 +2130,9 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_one_model: Optional[bool] = Field(
         default=True,
         description=
-        "Whether to use the faster one-model implementation (draft as submodule) or the two-model implementation."
-    )
+        "Always uses the one-model implementation (draft as submodule). "
+        "Setting False is ignored and falls back to True; the two-model path "
+        "is deprecated and will be removed in a future release.")
     eagle3_layers_to_capture: Optional[Set[int]] = Field(
         default=None,
         description=
@@ -2134,8 +2164,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
             raise ValueError("max_draft_len must be > 0 for Eagle")
         if not self.eagle3_one_model:
             logger.warning(
-                "Eagle3 2-model is deprecated and will be removed in release 1.4."
-            )
+                "Eagle3 2-model (eagle3_one_model=False) is deprecated and "
+                "ignored; falling back to eagle3_one_model=True. "
+                "2-model will be removed in a future release.")
+            self.eagle3_one_model = True
 
         self.num_eagle_layers = self.max_draft_len
 
@@ -2543,8 +2575,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     mtp_eagle_one_model: bool = Field(
         default=True,
         description=
-        "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
-    )
+        "When using EAGLE-style MTP, always uses the one-model implementation "
+        "(drafter as submodule). Setting False is ignored and falls back to "
+        "True; the two-model path is deprecated and will be removed in a "
+        "future release.")
 
     use_dynamic_tree: bool = Field(
         default=False,
@@ -2575,8 +2609,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=None,
         init=False,
         description="Number of MTP layers in the model checkpoint. "
-        "Auto-populated from the model's pretrained config. Do not set manually."
-    )
+        "Auto-populated from the target pretrained config, or from "
+        "speculative_model's config.json when MTP heads are loaded separately. "
+        "Do not set manually.")
 
     begin_thinking_phase_token: NonNegativeInt = Field(
         default=128798,
@@ -2649,8 +2684,10 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def log_two_model_deprecation_warning(self):
         if not self.mtp_eagle_one_model:
             logger.warning(
-                "2-model style MTP is deprecated and will be removed in release 1.4."
-            )
+                "2-model style MTP (mtp_eagle_one_model=False) is deprecated "
+                "and ignored; falling back to mtp_eagle_one_model=True. "
+                "2-model will be removed in a future release.")
+            self.mtp_eagle_one_model = True
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -3626,11 +3663,6 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "`divide_length`): one speculative iteration may advance the counter "
         "by multiple accepted tokens; at most one eviction is coalesced per update."
     )
-    model_path: str = Field(
-        min_length=1,
-        description="Checkpoint path used to derive RoPE tables when converting "
-        "the official calibration and to classify kernel-masked sliding-attention "
-        "layers.")
     calibration_path: str = Field(
         min_length=1,
         description="Path to the official TriAttention calibration `.pt` "
@@ -4228,14 +4260,18 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     kv_transfer_timeout_ms: Optional[PositiveInt] = Field(
         default=60000,
         description=
-        "Timeout in milliseconds for KV cache transfer. Requests exceeding this timeout will be cancelled."
-    )
+        "KV cache transfer timeout in milliseconds. Blocking sender waits use "
+        "it as an absolute deadline; blocking receive task waits use it per "
+        "task. The Python V2 transceiver requires a finite value; None remains "
+        "available to other runtimes. It is distinct from the sender future "
+        "wait slice.")
 
     kv_transfer_sender_future_timeout_ms: Optional[PositiveInt] = Field(
         default=1000,
         description=
-        "Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
-    )
+        "Duration in milliseconds of each bounded sender future wait slice "
+        "while polling KV transfer completion. It does not set the overall "
+        "transfer deadline.")
 
     kv_transfer_poll_interval_ms: Optional[PositiveInt] = Field(
         default=5000,
@@ -4595,8 +4631,9 @@ class BaseLlmArgs(StrictBaseModel):
         default=None,
         description="The parser to separate reasoning content from output.",
         status="prototype",
-        telemetry=TelemetryField.categorical('auto', 'deepseek-r1', 'laguna',
-                                             'qwen3', 'qwen3_5', 'minimax_m2',
+        telemetry=TelemetryField.categorical('auto', 'deepseek-r1',
+                                             'poolside_v1', 'laguna', 'qwen3',
+                                             'qwen3_5', 'minimax_m2',
                                              'minimax_m2_append_think',
                                              'nano-v3', 'gemma4', 'kimi_k2',
                                              'kimi_k25'))
@@ -5009,6 +5046,18 @@ class SamplerType(StrEnum):
     auto = "auto"
 
 
+class PrefillCudaGraphBackend(StrEnum):
+    """CUDA graph implementation used for prefill requests."""
+
+    DISABLED = "disabled"
+    PIECEWISE = "piecewise"
+    BREAKABLE = "breakable"
+
+
+_DEFAULT_PREFILL_CAPTURE_NUM_TOKENS = [2**i for i in range(8)
+                                       ] + [i for i in range(256, 3073, 256)]
+
+
 class TorchCompileConfig(StrictBaseModel):
     """Configuration for torch.compile."""
     enable_fullgraph: bool = Field(
@@ -5020,13 +5069,12 @@ class TorchCompileConfig(StrictBaseModel):
 
     enable_piecewise_cuda_graph: bool = Field(
         default=False,
-        description="Enable piecewise CUDA graph in torch.compile.")
+        description="Deprecated. Use prefill_cuda_graph_backend='piecewise' "
+        "instead.")
 
     capture_num_tokens: Optional[List[PositiveInt]] = Field(
         default=None,
-        description=
-        "List of num of tokens to capture the piecewise CUDA graph for. If not provided, the number of tokens will be the same as cuda_graph_config.batch_sizes."
-    )
+        description="Deprecated. Use prefill_capture_num_tokens instead.")
 
     @field_validator('capture_num_tokens')
     @classmethod
@@ -5041,16 +5089,9 @@ class TorchCompileConfig(StrictBaseModel):
         "When torch compile is enabled, userbuffers is enabled by default.")
 
     max_num_streams: PositiveInt = Field(
-        default=1,
+        default=3,
         description=
         "The maximum number of CUDA streams to use for torch.compile.")
-
-    @model_validator(mode='after')
-    def set_default_capture_num_tokens(self) -> 'TorchCompileConfig':
-        if self.enable_piecewise_cuda_graph and self.capture_num_tokens is None:
-            self.capture_num_tokens = [2**i for i in range(8)
-                                       ] + [i for i in range(256, 3073, 256)]
-        return self
 
 
 class TorchLlmArgs(BaseLlmArgs):
@@ -5296,6 +5337,20 @@ class TorchLlmArgs(BaseLlmArgs):
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
+
+    prefill_cuda_graph_backend: PrefillCudaGraphBackend = Field(
+        default=PrefillCudaGraphBackend.DISABLED,
+        description="CUDA graph implementation used for prefill requests. "
+        "Defaults to disabled.",
+        status="prototype",
+        telemetry=TelemetryField.categorical("disabled", "piecewise",
+                                             "breakable"))
+
+    prefill_capture_num_tokens: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "Token-count buckets captured by the selected prefill CUDA graph implementation.",
+        status="prototype")
 
     enable_autotuner: bool = Field(
         default=True,
@@ -5594,6 +5649,65 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def normalize_prefill_cuda_graph_config(self) -> 'TorchLlmArgs':
+        """Normalize legacy piecewise CUDA graph options into prefill fields."""
+        backend_is_explicit = "prefill_cuda_graph_backend" in self.model_fields_set
+        buckets_are_explicit = "prefill_capture_num_tokens" in self.model_fields_set
+        compile_config = self.torch_compile_config
+        legacy_buckets_are_explicit = (compile_config is not None
+                                       and "capture_num_tokens"
+                                       in compile_config.model_fields_set)
+
+        if compile_config is not None and compile_config.enable_piecewise_cuda_graph:
+            if (backend_is_explicit and self.prefill_cuda_graph_backend
+                    != PrefillCudaGraphBackend.PIECEWISE):
+                raise ValueError(
+                    "torch_compile_config.enable_piecewise_cuda_graph conflicts "
+                    "with prefill_cuda_graph_backend")
+            logger.warning(
+                "TorchCompileConfig.enable_piecewise_cuda_graph is deprecated; "
+                "use prefill_cuda_graph_backend='piecewise' instead.")
+            self.prefill_cuda_graph_backend = PrefillCudaGraphBackend.PIECEWISE
+
+        legacy_buckets = (compile_config.capture_num_tokens
+                          if compile_config is not None else None)
+        if legacy_buckets_are_explicit:
+            logger.warning(
+                "TorchCompileConfig.capture_num_tokens is deprecated; use "
+                "prefill_capture_num_tokens instead.")
+            if (legacy_buckets is not None and buckets_are_explicit
+                    and self.prefill_capture_num_tokens is not None
+                    and sorted(set(legacy_buckets)) != sorted(
+                        set(self.prefill_capture_num_tokens))):
+                raise ValueError(
+                    "torch_compile_config.capture_num_tokens conflicts with "
+                    "prefill_capture_num_tokens")
+            if not buckets_are_explicit and legacy_buckets is not None:
+                self.prefill_capture_num_tokens = list(legacy_buckets)
+
+        if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
+            if self.prefill_capture_num_tokens is None:
+                self.prefill_capture_num_tokens = list(
+                    _DEFAULT_PREFILL_CAPTURE_NUM_TOKENS)
+            if self.encode_only:
+                raise ValueError(
+                    "encode_only does not support prefill CUDA graphs")
+
+        if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE:
+            if self.torch_compile_config is None:
+                self.torch_compile_config = TorchCompileConfig()
+        elif self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
+            if self.torch_compile_config is not None:
+                raise ValueError(
+                    "breakable prefill CUDA graph does not support torch_compile_config"
+                )
+            if self.enable_lora or self.lora_config is not None:
+                raise ValueError(
+                    "breakable prefill CUDA graph does not support LoRA")
+
+        return self
+
+    @model_validator(mode="after")
     def validate_speculative_config(self):
         if self.speculative_config:
             if not self.speculative_config.supports_backend(self.backend):
@@ -5872,8 +5986,6 @@ class TorchLlmArgs(BaseLlmArgs):
             elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
-                if self.backend == "_autodeploy":
-                    self.speculative_config._draft_target_one_model = False
 
             # If speculative_config.draft_len_schedule is provided, cuda_graph_config.enable_padding is automatically set to True.
             # Also we add the draft_len_schedule keys into batch_sizes for better cuda graph coverage in dynamic draft length.

@@ -47,7 +47,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
-from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
@@ -163,6 +162,9 @@ class ConfigurableMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         override_quant_config: Optional["QuantConfig"] = None,
+        activation: Optional[str] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
         trtllm_gen_activation_alpha: Optional[float] = None,
         trtllm_gen_activation_beta: Optional[float] = None,
@@ -198,6 +200,9 @@ class ConfigurableMoE(MoE):
             model_config=model_config,
             routing_method=routing_method,
             override_quant_config=override_quant_config,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             trtllm_gen_activation_type=trtllm_gen_activation_type,
             trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
             trtllm_gen_activation_beta=trtllm_gen_activation_beta,
@@ -284,6 +289,9 @@ class ConfigurableMoE(MoE):
         model_config: ModelConfig,
         routing_method: BaseMoeRoutingMethod,
         override_quant_config: Optional["QuantConfig"],
+        activation: Optional[str],
+        situ_beta: Optional[float],
+        situ_linear_beta: Optional[float],
         trtllm_gen_activation_type: Optional[ActType_TrtllmGen],
         trtllm_gen_activation_alpha: Optional[float],
         trtllm_gen_activation_beta: Optional[float],
@@ -341,6 +349,9 @@ class ConfigurableMoE(MoE):
                 swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
                 activation_type=self.activation_type,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
                 trtllm_gen_activation_type=trtllm_gen_activation_type,
                 trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
                 trtllm_gen_activation_beta=trtllm_gen_activation_beta,
@@ -410,8 +421,9 @@ class ConfigurableMoE(MoE):
             )
 
     def _should_enable_dwdp(self) -> bool:
-        # DWDP is currently supported only for CuteDslFusedMoE with NVFP4 quantization.
-        if not isinstance(self.backend, CuteDslFusedMoE):
+        # DWDP is currently supported only by CuteDSL backends, and only with
+        # NVFP4 quantization.
+        if not self.backend.capabilities.supports_dwdp:
             return False
 
         quant_config = getattr(self.backend, "quant_config", None)

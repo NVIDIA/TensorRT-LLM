@@ -44,6 +44,9 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `nvidia/Cosmos3-Super` | Text-to-Image, Text-to-Video, Image-to-Video |
 | `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
+| `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text-to-Video |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | Text-to-Video |
 
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.
@@ -63,6 +66,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **Qwen-Image-Layered** [^6] | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | Yes | No | No | Yes | Yes | No | No | No | No | No |
 | **Cosmos3** | Yes | Yes | No | No | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | No |
+| **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
 [^1]: FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.
 

@@ -35,6 +35,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType
+from ..impl_contract import MoERunContext
 from ..interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
 from ..quantization import (
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
@@ -118,7 +119,7 @@ class MegaMoEDeepGemm(MoE):
 
     _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
 
-    # Kernel owns dispatch + GEMM1 + SwiGLU + GEMM2 + combine via NVLink
+    # Kernel owns dispatch + GEMM1 + gated activation + GEMM2 + combine via NVLink
     # SymmBuffer; ConfigurableMoE must NOT layer host-side comm on top.
     scheduler_kind = MoESchedulerKind.FUSED_COMM
 
@@ -203,11 +204,13 @@ class MegaMoEDeepGemm(MoE):
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         init_load_balancer: bool = True,
-        # DG tunables. ``swiglu_limit_scalar`` mirrors the upstream MoE
-        # kwarg; bridged to DG's ``activation_clamp`` at the call site.
-        activation: str = "swiglu",
+        # DG tunables. ``activation=None`` infers Kimi K3 SiTU from the
+        # pretrained config and otherwise defaults to SwiGLU.
+        activation: Optional[str] = None,
         swiglu_limit_scalar: Optional[float] = None,
         fast_math: bool = True,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -276,18 +279,27 @@ class MegaMoEDeepGemm(MoE):
             "not equivalent. Use a different MoE backend for models that "
             "require pre-scaling, or extend the kernel call."
         )
-        # DG's fp8_fp4_mega_moe currently only ships a fused SwiGLU
-        # activation path. Reject other ActivationType values explicitly so
-        # ``create_moe_backend`` callers do not silently get SwiGLU when
-        # they asked for GELU / etc.
+        # ``ActivationType.Swiglu`` describes the gated FC1 tensor geometry
+        # shared by SwiGLU and SiTU. The DeepGEMM-specific activation selects
+        # the actual elementwise function below.
         if activation_type != ActivationType.Swiglu:
             raise ValueError(
                 f"MegaMoEDeepGemm only supports ActivationType.Swiglu (got {activation_type})."
             )
+        activation, situ_beta, situ_linear_beta = self._resolve_activation_config(
+            model_config,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+        if activation == "situ" and swiglu_limit_scalar is not None:
+            raise ValueError("MegaMoEDeepGemm SiTU does not support activation_clamp.")
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
         self.swiglu_limit_scalar = swiglu_limit_scalar
         self.fast_math = fast_math
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
 
         # Buffer sizing. MoE layers execute serially per forward; a single
         # process-level pool sized to worst-case per-rank tokens serves all.
@@ -346,6 +358,46 @@ class MegaMoEDeepGemm(MoE):
         self.quant_method = None
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+    @staticmethod
+    def _resolve_activation_config(
+        model_config: ModelConfig,
+        *,
+        activation: Optional[str],
+        situ_beta: Optional[float],
+        situ_linear_beta: Optional[float],
+    ) -> Tuple[str, Optional[float], Optional[float]]:
+        pretrained_config = model_config.pretrained_config
+        text_config = getattr(pretrained_config, "text_config", None)
+        config_situ_beta = getattr(pretrained_config, "activation_situ_beta", None)
+        config_situ_linear_beta = getattr(pretrained_config, "activation_situ_linear_beta", None)
+        if config_situ_beta is None:
+            config_situ_beta = getattr(text_config, "activation_situ_beta", None)
+        if config_situ_linear_beta is None:
+            config_situ_linear_beta = getattr(text_config, "activation_situ_linear_beta", None)
+        if activation is None:
+            activation = "situ" if config_situ_beta is not None else "swiglu"
+        activation = activation.lower()
+        if activation not in ("swiglu", "situ"):
+            raise ValueError(
+                f"MegaMoEDeepGemm activation must be 'swiglu' or 'situ'; got {activation!r}."
+            )
+        if activation == "swiglu":
+            if situ_beta is not None or situ_linear_beta is not None:
+                raise ValueError("SiTU beta parameters require activation='situ'.")
+            return activation, None, None
+
+        situ_beta = config_situ_beta if situ_beta is None else situ_beta
+        situ_linear_beta = config_situ_linear_beta if situ_linear_beta is None else situ_linear_beta
+        if situ_beta is None or situ_linear_beta is None:
+            raise ValueError(
+                "MegaMoEDeepGemm SiTU requires activation_situ_beta and "
+                "activation_situ_linear_beta in the pretrained config, or "
+                "explicit situ_beta and situ_linear_beta arguments."
+            )
+        if situ_beta <= 0 or situ_linear_beta <= 0:
+            raise ValueError("MegaMoEDeepGemm SiTU beta parameters must be positive.")
+        return activation, float(situ_beta), float(situ_linear_beta)
 
     def _supports_load_balancer(self) -> bool:
         # The DeepGEMM mega kernel routes by `topk_idx` interpreted as slot id
@@ -651,13 +703,9 @@ class MegaMoEDeepGemm(MoE):
 
     def run_moe(
         self,
-        x: torch.Tensor,
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        x_sf: Optional[torch.Tensor] = None,
+        ctx: MoERunContext,
         *,
-        output_dtype: Optional[torch.dtype] = None,
-        **unused_kwargs,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """Run the fused kernel with either BF16 or pre-quantized activations.
 
@@ -665,9 +713,12 @@ class MegaMoEDeepGemm(MoE):
         FP8+SF+topk SymmBuffer fields in one custom op. The fallback path
         keeps the original ``quantize_input`` + copy contract.
         """
-        assert not unused_kwargs, (
-            f"MegaMoEDeepGemm.run_moe got unexpected kwargs: {sorted(unused_kwargs)}"
-        )
+        del workspace  # The SymmBuffer is this backend's own workspace.
+        x = ctx.x
+        token_selected_experts = ctx.token_selected_experts
+        token_final_scales = ctx.token_final_scales
+        x_sf = ctx.x_sf
+        output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
         dg = self._dg
@@ -711,5 +762,7 @@ class MegaMoEDeepGemm(MoE):
             activation=self.activation,
             activation_clamp=self.swiglu_limit_scalar,
             fast_math=self.fast_math,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
         )
         return y.to(output_dtype)

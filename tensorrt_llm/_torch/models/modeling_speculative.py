@@ -2348,20 +2348,101 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         return logits
 
+    def mtp_head_module_names(self) -> List[str]:
+        """Names of the MTP heads under every alias they are reachable by.
+
+        One-model MTP registers the same head objects twice: under
+        ``draft_model.mtp_layers.{h}`` and, after the target model extends its
+        layer list, under ``model.layers.{num_hidden_layers + h}``. A load that
+        wants to leave the heads untouched has to exclude both aliases.
+        """
+        mtp_layers = getattr(self.draft_model, "mtp_layers", None)
+        if not mtp_layers:
+            return []
+        head_ids = {id(layer) for layer in mtp_layers}
+        return [
+            name for name, module in self.named_modules(remove_duplicate=False)
+            if name and id(module) in head_ids
+        ]
+
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional[BaseWeightMapper] = None,
                      params_map: Optional[Dict[str, str]] = None,
                      allow_partial_loading: bool = False):
+        from tensorrt_llm._torch.speculative.utils import (
+            filter_mtp_checkpoint_weights, loads_mtp_from_speculative_model)
+
+        skip_modules = ["draft_model"]
+        if loads_mtp_from_speculative_model(self.spec_config):
+            # The heads come from speculative_model in a second pass
+            # (load_draft_weights), so exclude them here. They must be
+            # *skipped* rather than tolerated via allow_partial_loading:
+            # partial loading suppresses process_weights_after_loading() on
+            # every quantized Linear/MoE it touches, which would leave the
+            # target model's quant scales (NVFP4 alphas, MoE input scales)
+            # uninitialized.
+            weights = filter_mtp_checkpoint_weights(weights)
+            skip_modules.extend(self.mtp_head_module_names())
         super().load_weights(weights=weights,
                              weight_mapper=weight_mapper,
-                             skip_modules=["draft_model"],
+                             skip_modules=skip_modules,
                              params_map=params_map,
                              allow_partial_loading=allow_partial_loading)
 
     def load_draft_weights(self,
                            weights: Dict,
                            weight_mapper: Optional[BaseWeightMapper] = None):
+        from tensorrt_llm._torch.models.modeling_utils import \
+            _load_weights_impl_v2
+        from tensorrt_llm._torch.speculative.utils import (
+            loads_mtp_from_speculative_model,
+            remap_preprocessed_mtp_weights_for_draft_model,
+            select_mtp_checkpoint_weights,
+            skip_modules_for_separate_mtp_checkpoint)
+
+        if loads_mtp_from_speculative_model(self.spec_config):
+            # Load MTP heads into draft_model only, and verify every non-shared
+            # MTP parameter has a matching tensor. The previous parent-model
+            # load used allow_partial_loading=True, which silently left MTP
+            # modules at random init when keys did not bind.
+            n_total = len(weights)
+            weights = select_mtp_checkpoint_weights(weights)
+            if not weights:
+                raise ValueError(
+                    "speculative_model was set for MTP but no 'mtp.*' weights "
+                    f"were found in {self.spec_config.speculative_model!r}. "
+                    "Expected keys like 'mtp.layers.0.*'.")
+            n_dropped = n_total - len(weights)
+            if n_dropped:
+                logger.warning(
+                    "Ignoring %d non-mtp.* tensors from speculative_model while "
+                    "loading MTP heads (kept %d mtp.* tensors).", n_dropped,
+                    len(weights))
+            if weight_mapper is None:
+                raise ValueError(
+                    "weight_mapper is required to load separate MTP heads")
+            weights = weight_mapper.preprocess_weights(weights)
+            num_hidden_layers = self.config.num_hidden_layers
+            num_mtp_layers = len(self.draft_model.mtp_layers)
+            weights = remap_preprocessed_mtp_weights_for_draft_model(
+                weights,
+                num_hidden_layers=num_hidden_layers,
+                num_mtp_layers=num_mtp_layers,
+            )
+
+            # Skip optional modules (e.g. shared_head) only when absent from
+            # this checkpoint; architectures that ship those tensors still load
+            # them under allow_partial_loading=False.
+            _load_weights_impl_v2(
+                self.draft_model,
+                weights,
+                weight_mapper,
+                skip_modules=skip_modules_for_separate_mtp_checkpoint(weights),
+                allow_partial_loading=False,
+            )
+            return
+
         args = inspect.getfullargspec(self.draft_model.load_weights).args
         if "weight_mapper" in args:
             self.draft_model.load_weights(weights=weights,

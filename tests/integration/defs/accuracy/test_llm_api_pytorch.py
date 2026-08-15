@@ -33,10 +33,12 @@ from tensorrt_llm.llmapi import (
     DFlashDecodingConfig, DSparkDecodingConfig, DraftTargetDecodingConfig,
     Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
     MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
-    NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
-    SADecodingConfig, SamplingParams, SchedulerConfig,
-    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
+    NGramDecodingConfig, PARDDecodingConfig, PrefillCudaGraphBackend,
+    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
+    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
+    TorchCompileConfig)
 # isort: on
+from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (check_device_contain, get_device_count,
@@ -3306,20 +3308,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestDeepSeekR1DistillLlama70B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
-    MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B"
-
-    @skip_pre_hopper
-    @pytest.mark.skip_less_mpi_world_size(2)
-    def test_auto_dtype_tp2(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
-        _run_multinode_accuracy(self.MODEL_PATH,
-                                self.MODEL_NAME,
-                                benchmarks=["mmlu"],
-                                kv_cache_config=kv_cache_config)
-
-
 @pytest.mark.timeout(14400)
 @pytest.mark.skip_less_mpi_world_size(8)
 class TestDeepSeekV3(LlmapiAccuracyTestHarness):
@@ -3404,6 +3392,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend, disable_skip_indexer,
                             enable_heuristic_topk, use_cute_dsl_topk):
+        extra_llm_args = {}
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
@@ -3416,6 +3405,15 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 pytest.skip("Not supported MoE backend!")
             moe_config = MoeConfig()
             kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+            # Cap max_seq_len based on the evaluation task (NVBug 6476233).
+            MAX_SEQ_LEN_GRANULARITY = 8 * 1024  # Padding boundary for max_seq_len
+
+            task_classes = (GPQADiamond, ) if fp8kv else (MMLU, GSM8K)
+            max_task_seq_len = max(task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN
+                                   for task in task_classes)
+            extra_llm_args["max_seq_len"] = pad_up(max_task_seq_len,
+                                                   MAX_SEQ_LEN_GRANULARITY)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -3456,7 +3454,8 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
-                 sparse_attention_config=dsa_config) as llm:
+                 sparse_attention_config=dsa_config,
+                 **extra_llm_args) as llm:
 
             # GPQA Diamond takes too long to run, we enable it only for fp8kv.
             if fp8kv:
@@ -3591,6 +3590,66 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
                  **pytorch_config, **llm_kwargs) as llm:
 
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,attention_dp,max_batch_size,moe_backend,fp8kv,chunked_prefill",
+        [
+            (8, 1, 8, 0, True, 24, "CUTLASS", False, False),
+        ],
+        ids=["baseline"])
+    def test_nvfp4_multi_gpus_breakable_cuda_graph(self, tp_size, pp_size,
+                                                   ep_size, mtp_nextn,
+                                                   attention_dp, max_batch_size,
+                                                   moe_backend, fp8kv,
+                                                   chunked_prefill):
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
+
+        moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+            kv_cache_config.enable_block_reuse = True
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=True,
+                max_batch_size=max_batch_size,
+            ),
+            moe_config=moe_config,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_capture_num_tokens=[2048, 8192],
+        )
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+
+        llm_kwargs = dict(
+            max_batch_size=max_batch_size,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            kv_cache_config=kv_cache_config,
+            enable_attention_dp=attention_dp,
+            speculative_config=mtp_config,
+        )
+        if chunked_prefill:
+            llm_kwargs.update(
+                enable_chunked_prefill=True,
+                max_num_tokens=8192,
+            )
+
+        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
+                 **pytorch_config, **llm_kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -3932,6 +3991,86 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                              moe_backend,
                              eplb_config,
                              mtp_nextn=mtp_nextn)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.threadleak(enabled=False)
+    def test_mixed_breakable_cuda_graph(self):
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        base_prompt_ids = tokenizer.encode(
+            "TensorRT-LLM accelerates reliable large language model inference "
+            "with efficient attention, parallelism, and CUDA graphs. ",
+            add_special_tokens=False,
+        )
+        assert base_prompt_ids
+
+        def make_prompt(prompt_length):
+            return (base_prompt_ids *
+                    ((prompt_length + len(base_prompt_ids) - 1) //
+                     len(base_prompt_ids)))[:prompt_length]
+
+        generation_prompt = make_prompt(64)
+        context_prompt = make_prompt(129)
+        sampling_params = SamplingParams(
+            max_tokens=8,
+            min_tokens=8,
+            seed=42,
+            temperature=0,
+            ignore_eos=True,
+            detokenize=False,
+            add_special_tokens=False,
+        )
+        common_llm_kwargs = dict(
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=8,
+            moe_config=MoeConfig(backend="TRTLLM"),
+            enable_attention_dp=True,
+            max_batch_size=8,
+            max_num_tokens=1024,
+            max_seq_len=2048,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                dtype="fp8",
+                free_gpu_memory_fraction=0.6,
+            ),
+            cuda_graph_config=CudaGraphConfig(
+                batch_sizes=[1, 2, 4, 6, 8],
+                enable_padding=True,
+            ),
+        )
+
+        def run(backend):
+            with LLM(
+                    self.MODEL_PATH,
+                    **common_llm_kwargs,
+                    prefill_cuda_graph_backend=backend,
+                    prefill_capture_num_tokens=[128, 256, 512, 1024],
+            ) as llm:
+                generation_request = llm.generate_async(
+                    generation_prompt,
+                    sampling_params=sampling_params,
+                    streaming=True,
+                )
+                next(generation_request)
+                assert not generation_request.finished
+
+                # Admit a context request while the first request is decoding.
+                context_request = llm.generate_async(
+                    context_prompt,
+                    sampling_params=sampling_params,
+                    streaming=False,
+                )
+                generation_output = generation_request.result()
+                context_output = context_request.result()
+                return [
+                    generation_output.outputs[0].token_ids,
+                    context_output.outputs[0].token_ids,
+                ]
+
+        eager_token_ids = run(PrefillCudaGraphBackend.DISABLED)
+        breakable_token_ids = run(PrefillCudaGraphBackend.BREAKABLE)
+        assert breakable_token_ids == eager_token_ids
 
 
 _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
@@ -5165,23 +5304,6 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestKanana_Instruct(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "kanana-1.5-2.1b-instruct-2505"
-    MODEL_PATH = f"{llm_models_root()}/kanana-1.5-2.1b-instruct-2505"
-
-    @pytest.mark.skip_device_not_contain(["H20", "H100"])
-    def test_auto_dtype(self):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
-        pytorch_config = dict(cuda_graph_config=CudaGraphConfig(
-            enable_padding=True, max_batch_size=384))
-        with LLM(self.MODEL_PATH, **pytorch_config,
-                 enable_attention_dp=True) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 @skip_pre_hopper
 @pytest.mark.skip_less_device_memory(80000)
 class TestGPTOSS(LlmapiAccuracyTestHarness):
@@ -5223,12 +5345,14 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                                         dtype=kv_cache_dtype,
                                         use_kv_cache_manager_v2=v2_kv_cache)
 
+        # https://nvbugs/6529792: batch 512 avoids OOM; seq +128 is GSM8K headroom.
         llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=1,
                   pipeline_parallel_size=1,
                   moe_expert_parallel_size=1,
                   kv_cache_config=kv_cache_config,
-                  max_batch_size=720,
+                  max_batch_size=512,
+                  max_seq_len=GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN + 128,
                   **pytorch_config,
                   moe_config=MoeConfig(backend=moe_backend))
 
@@ -6200,6 +6324,47 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.threadleak(enabled=False)
+    def test_bf16_breakable_prefill_cuda_graph(self):
+        model_path = f"{llm_models_root()}/Qwen3.5-4B"
+        prompts = [
+            [[17] * 128],
+            [[17] * 129],
+            # The second request is admitted while the first is decoding,
+            # exercising BCG replay for a mixed context/decode batch.
+            [[17] * 64, [23] * 65],
+            [[31] * 256],
+        ]
+        sampling_params = SamplingParams(max_tokens=4)
+
+        def run(backend):
+            results = []
+            with LLM(
+                    model_path,
+                    trust_remote_code=True,
+                    max_seq_len=1024,
+                    max_num_tokens=512,
+                    max_batch_size=4,
+                    disable_overlap_scheduler=True,
+                    disable_mm_encoder=True,
+                    kv_cache_config=self.kv_cache_config,
+                    cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                      max_batch_size=4),
+                    prefill_cuda_graph_backend=backend,
+                    prefill_capture_num_tokens=[128, 256, 512],
+            ) as llm:
+                for batch in prompts:
+                    results.append([
+                        output.outputs[0].token_ids for output in llm.generate(
+                            batch, sampling_params=sampling_params)
+                    ])
+            return results
+
+        eager_results = run(PrefillCudaGraphBackend.DISABLED)
+        breakable_results = run(PrefillCudaGraphBackend.BREAKABLE)
+        assert breakable_results == eager_results
 
     @skip_pre_hopper
     def test_fp8(self):
@@ -7638,7 +7803,10 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      periodic_snapshot_interval, attention_dp,
-                                     use_mtp):
+                                     use_mtp, monkeypatch):
+        # WAR https://nvbugs/6525008: FlashInfer <=0.6.16 races on shared JIT
+        # workspaces across ranks; remove once fixed upstream.
+        monkeypatch.setenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "1")
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=3,
             mtp_eagle_one_model=True,
