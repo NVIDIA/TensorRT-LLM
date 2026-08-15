@@ -2,6 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
+from transformers import Exaone4Config
 
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -19,17 +20,6 @@ from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
-
-try:
-    from transformers import Exaone4Config
-except ImportError:
-    # TODO: Remove this once we have a proper transformers package
-    from transformers import AutoConfig, PretrainedConfig
-
-    class Exaone4Config(PretrainedConfig):
-        model_type = "exaone4"
-
-    AutoConfig.register(Exaone4Config.model_type, Exaone4Config)
 
 
 def check_is_sliding(config: Exaone4Config, layer_idx: int) -> bool:

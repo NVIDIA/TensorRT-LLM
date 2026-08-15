@@ -79,10 +79,10 @@ inline __device__ cute::uint128_t e2m1ToFp16(uint32_t src) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline __device__ void computeSfAndOutputScale(float& outputScale,
-                                               cutlass::float_e4m3_t& sfOut,
-                                               float const& amax,
-                                               float const& sfScale) {
+inline __device__ void computeNvFp4SfAndOutputScale(float& outputScale,
+                                                    cutlass::float_e4m3_t& sfOut,
+                                                    float const& amax,
+                                                    float const& sfScale) {
   // The reciprocal of E2M1_MAX.
   float constexpr reciprocalOfE2m1Max = 1.f / 6.f;
   // The FP32 sf.
@@ -100,11 +100,11 @@ inline __device__ void computeSfAndOutputScale(float& outputScale,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline __device__ void computeSfAndOutputScale(float& outputScale,
-                                               cutlass::float_e4m3_t& sfOut,
-                                               float const& amax,
-                                               float const& sfScale,
-                                               float const& sfScaleInv) {
+inline __device__ void computeNvFp4SfAndOutputScale(float& outputScale,
+                                                    cutlass::float_e4m3_t& sfOut,
+                                                    float const& amax,
+                                                    float const& sfScale,
+                                                    float const& sfScaleInv) {
   // The reciprocal of E2M1_MAX.
   float constexpr reciprocalOfE2m1Max = 1.f / 6.f;
   // The FP32 sf.
@@ -126,7 +126,7 @@ inline __device__ void computeSfAndOutputScale(float& outputScale,
 template <int NumEltsPerThread, typename OutT>
 inline __device__ void convertFp16ToE2m1(OutT& out,
                                          cutlass::float_e4m3_t& sfOut,
-                                         uint32_t const (&in)[NumEltsPerThread / 2],
+                                         cutlass::half_t const (&in)[NumEltsPerThread],
                                          float sfScale) {
 
   // This function converts fp16 elements to E2m1.
@@ -165,7 +165,7 @@ inline __device__ void convertFp16ToE2m1(OutT& out,
 
   // Compute the sf and output scale.
   float outputScale;
-  computeSfAndOutputScale(outputScale, sfOut, vecAmax, sfScale);
+  computeNvFp4SfAndOutputScale(outputScale, sfOut, vecAmax, sfScale);
 
   // Apply the output scale.
   cutlass::Array<float, NumEltsPerThread> scaled;
@@ -204,27 +204,30 @@ inline __device__ void convertFloatToE2m1(OutT& out,
   // The number of threads per vector of 16 elements.
   int32_t constexpr NumThreadsPerVec = 16 / NumEltsPerThread;
 
-  // Find the loacl amax.
+  // Find the local amax.
   float localAmax = 0;
 #pragma unroll
-  for (int ii = 0; ii < 16; ii++) {
+  for (int ii = 0; ii < NumEltsPerThread; ii++) {
     localAmax = fmaxf(localAmax, fabsf(in[ii]));
   }
 
   // Get the absolute maximum among all 16 values.
   if constexpr (NumThreadsPerVec > 1) {
-    static_assert(NumThreadsPerVec == 2, "Not supported.");
-    localAmax = fmaxf(__shfl_xor_sync(uint32_t(-1), localAmax, 1), localAmax);
+    static_assert(NumThreadsPerVec == 2 || NumThreadsPerVec == 4, "Not supported.");
+#pragma unroll
+    for (int32_t step = 1; step < NumThreadsPerVec; step *= 2) {
+      localAmax = fmaxf(__shfl_xor_sync(uint32_t(-1), localAmax, step), localAmax);
+    }
   }
 
   // Compute the sf and output scale.
   float outputScale;
-  computeSfAndOutputScale(outputScale, sfOut, localAmax, sfScale);
+  computeNvFp4SfAndOutputScale(outputScale, sfOut, localAmax, sfScale);
 
   // Apply the output scale.
   cutlass::Array<float, NumEltsPerThread> scaled;
 #pragma unroll
-  for (int ii = 0; ii < 16; ii++) {
+  for (int ii = 0; ii < NumEltsPerThread; ii++) {
     scaled[ii] = in[ii] * outputScale;
   }
 

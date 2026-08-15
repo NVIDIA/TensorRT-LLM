@@ -62,9 +62,16 @@ struct FmhaData {
     // Start token index in the O scaling-factor tensor. Used for FP4 SF offset in generation when
     // inflight batching is enabled (TRT-LLM). Context uses 0.
     int32_t startTokenIdxSfO{0};
+
+    // The variable sparseMla topK lengths with shape of [numTokensQ]
+    //  where each tokenQ has a corresponding topK length.
+    int32_t const* sparseMlaTopKLensPtrD;
   };
 
   struct Scales {
+    // DSv4 inverse-RoPE + 1x128 FP8 quant fusion output scale tensor.
+    float* dsv4OScaleFp32D{nullptr};
+
     // FP4 scaling factors for KV cache
     void const* kSfBasePtr;
     void const* vSfBasePtr;
@@ -100,6 +107,12 @@ struct FmhaData {
     // [sumOfSeqLensKv * numHeadsKv, hiddenDimKv] for sparse attention.
     void const* kBasePtr;
     void const* vBasePtr;
+
+    // DSv4 inverse-RoPE metadata inputs.
+    float const* dsv4InvRopeCosSinCacheD{nullptr};
+
+    // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
+    void const* slidingWindowKvPoolBasePtr{nullptr};
 
     // Attention sinks
     float const* attentionSinksPtrD;
@@ -146,6 +159,7 @@ struct FmhaData {
 class FmhaInterface {
 public:
   using ModuleCache = std::unordered_map<std::string, std::tuple<CUmodule, CUfunction>>;
+  enum class KernelCacheStatus { Unknown, CacheHit, CacheMiss };
 
   FmhaInterface(bool exportsCubin = false, int32_t numRotations = 1, bool verbose = false)
     : mExportsCubin(exportsCubin)
@@ -157,9 +171,9 @@ public:
   // Set the verbosity level for logging. When false, TLLM_LOG_INFO messages are suppressed.
   void setVerbose(bool verbose);
 
-  void generateAndCompileKernel(FmhaConfig& fmhaConfig) const;
+  KernelCacheStatus generateAndCompileKernel(FmhaConfig& fmhaConfig) const;
 
-  std::string getKernelName(FmhaConfig const& fmhaConfig) const;
+  std::string getKernelNameFromConfigs(FmhaConfig const& fmhaConfig) const;
 
   int32_t run(FmhaConfig const& config,
               FmhaData& data,

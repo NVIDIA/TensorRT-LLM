@@ -1,67 +1,71 @@
-import transformers
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""PyTorch-backend model zoo, loaded lazily.
 
+Importing this package no longer imports every ``modeling_*`` module (which
+executes all model class bodies and their ``@register_auto_model`` decorators
+at interpreter startup). Instead:
+
+- attribute access (``models.LlamaForCausalLM`` or
+  ``from tensorrt_llm._torch.models import LlamaForCausalLM``) imports just the
+  providing module, via PEP 562 ``__getattr__`` and ``MODEL_CLASS_TO_MODULE``;
+- architecture-based resolution (``AutoModelForCausalLM``) imports on demand
+  via ``modeling_utils.get_registered_model_class`` and
+  ``MODEL_ARCH_TO_MODULE``.
+"""
+import importlib
+
+# Importing _torch.configs triggers AutoConfig registration for TRT-LLM-only
+# model_types (deepseek_v32, kimi_k2, gemma4_unified) so AutoConfig /
+# AutoTokenizer.from_pretrained work under transformers >= 5.5; this must stay
+# eager — see _torch/configs/__init__.py.
+import tensorrt_llm._torch.configs  # noqa: F401
+
+from ._arch_index import MODEL_CLASS_TO_MODULE
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_bert import BertForSequenceClassification
-from .modeling_clip import CLIPVisionModel
-from .modeling_cohere2 import Cohere2ForCausalLM
-from .modeling_deepseekv3 import DeepseekV3ForCausalLM
-from .modeling_exaone4 import Exaone4ForCausalLM
-from .modeling_exaone_moe import ExaoneMoeForCausalLM
-from .modeling_gemma3 import Gemma3ForCausalLM
-from .modeling_gemma3vl import Gemma3VLM
-from .modeling_glm import Glm4MoeForCausalLM
-from .modeling_gpt_oss import GptOssForCausalLM
-from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
-from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
-from .modeling_hyperclovax import HCXVisionForCausalLM
-from .modeling_llama import LlamaForCausalLM
-from .modeling_llava_next import LlavaNextModel
-from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
-from .modeling_mistral import Mistral3VLM, MistralForCausalLM
-from .modeling_mixtral import MixtralForCausalLM
-from .modeling_nemotron import NemotronForCausalLM
-from .modeling_nemotron_h import NemotronHForCausalLM
-from .modeling_nemotron_nano import NemotronH_Nano_VL_V2
-from .modeling_nemotron_nas import NemotronNASForCausalLM
-from .modeling_phi3 import Phi3ForCausalLM
-from .modeling_phi4mm import Phi4MMForCausalLM
-from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
-                            Qwen2ForRewardModel)
-from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
-from .modeling_qwen3 import Qwen3ForCausalLM
-from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
-from .modeling_qwen3_moe import Qwen3MoeForCausalLM
-from .modeling_qwen3_next import Qwen3NextForCausalLM
-from .modeling_qwen3vl import Qwen3VLModel
-from .modeling_qwen3vl_moe import Qwen3MoeVLModel
-from .modeling_qwen_moe import Qwen2MoeForCausalLM
-from .modeling_seedoss import SeedOssForCausalLM
-from .modeling_siglip import SiglipVisionModel
-from .modeling_starcoder2 import Starcoder2ForCausalLM
 from .modeling_utils import get_model_architecture
-from .modeling_vila import VilaModel
 
-# Note: for better readiblity, this should have same order as imports above
 __all__ = [
+    "AfmoeForCausalLM",
     "AutoModelForCausalLM",
+    "BartForConditionalGeneration",
     "BertForSequenceClassification",
     "CLIPVisionModel",
+    "Cohere2ForCausalLM",
+    "Cosmos3Model",
     "DeepseekV3ForCausalLM",
+    "DeepseekV4ForCausalLM",
     "Exaone4ForCausalLM",
+    "Exaone4_5_ForConditionalGeneration",
     "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
+    "Glm4MoeForCausalLM",
+    "GptOssForCausalLM",
     "HCXVisionForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
+    "KimiK25ForConditionalGeneration",
+    "KimiK3ForConditionalGeneration",
+    "KimiLinearForCausalLM",
+    "LagunaForCausalLM",
     "LlamaForCausalLM",
     "LlavaNextModel",
+    "MBartForConditionalGeneration",
+    "MiniCPMV4_6Model",
+    "MiniMaxM2ForCausalLM",
+    "MiniMaxM3ForCausalLM",
+    "MiniMaxM3VLForConditionalGeneration",
     "Mistral3VLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
-    "NemotronH_Nano_VL_V2",
+    "MllamaForConditionalGeneration",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",
+    "NemotronH_Nano_VL_V2",
     "NemotronNASForCausalLM",
     "Phi3ForCausalLM",
     "Phi4MMForCausalLM",
@@ -69,31 +73,51 @@ __all__ = [
     "Qwen2ForProcessRewardModel",
     "Qwen2ForRewardModel",
     "Qwen2MoeForCausalLM",
-    "SiglipVisionModel",
-    "Starcoder2ForCausalLM",
-    "get_model_architecture",
-    "VilaModel",
     "Qwen2VLModel",
     "Qwen2_5_VLModel",
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    "Qwen3MoeVLModel",
+    "Qwen3NextForCausalLM",
+    "Qwen3VLModel",
     "Qwen3_5ForCausalLM",
     "Qwen3_5MoeForCausalLM",
-    "Qwen3NextForCausalLM",
-    "Qwen3MoeVLModel",
-    "GptOssForCausalLM",
+    "Qwen3_5MoeVLModel",
+    "Qwen3_5VLModel",
+    "QwenImageBenchModel",
     "SeedOssForCausalLM",
-    "Glm4MoeForCausalLM",
-    "Qwen3VLModel",
-    "MiniMaxM2ForCausalLM",
-    "Cohere2ForCausalLM",
+    "SiglipVisionModel",
+    "Starcoder2ForCausalLM",
+    "Step3p7ForCausalLM",
+    "Step3p7VLForConditionalGeneration",
+    "T5ForConditionalGeneration",
+    "VilaModel",
+    "WhisperForConditionalGeneration",
+    "get_model_architecture",
 ]
 
-if transformers.__version__ >= "4.45.1":
-    from .modeling_mllama import MllamaForConditionalGeneration  # noqa
 
-    __all__.append("MllamaForConditionalGeneration")
-else:
-    print(
-        f"Failed to import MllamaForConditionalGeneration as transformers.__version__ {transformers.__version__} < 4.45.1"
-    )
+def __getattr__(name: str):
+    module_name = MODEL_CLASS_TO_MODULE.get(name)
+    if module_name is None:
+        # Also resolve bare submodule access (models.modeling_llama,
+        # models.checkpoints, models.hf_parameter_utils, ...) so callers that
+        # relied on the previously-eager submodule attributes keep working.
+        try:
+            return importlib.import_module(f".{name}", __name__)
+        except ModuleNotFoundError as e:
+            # Only translate "no such submodule" into AttributeError; a
+            # ModuleNotFoundError raised *inside* an existing submodule
+            # (missing dependency) must propagate unchanged.
+            if e.name != f"{__name__}.{name}":
+                raise
+            raise AttributeError(
+                f"module {__name__!r} has no attribute {name!r}") from None
+    module = importlib.import_module(f".{module_name}", __name__)
+    attr = getattr(module, name)
+    globals()[name] = attr  # cache: subsequent access skips __getattr__
+    return attr
+
+
+def __dir__():
+    return sorted(set(__all__) | set(globals()))

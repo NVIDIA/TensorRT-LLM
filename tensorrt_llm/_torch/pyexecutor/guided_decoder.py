@@ -259,8 +259,12 @@ class GuidedDecoder:
                     matcher.fill_next_token_bitmask(self.bitmask_host, offset)
                     self.token_mask_host[offset] = 1
                     self.num_guided_tokens[slot] += 1
-                    # Process draft tokens
-                    for i, tid in enumerate(req.draft_tokens, 1):
+                    # Process draft tokens. Bound by the layout's draft length:
+                    # the new_tokens buffer always holds the static max, but only
+                    # `max_num_draft_tokens` slots are reserved this iteration.
+                    for i, tid in enumerate(
+                            req.draft_tokens[:requests.max_num_draft_tokens],
+                            1):
                         accepted = matcher.accept_token(tid)
                         if not accepted:
                             break
@@ -332,9 +336,13 @@ class GuidedDecoder:
             d2t=d2t)
 
     @nvtx_range("GuidedDecoder.add_batch")
-    def add_batch(self, scheduled_requests: ScheduledRequests) -> None:
+    def add_batch(self,
+                  scheduled_requests: ScheduledRequests,
+                  runtime_draft_len: Optional[int] = None) -> None:
+        num_draft_tokens = (self.max_num_draft_tokens
+                            if runtime_draft_len is None else runtime_draft_len)
         self.requests = GuidedRequests.from_scheduled_requests(
-            scheduled_requests, self.max_num_draft_tokens)
+            scheduled_requests, num_draft_tokens)
 
     @nvtx_range("GuideDecoder.build")
     def build(self) -> List[Tuple[int, str]]:
@@ -470,9 +478,14 @@ class CapturableGuidedDecoder(GuidedDecoder):
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,
-                  new_tokens: Optional[torch.Tensor] = None) -> None:
+                  new_tokens: Optional[torch.Tensor] = None,
+                  runtime_draft_len: Optional[int] = None) -> None:
+        # See GuidedDecoder.add_batch: the layout must follow the runtime draft
+        # length so the captured graph's bitmask matches the target logits.
+        num_draft_tokens = (self.max_num_draft_tokens
+                            if runtime_draft_len is None else runtime_draft_len)
         self.requests = GuidedRequests.from_scheduled_requests(
-            scheduled_requests, self.max_num_draft_tokens)
+            scheduled_requests, num_draft_tokens)
         if new_tokens is not None:
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
         self.queue.put((self.requests, new_tokens is not None))

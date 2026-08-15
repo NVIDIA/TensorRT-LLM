@@ -317,11 +317,21 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         return {}
 
     def get_cache_config_updates(self):
-        """Return kv cache dtype updates."""
+        """Return kv cache dtype updates.
+
+        Only returns an override when the checkpoint's quantization config
+        explicitly carries a ``kv_cache_dtype``.  Otherwise returns an empty
+        dict so the user-provided ``kv_cache_config.dtype`` (yaml / init
+        kwarg) is preserved — the factory must not silently clobber an
+        explicit setting with ``"auto"`` just because the HF quantization
+        config is silent on KV cache dtype.
+        """
         if not self._quant_config_reader:
             return {}
 
-        kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype", "auto")
+        kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype")
+        if kv_cache_dtype is None:
+            return {}
         assert kv_cache_dtype in ("fp8", "auto"), (
             f"Unsupported dtype: {kv_cache_dtype}. Only fp8 and auto are supported."
         )
@@ -331,7 +341,15 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Initialize the tokenizer—either a custom name or the model's default."""
         if self.tokenizer is None:
             return None
-        return AutoTokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        # Transformers 5.x: LlamaTokenizer forces a Metaspace pre-tokenizer over
+        # the ByteLevel one declared in tokenizer.json for repos like
+        # DeepSeek-V3/R1 that set tokenizer_class="LlamaTokenizer" but ship a
+        # ByteLevel BPE.  Mirror the fix the pytorch backend applies inside
+        # TransformersTokenizer.from_pretrained.
+        from tensorrt_llm.tokenizer import maybe_fix_byte_level_tokenizer
+
+        return maybe_fix_byte_level_tokenizer(tokenizer, self.tokenizer, **self.tokenizer_kwargs)
 
     def build_and_load_model(self, device: DeviceLikeType) -> nn.Module:
         """Automatically build the model from_pretrained and load the weights.

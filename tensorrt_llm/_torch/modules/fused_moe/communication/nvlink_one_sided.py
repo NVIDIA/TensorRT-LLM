@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,11 +25,21 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.alltoall_watchdog import (
+    DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
+    DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
+    ActiveRankMaskSnapshot,
+    AlltoAllWatchdog,
+    AlltoAllWatchdogCoordinator,
+    AlltoAllWatchdogTimeout,
+    EPGroupHealthLike,
+    reject_rank_mask_cuda_graph_capture,
+)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -51,11 +61,13 @@ class NVLinkOneSided(Communication):
     """
 
     # Constants from C++ (must match moeAlltoAllKernels.h)
-    MAX_RANKS = 64
+    MAX_RANKS = 128
     MAX_TOP_K = 8
     MAX_PAYLOADS = 8
 
-    # Single shared workspace/memory across the process
+    # Shared workspaces/memory across the process, keyed by payload layout.
+    _WORKSPACES: Dict[Tuple[object, ...], dict] = {}
+    _WORKSPACE_REFCOUNTS: Dict[Tuple[object, ...], int] = {}
     _WORKSPACE: dict | None = None
 
     # MetaInfo indices - initialized from C++ constants
@@ -149,7 +161,11 @@ class NVLinkOneSided(Communication):
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
         use_low_precision_combine: bool = False,
-    ):
+        ep_group_health: EPGroupHealthLike | None = None,
+        alltoall_watchdog_timeout_s: Optional[float] = None,
+        alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
+        alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
+    ) -> None:
         """
         Initialize NVLinkOneSided with workspace allocation.
 
@@ -167,6 +183,13 @@ class NVLinkOneSided(Communication):
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
                 transfer (halves NVLink bandwidth usage, output precision is preserved).
                 Corresponds to model_config.use_low_precision_moe_combine.
+            ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
+                enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
+                detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
+            alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
+                watchdog is disabled.
+            alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
+            alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
         """
         super().__init__(mapping)
 
@@ -221,10 +244,27 @@ class NVLinkOneSided(Communication):
             )
             self.workspace_size_per_rank = 2048 * 1024 * 1024
 
-        # Initialize or reuse workspace
+        # Initialize or reuse workspace.  The C++ op computes payload offsets
+        # from the current tensors at dispatch time, while the Python singleton
+        # owns the symmetric memory backing those offsets.  Keep separate
+        # workspaces for different payload layouts so one test/layer cannot
+        # reuse stale one-sided state from another shape.
         MnnvlMemory.initialize()
+        self._workspace_key = (
+            self.workspace_size_per_rank,
+            self.max_num_tokens_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.eplb_stats_num_experts,
+            self.num_experts,
+            self.top_k,
+            hidden_size,
+            dtype,
+            self.use_low_precision_combine,
+        )
 
-        if self._WORKSPACE is None:
+        workspace_state = NVLinkOneSided._WORKSPACES.get(self._workspace_key)
+        if workspace_state is None:
             tllm_logger.info(
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
@@ -238,37 +278,75 @@ class NVLinkOneSided(Communication):
                 self.max_num_tokens_per_rank,
                 self.eplb_stats_num_experts,
             )
-            NVLinkOneSided._WORKSPACE = {
+            workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
                 "ep_rank": self.ep_rank,
                 "ep_size": self.ep_size,
                 "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                "num_experts": self.num_experts,
+                "top_k": self.top_k,
+                "hidden_size": hidden_size,
+                "dtype": dtype,
+                "use_low_precision_combine": self.use_low_precision_combine,
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
             }
+            NVLinkOneSided._WORKSPACES[self._workspace_key] = workspace_state
         else:
-            assert self._WORKSPACE["workspace_size_per_rank"] == self.workspace_size_per_rank, (
-                "reuse workspace with different workspace_size_per_rank"
-            )
-            assert self._WORKSPACE["max_num_tokens_per_rank"] == self.max_num_tokens_per_rank, (
-                "reuse workspace with different max_num_tokens_per_rank"
-            )
-            assert self._WORKSPACE["ep_rank"] == self.ep_rank, (
-                "reuse workspace with different ep_rank"
-            )
-            assert self._WORKSPACE["ep_size"] == self.ep_size, (
-                "reuse workspace with different ep_size"
-            )
-            assert self._WORKSPACE["eplb_stats_num_experts"] == self.eplb_stats_num_experts, (
-                "reuse workspace with different eplb_stats_num_experts"
-            )
+            expected_workspace_state = {
+                "workspace_size_per_rank": self.workspace_size_per_rank,
+                "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
+                "ep_rank": self.ep_rank,
+                "ep_size": self.ep_size,
+                "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                "num_experts": self.num_experts,
+                "top_k": self.top_k,
+                "hidden_size": hidden_size,
+                "dtype": dtype,
+                "use_low_precision_combine": self.use_low_precision_combine,
+            }
+            for key, expected_value in expected_workspace_state.items():
+                assert workspace_state[key] == expected_value, (
+                    f"reuse workspace with different {key}"
+                )
 
-        self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
-        self.workspace = self._WORKSPACE["workspace"]
-        self.moe_a2a_metainfo = self._WORKSPACE["metainfo"]
-        self.max_num_tokens_per_rank = self._WORKSPACE["max_num_tokens_per_rank"]
+        NVLinkOneSided._WORKSPACE = workspace_state
+        NVLinkOneSided._WORKSPACE_REFCOUNTS[self._workspace_key] = (
+            NVLinkOneSided._WORKSPACE_REFCOUNTS.get(self._workspace_key, 0) + 1
+        )
+        self._destroyed = False
+        self._workspace_state = workspace_state
+        self.mnnvl_mem = workspace_state["mnnvl_mem"]
+        self.workspace = workspace_state["workspace"]
+        self.moe_a2a_metainfo = workspace_state["metainfo"]
+        self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
+        self.ep_group_health = ep_group_health
+        # Keep the kernel specialization stable for this communicator's lifetime.
+        self._rank_mask_enabled = ep_group_health is not None
+        self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
+            workspace_state=workspace_state,
+            workspace=self.workspace,
+            metainfo=self.moe_a2a_metainfo,
+            metainfo_index={
+                "FLAG_VAL_OFFSET_INDEX": self.FLAG_VAL_OFFSET_INDEX,
+                "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": self.DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX,
+                "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": self.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX,
+            },
+            ep_rank=self.ep_rank,
+            health=self.ep_group_health,
+        )
+        self._alltoall_watchdog: AlltoAllWatchdog | None = None
+        if alltoall_watchdog_timeout_s is None and self.ep_group_health is not None:
+            alltoall_watchdog_timeout_s = DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S
+        if alltoall_watchdog_timeout_s is not None:
+            self._alltoall_watchdog = self._watchdog_coordinator.acquire_watchdog(
+                ep_size=self.ep_size,
+                timeout_s=alltoall_watchdog_timeout_s,
+                poll_interval_s=alltoall_watchdog_poll_interval_s,
+                on_timeout=alltoall_watchdog_on_timeout,
+            )
 
         # Initialize dispatch state
         self._dispatch_state = {"phase": "idle"}
@@ -288,6 +366,39 @@ class NVLinkOneSided(Communication):
         NVLINK one-sided comm supports post-quant dispatch.
         """
         return True
+
+    def destroy(self):
+        """Release this instance's reference to the shared symmetric workspace."""
+        if getattr(self, "_destroyed", False):
+            return
+
+        self._destroyed = True
+        if self._alltoall_watchdog is not None:
+            self._watchdog_coordinator.release_watchdog(self._alltoall_watchdog)
+            self._alltoall_watchdog = None
+        workspace_key = getattr(self, "_workspace_key", None)
+        if workspace_key is None:
+            return
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
+        if refcount > 0:
+            NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
+        else:
+            NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
+            workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
+            if NVLinkOneSided._WORKSPACE is workspace_state:
+                NVLinkOneSided._WORKSPACE = None
+            if workspace_state is not None:
+                workspace_state.clear()
+
+        self.mnnvl_mem = None
+        self.workspace = None
+        self.moe_a2a_metainfo = None
+        self._workspace_state = None
+        self._dispatch_state = {"phase": "destroyed"}
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
@@ -318,7 +429,11 @@ class NVLinkOneSided(Communication):
             token_final_scales: Router weights [local_num_tokens, top_k]
             all_rank_num_tokens: Token counts per rank [ep_size]
             use_dp_padding: Whether to use DP padding (optional)
-            **kwargs: Strategy-specific arguments (unused)
+            **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` may override the
+                committed membership for dispatch. Without an override, the committed mask and generation are
+                captured together; combine reuses that mask and fails closed if the generation changes first.
+                The masked kernel rejects inactive routes before remote access; that sentinel is an internal abort
+                artifact, not valid model output.
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
@@ -326,6 +441,7 @@ class NVLinkOneSided(Communication):
         """
         if self._dispatch_state.get("phase") == "dispatched":
             raise RuntimeError("dispatch called twice without an intervening combine")
+        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
@@ -349,6 +465,13 @@ class NVLinkOneSided(Communication):
             assert eplb_local_stats.size(0) == self.eplb_stats_num_experts, (
                 "eplb_local_stats size must match eplb_stats_num_experts"
             )
+        requested_active_rank_mask = kwargs.get("active_rank_mask")
+        if not self._rank_mask_enabled and requested_active_rank_mask is not None:
+            raise ValueError("active_rank_mask requires committed EP group health")
+        active_rank_mask_snapshot = self._watchdog_coordinator.capture_active_rank_mask(
+            requested_active_rank_mask
+        )
+        active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
@@ -362,7 +485,12 @@ class NVLinkOneSided(Communication):
                 self.top_k,
                 self.num_experts,
                 eplb_local_stats,
+                self._rank_mask_enabled,
+                active_rank_mask,
             )
+        )
+        self._watchdog_coordinator.watch_collective(
+            self._alltoall_watchdog, "dispatch", active_rank_mask
         )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
@@ -370,6 +498,7 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
+        self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
@@ -432,6 +561,9 @@ class NVLinkOneSided(Communication):
             final_hidden_states: Output from MoE computation
                 Shape: [ep_size, max_tokens_per_rank, hidden_size] or
                        [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
+            **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` must match the mask
+                captured by dispatch for this collective when supplied. A committed-generation change since
+                dispatch aborts the collective epoch.
 
         Returns:
             Combined output tensor [local_num_tokens, hidden_size]
@@ -439,6 +571,7 @@ class NVLinkOneSided(Communication):
         """
         if self._dispatch_state.get("phase") != "dispatched":
             raise RuntimeError("combine called before a successful dispatch")
+        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
 
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
@@ -466,6 +599,16 @@ class NVLinkOneSided(Communication):
             raise ValueError(
                 f"final_hidden_states must be 2D or 3D, got {final_hidden_states.dim()}D"
             )
+        active_rank_mask_snapshot = self._dispatch_state.get("active_rank_mask_snapshot")
+        if not isinstance(active_rank_mask_snapshot, ActiveRankMaskSnapshot):
+            raise RuntimeError("combine called but dispatch rank-mask snapshot is missing")
+        requested_active_rank_mask = kwargs.get("active_rank_mask")
+        if not self._rank_mask_enabled and requested_active_rank_mask is not None:
+            raise ValueError("active_rank_mask requires committed EP group health")
+        active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
+            active_rank_mask_snapshot,
+            requested_active_rank_mask,
+        )
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -478,12 +621,27 @@ class NVLinkOneSided(Communication):
             int(combine_payload_offset),
             bool(self.payload_in_workspace),
             bool(self.use_low_precision_combine),
+            self._rank_mask_enabled,
+            active_rank_mask,
+        )
+        self._watchdog_coordinator.watch_collective(
+            self._alltoall_watchdog, "combine", active_rank_mask
         )
 
         # Reset state for next round
-        self._dispatch_state = {"phase": "idle"}
+        self.reset_state()
 
         return output
+
+    def reset_state(self) -> None:
+        """Reset the dispatch/combine state machine to ``idle``.
+
+        Safe to call between forward passes (or from an error handler) to
+        recover from a forward that called ``dispatch`` but did not reach
+        ``combine`` — e.g. because an OOM aborted the forward. Without this,
+        the next ``dispatch`` would raise ``dispatch called twice``.
+        """
+        self._dispatch_state = {"phase": "idle"}
 
     def get_combine_payload_tensor_in_workspace(
         self, runtime_max_tokens_per_rank: int, hidden_size: int, dtype: torch.dtype

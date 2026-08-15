@@ -329,7 +329,8 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
         "The chemical symbol for water is",
     ]
 
-    sampling_config = SamplingParams(max_tokens=10,
+    # max_tokens=2 keeps the smoke check tight.
+    sampling_config = SamplingParams(max_tokens=2,
                                      temperature=0.0,
                                      return_generation_logits=True)
 

@@ -1,10 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import json
 import pickle
 import tempfile
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
@@ -416,6 +421,78 @@ def test_llm_request():
     assert torch.equal(llm_request.draft_logits, logits)
 
 
+def test_generation_only_llm_request_adopts_draft_tokens() -> None:
+    request_id = 42
+    first_gen_tokens = [100]
+    draft_tokens = [101, 102, 103]
+    llm_request_type = _tb.internal.batch_manager.LlmRequestType
+    context_phase_params = _tb.executor.ContextPhaseParams(
+        first_gen_tokens,
+        request_id,
+        None,
+        draft_tokens,
+        None,
+        None,
+    )
+
+    llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=context_phase_params,
+    )
+
+    assert llm_request.is_generation_only_request
+    assert llm_request.has_draft_tokens()
+    assert llm_request.num_draft_tokens == len(draft_tokens)
+    assert llm_request.draft_tokens == draft_tokens
+    assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+    late_llm_request = _tb.internal.batch_manager.LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[1, 2, 3],
+        is_streaming=False,
+        llm_request_type=llm_request_type.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+
+    assert late_llm_request.draft_tokens is None
+    assert late_llm_request.num_draft_tokens == 0
+
+    late_llm_request.context_phase_params = context_phase_params
+
+    assert late_llm_request.has_draft_tokens()
+    assert late_llm_request.num_draft_tokens == len(draft_tokens)
+    assert late_llm_request.draft_tokens == draft_tokens
+
+
+@pytest.mark.cpu_only
+def test_llm_request_kv_cache_transfer_metric_bindings():
+    request = _tb.internal.batch_manager.LlmRequest(
+        request_id=0,
+        max_new_tokens=5,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[0, 1, 2],
+        is_streaming=True,
+    )
+    offset = _tb.internal.batch_manager.LlmRequest.global_steady_clock_offset
+    offset = offset if offset is not None else timedelta()
+    start = timedelta(seconds=1.25)
+    end = timedelta(seconds=2.5)
+
+    request.set_kv_cache_transfer_start(start)
+    request.set_kv_cache_transfer_end(end)
+    request.set_kv_cache_size(128)
+
+    assert request.kv_cache_transfer_start == start + offset
+    assert request.kv_cache_transfer_end == end + offset
+    assert request.kv_cache_size == 128
+
+
 def test_Mpicomm():
     size1 = _tb.MpiComm.size()
     rank1 = _tb.MpiComm.rank()
@@ -476,8 +553,6 @@ def test_KvCache_events_binding():
         'max_beam_width':
         1,
         'max_attention_window_vec': [max_sequence_length],
-        'temp_attention_window_inputs':
-        None,
         'dtype':
         _tb.DataType.FLOAT,
         'sink_token_length':
@@ -485,6 +560,8 @@ def test_KvCache_events_binding():
         'stream':
         stream.cuda_stream,
         'max_sequence_length':
+        max_sequence_length,
+        'chunk_size':
         max_sequence_length,
         'enable_block_reuse':
         True,

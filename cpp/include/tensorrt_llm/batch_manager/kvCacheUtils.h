@@ -72,16 +72,40 @@ public:
     static BlockRange fromReuseTree(
         BaseKVCacheManager& cacheManager, BlockKey const& lastBlockKey, int32_t indexFromEnd)
     {
+        auto windowSize = getCheckedWindowSize(cacheManager);
+        auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
+        return fromLastBlock(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
+    }
 
+    static BlockRange fromReuseTree(
+        BaseKVCacheManager& cacheManager, std::vector<BlockKey> const& blockKeys, int32_t indexFromEnd)
+    {
+        TLLM_CHECK_WITH_INFO(!blockKeys.empty(), "blockKeys must not be empty for reuse tree lookup");
+        auto windowSize = getCheckedWindowSize(cacheManager);
+        auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
+        return fromLastBlock(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
+    }
+
+private:
+    static BlockRange fromLastBlock(BaseKVCacheManager const& cacheManager, std::shared_ptr<KVCacheBlock> lastBlock,
+        int32_t indexFromEnd, SizeType32 windowSize)
+    {
+        // TODO: handle the case where the last block is not found
+        TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
+        return collectBlocks(cacheManager, std::move(lastBlock), indexFromEnd, windowSize);
+    }
+
+    static SizeType32 getCheckedWindowSize(BaseKVCacheManager& cacheManager)
+    {
         auto poolNum = cacheManager.getBlockManager().getNumPools(
             /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
         TLLM_CHECK_WITH_INFO(poolNum == 1, "Reuse tree is not supported for multiple pools or variable window size");
+        return cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
+    }
 
-        auto windowSize = cacheManager.getBlockManager().getWindowSizesMetadata().begin()->first;
-        // Find the last block in the reuse tree for the provided full sequence of block keys
-        auto lastBlock = cacheManager.findBlocksInReuseTreeByBlockKey(lastBlockKey, windowSize);
-        // TODO: handle the case where the last block is not found
-        TLLM_CHECK_WITH_INFO(lastBlock, "Couldn't find the requested block in the reuse tree");
+    static BlockRange collectBlocks(BaseKVCacheManager const& cacheManager, std::shared_ptr<KVCacheBlock> lastBlock,
+        int32_t indexFromEnd, SizeType32 windowSize)
+    {
         int32_t const numBlocksToCollect = indexFromEnd + 1;
 
         std::vector<SizeType32> blockIds;
@@ -104,6 +128,7 @@ public:
         return BlockRange(cacheManager, blockIdsPerWindow, 0);
     }
 
+public:
     void setBlockIdsForWindow(SizeType32 windowSize, std::vector<SizeType32> blockIds)
     {
         TLLM_CHECK_WITH_INFO(mBlockIdsPerWindow.find(windowSize) != mBlockIdsPerWindow.end(),

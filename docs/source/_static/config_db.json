@@ -13,6 +13,18 @@
       "scenario": "Max Throughput"
     },
     {
+      "command": "trtllm-serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/nemotron-3-ultra-throughput.yaml",
+      "config_filename": "nemotron-3-ultra-throughput.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/nemotron-3-ultra-throughput.yaml",
+      "config_path": "examples/configs/curated/nemotron-3-ultra-throughput.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/nemotron-3-ultra-throughput.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300, H100, H200",
+      "model": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+      "model_display_name": "Nemotron v3 Ultra (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+      "scenario": "Max Throughput"
+    },
+    {
       "command": "trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --config ${TRTLLM_DIR}/examples/configs/curated/qwen3-next.yaml",
       "config_filename": "qwen3-next.yaml",
       "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3-next.yaml",
@@ -22,6 +34,66 @@
       "model": "Qwen/Qwen3-Next-80B-A3B-Thinking",
       "model_display_name": "Qwen3-Next-80B",
       "model_url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking",
+      "scenario": "Max Throughput"
+    },
+    {
+      "command": "trtllm-serve Qwen/Qwen3.8-2.4T-A95B-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.8-low-latency.yaml",
+      "config_filename": "qwen3.8-low-latency.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.8-low-latency.yaml",
+      "config_path": "examples/configs/curated/qwen3.8-low-latency.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.8-low-latency.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "model_display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "model_url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "scenario": "Min Latency (No MTP)"
+    },
+    {
+      "command": "trtllm-serve Qwen/Qwen3.8-2.4T-A95B-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.8-low-latency-mtp3.yaml",
+      "config_filename": "qwen3.8-low-latency-mtp3.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.8-low-latency-mtp3.yaml",
+      "config_path": "examples/configs/curated/qwen3.8-low-latency-mtp3.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.8-low-latency-mtp3.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "model_display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "model_url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "scenario": "Min Latency (MTP3)"
+    },
+    {
+      "command": "cd \"${TRTLLM_DIR}\" && trtllm-serve Qwen/Qwen3.8-2.4T-A95B-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.8-high-throughput.yaml",
+      "config_filename": "qwen3.8-high-throughput.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.8-high-throughput.yaml",
+      "config_path": "examples/configs/curated/qwen3.8-high-throughput.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.8-high-throughput.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "model_display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "model_url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "scenario": "Max Throughput (Static EPLB, No MTP)"
+    },
+    {
+      "command": "cd \"${TRTLLM_DIR}\" && trtllm-serve Qwen/Qwen3.8-2.4T-A95B-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml",
+      "config_filename": "qwen3.8-high-throughput-mtp3.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml",
+      "config_path": "examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.8-high-throughput-mtp3.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "model_display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "model_url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
+      "scenario": "Max Throughput (Static EPLB, MTP3)"
+    },
+    {
+      "command": "trtllm-serve nvidia/Qwen3.5-397B-A17B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/qwen3.5.yaml",
+      "config_filename": "qwen3.5.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3.5.yaml",
+      "config_path": "examples/configs/curated/qwen3.5.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/qwen3.5.yaml",
+      "gpu_compatibility": "B200, B300, GB200, GB300",
+      "model": "nvidia/Qwen3.5-397B-A17B-NVFP4",
+      "model_display_name": "Qwen3.5-397B-A17B (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4",
       "scenario": "Max Throughput"
     },
     {
@@ -143,9 +215,140 @@
       "model_display_name": "Llama 4 Scout (FP8)",
       "model_url": "https://huggingface.co/nvidia/Llama-4-Scout-17B-16E-Instruct-FP8",
       "scenario": "Max Throughput"
+    },
+    {
+      "command": "trtllm-serve MiniMaxAI/MiniMax-M3-MXFP8 --config ${TRTLLM_DIR}/examples/configs/curated/minimax-m3-throughput.yaml",
+      "config_filename": "minimax-m3-throughput.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/minimax-m3-throughput.yaml",
+      "config_path": "examples/configs/curated/minimax-m3-throughput.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/minimax-m3-throughput.yaml",
+      "gpu_compatibility": "GB200",
+      "model": "MiniMaxAI/MiniMax-M3-MXFP8",
+      "model_display_name": "MiniMax-M3 (MXFP8)",
+      "model_url": "https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8",
+      "scenario": "Max Throughput"
+    },
+    {
+      "command": "trtllm-serve deepseek-ai/DeepSeek-V4-Pro --config ${TRTLLM_DIR}/examples/configs/curated/deepseek-v4-pro-latency.yaml",
+      "config_filename": "deepseek-v4-pro-latency.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/deepseek-v4-pro-latency.yaml",
+      "config_path": "examples/configs/curated/deepseek-v4-pro-latency.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/deepseek-v4-pro-latency.yaml",
+      "gpu_compatibility": "B200",
+      "model": "deepseek-ai/DeepSeek-V4-Pro",
+      "model_display_name": "deepseek-ai/DeepSeek-V4-Pro",
+      "model_url": "",
+      "scenario": "Min Latency"
+    },
+    {
+      "command": "trtllm-serve deepseek-ai/DeepSeek-V4-Pro --config ${TRTLLM_DIR}/examples/configs/curated/deepseek-v4-pro-throughput.yaml",
+      "config_filename": "deepseek-v4-pro-throughput.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/deepseek-v4-pro-throughput.yaml",
+      "config_path": "examples/configs/curated/deepseek-v4-pro-throughput.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/deepseek-v4-pro-throughput.yaml",
+      "gpu_compatibility": "B200",
+      "model": "deepseek-ai/DeepSeek-V4-Pro",
+      "model_display_name": "deepseek-ai/DeepSeek-V4-Pro",
+      "model_url": "",
+      "scenario": "Max Throughput"
     }
   ],
   "entries": [
+    {
+      "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp4_conc8.yaml",
+      "concurrency": 8,
+      "config_filename": "1k1k_tp4_conc8.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp4_conc8.yaml",
+      "config_path": "examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp4_conc8.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp4_conc8.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 1024,
+      "model": "deepseek-ai/DeepSeek-R1-0528",
+      "model_display_name": "DeepSeek-R1",
+      "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Min Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp4_conc16.yaml",
+      "concurrency": 16,
+      "config_filename": "1k1k_tp4_conc16.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp4_conc16.yaml",
+      "config_path": "examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp4_conc16.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp4_conc16.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 1024,
+      "model": "deepseek-ai/DeepSeek-R1-0528",
+      "model_display_name": "DeepSeek-R1",
+      "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Max Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc8.yaml",
+      "concurrency": 8,
+      "config_filename": "8k1k_tp4_conc8.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc8.yaml",
+      "config_path": "examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc8.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc8.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 8192,
+      "model": "deepseek-ai/DeepSeek-R1-0528",
+      "model_display_name": "DeepSeek-R1",
+      "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Min Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc16.yaml",
+      "concurrency": 16,
+      "config_filename": "8k1k_tp4_conc16.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc16.yaml",
+      "config_path": "examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc16.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc16.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 8192,
+      "model": "deepseek-ai/DeepSeek-R1-0528",
+      "model_display_name": "DeepSeek-R1",
+      "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc32.yaml",
+      "concurrency": 32,
+      "config_filename": "8k1k_tp4_conc32.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc32.yaml",
+      "config_path": "examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc32.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp4_conc32.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 8192,
+      "model": "deepseek-ai/DeepSeek-R1-0528",
+      "model_display_name": "DeepSeek-R1",
+      "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Max Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc1.yaml",
       "concurrency": 1,
@@ -263,7 +466,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Balanced"
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc128.yaml",
@@ -280,7 +485,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc256.yaml",
@@ -637,7 +844,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc32.yaml",
@@ -654,7 +863,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Balanced"
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc64.yaml",
@@ -671,7 +882,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Balanced"
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc128.yaml",
@@ -688,7 +901,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc256.yaml",
@@ -705,7 +920,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc512.yaml",
@@ -807,7 +1024,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc8.yaml",
@@ -824,7 +1043,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc16.yaml",
@@ -841,7 +1062,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc32.yaml",
@@ -858,7 +1081,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Balanced"
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc64.yaml",
@@ -875,7 +1100,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Balanced"
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc128.yaml",
@@ -892,7 +1119,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc256.yaml",
@@ -909,7 +1138,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc512.yaml",
@@ -1181,7 +1412,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc8.yaml",
@@ -1198,7 +1431,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc16.yaml",
@@ -1215,7 +1450,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Balanced"
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc32.yaml",
@@ -1232,7 +1469,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc64.yaml",
@@ -1249,7 +1488,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc128.yaml",
@@ -1266,7 +1507,9 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc256.yaml",
@@ -1283,7 +1526,85 @@
       "model_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Max Throughput"
+      "performance_profile": "Max Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc4.yaml",
+      "concurrency": 4,
+      "config_filename": "1k1k_tp4_conc4.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc4.yaml",
+      "config_path": "examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc4.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc4.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 1024,
+      "model": "nvidia/DeepSeek-R1-0528-FP4-v2",
+      "model_display_name": "DeepSeek-R1 (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Min Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc8.yaml",
+      "concurrency": 8,
+      "config_filename": "1k1k_tp4_conc8.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc8.yaml",
+      "config_path": "examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc8.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc8.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 1024,
+      "model": "nvidia/DeepSeek-R1-0528-FP4-v2",
+      "model_display_name": "DeepSeek-R1 (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc16.yaml",
+      "concurrency": 16,
+      "config_filename": "1k1k_tp4_conc16.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc16.yaml",
+      "config_path": "examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc16.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc16.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 1024,
+      "model": "nvidia/DeepSeek-R1-0528-FP4-v2",
+      "model_display_name": "DeepSeek-R1 (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc256.yaml",
+      "concurrency": 256,
+      "config_filename": "1k1k_tp4_conc256.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc256.yaml",
+      "config_path": "examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc256.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc256.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 1024,
+      "model": "nvidia/DeepSeek-R1-0528-FP4-v2",
+      "model_display_name": "DeepSeek-R1 (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Max Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k8k_tp4_conc2048.yaml",
@@ -1303,6 +1624,82 @@
       "performance_profile": "High Throughput"
     },
     {
+      "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc4.yaml",
+      "concurrency": 4,
+      "config_filename": "8k1k_tp4_conc4.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc4.yaml",
+      "config_path": "examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc4.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc4.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 8192,
+      "model": "nvidia/DeepSeek-R1-0528-FP4-v2",
+      "model_display_name": "DeepSeek-R1 (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Min Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc8.yaml",
+      "concurrency": 8,
+      "config_filename": "8k1k_tp4_conc8.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc8.yaml",
+      "config_path": "examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc8.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc8.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 8192,
+      "model": "nvidia/DeepSeek-R1-0528-FP4-v2",
+      "model_display_name": "DeepSeek-R1 (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc16.yaml",
+      "concurrency": 16,
+      "config_filename": "8k1k_tp4_conc16.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc16.yaml",
+      "config_path": "examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc16.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc16.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 8192,
+      "model": "nvidia/DeepSeek-R1-0528-FP4-v2",
+      "model_display_name": "DeepSeek-R1 (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc256.yaml",
+      "concurrency": 256,
+      "config_filename": "8k1k_tp4_conc256.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc256.yaml",
+      "config_path": "examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc256.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc256.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "4xB200_NVL",
+      "isl": 8192,
+      "model": "nvidia/DeepSeek-R1-0528-FP4-v2",
+      "model_display_name": "DeepSeek-R1 (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc1024.yaml",
       "concurrency": 1024,
       "config_filename": "8k1k_tp4_conc1024.yaml",
@@ -1317,7 +1714,7 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 4,
       "osl": 1024,
-      "performance_profile": "Min Latency"
+      "performance_profile": "High Throughput"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc2048.yaml",
@@ -1385,7 +1782,9 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc8.yaml",
@@ -1436,7 +1835,9 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Balanced"
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc64.yaml",
@@ -1453,7 +1854,9 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Balanced"
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc128.yaml",
@@ -1470,7 +1873,9 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc256.yaml",
@@ -1487,7 +1892,9 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc512.yaml",
@@ -1776,7 +2183,9 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc8.yaml",
@@ -1844,7 +2253,9 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc128.yaml",
@@ -1861,7 +2272,9 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc256.yaml",
@@ -1878,7 +2291,9 @@
       "model_url": "https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "High Throughput"
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc512.yaml",
@@ -1896,6 +2311,177 @@
       "num_gpus": 8,
       "osl": 1024,
       "performance_profile": "Max Throughput"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp1_conc256.yaml",
+      "concurrency": 256,
+      "config_filename": "1k1k_tp1_conc256.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp1_conc256.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp1_conc256.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp1_conc256.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "B200_NVL",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc4.yaml",
+      "concurrency": 4,
+      "config_filename": "8k1k_tp1_conc4.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc4.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc4.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc4.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "B200_NVL",
+      "isl": 8192,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "Min Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc8.yaml",
+      "concurrency": 8,
+      "config_filename": "8k1k_tp1_conc8.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc8.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc8.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc8.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "B200_NVL",
+      "isl": 8192,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc16.yaml",
+      "concurrency": 16,
+      "config_filename": "8k1k_tp1_conc16.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc16.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc16.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc16.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "B200_NVL",
+      "isl": 8192,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc32.yaml",
+      "concurrency": 32,
+      "config_filename": "8k1k_tp1_conc32.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc32.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc32.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc32.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "B200_NVL",
+      "isl": 8192,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc64.yaml",
+      "concurrency": 64,
+      "config_filename": "8k1k_tp1_conc64.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc64.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc64.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc64.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "B200_NVL",
+      "isl": 8192,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc128.yaml",
+      "concurrency": 128,
+      "config_filename": "8k1k_tp1_conc128.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc128.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc128.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc128.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "B200_NVL",
+      "isl": 8192,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc256.yaml",
+      "concurrency": 256,
+      "config_filename": "8k1k_tp1_conc256.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc256.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc256.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc256.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "B200_NVL",
+      "isl": 8192,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "Max Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp2_conc256.yaml",
+      "concurrency": 256,
+      "config_filename": "1k1k_tp2_conc256.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp2_conc256.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp2_conc256.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp2_conc256.yaml",
+      "gpu": "B200_NVL",
+      "gpu_display": "2xB200_NVL",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 2,
+      "osl": 1024,
+      "performance_profile": "High Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc4.yaml",
@@ -2799,6 +3385,101 @@
       "performance_profile": "Max Throughput"
     },
     {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc8.yaml",
+      "concurrency": 8,
+      "config_filename": "1k1k_tp1_conc8.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc8.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc8.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc8.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "H200_SXM",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "Min Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc64.yaml",
+      "concurrency": 64,
+      "config_filename": "1k1k_tp1_conc64.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc64.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc64.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc64.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "H200_SXM",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "Max Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp1_conc4.yaml",
+      "concurrency": 4,
+      "config_filename": "8k1k_tp1_conc4.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp1_conc4.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp1_conc4.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp1_conc4.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "H200_SXM",
+      "isl": 8192,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 1,
+      "osl": 1024,
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc4.yaml",
+      "concurrency": 4,
+      "config_filename": "1k1k_tp2_conc4.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc4.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc4.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc4.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "2xH200_SXM",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 2,
+      "osl": 1024,
+      "performance_profile": "Min Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc32.yaml",
+      "concurrency": 32,
+      "config_filename": "1k1k_tp2_conc32.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc32.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc32.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc32.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "2xH200_SXM",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 2,
+      "osl": 1024,
+      "performance_profile": "Max Throughput",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
       "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc16.yaml",
       "concurrency": 16,
       "config_filename": "8k1k_tp2_conc16.yaml",
@@ -2850,6 +3531,82 @@
       "performance_profile": "Max Throughput"
     },
     {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc4.yaml",
+      "concurrency": 4,
+      "config_filename": "1k1k_tp4_conc4.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc4.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc4.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc4.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "4xH200_SXM",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Min Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc8.yaml",
+      "concurrency": 8,
+      "config_filename": "1k1k_tp4_conc8.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc8.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc8.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc8.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "4xH200_SXM",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc16.yaml",
+      "concurrency": 16,
+      "config_filename": "1k1k_tp4_conc16.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc16.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc16.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc16.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "4xH200_SXM",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc32.yaml",
+      "concurrency": 32,
+      "config_filename": "1k1k_tp4_conc32.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc32.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc32.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc32.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "4xH200_SXM",
+      "isl": 1024,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
       "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc128.yaml",
       "concurrency": 128,
       "config_filename": "1k1k_tp4_conc128.yaml",
@@ -2864,7 +3621,7 @@
       "model_url": "https://huggingface.co/openai/gpt-oss-120b",
       "num_gpus": 4,
       "osl": 1024,
-      "performance_profile": "Min Latency"
+      "performance_profile": "High Throughput"
     },
     {
       "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc384.yaml",
@@ -2881,7 +3638,7 @@
       "model_url": "https://huggingface.co/openai/gpt-oss-120b",
       "num_gpus": 4,
       "osl": 1024,
-      "performance_profile": "Balanced"
+      "performance_profile": "High Throughput"
     },
     {
       "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc1024.yaml",
@@ -2952,6 +3709,25 @@
       "performance_profile": "Balanced"
     },
     {
+      "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc64.yaml",
+      "concurrency": 64,
+      "config_filename": "8k1k_tp4_conc64.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc64.yaml",
+      "config_path": "examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc64.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc64.yaml",
+      "gpu": "H200_SXM",
+      "gpu_display": "4xH200_SXM",
+      "isl": 8192,
+      "model": "openai/gpt-oss-120b",
+      "model_display_name": "gpt-oss-120b",
+      "model_url": "https://huggingface.co/openai/gpt-oss-120b",
+      "num_gpus": 4,
+      "osl": 1024,
+      "performance_profile": "Balanced",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
+    },
+    {
       "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc768.yaml",
       "concurrency": 768,
       "config_filename": "8k1k_tp4_conc768.yaml",
@@ -2983,7 +3759,9 @@
       "model_url": "https://huggingface.co/openai/gpt-oss-120b",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Min Latency"
+      "performance_profile": "Min Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc8.yaml",
@@ -3000,7 +3778,9 @@
       "model_url": "https://huggingface.co/openai/gpt-oss-120b",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc16.yaml",
@@ -3374,7 +4154,9 @@
       "model_url": "https://huggingface.co/openai/gpt-oss-120b",
       "num_gpus": 8,
       "osl": 1024,
-      "performance_profile": "Low Latency"
+      "performance_profile": "Low Latency",
+      "validated_trtllm_commit": "93cb6518b6d6dbd6095748189e626db731f44545",
+      "validated_trtllm_version": "1.3.0rc14"
     },
     {
       "command": "trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc32.yaml",
@@ -3480,6 +4262,10 @@
     }
   ],
   "models": {
+    "MiniMaxAI/MiniMax-M3-MXFP8": {
+      "display_name": "MiniMax-M3 (MXFP8)",
+      "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8"
+    },
     "Qwen/Qwen3-30B-A3B": {
       "display_name": "Qwen3-30B-A3B",
       "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B"
@@ -3488,9 +4274,17 @@
       "display_name": "Qwen3-Next-80B",
       "url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking"
     },
+    "Qwen/Qwen3.8-2.4T-A95B-FP8": {
+      "display_name": "Qwen3.8-2.4T-A95B (FP8)",
+      "url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8"
+    },
     "deepseek-ai/DeepSeek-R1-0528": {
       "display_name": "DeepSeek-R1",
       "url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528"
+    },
+    "deepseek-ai/DeepSeek-V4-Pro": {
+      "display_name": "deepseek-ai/DeepSeek-V4-Pro",
+      "url": ""
     },
     "nvidia/DeepSeek-R1-0528-FP4-v2": {
       "display_name": "DeepSeek-R1 (NVFP4)",
@@ -3515,6 +4309,14 @@
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": {
       "display_name": "Nemotron v3 Super (NVFP4)",
       "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    },
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4": {
+      "display_name": "Nemotron v3 Ultra (NVFP4)",
+      "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
+    },
+    "nvidia/Qwen3.5-397B-A17B-NVFP4": {
+      "display_name": "Qwen3.5-397B-A17B (NVFP4)",
+      "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4"
     },
     "openai/gpt-oss-120b": {
       "display_name": "gpt-oss-120b",

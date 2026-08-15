@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaKernels.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaRunnerParams.h"
 #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/prepareCustomMask.h"
@@ -293,8 +294,8 @@ protected:
         int64_t totalMaskSize = static_cast<int64_t>(batchSize) * maxNumTilesQ * maxNumCustomMaskTilesKv * numInstsQ
             * numInstsKv * (tileSizeQ * tileSizeKvPadded) / 32;
 
-        auto customMaskOffsetsDevice = mBufferManager->gpu(batchSize, nvinfer1::DataType::kINT64);
-        auto customMaskDevice = mBufferManager->gpu(totalMaskSize, nvinfer1::DataType::kINT32);
+        auto customMaskOffsetsDevice = mBufferManager->gpu(batchSize, tensorrt_llm::DataType::kINT64);
+        auto customMaskDevice = mBufferManager->gpu(totalMaskSize, tensorrt_llm::DataType::kINT32);
 
         // Clear GPU buffers to ensure no stale data from previous tests
         cudaMemsetAsync(bufferCast<int64_t>(*customMaskOffsetsDevice), 0, batchSize * sizeof(int64_t), mStream->get());
@@ -372,6 +373,14 @@ TEST_F(PrepareCustomMaskTest, MediumBatch)
         /* maxSeqLenQ */ 32,
         /* maxSeqLenKv */ 256,
         /* numHeadsQPerKv */ 8);
+}
+
+TEST_F(PrepareCustomMaskTest, LargeBatchParallelOffsetScan)
+{
+    testPrepareCustomMask(/* batchSize */ 128,
+        /* maxSeqLenQ */ 16,
+        /* maxSeqLenKv */ 128,
+        /* numHeadsQPerKv */ 4);
 }
 
 } // namespace

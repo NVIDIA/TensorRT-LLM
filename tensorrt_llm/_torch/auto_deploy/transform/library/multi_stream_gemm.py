@@ -61,6 +61,7 @@ from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformReg
 # ---------------------------------------------------------------------------
 _SUPPORTED_LINEAR_OPS: List[Callable] = [
     torch.ops.auto_deploy.trtllm_finegrained_fp8_linear,
+    torch.ops.auto_deploy.trtllm_fp8_deepgemm,
 ]
 
 # Multi-stream passthrough functions used by other transforms.  If any user of

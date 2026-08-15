@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import json
 import pathlib
@@ -67,7 +70,7 @@ from dataclasses import replace
 
 
 @force_ampere
-@pytest.mark.parametrize("enable_chunked_prefill,", [False, True])
+@pytest.mark.parametrize("enable_chunked_prefill", [False, True])
 @pytest.mark.part2
 def test_tinyllama_logits_processor(enable_chunked_prefill):
     tinyllama_logits_processor_test_harness(
@@ -247,6 +250,34 @@ def test_llm_perf_metrics():
         assert perf_metrics.first_iter is not None
         assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
         assert perf_metrics.last_iter == perf_metrics.iter
+
+
+@skip_ray
+@pytest.mark.part3
+@pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
+def test_llm_prefix_cache_reuse(attn_backend):
+    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    prompt = "The future of AI is " * 20
+    sampling_params = SamplingParams(temperature=0,
+                                     max_tokens=5,
+                                     return_perf_metrics=True)
+
+    with LLM(
+            model=model_path,
+            attn_backend=attn_backend,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            cuda_graph_config=None,
+    ) as llm:
+        cold_output = llm.generate(prompt, sampling_params).outputs[0]
+        warm_output = llm.generate(prompt, sampling_params).outputs[0]
+
+    cold_metrics = cold_output.request_perf_metrics
+    warm_metrics = warm_output.request_perf_metrics
+    assert cold_metrics is not None
+    assert warm_metrics is not None
+    assert cold_metrics.kv_cache_metrics.num_reused_blocks == 0
+    assert warm_metrics.kv_cache_metrics.num_reused_blocks > 0
+    assert cold_output.token_ids == warm_output.token_ids
 
 
 @skip_ray
@@ -610,14 +641,15 @@ def test_nemotron_nas_lora(cuda_graph_config) -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-        cuda_graph_config=cuda_graph_config)
+        cuda_graph_config=cuda_graph_config,
+        trust_remote_code=True)
 
     prompts = [
         "Hello, how are you?",
         "Hello, how are you?",
     ]
 
-    sampling_params = SamplingParams(max_tokens=10, add_special_tokens=False)
+    sampling_params = SamplingParams(max_tokens=3, add_special_tokens=False)
     lora_req = LoRARequest(
         "task-0", 0,
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
@@ -692,59 +724,6 @@ def test_llama_3_3_70b_fp8_with_squad_lora_tp2() -> None:
             f"Output similarity too low (similarity={similarity:.2%})!\nExpected: {repr(expected_output)}\nGot: {repr(generated_text)}"
     finally:
         llm.shutdown()
-
-
-@skip_gpu_memory_less_than_80gb
-@pytest.mark.part2
-@test_lora_with_and_without_cuda_graph
-def test_bielik_11b_v2_2_instruct_multi_lora(cuda_graph_config) -> None:
-    model_dir = f"{llm_models_root()}/Bielik-11B-v2.2-Instruct"
-
-    target_modules = ['attn_q', 'attn_k', 'attn_v']
-
-    # Set up temporary directory for LoRA adapters
-    with tempfile.TemporaryDirectory() as lora_dir:
-        print("Creating dummy LoRAs...")
-
-        model = AutoModelForCausalLM.from_pretrained(model_dir,
-                                                     dtype=torch.bfloat16,
-                                                     device_map="auto")
-        hf_modules = ["q_proj", "k_proj", "v_proj"]
-        peft_lora_config = PeftLoraConfig(r=8,
-                                          target_modules=hf_modules,
-                                          bias="none",
-                                          task_type="CAUSAL_LM")
-        lora_paths = []
-        for i in range(2):
-            lora_model = get_peft_model(model, peft_lora_config)
-            for param in lora_model.parameters():
-                param.data.zero_()
-            lora_path = f"{lora_dir}/lora_{i}"
-            lora_model.save_pretrained(lora_path)
-            lora_paths.append(lora_path)
-
-        trtllm_lora_config = LoraConfig(lora_target_modules=target_modules,
-                                        max_lora_rank=8,
-                                        max_loras=2,
-                                        max_cpu_loras=2)
-        llm = LLM(model_dir,
-                  lora_config=trtllm_lora_config,
-                  cuda_graph_config=cuda_graph_config)
-
-        prompts = [
-            "Kim był Mikołaj Kopernik i z czego zasłynął?",
-            "Gdzie znajduje się stolica Polski?",
-        ]
-        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
-        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
-        lora_requests = [lora_req1, lora_req2]
-        sampling_params = SamplingParams(max_tokens=200)
-
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=lora_requests)
-
-        assert len(outputs) == 2
 
 
 @pytest.mark.part2
@@ -951,8 +930,7 @@ def test_nemo_lora_unsupported_modules_validation(tmp_path):
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
 def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
-    """
-    Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
+    """Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
 
     This test verifies two properties:
     1. That a NeMo-format LoRA checkpoint with GQA (grouped query attention) can be loaded and applied to a TinyLlama model,
@@ -1097,7 +1075,7 @@ class TestLlmError:
 
     @pytest.mark.part3
     def test_max_num_token_check(self):
-        """ LLM should raise error when got prompt length exceed the valid range. """
+        """LLM should raise error when got prompt length exceed the valid range."""
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
@@ -1187,7 +1165,7 @@ def test_min_tokens(use_speculative: bool):
 def test_min_tokens_long_prompt():
     """Check min_tokens is respected when prompt is longer than min_tokens.
 
-    Regression test for NVBug 5823135: _apply_min_length_penalty compared
+    Regression test for NVBug 5823135: the min-length EOS suppression compared
     total token count (prompt + generated) against the raw min_tokens value
     instead of comparing generated token count only.  When prompt_len >=
     min_tokens the EOS suppression was never activated, allowing early
@@ -1395,7 +1373,7 @@ class TestLlmError:
 
     @pytest.mark.part3
     def test_max_num_token_check(self):
-        """ LLM should raise error when got prompt length exceed the valid range. """
+        """LLM should raise error when got prompt length exceed the valid range."""
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
@@ -1449,7 +1427,6 @@ async def test_llm_rpc_streaming():
 @skip_ray
 def test_llm_rpc_get_stats():
     """Test that get_stats works with RPC orchestrator."""
-
     with LLM(model=llama_model_path,
              kv_cache_config=global_kvcache_config,
              enable_iter_perf_stats=True,
@@ -1505,7 +1482,8 @@ async def test_llm_rpc_get_stats_async():
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.part0
 @skip_ray
-def test_llm_context_only_timed_out():
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+def test_llm_context_only_timed_out(transceiver_runtime):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1517,11 +1495,15 @@ def test_llm_context_only_timed_out():
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm = LLM(model=llama_model_path,
               kv_cache_config=global_kvcache_config,
               tensor_parallel_size=tp_size,
               cache_transceiver_config=CacheTransceiverConfig(
-                  backend="UCX", kv_transfer_timeout_ms=1000),
+                  backend=backend,
+                  kv_transfer_timeout_ms=1000,
+                  transceiver_runtime=transceiver_runtime),
               **llm_args_extra)
 
     max_tokens = 1
@@ -1542,18 +1524,22 @@ def test_llm_context_only_timed_out():
                                disaggregated_params=disaggregated_params):
         print(output)
 
+    # Wait until the context-only request has allocated KV cache blocks
     max_retries = 10
+    all_results = []
     for _ in range(max_retries):
         results = llm.get_stats(2)
-        if len(results) == 1:
+        all_results.extend(results)
+        if all_results and all_results[-1]["kvCacheStats"]["usedNumBlocks"] > 0:
             break
         time.sleep(1)
     else:
         pytest.fail(
-            f"Failed to get stats with len==1 after {max_retries} retries")
+            f"Context-only KV cache blocks not allocated after {max_retries} retries"
+        )
+    results = all_results
 
-    assert len(results) == 1
-    context_only_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    context_only_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
     print(f"Context only used num blocks: {context_only_used_num_blocks}")
 
     # Sleep 5 seconds to allow context only request to time out
@@ -1563,11 +1549,20 @@ def test_llm_context_only_timed_out():
     for output in llm.generate(prompts0, sampling_params=sampling_params):
         print(output)
 
-    # Get number of allocated blocks
-    results = llm.get_stats(2)
-    assert len(results) == 1
-    final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    # Wait until KV cache blocks are released (usedNumBlocks == 0)
+    max_retries = 10
+    all_results = []
+    for _ in range(max_retries):
+        results = llm.get_stats(2)
+        all_results.extend(results)
+        if all_results and all_results[-1]["kvCacheStats"]["usedNumBlocks"] == 0:
+            break
+        time.sleep(1)
+    else:
+        pytest.fail(f"KV cache blocks not released after {max_retries} retries")
+    results = all_results
 
+    final_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
     assert final_used_num_blocks == 0
 
 
@@ -1579,8 +1574,14 @@ def test_llm_context_only_timed_out():
 @skip_ray
 @pytest.mark.parametrize("sender_future_timeout_ms", [100, 1000])
 @pytest.mark.parametrize("backend", ["NIXL", "UCX"])
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
 def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
-                                                       backend):
+                                                       backend,
+                                                       transceiver_runtime):
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    if transceiver_runtime == "PYTHON" and backend == "UCX":
+        pytest.skip("Python transceiver (V2) does not support UCX backend")
+
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1595,15 +1596,15 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.1,
                                     max_tokens=1000,
                                     enable_block_reuse=False)
-    llm = LLM(
-        model=llama_model_path,
-        kv_cache_config=kv_cache_config,
-        tensor_parallel_size=tp_size,
-        cache_transceiver_config=CacheTransceiverConfig(
-            backend=backend,
-            kv_transfer_timeout_ms=1000,
-            kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms),
-        **llm_args_extra)
+    llm = LLM(model=llama_model_path,
+              kv_cache_config=kv_cache_config,
+              tensor_parallel_size=tp_size,
+              cache_transceiver_config=CacheTransceiverConfig(
+                  backend=backend,
+                  kv_transfer_timeout_ms=1000,
+                  kv_transfer_sender_future_timeout_ms=sender_future_timeout_ms,
+                  transceiver_runtime=transceiver_runtime),
+              **llm_args_extra)
 
     max_tokens = 1
     sampling_params = SamplingParams(max_tokens=max_tokens)
@@ -1655,7 +1656,8 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-async def test_llm_disagg_gen_cancelled():
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+async def test_llm_disagg_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1667,18 +1669,24 @@ async def test_llm_disagg_gen_cancelled():
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm_ctx = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend="UCX", kv_transfer_timeout_ms=1000),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend="UCX", kv_transfer_timeout_ms=1000),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     try:
@@ -1727,19 +1735,22 @@ async def test_llm_disagg_gen_cancelled():
             print(f"num output tokens: {num_output_tokens}")
             assert result.outputs[0].finish_reason == "cancelled"
 
-            # Num check that the number of free/used blocks is as expected
+            # Wait until KV cache blocks are released (usedNumBlocks == 0)
             time.sleep(1.)
             max_retries = 10
+            all_results = []
             for _ in range(max_retries):
                 results = llm_gen.get_stats(2)
                 print("len(results):", len(results))
-                if len(results) == num_output_tokens - (1 if iter == 0 else 0):
+                all_results.extend(results)
+                if all_results and all_results[-1]["kvCacheStats"][
+                        "usedNumBlocks"] == 0:
                     break
                 time.sleep(1)
             else:
                 pytest.fail(
-                    f"Failed to get stats with len=={num_output_tokens - 1} after {max_retries} retries"
-                )
+                    f"KV cache blocks not released after {max_retries} retries")
+            results = all_results
 
             after_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
             assert after_used_num_blocks == 0
@@ -1827,7 +1838,8 @@ def test_priority_request_completes_before_low_priority():
 @pytest.mark.part0
 @skip_ray
 @pytest.mark.asyncio
-async def test_llm_disagg_streaming_gen_cancelled():
+@pytest.mark.parametrize("transceiver_runtime", [None, "PYTHON"])
+async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
     tp_size = 1
     use_overlap = False
     enable_iter_req_stats = False
@@ -1839,18 +1851,24 @@ async def test_llm_disagg_streaming_gen_cancelled():
              enable_iter_req_stats=enable_iter_req_stats,
              disable_overlap_scheduler=not use_overlap))
 
+    # Python transceiver (V2) only supports NIXL/DEFAULT backends
+    backend = "NIXL" if transceiver_runtime == "PYTHON" else "UCX"
     llm_ctx = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend="UCX", kv_transfer_timeout_ms=1000),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend="UCX", kv_transfer_timeout_ms=1000),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     try:

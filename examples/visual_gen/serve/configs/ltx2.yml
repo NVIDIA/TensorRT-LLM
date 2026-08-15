@@ -1,8 +1,7 @@
-text_encoder_path: google/gemma-3-12b-it
-linear:
-  type: default
-attention:
+cache_config:
+  cache_backend: cache_dit
+attention_config:
    backend: VANILLA
-parallel:
-   dit_cfg_size: 1
-   dit_ulysses_size: 1
+parallel_config:
+   cfg_size: 1
+   ulysses_size: 1

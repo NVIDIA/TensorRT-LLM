@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -69,9 +69,22 @@ class RequestData:
     computed_position: int
     # The number of scheduled tokens for the upcoming forward pass.
     num_scheduled_tokens: int
+    # The cumulative chain of block hashes for full blocks of beam 0. Each entry
+    # is the hash that KV cache events will report for the corresponding block;
+    # the chain is read directly from the KV cache manager's stored block hashes
+    # rather than recomputed Python-side. May front-run the corresponding KV cache
+    # event emission slightly: when a block becomes full during generation, its
+    # hash is committed in the same scheduler step.
+    block_hashes: List[int] = field(default_factory=list)
     # The retention priorities for each new block (same length as new_block_ids).
     # Used for priority-based offload filtering. None means use default priority.
     priorities: Optional[List[int]] = None
+    # Per-request cache salt that the KV cache manager uses to isolate reuse
+    # between requests carrying different salts. Connectors that key cached
+    # content on token sequences (e.g. by hashing tokens to a file path or
+    # remote object id) MUST mix cache_salt into their identifiers,
+    # otherwise blocks from a different salt could be incorrectly reused.
+    cache_salt: Optional[str] = None
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -309,6 +322,11 @@ class KvCacheConnectorSchedulerOutputRequest:
         block_ids = kv_cache_manager.get_cache_indices(req)
         tokens = req.get_tokens(0)
 
+        # Commit hashes for any blocks that have become full since the last call
+        # and read back the full cumulative chain. The C++ side sets each block's
+        # mBlockKey/mHash on first call, so subsequent calls become pure lookups.
+        block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
+
         new_block_ids = block_ids[len(self.block_ids) :]
         new_tokens = tokens[len(self.tokens) :]
 
@@ -341,7 +359,9 @@ class KvCacheConnectorSchedulerOutputRequest:
             new_block_ids,
             computed_position,
             num_scheduled_tokens,
-            priorities,
+            block_hashes=block_hashes,
+            priorities=priorities,
+            cache_salt=req.cache_salt,
         )
 
 

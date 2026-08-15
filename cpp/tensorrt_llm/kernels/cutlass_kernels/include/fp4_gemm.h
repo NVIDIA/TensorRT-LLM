@@ -54,7 +54,7 @@ public:
 
     virtual void gemm(void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
         float const* global_sf, int m, int n, int k, int batch_count, tkc::CutlassGemmConfig gemmConfig,
-        char* workspace, const size_t workspaceBytes, cudaStream_t stream)
+        char* workspace, const size_t workspaceBytes, cudaStream_t stream, void const* bias = nullptr)
         = 0;
 
     // Returns desired workspace size in bytes.
@@ -67,6 +67,8 @@ enum class FP4GemmType
 {
     W4A4_NVFP4_NVFP4,
     W4A8_MXFP4_MXFP8,
+    // W8A8 MXFP8 weight (e4m3 + UE8M0 1x32 block scales) x dynamic MXFP8 activation.
+    W8A8_MXFP8_MXFP8,
 };
 
 template <typename T, FP4GemmType gemmType = FP4GemmType::W4A4_NVFP4_NVFP4>
@@ -78,7 +80,7 @@ public:
 
     void gemm(void* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
         float const* global_sf, int m, int n, int k, int batch_count, tkc::CutlassGemmConfig gemmConfig,
-        char* workspace, const size_t workspaceBytes, cudaStream_t stream) override;
+        char* workspace, const size_t workspaceBytes, cudaStream_t stream, void const* bias = nullptr) override;
 
     // Returns desired workspace size in bytes.
     size_t getWorkspaceSize(int const m, int const n, int const k, int const batch_count) override;
@@ -88,7 +90,8 @@ public:
 private:
     size_t dispatchToArch(T* D, void const* A, void const* B, void const* input_sf, void const* weight_sf,
         float const* global_sf, int m, int n, int k, int batch_count, tkc::CutlassGemmConfig gemmConfig,
-        char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr);
+        char* workspace, const size_t workspaceBytes, cudaStream_t stream, int* occupancy = nullptr,
+        void const* bias = nullptr);
 
     size_t getWorkspaceSizeImpl(int const m, int const n, int const k, int const batch_count);
 

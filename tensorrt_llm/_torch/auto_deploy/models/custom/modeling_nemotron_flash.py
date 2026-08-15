@@ -1,4 +1,23 @@
-# Adapted from: https://huggingface.co/nvidia/Nemotron-Flash-3B-Instruct/tree/main
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Adapted from NVIDIA's Nemotron-Flash-3B-Instruct model (Apache-2.0, NVIDIA CORPORATION & AFFILIATES.):
+# https://huggingface.co/nvidia/Nemotron-Flash-3B-Instruct/tree/main
 import copy
 import math
 from typing import List, Optional, Tuple, Union
@@ -13,12 +32,18 @@ from transformers.modeling_outputs import CausalLMOutput, MoeModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import BatchEncoding
 
-from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.inputs.content_format import ContentFormat
-from tensorrt_llm.inputs.registry import (
-    MULTIMODAL_PLACEHOLDER_REGISTRY,
-    MultimodalPlaceholderMetadata,
-)
+from ..._compat import ActivationType
+
+try:
+    from tensorrt_llm.inputs.content_format import ContentFormat
+    from tensorrt_llm.inputs.registry import (
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        MultimodalPlaceholderMetadata,
+    )
+except ModuleNotFoundError:
+    ContentFormat = None
+    MULTIMODAL_PLACEHOLDER_REGISTRY = None
+    MultimodalPlaceholderMetadata = None
 
 from ..nemotron_flash import NemotronFlashForCausalLMFactory
 
@@ -872,7 +897,7 @@ class NemotronFlashPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["NemotronFlashAttentionDecoderLayer", "NemotronFlashMambaDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
-    _supports_flash_attn_2 = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_cache_class = True
 
@@ -1039,7 +1064,7 @@ class TruncatedLinear(nn.Linear):
 
 
 class NemotronFlashForCausalLM(NemotronFlashPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)
@@ -1107,7 +1132,8 @@ NemotronFlashForCausalLMFactory.register_custom_model_cls(
     "NemotronFlashConfig", NemotronFlashForCausalLM
 )
 # The custom tokenizer's chat template expects plain strings, not OpenAI-style content dicts.
-MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
-    "nemotron_flash",
-    MultimodalPlaceholderMetadata(content_format=ContentFormat.PASSTHROUGH),
-)
+if MULTIMODAL_PLACEHOLDER_REGISTRY is not None:
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        "nemotron_flash",
+        MultimodalPlaceholderMetadata(content_format=ContentFormat.PASSTHROUGH),
+    )

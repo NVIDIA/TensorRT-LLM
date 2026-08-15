@@ -131,13 +131,15 @@ void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, Bea
 void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& bh,
     runtime::SizeType32 const maxAttentionWindow, runtime::SizeType32 sinkTokenLength, cudaStream_t stream);
 
-__global__ void addCumLogProbs(float* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
-    ::tensorrt_llm::kernels::FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
+__global__ void addCumLogProbs(float* __restrict pStage1LogProbs, int const* __restrict pStage1Ids,
+    float const* __restrict cumLogProbs, ::tensorrt_llm::kernels::FinishedState const* finished, int const* endIds,
+    float const* diversityRates, runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn,
+    size_t const nBMOut, size_t const nBM);
 
-__global__ void addCumLogProbs(half* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
-    ::tensorrt_llm::kernels::FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
+__global__ void addCumLogProbs(half* __restrict pStage1LogProbs, int const* __restrict pStage1Ids,
+    float const* __restrict cumLogProbs, ::tensorrt_llm::kernels::FinishedState const* finished, int const* endIds,
+    float const* diversityRates, runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn,
+    size_t const nBMOut, size_t const nBM);
 
 __global__ void gatherId(int const* __restrict pStage1Id, int* __restrict pStage2Id, size_t const nBS,
     size_t const nBMIn, size_t const nBMOut, size_t const nV);

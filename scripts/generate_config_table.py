@@ -23,6 +23,8 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import yaml
+
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent
 
@@ -32,6 +34,8 @@ if str(REPO_ROOT) not in sys.path:
 from examples.configs.database.database import (  # noqa: E402
     CURATED_LIST_PATH,
     DATABASE_LIST_PATH,
+    PROFILE_DISPLAY_NAMES,
+    PROFILE_ORDER,
     CuratedRecipeList,
     RecipeList,
     assign_profile,
@@ -41,6 +45,10 @@ MODEL_INFO = {
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4": {
         "display_name": "Nemotron v3 Super (NVFP4)",
         "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+    },
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4": {
+        "display_name": "Nemotron v3 Ultra (NVFP4)",
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
     },
     "deepseek-ai/DeepSeek-R1-0528": {
         "display_name": "DeepSeek-R1",
@@ -66,6 +74,14 @@ MODEL_INFO = {
         "display_name": "Qwen3-Next-80B",
         "url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking",
     },
+    "Qwen/Qwen3.8-2.4T-A95B-FP8": {
+        "display_name": "Qwen3.8-2.4T-A95B (FP8)",
+        "url": "https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8",
+    },
+    "nvidia/Qwen3.5-397B-A17B-NVFP4": {
+        "display_name": "Qwen3.5-397B-A17B (NVFP4)",
+        "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4",
+    },
     "Qwen/Qwen3-30B-A3B": {
         "display_name": "Qwen3-30B-A3B",
         "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B",
@@ -81,6 +97,10 @@ MODEL_INFO = {
     "nvidia/Kimi-K2-Thinking-NVFP4": {
         "display_name": "Kimi-K2-Thinking (NVFP4)",
         "url": "https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4",
+    },
+    "MiniMaxAI/MiniMax-M3-MXFP8": {
+        "display_name": "MiniMax-M3 (MXFP8)",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8",
     },
 }
 
@@ -102,6 +122,9 @@ class RecipeRow:
     config_filename: str
     config_github_url: str
     config_raw_url: str
+    profile: str | None
+    validated_trtllm_commit: str | None
+    validated_trtllm_version: str | None
 
 
 @dataclass(frozen=True)
@@ -125,6 +148,36 @@ def _model_display_and_url(model: str) -> tuple[str, str]:
     return model, ""
 
 
+def _references_repo_relative_path(config_path: str) -> bool:
+    """Return True if the config points at another repo file through a relative path.
+
+    Such a path (for example ``moe_config.load_balancer``) is opened relative to the
+    working directory, so the serve command has to run from the TensorRT LLM directory.
+    """
+    try:
+        config = yaml.safe_load((REPO_ROOT / config_path).read_text())
+    except (OSError, yaml.YAMLError):
+        return False
+
+    def walk(node) -> bool:
+        if isinstance(node, dict):
+            return any(walk(value) for value in node.values())
+        if isinstance(node, list):
+            return any(walk(item) for item in node)
+        if isinstance(node, str) and not os.path.isabs(node):
+            return (REPO_ROOT / node).is_file()
+        return False
+
+    return walk(config)
+
+
+def _serve_command(model: str, config_path: str) -> str:
+    command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{config_path}"
+    if _references_repo_relative_path(config_path):
+        command = f'cd "${{TRTLLM_DIR}}" && {command}'
+    return command
+
+
 def build_curated_rows(yaml_path: Path) -> list[CuratedRow]:
     """Parse curated recipe YAML and return CuratedRow entries for JSON serialization."""
     curated_list = CuratedRecipeList.from_yaml(Path(yaml_path))
@@ -137,7 +190,7 @@ def build_curated_rows(yaml_path: Path) -> list[CuratedRow]:
         config_filename = os.path.basename(config_path)
         config_github_url = f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{config_path}"
         config_raw_url = f"https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/{config_path}"
-        command = f"trtllm-serve {entry.model} --config ${{TRTLLM_DIR}}/{config_path}"
+        command = _serve_command(entry.model, config_path)
         rows.append(
             CuratedRow(
                 model=entry.model,
@@ -155,7 +208,7 @@ def build_curated_rows(yaml_path: Path) -> list[CuratedRow]:
     return rows
 
 
-def build_rows(yaml_path) -> list[RecipeRow]:
+def build_rows(yaml_path: Path) -> list[RecipeRow]:
     recipe_list = RecipeList.from_yaml(Path(yaml_path))
 
     model_groups = defaultdict(lambda: defaultdict(list))
@@ -177,7 +230,7 @@ def build_rows(yaml_path) -> list[RecipeRow]:
 
         for key in sorted_keys:
             entries = subgroups[key]
-            entries.sort(key=lambda x: x.concurrency)
+            entries.sort(key=lambda x: (x.concurrency, PROFILE_ORDER.get(x.profile, -1)))
 
             for idx, entry in enumerate(entries):
                 gpu = entry.gpu
@@ -188,9 +241,13 @@ def build_rows(yaml_path) -> list[RecipeRow]:
                 conc = entry.concurrency
                 config_path = entry.config_path
 
-                profile = assign_profile(len(entries), idx, conc)
+                performance_profile = (
+                    PROFILE_DISPLAY_NAMES[entry.profile]
+                    if entry.profile
+                    else assign_profile(len(entries), idx, conc)
+                )
 
-                command = f"trtllm-serve {model} --config ${{TRTLLM_DIR}}/{config_path}"
+                command = _serve_command(model, config_path)
 
                 config_filename = os.path.basename(config_path)
                 config_github_url = (
@@ -212,18 +269,23 @@ def build_rows(yaml_path) -> list[RecipeRow]:
                         concurrency=conc,
                         config_path=config_path,
                         gpu_display=gpu_display,
-                        performance_profile=profile,
+                        performance_profile=performance_profile,
                         command=command,
                         config_filename=config_filename,
                         config_github_url=config_github_url,
                         config_raw_url=config_raw_url,
+                        profile=entry.profile,
+                        validated_trtllm_commit=entry.validated_trtllm_commit,
+                        validated_trtllm_version=entry.validated_trtllm_version,
                     )
                 )
 
     return rows
 
 
-def generate_json(yaml_path: Path, output_file: Path, curated_yaml_path: Path | None = None):
+def generate_json(
+    yaml_path: Path, output_file: Path, curated_yaml_path: Path | None = None
+) -> None:
     rows = build_rows(yaml_path)
 
     source_path = Path(yaml_path)
@@ -254,7 +316,9 @@ def generate_json(yaml_path: Path, output_file: Path, curated_yaml_path: Path | 
     payload = {
         "source": source,
         "models": models,
-        "entries": [asdict(r) for r in rows],
+        "entries": [
+            {key: value for key, value in asdict(row).items() if value is not None} for row in rows
+        ],
         "curated_entries": curated_entries,
     }
 

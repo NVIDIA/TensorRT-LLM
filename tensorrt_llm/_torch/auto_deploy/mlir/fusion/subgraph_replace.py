@@ -66,7 +66,9 @@ def replace_subgraph_with_fused_op(
             shape = [s if s >= 0 else 2 for s in out.type.get_shape()]
             dtype = mlir_to_torch_dtype(out.type.element_type)
             fake_vals.append(torch.empty(shape, dtype=dtype, device="meta"))
-    val_meta = tuple(fake_vals) if len(fake_vals) > 1 else fake_vals[0] if fake_vals else None
+    # Generated fused kernels return a tuple even for a single output, so keep
+    # metadata in the same structure for MLIR -> FX getitem propagation.
+    val_meta = tuple(fake_vals) if fake_vals else None
 
     # Store synthetic metadata for the MLIR→FX converter
     metadata[node_key] = {

@@ -43,7 +43,7 @@ There are two ways to trigger skills and agents:
    sub-agent automatically.
 
 2. **Manual invoke** — type `/<skill-name>` (e.g. `/perf-analysis`,
-   `/serve-config-guide`) to explicitly run a skill. For sub-agents, type
+   `/trtllm-serve-config-guide`) to explicitly run a skill. For sub-agents, type
    `@"<agent-name>" (agent)` (e.g. `@"exec-compile-specialist (agent)"`) to
    delegate a task directly. This is useful when you know exactly which workflow you want.
 
@@ -63,12 +63,10 @@ short and not repeat it.
 | Prefix | Domain | Definition |
 |---|---|---|
 | `ad-` | AutoDeploy | Model onboarding, pipeline debugging, and execution for the AutoDeploy backend |
-| `ci-` | CI/CD | CI failure retrieval, test diagnostics, and pipeline workflows |
 | `exec-` | Execution infra | Environment setup and job execution (compile, run, container) |
 | `kernel-` | Kernel development | Kernel writing, generation, and kernel-specific transforms |
 | `perf-` | Performance work | Profiling, analysis, and tuning above the kernel layer (kernel modifications belong under `kernel-`) |
-| `serve-` | Serving | Serving configuration, deployment, and runtime workflows |
-| `trtllm-` | TRT-LLM dev workflows | Workflows for reading, modifying, and contributing to the codebase (static subsystem knowledge belongs in repo docs) |
+| `trtllm-` | TRT-LLM project workflows | Project-specific workflows: codebase exploration, contribution, dependency upgrades, and serving configuration (static subsystem knowledge belongs in repo docs) |
 
 Guidelines:
 

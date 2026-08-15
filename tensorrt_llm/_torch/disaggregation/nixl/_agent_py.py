@@ -1,13 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import importlib
 import time
 from enum import Enum
-
-from nixl import nixl_agent, nixl_agent_config, nixl_xfer_handle
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 # Import base classes for type compatibility
 from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
+
+# The PyPI ``nixl`` meta-package provides a top-level ``nixl`` shim that
+# redirects to ``nixl_cu13`` or ``nixl_cu12``. When only ``nixl-cu13`` (or
+# ``nixl-cu12``) is installed without the meta-package, ``import nixl`` fails.
+# Try the CUDA-specific packages first, then fall back to the meta-package.
+_nixl_mod = None
+for _candidate in ("nixl_cu13", "nixl_cu12", "nixl"):
+    try:
+        _nixl_mod = importlib.import_module(_candidate)
+        break
+    except ImportError:
+        continue
+if _nixl_mod is None:
+    raise ImportError(
+        "Could not find a NIXL Python package. "
+        "Install ``nixl-cu13`` (CUDA 13) or ``nixl-cu12`` (CUDA 12)."
+    )
+nixl_agent = _nixl_mod.nixl_agent
+nixl_agent_config = _nixl_mod.nixl_agent_config
+nixl_xfer_handle = _nixl_mod.nixl_xfer_handle
 
 
 class TransferState(Enum):
@@ -50,19 +84,47 @@ class NixlTransferStatus(TransferStatus):
 class NixlTransferAgent(BaseTransferAgent):
     """NixlTransferAgent using Python nixl library."""
 
-    def __init__(self, name: str, use_prog_thread: bool = True, num_threads: int = 1, **kwargs):
+    def __init__(
+        self,
+        name: str,
+        use_prog_thread: bool = True,
+        num_threads: int = 1,
+        rank: int | None = None,
+        world_size: int | None = None,
+        **kwargs,
+    ):
         """
         Initialize NixlTransferAgent.
         :param name: Name of the agent.
         :param use_prog_thread: Whether to enable the progress thread, if available.
         :param num_workers: Specify number of threads for the supported multi-threaded backends.
+        :param rank: Process rank, used only to keep the shared agent interface consistent.
+        :param world_size: Process count, used only to keep the shared agent interface consistent.
         """
+        if (rank is None) != (world_size is None):
+            raise ValueError("rank and world_size must be specified together")
+        if rank is not None:
+            assert world_size is not None
+            if world_size <= 0 or rank < 0 or rank >= world_size:
+                raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+
         self.name = name
         self.backends = ["UCX"]
         agent_config = nixl_agent_config(
             enable_prog_thread=use_prog_thread, backends=self.backends, num_threads=num_threads
         )
         self.agent = nixl_agent(name, agent_config)
+
+    def shutdown(self):
+        if getattr(self, "agent", None) is None:
+            return
+        self.agent = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
+        self.shutdown()
 
     def _get_validated_reg_descs(self, descs: RegMemoryDescs):
         if not descs.descs:

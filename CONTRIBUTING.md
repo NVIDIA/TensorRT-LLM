@@ -118,12 +118,29 @@ For NVIDIA developers,  please submit feature or bug fixes to the dedicated bran
 
 Meanwhile, please add the "release blocker" label to any PRs that could potentially cause a release delay.
 
+### Inactive pull requests
+
+TensorRT LLM automatically reviews inactive pull requests each day. This policy applies to both draft and
+ready-for-review pull requests:
+
+* After more than 120 days without activity, the workflow reminds the author. Pull requests without merge conflicts
+  remain open and receive another reminder after each subsequent 120-day period without activity.
+* For a pull request with merge conflicts, the reminder warns that the pull request will close after another 60 days
+  without activity unless its conflicts are resolved.
+* A pull request is closed only when it still has merge conflicts and the warning remains its latest activity for more
+  than 60 days. Any subsequent activity resets the closure process.
+
+Maintainers can apply the `no-stale` label to exempt an intentionally parked pull request from reminders and
+automatic closure. If an inactive pull request is closed and the work is still relevant, open a new pull request.
+The original pull request may instead be reopened after its conflicts are resolved if its source branch is still
+available.
+
 
 ## Tests and Code Review for Protected APIs
 
-Some APIs are committed to be stable; any breaking changes to these APIs require careful design and review.
+Some APIs are committed to be stable; breaking changes to these APIs should be avoided and require careful design and review.
 
-This repo contains an [API stability testsuite](./tests/api_stability) to protect committed APIs (currently including the core components of LLM API). If your PR brings breaking changes to the protected APIs, the API stability tests will fail, reporting errors like:
+This repo contains an [API stability testsuite](./tests/unittest/api_stability) to protect committed APIs (currently including the core components of LLM API). If your PR brings breaking changes to the protected APIs, the API stability tests will fail, reporting errors like:
 
 ```txt
 def test_signature(self):
@@ -138,6 +155,7 @@ tests/api_stability/test_api_stability.py:241: AssertionError
 ```
 
 As the error message suggests, please ask for reviews from the code owners of the corresponding APIs.
+If API stability reference files change, classify the accepted LLM API contract change with `api-compatible` or `api-breaking`; `api-breaking` also requires `BREAKING` in the PR title. See the [API change guide](./docs/source/developer-guide/api-change.md) for details.
 
 
 ## Signing Your Work

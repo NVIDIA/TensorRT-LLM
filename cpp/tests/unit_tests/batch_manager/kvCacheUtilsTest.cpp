@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
@@ -48,7 +49,7 @@ TEST_F(BlockIteratorTest, BasicTest)
     auto constexpr mNumLayers = 5;
     auto constexpr mBlockSize = 32;
     auto const cacheShape = tr::ITensor::makeShape({mNumPrimaryBlocks, mNumLayers, 2, mBlockSize});
-    constexpr nvinfer1::DataType dtype{tr::TRTDataType<DataType>::value};
+    constexpr tensorrt_llm::DataType dtype{tr::TRTDataType<DataType>::value};
     tr::ITensor::SharedPtr pool = tr::BufferManager::cpu(cacheShape, dtype);
     std::vector<SizeType32> blockIds(mNumPrimaryBlocks);
     std::iota(blockIds.begin(), blockIds.end(), 0);
@@ -75,7 +76,7 @@ TEST_F(BlockIteratorTest, BasicTest)
 
 TEST_F(BlockIteratorTest, CacheManagerTest)
 {
-    auto constexpr dataType = nvinfer1::DataType::kFLOAT;
+    auto constexpr dataType = tensorrt_llm::DataType::kFLOAT;
     auto constexpr numLayers = 12;
     auto constexpr numKvHeads = 6;
     auto constexpr sizePerHead = 16;
@@ -99,8 +100,8 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
         = {{maxAttentionWindow, std::make_tuple(blocksInPrimaryPool, blocksInSecondaryPool)}};
 
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
-        blocksPerWindow, maxNumSequences, stream, maxSequenceLength, beamWidth, maxAttentionWindowVec, std::nullopt,
-        dataType, 0);
+        blocksPerWindow, maxNumSequences, stream, maxSequenceLength, beamWidth, maxAttentionWindowVec, dataType, 0,
+        maxSequenceLength);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -121,8 +122,9 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     auto constexpr beamIdx = 0;
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.addSequence(
-        seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow, /*isEnableBlockReuse=*/true);
+    auto const batchSeqStats = blockManager.addSequenceBatch({&seq0}, {promptLen0}, {numContextBlocks0},
+        {std::ref(*llmRequest0)}, maxAttentionWindow, /*isEnableBlockReuse=*/true);
+    ASSERT_THAT(batchSeqStats, ::testing::SizeIs(1));
 
     auto const blockIds = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(blockIds, ::testing::ElementsAreArray({0, 1, 2}));
