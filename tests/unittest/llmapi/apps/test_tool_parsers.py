@@ -1035,8 +1035,25 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert len(r_args.calls) == 1
         assert json.loads(r_args.calls[0].parameters) == {"location": "SF"}
 
-    def test_streaming_zero_arg_tool(self, parser):
-        """Test streaming a zero-argument tool call."""
+    @pytest.mark.parametrize(
+        "arguments_chunk,oneshot_params",
+        [
+            (', "arguments": {}}', "{}"),
+            ("}", "{}"),
+            # detect_and_parse dumps an explicit null as-is; only the streaming
+            # path normalizes it. Asserted here so the divergence stays visible.
+            (', "arguments": null}', "null"),
+        ],
+        ids=["empty_object", "key_absent", "explicit_null"],
+    )
+    def test_streaming_zero_arg_tool(self, parser, arguments_chunk,
+                                     oneshot_params):
+        """Test streaming a zero-argument tool call.
+
+        A model can express "no arguments" as an empty object, by omitting the
+        key, or as an explicit null. All three have to complete the call and
+        stream "{}".
+        """
         tools = [
             ChatCompletionToolsParam(
                 type="function",
@@ -1053,7 +1070,7 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         chunks = [
             "<tool_call>\n",
             '{"name": "get_time"',
-            ', "arguments": {}}',
+            arguments_chunk,
             "\n</tool_call>",
         ]
 
@@ -1064,15 +1081,15 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         names = [c.name for r in results for c in r.calls if c.name]
         assert "get_time" in names
 
-        # An empty argument object still has to be streamed, otherwise the client
-        # is left with arguments="", which is not valid JSON.
+        # A zero-argument call still has to stream its arguments, otherwise the
+        # client is left with arguments="", which is not valid JSON.
         params = "".join(c.parameters for r in results for c in r.calls)
         assert params == "{}", f"Expected '{{}}', got {params!r}"
 
         # The completed call must also be consumed from the buffer, otherwise the
         # parser stays in the tool-call branch and swallows the rest of the output.
-        assert parser.detect_and_parse("".join(chunks),
-                                       tools).calls[0].parameters == "{}"
+        oneshot = parser.detect_and_parse("".join(chunks), tools)
+        assert oneshot.calls[0].parameters == oneshot_params
         assert "<tool_call>" not in parser._buffer
 
 
