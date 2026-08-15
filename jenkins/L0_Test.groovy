@@ -5602,7 +5602,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
-        9,
+        6,
         8,
         2
     )
@@ -5647,7 +5647,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        3,
+        1,
         12,
         3
     )
@@ -5656,7 +5656,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
-        2,
+        1,
         16,
         4
     )
@@ -5665,7 +5665,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        4,
+        2,
         20,
         5
     )
@@ -5683,7 +5683,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        8,
+        1,
         36,
         9
     )
@@ -5698,15 +5698,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         2
     )
     // GB300 PerfSanity post-merge disaggregated
-    // 3 Nodes (pre-merge, functional-only)
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        1,
-        12,
-        3
-    )
     // 3 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
@@ -5721,18 +5712,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "gb300-flex-aws-cmh",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        4,
+        2,
         20,
         5
-    )
-    // 9 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        1,
-        36,
-        9
     )
     // GB300 GLM-5 disaggregated (ctx DEP2)
     // 3 Nodes (pre-merge, functional-only)
