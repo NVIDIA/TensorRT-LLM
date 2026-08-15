@@ -52,9 +52,14 @@ def validate() -> List[str]:
             errors.append(f"SMS schema missing event definition: {event_name}")
             continue
 
-        sms_props = set(events[event_name].get("properties", {}).keys())
+        event_schema = events[event_name]
+        sms_props = set(event_schema.get("properties", {}).keys())
+        sms_required = set(event_schema.get("required", []))
         # Pydantic field aliases are the wire names (camelCase)
         pydantic_aliases = {f.alias or name for name, f in model_cls.model_fields.items()}
+        pydantic_required = {
+            f.alias or name for name, f in model_cls.model_fields.items() if f.is_required()
+        }
 
         missing_in_pydantic = sms_props - pydantic_aliases
         missing_in_sms = pydantic_aliases - sms_props
@@ -68,6 +73,17 @@ def validate() -> List[str]:
             errors.append(
                 f"{event_name}: field '{field}' in Pydantic model "
                 f"{model_cls.__name__} but missing from SMS schema"
+            )
+
+        for field in sorted(sms_required - pydantic_required):
+            errors.append(
+                f"{event_name}: field '{field}' required in SMS schema but optional "
+                f"in Pydantic model {model_cls.__name__}"
+            )
+        for field in sorted(pydantic_required - sms_required):
+            errors.append(
+                f"{event_name}: field '{field}' required in Pydantic model "
+                f"{model_cls.__name__} but not required in SMS schema"
             )
 
     return errors
