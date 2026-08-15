@@ -75,7 +75,7 @@ class ChatPostprocArgs(PostprocArgs):
     model: str
     num_choices: int = 1
     tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none"],
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     return_logprobs: bool = False
     top_logprobs: bool = False
@@ -203,6 +203,10 @@ def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
             result = tool_parser.detect_and_parse(text, tools)
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
+        if args.tool_choice == "none":
+            # tool_choice="none": still run the parser so tool-call markup
+            # is stripped from content, but never surface tool calls.
+            return result.normal_text, []
         normal_text, calls = result.normal_text, result.calls
         if result.calls:
             args.has_tool_call[output_index] = True
