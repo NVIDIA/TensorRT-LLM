@@ -1184,6 +1184,7 @@ def get_quick_skip_reason(
             num_experts=None if model_config is None else model_config.num_experts,
             top_k=None if model_config is None else model_config.top_k,
             swiglu_gptoss_style=swiglu_gptoss_style,
+            bias=swiglu_gptoss_style,
         )
         # Multi-rank constraints are checked by the helpers below.
         deployment = MoEDeployment(

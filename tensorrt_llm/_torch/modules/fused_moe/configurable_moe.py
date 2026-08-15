@@ -331,6 +331,7 @@ class ConfigurableMoE(MoE):
                     swiglu_beta=kwargs.get("swiglu_beta"),
                     activation_type=self.activation_type,
                 ),
+                bias=kwargs.get("bias", False),
                 activation_type=self.activation_type,
                 routing=self.routing_method,
                 layer_idx=self.layer_idx,

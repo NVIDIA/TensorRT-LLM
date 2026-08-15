@@ -89,6 +89,9 @@ class MoEProblem:
     top_k: Optional[int] = None
     #: Tri-state because some call sites cannot distinguish gpt-oss SwiGLU.
     swiglu_gptoss_style: Optional[bool] = None
+    #: Expert FC bias, distinct from ``swiglu_gptoss_style``. MiniMax sets
+    #: SwigluBias + alpha/beta/limit with ``bias=False``; gpt-oss sets both.
+    bias: Optional[bool] = None
     #: ``ActivationType`` member name; omitted values canonicalize to SwiGLU.
     activation: str = "Swiglu"
     #: ``RoutingMethodType`` member name; None means the call site did not say.
@@ -362,6 +365,7 @@ class MoEResolutionReport:
                 "num_experts": self.problem.num_experts,
                 "top_k": self.problem.top_k,
                 "swiglu_gptoss_style": self.problem.swiglu_gptoss_style,
+                "bias": self.problem.bias,
                 "activation": self.problem.activation,
                 "routing": self.problem.routing,
             },

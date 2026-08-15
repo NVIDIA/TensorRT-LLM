@@ -446,6 +446,7 @@ def create_moe(
             swiglu_beta=swiglu_beta,
             activation_type=activation_type,
         ),
+        bias=bias,
         activation_type=activation_type,
         routing=routing_method,
         layer_idx=layer_idx,

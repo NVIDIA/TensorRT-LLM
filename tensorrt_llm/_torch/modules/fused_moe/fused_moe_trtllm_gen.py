@@ -181,6 +181,26 @@ class TRTLLMGenFusedMoE(MoE):
                     MoERejectReason.DEP_MISSING,
                     "TRTLLMGenFusedMoE unquantized BF16 path requires FlashInfer fused MoE "
                     "with trtllm_bf16_moe support.")
+            # FlashInfer BF16 kernels require the per-rank intermediate size
+            # to be a multiple of 128.
+            if p.intermediate_size is not None:
+                inter = p.intermediate_size
+                if d.tp_size > 1:
+                    if inter % d.tp_size != 0:
+                        return _reject(
+                            MoERejectReason.SHAPE_UNALIGNED,
+                            "TRTLLMGenFusedMoE BF16 FlashInfer path requires "
+                            f"intermediate_size ({inter}) divisible by "
+                            f"moe_tp_size ({d.tp_size})")
+                    inter = inter // d.tp_size
+                if inter % 128 != 0:
+                    return _reject(
+                        MoERejectReason.SHAPE_UNALIGNED,
+                        "TRTLLMGenFusedMoE BF16 FlashInfer path requires "
+                        "intermediate_size_per_partition % 128 == 0; "
+                        f"got {inter} "
+                        f"(full intermediate_size={p.intermediate_size}, "
+                        f"moe_tp_size={d.tp_size})")
             return MoEEligibility.ok()
 
         # Check if quant_algo is supported

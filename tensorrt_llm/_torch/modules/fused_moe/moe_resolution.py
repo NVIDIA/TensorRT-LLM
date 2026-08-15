@@ -193,6 +193,7 @@ def build_moe_problem(
     intermediate_size: Optional[int] = None,
     top_k: Optional[int] = None,
     swiglu_gptoss_style: Optional[bool] = None,
+    bias: Optional[bool] = None,
     activation_type: Optional[ActivationType] = None,
     routing: Optional["BaseMoeRoutingMethod | RoutingMethodType"] = None,
 ) -> MoEProblem:
@@ -221,6 +222,7 @@ def build_moe_problem(
         num_experts=shapes.num_experts,
         top_k=shapes.top_k,
         swiglu_gptoss_style=swiglu_gptoss_style,
+        bias=bias,
         activation=canonical_activation(activation_type),
         routing=canonical_routing(routing),
     )
@@ -315,6 +317,7 @@ def resolve_moe_impl(
     hidden_size: Optional[int] = None,
     intermediate_size: Optional[int] = None,
     swiglu_gptoss_style: Optional[bool] = None,
+    bias: Optional[bool] = None,
     activation_type: Optional[ActivationType] = None,
     routing: Optional["BaseMoeRoutingMethod | RoutingMethodType"] = None,
     layer_idx: Optional[int] = None,
@@ -332,6 +335,7 @@ def resolve_moe_impl(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             swiglu_gptoss_style=swiglu_gptoss_style,
+            bias=bias,
             activation_type=activation_type,
             routing=routing,
         )

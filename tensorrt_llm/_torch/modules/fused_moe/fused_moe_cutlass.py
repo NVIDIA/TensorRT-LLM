@@ -164,27 +164,17 @@ class CutlassFusedMoE(MoE):
 
     _GPTOSS_SUPPORTED_ALGOS: frozenset[Optional[QuantAlgo]] = frozenset({
         None,
+        QuantAlgo.NVFP4,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_FP8,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     })
-    """Algorithms whose weight methods can serve gpt-oss SwiGLU (bias + alpha/beta/limit).
+    """Algorithms whose weight methods can serve gpt-oss / MiniMax SwiGLU.
 
-    The CUDA kernel is not the constraint: ``torch.ops.trtllm.fused_moe`` takes
-    ``swiglu_alpha`` / ``swiglu_beta`` / ``swiglu_limit`` on every path, and
-    ``moeOp.cpp`` promotes ``ActivationType::SwigluBias`` from those tensors
-    alone. ``None`` (unquantized BF16/FP16) is included because
-    ``UnquantizedFusedMoEMethod`` registers a 2-D ``(E, 2I)`` bias that matches
-    the op's ``fc1_expert_biases`` contract, and the TMA-WS / Ampere-unfused
-    activation kernels apply that bias plus ``SwigluBiasAdaptor``.
-
-    The remaining members are the MXFP4 family:
-    ``MXFP4WeightFusedMoEMethod.create_weights`` computes a real bias shape and
-    its loaders tolerate a 1-D checkpoint tensor. Every other algorithm either
-    inherits the base ``w3_w1_weight_shape[:2]`` default (wrong for transposed
-    layouts such as W8A16 / W4A8_AWQ) or hard-asserts 2-D in padding (NVFP4).
-    Widening this set without adding that plumbing turns a selection-time
-    rejection into a weight-loading crash.
+    Unquantized and the MXFP4 family can load a 1-D gpt-oss expert bias.
+    NVFP4 is included for MiniMax-style SwigluBias without expert bias.
+    ``can_implement`` still rejects NVFP4 when ``p.bias is True`` because the
+    NVFP4 weight pad only accepts 2-D tensors.
     """
 
     @classmethod
@@ -210,6 +200,15 @@ class CutlassFusedMoE(MoE):
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
                 f"CutlassFusedMoE cannot load a gpt-oss bias for "
                 f"quant_algo={quant_algo}; supported: {supported}")
+
+        # NVFP4 can run SwigluBias, but cannot pad a 1-D gpt-oss expert bias.
+        if (p.swiglu_gptoss_style and quant_algo == QuantAlgo.NVFP4
+                and p.bias is True):
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "CutlassFusedMoE NVFP4 cannot load a 1-D gpt-oss expert bias "
+                "(weight-pad assert is 2-D); MiniMax-style SwigluBias without "
+                "bias is eligible")
 
         # Check if quant_algo is supported
         if quant_algo not in cls._QUANT_SUPPORT_TABLE:

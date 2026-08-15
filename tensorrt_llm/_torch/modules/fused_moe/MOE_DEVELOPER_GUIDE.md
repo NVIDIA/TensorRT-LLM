@@ -337,7 +337,9 @@ is gated on `MoEDep.FLASHINFER_BF16_MOE` rather than on a quant algo, and why
 `TRTLLMOpBackend` raises `NotImplementedError` for it. The row reads `Y` because
 `can_implement` really can select it; without the FlashInfer symbols the layer
 degrades to Cutlass with `DEP_MISSING` recorded in `degraded_from`, where the
-pre-resolver code raised `RuntimeError` instead.
+pre-resolver code raised `RuntimeError` instead. The same path also requires
+`intermediate_size_per_partition % 128 == 0` (`Bf16MoeLauncher::check_moe`);
+a non-aligned shard is `SHAPE_UNALIGNED` and falls back to Cutlass.
 
 Cutlass covers `W4A16 NVFP4` on a wider SM range than plain `NVFP4` because the
 two run different kernels: `W4A16NVFP4CutlassFusedMoEMethod` dequantizes the FP4
@@ -375,23 +377,21 @@ every specialized backend — `CuteDslFusedMoE`, `CuteDslB12xFusedMoE`,
 `DeepGemmFusedMoE`, `DenseGEMMFusedMoE`, `MarlinFusedMoE` — while
 `TRTLLMGenFusedMoE` accepts only the algorithms in its `_GPTOSS_SUPPORTED_ALGOS`.
 
-Cutlass gates gpt-oss on unquantized plus the MXFP4 family
-(`CutlassFusedMoE._GPTOSS_SUPPORTED_ALGOS` = `None`, `W4A16_MXFP4`,
-`W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`). The CUDA kernel is not the constraint —
-`torch.ops.trtllm.fused_moe` takes `swiglu_alpha` / `swiglu_beta` /
-`swiglu_limit` on the same call for every path, and the C++ side derives
-`ActivationType::SwigluBias` purely from whether those tensors are present.
-Unquantized is eligible because `UnquantizedFusedMoEMethod` registers a 2-D
-`(E, 2I)` bias that matches the op's `fc1_expert_biases` contract; H100/B200
-TMA-WS GEMM1 then applies that bias in `doActivation` via `SwigluBiasAdaptor`.
-The remaining constraint is the Python bias plumbing for *quantized* methods:
-`FusedMoEMethodBase.load_expert_weights_to_dst` routes the per-expert bias
-through the *weight* loaders, so a method must both compute a real bias shape and
-tolerate a 1-D tensor there. Only `MXFP4WeightFusedMoEMethod` does both; everyone
-else inherits the base `w3_w1_weight_shape[:2]` default (wrong for the transposed
-W8A16 / W4A8_AWQ layouts) or hard-asserts 2-D while padding (NVFP4). Widening the
-set without adding that plumbing converts a selection-time rejection into a
-weight-loading crash.
+Cutlass gates gpt-oss / MiniMax SwiGLU on unquantized, NVFP4, and the MXFP4
+family (`CutlassFusedMoE._GPTOSS_SUPPORTED_ALGOS` = `None`, `NVFP4`,
+`W4A16_MXFP4`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`). The CUDA kernel is not
+the constraint — `torch.ops.trtllm.fused_moe` takes `swiglu_alpha` /
+`swiglu_beta` / `swiglu_limit` on the same call for every path, including
+NVFP4 (`CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1>`), and TMA-WS GEMM1
+applies `SwigluBiasAdaptor` in `doActivation`. NVFP4 is eligible only when
+there is no expert bias (`MoEProblem.bias is not True`): MiniMax-M3 NVFP4
+passes `ActivationType.SwigluBias` + alpha/beta/limit with `bias=False`.
+gpt-oss 1-D bias still goes through `NVFP4CutlassFusedMoEMethod`'s 2-D
+weight pad and is rejected at selection. Unquantized and the MXFP4 family
+can load that 1-D bias. W8A16 / W4A8_AWQ stay rejected because they inherit
+the base `w3_w1_weight_shape[:2]` default (wrong for transposed layouts).
+Widening the set without that distinction converts a selection-time
+rejection into a weight-loading crash.
 
 Three things make this easy to get wrong in either direction. First, the SM
 asymmetry: `ModelConfig.get_mxfp4_quant_algo` maps a gpt-oss checkpoint to
@@ -402,7 +402,16 @@ there. Second, dropping the gate altogether is equally wrong: it un-skips the
 `test_configurable_moe_single_gpu` gpt-oss × CUTLASS matrix, which then fails
 inside weight loading rather than being rejected up front. Third, omitting
 `None` rejects dummy / unquantized gpt-oss (`test_gpt_oss_trtllmgen[CUTLASS]`)
-even though the kernel path is valid.
+even though the kernel path is valid. Fourth, treating MiniMax SwigluBias as
+"gpt-oss bias load" and excluding NVFP4 rejects
+`TestMiniMaxM3::test_nvfp4` (`MoeConfig(backend="CUTLASS")`): MiniMax has no
+expert bias, and the NVFP4 TMA-WS runner already applies `SwigluBiasAdaptor`.
+
+The unquantized `TRTLLMGenFusedMoE` FlashInfer path has a separate shape
+gate: `Bf16MoeLauncher::check_moe` requires
+`intermediate_size % 128 == 0`, and the wrapper passes
+`intermediate_size_per_partition`. Qwen3.5-35B BF16 TP8 shards 512 → 64 and
+must degrade to Cutlass instead of dying in the kernel launcher.
 
 ### Scheduler / EPLB Constraints
 
