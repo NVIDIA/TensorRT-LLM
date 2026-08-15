@@ -10,12 +10,21 @@ import cutlass.cute as cute
 import torch
 
 from ..._utils import get_sm_version, is_sm_100f
+from ...logger import logger
 from ..cute_dsl_kernels.blackwell.dspark_attention import DSparkAttentionKernel
 
 _INDEX_DTYPE_TO_CUTLASS = {
     torch.int32: cutlass.Int32,
     torch.int64: cutlass.Int64,
 }
+
+
+def _log_unsupported(reason: str, key: str) -> bool:
+    logger.debug_once(
+        f"Falling back from fused DSpark attention: {reason}",
+        key=("fused_dspark_attention_unsupported", key),
+    )
+    return False
 
 
 def is_fused_dspark_attention_supported(
@@ -29,40 +38,86 @@ def is_fused_dspark_attention_supported(
 ) -> bool:
     """Return whether the production DSpark shape can use the CuteDSL op."""
     if not is_sm_100f():
-        return False
+        return _log_unsupported(f"SM {get_sm_version()} is not SM100/SM103", "sm_version")
     if not all(t.is_cuda for t in (q, main_kv, block_kv, kv_cache, slots, start_pos, attn_sink)):
-        return False
+        return _log_unsupported("all inputs must be CUDA tensors", "device")
     if q.dtype != torch.bfloat16:
-        return False
+        return _log_unsupported(f"q dtype must be BF16, got {q.dtype}", "q_dtype")
     if main_kv.dtype != q.dtype or block_kv.dtype != q.dtype or kv_cache.dtype != q.dtype:
-        return False
+        return _log_unsupported(
+            "main_kv, block_kv, and kv_cache dtypes must match q; "
+            f"got {main_kv.dtype}, {block_kv.dtype}, and {kv_cache.dtype}",
+            "kv_dtype",
+        )
     if attn_sink.dtype != torch.float32:
-        return False
+        return _log_unsupported(
+            f"attn_sink dtype must be FP32, got {attn_sink.dtype}", "attn_sink_dtype"
+        )
     if slots.dtype not in (torch.int32, torch.int64) or start_pos.dtype not in (
         torch.int32,
         torch.int64,
     ):
-        return False
+        return _log_unsupported(
+            f"slots and start_pos must use INT32 or INT64, got {slots.dtype} and {start_pos.dtype}",
+            "index_dtype",
+        )
     if slots.dtype != start_pos.dtype:
-        return False
+        return _log_unsupported(
+            f"slots and start_pos dtypes must match, got {slots.dtype} and {start_pos.dtype}",
+            "index_dtype_match",
+        )
     if q.ndim != 4 or main_kv.ndim != 2 or block_kv.ndim != 3 or kv_cache.ndim != 3:
-        return False
+        return _log_unsupported(
+            "expected q/main_kv/block_kv/kv_cache ranks 4/2/3/3, "
+            f"got {q.ndim}/{main_kv.ndim}/{block_kv.ndim}/{kv_cache.ndim}",
+            "tensor_ranks",
+        )
     head_dim = q.shape[-1]
-    return (
-        head_dim == 512
-        and main_kv.shape == (q.shape[0], head_dim)
-        and block_kv.shape == (q.shape[0], q.shape[1], head_dim)
-        and kv_cache.shape[-1] == head_dim
-        and attn_sink.shape == (q.shape[2],)
-        and slots.shape == (q.shape[0],)
-        and start_pos.shape == (q.shape[0],)
-        and q.is_contiguous()
-        and main_kv.is_contiguous()
-        and block_kv.is_contiguous()
-        and slots.is_contiguous()
-        and start_pos.is_contiguous()
-        and attn_sink.is_contiguous()
-    )
+    if head_dim != 512:
+        return _log_unsupported(f"head_dim must be 512, got {head_dim}", "head_dim")
+    expected_main_kv_shape = (q.shape[0], head_dim)
+    if main_kv.shape != expected_main_kv_shape:
+        return _log_unsupported(
+            f"main_kv shape must be {expected_main_kv_shape}, got {tuple(main_kv.shape)}",
+            "main_kv_shape",
+        )
+    expected_block_kv_shape = (q.shape[0], q.shape[1], head_dim)
+    if block_kv.shape != expected_block_kv_shape:
+        return _log_unsupported(
+            f"block_kv shape must be {expected_block_kv_shape}, got {tuple(block_kv.shape)}",
+            "block_kv_shape",
+        )
+    if kv_cache.shape[-1] != head_dim:
+        return _log_unsupported(
+            f"kv_cache trailing dimension must be {head_dim}, got {kv_cache.shape[-1]}",
+            "kv_cache_shape",
+        )
+    expected_sink_shape = (q.shape[2],)
+    if attn_sink.shape != expected_sink_shape:
+        return _log_unsupported(
+            f"attn_sink shape must be {expected_sink_shape}, got {tuple(attn_sink.shape)}",
+            "attn_sink_shape",
+        )
+    expected_batch_shape = (q.shape[0],)
+    if slots.shape != expected_batch_shape or start_pos.shape != expected_batch_shape:
+        return _log_unsupported(
+            "slots and start_pos shapes must match the q batch size; "
+            f"expected {expected_batch_shape}, got {tuple(slots.shape)} and {tuple(start_pos.shape)}",
+            "index_shape",
+        )
+    if not q.is_contiguous():
+        return _log_unsupported("q must be contiguous", "q_layout")
+    if not main_kv.is_contiguous():
+        return _log_unsupported("main_kv must be contiguous", "main_kv_layout")
+    if not block_kv.is_contiguous():
+        return _log_unsupported("block_kv must be contiguous", "block_kv_layout")
+    if not slots.is_contiguous():
+        return _log_unsupported("slots must be contiguous", "slots_layout")
+    if not start_pos.is_contiguous():
+        return _log_unsupported("start_pos must be contiguous", "start_pos_layout")
+    if not attn_sink.is_contiguous():
+        return _log_unsupported("attn_sink must be contiguous", "attn_sink_layout")
+    return True
 
 
 @functools.cache

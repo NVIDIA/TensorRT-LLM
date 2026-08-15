@@ -49,13 +49,19 @@ def _reference(q, main_kv, block_kv, kv_cache, slots, start_pos, sink):
 
 
 @pytest.mark.parametrize(
-    "invalid_case",
-    ["q_dtype", "head_dim", "q_layout", "index_dtype", "q_rank"],
+    "invalid_case,reason",
+    [
+        ("q_dtype", "q dtype must be BF16"),
+        ("head_dim", "head_dim must be 512"),
+        ("q_layout", "q must be contiguous"),
+        ("index_dtype", "slots and start_pos dtypes must match"),
+        ("q_rank", "expected q/main_kv/block_kv/kv_cache ranks 4/2/3/3"),
+    ],
 )
-def test_fused_dspark_attention_support_gate_rejects_invalid_inputs(invalid_case):
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        is_fused_dspark_attention_supported,
-    )
+def test_fused_dspark_attention_support_gate_rejects_invalid_inputs(
+    monkeypatch, invalid_case, reason
+):
+    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
 
     inputs = list(_make_inputs())
     if invalid_case == "q_dtype":
@@ -69,7 +75,17 @@ def test_fused_dspark_attention_support_gate_rejects_invalid_inputs(invalid_case
     else:
         inputs[0] = inputs[0][0]
 
-    assert not is_fused_dspark_attention_supported(*inputs)
+    messages = []
+    monkeypatch.setattr(
+        dspark_attention_op.logger,
+        "debug_once",
+        lambda *message, key: messages.append((" ".join(map(str, message)), key)),
+    )
+
+    assert not dspark_attention_op.is_fused_dspark_attention_supported(*inputs)
+    assert len(messages) == 1
+    assert reason in messages[0][0]
+    assert messages[0][1][0] == "fused_dspark_attention_unsupported"
 
 
 def test_cute_dsl_dspark_attention_rejects_invalid_inputs():

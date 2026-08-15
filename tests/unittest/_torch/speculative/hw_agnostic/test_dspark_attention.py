@@ -60,6 +60,27 @@ def test_rmsnorm_rope_fallback_applies_weight_without_rmsnorm(monkeypatch):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_rmsnorm_rope_skips_frequency_view_on_unsupported_arch(monkeypatch):
+    monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(dspark_attention, "is_sm_100f", lambda: False)
+    view_as_real = Mock(side_effect=AssertionError("frequency view should be skipped"))
+    monkeypatch.setattr(torch, "view_as_real", view_as_real)
+    x = torch.randn(2, 3, 64, dtype=torch.bfloat16)
+
+    actual = dspark_attention._rmsnorm_rope_batched(
+        x,
+        torch.ones(64, dtype=torch.bfloat16),
+        1e-6,
+        0,
+        torch.empty(2, 3, 1, dtype=torch.complex64),
+        apply_weight=False,
+        apply_rmsnorm=False,
+    )
+
+    assert actual is x
+    view_as_real.assert_not_called()
+
+
 def test_batched_attention_rejects_mismatched_window_size():
     unused_tensor = torch.empty(0)
     with pytest.raises(ValueError, match="does not match window_size"):

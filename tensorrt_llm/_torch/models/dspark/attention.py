@@ -36,6 +36,7 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+from ...._utils import is_sm_100f
 from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -312,7 +313,7 @@ def _rmsnorm_rope_batched(
     inverse_rope: bool = False,
 ) -> torch.Tensor:
     """Fuse DSpark RMSNorm and last-dimension RoPE when supported."""
-    if IS_CUTLASS_DSL_AVAILABLE:
+    if IS_CUTLASS_DSL_AVAILABLE and is_sm_100f():
         freqs_real = torch.view_as_real(freqs_cis).reshape(-1, freqs_cis.shape[-1], 2)
         if is_fused_dspark_rmsnorm_rope_supported(t, weight, freqs_real, num_heads, rope_head_dim):
             return cute_dsl_dspark_rmsnorm_rope(
