@@ -119,6 +119,8 @@ Related knobs for shared-storage workflows:
 
 Plain local-disk builds are unaffected: without `--build_root`, all paths behave as before.
 
+Artifact copy-back into the checkout (`tensorrt_llm/include`, the `deep_gemm`/`deep_ep`/`flash_mla` Python trees) is incremental: directory trees are populated once via a streamed tar pipeline and then kept in sync by size/mtime comparison, so a rebuild rewrites only what changed instead of re-copying ~10k files onto the (possibly network) filesystem.
+
 #### Out-of-tree wheel builds (read-only checkout)
 
 For CI or ephemeral-node workflows that only need a wheel, add `--out-of-tree` to guarantee the checkout is never written — it can even be mounted read-only:
