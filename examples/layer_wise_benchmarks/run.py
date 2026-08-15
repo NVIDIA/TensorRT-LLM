@@ -88,6 +88,11 @@ group.add_argument("--replay-verify-metadata", action="store_true", dest="replay
 group.add_argument(
     "--no-replay-verify-metadata", action="store_false", dest="replay_verify_metadata"
 )
+# Without this the "default on" below is dead code. In a mutually exclusive group
+# argparse seeds the dest from the FIRST action's default -- store_true's False --
+# so replay_verify_metadata is always a real bool and never None, and passing
+# neither flag silently disabled verification instead of enabling it.
+parser.set_defaults(replay_verify_metadata=None)
 # Schedule
 parser.add_argument("--warmup-times", type=int, default=20)
 parser.add_argument("--run-times", type=int, default=100)
