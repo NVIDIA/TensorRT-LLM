@@ -43,6 +43,46 @@ def _reset_inflight_cancel_env_cache(monkeypatch):
     monkeypatch.setattr(transceiver_module, "_disagg_inflight_cancel_enabled_cache", None)
 
 
+def test_supported_config_enables_inflight_cancel_by_default(monkeypatch):
+    config = CacheTransceiverConfig(
+        backend="NIXL", transceiver_runtime="CPP", kv_transfer_timeout_ms=1000
+    )
+
+    transceiver_module._enable_disagg_inflight_cancel_by_default(config)
+
+    assert transceiver_module.is_disagg_inflight_cancel_enabled()
+    assert transceiver_module.getenv(
+        transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV
+    ) == "1"
+
+
+def test_explicit_inflight_cancel_opt_out_is_preserved(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "0")
+    config = CacheTransceiverConfig(
+        backend="NIXL", transceiver_runtime="CPP", kv_transfer_timeout_ms=1000
+    )
+
+    transceiver_module._enable_disagg_inflight_cancel_by_default(config)
+
+    assert not transceiver_module.is_disagg_inflight_cancel_enabled()
+    assert transceiver_module.getenv(
+        transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV
+    ) == "0"
+
+
+def test_unsupported_config_does_not_auto_enable_inflight_cancel():
+    config = CacheTransceiverConfig(
+        backend="MOONCAKE", transceiver_runtime="CPP", kv_transfer_timeout_ms=1000
+    )
+
+    transceiver_module._enable_disagg_inflight_cancel_by_default(config)
+
+    assert not transceiver_module.is_disagg_inflight_cancel_enabled()
+    assert transceiver_module.getenv(
+        transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV
+    ) is None
+
+
 def _make_timeout_request(request_id=7, in_progress=False):
     return SimpleNamespace(
         is_attention_dp_dummy=False,

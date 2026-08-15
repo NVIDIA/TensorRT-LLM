@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
-from os import getenv
+from os import environ, getenv
 from typing import Any, Dict, List, Optional
 
 import tensorrt_llm
@@ -59,6 +59,28 @@ def _is_disagg_inflight_cancel_config_supported(
             and getenv(_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV) != "1"
             and getenv(_DISAGG_LAYERWISE_ENV) != "1"
             and getenv(_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV) != "1")
+
+
+def _enable_disagg_inflight_cancel_by_default(
+        cache_transceiver_config: CacheTransceiverConfig) -> None:
+    """Enable fail-closed transfer cancellation for configurations that support it.
+
+    An explicit environment setting remains authoritative, including ``0`` as an
+    opt-out. Unsupported configurations keep the legacy behavior.
+    """
+    global _disagg_inflight_cancel_enabled_cache
+    if getenv(_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV) is not None:
+        return
+    if not _is_disagg_inflight_cancel_config_supported(cache_transceiver_config):
+        return
+
+    environ[_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV] = "1"
+    _disagg_inflight_cancel_enabled_cache = None
+    logger.info(
+        "Enabling disaggregated in-flight KV transfer cancellation by default "
+        "for the supported NIXL/UCX configuration. Set %s=0 to opt out.",
+        _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV,
+    )
 
 
 def _validate_disagg_inflight_cancel_config(
@@ -148,6 +170,9 @@ def create_kv_cache_transceiver(
                 f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
             )
         cache_transceiver_config.backend = backend
+
+    _enable_disagg_inflight_cancel_by_default(cache_transceiver_config)
+    _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(
