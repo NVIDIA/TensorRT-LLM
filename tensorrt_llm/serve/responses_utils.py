@@ -160,8 +160,11 @@ def _parse_response_input(
             Author.new(Role.TOOL, f"functions.{call_response.name}"),
             input_msg["output"])
     elif input_msg["type"] == "reasoning":
-        content = input_msg["content"]
-        assert len(content) == 1
+        content = input_msg.get("content") or []
+        if len(content) != 1:
+            raise ValueError(
+                "Input item of type 'reasoning' must have exactly one "
+                f"'content' element, got {len(content)}")
         msg = Message.from_role_and_content(Role.ASSISTANT, content[0]["text"])
     elif input_msg["type"] == "function_call":
         msg = Message.from_role_and_content(Role.ASSISTANT,
