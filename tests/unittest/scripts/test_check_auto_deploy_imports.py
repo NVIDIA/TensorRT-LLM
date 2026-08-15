@@ -4,6 +4,7 @@
 
 import importlib.util
 from pathlib import Path
+from types import ModuleType
 from unittest import mock
 
 import pytest
@@ -14,18 +15,28 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPT_PATH = REPO_ROOT / "scripts" / "check_auto_deploy_imports.py"
 
 
-def _load_module():
+def _load_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("check_auto_deploy_imports", SCRIPT_PATH)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def test_check_file_reports_read_errors(tmp_path):
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError("permission denied"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_check_file_reports_read_errors(
+    tmp_path: Path, error: OSError | UnicodeDecodeError
+) -> None:
     module = _load_module()
     source = tmp_path / "model.py"
 
-    with mock.patch.object(Path, "read_text", side_effect=OSError("permission denied")):
+    with mock.patch.object(Path, "read_text", side_effect=error):
         violations = module._check_file(source)
 
-    assert violations == [(1, "failed to read file: permission denied")]
+    assert violations == [(1, f"failed to read file: {error}")]
