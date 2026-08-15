@@ -110,6 +110,33 @@ class BaseToolParser(ABC):
                 return i
         return 0
 
+    def _starts_with_leftover_eot_token(self, buffer: str) -> bool:
+        r"""Check if the buffer opens with the eot_token of a finished call.
+
+        Completing a tool call leaves everything the parser did not consume in
+        the buffer, starting with that call's eot_token. When the eot_token
+        itself begins with the tool_call_separator, as in Qwen3 where calls are
+        separated by "\n" and closed by "\n</tool_call>", that leftover looks
+        exactly like the separator that introduces the next tool call.
+        """
+        return bool(self.eot_token) and buffer.startswith(self.eot_token)
+
+    def _may_begin_tool_call(self, text: str) -> bool:
+        """Check whether text could be the opening of a tool call.
+
+        Tells a tool_call_separator that introduces another call apart from one
+        that merely precedes ordinary prose. A call opens either with the
+        bot_token or, in the formats this base class streams, with bare JSON.
+        Text too short to judge counts as a maybe, so the buffer keeps growing
+        until the answer is certain.
+        """
+        if not text:
+            return True
+        if self.bot_token and (text.startswith(self.bot_token)
+                               or self.bot_token.startswith(text)):
+            return True
+        return text[0] in "{["
+
     def parse_streaming_increment(self, new_text: str,
                                   tools: List[Tool]) -> StreamingParseResult:
         """
@@ -127,15 +154,65 @@ class BaseToolParser(ABC):
 
         For incompatible formats, detectors should override this method with custom logic.
         """
+        pending = self._buffer + new_text
+        name_sent = self.current_tool_name_sent
+        result = self._parse_increment_once(new_text, tools)
+
+        # A pass stops at the end of one tool call and leaves the rest of the
+        # increment in the buffer for the increment after it. Nothing drains
+        # the buffer once the stream ends, so whatever arrived in the same
+        # chunk as the closing markup -- trailing content, a further tool call,
+        # or the arguments of the call that just opened -- would never be
+        # emitted. Keep parsing while a pass still moves the parser forward.
+        #
+        # Forward means the buffer shrank, or the pass sent a tool name and so
+        # the next one will stream that call's arguments. A pass that does
+        # neither has nothing left to give, and repeating it would re-parse the
+        # same bytes on every token of the stream.
+        while self._buffer and (self._buffer != pending or
+                                (self.current_tool_name_sent
+                                 and not name_sent)):
+            pending = self._buffer
+            name_sent = self.current_tool_name_sent
+            step = self._parse_increment_once("", tools)
+            result.normal_text += step.normal_text
+            result.calls.extend(step.calls)
+
+        return result
+
+    def _parse_increment_once(self, new_text: str,
+                              tools: List[Tool]) -> StreamingParseResult:
+        """Run a single parsing pass over the buffer plus the new text."""
         # Append new text to buffer
         self._buffer += new_text
+
+        # Parsing a tool call stops at its closing markup, leaving the
+        # eot_token at the head of the buffer. Drop it before looking at what
+        # follows: it is markup rather than content, and while it is still
+        # there the checks below read it as part of the next tool call.
+        if self.current_tool_id > 0 and self.eot_token:
+            if self._starts_with_leftover_eot_token(self._buffer):
+                self._buffer = self._buffer[len(self.eot_token):]
+            elif self.eot_token.startswith(self._buffer):
+                # The end token is still arriving one token at a time. Hold it
+                # so its opening bytes are not mistaken for content.
+                return StreamingParseResult()
+
         current_text = self._buffer
 
         # The current_text has tool_call if it is the start of a new tool call sequence
-        # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
-        if not (self.has_tool_call(current_text) or
-                (self.current_tool_id > 0
-                 and current_text.startswith(self.tool_call_separator))):
+        # or it is the start of a new tool call after a tool call separator, when there is a previous tool call.
+        # The separator only introduces a call when a call actually follows it;
+        # a response that resumes with prose on a new line starts the same way,
+        # and reading that as a call leaves it stuck in the tool call branch
+        # below, where prose never parses as JSON.
+        starts_next_tool_call = (
+            self.current_tool_id > 0
+            and current_text.startswith(self.tool_call_separator)
+            and self._may_begin_tool_call(
+                current_text[len(self.tool_call_separator):]))
+
+        if not (self.has_tool_call(current_text) or starts_next_tool_call):
             # Only clear buffer if we're sure no tool call is starting
             if not self._ends_with_partial_token(self._buffer, self.bot_token):
                 normal_text = self._buffer
@@ -158,8 +235,7 @@ class BaseToolParser(ABC):
                 tool_call_pos = current_text.find(self.bot_token)
                 if tool_call_pos != -1:
                     start_idx = tool_call_pos + len(self.bot_token)
-                elif self.current_tool_id > 0 and current_text.startswith(
-                        self.tool_call_separator):
+                elif starts_next_tool_call:
                     start_idx = len(self.tool_call_separator)
                 else:
                     start_idx = 0
@@ -222,6 +298,9 @@ class BaseToolParser(ABC):
             else:
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
+                argument_diff = None
+                # Save the ID of the tool that's completing
+                completing_tool_id = self.current_tool_id
 
                 if cur_arguments:
                     # Calculate how much of the arguments we've already streamed
@@ -233,24 +312,9 @@ class BaseToolParser(ABC):
                         prev_arguments = self.prev_tool_call_arr[
                             self.current_tool_id].get("arguments")
 
-                    argument_diff = None
-
                     # If the current tool's JSON is complete, send all remaining arguments
                     if is_current_complete:
                         argument_diff = cur_args_json[sent:]
-                        completing_tool_id = (
-                            self.current_tool_id
-                        )  # Save the ID of the tool that's completing
-
-                        # Only remove the processed portion, keep unprocessed content
-                        self._buffer = current_text[start_idx + end_idx:]
-
-                        if self.current_tool_id < len(self.prev_tool_call_arr):
-                            self.prev_tool_call_arr[
-                                self.current_tool_id].clear()
-                        self.current_tool_name_sent = False
-                        self.streamed_args_for_tool[self.current_tool_id] = ""
-                        self.current_tool_id += 1
 
                     # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
@@ -260,21 +324,36 @@ class BaseToolParser(ABC):
                                                         cur_args_json)
                             argument_diff = prefix[sent:]
 
-                    # Send the argument diff if there's something new
-                    if argument_diff is not None:
-                        # Use the correct tool_index: completing_tool_id for completed tools, current_tool_id for ongoing
-                        tool_index_to_use = (completing_tool_id
-                                             if is_current_complete else
-                                             self.current_tool_id)
-                        res = StreamingParseResult(calls=[
-                            ToolCallItem(
-                                tool_index=tool_index_to_use,
-                                parameters=argument_diff,
-                            )
-                        ], )
-                        if not is_current_complete:
-                            self.streamed_args_for_tool[
-                                self.current_tool_id] += argument_diff
+                # Close the call out whenever its JSON is complete, not only
+                # when it carried arguments. A call invoked with none still
+                # ends here, and leaving it open keeps its markup and
+                # everything after it stuck in the buffer for the rest of the
+                # stream.
+                if is_current_complete:
+                    # Only remove the processed portion, keep unprocessed content
+                    self._buffer = current_text[start_idx + end_idx:]
+
+                    if self.current_tool_id < len(self.prev_tool_call_arr):
+                        self.prev_tool_call_arr[self.current_tool_id].clear()
+                    self.current_tool_name_sent = False
+                    self.streamed_args_for_tool[self.current_tool_id] = ""
+                    self.current_tool_id += 1
+
+                # Send the argument diff if there's something new
+                if argument_diff is not None:
+                    # Use the correct tool_index: completing_tool_id for completed tools, current_tool_id for ongoing
+                    tool_index_to_use = (completing_tool_id
+                                         if is_current_complete else
+                                         self.current_tool_id)
+                    res = StreamingParseResult(calls=[
+                        ToolCallItem(
+                            tool_index=tool_index_to_use,
+                            parameters=argument_diff,
+                        )
+                    ], )
+                    if not is_current_complete:
+                        self.streamed_args_for_tool[
+                            self.current_tool_id] += argument_diff
 
             # Update prev_tool_call_arr with current state
             if self.current_tool_id >= 0:

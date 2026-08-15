@@ -97,6 +97,20 @@ def sample_tools():
     ]
 
 
+def _arguments_by_tool_index(calls) -> dict:
+    """Reassemble each tool call's streamed arguments, keyed by tool index.
+
+    Arguments reach the client as a series of fragments carrying no name, so a
+    test that wants to check them has to join the fragments per tool index.
+    """
+    joined: dict = {}
+    for call in calls:
+        if call.parameters:
+            joined[call.tool_index] = joined.get(call.tool_index,
+                                                 "") + call.parameters
+    return {index: json.loads(text) for index, text in joined.items()}
+
+
 # Concrete implementation of BaseToolParser for testing
 class ConcreteToolParser(BaseToolParser):
     """Concrete implementation of BaseToolParser for testing abstract methods."""
@@ -312,9 +326,14 @@ class TestBaseToolParser:
             '[TOOL_CALLS] {"name":"get_weather","arguments":{"location":"Boston"}}',
             sample_tools)
 
-        # Should have sent tool name (first call)
-        assert len(result.calls) == 1
+        # The whole call arrived at once, so the name and the arguments both
+        # go out here. Keeping the arguments back for a later increment drops
+        # them whenever this chunk turns out to be the last one.
+        assert len(result.calls) == 2
         assert result.calls[0].name == "get_weather"
+        assert result.calls[0].parameters == ""
+        assert json.loads(result.calls[1].parameters) == {"location": "Boston"}
+        assert parser._buffer == ""
 
     def test_parse_streaming_increment_invalid_tool_name(self, sample_tools):
         """Test streaming parser handles invalid tool name."""
@@ -764,6 +783,187 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "search_web"
         assert result.calls[0].parameters == ""
         assert result.calls[0].tool_index == 1
+
+    # Issue #17740: the eot_token "\n</tool_call>" starts with the
+    # tool_call_separator "\n", so the leftover buffer of a finished call used
+    # to be read as the separator announcing the next one. The parser then
+    # stayed in the tool call branch, where the closing markup never parses as
+    # JSON, and silently swallowed the rest of the response.
+    def test_streaming_emits_content_after_completed_tool_call(
+            self, sample_tools, parser):
+        """Text streamed after a finished tool call reaches the client."""
+        chunks = [
+            "<tool_call>\n",
+            '{"name":"get_weather","arguments":{"location":"NYC"}}',
+            "\n</tool_call>",
+            " It is sunny.",
+        ]
+        normal_text = "".join(
+            parser.parse_streaming_increment(chunk, sample_tools).normal_text
+            for chunk in chunks)
+
+        assert normal_text == " It is sunny."
+        assert parser._buffer == ""
+
+    def test_streaming_content_after_tool_call_with_split_end_token(
+            self, sample_tools, parser):
+        """The end token may arrive across chunks without trapping the buffer."""
+        chunks = [
+            "<tool_call>\n",
+            '{"name":"get_weather","arguments":{"location":"NYC"}}',
+            "\n</tool",
+            "_call>",
+            " It is sunny.",
+        ]
+        normal_text = "".join(
+            parser.parse_streaming_increment(chunk, sample_tools).normal_text
+            for chunk in chunks)
+
+        assert normal_text == " It is sunny."
+        assert parser._buffer == ""
+
+    def test_streaming_content_after_tool_call_character_by_character(
+            self, sample_tools, parser):
+        """Token-by-token streaming keeps the markup out of the content."""
+        response = ('<tool_call>\n'
+                    '{"name":"get_weather","arguments":{"location":"NYC"}}\n'
+                    '</tool_call> It is sunny.')
+        normal_text = "".join(
+            parser.parse_streaming_increment(char, sample_tools).normal_text
+            for char in response)
+
+        assert normal_text == " It is sunny."
+        assert parser._buffer == ""
+
+    def test_streaming_content_in_same_chunk_as_end_token(
+            self, sample_tools, parser):
+        """Content sharing a chunk with the closing markup is still emitted.
+
+        Nothing drains the parser buffer once the stream ends, so a tool call
+        that completes on the final chunk has to release the rest of that
+        chunk right away.
+        """
+        chunks = [
+            "<tool_call>\n",
+            '{"name":"get_weather","arguments":{"location":"NYC"}}',
+            "\n</tool_call> It is sunny.",
+        ]
+        normal_text = "".join(
+            parser.parse_streaming_increment(chunk, sample_tools).normal_text
+            for chunk in chunks)
+
+        assert normal_text == " It is sunny."
+        assert parser._buffer == ""
+
+    def test_streaming_whole_response_in_one_chunk(self, sample_tools, parser):
+        """A single chunk carrying the entire response loses nothing."""
+        result = parser.parse_streaming_increment(
+            '<tool_call>\n{"name":"get_weather","arguments":{"location":"NYC"}}'
+            '\n</tool_call> It is sunny.', sample_tools)
+
+        assert [call.name for call in result.calls
+                if call.name] == ["get_weather"]
+        assert json.loads("".join(call.parameters for call in result.calls
+                                  if call.parameters)) == {
+                                      "location": "NYC"
+                                  }
+        assert result.normal_text == " It is sunny."
+        assert parser._buffer == ""
+
+    def test_streaming_two_tool_calls_in_one_chunk(self, sample_tools, parser):
+        """A second call sharing the chunk with the first is not swallowed."""
+        result = parser.parse_streaming_increment(
+            '<tool_call>\n{"name":"get_weather","arguments":{"location":"NYC"}}'
+            '\n</tool_call>\n'
+            '<tool_call>\n{"name":"search_web","arguments":{"query":"AI"}}'
+            '\n</tool_call> All set.', sample_tools)
+
+        assert [call.name for call in result.calls
+                if call.name] == ["get_weather", "search_web"]
+        assert _arguments_by_tool_index(result.calls) == {
+            0: {
+                "location": "NYC"
+            },
+            1: {
+                "query": "AI"
+            },
+        }
+        assert result.normal_text == " All set."
+        assert parser._buffer == ""
+
+    def test_streaming_content_after_tool_call_on_its_own_line(
+            self, sample_tools, parser):
+        """Prose resuming on a new line is content, not another tool call.
+
+        It opens with the tool_call_separator just as a following call would,
+        so the parser has to look at what comes after the separator.
+        """
+        chunks = [
+            "<tool_call>\n",
+            '{"name":"get_weather","arguments":{"location":"NYC"}}',
+            "\n</tool_call>",
+            "\nIt is sunny.",
+        ]
+        normal_text = "".join(
+            parser.parse_streaming_increment(chunk, sample_tools).normal_text
+            for chunk in chunks)
+
+        assert normal_text == "\nIt is sunny."
+        assert parser._buffer == ""
+
+    def test_streaming_content_after_zero_argument_tool_call(
+            self, sample_tools, parser):
+        """A call invoked with no arguments still closes out.
+
+        The completion bookkeeping used to sit behind a check for arguments to
+        stream, so a call with none never released the buffer and took the rest
+        of the response down with it.
+        """
+        chunks = [
+            "<tool_call>\n",
+            '{"name":"get_weather","arguments":{}}',
+            "\n</tool_call>",
+            " Nothing to report.",
+        ]
+        normal_text = "".join(
+            parser.parse_streaming_increment(chunk, sample_tools).normal_text
+            for chunk in chunks)
+
+        assert normal_text == " Nothing to report."
+        assert parser._buffer == ""
+
+    def test_streaming_content_after_multiple_tool_calls(
+            self, sample_tools, parser):
+        """A separator between two calls is still honored before the content."""
+        chunks = [
+            "<tool_call>\n",
+            '{"name":"get_weather","arguments":{"location":"NYC"}}',
+            "\n</tool_call>\n",
+            "<tool_call>\n",
+            '{"name":"search_web","arguments":{"query":"AI"}}',
+            "\n</tool_call>",
+            " All set.",
+        ]
+        normal_text = ""
+        names = []
+        calls = []
+        for chunk in chunks:
+            result = parser.parse_streaming_increment(chunk, sample_tools)
+            normal_text += result.normal_text
+            names += [call.name for call in result.calls if call.name]
+            calls += result.calls
+
+        assert names == ["get_weather", "search_web"]
+        assert _arguments_by_tool_index(calls) == {
+            0: {
+                "location": "NYC"
+            },
+            1: {
+                "query": "AI"
+            },
+        }
+        assert normal_text == " All set."
+        assert parser._buffer == ""
 
     def test_structure_info_function(self):
         """Test structure_info returns correct lambda function."""
