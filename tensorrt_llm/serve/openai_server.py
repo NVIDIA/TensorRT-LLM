@@ -1697,8 +1697,11 @@ class OpenAIServer(_VideoRoutesMixin):
             _apply_kimi_chat_extensions(
                 request, resolve_top_level_model_type(self.model_config))
             conversation: List[ConversationMessage] = []
+            # exclude_none: pydantic-injected null defaults (strict,
+            # description, parameters) would otherwise leak into the rendered
+            # tool-declare JSON and skew prompt-token counts.
             tool_dicts = None if request.tools is None else [
-                tool.model_dump() for tool in request.tools
+                tool.model_dump(exclude_none=True) for tool in request.tools
             ]
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -1737,6 +1740,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     if strict_guided is not None:
                         sampling_params.guided_decoding = strict_guided
             postproc_args = ChatPostprocArgs.from_request(request)
+            if (resolve_top_level_model_type(self.model_config) == "kimi_k3"
+                    and request.add_generation_prompt
+                    and request.prompt_token_ids is None):
+                # Kimi's prompt-token accounting excludes the trailing 3-token
+                # generation channel opener (<|open|>think|response<|sep|>);
+                # the model still sees the full rendered prompt.
+                postproc_args.num_prompt_tokens_offset = 3
             if dynamic_tools:
                 # The tool parser must see dynamic tools to recognize their
                 # calls in the model output.

@@ -247,7 +247,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
     res: List[str] = []
     finish_reason_sent = [False] * args.num_choices
-    prompt_tokens = args.num_prompt_tokens
+    prompt_tokens = args.num_prompt_tokens - args.num_prompt_tokens_offset
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     stream_response_id, stream_created = _ensure_stream_metadata(
         args, rsp, "chatcmpl")
@@ -457,7 +457,7 @@ def chat_response_post_processor(
             full_message = args.last_message_content + choice.message.content
             choice.message.content = full_message
 
-    num_prompt_tokens = args.num_prompt_tokens
+    num_prompt_tokens = args.num_prompt_tokens - args.num_prompt_tokens_offset
     num_generated_tokens = sum(len(output.token_ids) for output in rsp.outputs)
     usage = UsageInfo(
         prompt_tokens=num_prompt_tokens,
