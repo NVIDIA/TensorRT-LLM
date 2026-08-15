@@ -95,6 +95,8 @@ def validate_models(models: typing.Any) -> list[str]:
         name = model_entry.get("name")
         if not isinstance(name, str) or not name.strip():
             errors.append(f"{entry_label}: missing non-empty string 'name'.")
+        elif name != name.strip():
+            errors.append(f"{entry_label}: 'name' must not have leading or trailing whitespace.")
 
         yaml_extra = model_entry.get("yaml_extra")
         if not isinstance(yaml_extra, list) or not all(
@@ -105,10 +107,12 @@ def validate_models(models: typing.Any) -> list[str]:
         config_id = model_entry.get("config_id", DEFAULT_CONFIG_ID)
         if not isinstance(config_id, str) or not config_id.strip():
             errors.append(f"{entry_label}: 'config_id' must be a non-empty string when provided.")
+        elif config_id != config_id.strip():
+            errors.append(f"{entry_label}: 'config_id' must not have leading or trailing whitespace.")
 
-        if not isinstance(name, str) or not name.strip():
+        if not isinstance(name, str) or not name.strip() or name != name.strip():
             continue
-        if not isinstance(config_id, str) or not config_id.strip():
+        if not isinstance(config_id, str) or not config_id.strip() or config_id != config_id.strip():
             continue
 
         seen_model_configs[(name, config_id)].append(index)
