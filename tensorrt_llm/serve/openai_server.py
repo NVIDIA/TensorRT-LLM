@@ -376,6 +376,14 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
         return None
 
     parser = tool_parser_cls()
+    # Parsers whose wire format can't be expressed through structure_info
+    # triples (kimi_k3 XTML) provide a complete format themselves.
+    custom_format = parser.build_strict_structural_tag_format(tools)
+    if custom_format is not None:
+        resp_format = ResponseFormat(type="structural_tag",
+                                     format=custom_format)
+        return GuidedDecodingParams(structural_tag=resp_format.model_dump_json(
+            by_alias=True, exclude_none=True))
     if not parser.supports_structural_tag():
         logger.warning(
             "Tool parser '%s' does not support structural tags, "
