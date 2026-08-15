@@ -926,7 +926,7 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
 
 # Valid function-tool name: no leading digit, word chars/dash only, at most
 # 256 chars (Kimi Vendor Verifier contract for message-level tools).
-_DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}$")
+_DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}\Z")
 
 
 class ChatCompletionThinkingParam(OpenAIBaseModel):
@@ -1189,12 +1189,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if "tool_choice" not in data and (data.get("tools")
                                           or has_dynamic_tools):
             data["tool_choice"] = "auto"
-        # "none" and "auto" are meaningful without tools; "required" and a
-        # named function must have a non-empty tool set to pick from —
-        # request-level or message-level (dynamic) tools both count.
+        # "none" and "auto" are meaningful without tools. "required" needs a
+        # non-empty tool set — request-level or message-level (dynamic)
+        # tools both count. A named function must be a request-level tool.
         if "tool_choice" in data and data["tool_choice"] not in ("none",
                                                                  "auto"):
-            if not (data.get("tools") or has_dynamic_tools):
+            satisfied = data.get("tools") or (data["tool_choice"] == "required"
+                                              and has_dynamic_tools)
+            if not satisfied:
                 raise ValueError(
                     "When using `tool_choice`, `tools` must be set.")
         return data
@@ -1224,7 +1226,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     if isinstance(name, str):
                         seen_names.add(name)
         for message in messages:
-            if not isinstance(message, dict) or "tools" not in message:
+            # A null tools key is treated as absent (some SDKs serialize
+            # optional fields as null); only declared tools are validated.
+            if not isinstance(message,
+                              dict) or message.get("tools") is None:
                 continue
             if message.get("role") != "system":
                 raise ValueError(
