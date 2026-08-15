@@ -79,7 +79,13 @@ def main() -> int:
         if msg:
             violations.append(f"{rel}: {expected_name!r} {msg}")
 
-        fm_name = load_frontmatter_name(path)
+        try:
+            fm_name = load_frontmatter_name(path)
+        except yaml.YAMLError as exc:
+            problem = getattr(exc, "problem", None) or str(exc)
+            violations.append(f"{rel}: invalid YAML frontmatter: {problem}")
+            continue
+
         if fm_name is None:
             violations.append(f"{rel}: missing `name` field in frontmatter")
         elif fm_name != expected_name:
