@@ -32,7 +32,7 @@ benchmark:
   multi_round: 12
   benchmark_ratio: 0.0
   streaming: true
-  concurrency_list: '2'
+  concurrency_list: '12'
   input_length: 50000
   output_length: 2048
   dataset_file: <dataset_file>
