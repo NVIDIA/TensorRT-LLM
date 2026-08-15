@@ -20,7 +20,4 @@ def test_validate_detects_requiredness_drift(tmp_path, monkeypatch):
 
     errors = validator.validate()
 
-    assert (
-        "trtllm_heartbeat: field 'seq' required in Pydantic model "
-        "TrtllmHeartbeat but not required in SMS schema"
-    ) in errors
+    assert "trtllm_heartbeat: field 'seq' in SMS properties but missing from required" in errors
