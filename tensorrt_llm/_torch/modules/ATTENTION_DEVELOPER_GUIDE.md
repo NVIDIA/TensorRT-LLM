@@ -134,14 +134,14 @@ both. The separate adapter types make the `Attention` and `MLA` signatures
 statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
-output allocation. DeepSeek-V4's fused epilogue is the exception: it requires
-two typed output buffers before the attention op runs, so it implements the
-optional output-preparation hook. `_create_outputs()` always returns a tensor
-list whose first entry is the standard attention output. The same list flows
-through forward, the registered custom op, and output projection; algorithms
-own the meaning of any additional entries. Context- and generation-phase
-helpers stay within each algorithm module and are not part of the generic hook
-facade.
+output allocation. DeepSeek-V4's fused epilogue instead uses the optional
+output-preparation hook to create one token-major O-LoRA output tensor. Its
+context- and generation-phase helpers allocate the private FP8 attention and
+scale buffers, then write the O-LoRA result into the corresponding token range.
+The shared MLA custom-op contract exposes exactly one mutable output tensor;
+`_create_outputs()` keeps that tensor in a single-entry list through forward
+and output projection. Phase-specific scratch buffers remain inside the
+DeepSeek-V4 algorithm module and do not widen the generic hook facade.
 
 Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
 their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
