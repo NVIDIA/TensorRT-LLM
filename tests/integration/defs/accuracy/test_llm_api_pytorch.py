@@ -33,9 +33,10 @@ from tensorrt_llm.llmapi import (
     DFlashDecodingConfig, DSparkDecodingConfig, DraftTargetDecodingConfig,
     Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
     MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
-    NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
-    SADecodingConfig, SamplingParams, SchedulerConfig,
-    SkipSoftmaxAttentionConfig, SAEnhancerConfig, TorchCompileConfig)
+    NGramDecodingConfig, PARDDecodingConfig, PrefillCudaGraphBackend,
+    RocketSparseAttentionConfig, SADecodingConfig, SamplingParams,
+    SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
+    TorchCompileConfig)
 # isort: on
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization import QuantAlgo
@@ -3597,6 +3598,66 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,mtp_nextn,attention_dp,max_batch_size,moe_backend,fp8kv,chunked_prefill",
+        [
+            (8, 1, 8, 0, True, 24, "CUTLASS", False, False),
+        ],
+        ids=["baseline"])
+    def test_nvfp4_multi_gpus_breakable_cuda_graph(self, tp_size, pp_size,
+                                                   ep_size, mtp_nextn,
+                                                   attention_dp, max_batch_size,
+                                                   moe_backend, fp8kv,
+                                                   chunked_prefill):
+        sm_version = get_sm_version()
+        if moe_backend == "TRTLLM" and sm_version in (120, 121):
+            pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
+
+        moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+            kv_cache_config.enable_block_reuse = True
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=True,
+                max_batch_size=max_batch_size,
+            ),
+            moe_config=moe_config,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_capture_num_tokens=[2048, 8192],
+        )
+
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(max_draft_len=mtp_nextn)
+
+        llm_kwargs = dict(
+            max_batch_size=max_batch_size,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            kv_cache_config=kv_cache_config,
+            enable_attention_dp=attention_dp,
+            speculative_config=mtp_config,
+        )
+        if chunked_prefill:
+            llm_kwargs.update(
+                enable_chunked_prefill=True,
+                max_num_tokens=8192,
+            )
+
+        with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
+                 **pytorch_config, **llm_kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,indexer_k_fp4,use_cute_dsl",
         [
             (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, False,
@@ -3930,6 +3991,86 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                              moe_backend,
                              eplb_config,
                              mtp_nextn=mtp_nextn)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.threadleak(enabled=False)
+    def test_mixed_breakable_cuda_graph(self):
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
+        base_prompt_ids = tokenizer.encode(
+            "TensorRT-LLM accelerates reliable large language model inference "
+            "with efficient attention, parallelism, and CUDA graphs. ",
+            add_special_tokens=False,
+        )
+        assert base_prompt_ids
+
+        def make_prompt(prompt_length):
+            return (base_prompt_ids *
+                    ((prompt_length + len(base_prompt_ids) - 1) //
+                     len(base_prompt_ids)))[:prompt_length]
+
+        generation_prompt = make_prompt(64)
+        context_prompt = make_prompt(129)
+        sampling_params = SamplingParams(
+            max_tokens=8,
+            min_tokens=8,
+            seed=42,
+            temperature=0,
+            ignore_eos=True,
+            detokenize=False,
+            add_special_tokens=False,
+        )
+        common_llm_kwargs = dict(
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=8,
+            moe_config=MoeConfig(backend="TRTLLM"),
+            enable_attention_dp=True,
+            max_batch_size=8,
+            max_num_tokens=1024,
+            max_seq_len=2048,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                dtype="fp8",
+                free_gpu_memory_fraction=0.6,
+            ),
+            cuda_graph_config=CudaGraphConfig(
+                batch_sizes=[1, 2, 4, 6, 8],
+                enable_padding=True,
+            ),
+        )
+
+        def run(backend):
+            with LLM(
+                    self.MODEL_PATH,
+                    **common_llm_kwargs,
+                    prefill_cuda_graph_backend=backend,
+                    prefill_capture_num_tokens=[128, 256, 512, 1024],
+            ) as llm:
+                generation_request = llm.generate_async(
+                    generation_prompt,
+                    sampling_params=sampling_params,
+                    streaming=True,
+                )
+                next(generation_request)
+                assert not generation_request.finished
+
+                # Admit a context request while the first request is decoding.
+                context_request = llm.generate_async(
+                    context_prompt,
+                    sampling_params=sampling_params,
+                    streaming=False,
+                )
+                generation_output = generation_request.result()
+                context_output = context_request.result()
+                return [
+                    generation_output.outputs[0].token_ids,
+                    context_output.outputs[0].token_ids,
+                ]
+
+        eager_token_ids = run(PrefillCudaGraphBackend.DISABLED)
+        breakable_token_ids = run(PrefillCudaGraphBackend.BREAKABLE)
+        assert breakable_token_ids == eager_token_ids
 
 
 _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
@@ -6183,6 +6324,47 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.threadleak(enabled=False)
+    def test_bf16_breakable_prefill_cuda_graph(self):
+        model_path = f"{llm_models_root()}/Qwen3.5-4B"
+        prompts = [
+            [[17] * 128],
+            [[17] * 129],
+            # The second request is admitted while the first is decoding,
+            # exercising BCG replay for a mixed context/decode batch.
+            [[17] * 64, [23] * 65],
+            [[31] * 256],
+        ]
+        sampling_params = SamplingParams(max_tokens=4)
+
+        def run(backend):
+            results = []
+            with LLM(
+                    model_path,
+                    trust_remote_code=True,
+                    max_seq_len=1024,
+                    max_num_tokens=512,
+                    max_batch_size=4,
+                    disable_overlap_scheduler=True,
+                    disable_mm_encoder=True,
+                    kv_cache_config=self.kv_cache_config,
+                    cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                                      max_batch_size=4),
+                    prefill_cuda_graph_backend=backend,
+                    prefill_capture_num_tokens=[128, 256, 512],
+            ) as llm:
+                for batch in prompts:
+                    results.append([
+                        output.outputs[0].token_ids for output in llm.generate(
+                            batch, sampling_params=sampling_params)
+                    ])
+            return results
+
+        eager_results = run(PrefillCudaGraphBackend.DISABLED)
+        breakable_results = run(PrefillCudaGraphBackend.BREAKABLE)
+        assert breakable_results == eager_results
 
     @skip_pre_hopper
     def test_fp8(self):
