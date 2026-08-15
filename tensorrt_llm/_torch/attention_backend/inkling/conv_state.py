@@ -95,9 +95,7 @@ class InklingConvStateCache:
         # Reserved rows sit above the real ones so a real slot id is always a
         # valid index into the first ``num_request_slots`` rows.
         self._padding_slot = num_request_slots
-        self._attention_dp_dummy_slot = (
-            num_request_slots + 1 if reserve_attention_dp_slot else None
-        )
+        self._attention_dp_dummy_slot = num_request_slots + 1 if reserve_attention_dp_slot else None
         self._max_draft_len = max(0, int(max_draft_len))
         num_slots = num_request_slots + 1 + int(reserve_attention_dp_slot)
         self.num_slots = num_slots

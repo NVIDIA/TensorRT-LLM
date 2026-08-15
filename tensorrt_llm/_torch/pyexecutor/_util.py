@@ -608,9 +608,9 @@ class KvCacheCreator:
             enable_block_reuse=kv_cache_config.enable_block_reuse,
             enable_chunked_prefill=bool(
                 getattr(self._llm_args, "enable_chunked_prefill", False)),
-            enable_cache_transceiver=(
-                self._cache_transceiver_config is not None
-                and self._cache_transceiver_config.backend is not None))
+            enable_cache_transceiver=(self._cache_transceiver_config is not None
+                                      and self._cache_transceiver_config.backend
+                                      is not None))
         cls = get_kv_cache_manager_cls(
             model_config,
             kv_cache_config,

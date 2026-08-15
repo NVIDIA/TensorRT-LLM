@@ -116,12 +116,12 @@ def is_inkling(config):
     return getattr(text_config, "model_type", None) == "inkling_text"
 
 
-def reject_unsupported_inkling_kv_cache_features(config,
-                                                 *,
-                                                 enable_block_reuse: bool,
-                                                 enable_chunked_prefill: bool,
-                                                 enable_cache_transceiver:
-                                                 bool = False):
+def reject_unsupported_inkling_kv_cache_features(
+        config,
+        *,
+        enable_block_reuse: bool,
+        enable_chunked_prefill: bool,
+        enable_cache_transceiver: bool = False):
     """Refuse the features Inkling's context path cannot serve correctly.
 
     The first two leave a *context* request with history it is supposed to
