@@ -193,13 +193,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         is separate or speculation is off).
     """
 
-    # One-model speculative draft layers share this manager (unified KV
-    # cache): reuse, eviction, and disaggregated transfer then cover the
-    # drafter's KV natively. The drafter's buffers get their own uniform V2
-    # pool (their per-block size differs from every M3 buffer), and its
-    # attention addresses that pool through ``get_draft_subpage_view``.
-    supports_shared_draft_layers = True
-
     # WAR: the Eagle draft kernels break at tokens_per_block=128 (the MSA
     # target's page size) — the SM103 context cubin is missing (its unfused
     # fallback demands a multi-TiB workspace) and the generation kernel hits
@@ -207,7 +200,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     # value sizes both the separate draft manager and the view's sub-pages.
     # Retirement, once the kernels are fixed (WAR sites point here):
     #   1. Validate with TRTLLM_M3_DRAFT_KV_TOKENS_PER_BLOCK=128; the view
-    #      degenerates to the identity expansion (unit-tested).
+    #      degenerates to the identity expansion.
     #   2. Delete the WAR surface — MiniMaxM3DraftSubpageView,
     #      ``get_draft_subpage_view``, the ``add_dummy_requests`` override,
     #      and this attribute; the drafter then attends the shared manager
