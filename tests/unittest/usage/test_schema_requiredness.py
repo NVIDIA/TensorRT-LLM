@@ -3,13 +3,22 @@
 
 import importlib
 import json
+from pathlib import Path
 
 import pytest
 
 pytestmark = pytest.mark.cpu_only
 
 
-def test_validate_detects_requiredness_drift(tmp_path, monkeypatch):
+def test_checked_in_schema_has_no_requiredness_drift() -> None:
+    validator = importlib.import_module("tensorrt_llm.usage.schemas.__main__")
+
+    assert validator.validate() == []
+
+
+def test_validate_detects_requiredness_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     validator = importlib.import_module("tensorrt_llm.usage.schemas.__main__")
     sms = json.loads(validator.SMS_SCHEMA_PATH.read_text(encoding="utf-8"))
     sms["definitions"]["events"]["trtllm_heartbeat"]["required"] = []
