@@ -235,13 +235,15 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
         if enabled and request.thinking.effort is not None:
             derived["thinking_effort"] = request.thinking.effort
     if ("reasoning_effort" in request.model_fields_set
-            and request.reasoning_effort is not None):
-        # Kimi semantics: reasoning_effort overrides thinking.effort.
+            and request.reasoning_effort is not None
+            and "thinking_effort" not in derived):
+        # Kimi semantics: an explicit thinking.effort wins; reasoning_effort
+        # applies only when thinking.effort is absent (KVV
+        # test_reasoning_effort_ignored_when_effort_present).
         effort = getattr(request.reasoning_effort, "value",
                          request.reasoning_effort).lower()
         if effort == "none":
             derived["thinking"] = False
-            derived.pop("thinking_effort", None)
         elif effort in ("low", "high", "max"):
             derived["thinking_effort"] = effort
         # Other efforts (e.g. harmony's "medium") have no K3 equivalent;
