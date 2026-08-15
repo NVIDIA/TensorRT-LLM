@@ -373,7 +373,9 @@ def _normalize_tool_call_arguments(index: int,
     return item
 
 
-def _parse_fallback_tool_calls(tool_calls: list[Any]) -> list[dict[str, Any]]:
+def _parse_fallback_tool_calls(
+        tool_calls: list[Any],
+        lenient_json: bool = False) -> list[dict[str, Any]]:
     """Parse raw tool-call lists accepted only by the tau2-bench fallback path.
 
     `openai_server.py` first attempts strict OpenAI request validation. Some tau2-bench requests
