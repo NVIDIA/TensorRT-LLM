@@ -24,6 +24,7 @@ from tensorrt_llm import LLM as TorchLLM
 from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
@@ -3196,7 +3197,6 @@ kv_cache_compression_config:
   beta: 17
   eviction_mode: per_head
   normalize_scores: false
-  model_path: /tmp/model
   calibration_path: /tmp/calibration.pt
 """)
 
@@ -3783,6 +3783,14 @@ class TestTransceiverRuntimeAutoResolution:
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
+    @pytest.mark.parametrize("model_cls", [Gemma3ForCausalLM, LlamaForCausalLM])
+    def test_llama_and_gemma_model_preferences_adopted(self, model_cls):
+        """Llama and Gemma adopt Python when the runtime is left at auto."""
+        args = self._disagg_args()
+        assert args.cache_transceiver_config.transceiver_runtime == "auto"
+        _resolve_transceiver_runtime_auto(args, model_cls)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
     @pytest.mark.parametrize("explicit_runtime", ["CPP", "PYTHON", None])
     def test_explicit_value_not_overridden_by_model_preference(
             self, explicit_runtime):
@@ -4042,10 +4050,8 @@ class TestTransceiverRuntimeAutoResolution:
 class TestDeepseekRuntimePreferences:
     """DeepSeek KV-cache manager and transceiver preferences.
 
-    DeepseekV3ForCausalLM and DeepseekV32ForCausalLM prefer the Python KV-cache
-    transceiver, while GlmMoeDsaForCausalLM (GLM 5.2) requires the C++ transceiver
-    because its per-layer masked DSA indexer k-cache pool is not supported by the
-    Python (v2) transceiver.
+    DeepseekV3ForCausalLM, DeepseekV32ForCausalLM, and GlmMoeDsaForCausalLM
+    prefer the Python KV-cache transceiver.
     """
 
     @staticmethod
@@ -4055,19 +4061,32 @@ class TestDeepseekRuntimePreferences:
         cfg.model_type = model_type
         return cfg
 
-    @pytest.mark.parametrize("architectures,model_type,expected", [
-        (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "CPP"),
-        (["DeepseekV3ForCausalLM"], "deepseek_v3", "PYTHON"),
-        (["DeepseekV32ForCausalLM"], "deepseek_v32", "PYTHON"),
+    @pytest.mark.parametrize("architectures,model_type", [
+        (["GlmMoeDsaForCausalLM"], "glm_moe_dsa"),
+        (["DeepseekV3ForCausalLM"], "deepseek_v3"),
+        (["DeepseekV32ForCausalLM"], "deepseek_v32"),
     ])
     def test_preference_per_architecture(self, architectures: list[str],
-                                         model_type: str,
-                                         expected: str) -> None:
-        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
-            DeepseekV3ForCausalLM
+                                         model_type: str) -> None:
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
         cfg = self._pretrained_config(architectures, model_type)
-        assert DeepseekV3ForCausalLM.get_preferred_transceiver_runtime(
-            cfg) == expected
+        model_cls = get_registered_model_class(architectures[0])
+        assert model_cls is not None
+        assert model_cls.get_preferred_transceiver_runtime(cfg) == "PYTHON"
+
+    def test_glm_uses_independent_model_flavor(self) -> None:
+        """GLM can evolve independently from its DeepSeek implementation base."""
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import (
+            DeepseekV3ForCausalLM, GlmMoeDsaForCausalLM)
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        assert get_registered_model_class(
+            "DeepseekV3ForCausalLM") is DeepseekV3ForCausalLM
+        assert get_registered_model_class(
+            "GlmMoeDsaForCausalLM") is GlmMoeDsaForCausalLM
+        assert issubclass(GlmMoeDsaForCausalLM, DeepseekV3ForCausalLM)
 
     def test_prefers_python_without_config(self) -> None:
         """Preference is unconditional without a pretrained config."""
