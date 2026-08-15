@@ -26,8 +26,37 @@ model appears, widen that hook rather than adding another beside it.
 
 import torch
 
+from ....logger import logger
 from ...pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
-from .conv_state import InklingConvRuntime, InklingConvStateCache
+from .conv_state import InklingConvState, InklingConvStateCache
+
+
+def _resolve_conv_dtype(pretrained_config) -> torch.dtype:
+    """The compute dtype the short-conv pool holds.
+
+    Not the manager's ``dtype`` argument -- that is the KV cache dtype, a C++
+    binding type ``torch.zeros`` rejects, and it is ``nvfp4``/``fp8`` on
+    quantized releases while the conv pool holds unquantized pre-conv
+    activations.
+
+    HuggingFace configs carry ``torch_dtype`` as either a ``torch.dtype`` or its
+    name (``"bfloat16"``), so both are accepted. An unresolvable value raises:
+    the previous silent fall back to bfloat16 turned an fp16 checkpoint into a
+    pool of the wrong dtype, which reaches the conv kernels as a dtype mismatch
+    far from its cause.
+    """
+    config = getattr(pretrained_config, "text_config", pretrained_config)
+    dtype = getattr(config, "torch_dtype", None)
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        resolved = getattr(torch, dtype, None)
+        if isinstance(resolved, torch.dtype):
+            return resolved
+    raise ValueError(
+        f"Inkling short-conv pool needs the model's compute dtype, but "
+        f"torch_dtype={dtype!r} on {type(config).__name__} is not a torch dtype"
+    )
 
 
 class InklingHybridCacheManager(KVCacheManagerV2):
@@ -41,40 +70,78 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     cannot drift apart.
 
     The cost is that the pool is also allocated for the throwaway manager built
-    during KV-cache size estimation, and freed along with it.
+    during KV-cache size estimation, and freed along with it. That is what makes
+    the pool's bytes show up in the peak-memory reading
+    ``configure_kv_cache_capacity`` takes -- the pool is a plain torch
+    allocation and no V2 byte quota knows about it -- so the budget handed to
+    the serving manager already has one pool's worth subtracted. The accounting
+    holds exactly because both pools are the same fixed size; see
+    :class:`InklingConvStateCache`.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        pretrained_config = kwargs["pretrained_config"]
-        mapping = kwargs["mapping"]
-        max_batch_size = kwargs["max_batch_size"]
-        # Not kwargs["dtype"] -- that is the KV cache dtype, a C++ binding type
-        # torch.zeros rejects. The conv pool holds pre-conv activations, so it
-        # takes the model's compute dtype from the (text) config.
-        text_config = getattr(pretrained_config, "text_config", pretrained_config)
-        conv_dtype = getattr(text_config, "torch_dtype", None)
-        if not isinstance(conv_dtype, torch.dtype):
-            conv_dtype = torch.bfloat16
+    def __init__(self, *args, pretrained_config, mapping, max_batch_size, **kwargs):
+        # The three arguments the pool needs are declared, not read back out of
+        # ``**kwargs``. KVCacheManagerV2 takes ``mapping`` / ``max_batch_size``
+        # keyword-only and absorbs ``pretrained_config`` into ``**kwargs``
+        # without storing it, so subscripting kwargs worked only as long as
+        # every caller passed all three by keyword: omitting one surfaced as a
+        # bare KeyError from inside this constructor rather than as a TypeError
+        # naming the parameter.
+        super().__init__(
+            *args,
+            pretrained_config=pretrained_config,
+            mapping=mapping,
+            max_batch_size=max_batch_size,
+            **kwargs,
+        )
         # The conv pool's k/v width follows the attention kv-head split, so it
         # takes the attention TP, not the global one -- the same rule
         # KVCacheManagerV2 applies to the paged pool. Dividing by the global
         # tp_size would allocate narrow conv rows for full-width convs.
         attn_tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-        # +1 row for the CUDA-graph padding / dummy-request slot (the mamba
-        # pattern): a padded decode batch admits up to max_batch_size real
-        # requests plus a shared dummy row.
+        # One row per sequence that can be resident at once. Pipeline stages
+        # each hold a microbatch, so the bound is max_batch_size * pp_size --
+        # the same count MambaHybridCacheManagerV2 calls
+        # ``_max_resident_sequences``. The padding and attention-DP rows are
+        # reserved on top of this by the pool itself.
+        num_request_slots = max_batch_size * mapping.pp_size
+        spec_config = kwargs.get("spec_config")
+        max_draft_len = int(getattr(spec_config, "max_draft_len", 0) or 0)
         self._conv_cache = InklingConvStateCache(
             pretrained_config,
             attn_tp_size,
-            max_batch_size + 1,
+            num_request_slots,
             torch.device("cuda", torch.cuda.current_device()),
-            conv_dtype,
+            _resolve_conv_dtype(pretrained_config),
+            reserve_attention_dp_slot=mapping.enable_attention_dp,
+            max_draft_len=max_draft_len,
+        )
+        logger.info(
+            f"Inkling short-conv state pool: {self._conv_cache.num_slots} rows "
+            f"({num_request_slots} request + reserved), "
+            f"{self._conv_cache.conv_state_bytes() / (1 << 20):.1f} MiB"
         )
 
     # ---- model-facing -----------------------------------------------------
-    def prepare_conv_runtime(self, attn_metadata):
-        return self._conv_cache, InklingConvRuntime.build(attn_metadata, self._conv_cache)
+    @property
+    def conv_state_cache(self) -> InklingConvStateCache:
+        """The short-conv state pool, for the metadata's per-step publication."""
+        return self._conv_cache
+
+    def get_conv_states(self, layer_idx: int) -> InklingConvState:
+        """The four short-conv state buffers of ``layer_idx``.
+
+        Named after ``BaseMambaCacheManager.get_conv_states`` on purpose: this
+        is the same question asked of the same kind of manager. It cannot
+        *implement* that hook, which returns one tensor per layer and cannot
+        express Inkling's four convs at two widths -- widening the shared hook
+        is the move if a second short-conv model appears.
+        """
+        return self._conv_cache.layer_state(layer_idx)
+
+    def get_state_indices(self) -> torch.Tensor:
+        """Pool rows of the current batch, in packed batch order."""
+        return self._conv_cache.state_indices
 
     def free_conv_state(self, request_ids) -> None:
         self._conv_cache.free(list(request_ids))

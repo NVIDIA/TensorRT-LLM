@@ -102,27 +102,25 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         framework's pre-forward hook and is already called on every input-prep
         path, so the host->device slot write stays outside the captured region.
 
-        Type-tests the concrete manager rather than an abstract protocol. A
-        protocol would have to be satisfied by exactly one class -- both its
-        useful methods return Inkling's own pool and runtime types -- so it
-        would abstract nothing while putting an Inkling file under
-        ``pyexecutor``. The framework rule this looks like it breaks ("test the
-        capability, not the model", the way _prepare_mamba_metadata tests
-        BaseMambaCacheManager) is about not branching on model identity in
-        SHARED code; this class only ever serves Inkling by construction.
+        Tests for the pool rather than for the concrete manager class: the
+        manager owns the pool's *lifetime* (it is freed with the request's KV
+        blocks) but nothing about a per-forward batch split, which is metadata
+        work and belongs here. Asking for the capability also keeps the test
+        honest for the fake managers the unit tests build.
 
         If a second short-conv model ever appears, the right move is to widen
         the framework's existing hook -- ``BaseMambaCacheManager`` already
         declares ``get_conv_states(layer_idx)`` and three models implement it --
         not to invent a parallel protocol beside it.
         """
-        from .cache_manager import InklingHybridCacheManager
+        from .conv_state import InklingConvRuntime
 
-        mgr = self.kv_cache_manager
-        if not isinstance(mgr, InklingHybridCacheManager) or self.request_ids is None:
+        cache = getattr(self.kv_cache_manager, "conv_state_cache", None)
+        if cache is None or self.request_ids is None:
             self.ink_conv_cache = self.ink_conv_rt = None
             return
-        self.ink_conv_cache, self.ink_conv_rt = mgr.prepare_conv_runtime(self)
+        self.ink_conv_cache = cache
+        self.ink_conv_rt = InklingConvRuntime.build(self, cache)
 
     def _prepare_inkling_decode(self) -> None:
         # Reset first: a step that returns early must not leave the previous

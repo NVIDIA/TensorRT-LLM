@@ -26,6 +26,7 @@ import json
 import os
 import struct
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 from utils.llm_data import llm_models_root
@@ -629,16 +630,28 @@ def test_conv_pool_dtype_is_a_torch_dtype_not_the_kv_cache_dtype():
     code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
     assert 'kwargs["dtype"]' not in code and 'kwargs.get("dtype")' not in code
 
-    # The resolution itself: a config torch_dtype wins, anything else -> bf16.
-    for cfg, expected in (
-        (SimpleNamespace(torch_dtype=torch.float16), torch.float16),
-        (SimpleNamespace(torch_dtype="not-a-dtype"), torch.bfloat16),
-        (SimpleNamespace(), torch.bfloat16),
-    ):
-        resolved = getattr(cfg, "torch_dtype", None)
-        if not isinstance(resolved, torch.dtype):
-            resolved = torch.bfloat16
-        assert resolved is expected
+    # A torch dtype wins; HF's string spelling of the same thing resolves to it.
+    assert csm._resolve_conv_dtype(SimpleNamespace(torch_dtype=torch.float16)) is torch.float16
+    assert csm._resolve_conv_dtype(SimpleNamespace(torch_dtype="float16")) is torch.float16
+    # The multimodal config defers to its text sub-config.
+    assert (
+        csm._resolve_conv_dtype(SimpleNamespace(text_config=SimpleNamespace(torch_dtype="float16")))
+        is torch.float16
+    )
+
+
+def test_conv_pool_dtype_refuses_to_guess():
+    """An unresolvable torch_dtype must raise here, not fall back to bfloat16.
+
+    The pool holds pre-conv activations, so a silent bf16 default on an fp16
+    release builds the whole pool in the wrong dtype. Nothing checks it until
+    causal_conv1d_update reports a dtype mismatch, layers deep and with no
+    mention of the config field that caused it."""
+    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as csm
+
+    for cfg in (SimpleNamespace(torch_dtype="not-a-dtype"), SimpleNamespace()):
+        with pytest.raises(ValueError, match="torch_dtype"):
+            csm._resolve_conv_dtype(cfg)
 
 
 def test_inkling_attention_lives_in_its_own_package_not_under_sparse():
@@ -694,27 +707,29 @@ def test_no_conv_state_protocol_and_no_inkling_file_in_pyexecutor():
     assert not offenders, offenders
 
 
-def test_metadata_type_tests_the_concrete_manager():
-    """prepare() must react to Inkling's own manager, and to nothing else."""
-    from tensorrt_llm._torch.attention_backend.inkling import InklingHybridCacheManager
+def test_metadata_builds_the_runtime_itself_from_the_managers_pool():
+    """prepare() must react to a manager that owns a conv pool, and the split
+    it builds is metadata work: the manager is asked for the pool, not for a
+    per-forward runtime object."""
+    from tensorrt_llm._torch.attention_backend.inkling import conv_state as cs
 
-    class _FakeConvManager(_FakeKvManager, InklingHybridCacheManager):
-        def __init__(self, *a, **kw):
-            _FakeKvManager.__init__(self, *a, **kw)
-            self.prepared = 0
-
-        def prepare_conv_runtime(self, attn_metadata):
-            self.prepared += 1
-            return "POOL", "RUNTIME"
+    class _FakeConvManager(_FakeKvManager):
+        conv_state_cache = "POOL"
 
     md = _ink_metadata()
     md.kv_cache_manager = _FakeConvManager(
         md.kv_cache_manager.pp_layers, md.kv_cache_manager._blocks
     )
+    built = {}
 
-    md._prepare_inkling_conv()
+    def _build(attn_metadata, cache):
+        built["args"] = (attn_metadata, cache)
+        return "RUNTIME"
 
-    assert md.kv_cache_manager.prepared == 1
+    with mock.patch.object(cs.InklingConvRuntime, "build", _build):
+        md._prepare_inkling_conv()
+
+    assert built["args"] == (md, "POOL")
     assert (md.ink_conv_cache, md.ink_conv_rt) == ("POOL", "RUNTIME")
 
 
@@ -993,10 +1008,16 @@ def test_every_deferred_import_in_the_inkling_package_resolves():
 # Attention (which already scoped itself to attention TP) or an all-reduce that
 # sums activations belonging to different requests.
 # ---------------------------------------------------------------------------
-def _adp_mapping(adp, tp_size=4):
+def _adp_mapping(adp, tp_size=4, pp_size=1):
     from tensorrt_llm.mapping import Mapping
 
-    return Mapping(world_size=tp_size, tp_size=tp_size, rank=0, enable_attention_dp=adp)
+    return Mapping(
+        world_size=tp_size * pp_size,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        rank=0,
+        enable_attention_dp=adp,
+    )
 
 
 def test_short_conv_keeps_every_channel_under_attention_dp():
@@ -1095,7 +1116,7 @@ def test_dense_mlp_still_tp_shards_and_reduces_without_attention_dp(no_collectiv
     assert tuple(mlp.down_proj.weight.shape) == (8, 4)  # 16 / 4 ranks
 
 
-def _conv_pool(tp_size, kv_heads=16, head_dim=8):
+def _conv_pool(tp_size, kv_heads=16, head_dim=8, num_request_slots=2, **kwargs):
     import torch
 
     from tensorrt_llm._torch.attention_backend.inkling import InklingConvStateCache
@@ -1107,14 +1128,17 @@ def _conv_pool(tp_size, kv_heads=16, head_dim=8):
         layer_num_kv_heads=lambda i: kv_heads,
         layer_head_dim=lambda i: head_dim,
     )
-    return InklingConvStateCache(cfg, tp_size, 2, torch.device("cpu"), torch.bfloat16)
+    return InklingConvStateCache(
+        cfg, tp_size, num_request_slots, torch.device("cpu"), torch.bfloat16, **kwargs
+    )
 
 
 def test_conv_pool_k_v_width_follows_the_split_it_is_given():
     """The pool's k/v rows must be exactly as wide as the convs that write them.
-    tp_size 1 (the ADP case) is full width; tp_size 4 is the TP slice."""
-    assert tuple(_conv_pool(1).layer_state(0).k.shape) == (2, 128, 3)
-    assert tuple(_conv_pool(4).layer_state(0).k.shape) == (2, 32, 3)
+    tp_size 1 (the ADP case) is full width; tp_size 4 is the TP slice.
+    Row count is 2 request rows + the reserved CUDA-graph padding row."""
+    assert tuple(_conv_pool(1).layer_state(0).k.shape) == (3, 128, 3)
+    assert tuple(_conv_pool(4).layer_state(0).k.shape) == (3, 32, 3)
 
 
 def test_conv_pool_attn_and_mlp_rows_are_never_split():
@@ -1123,8 +1147,78 @@ def test_conv_pool_attn_and_mlp_rows_are_never_split():
     regardless of the split."""
     for tp in (1, 4):
         st = _conv_pool(tp).layer_state(0)
-        assert tuple(st.attn.shape) == (2, 8, 3), tp
-        assert tuple(st.mlp.shape) == (2, 8, 3), tp
+        assert tuple(st.attn.shape) == (3, 8, 3), tp
+        assert tuple(st.mlp.shape) == (3, 8, 3), tp
+
+
+def test_conv_pool_reserves_a_row_for_padding_and_one_for_attention_dp():
+    """Reserved rows sit above the real ones and are not handed to requests.
+
+    Charging a padding sentinel a real row silently shrinks the servable batch:
+    cuda_graph_runner keeps one dummy id per runtime draft length, and the
+    attention-DP idle dummy is a third id on top of those."""
+    pool = _conv_pool(1, num_request_slots=2, reserve_attention_dp_slot=True)
+
+    assert (pool.num_request_slots, pool.num_slots) == (2, 4)
+    assert tuple(pool.layer_state(0).attn.shape) == (4, 8, 3)
+
+
+def test_conv_pool_aliases_every_padding_sentinel_to_one_reserved_row():
+    """All CUDA-graph sentinel ids -- one per runtime draft length -- share the
+    padding row, and the attention-DP dummy has its own."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+    from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+
+    pool = _conv_pool(1, num_request_slots=2, reserve_attention_dp_slot=True, max_draft_len=3)
+
+    sentinels = [CUDA_GRAPH_DUMMY_REQUEST_ID - d for d in range(4)]
+    assert pool.slots_for(sentinels) == [2, 2, 2, 2]
+    assert pool.slots_for([ATTENTION_DP_DUMMY_REQUEST_ID]) == [3]
+    # Real rows are untouched by all that padding: both requests get real rows,
+    # handed out from the bottom of the pool.
+    assert pool.slots_for([101, 102]) == [0, 1]
+
+
+def test_conv_pool_never_returns_a_reserved_row_to_the_free_list():
+    """free() on a sentinel must not hand a real request a row the next padding
+    batch overwrites."""
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+
+    pool = _conv_pool(1, num_request_slots=1)
+    pool.slots_for([CUDA_GRAPH_DUMMY_REQUEST_ID])
+    pool.free([CUDA_GRAPH_DUMMY_REQUEST_ID])
+
+    assert pool.slots_for([7]) == [0]  # the one real row, not the padding row
+    pool.free([7])
+    assert pool.slots_for([8]) == [0]
+
+
+def test_conv_pool_raises_when_it_runs_out_instead_of_growing():
+    """A grown pool reallocates every buffer, stranding the pointers a captured
+    CUDA graph holds -- and a graph replaying against a freed buffer does not
+    raise. Refuse loudly instead; the pool is sized to every sequence that can
+    be resident at once, so exhaustion means a row leaked."""
+    pool = _conv_pool(1, num_request_slots=2)
+    pool.slots_for([1, 2])
+
+    with pytest.raises(RuntimeError, match="out of rows"):
+        pool.slots_for([3])
+
+    assert not hasattr(pool, "_grow")
+
+
+def test_conv_pool_keeps_a_requests_row_across_steps():
+    """The carried short-conv window is the whole point of the pool: a request
+    must keep its row until free(), and the row must be zeroed on first use."""
+    pool = _conv_pool(1, num_request_slots=2)
+
+    assert pool.slots_for([5]) == pool.slots_for([5])
+    pool.layer_state(0).k[pool.slots_for([5])[0]].fill_(1.0)
+    slot = pool.slots_for([5])[0]
+    pool.free([5])
+    pool.slots_for([6])  # reuses the row
+
+    assert float(pool.layer_state(0).k[slot].abs().sum()) == 0.0
 
 
 def test_cache_manager_sizes_the_conv_pool_by_attention_tp(monkeypatch):
@@ -1137,14 +1231,7 @@ def test_cache_manager_sizes_the_conv_pool_by_attention_tp(monkeypatch):
 
     from tensorrt_llm._torch.attention_backend.inkling import cache_manager as cm
 
-    seen = {}
-
-    class _FakePool:
-        def __init__(self, pretrained_config, tp_size, max_batch, device, dtype):
-            seen["tp_size"] = tp_size
-
-    monkeypatch.setattr(cm.KVCacheManagerV2, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(cm, "InklingConvStateCache", _FakePool)
+    seen = _patch_pool(monkeypatch, cm)
     cfg = SimpleNamespace(torch_dtype=torch.bfloat16)
 
     cm.InklingHybridCacheManager(
@@ -1156,6 +1243,71 @@ def test_cache_manager_sizes_the_conv_pool_by_attention_tp(monkeypatch):
         pretrained_config=cfg, mapping=_adp_mapping(False), max_batch_size=8
     )
     assert seen["tp_size"] == 4, "without ADP the conv pool must keep the TP slice"
+
+
+def _patch_pool(monkeypatch, cm):
+    """Replace the pool with a recorder and the V2 base __init__ with a no-op,
+    so the manager's sizing arithmetic can be read off without a GPU."""
+    seen = {}
+
+    class _FakePool:
+        num_slots = 0
+
+        def __init__(self, pretrained_config, tp_size, num_request_slots, device, dtype, **kwargs):
+            seen.update(tp_size=tp_size, num_request_slots=num_request_slots, dtype=dtype, **kwargs)
+
+        def conv_state_bytes(self):
+            return 0
+
+    monkeypatch.setattr(cm.KVCacheManagerV2, "__init__", lambda self, *a, **k: None)
+    monkeypatch.setattr(cm, "InklingConvStateCache", _FakePool)
+    return seen
+
+
+def test_cache_manager_sizes_the_conv_pool_for_every_resident_sequence(monkeypatch):
+    """One row per sequence that can be resident at once -- max_batch_size per
+    pipeline stage, the count MambaHybridCacheManagerV2 calls
+    _max_resident_sequences -- plus the reserved rows the pool adds itself.
+
+    Sizing it at max_batch_size alone leaves a PP>1 or attention-DP deployment
+    depending on pool growth, which is exactly what cannot happen once CUDA
+    graphs have captured the pool's pointers."""
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as cm
+
+    seen = _patch_pool(monkeypatch, cm)
+    cfg = SimpleNamespace(torch_dtype=torch.bfloat16)
+
+    cm.InklingHybridCacheManager(
+        pretrained_config=cfg,
+        mapping=_adp_mapping(False, pp_size=2),
+        max_batch_size=8,
+    )
+
+    assert seen["num_request_slots"] == 16
+    assert seen["reserve_attention_dp_slot"] is False
+
+    cm.InklingHybridCacheManager(
+        pretrained_config=cfg, mapping=_adp_mapping(True), max_batch_size=8
+    )
+    assert seen["reserve_attention_dp_slot"] is True
+
+
+def test_cache_manager_requires_its_three_pool_arguments_by_name(monkeypatch):
+    """Omitting one used to raise a bare KeyError from inside the constructor,
+    because they were read back out of **kwargs."""
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as cm
+
+    _patch_pool(monkeypatch, cm)
+    cfg = SimpleNamespace(torch_dtype=torch.bfloat16)
+
+    with pytest.raises(TypeError, match="pretrained_config"):
+        cm.InklingHybridCacheManager(mapping=_adp_mapping(False), max_batch_size=8)
+    with pytest.raises(TypeError, match="max_batch_size"):
+        cm.InklingHybridCacheManager(pretrained_config=cfg, mapping=_adp_mapping(False))
 
 
 def test_attention_never_sizes_a_tensor_by_the_unguarded_global_tp():

@@ -44,32 +44,67 @@ class InklingConvStateCache:
     across decode steps, with the same lifetime as the paged KV cache.
 
     Per layer it allocates the four :class:`InklingConvState` buffers, each
-    ``[max_batch, channels, kernel_size - 1]``. The k/v conv channels follow the
+    ``[num_slots, channels, kernel_size - 1]``. The k/v conv channels follow the
     fused-qkv k/v split (TP-sharded); the residual-stream convs are replicated.
 
-    All buffers, including the ``[max_batch]`` int32 ``state_indices``, keep
-    stable device addresses and are mutated in place, so a captured CUDA graph
-    replays cleanly (the Mamba2Metadata stable-pointer pattern).
+    The row count is fixed at construction and never changes:
+
+      ``num_request_slots`` real rows, one per resident sequence, plus one
+      permanently reserved row shared by every CUDA-graph padding sentinel, plus
+      one reserved row for the attention-DP idle dummy when that is enabled.
+
+    This is the ``MambaCacheManager`` slot layout (``_padding_slot`` /
+    ``_attention_dp_dummy_slot``), and it is a fixed size for the same two
+    reasons. First, padding rows must not consume real-request capacity: the
+    CUDA-graph runner keeps one sentinel id per runtime draft length, so
+    charging each of them a real row silently shrinks the servable batch.
+    Second, all buffers -- including the int32 ``state_indices`` -- keep stable
+    device addresses and are mutated in place, so a captured CUDA graph replays
+    cleanly (the Mamba2Metadata stable-pointer pattern). A pool that
+    reallocated to grow would strand every pointer a previously captured graph
+    holds, and a graph replaying against a freed buffer does not raise -- it
+    reads whatever the allocator handed out next.
+
+    Fixing the size also keeps KV-cache capacity estimation honest. The pool is
+    a plain torch allocation, invisible to the V2 manager's own byte quota, and
+    it is counted only because the throwaway estimation manager holds one while
+    ``configure_kv_cache_capacity`` reads peak memory. That accounting is
+    correct exactly when the estimation pool and the serving pool are the same
+    size, which is true iff neither can grow.
     """
 
     def __init__(
         self,
         pretrained_config,
         tp_size: int,
-        max_batch_size: int,
+        num_request_slots: int,
         device: torch.device,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype,
+        *,
+        reserve_attention_dp_slot: bool = False,
+        max_draft_len: int = 0,
     ):
         # Takes the pretrained config + tp_size rather than a ``ModelConfig`` so
         # the KV cache manager can build the pool from what it already has.
         # Accept either the text config or the top-level multimodal one.
         config = getattr(pretrained_config, "text_config", pretrained_config)
         kwin = config.sconv_kernel_size - 1
-        self.max_batch_size = max_batch_size
+        if num_request_slots <= 0:
+            raise ValueError(f"num_request_slots must be > 0, got {num_request_slots}")
+        self.num_request_slots = num_request_slots
+        # Reserved rows sit above the real ones so a real slot id is always a
+        # valid index into the first ``num_request_slots`` rows.
+        self._padding_slot = num_request_slots
+        self._attention_dp_dummy_slot = (
+            num_request_slots + 1 if reserve_attention_dp_slot else None
+        )
+        self._max_draft_len = max(0, int(max_draft_len))
+        num_slots = num_request_slots + 1 + int(reserve_attention_dp_slot)
+        self.num_slots = num_slots
         self.kwin = kwin
 
         def buf(channels):
-            return torch.zeros(max_batch_size, channels, kwin, device=device, dtype=dtype)
+            return torch.zeros(num_slots, channels, kwin, device=device, dtype=dtype)
 
         self._layers: List[InklingConvState] = []
         for i in range(config.num_hidden_layers):
@@ -78,103 +113,96 @@ class InklingConvStateCache:
             self._layers.append(
                 InklingConvState(k=buf(kv_dim), v=buf(kv_dim), attn=buf(hidden), mlp=buf(hidden))
             )
-        # Stable per-request slot-index buffer, refreshed in place per forward
+        # Stable per-batch-row slot-index buffer, refreshed in place per forward
         # from input preparation (see :meth:`write_state_indices`) so a captured
-        # decode graph aliases it and every replay sees the current batch.
-        self.state_indices = torch.arange(max_batch_size, dtype=torch.int32, device=device)
+        # decode graph aliases it and every replay sees the current batch. It is
+        # indexed by batch position, not by slot, so it needs one entry per row
+        # the padded batch can carry -- which ``num_slots`` bounds.
+        self.state_indices = torch.arange(num_slots, dtype=torch.int32, device=device)
         # Pinned host staging for that write: one async H2D copy per forward,
         # legal under graph capture. Kept in lock-step size with ``state_indices``.
         self.state_indices_cpu = torch.zeros(
-            max_batch_size, dtype=torch.int32, pin_memory=prefer_pinned()
+            num_slots, dtype=torch.int32, pin_memory=prefer_pinned()
         )
         self._slot_of = {}
-        self._free = list(range(max_batch_size - 1, -1, -1))
+        self._free = list(range(num_request_slots - 1, -1, -1))
+
+    def conv_state_bytes(self) -> int:
+        """Total device bytes this pool holds. Reported by the cache manager."""
+        return sum(t.numel() * t.element_size() for st in self._layers for t in st)
 
     def layer_state(self, layer_idx: int) -> InklingConvState:
         """The four short-conv state buffers for ``layer_idx`` (pool views)."""
         return self._layers[layer_idx]
 
+    def _reserved_slot_for(self, request_id: int) -> Optional[int]:
+        """The reserved row ``request_id`` aliases, or None for a real request.
+
+        Padding rows carry no state anyone reads back, so every sentinel shares
+        one row. ``cuda_graph_runner`` caches one dummy id per runtime draft
+        length (``CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len``), so the whole
+        descending range has to map here, not just the exact sentinel.
+        """
+        from ...pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        from ...pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+
+        if CUDA_GRAPH_DUMMY_REQUEST_ID - self._max_draft_len <= request_id:
+            return self._padding_slot
+        if request_id == ATTENTION_DP_DUMMY_REQUEST_ID:
+            return self._attention_dp_dummy_slot
+        return None
+
     def slots_for(self, request_ids: List[int]) -> List[int]:
         """Map request ids to their (stable) pool rows, allocating new ones.
 
-        Fresh requests get a zero-initialised slot; existing requests keep their
-        row so their carried short-conv windows persist across decode steps.
+        Fresh requests get a zero-initialised row; existing requests keep theirs
+        so their carried short-conv windows persist across decode steps. Padding
+        sentinels and the attention-DP idle dummy alias their reserved rows and
+        never consume real capacity.
 
-        If a single forward presents more *fresh* requests than the pool has
-        free rows, the pool grows to fit (see :meth:`_grow`). Steady-state
-        serving is bounded by ``max_batch_size`` (+1 CUDA-graph pad row) and
-        never triggers growth, but the one-time KV-cache estimation forward can
-        exceed it: that dummy batch is sized to saturate ``max_num_tokens`` (and
-        is replicated ``x tp_size`` under attention DP), independent of
-        ``max_batch_size``. Growing there (instead of ``IndexError`` on an empty
-        free list) lets estimation profile memory correctly, and because growth
-        only happens in that eager estimation/warmup window the buffers a later
-        CUDA graph captures are the final, pointer-stable ones.
+        Raises when the real rows are exhausted. The pool is sized to every
+        sequence that can be resident at once, so exhaustion means a request
+        held a row past its ``free_resources`` -- and the alternative to raising
+        is handing that request a row another request is still carrying state
+        in, which produces wrong tokens silently.
         """
-        num_new = sum(1 for r in request_ids if r not in self._slot_of)
-        if num_new > len(self._free):
-            self._grow(num_new - len(self._free))
         slots = []
         for r in request_ids:
-            if r not in self._slot_of:
-                slot = self._free.pop()
+            slot = self._slot_of.get(r)
+            if slot is None:
+                slot = self._reserved_slot_for(r)
+                if slot is None:
+                    if not self._free:
+                        raise RuntimeError(
+                            "Inkling short-conv pool is out of rows "
+                            f"({self.num_request_slots} request rows, all live). "
+                            "Every resident sequence needs one row; a row is "
+                            "returned only by the cache manager's free_resources."
+                        )
+                    slot = self._free.pop()
                 self._slot_of[r] = slot
                 for st in self._layers:
                     for t in st:
                         t[slot].zero_()
-            slots.append(self._slot_of[r])
+            slots.append(slot)
         return slots
 
-    def _grow(self, extra: int):
-        """Append ``extra`` fresh (zeroed) rows to every per-request buffer.
-
-        Reallocates each layer's four short-conv state tensors and the shared
-        ``state_indices`` scratch to ``max_batch_size + extra`` rows, copying the
-        existing rows forward so any in-flight request keeps its carried window,
-        and returns the new rows to the free list. Called only from
-        :meth:`slots_for` when a batch needs more rows than the pool owns; see
-        there for why that happens (KV-cache estimation / attention-DP), and why
-        it is safe w.r.t. CUDA-graph pointer stability.
-        """
-        old = self.max_batch_size
-        new = old + extra
-        for i, st in enumerate(self._layers):
-            grown = []
-            for t in st:
-                buf = torch.zeros(new, t.shape[1], t.shape[2], device=t.device, dtype=t.dtype)
-                buf[:old].copy_(t)
-                grown.append(buf)
-            self._layers[i] = InklingConvState(*grown)
-        self.state_indices = torch.arange(new, dtype=torch.int32, device=self.state_indices.device)
-        # Keep the pinned host-staging buffer sized in lock-step, else the eager
-        # H2D write in write_state_indices would index past its end.
-        self.state_indices_cpu = torch.zeros(new, dtype=torch.int32, pin_memory=prefer_pinned())
-        # New rows old..new-1 join the free list, popped ascending like __init__.
-        self._free = list(range(new - 1, old - 1, -1)) + self._free
-        self.max_batch_size = new
-
-    def write_state_indices(self, request_ids: List[int], is_graph: bool) -> List[int]:
+    def write_state_indices(self, request_ids: List[int]) -> List[int]:
         """Resolve ``request_ids`` to pool rows and publish them into the stable
         ``state_indices`` CUDA buffer -- the eager, pre-capture slot write.
 
         Returns the resolved slots in packed batch order (contexts first). A
         captured decode graph aliases ``state_indices``, so this must run every
         forward from eager input-prep, not inside ``model.forward``.
-
-        ``is_graph`` guards pool-pointer stability: growth reallocates
-        ``state_indices`` and would strand the captured pointer, so it may only
-        happen while eager. The pool is sized above any graph batch, so this is
-        a loud check on an otherwise silent decode corruption.
         """
-        before = self.state_indices.data_ptr()
         slots = self.slots_for(request_ids)
-        if is_graph and self.state_indices.data_ptr() != before:
-            raise RuntimeError(
-                "Inkling short-conv pool grew during CUDA graph capture/replay; "
-                "the pool must be sized to the max graph batch up front (a grown "
-                "pool strands the captured state_indices pointer)."
-            )
         n = len(slots)
+        if n > self.num_slots:
+            raise RuntimeError(
+                f"Inkling short-conv batch has {n} rows but the pool publishes "
+                f"only {self.num_slots} state indices; the pool is sized to the "
+                "padded scheduler batch, so this signals a batch-shape mismatch."
+            )
         self.state_indices_cpu[:n].copy_(torch.tensor(slots, dtype=torch.int32))
         self.state_indices[:n].copy_(self.state_indices_cpu[:n], non_blocking=True)
         return slots
@@ -182,7 +210,9 @@ class InklingConvStateCache:
     def free(self, request_ids: List[int]):
         for r in request_ids:
             slot = self._slot_of.pop(r, None)
-            if slot is not None:
+            # Reserved rows are permanent: returning one to the free list would
+            # hand a real request a row the next padding batch overwrites.
+            if slot is not None and slot < self.num_request_slots:
                 self._free.append(slot)
 
 
@@ -212,8 +242,7 @@ class InklingConvRuntime:
         ``InklingAttentionMetadata.prepare()``, so the host->device slot write
         lands outside the captured ``model.forward``.
         """
-        is_graph = bool(getattr(attn_metadata, "is_cuda_graph", False))
-        slots = cache.write_state_indices(list(attn_metadata.request_ids), is_graph)
+        slots = cache.write_state_indices(list(attn_metadata.request_ids))
         seq_lens = attn_metadata.seq_lens.tolist()
         num_contexts = attn_metadata.num_contexts
         state_indices = cache.state_indices
