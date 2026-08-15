@@ -109,6 +109,11 @@ COSMOS3_T2I_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate images from a give prompt."
 )
 COSMOS3_V2V_FLOW_SHIFT = 10.0
+# Fraction of a transfer hint that may be mirror-padding before it is worth a
+# warning. A few frames of tail ping-pong is normal when clips differ slightly;
+# beyond this the control is mostly invented and the client likely sent clips of
+# different videos.
+CONTROL_LENGTH_MISMATCH_RATIO = 0.10
 COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
 COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
 COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
@@ -1763,6 +1768,34 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         extra_chunks = remaining // stride + (1 if remaining % stride else 0)
         return 1 + extra_chunks, stride
 
+    def _warn_on_control_length_mismatch(
+        self, per_hint_frames: dict[str, torch.Tensor], total_frames: int
+    ) -> None:
+        """Flag hints short enough that mirror-padding invents most of their control.
+
+        Measured as padding actually applied rather than as disagreement between
+        hints, because that is what reaches the model: a request that pins
+        ``num_frames`` down to the shortest clip pads nothing and stays silent,
+        while a few frames of tail ping-pong is well under the threshold. A
+        large gap is almost always a client that sent clips of different videos.
+        """
+        if self.rank != 0 or total_frames <= 0:
+            return
+        short = {
+            key: frames.shape[1]
+            for key, frames in per_hint_frames.items()
+            if (total_frames - frames.shape[1]) / total_frames > CONTROL_LENGTH_MISMATCH_RATIO
+        }
+        if not short:
+            return
+        counts = ", ".join(f"{key}: {count}" for key, count in sorted(short.items()))
+        logger.warning(
+            f"Cosmos3 transfer control length mismatch: {counts} against {total_frames} frames "
+            f"generated. The short hints are mirror-padded up to that length, so the output is "
+            f"conditioned on control content that does not exist in them. Supply clips of "
+            f"matching length, or set num_frames to the shortest one."
+        )
+
     @staticmethod
     def _positive_float(value: Optional[float]) -> Optional[float]:
         if value is None:
@@ -2000,10 +2033,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             prepare_error = exc
         synchronize_media_prepare_status(prepare_error)
 
-        total_frames = next(iter(per_hint_frames.values())).shape[1]
-        if transfer_config.num_frames is not None:
-            total_frames = min(total_frames, int(transfer_config.num_frames))
-        total_frames = max(1, total_frames)
+        # The longest hint sets the length. Taking the first hint's instead would
+        # make the result depend on TRANSFER_HINT_KEYS order rather than on the
+        # request: with the same two clips, the earlier modality would win, so a
+        # shorter first hint silently truncated the longer one (the chunk loop
+        # never reads past total_frames) while a longer one padded it. No
+        # further clamp is needed -- every hint was decoded under decode_frames,
+        # which already bounds them by num_frames.
+        total_frames = max(1, max(frames.shape[1] for frames in per_hint_frames.values()))
+        self._warn_on_control_length_mismatch(per_hint_frames, total_frames)
         per_hint_frames = {
             key: pad_temporal_frames(frames, total_frames)
             for key, frames in per_hint_frames.items()

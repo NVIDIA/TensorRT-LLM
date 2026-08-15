@@ -904,6 +904,102 @@ class TestForwardTransferChunks:
         )
 
 
+class TestControlLengthMismatch:
+    """Hint lengths decide the output length and how much control is invented."""
+
+    @staticmethod
+    def _frames(count: int) -> torch.Tensor:
+        return torch.zeros(3, count, 16, 16, dtype=torch.uint8)
+
+    def _warning(self, monkeypatch, per_hint: dict, total_frames: int) -> str:
+        """Warnings emitted for one (hints, total_frames) pair.
+
+        ``tensorrt_llm.logger`` does not propagate to the root logger, so this
+        captures through the module's logger rather than pytest's caplog.
+        """
+        pipeline = _make_pipeline()
+        seen: list[str] = []
+        monkeypatch.setattr(
+            pipeline_module.logger,
+            "warning",
+            lambda *args, **kwargs: seen.append(" ".join(str(a) for a in args)),
+        )
+        pipeline._warn_on_control_length_mismatch(per_hint, total_frames)
+        return " ".join(seen)
+
+    def test_warns_when_a_hint_is_mostly_padding(self, monkeypatch):
+        text = self._warning(monkeypatch, {"edge": self._frames(200), "seg": self._frames(50)}, 200)
+        assert "seg: 50" in text
+        assert "200 frames" in text
+        # The hint that set the length was not padded, so it is not named.
+        assert "edge:" not in text
+
+    def test_silent_for_a_short_tail_difference(self, monkeypatch):
+        """A few frames of ping-pong at the tail is the normal case the
+        reference pads for; warning on it would train people to ignore this."""
+        assert (
+            self._warning(monkeypatch, {"edge": self._frames(200), "seg": self._frames(195)}, 200)
+            == ""
+        )
+
+    def test_silent_when_nothing_is_padded(self, monkeypatch):
+        """A request that pins `num_frames` down to the shortest clip truncates
+        the long hint rather than padding the short one, so no control is
+        invented and there is nothing to warn about."""
+        assert (
+            self._warning(monkeypatch, {"edge": self._frames(200), "seg": self._frames(50)}, 50)
+            == ""
+        )
+
+    def test_output_length_follows_the_longest_hint(self, monkeypatch):
+        """`edge` sorts before `seg` in TRANSFER_HINT_KEYS, so taking the first
+        hint's length would truncate the longer seg control to 4 frames and cut
+        the output in half -- on nothing the request expressed."""
+        pipeline = _make_pipeline()
+        tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
+        pipeline._tokenize_prompt = lambda *a, **k: next(tokenized)
+        pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)
+        monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
+
+        lengths = {b"edge-clip": 4, b"seg-clip": 8}
+
+        def fake_media_decode(data, *, first_frame, last_frame, target_h, target_w, device):
+            count = min(lengths[data], last_frame + 1)
+            return torch.zeros(count, target_h, target_w, 3, dtype=torch.uint8)
+
+        monkeypatch.setattr(transfer_module, "decode_video_reference_window", fake_media_decode)
+        cfg = resolve_transfer_config(
+            {
+                "edge": {"control": b"edge-clip"},
+                "seg": {"control": b"seg-clip"},
+                "max_frames": 8,
+                "num_video_frames_per_chunk": 5,
+                "num_conditional_frames": 1,
+            },
+            _req(num_frames=8, guidance_scale=1.0),
+        )
+        output = pipeline._forward_transfer(
+            prompt="transfer",
+            negative_prompt="",
+            height=16,
+            width=16,
+            max_frames=8,
+            num_inference_steps=1,
+            max_sequence_length=8,
+            use_system_prompt=False,
+            use_duration_template=False,
+            use_resolution_template=False,
+            seed=1,
+            frame_rate=24.0,
+            num_frames=8,
+            use_guardrails=False,
+            timer=_started_timer(),
+            transfer_config=cfg,
+            video=None,
+        )
+        assert output.video.shape[2] == 8
+
+
 class TestTransferFrameRateResolution:
     """What `_forward_transfer` actually emits at, not what `infer()` hands it.
 
