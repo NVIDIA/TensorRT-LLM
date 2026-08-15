@@ -58,6 +58,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import (
     DecoderModel,
     DecoderModelForCausalLM,
+    MetaInitException,
     filter_weights,
     register_auto_model,
 )
@@ -1121,6 +1122,46 @@ def _encode_inkling_audio_embeds(
     return [audio_tower(x)]
 
 
+def _has_meta_tensors(module: nn.Module) -> bool:
+    return any(getattr(p, "is_meta", False) for p in module.parameters()) or any(
+        getattr(b, "is_meta", False) for b in module.buffers()
+    )
+
+
+def _build_replicated_bf16_tower(tower_cls, tower_config):
+    """Build a replicated bf16 media tower, or defer it under ``MetaInitMode``.
+
+    Returns ``(tower, deferred_config)``: exactly one is ``None``. A non-``None``
+    ``deferred_config`` means ``load_weights`` must rebuild the tower before
+    loading into it.
+
+    The deferral is not an optimization, it is what keeps meta init working at
+    all. ``MetaInitMode`` allocates parameters on the ``meta`` device and only
+    permits random-init ops on them; ``.to(torch.bfloat16)`` dispatches
+    ``aten._to_copy.default``, which raises ``MetaInitException``. The model
+    loader wraps that mode around the ENTIRE ``from_config`` call, so a single
+    tower raising there costs the whole text stack its meta init and the model
+    is rebuilt with real allocations -- which is precisely what meta init exists
+    to avoid ("skip memory allocation when creating weights, which avoids OOM
+    when GPU memory is not enough for all weights"). The failure is silent: it
+    is logged at INFO as "Fallback to regular model init".
+
+    Same shape as ``modeling_kimi_k3_vl`` / ``modeling_kimi_k25``, which defer
+    their vision encoders for this reason.
+    """
+    if tower_config is None or not getattr(tower_config, "decoder_dmodel", None):
+        return None, None
+    try:
+        tower = tower_cls(tower_config)
+    except MetaInitException:
+        return None, tower_config
+    # Constructing may succeed while leaving meta parameters behind; the
+    # `.to(bfloat16)` below is what would raise on them, so check first.
+    if _has_meta_tensors(tower):
+        return None, tower_config
+    return tower.to(torch.bfloat16), None
+
+
 @register_auto_model("InklingForConditionalGeneration")
 @register_input_processor(
     InklingInputProcessor,
@@ -1186,18 +1227,20 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         # The hMLP vision tower is a replicated bf16 submodule: excluded from
         # NVFP4 and not TP-sharded, since every rank runs the identical tower
         # over identical patches. ``None`` for a text-only checkpoint.
+        # Both towers are built through ``_build_replicated_bf16_tower``, which
+        # returns ``None`` under ``MetaInitMode`` and records the config for
+        # ``load_weights`` to rebuild from. Constructing them eagerly here used
+        # to abort meta init for the WHOLE model -- see that helper.
         vision_config = getattr(model_config.pretrained_config, "vision_config", None)
-        if vision_config is not None and getattr(vision_config, "decoder_dmodel", None):
-            self.visual = InklingVisionModel(vision_config).to(torch.bfloat16)
-        else:
-            self.visual = None
+        self.visual, self._deferred_vision_config = _build_replicated_bf16_tower(
+            InklingVisionModel, vision_config
+        )
         # The dMel audio tower follows the same rules as the vision tower, with
         # one row per dMel frame. ``None`` when the config has no ``audio_config``.
         audio_config = getattr(model_config.pretrained_config, "audio_config", None)
-        if audio_config is not None and getattr(audio_config, "decoder_dmodel", None):
-            self.audio_tower = InklingAudioModel(audio_config).to(torch.bfloat16)
-        else:
-            self.audio_tower = None
+        self.audio_tower, self._deferred_audio_config = _build_replicated_bf16_tower(
+            InklingAudioModel, audio_config
+        )
         # The media placeholder ids the Inkling chat template emits. They must be
         # in-vocab, since the executor rejects out-of-range request token ids.
         # Surfaced to the model engine's ``_prepare_multimodal_indices`` so it can
@@ -1372,7 +1415,21 @@ class InklingForConditionalGeneration(InklingForCausalLM):
             out[pos, :] = rows.to(dtype=out.dtype, device=out.device)
         return input_ids, out
 
+    def _materialize_deferred_towers(self):
+        """Rebuild any tower that ``__init__`` skipped under ``MetaInitMode``.
+
+        Runs before the towers are loaded into. By this point the meta-init
+        context is long gone, so construction takes its normal path.
+        """
+        if self._deferred_vision_config is not None:
+            self.visual = InklingVisionModel(self._deferred_vision_config).to(torch.bfloat16)
+            self._deferred_vision_config = None
+        if self._deferred_audio_config is not None:
+            self.audio_tower = InklingAudioModel(self._deferred_audio_config).to(torch.bfloat16)
+            self._deferred_audio_config = None
+
     def load_weights(self, weights: dict, weight_mapper=None):
+        self._materialize_deferred_towers()
         # Load the bf16 vision + audio towers first -- the ``model.visual.*`` /
         # ``model.audio.*`` keys the text loader drops -- so any post-load
         # completeness check sees them populated.
