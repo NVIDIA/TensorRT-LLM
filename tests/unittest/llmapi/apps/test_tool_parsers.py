@@ -4431,23 +4431,37 @@ class TestStreamingLeadingText:
 
     @staticmethod
     def _feed(parser, deltas, tools):
-        """Stream deltas through the parser and accumulate what it emits."""
+        """Stream deltas through the parser and accumulate what it emits.
+
+        A trailing empty increment drains the arguments: parsers send the tool
+        name on the increment that completes the call and the arguments on the
+        one after it.
+        """
         normal_text = ""
-        calls = []
-        for delta in deltas:
+        names = []
+        arguments = ""
+        for delta in [*deltas, ""]:
             result = parser.parse_streaming_increment(delta, tools)
             normal_text += result.normal_text
-            calls.extend(result.calls)
-        return normal_text, calls
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                arguments += call.parameters
+        return normal_text, names, arguments
+
+    def _assert_call_intact(self, names, arguments):
+        assert names == ["get_weather"]
+        assert json.loads(arguments) == {"location": "NYC"}
 
     def test_leading_text_in_same_increment(self, sample_tools, parser_cls,
                                             tool_call):
         parser = parser_cls()
-        normal_text, calls = self._feed(parser, [_LEADING_TEXT + tool_call],
-                                        sample_tools)
+        normal_text, names, arguments = self._feed(parser,
+                                                   [_LEADING_TEXT + tool_call],
+                                                   sample_tools)
 
         assert normal_text == _LEADING_TEXT
-        assert [call.name for call in calls if call.name] == ["get_weather"]
+        self._assert_call_intact(names, arguments)
 
     def test_leading_text_emitted_once_when_call_spans_increments(
             self, sample_tools, parser_cls, tool_call):
@@ -4455,15 +4469,40 @@ class TestStreamingLeadingText:
         split_at = len(parser.bot_token)
         deltas = [_LEADING_TEXT + tool_call[:split_at], tool_call[split_at:]]
 
-        normal_text, calls = self._feed(parser, deltas, sample_tools)
+        normal_text, names, arguments = self._feed(parser, deltas, sample_tools)
 
         assert normal_text == _LEADING_TEXT
-        assert [call.name for call in calls if call.name] == ["get_weather"]
+        self._assert_call_intact(names, arguments)
 
     def test_tool_call_without_leading_text_emits_no_content(
             self, sample_tools, parser_cls, tool_call):
         parser = parser_cls()
-        normal_text, calls = self._feed(parser, [tool_call], sample_tools)
+        normal_text, names, arguments = self._feed(parser, [tool_call],
+                                                   sample_tools)
 
         assert normal_text == ""
-        assert [call.name for call in calls if call.name] == ["get_weather"]
+        self._assert_call_intact(names, arguments)
+
+    def test_content_does_not_depend_on_increment_boundaries(
+            self, sample_tools, parser_cls, tool_call):
+        """What the client sees must not change with the delta boundaries.
+
+        This is why the leading segment is emitted verbatim rather than
+        stripped: a prefix arriving in its own increment leaves the parser
+        before any tool call is known, so trimming at the split point would
+        make the streamed content depend on how the text happened to be
+        chunked.
+        """
+        split_at = len(parser_cls().bot_token)
+        chunkings = (
+            [_LEADING_TEXT + tool_call],
+            [_LEADING_TEXT, tool_call],
+            [_LEADING_TEXT + tool_call[:split_at], tool_call[split_at:]],
+        )
+
+        emitted = {
+            self._feed(parser_cls(), deltas, sample_tools)[0]
+            for deltas in chunkings
+        }
+
+        assert emitted == {_LEADING_TEXT}

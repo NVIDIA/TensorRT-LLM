@@ -119,6 +119,13 @@ class BaseToolParser(ABC):
         of it, so it has to be returned to the client as normal text instead of
         being consumed along with the markup.
 
+        The split is verbatim: no whitespace is trimmed. Trimming here would
+        make the streamed content depend on where increment boundaries happen
+        to fall, since a prefix that arrives in its own increment is emitted by
+        the no-tool-call path, which does not trim either. Non-streaming
+        ``detect_and_parse`` strips the prefix in most parsers, so accumulated
+        streaming content can carry whitespace that the one-shot path drops.
+
         Returns a ``(normal_text, remainder)`` pair. ``normal_text`` is empty
         when the buffer starts with a tool call or contains none of the tokens.
         """
