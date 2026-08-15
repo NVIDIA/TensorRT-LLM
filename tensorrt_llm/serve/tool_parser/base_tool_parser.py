@@ -135,7 +135,9 @@ class BaseToolParser(ABC):
         # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
         if not (self.has_tool_call(current_text) or
                 (self.current_tool_id > 0
-                 and current_text.startswith(self.tool_call_separator))):
+                 and current_text.startswith(self.tool_call_separator)
+                 and not (self.eot_token
+                          and current_text.startswith(self.eot_token)))):
             # Only clear buffer if we're sure no tool call is starting
             if not self._ends_with_partial_token(self._buffer, self.bot_token):
                 normal_text = self._buffer
