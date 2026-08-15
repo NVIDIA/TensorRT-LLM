@@ -293,11 +293,39 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
             total_blocks = (req.prompt_len + tpb - 1) // tpb
-            if block_ids.size > total_blocks:
-                block_ids = block_ids[:total_blocks]
             window_size = lg.sliding_window_size
 
             if window_size is not None:
+                allocated_blocks = (
+                    req.prompt_len + self._kv_cache_manager.num_extra_kv_tokens + tpb - 1
+                ) // tpb
+                beam0_block_ids, tail_block_ids = self._split_packed_beam_block_ids(
+                    block_ids,
+                    req.py_beam_width,
+                    allocated_blocks,
+                )
+                if beam0_block_ids.size > allocated_blocks:
+                    beam0_block_ids = beam0_block_ids[:allocated_blocks]
+                    block_ids = (
+                        np.concatenate([beam0_block_ids, tail_block_ids])
+                        if tail_block_ids.size > 0
+                        else beam0_block_ids
+                    )
+                # Current PyExecutor cache managers disable KV-cache token sinks,
+                # so SWA block lists contain an evictable prompt prefix followed
+                # by the speculative scratch tail. If token sinks are enabled,
+                # this must use block-ordinal metadata to preserve the sink prefix.
+                # Remove scratch before trimming stale prompt blocks; otherwise a
+                # boundary-crossing allocation can displace initialized prompt KV.
+                scratch_blocks = max(0, allocated_blocks - total_blocks)
+                if scratch_blocks > 0:
+                    if req.py_beam_width != 1:
+                        raise ValueError("speculative scratch blocks require beam_width == 1")
+                    block_ids = (
+                        block_ids[:-scratch_blocks]
+                        if scratch_blocks < block_ids.size
+                        else np.array([], dtype=np.int64)
+                    )
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tpb)
                 expected_valid = max(0, total_blocks - stale_end)
@@ -307,7 +335,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # stale region (those blocks were already pruned, no extra skip).
                 cache_skip = max(0, cached_per_lg[idx] // tpb - stale_end)
             else:
-                total_blocks = (req.prompt_len + tpb - 1) // tpb
+                if block_ids.size > total_blocks:
+                    block_ids = block_ids[:total_blocks]
                 expected_valid = total_blocks
                 cache_skip = cached_per_lg[idx] // tpb
 

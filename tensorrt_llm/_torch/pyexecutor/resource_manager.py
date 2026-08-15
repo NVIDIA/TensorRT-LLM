@@ -18,6 +18,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
@@ -208,6 +209,10 @@ def get_pp_layers(
 
 
 def request_context(is_draft: bool, scheduled_requests: ScheduledRequests):
+    # The non-draft scope has nothing to do, and this runs on the executor's
+    # per-iteration path, so return before executing the class statement below.
+    if not is_draft:
+        return nullcontext()
 
     class RequestContext:
 
