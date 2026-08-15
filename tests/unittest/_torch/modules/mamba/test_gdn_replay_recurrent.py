@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.fla.cached_replay import (
+    _supports_ratio8_replay_tiling,
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
@@ -61,6 +62,19 @@ def _seq_ref_step(S, q, k, v, g, beta, scale):
     return torch.stack(outs), states
 
 
+@pytest.mark.parametrize(
+    "H,HV,head_tiles,expected",
+    [
+        (1, 8, 8, True),
+        (1, 8, 512, True),
+        (1, 8, 520, False),
+        (2, 8, 512, False),
+    ],
+)
+def test_gdn_replay_ratio8_tiling_boundary(H, HV, head_tiles, expected):
+    assert _supports_ratio8_replay_tiling(H, HV, head_tiles) is expected
+
+
 @pytest.mark.parametrize("fused_gating", [False, True], ids=["pre_gated", "fused_gating"])
 @pytest.mark.parametrize(
     "pool_dtype", [torch.bfloat16, torch.float32], ids=["bf16_pool", "fp32_pool"]
@@ -72,8 +86,13 @@ def _seq_ref_step(S, q, k, v, g, beta, scale):
 )
 @pytest.mark.parametrize(
     "H,HV,K,V",
-    [(4, 8, 128, 128), (2, 4, 64, 64), (4, 16, 128, 128)],
-    ids=["qwen3_like", "small", "qwen3_5_like"],
+    [
+        (4, 8, 128, 128),
+        (2, 4, 64, 64),
+        (4, 16, 128, 128),
+        (1, 8, 128, 128),
+    ],
+    ids=["qwen3_like", "small", "qwen3_5_like", "ratio8"],
 )
 def test_gdn_replay_vs_legacy_and_ref(H, HV, K, V, T, HIST, iters, pool_dtype, fused_gating):
     if not torch.cuda.is_available():
@@ -431,8 +450,13 @@ def test_gdn_cached_replay_all_layer_commit_matches_reference(state_layout):
     torch.testing.assert_close(actual_states.float(), expected_states.float(), rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize(
+    "H,HV,K,V",
+    [(2, 4, 64, 64), (1, 8, 128, 128)],
+    ids=["ratio2", "ratio8"],
+)
 @pytest.mark.parametrize("batch_size", [8, 16], ids=["small_fused", "large_all_layer"])
-def test_gdn_cached_replay_dispatch_cuda_graph_matches_eager(batch_size):
+def test_gdn_cached_replay_dispatch_cuda_graph_matches_eager(batch_size, H, HV, K, V):
     """Both sides of the BS16 dispatch must be safe under CUDA graphs."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -446,7 +470,6 @@ def test_gdn_cached_replay_dispatch_cuda_graph_matches_eager(batch_size):
     device = "cuda"
     dtype = torch.bfloat16
     num_layers, T, HIST = 2, 4, 16
-    H, HV, K, V = 2, 4, 64, 64
     num_slots = batch_size + 1
     use_all_layer_commit = batch_size >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 

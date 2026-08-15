@@ -60,6 +60,10 @@ from tensorrt_llm._torch.modules.fused_moe import (
 )
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import (
+    _DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS,
+    _configure_deepgemm_moe_max_num_tokens,
+)
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
 from tensorrt_llm._torch.modules.fused_moe.interface import (
@@ -87,6 +91,32 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+@pytest.mark.parametrize(
+    ("max_num_tokens", "expected_value"),
+    [
+        pytest.param(8192, 8192, id="below-conservative-default"),
+        pytest.param(65536, _DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS, id="above-conservative-default"),
+    ],
+)
+def test_deepgemm_clamps_only_derived_moe_max_num_tokens(max_num_tokens, expected_value):
+    model_config = ModelConfig(max_num_tokens=max_num_tokens)
+    model_config._frozen = True
+
+    _configure_deepgemm_moe_max_num_tokens(model_config)
+
+    assert model_config.moe_max_num_tokens == expected_value
+    assert model_config._frozen is True
+
+
+@pytest.mark.parametrize("configured_value", [32768, 65536])
+def test_deepgemm_preserves_explicit_moe_max_num_tokens(configured_value):
+    model_config = ModelConfig(moe_max_num_tokens=configured_value)
+
+    _configure_deepgemm_moe_max_num_tokens(model_config)
+
+    assert model_config.moe_max_num_tokens == configured_value
 
 
 def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():

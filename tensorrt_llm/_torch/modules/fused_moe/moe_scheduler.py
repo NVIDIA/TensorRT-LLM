@@ -638,7 +638,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
         )
 
         # ========== Empty-chunk substitution (DP only) ==========
-        chunked_used = torch.ones(num_chunks, dtype=torch.bool)
+        # This is host-only bookkeeping. Keep it as Python state so checking a
+        # chunk below does not dispatch Tensor.__bool__ while a CUDA Graph is
+        # being captured.
+        chunked_used = [True] * num_chunks
         if moe.use_dp:
             # The split heuristic guarantees chunk 0 has >= 1 token, so it can
             # stand in for any empty chunk on this rank. Without substitution,

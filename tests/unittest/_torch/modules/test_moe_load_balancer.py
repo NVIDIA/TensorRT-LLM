@@ -1,4 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
 import os
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -312,6 +317,184 @@ class TestMoeLoadBalancer(unittest.TestCase):
         mock_load_balancer_impl.return_value.shutdown.assert_called_once()
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_online_iteration_cadence(self, mock_load_balancer_impl):
+        """Test that cadence samples, drains pending copies, then skips."""
+
+        torch.cuda.set_device(0)
+        balancer = MoeLoadBalancer(0, 4, 2, iteration_interval=4)
+        balancer.set_iter_info(True, True)
+
+        self.assertTrue(balancer.requires_eager_forward())
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertTrue(balancer.runtime_state.active)
+
+        self.assertTrue(balancer.requires_eager_forward())
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertTrue(balancer.runtime_state.active)
+
+        self.assertFalse(balancer.requires_eager_forward())
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertFalse(balancer.runtime_state.active)
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertFalse(balancer.runtime_state.active)
+
+        self.assertTrue(balancer.requires_eager_forward())
+        with MoeLoadBalancerIterContext(balancer):
+            self.assertTrue(balancer.runtime_state.active)
+
+        self.assertEqual(
+            mock_load_balancer_impl.return_value.start_iter.call_args_list, [
+                unittest.mock.call(0, True, True),
+                unittest.mock.call(1, False, False),
+                unittest.mock.call(2, True, True),
+            ])
+        self.assertEqual(
+            mock_load_balancer_impl.return_value.end_iter.call_args_list, [
+                unittest.mock.call(0),
+                unittest.mock.call(1),
+                unittest.mock.call(2),
+            ])
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_invalid_online_iteration_interval(self, mock_load_balancer_impl):
+        """Test that a non-positive cadence interval is rejected."""
+
+        torch.cuda.set_device(0)
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            MoeLoadBalancer(0, 4, 2, iteration_interval=0)
+        mock_load_balancer_impl.assert_not_called()
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_batched_online_statistics_and_updates(self,
+                                                   mock_load_balancer_impl):
+        """Test that a cycle observes before it migrates any layer."""
+
+        torch.cuda.set_device(0)
+        environment = {
+            'TRTLLM_EPLB_STATISTICS_PER_CYCLE': '3',
+            'TRTLLM_EPLB_CYCLE_START_ITER': '2',
+            'TRTLLM_EPLB_STATISTIC_INTERVAL': '2',
+            'TRTLLM_EPLB_UPDATE_INTERVAL': '3',
+            'TRTLLM_EPLB_CYCLE_INTERVAL': '4',
+        }
+        with patch.dict(os.environ, environment):
+            balancer = MoeLoadBalancer(0, 4, 2)
+        balancer.single_layer_load_balancers = [MagicMock() for _ in range(5)]
+        balancer.set_iter_info(True, True)
+
+        expected_modes = [
+            'skip', 'skip', 'sample', 'skip', 'sample', 'skip', 'sample',
+            'update', 'drain', 'skip', 'update', 'drain', 'skip', 'update',
+            'drain', 'skip', 'skip', 'skip', 'skip', 'sample'
+        ]
+        observed_modes = []
+        for _ in expected_modes:
+            observed_modes.append(balancer.get_next_iter_mode())
+            with MoeLoadBalancerIterContext(balancer):
+                pass
+
+        self.assertEqual(observed_modes, expected_modes)
+        self.assertEqual(
+            mock_load_balancer_impl.return_value.start_iter.call_args_list, [
+                unittest.mock.call(0, True, False),
+                unittest.mock.call(1, True, False),
+                unittest.mock.call(2, True, False),
+                unittest.mock.call(3, False, True),
+                unittest.mock.call(4, False, False),
+                unittest.mock.call(5, False, True),
+                unittest.mock.call(6, False, False),
+                unittest.mock.call(7, False, True),
+                unittest.mock.call(8, False, False),
+                unittest.mock.call(9, True, False),
+            ])
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_batched_online_update_interval_requires_drain(
+            self, mock_load_balancer_impl):
+        """Test that adjacent migrations cannot omit their drain forward."""
+
+        torch.cuda.set_device(0)
+        environment = {
+            'TRTLLM_EPLB_STATISTICS_PER_CYCLE': '1',
+            'TRTLLM_EPLB_UPDATE_INTERVAL': '1',
+        }
+        with patch.dict(os.environ, environment):
+            with self.assertRaisesRegex(ValueError, "at least two"):
+                MoeLoadBalancer(0, 4, 2)
+        mock_load_balancer_impl.assert_not_called()
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_batched_online_cycle_consumes_cpp_empty_update_group(
+            self, mock_load_balancer_impl):
+        """Test cadence stays aligned with a divisible C++ update plan."""
+
+        torch.cuda.set_device(0)
+        environment = {
+            'TRTLLM_EPLB_STATISTICS_PER_CYCLE': '1',
+            'TRTLLM_EPLB_UPDATE_INTERVAL': '2',
+        }
+        with patch.dict(os.environ, environment):
+            balancer = MoeLoadBalancer(0, 4, 4)
+        # Six layers split into two round-robin groups of three. The configured
+        # maximum is four, so this also proves the empty-group condition follows
+        # the actual C++ plan rather than layer_count % layer_updates_per_iter.
+        balancer.single_layer_load_balancers = [MagicMock() for _ in range(6)]
+        balancer.set_iter_info(True, True)
+
+        observed_modes = []
+        for _ in range(8):
+            observed_modes.append(balancer.get_next_iter_mode())
+            with MoeLoadBalancerIterContext(balancer):
+                pass
+
+        self.assertEqual(observed_modes, [
+            'sample', 'update', 'drain', 'update', 'drain', 'update', 'drain',
+            'sample'
+        ])
+        self.assertEqual(
+            mock_load_balancer_impl.return_value.start_iter.call_args_list, [
+                unittest.mock.call(0, True, False),
+                unittest.mock.call(1, False, True),
+                unittest.mock.call(2, False, False),
+                unittest.mock.call(3, False, True),
+                unittest.mock.call(4, False, False),
+                unittest.mock.call(5, False, True),
+                unittest.mock.call(6, False, False),
+                unittest.mock.call(7, True, False),
+            ])
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
+    def test_inactive_online_iteration_routes_without_statistics(
+            self, mock_load_balancer_impl):
+        """Test that skipped iterations retain routing without EPLB sync."""
+
+        torch.cuda.set_device(0)
+        balancer = MoeLoadBalancer(0, 4, 2, iteration_interval=4)
+        mock_single_layer_impl = MagicMock()
+        selected_experts = torch.tensor([[0, 1]], dtype=torch.int32)
+        routed_slots = torch.tensor([[2, 3]], dtype=torch.int32)
+        layer = SingleLayerMoeLoadBalancer(mock_single_layer_impl,
+                                           MPI.COMM_WORLD,
+                                           expert_count=4,
+                                           runtime_state=balancer.runtime_state)
+
+        with patch('torch.ops.trtllm.moe_load_balance_wait_gpu_stage') as mock_wait, \
+             patch('torch.ops.trtllm.moe_load_balance_set_cpu_stage') as mock_set_cpu, \
+             patch('torch.ops.trtllm.moe_load_balance_routing', return_value=routed_slots) as mock_route:
+            layer.start_wait_gpu_stage()
+            layer.done_wait_gpu_stage()
+            layer.update_local_statistic(selected_experts, True, True)
+            self.assertIsNone(layer.get_local_statistic_tensor())
+            result = layer.route(selected_experts)
+            layer.start_set_cpu_stage()
+            layer.done_set_cpu_stage()
+
+        mock_wait.assert_not_called()
+        mock_set_cpu.assert_not_called()
+        mock_route.assert_called_once()
+        self.assertTrue(torch.equal(result, routed_slots))
+
+    @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_reconfigure_mask_only_rejects_active_iteration(
             self, mock_load_balancer_impl):
         """Test mask-only reconfigure is rejected during an active iteration."""
@@ -326,6 +509,58 @@ class TestMoeLoadBalancer(unittest.TestCase):
 
         mock_load_balancer_impl.return_value.reconfigure_mask_only.assert_not_called(
         )
+
+    def test_eplb_telemetry_records_lifecycle_and_placement(self):
+        """Test optional telemetry records phases and migrated bytes."""
+
+        previous_placement = [{
+            'layer_id': 7,
+            'rank_expert_ids': [[0, 1], [2, 3]],
+        }]
+        current_placement = [[0, 4], [2, 5]]
+        layer = MagicMock()
+        layer.get_layer_idx.return_value = 7
+        layer.get_old_rank_expert_ids.return_value = current_placement
+        layer.host_tensor_sharer.name_info = {
+            'weight': (torch.float16, (2, 3)),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            balancer = object.__new__(MoeLoadBalancer)
+            balancer.is_shutdown = True
+            balancer.ep_rank = 0
+            balancer.telemetry_path = os.path.join(temp_dir, 'lifecycle.jsonl')
+            balancer.forward_iter_id = 10
+            balancer.iter_id = 3
+            balancer.single_layer_load_balancers = [layer]
+            balancer._telemetry_previous_mode = None
+            balancer._telemetry_previous_placement = previous_placement
+            balancer._telemetry_counts = {
+                'sample': 0,
+                'update': 0,
+                'drain': 0,
+                'skip': 0,
+            }
+
+            for mode in ('sample', 'update', 'drain', 'skip'):
+                balancer.record_iter_mode(mode)
+
+            with open(balancer.telemetry_path,
+                      encoding='utf-8') as telemetry_file:
+                records = [json.loads(line) for line in telemetry_file]
+
+        self.assertEqual([record['event'] for record in records],
+                         ['sample', 'update', 'drain_complete', 'stable'])
+        self.assertEqual(records[2]['changed_slots'], 2)
+        self.assertEqual(records[2]['changed_bytes'], 24)
+        self.assertEqual(records[2]['placement'][0]['rank_expert_ids'],
+                         current_placement)
+        self.assertEqual(records[3]['counts'], {
+            'sample': 1,
+            'update': 1,
+            'drain': 1,
+            'skip': 1,
+        })
 
     def test_real_statistic_kernel(self):
         """Test the real statistic kernel functionality."""

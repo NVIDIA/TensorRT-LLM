@@ -22,6 +22,7 @@ import triton.language as tl
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...memory_buffer_utils import get_memory_buffers
@@ -33,6 +34,32 @@ from .impl_contract import (MoEInputRequirement, MoERunContext,
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
+
+_DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS = 18688
+
+
+def _configure_deepgemm_moe_max_num_tokens(model_config: ModelConfig) -> None:
+    moe_max_num_tokens = model_config.moe_max_num_tokens
+    if moe_max_num_tokens is None:
+        raise ValueError("moe_max_num_tokens must be set before creating MoE")
+
+    if not model_config._moe_max_num_tokens_is_default:
+        if moe_max_num_tokens > _DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS:
+            logger.warning_once(
+                "DeepGEMM moe_max_num_tokens is explicitly set to "
+                f"{moe_max_num_tokens}, above the conservative default "
+                f"{_DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS}; this may increase "
+                "GPU memory usage.",
+                key="deepgemm_explicit_moe_max_num_tokens")
+        return
+
+    if moe_max_num_tokens <= _DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS:
+        return
+
+    was_frozen = model_config._frozen
+    model_config._frozen = False
+    model_config.moe_max_num_tokens = (_DEFAULT_DEEPGEMM_MOE_MAX_NUM_TOKENS)
+    model_config._frozen = was_frozen
 
 
 @triton.jit
@@ -617,7 +644,7 @@ def preprocess_after_permute(expert_first_token_offset_tensor,
 
     Only the number of permuted (expanded) tokens is needed here, not the
     permuted activations themselves. Callers that run moe_permute_op with
-    skip_data_expand=True leave permuted_data_tensor uninitialized, so the count
+    skip_data_expand=True return an empty permuted_data_tensor, so the count
     must come from a populated tensor (e.g. permuted_row_to_unpermuted_row_tensor.shape[0]).
     """
     total_tokens = num_permuted_tokens
@@ -828,11 +855,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         # max_num_tokens = ((mtp+1)*max_batch_size+max_isl+128+63)//64*64 = 9344
         # moe_max_num_tokens = max_num_tokens * 2 = 18688
         # It can avoid OOM for 8k/1k cases.
-        default_moe_max_num_tokens = 18688
-        if model_config.moe_max_num_tokens > default_moe_max_num_tokens:
-            model_config._frozen = False
-            model_config.moe_max_num_tokens = default_moe_max_num_tokens
-            model_config._frozen = True
+        # Preserve an explicit deployment value. Only clamp the derived
+        # default, which keeps the existing OOM-safe behavior when the user
+        # does not size the DeepGEMM workspace deliberately.
+        _configure_deepgemm_moe_max_num_tokens(model_config)
 
         super().__init__(
             routing_method=routing_method,
@@ -982,23 +1008,26 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         assert token_selected_experts is not None
         assert token_final_scales is not None
 
-        # Permutation.
-        # skip_data_expand=True computes the permutation maps but skips the
-        # data-copy step (expandInputRowsKernel), so permuted_data_tensor and
-        # permuted_token_final_scales_tensor are returned with UNINITIALIZED
-        # contents (still full-size, just never written). The fused expand+quant
-        # kernel re-derives the activations from x via
+        # Permutation. With skip_data_expand=True, the operator needs the input
+        # row count and dtype but never reads its hidden dimension. Use a
+        # zero-width view so older operator libraries, which still size an
+        # unused expanded return from input.shape[1], allocate no activation
+        # storage. The fused expand+quant kernel reads the original x below.
+        # Newer operator libraries return the unused activation and scale
+        # tensors empty as well.
+        #
+        # The fused expand+quant kernel re-derives the activations from x via
         # permuted_row_to_unpermuted_row_tensor instead, so all unused outputs are
         # discarded with `_`.
         (
             permuted_row_to_unpermuted_row_tensor,
             _,  # permuted_token_selected_experts_tensor (unused)
-            _,  # permuted_data_tensor (uninitialized under skip_data_expand)
+            _,  # permuted_data_tensor (unused and allocation-free)
             expert_first_token_offset_tensor,
-            _,  # permuted_token_final_scales_tensor (uninitialized under skip_data_expand)
+            _,  # permuted_token_final_scales_tensor (unused)
             unpermuted_row_to_permuted_row_tensor,
         ) = torch.ops.trtllm.moe_permute_op(
-            x,
+            x[:, :0],
             token_selected_experts,
             token_final_scales,
             None,  # w3_w1_weight.view(weight_dtype),

@@ -28,6 +28,7 @@ This module is only imported when ``TLLM_USE_FLASHINFER_GDN_PREFILL=1`` is set
 at process start; do not import it lazily inside hot paths.
 """
 
+import inspect
 from typing import Optional, Tuple
 
 import torch
@@ -38,6 +39,30 @@ from tensorrt_llm._torch.modules.fla.fused_state_io import (
 )
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 from tensorrt_llm._utils import is_sm_100f
+
+
+def _enable_cutlass_dsl_45_pipeline_compatibility(pipeline) -> None:
+    """Accept FlashInfer's explicit DSL 4.6 default on CUTLASS DSL 4.5.
+
+    FlashInfer 0.6.17.dev20260806 permits CUTLASS DSL 4.5 but passes the new
+    ``enable_multicast_signaling=False`` spelling. DSL 4.5 already implements
+    that non-multicast behavior; its Python signature simply predates the
+    keyword. Only the equivalent ``False`` case is adapted here.
+    """
+    create = pipeline.PipelineTmaAsync.create
+    if "enable_multicast_signaling" in inspect.signature(create).parameters:
+        return
+    if getattr(create, "_trtllm_cutlass_dsl_45_compatibility", False):
+        return
+
+    def create_compatible(*args, **kwargs):
+        enable_multicast_signaling = kwargs.pop("enable_multicast_signaling", False)
+        if enable_multicast_signaling:
+            raise ValueError("enable_multicast_signaling=True requires nvidia-cutlass-dsl>=4.6")
+        return create(*args, **kwargs)
+
+    create_compatible._trtllm_cutlass_dsl_45_compatibility = True
+    pipeline.PipelineTmaAsync.create = staticmethod(create_compatible)
 
 
 # Mirror the @torch.compiler.disable on the legacy Triton wrapper
@@ -65,6 +90,9 @@ def chunk_gated_delta_rule(
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
     # build does not error until the function is actually called.
     import flashinfer
+    from cutlass import pipeline
+
+    _enable_cutlass_dsl_45_pipeline_compatibility(pipeline)
 
     # --- Step 1: pre-flight asserts --------------------------------------
     assert head_first is False, "head_first=True is not supported by this wrapper"

@@ -1,6 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import struct
 import types
+from dataclasses import replace
 
 import pytest
 import torch
@@ -14,6 +18,30 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    ("configured_value", "expected_value", "is_default"),
+    [
+        pytest.param(None, 32768, True, id="derived-default"),
+        pytest.param(32768, 32768, False, id="explicit-32768"),
+        pytest.param(65536, 65536, False, id="explicit-65536"),
+    ],
+)
+def test_moe_max_num_tokens_tracks_explicit_configuration(
+    configured_value, expected_value, is_default
+):
+    model_config = ModelConfig(max_num_tokens=32768, moe_max_num_tokens=configured_value)
+
+    assert model_config.moe_max_num_tokens == expected_value
+    assert model_config._moe_max_num_tokens_is_default is is_default
+    assert replace(model_config)._moe_max_num_tokens_is_default is is_default
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_moe_max_num_tokens_rejects_nonpositive_values(value):
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        ModelConfig(moe_max_num_tokens=value)
 
 
 def make_pretrained_config(

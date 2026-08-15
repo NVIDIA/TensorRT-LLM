@@ -58,7 +58,7 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-flashinfer-python==0.6.16
+flashinfer-python @ https://github.com/flashinfer-ai/flashinfer/releases/download/nightly-v0.6.17-20260806/flashinfer_python-0.6.17.dev20260806-py3-none-any.whl#sha256=4ed64b717bf979d268fd7249dfa354d100effe36bc9d340efac8dcebd354611d
 xgrammar==0.1.32
 llguidance==0.7.29
 jsonschema

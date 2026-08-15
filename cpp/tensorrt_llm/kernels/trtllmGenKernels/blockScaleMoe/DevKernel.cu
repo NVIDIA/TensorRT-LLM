@@ -265,12 +265,14 @@ constexpr int DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA = 128;
 // and strides over the row space. This visits the per-expert tile padding that
 // the expanded-space kernel skips (~4% extra rows at 32 local experts); those
 // rows are dropped by the finalize kernel. The arithmetic below deliberately
-// preserves the legacy kernel's 0/0 -> NaN behavior for an all-zero block.
+// matches activationDeepSeekKernel bit for bit, including its finite all-zero
+// block handling.
 constexpr int kDsActWarpSize = 32;
 constexpr int kDsActEltsPerSf = 128;
 constexpr int kDsActEltsPerThread = kDsActEltsPerSf / kDsActWarpSize;
 constexpr int kDsActWarpsPerCta = 4;
 constexpr int kDsActPermutedNumThreadsPerCta = kDsActWarpSize * kDsActWarpsPerCta;
+constexpr float kDsActAmaxEpsilon = 1.0e-10F;
 
 constexpr bool shouldUsePermutedActivation(int innerDim, int numTokens, int topK, int numExperts, int tileTokensDim)
 {
@@ -352,7 +354,11 @@ __global__ void activationDeepSeekPermutedKernel(KernelParams params)
             aMax = fmaxf(aMax, __shfl_xor_sync(0xffffffffu, aMax, offset));
         }
 
-        float const scaleOut = aMax / kE4m3MaxVal;
+        // Keep an all-zero activation block finite. Without the floor, scaleOut
+        // is zero and quantizing the zero values evaluates 0 / 0, producing FP8
+        // NaNs that poison FC2 and all following layers. This matches the
+        // epsilon used by the DeepGEMM FP8 activation quantizer.
+        float const scaleOut = fmaxf(aMax, kDsActAmaxEpsilon) / kE4m3MaxVal;
 
         if (lane == 0)
         {
@@ -367,7 +373,7 @@ __global__ void activationDeepSeekPermutedKernel(KernelParams params)
             // Divide; do NOT hoist a reciprocal. `x / s` and `x * (1/s)` round
             // differently, and an equivalence run showed that single ulp flip a
             // greedy-decoded token. This must match activationDeepSeekKernel
-            // bit for bit, including 0/0 -> NaN on an all-zero scale block.
+            // bit for bit.
             outElts[i] = static_cast<Type>(out[i] / scaleOut);
         }
         *reinterpret_cast<PackedIo*>(params.outPtr + static_cast<int64_t>(permutedIdx) * outputDim + hiddenBase)
@@ -504,10 +510,11 @@ __global__ void activationDeepSeekKernel(KernelParams params)
                         {
                             continue;
                         }
-                        s_scaleOutArr[tokenInCtaIdx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
+                        float const scaleOut = fmaxf(aMaxArr[tokenInCtaIdx], kDsActAmaxEpsilon) / E4m3MaxVal;
+                        s_scaleOutArr[tokenInCtaIdx] = scaleOut;
                         int const scaleOut_idx
                             = permutedIdxArr[tokenInCtaIdx] + totalNumPaddedTokens * (hiddenIdx / 128);
-                        params.outDqSfsPtr[scaleOut_idx] = aMaxArr[tokenInCtaIdx] / E4m3MaxVal;
+                        params.outDqSfsPtr[scaleOut_idx] = scaleOut;
                     }
                 }
                 __syncthreads();

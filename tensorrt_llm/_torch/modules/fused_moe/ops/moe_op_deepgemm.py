@@ -169,20 +169,21 @@ class DeepGemmMoEOp(MoEOp):
         intermediate_size = module.intermediate_size
         hidden_size = x.shape[1]
 
-        # Permute the data for expert-parallel processing.
-        # Unlike DeepGemmFusedMoE (which fuses gather+finalize and never touches
-        # permuted_data_tensor), this op reuses permuted_data_tensor as a
-        # write-before-read scratch buffer in the gather+finalize tail below, so
-        # it is kept; only the genuinely unused outputs are discarded with `_`.
+        # Permute the data for expert-parallel processing. The skipped
+        # permutation uses only the row count and dtype, so a zero-width view
+        # prevents older operator libraries from allocating an unused expanded
+        # activation return. This path still needs a write-before-read scratch
+        # buffer in the gather+finalize tail, so it allocates that buffer at the
+        # point of use below.
         (
             permuted_row_to_unpermuted_row_tensor,
             _,  # permuted_token_selected_experts_tensor (unused)
-            permuted_data_tensor,
+            _,  # permuted_data_tensor (empty under skip_data_expand)
             expert_first_token_offset_tensor,
-            _,  # permuted_token_final_scales_tensor (uninitialized under skip_data_expand)
+            _,  # permuted_token_final_scales_tensor (empty under skip_data_expand)
             unpermuted_row_to_permuted_row_tensor,
         ) = torch.ops.trtllm.moe_permute_op(
-            x,
+            x[:, :0],
             token_selected_slots,
             token_final_scales,
             None,  # w3_w1_weight
@@ -290,6 +291,9 @@ class DeepGemmMoEOp(MoEOp):
         )
 
         # Gather results back to original token order
+        permuted_data_tensor = torch.empty((num_permuted_tokens, hidden_size),
+                                           dtype=x.dtype,
+                                           device=x.device)
         triton_masked_index_gather(permuted_data_tensor, h3,
                                    expert_first_token_offset_tensor,
                                    token_to_expert_map)
