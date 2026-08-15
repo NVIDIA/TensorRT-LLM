@@ -42,6 +42,10 @@ def _unescape_attr(value: str) -> str:
     return value.replace("&quot;", '"').replace("&amp;", "&")
 
 
+def _escape_attr(value: str) -> str:
+    return value.replace("&", "&amp;").replace('"', "&quot;")
+
+
 def _parse_attrs(header: str) -> Dict[str, str]:
     return {key: _unescape_attr(value) for key, value in re.findall(r'(\w+)="([^"]*)"', header)}
 
@@ -96,14 +100,87 @@ class KimiK3ToolParser(BaseToolParser):
 
     def supports_structural_tag(self) -> bool:
         # XTML argument bodies are tag-structured text, not JSON — the
-        # JSON-schema-driven structural-tag constrained decoding used for
-        # strict tools does not apply.
+        # generic begin/end/trigger structural-tag path does not apply.
+        # Strict tools are handled by build_strict_structural_tag_format.
         return False
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError(
             "kimi_k3 XTML tool calls do not support structural-tag constrained decoding"
         )
+
+    def build_strict_structural_tag_format(
+            self, tools: List[Tool]) -> Dict[str, Any] | None:
+        """xgrammar structural-tag format enforcing well-formed K3 tool calls.
+
+        Any generated tools section is constrained to calls of the declared
+        tools; a strict tool with a parameters schema additionally gets its
+        arguments constrained to that JSON Schema via the K3 json-block body
+        form (the per-argument XTML form has no xgrammar equivalent).
+        Non-strict tools keep free-form bodies. The outer triggered_tags
+        must keep ``at_least_one``/``stop_after_first`` False: True would
+        forbid the think/response text before the section and the message
+        close after it, deadlocking generation.
+        """
+        if not tools:
+            return None
+        call_tags: List[Dict[str, Any]] = []
+        for tool in tools:
+            begin = f'<|open|>call tool="{_escape_attr(tool.function.name)}"'
+            if tool.function.strict and tool.function.parameters:
+                call_tags.append({
+                    "type": "tag",
+                    "begin": begin,
+                    "content": {
+                        "type":
+                        "sequence",
+                        "elements": [
+                            {
+                                "type": "regex",
+                                "pattern": ' index="[1-9][0-9]{0,2}"',
+                            },
+                            {
+                                "type": "const_string",
+                                "value":
+                                '<|sep|><|open|>json type="object"<|sep|>',
+                            },
+                            {
+                                "type": "json_schema",
+                                "json_schema": tool.function.parameters,
+                            },
+                        ],
+                    },
+                    "end": "<|close|>json<|sep|><|close|>call<|sep|>",
+                })
+            else:
+                call_tags.append({
+                    "type": "tag",
+                    "begin": begin,
+                    "content": {
+                        "type": "any_text"
+                    },
+                    "end": "<|close|>call<|sep|>",
+                })
+        return {
+            "type":
+            "triggered_tags",
+            "triggers": [self.bot_token],
+            "tags": [{
+                "type": "tag",
+                "begin": self.bot_token,
+                "content": {
+                    "type": "tags_with_separator",
+                    "separator": "",
+                    "at_least_one": True,
+                    "tags": call_tags,
+                },
+                "end": self.eot_token,
+            }],
+            "at_least_one":
+            False,
+            "stop_after_first":
+            False,
+        }
 
     @staticmethod
     def _coerce_value(value: str, value_type: str) -> Any:
