@@ -261,6 +261,10 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
     if model_type != "kimi_k3":
         return
     _enforce_kimi_param_policy(request)
+    if request.top_p is None:
+        # Kimi pins top_p at 0.95; to_sampling_params would otherwise fall
+        # back to 1.0, silently diverging from vendor sampling.
+        request.top_p = 0.95
     if request.stream and request.stream_options is None:
         # StreamOptions defaults: include_usage=True, continuous off.
         request.stream_options = StreamOptions()
@@ -1702,14 +1706,17 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
-            _apply_kimi_chat_extensions(
-                request, resolve_top_level_model_type(self.model_config))
+            model_type = resolve_top_level_model_type(self.model_config)
+            is_kimi_k3 = model_type == "kimi_k3"
+            _apply_kimi_chat_extensions(request, model_type)
             conversation: List[ConversationMessage] = []
-            # exclude_none: pydantic-injected null defaults (strict,
-            # description, parameters) would otherwise leak into the rendered
-            # tool-declare JSON and skew prompt-token counts.
+            # exclude_none for kimi_k3: pydantic-injected null defaults
+            # (strict, description, parameters) would otherwise leak into the
+            # rendered tool-declare JSON and skew prompt-token parity. Other
+            # models keep their historical rendering.
             tool_dicts = None if request.tools is None else [
-                tool.model_dump(exclude_none=True) for tool in request.tools
+                tool.model_dump(exclude_none=is_kimi_k3)
+                for tool in request.tools
             ]
             # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
@@ -1732,40 +1739,49 @@ class OpenAIServer(_VideoRoutesMixin):
                 chat_template_kwargs=request.chat_template_kwargs,
             )
             reasoning_parser_name = self.generator.args.reasoning_parser
-            dynamic_tools = _dynamic_tool_dicts(request.messages)
-            _configure_parser_special_token_decoding(
-                sampling_params,
-                reasoning_parser_name=reasoning_parser_name,
-                tool_parser_name=self.tool_parser,
-                has_tools=bool(request.tools) or bool(dynamic_tools))
-            if self.tool_parser and request.tools:
-                # When strict=True on any tool, apply constrained decoding
-                # via structural tags (only if response_format doesn't already
-                # set guided decoding).
-                if sampling_params.guided_decoding is None:
-                    strict_guided = _build_tool_strict_guided_decoding_params(
-                        request.tools, self.tool_parser)
-                    if strict_guided is not None:
-                        sampling_params.guided_decoding = strict_guided
-            postproc_args = ChatPostprocArgs.from_request(request)
-            if (resolve_top_level_model_type(self.model_config) == "kimi_k3"
-                    and request.add_generation_prompt
-                    and request.prompt_token_ids is None):
-                # Kimi's prompt-token accounting excludes the trailing 3-token
-                # generation channel opener (<|open|>think|response<|sep|>);
-                # the model still sees the full rendered prompt.
-                postproc_args.num_prompt_tokens_offset = 3
+            # Message-level (dynamic) tools are a Kimi API extension; only
+            # kimi_k3 templates render them, so other models keep ignoring
+            # the key entirely.
+            dynamic_tools = _dynamic_tool_dicts(
+                request.messages) if is_kimi_k3 else []
+            dynamic_tool_params: List[ChatCompletionToolsParam] = []
             if dynamic_tools:
-                # The tool parser must see dynamic tools to recognize their
-                # calls in the model output.
                 try:
-                    postproc_args.tools = (postproc_args.tools or []) + [
+                    dynamic_tool_params = [
                         ChatCompletionToolsParam.model_validate(tool)
                         for tool in dynamic_tools
                     ]
                 except ValidationError as e:
                     raise ValueError(
                         f"Invalid message-level tool declaration: {e}") from e
+            _configure_parser_special_token_decoding(
+                sampling_params,
+                reasoning_parser_name=reasoning_parser_name,
+                tool_parser_name=self.tool_parser,
+                has_tools=bool(request.tools) or bool(dynamic_tools))
+            all_tools = (request.tools or []) + dynamic_tool_params
+            if self.tool_parser and all_tools:
+                # When strict=True on any tool, apply constrained decoding
+                # via structural tags (only if response_format doesn't already
+                # set guided decoding). Dynamic tools must be in the grammar
+                # too, or their calls would be masked out.
+                if sampling_params.guided_decoding is None:
+                    strict_guided = _build_tool_strict_guided_decoding_params(
+                        all_tools, self.tool_parser)
+                    if strict_guided is not None:
+                        sampling_params.guided_decoding = strict_guided
+            postproc_args = ChatPostprocArgs.from_request(request)
+            if (is_kimi_k3 and request.add_generation_prompt
+                    and request.prompt_token_ids is None):
+                # Kimi's prompt-token accounting excludes the trailing 3-token
+                # generation channel opener (<|open|>think|response<|sep|>);
+                # the model still sees the full rendered prompt.
+                postproc_args.num_prompt_tokens_offset = 3
+            if dynamic_tool_params:
+                # The tool parser must see dynamic tools to recognize their
+                # calls in the model output.
+                postproc_args.tools = (postproc_args.tools
+                                       or []) + dynamic_tool_params
             self._validate_internal_disagg_request(request, raw_request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
