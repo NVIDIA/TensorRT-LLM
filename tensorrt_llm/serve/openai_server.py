@@ -207,6 +207,32 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "build that relays 'resolved_thinking'.")
 
 
+def _enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
+    """Enforce Kimi's immutable sampling-parameter policy (KVV params suite).
+
+    Kimi's API pins top_p, the penalties, and n, and bounds temperature to
+    [0, 1]; out-of-policy values must fail fast with HTTP 400 rather than
+    generate. Set TRTLLM_KIMI_PARAM_POLICY=0 to serve unconstrained.
+    """
+    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "1") == "0":
+        return
+    if request.temperature is not None and not (0.0 <= request.temperature <=
+                                                1.0):
+        raise ValueError("temperature must be within [0, 1] for this model; "
+                         f"got {request.temperature}.")
+    if request.top_p is not None and request.top_p != 0.95:
+        raise ValueError(
+            f"top_p is fixed at 0.95 for this model; got {request.top_p}.")
+    if request.presence_penalty:
+        raise ValueError("presence_penalty is fixed at 0 for this model; "
+                         f"got {request.presence_penalty}.")
+    if request.frequency_penalty:
+        raise ValueError("frequency_penalty is fixed at 0 for this model; "
+                         f"got {request.frequency_penalty}.")
+    if request.n != 1:
+        raise ValueError(f"n is fixed at 1 for this model; got {request.n}.")
+
+
 def _dynamic_tool_dicts(messages) -> list[dict]:
     """Collect message-level (dynamic) tool declarations from system messages."""
     tools: list[dict] = []
@@ -235,6 +261,7 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
     """
     if model_type != "kimi_k3":
         return
+    _enforce_kimi_param_policy(request)
     if request.stream and request.stream_options is None:
         # StreamOptions defaults: include_usage=True, continuous off.
         request.stream_options = StreamOptions()
