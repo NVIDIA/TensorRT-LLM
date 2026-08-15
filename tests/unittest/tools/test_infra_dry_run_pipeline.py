@@ -135,7 +135,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn("if (isInfraDryRun())", body)
         infra_pytest_install = (
             "pip3 install 'pytest<9.1' pytest-csv pytest-split pytest-timeout "
-            "pytest-unused-fixtures mako"
+            "pytest-unused-fixtures mako boto3"
         )
         self.assertIn(infra_pytest_install, body)
         self.assertIn("runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)", body)
