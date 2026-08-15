@@ -345,10 +345,11 @@ def _normalize_tool_call_arguments(index: int, item: Any) -> dict[str, Any]:
     elif isinstance(arguments, str):
         try:
             arguments = json.loads(arguments)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"tool_calls[{index}].function.arguments must be valid JSON."
-            ) from e
+        except json.JSONDecodeError:
+            # Keep the raw string: python-renderer templates (kimi_k3)
+            # normalize unparseable arguments themselves and render them
+            # verbatim as a JSON block, matching the reference tokenizer.
+            return item
         if not isinstance(arguments, dict):
             raise ValueError(
                 f"tool_calls[{index}].function.arguments must be a JSON object."
