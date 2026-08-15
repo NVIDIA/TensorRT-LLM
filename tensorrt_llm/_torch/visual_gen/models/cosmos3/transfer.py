@@ -334,26 +334,16 @@ def resolve_transfer_config(
             "emphasize_control_in_prompt",
             TRANSFER_SAMPLE_DEFAULTS["emphasize_control_in_prompt"],
         ),
-        num_frames=_extra_or_default(
-            extra_params, "num_frames", getattr(req_params, "num_frames", None)
-        ),
+        # `num_frames` and `frame_rate` are request fields, not extra params, so
+        # they are read from `req_params` alone: `extra_params` spellings of them
+        # would be a second name for the same knob with different precedence, and
+        # `validate_visual_gen_params` rejects them as undeclared keys anyway.
+        num_frames=getattr(req_params, "num_frames", None),
         # Only a caller-supplied frame_rate seeds this. Taking the request's
         # value unconditionally would capture the executor-merged default,
         # which then wins in _forward_transfer over a rate the pipeline
         # inferred from the source -- silently pinning every transfer to 24.
-        fps=_extra_or_default(
-            extra_params,
-            "fps",
-            _extra_or_default(
-                extra_params,
-                "frame_rate",
-                _extra_or_default(
-                    extra_params,
-                    "resolved_frame_rate",
-                    getattr(req_params, "frame_rate", None) if "frame_rate" in specified else None,
-                ),
-            ),
-        ),
+        fps=getattr(req_params, "frame_rate", None) if "frame_rate" in specified else None,
     )
 
     if len(hints) == 1:
@@ -364,16 +354,9 @@ def resolve_transfer_config(
             elif field_name == "flow_shift":
                 user_set = extra_params.get("flow_shift", None) is not None
             elif field_name == "fps":
-                user_set = (
-                    extra_params.get("fps", None) is not None
-                    or extra_params.get("frame_rate", None) is not None
-                    or extra_params.get("resolved_frame_rate", None) is not None
-                    or "frame_rate" in specified
-                )
+                user_set = "frame_rate" in specified
             elif field_name == "num_frames":
-                user_set = extra_params.get("num_frames", None) is not None or (
-                    "num_frames" in specified
-                )
+                user_set = "num_frames" in specified
             else:
                 user_set = extra_params.get(field_name, None) is not None
             if not user_set:

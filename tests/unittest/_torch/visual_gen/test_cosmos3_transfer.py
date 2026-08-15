@@ -302,8 +302,18 @@ class TestTransferConfig:
         assert resolve_transfer_config({"guidance_scale": 3.0}, _req()) is None
 
     def test_wsm_fps_preset_default_and_override(self):
+        """The override is a request field, not an extra param.
+
+        `frame_rate` reaches the pipeline as a declared generation field, so
+        that is the only spelling a real request can use -- an `extra_params`
+        copy of it would be rejected as an undeclared key by
+        `validate_visual_gen_params` before `infer()` ever runs.
+        """
         assert resolve_transfer_config({"wsm": True}, _req()).fps == 10
-        assert resolve_transfer_config({"wsm": True, "fps": 24.0}, _req()).fps == 24.0
+        assert resolve_transfer_config({"wsm": True}, _req(frame_rate=24.0)).fps == 24.0
+        # The rate the executor merges into every request is not caller intent,
+        # so it must not defeat the preset.
+        assert resolve_transfer_config({"wsm": True}, _merged_req(frame_rate=24.0)).fps == 10
 
     def test_wsm_clip_presets_survive_merged_request_defaults(self):
         """wsm wants 101 frames at 10 fps, but `num_frames` and `frame_rate`
