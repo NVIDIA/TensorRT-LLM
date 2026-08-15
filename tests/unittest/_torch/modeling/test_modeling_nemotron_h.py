@@ -5,8 +5,28 @@ from utils.util import skip_fp8_pre_ada, skip_gpu_memory_less_than
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, LoadFormat
 from tensorrt_llm.sampling_params import SamplingParams
+
+
+def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    raw_probs = torch.softmax(logits, dim=-1)
+    index = token_ids.unsqueeze(1)
+    assert index.device == raw_probs.device, (
+        "index and raw_probs should be on the same device, "
+        f"but got index location: {index.device}, raw_probs location: {raw_probs.device}"
+    )
+    token_probs = torch.gather(raw_probs, dim=1, index=index).squeeze(-1)
+    return torch.log(token_probs)
+
+
+def extract_decode_logprobs(result: RequestOutput,
+                            gen_idx: int = 0) -> torch.Tensor:
+    """Shared by test_modeling_nemotron_nano_v2_vl.py."""
+    token_ids = torch.tensor(result.outputs[gen_idx].token_ids)
+    logits = result.outputs[gen_idx].generation_logits
+    return get_logprobs(token_ids, logits)
 
 
 def create_nemotron_h_llm(model_folder,
