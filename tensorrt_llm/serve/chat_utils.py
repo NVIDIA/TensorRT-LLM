@@ -268,6 +268,11 @@ def parse_chat_message_content(
         result.update(_parse_assistant_message_content(message))
     elif role == "tool":
         result.update(_parse_tool_message_content(message))
+    elif role == "system" and message.get("tools") is not None:
+        # Message-level (dynamic) tool declarations: python-renderer chat
+        # templates (kimi_k3) render these as an in-conversation tool
+        # declare block at this message's position.
+        result["tools"] = message["tools"]
     return result
 
 

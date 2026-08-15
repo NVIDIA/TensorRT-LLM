@@ -356,6 +356,9 @@ class ConversationMessage(TypedDict, total=False):
     content: str
     media: List[MultimodalData]
     content_parts: List[Union[str, dict]]
+    # Message-level (dynamic) tool declarations on system messages, consumed
+    # by python-renderer chat templates (kimi_k3).
+    tools: List[dict]
 
 
 class MultimodalDataTracker:

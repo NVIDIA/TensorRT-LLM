@@ -73,16 +73,16 @@ from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionNamedToolChoiceParam, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionResponseChoice, ChatMessage,
-    CompletionRequest, CompletionResponse, CompletionResponseChoice,
-    EmbeddingRequest, EmbeddingResponse, EmbeddingResponseData,
-    EmbeddingUsageInfo, ErrorResponse, ImageEditRequest, ImageGenerationRequest,
+    ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatCompletionToolsParam, ChatMessage, CompletionRequest,
+    CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo,
+    ErrorResponse, ImageEditRequest, ImageGenerationRequest,
     ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
     ModelList, PromptTokensDetails, ResponseFormat, ResponsesRequest,
     ResponsesResponse, StreamOptions, TokenizeRequest, TokenizeResponse,
     UpdateWeightsRequest, UsageInfo, ensure_request_chat_template_allowed,
-    to_llm_conversation_params,
-    to_llm_disaggregated_params)
+    to_llm_conversation_params, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -207,6 +207,16 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "build that relays 'resolved_thinking'.")
 
 
+def _dynamic_tool_dicts(messages) -> list[dict]:
+    """Collect message-level (dynamic) tool declarations from system messages."""
+    tools: list[dict] = []
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "system" and msg.get(
+                "tools"):
+            tools.extend(msg["tools"])
+    return tools
+
+
 def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
                                 model_type: Optional[str]) -> None:
     """Apply Kimi/Moonshot API semantics to a chat request for kimi_k3.
@@ -248,7 +258,8 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
             derived["thinking_effort"] = effort
         # Other efforts (e.g. harmony's "medium") have no K3 equivalent;
         # leave the template default.
-    if ("tool_choice" in request.model_fields_set and request.tools
+    if ("tool_choice" in request.model_fields_set
+            and (request.tools or _dynamic_tool_dicts(request.messages))
             and request.tool_choice in ("required", "none")):
         derived["tool_choice"] = request.tool_choice
     response_format = request.response_format
@@ -1843,11 +1854,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 forced_tool_name = request.tool_choice.function.name
 
             reasoning_parser_name = self.generator.args.reasoning_parser
+            dynamic_tools = _dynamic_tool_dicts(request.messages)
             _configure_parser_special_token_decoding(
                 sampling_params,
                 reasoning_parser_name=reasoning_parser_name,
                 tool_parser_name=self.tool_parser,
-                has_tools=bool(request.tools))
+                has_tools=bool(request.tools) or bool(dynamic_tools))
             if self.tool_parser and request.tools:
                 # When strict=True on any tool, apply constrained decoding
                 # via structural tags (only if response_format doesn't already
@@ -1897,6 +1909,17 @@ class OpenAIServer(_VideoRoutesMixin):
                     err_type="BadRequestError",
                     status_code=HTTPStatus.BAD_REQUEST)
             postproc_args = ChatPostprocArgs.from_request(request)
+            if dynamic_tools:
+                # The tool parser must see dynamic tools to recognize their
+                # calls in the model output.
+                try:
+                    postproc_args.tools = (postproc_args.tools or []) + [
+                        ChatCompletionToolsParam.model_validate(tool)
+                        for tool in dynamic_tools
+                    ]
+                except ValidationError as e:
+                    raise ValueError(
+                        f"Invalid message-level tool declaration: {e}") from e
             self._validate_internal_disagg_request(request, raw_request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
