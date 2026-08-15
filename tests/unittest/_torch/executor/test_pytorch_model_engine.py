@@ -15,6 +15,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
     MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
     MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
     _make_single_token_context_graph_batch)
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
+                                          PrefillCudaGraphBackend,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchLlmArgs)
 
@@ -41,7 +43,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.inputs.registry import BaseMultimodalDummyInputsBuilder
+from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
+                                          BaseMultimodalInputProcessor)
 from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
 from tensorrt_llm.mapping import CpType, Mapping
@@ -238,10 +241,15 @@ def _make_forward_only_engine(
     )
     engine.spec_metadata = spec_metadata
     engine._set_up_spec_metadata = Mock(return_value=spec_metadata)
-    engine._prepare_inputs = Mock(return_value=({"prepared": True}, None))
+    prepared_inputs = {
+        "prepared": True,
+        "input_ids": torch.zeros(2, dtype=torch.int32),
+    }
+    engine._prepare_inputs = Mock(return_value=(prepared_inputs, None))
     outputs = {"logits": object()}
     engine._forward_step = Mock(return_value=outputs)
     engine._execute_logit_post_processors = Mock()
+    engine.breakable_cuda_graph_runner = None
 
     runner = Mock()
     runner.enabled = runner_enabled
@@ -817,7 +825,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         prepare_args = engine._prepare_inputs.call_args.args
         self.assertIs(prepare_args[0], graph_batch)
         self.assertEqual(prepare_args[-1], frozenset({1}))
-        runner.replay.assert_called_once_with(key, {"prepared": True})
+        prepared_inputs = engine._prepare_inputs.return_value[0]
+        runner.replay.assert_called_once_with(key, prepared_inputs)
         engine._forward_step.assert_not_called()
         engine._execute_logit_post_processors.assert_called_once_with(
             batch, outputs)
@@ -891,7 +900,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertEqual(
             semantic_attn_metadata.update_spec_dec_param.call_args.
             kwargs["num_contexts"], 1)
-        runner.replay.assert_called_once_with(key, {"prepared": True})
+        prepared_inputs = engine._prepare_inputs.return_value[0]
+        runner.replay.assert_called_once_with(key, prepared_inputs)
 
     def test_zero_runtime_draft_speculation_graph_miss_is_semantic_eager(
             self) -> None:
@@ -972,7 +982,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         prepare_args = engine._prepare_inputs.call_args.args
         self.assertIs(prepare_args[0], graph_batch)
         self.assertEqual(prepare_args[-1], frozenset({context.py_request_id}))
-        runner.replay.assert_called_once_with(key, {"prepared": True})
+        prepared_inputs = engine._prepare_inputs.return_value[0]
+        runner.replay.assert_called_once_with(key, prepared_inputs)
 
     def test_multimodal_graph_miss_preserves_semantic_payload(self) -> None:
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(None)
@@ -1001,6 +1012,35 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIs(engine._prepare_inputs.call_args.args[0], batch)
         self.assertIs(context.py_multimodal_data, multimodal_data)
         self.assertIn("multimodal_embedding", multimodal_data)
+
+    def test_breakable_graph_falls_back_for_context_logits(self) -> None:
+        engine, _, resource_manager, _, outputs = \
+            _make_forward_only_engine(None)
+        breakable_runner = Mock()
+        breakable_runner.is_capturing = False
+        breakable_runner.is_warming_up = False
+        breakable_runner.has_graph.return_value = True
+        breakable_runner.execute.return_value = outputs
+        engine.breakable_cuda_graph_runner = breakable_runner
+
+        batch = ScheduledRequests()
+        batch.context_requests_last_chunk = [_make_request_stub(1)]
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+                return_value=Mock()
+        ), patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.get_per_request_prefill_cuda_graph_flag",
+                return_value=True):
+            actual_outputs = engine.forward(
+                batch,
+                resource_manager,
+                gather_context_logits=True,
+            )
+
+        self.assertIs(actual_outputs, outputs)
+        breakable_runner.execute.assert_not_called()
+        engine._forward_step.assert_called_once()
 
     def test_generation_only_forward_does_not_call_new_selector(self) -> None:
         key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
@@ -1138,6 +1178,44 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         expected_output = torch.cat(
             (fixed_slot_output[511:512], fixed_slot_output[:400]))
         torch.testing.assert_close(restored_output, expected_output)
+
+    def test_breakable_rejects_multimodal_models(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+        engine.input_processor = None
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=False)
+
+        self.assertTrue(engine.is_multimodal)
+        with self.assertRaisesRegex(ValueError, "multimodal models"):
+            engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_breakable_allows_text_decoder_with_multimodal_processor(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = Mock(spec=DecoderModelForCausalLM)
+        engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=False)
+
+        self.assertTrue(engine.is_multimodal)
+        engine._validate_breakable_cuda_graph_compatibility()
+
+    def test_breakable_allows_multimodal_wrapper_in_text_only_mode(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.model = DummyLegacyMultimodalIndexModel()
+        engine.model.llm = Mock(spec=DecoderModelForCausalLM)
+        engine.model.mm_encoder = None
+        engine.input_processor = Mock(spec=BaseMultimodalInputProcessor)
+        engine.llm_args = SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            disable_mm_encoder=True)
+
+        self.assertTrue(engine.is_multimodal)
+        engine._validate_breakable_cuda_graph_compatibility()
 
     def test_prepare_multimodal_indices_uses_mixin_token_ids(self) -> None:
         engine = object.__new__(PyTorchModelEngine)
