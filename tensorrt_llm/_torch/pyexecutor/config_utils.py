@@ -116,10 +116,17 @@ def is_inkling(config):
     return getattr(text_config, "model_type", None) == "inkling_text"
 
 
-def reject_unsupported_inkling_kv_cache_features(config, *,
+def reject_unsupported_inkling_kv_cache_features(config,
+                                                 *,
                                                  enable_block_reuse: bool,
-                                                 enable_chunked_prefill: bool):
-    """Refuse the two features Inkling's context path cannot serve correctly.
+                                                 enable_chunked_prefill: bool,
+                                                 enable_cache_transceiver:
+                                                 bool = False):
+    """Refuse the features Inkling's context path cannot serve correctly.
+
+    The first two leave a *context* request with history it is supposed to
+    attend to and convolve against; the third moves a request between instances
+    without its short-conv state.
 
     Both leave a *context* request with history it is supposed to attend to and
     convolve against -- ``num_cached_tokens_per_seq > 0`` on a context request --
@@ -184,6 +191,20 @@ def reject_unsupported_inkling_kv_cache_features(config, *,
             "has_initial_state and so never consumed. Supporting it needs a "
             "chunked-context attention path, not just the conv fix. Set "
             "enable_chunked_prefill=False to run Inkling.")
+    if enable_cache_transceiver:
+        # The C++ transceiver route is already refused in _util.py for every V2
+        # manager. The Python one (KvCacheTransceiverV2) is not, and it would
+        # transfer the paged KV correctly and drop the short-conv windows on the
+        # floor: they live in InklingConvStateCache, a plain torch pool with no
+        # page table and no entry in the disagg page-table builder. The decode
+        # instance would then convolve against zeros -- wrong output, no error.
+        raise NotImplementedError(
+            "Inkling does not support disaggregated serving. The four "
+            "short-conv windows per layer are per-request state outside the "
+            "paged KV cache (InklingConvStateCache), so they are not part of "
+            "any cache transfer; the generation instance would resume from a "
+            "zeroed window and silently emit wrong output. Unset "
+            "cache_transceiver_config to run Inkling.")
 
 
 def _coerce_torch_dtype(dtype):

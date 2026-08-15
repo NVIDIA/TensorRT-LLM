@@ -166,6 +166,29 @@ def test_chunked_prefill_is_rejected():
         )
 
 
+def test_disaggregated_serving_is_rejected():
+    """The C++ transceiver route is already refused for every V2 manager, but
+    the Python one (KvCacheTransceiverV2) is not. It would move the paged KV and
+    silently leave the short-conv windows behind -- they are a plain torch pool
+    with no page table -- so the generation instance would resume from zeros."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        reject_unsupported_inkling_kv_cache_features,
+    )
+
+    with pytest.raises(NotImplementedError, match="disaggregated"):
+        reject_unsupported_inkling_kv_cache_features(
+            InklingConfig(),
+            enable_block_reuse=False,
+            enable_chunked_prefill=False,
+            enable_cache_transceiver=True,
+        )
+
+    # Default off: an aggregate deployment pays nothing.
+    reject_unsupported_inkling_kv_cache_features(
+        InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=False
+    )
+
+
 def test_both_messages_name_the_attention_path_not_just_the_conv():
     """The conv window is the visible half; the load-bearing half is that
     inkling_prefill_attention has no paged-KV argument, so a context request
