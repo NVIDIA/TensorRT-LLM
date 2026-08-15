@@ -28,6 +28,7 @@ is seen.
 """
 
 import json
+import os
 import re
 from typing import Any, Dict, List
 
@@ -108,6 +109,14 @@ class KimiK3ToolParser(BaseToolParser):
         forbid the think/response text before the section and the message
         close after it, deadlocking generation.
         """
+        if os.getenv("TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR", "0") != "1":
+            # Experimental, opt-in: under concurrent guided load with
+            # production tool schemas, sampling tripped a device-side assert
+            # and hard-killed the deployment (KVV schema suite, job 3054205:
+            # TensorCompare.cu _assert_async in sampler.update_requests).
+            # Root-cause investigation pending; strict tools fall back to
+            # the warn-and-continue path meanwhile.
+            return None
         if not tools:
             return None
         call_tags: List[Dict[str, Any]] = []
