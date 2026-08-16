@@ -61,13 +61,13 @@ from _torch.modules.moe.kimi_k3_ref_moe._mxfp4 import (
 )
 from torch import nn
 
-from tensorrt_llm._torch.modules.kimi_k3_moe._mlp import (
+from tensorrt_llm._torch.models.modeling_kimi_linear import (
     KimiK3MLP,
+    KimiK3MoEGate,
     KimiK3RMSNorm,
     NonSituActivation,
     SituAndMul,
 )
-from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 
 
 class KimiK3RoutedExpertBank(nn.Module):

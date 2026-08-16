@@ -41,13 +41,13 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
     _K3_MOE_EP_ENV,
     _K3_MOE_TP_ENV,
+    KimiK3MoEGate,
     KimiK3MoERuntime,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
 from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
     _MEGA_MOE_SYMM_BUFFER_CACHE,
 )
-from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping

@@ -23,7 +23,7 @@ import dataclasses
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
+from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate
 
 
 @dataclasses.dataclass
