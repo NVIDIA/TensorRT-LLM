@@ -1942,6 +1942,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip(
+        reason="CuteDslFusedMoE declines FP8 block scales: it has no FP8 "
+        "block-scale kernel, only a torch.einsum reference. See the ‡ footnote "
+        "in tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md. "
+        "Re-enable against DEEPGEMM / TRTLLM once this checkpoint has an "
+        "owner backend on SM100.")
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False])
     @parametrize_with_ids(
@@ -2129,6 +2135,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip(
+        reason="Same as test_cute_dsl_fp8_block_scales: CuteDslFusedMoE "
+        "declines FP8 block scales, so a CUTEDSL request on this checkpoint no "
+        "longer resolves.")
     @pytest.mark.skip_less_device(4)
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False])
@@ -7270,8 +7280,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
         The NVFP4 checkpoint is MIXED_PRECISION with deliberately-unquantized
         MTP draft layers, so this also guards the per-layer
-        MARLIN -> Cutlass fallback in ``create_moe.get_moe_cls`` while the
-        main-model expert layers stay on MARLIN. Attention DP exercises the
+        MARLIN -> Cutlass degradation in ``moe_resolution.resolve_moe_impl``
+        while the main-model expert layers stay on MARLIN. Attention DP exercises the
         external-comm dispatch path with scheduler-precomputed routing.
         """
         model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
