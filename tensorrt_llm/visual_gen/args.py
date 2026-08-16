@@ -116,7 +116,7 @@ class AttentionConfig(StrictBaseModel):
         status="prototype",
         description=(
             "Sparse attention recipe. Discriminated by algorithm: "
-            "skip_softmax (TRTLLM backend) or VSA (CUTEDSL backend)."
+            "skip_softmax (TRTLLM / CUTEDSL backends) or VSA (CUTEDSL backend)."
         ),
     )
 
@@ -177,29 +177,34 @@ class AttentionConfig(StrictBaseModel):
             return self
 
         algo = self.sparse_attention_config.algorithm
-        required_backend = {"skip_softmax": "TRTLLM", "vsa": "CUTEDSL"}.get(algo)
-        if required_backend is None:
+        supported_backends = {
+            "skip_softmax": ("TRTLLM", "CUTEDSL"),
+            "vsa": ("CUTEDSL",),
+        }.get(algo)
+        if supported_backends is None:
             return self
 
-        if self.backend != required_backend:
+        if self.backend not in supported_backends:
             raise ValueError(
                 f"sparse_attention_config with algorithm='{algo}' requires "
-                f"backend='{required_backend}', got backend='{self.backend}'. "
-                f"Either set backend='{required_backend}' or remove "
+                f"backend in {supported_backends}, got backend='{self.backend}'. "
+                f"Either select a supported backend or remove "
                 f"sparse_attention_config."
             )
         return self
 
     @model_validator(mode="after")
     def _validate_cutedsl_quant_sparse_mutex(self) -> "AttentionConfig":
-        # quant_attention_config and sparse_attention_config are mutually exclusive.
+        # VSA replaces the dense CuTeDSL path and cannot compose with quantized
+        # attention. SkipSoftmax is part of that dense path and can compose.
         if (
             self.backend == "CUTEDSL"
             and self.quant_attention_config is not None
             and self.sparse_attention_config is not None
+            and self.sparse_attention_config.algorithm == "vsa"
         ):
             raise ValueError(
-                "CUTEDSL backend: quant_attention_config and "
+                "CUTEDSL backend: quant_attention_config and VSA "
                 "sparse_attention_config are mutually exclusive (the "
                 "CuTeDSLAttention dispatcher selects either the dense path "
                 "or the sparse VSA path, not both)."

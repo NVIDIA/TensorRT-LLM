@@ -5,6 +5,7 @@
 
 import json
 import math
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -15,7 +16,14 @@ from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
 )
-from tensorrt_llm.visual_gen.args import AttentionConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
+    CuTeDSLAttention,
+    _resolve_skip_softmax_threshold_scale_factor,
+)
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
+from tensorrt_llm._torch.visual_gen.modules.attention import Attention
+from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig, VisualGenArgs
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -100,6 +108,19 @@ class TestVisualGenSkipSoftmaxUserAPI:
         assert sparse_config.target_sparsity == 0.5
         assert sparse_config.disabled_until_timestep == 0.6
         assert AttentionConfig(**config.model_dump()).model_dump() == config.model_dump()
+
+    def test_cutedsl_api_accepts_skip_softmax_with_quantized_attention(self):
+        config = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8"),
+            sparse_attention_config=SkipSoftmaxAttentionConfig(
+                threshold_scale_factor=5000.0,
+                disabled_until_timestep=0.6,
+            ),
+        )
+
+        assert isinstance(config.sparse_attention_config, SkipSoftmaxAttentionConfig)
+        assert config.quant_attention_config is not None
 
     def test_yaml_api_parses_skip_softmax_config(self):
         # YAML config should deserialize to the same public config object as
@@ -386,6 +407,91 @@ class TestVisualGenSkipSoftmaxTimestepCutoff:
             )
             == expected
         )
+
+
+class TestVisualGenSkipSoftmaxCuTeDSL:
+    """CuTeDSL lowering and runtime scheduling use the shared SkipSoftmax params."""
+
+    def test_attention_lowers_skip_softmax_params_for_cutedsl(self):
+        sparse_config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor=5000.0,
+            disabled_until_timestep=0.6,
+        )
+        quant_config = QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8")
+        model_config = DiffusionModelConfig(
+            component_name="transformer",
+            pretrained_config=SimpleNamespace(),
+            attention=AttentionConfig(
+                backend="CUTEDSL",
+                quant_attention_config=quant_config,
+                sparse_attention_config=sparse_config,
+            ),
+            skip_create_weights_in_init=True,
+        )
+
+        attention = Attention(
+            hidden_size=16,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_norm=False,
+            config=model_config,
+            module_name="blocks.0.attn1",
+        )
+
+        assert isinstance(attention.attn, CuTeDSLAttention)
+        assert isinstance(attention.sparse_params, SkipSoftmaxParams)
+        assert attention.attn.sparse_params is attention.sparse_params
+        assert attention.attn.quant_attention_config is quant_config
+
+    @pytest.mark.parametrize(
+        ("timestep", "expected"),
+        [
+            (1.0, None),
+            (0.6, None),
+            (0.59, 5000.0),
+            (None, 5000.0),
+        ],
+    )
+    def test_runtime_threshold_tracks_timestep(self, timestep, expected):
+        sparse_params = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor=5000.0,
+            disabled_until_timestep=0.6,
+        ).to_sparse_params()
+
+        threshold = _resolve_skip_softmax_threshold_scale_factor(
+            None,
+            sparse_params,
+            timestep,
+        )
+
+        assert threshold == expected
+
+    def test_cuda_graph_phase_uses_checkpoint_timestep_cutoff(self):
+        sparse_config = SkipSoftmaxAttentionConfig(threshold_scale_factor=5000.0)
+        model_config = DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(
+                sparse_attention_config=_ckpt_sparse_attention_config(disabled_until_timestep=0.6)
+            ),
+            attention=AttentionConfig(
+                backend="CUTEDSL",
+                sparse_attention_config=sparse_config,
+            ),
+        )
+        model = BaseDiffusionModel(model_config)
+
+        class _Runner:
+            def __init__(self):
+                self.extra_key_fns = {}
+
+            def register_extra_key_fn(self, name, fn):
+                self.extra_key_fns[name] = fn
+
+        runner = _Runner()
+        model.register_cuda_graph_extra_key_fns(runner)
+
+        phase_fn = runner.extra_key_fns["skip_softmax_phase"]
+        assert phase_fn(timestep=0.6) == 0
+        assert phase_fn(timestep=0.59) == 1
 
 
 class TestVisualGenSkipSoftmaxPipelineConfig:

@@ -72,7 +72,6 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
             SkipSoftmaxParams,
             SkipSoftmaxScheduler,
-            skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
         )
 
         module_name = kwargs.get("module_name", None)
@@ -81,13 +80,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if module_name is not None and self._is_disabled(module_name, ckpt_sparse_attention_config):
             return None
 
-        disabled_until_timestep = self.disabled_until_timestep
-        if disabled_until_timestep is None:
-            disabled_until_timestep = (
-                skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
-                    ckpt_sparse_attention_config
-                )
-            )
+        disabled_until_timestep = self.resolve_disabled_until_timestep(
+            checkpoint_config=ckpt_sparse_attention_config,
+        )
 
         threshold_scale_factor = self.resolve_threshold_scale_factor(ckpt_sparse_attention_config)
         if threshold_scale_factor is None:
@@ -103,6 +98,20 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         ):
             return None
         return SkipSoftmaxParams(scheduler=scheduler)
+
+    def resolve_disabled_until_timestep(self, **kwargs) -> Optional[float]:
+        """Resolve the user override or checkpoint-provided timestep cutoff."""
+        if self.disabled_until_timestep is not None:
+            return self.disabled_until_timestep
+
+        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+            skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
+        )
+
+        ckpt_sparse_attention_config = self._ckpt_sparse_attention_config_from_kwargs(kwargs)
+        return skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
+            ckpt_sparse_attention_config
+        )
 
     def _is_disabled(
         self,
