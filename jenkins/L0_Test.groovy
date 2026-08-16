@@ -3586,12 +3586,16 @@ def launchTestListCheck(pipeline)
  */
 def runPytestWithLog(stageName, pytestCommand, invIdx, unfinishedFile, timeoutDataFile, llmSrc) {
     def outDir = "${WORKSPACE}/${stageName}"
-    def cmdFile = "${outDir}/pytest_cmd_${invIdx}.sh"
+    // writeFile runs as the Jenkins agent user, whereas the stage directory is
+    // created by the test container and can be root-owned. Keep the temporary
+    // command file in the Jenkins-writable workspace root.
+    def safeStageName = stageName.replaceAll("[^A-Za-z0-9_.-]", "_")
+    def cmdFile = "${WORKSPACE}/pytest_cmd_${safeStageName}_${invIdx}.sh"
     def wrapperScript = "${llmSrc}/jenkins/scripts/run_pytest_with_log.sh"
 
-    sh "mkdir -p '${outDir}'"
     writeFile file: cmdFile, text: "#!/usr/bin/env bash\ncd '${llmSrc}/tests/integration/defs'\n${pytestCommand.join(' ')}"
     try {
+        sh "mkdir -p '${outDir}'"
         sh "bash '${wrapperScript}' '${cmdFile}' '${outDir}' '${timeoutDataFile}' '${invIdx}' '${unfinishedFile}'"
     } finally {
         sh "rm -f '${cmdFile}' || true"

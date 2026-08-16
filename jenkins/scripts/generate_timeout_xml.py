@@ -42,6 +42,23 @@ def sanitize_for_xml(text):
     return escape(text, quote=False)
 
 
+def format_timeout_system_out(nodeid, snippet):
+    """Return a human-readable timeout section for a JUnit ``system-out`` field."""
+    return (
+        "\n"
+        "==============================================================================\n"
+        "PYTEST TIMEOUT\n"
+        f"Test: {nodeid}\n"
+        "------------------------------------------------------------------------------\n"
+        "Captured pytest output:\n"
+        "------------------------------------------------------------------------------\n"
+        f"{snippet.rstrip()}\n"
+        "==============================================================================\n"
+        "END PYTEST TIMEOUT\n"
+        "==============================================================================\n"
+    )
+
+
 def load_timeout_map(path):
     """Load *path* as NDJSON and return a ``{nodeid: snippet}`` mapping.
 
@@ -174,10 +191,11 @@ def generate_timeout_xml(stage_name, testList, outputFilePath, timeout_map=None)
 
         if test in timeout_map:
             # Confirmed pytest-timeout kill: embed the captured log snippet.
-            snippet_escaped = sanitize_for_xml(timeout_map[test])
+            system_out = format_timeout_system_out(test, timeout_map[test])
+            snippet_escaped = sanitize_for_xml(system_out)
             error_block = (
                 f'        <error message="pytest_timeout">Pytest timeout.</error>\n'
-                f"        <system-out>{snippet_escaped}</system-out>"
+                f"        <system-out>{snippet_escaped}</system-out>\n"
             )
         else:
             # Unexpected termination (OOM, node crash, etc.) or unknown cause.
