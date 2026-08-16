@@ -122,7 +122,11 @@ def hash_files(paths: list[Path]) -> dict[Path, str]:
 
 
 def normalize_path(filepath: str, repo_root: Path) -> str:
-    """Normalize an absolute path to a repo-relative POSIX path.
+    """Normalize a path into the POSIX form used as a baseline JSON key.
+
+    An absolute path under ``repo_root`` becomes repo-relative; an absolute
+    path outside it stays absolute; a relative path is left as-is. Every case
+    is returned with forward slashes.
 
     The baseline JSON stores forward-slash keys. Returning the platform
     separator instead would make every lookup miss on Windows, so each
