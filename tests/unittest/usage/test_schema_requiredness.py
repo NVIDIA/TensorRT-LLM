@@ -16,7 +16,7 @@ def test_checked_in_schema_has_no_requiredness_drift() -> None:
     assert validator.validate() == []
 
 
-def test_validate_detects_requiredness_drift(
+def test_validate_detects_property_missing_from_required(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     validator = importlib.import_module("tensorrt_llm.usage.schemas.__main__")
@@ -30,3 +30,23 @@ def test_validate_detects_requiredness_drift(
     errors = validator.validate()
 
     assert "trtllm_heartbeat: field 'seq' in SMS properties but missing from required" in errors
+
+
+def test_validate_detects_required_field_missing_from_properties(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    validator = importlib.import_module("tensorrt_llm.usage.schemas.__main__")
+    sms = json.loads(validator.SMS_SCHEMA_PATH.read_text(encoding="utf-8"))
+    heartbeat = sms["definitions"]["events"]["trtllm_heartbeat"]
+    heartbeat["required"].append("undeclared_field")
+
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(json.dumps(sms), encoding="utf-8")
+    monkeypatch.setattr(validator, "SMS_SCHEMA_PATH", schema_path)
+
+    errors = validator.validate()
+
+    assert (
+        "trtllm_heartbeat: field 'undeclared_field' in SMS required but missing from properties"
+        in errors
+    )
