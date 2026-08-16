@@ -203,6 +203,7 @@ def main(ctx, model: str, tokenizer: Optional[str],
             f"{backend} is not a known backend, check help for available options.",
             param_hint="backend")
 
+    # Pre-check YAML telemetry settings before full config validation.
     if extra_llm_api_options is not None:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_extra_dict = yaml.safe_load(f)
@@ -222,6 +223,7 @@ def main(ctx, model: str, tokenizer: Optional[str],
             extra_llm_api_options,
             explicit_cli_keys=explicit_cli_keys)
 
+    # Update telemetry state or disable the early session.
     start_usage_session(
         llm_args.get("telemetry_config"),
         default_usage_context=_telemetry_config.UsageContext.CLI_EVAL.value,
