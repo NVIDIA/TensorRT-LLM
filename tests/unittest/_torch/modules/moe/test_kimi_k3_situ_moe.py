@@ -469,7 +469,7 @@ def test_kimi_k3_moe_split_selection(monkeypatch):
     assert KimiK3MoERuntime._select_moe_tp_ep(auto) == (4, 2)
 
 
-@pytest.mark.parametrize("backend", ["TRTLLM", "MEGAMOE_DEEPGEMM"])
+@pytest.mark.parametrize("backend", ["TRTLLM", "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"])
 def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
     model_config = ModelConfig(
         mapping=Mapping(world_size=1, rank=0, tp_size=1),
@@ -486,7 +486,8 @@ def test_kimi_k3_routed_config_preserves_explicit_backend(backend):
     "backend,expected_moe_max_num_tokens",
     [
         pytest.param("TRTLLM", 33024, id="trtllm"),
-        pytest.param("MEGAMOE_DEEPGEMM", 131072, id="megamoe"),
+        pytest.param("MEGAMOE_DEEPGEMM", 131072, id="megamoe-deepgemm"),
+        pytest.param("MEGAMOE_CUTEDSL", 131072, id="megamoe-cutedsl"),
     ],
 )
 def test_kimi_k3_routed_config_scopes_megamoe_capacity(backend, expected_moe_max_num_tokens):

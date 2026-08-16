@@ -3786,10 +3786,27 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         # those containers is created lazily on the load path, which a
         # multi-threaded streaming loader cannot do safely.
         super().prepare_streaming_expert_load(module)
+        # This backend keeps its raw NVFP4 source params as 0-element
+        # placeholders and only rematerializes them inside its own
+        # load_weights, which a streaming loader bypasses -- so without this
+        # the first per-expert write indexes an empty tensor
+        # ("index 0 is out of bounds for dimension 0 with size 0").
+        # process_weights_after_loading shrinks them again after packing.
+        self._materialize_source_params(module)
         module.tmp_cutlass_w3_w1_weights = {}
         module.tmp_cutlass_w3_w1_weight_scales = {}
         module._streamed_w2_covered = set()
         module._streamed_w2_scale_covered = set()
+
+    # NOTE: this backend deliberately does NOT override
+    # finalize_streamed_expert, unlike its Cutlass sibling. Its staged
+    # dicts are not only staging: _initial_slot_coverage() COUNTS their
+    # entries to decide which slots a partial load actually populated, so
+    # draining them per expert would report zero coverage and make a
+    # complete load look empty. Bounding the staged footprint here means
+    # moving that accounting off the dicts first (e.g. onto
+    # _streamed_expert_slots, which already tracks exactly this) rather
+    # than copying the Cutlass drain over.
 
     def _get_fc2_alpha_input_scale(
         self,
@@ -4220,7 +4237,24 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                                           module: torch.nn.Module) -> None:
         """Reject partially populated NVFP4 auxiliary-scale families."""
         n_slots = module.expert_size_per_partition
-        n_experts = module.num_experts
+        # A whole-checkpoint load is handed every expert's input_scale, because
+        # the weights dict holds the entire checkpoint; a streaming EP load
+        # only ever reads its own rank's experts, so its complete answer is
+        # expert_size_per_partition, not num_experts. Expecting the latter
+        # turns a complete streamed load into a false "partial" report.
+        #
+        # This is the one place the documented divergence in
+        # load_streaming_nvfp4_expert becomes visible: with fewer entries the
+        # global input-scale reduction in process_weights_after_loading is over
+        # the rank-local slice rather than all experts. The two agree exactly
+        # while input_scale is uniform across experts -- which is what a
+        # static-activation-scale checkpoint gives. A checkpoint with genuinely
+        # per-expert activation scales needs a cross-rank reduction added
+        # there; this check is not the place to catch that, because a
+        # single-rank load of such a checkpoint would be equally wrong and
+        # equally "complete".
+        streamed = bool(getattr(module, '_streamed_expert_slots', None))
+        n_experts = n_slots if streamed else module.num_experts
         weight_scale_2 = getattr(module, 'tmp_weight_scale_2', None) or {}
         raw_input_scales = getattr(module, 'tmp_raw_input_scales', None) or {}
 

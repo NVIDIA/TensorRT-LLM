@@ -1100,6 +1100,20 @@ class KimiK3MoERuntime(nn.Module):
                     "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
                     f"MoE factory selected {type(self.routed_experts.backend).__name__}."
                 )
+        if routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL":
+            from ..modules.fused_moe.mega_moe import MegaMoECuteDsl
+
+            # Same guard as MEGAMOE_DEEPGEMM above, and for the same reason:
+            # create_moe silently falls back when a backend declines the
+            # config, and for MegaMoE the decline is easy to trigger (it is
+            # EP-only and has its own token/top-k limits), so an explicit
+            # request that quietly became CUTLASS would be measured as if it
+            # were MegaMoE.
+            if not isinstance(self.routed_experts.backend, MegaMoECuteDsl):
+                raise RuntimeError(
+                    "Kimi K3 explicitly requested MEGAMOE_CUTEDSL, but the "
+                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
+                )
         if self.routed_experts.layer_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
@@ -1246,11 +1260,15 @@ class KimiK3MoERuntime(nn.Module):
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
         """Build a private routed-expert mapping without mutating the shared
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
-        supported_backends = {"TRTLLM", "MEGAMOE_DEEPGEMM"}
+        supported_backends = {
+            "TRTLLM",
+            "MEGAMOE_DEEPGEMM",
+            "MEGAMOE_CUTEDSL",
+        }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
-                "Kimi K3 SiTU routed experts only support the TRTLLM and "
-                "MEGAMOE_DEEPGEMM backends; "
+                "Kimi K3 SiTU routed experts only support the TRTLLM, "
+                "MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:
@@ -1295,7 +1313,10 @@ class KimiK3MoERuntime(nn.Module):
         # divides it by EP size for the per-rank allocation. Other backends
         # keep the user-configured value as their MoE chunking bound.
         # Preserve an explicitly larger capacity.
-        if routed_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
+        if routed_model_config.moe_backend in {
+            "MEGAMOE_DEEPGEMM",
+            "MEGAMOE_CUTEDSL",
+        }:
             default_moe_max_num_tokens = routed_model_config.max_num_tokens * routed_mapping.dp_size
             configured_moe_max_num_tokens = int(routed_model_config.moe_max_num_tokens or 0)
             if configured_moe_max_num_tokens < default_moe_max_num_tokens:
