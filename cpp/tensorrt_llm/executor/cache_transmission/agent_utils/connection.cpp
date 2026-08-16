@@ -748,12 +748,59 @@ std::vector<uint8_t> const& AgentConnectionManager::getBufferKinds() const
     return mBufferKinds;
 }
 
+namespace
+{
+
+/// Publishes a remote agent as "handshake in flight", then releases the held lock for the duration
+/// of that handshake and takes it back afterwards. Owning the unlock/relock as well as the mark is
+/// what makes the exception path safe: if loadRemoteAgent throws, the destructor still re-acquires
+/// the lock before clearing the mark, so the mark never disappears unsynchronized and a failed
+/// handshake stays retryable.
+class ScopedAgentLoad
+{
+public:
+    ScopedAgentLoad(std::unique_lock<std::mutex>& lock, std::set<std::string>& loadingAgents,
+        std::condition_variable& cv, std::string const& name)
+        : mLock(lock)
+        , mLoadingAgents(loadingAgents)
+        , mCv(cv)
+        , mName(name)
+    {
+        mLoadingAgents.insert(mName);
+        mLock.unlock();
+    }
+
+    ~ScopedAgentLoad()
+    {
+        // Unconditional: the constructor unlocked, and the guarded scope never touches the lock.
+        mLock.lock();
+        mLoadingAgents.erase(mName);
+        mCv.notify_all();
+    }
+
+    ScopedAgentLoad(ScopedAgentLoad const&) = delete;
+    ScopedAgentLoad& operator=(ScopedAgentLoad const&) = delete;
+
+private:
+    std::unique_lock<std::mutex>& mLock;
+    std::set<std::string>& mLoadingAgents;
+    std::condition_variable& mCv;
+    std::string const& mName;
+};
+
+} // namespace
+
 AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connectionInfo,
     std::optional<std::string> metadata, bool isSender)
 {
 
     TLLM_LOG_DEBUG(mRank, "mAgentName: %s connect to %s", mAgentName.c_str(), remoteAgentName.c_str());
-    std::scoped_lock lock(mConnectionsMutex);
+    std::unique_lock lock(mConnectionsMutex);
+    // Observe an in-flight handshake's result instead of racing it: starting a second load for the
+    // same peer would insert a second AgentConnection over the first, dangling the raw pointer an
+    // earlier caller already returned, and would let invalidateRemoteAgent below run against a poll
+    // still in progress. Only same-peer callers wait; every other peer proceeds immediately.
+    mLoadingAgentsCv.wait(lock, [&] { return mLoadingAgents.count(remoteAgentName) == 0; });
     auto it = mConnections.find(remoteAgentName);
     if (it != mConnections.end())
     {
@@ -788,6 +835,11 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
             TLLM_CHECK_WITH_INFO(!isSender, "Sender shouldn't call loadRemoteAgent");
             TLLM_LOG_DEBUG(mRank, "mAgentName: %s connect to %s with loadRemoteAgent", mAgentName.c_str(),
                 remoteAgentName.c_str());
+            // This overload waits on the peer's metadata reply -- unbounded network I/O. Holding
+            // mConnectionsMutex across it let one silent peer stall connect() for every other peer
+            // too, and stall notification draining with it: the sender thread blocks here while
+            // holding mNotificationMutex, which updateUnhandledNotifications then can never take.
+            ScopedAgentLoad const loading{lock, mLoadingAgents, mLoadingAgentsCv, remoteAgentName};
             m_Agent->loadRemoteAgent(remoteAgentName, connectionInfo);
         }
     }

@@ -24,7 +24,9 @@
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/transferAgent.h"
+#include <condition_variable>
 #include <map>
+#include <set>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -333,6 +335,10 @@ public:
 private:
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
     std::mutex mConnectionsMutex;
+    /// Remote agents whose loadRemoteAgent handshake is in flight on some other thread, which runs
+    /// with mConnectionsMutex released. See connect() for why same-peer callers wait on it.
+    std::set<std::string> mLoadingAgents;
+    std::condition_variable mLoadingAgentsCv;
     /// Connection info for dynamically discovered agents that are not listed in mCommState.
     std::map<std::string, std::string> mRemoteConnectionInfo;
     std::mutex mRemoteConnectionInfoMutex;

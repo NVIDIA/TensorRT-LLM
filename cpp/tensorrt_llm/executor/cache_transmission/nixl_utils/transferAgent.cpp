@@ -667,8 +667,6 @@ ConnectionInfoType NixlTransferAgent::getLocalConnectionInfo()
 
 void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
 {
-    std::unique_lock<std::shared_mutex> lock(mLock);
-    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::loadRemoteAgent called after shutdown");
     auto const separator = connectionInfo.rfind(':');
     TLLM_CHECK_WITH_INFO(separator != std::string::npos,
         "Invalid NIXL connection info, expected 'ip:port' or '[ipv6]:port': %s", connectionInfo.c_str());
@@ -685,22 +683,58 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
     nixl_opt_args_t md_extra_params;
     md_extra_params.ipAddr = ip;
     md_extra_params.port = std::stoi(port);
-    auto status = mRawAgent->fetchRemoteMD(name, &md_extra_params);
-    TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "fetchRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
-    // status = mRawAgent->sendLocalMD(&md_extra_params);
-    // TLLM_CHECK_WITH_INFO(
-    //     status == NIXL_SUCCESS, "sendLocalMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
 
-    status = NIXL_ERR_NOT_FOUND;
+    // The metadata wait below is unbounded network I/O. Holding mLock across it would block every
+    // other entry point -- exclusively for the writers (registerMemory, invalidateRemoteAgent,
+    // shutdown), and, because glibc's shared_mutex prefers writers, transitively for readers queued
+    // behind them. So take the lock per NIXL call instead of across the whole wait: writers now
+    // queue behind a single call rather than the entire handshake.
+    //
+    // Scoping it this way, rather than observing mRawAgent through a weak_ptr, is what preserves the
+    // second duty the original exclusive lock was carrying: shutdown() takes mLock exclusively
+    // *specifically* to drain in-flight callers before mRawAgent.reset(). A weak_ptr handle would let
+    // the reset land while this thread still held a strong ref, migrating ~nixlAgent (documented to
+    // release UCX and the progress thread synchronously) onto the waiter. Holding the shared_lock
+    // across the dereference keeps that release on the teardown thread where it belongs.
+    auto withAgent = [this, &name](auto&& fn)
+    {
+        std::shared_lock<std::shared_mutex> lock(mLock);
+        // Same invariant every other entry point relies on: shutdown() resets mRawAgent under the
+        // exclusive lock only after setting mShutdown, so !mShutdown here implies a live agent.
+        TLLM_CHECK_WITH_INFO(!mShutdown.load(),
+            "NixlTransferAgent shut down while awaiting metadata of remote agent '%s'", name.c_str());
+        return fn(*mRawAgent);
+    };
+
+    auto fetchRemoteMD = [&]
+    {
+        auto const status = withAgent([&](nixlAgent& agent) { return agent.fetchRemoteMD(name, &md_extra_params); });
+        TLLM_CHECK_WITH_INFO(
+            status == NIXL_SUCCESS, "fetchRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    };
+    fetchRemoteMD();
+
+    nixl_status_t status{NIXL_ERR_NOT_FOUND};
     nixl_xfer_dlist_t descs{DRAM_SEG};
+    // fetchRemoteMD is fire-and-forget with no retransmit, so if that one request is lost -- or
+    // reaches a listener that is not serving yet -- no reply ever arrives and polling alone waits
+    // forever. Re-ask periodically so the handshake recovers on its own.
+    auto constexpr kRefetchInterval = std::chrono::seconds(5);
+    auto lastFetch = std::chrono::steady_clock::now();
     while (status == NIXL_ERR_NOT_FOUND)
     {
-        status = mRawAgent->checkRemoteMD(name, descs);
+        status = withAgent([&](nixlAgent& agent) { return agent.checkRemoteMD(name, descs); });
         TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND,
             "checkRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
         if (status == NIXL_ERR_NOT_FOUND)
         {
+            if (auto const now = std::chrono::steady_clock::now(); now - lastFetch >= kRefetchInterval)
+            {
+                lastFetch = now;
+                TLLM_LOG_WARNING(mRank, "Still waiting for NIXL metadata of remote agent '%s' at %s; re-requesting.",
+                    name.c_str(), connectionInfo.c_str());
+                fetchRemoteMD();
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
