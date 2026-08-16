@@ -966,6 +966,21 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - **黄金点:slo20 全套原件(ADP+DEEPGEMM+maxbs256+kv0.8)× u128 = 28,784 成功/27 失败**。与原始 slo20 唯二偏差:ctx 3×tp8、并发 128(均有硬归因)。
 - **四臂矩阵已在该点开跑**:notrim(r1=28.8k ✓)/DL4/DL3/sched(nvfp4 DSpark,sched 挂 aa_slo20_table_v1 + tiers2345 裸 sigmoid)——回答"收益属于置信度调度还是静态砍 draft len"(roofline best-static 之争的实测版)。
 
+## 【08-16 09:30】slo20-true 四臂矩阵终表(laliao 侧):静态砍 DL 伤 SLO;sched 无损无益(nvfp4 平 θ 下理性拒裁)
+
+工作点 = slo20 原件键(ADP+DEEPGEMM+maxbs256+kv0.8)× u128 × nvfp4 DSpark,每臂独立冷启动,AA client 真轨迹:
+
+| 臂 | 完成数 | SSE p50 tok/s |
+|---|---|---|
+| notrim(heur)×2 | 28,784 / 29,698 | 92.1 / 91.6 |
+| notrim-noheur(公平对照) | **30,199** | 91.7 |
+| **sched**(表+tiers2345 裸sigmoid) | 29,179 | **92.5** |
+| DL4 | 30,090 | **84.1(−8%)** |
+| DL3 | 29,227 | **77.3(−16%)** |
+
+- **静态砍 DL 在 SLO 语义下净损**:吞吐 +1~4%(rep 方差 ~3% 内)换每请求速度 −8~−16%——roofline 的 best-static 之争在 SLO 判据下出局。
+- **sched 无损无益**:vs 公平对照完成数 −3.4%(方差内)、速度 +0.9%;trim 仅 0.0023、accept 3.55——planner 按表判定 nvfp4 的 θ 不值得裁并拒裁,行为正确。与量化经济学自洽(收益的肉在 fp8,agg 侧 +11.8% 已证)。sched×heuristic_topk 被验证器禁(ragged 批 next_n 重建不成立)——sched 部署需关 heuristic,公平对照已扣除该差异。
+- 下一格候选:fp8 原版 × 同矩阵(唯一可能让 sched 翻正的工作点);u512+ 需先修 v2 rawref(回滚路径)。
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
