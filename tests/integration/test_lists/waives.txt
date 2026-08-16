@@ -163,6 +163,7 @@ full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_fu
 full:DGX_B200/disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b] SKIP (https://nvbugs/6594241)
 full:DGX_B200/perf/test_perf_sanity.py::test_e2e[aggr_upload-gemma4_26b_a4b_nvfp4_blackwell-gemma4_26b_a4b_nvfp4_tp1_1k1k] SKIP (https://nvbugs/6571410)
 full:DGX_B200/perf/test_perf_sanity.py::test_e2e[aggr_upload-host_perf_llama8b_spec_decode-llama8b_spec_bs1_128_128] SKIP (https://nvbugs/6571408)
+full:DGX_H100/unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_tinyllama_logits_processor_tp2pp2 SKIP (https://nvbugs/6618106)
 full:GB200/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[ctx_block_reuse_only] SKIP (https://nvbugs/6525893)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy SKIP (https://nvbugs/6276923)
 full:GB200/accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt SKIP (https://nvbugs/6276923)
