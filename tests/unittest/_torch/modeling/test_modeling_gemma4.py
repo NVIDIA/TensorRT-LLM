@@ -1220,6 +1220,80 @@ class TestGemma4HFComparison(unittest.TestCase):
         """K=V attention: full layers share key→value, v_norm applied."""
         self._run_full_model_comparison(deepcopy(GEMMA4_KEV_CONFIG))
 
+    # -- Production head dims (256 sliding / 512 full) without trtllm-gen ----
+    #
+    # trtllm-gen ships head_dim 512 cubins for datacenter Blackwell only, and
+    # FlashInfer's fa2/fa3 paged kernels stop at 256. Patching ``is_sm_100f``
+    # off forces the dispatch every other architecture takes (Hopper included),
+    # where the full-attention layers run on the Triton prefill/decode kernels
+    # while the sliding layers stay on FlashInfer. Comparing against HF then
+    # covers the mixed-backend model end to end, on any GPU.
+
+    def _run_triton_path_comparison(self, config_dict):
+        """Run the HF comparison with the non-Blackwell dispatch forced on.
+
+        Both ``is_sm_100f`` call sites must be patched together. The one in
+        ``modeling_gemma4`` picks ``flashinfer_backend`` ("fa2" off Blackwell,
+        "trtllm-gen" on it); the one in the FlashInfer backend decides whether
+        head_dim>256 layers divert to Triton. Patching only the backend would,
+        on Blackwell, leave the sliding layers on trtllm-gen while the full
+        layers ran on Triton -- a mix that never occurs in production. Patching
+        both makes this a faithful non-Blackwell simulation on any GPU.
+        """
+        with (
+            unittest.mock.patch(
+                "tensorrt_llm._torch.attention_backend.flashinfer.is_sm_100f",
+                return_value=False,
+            ),
+            unittest.mock.patch(
+                "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
+                return_value=False,
+            ),
+        ):
+            self._run_full_model_comparison(config_dict)
+
+    @torch.no_grad()
+    def test_e2b_real_dims_triton_path(self):
+        """E2B geometry: MQA sliding + head_dim 512 full layers on Triton."""
+        self._run_triton_path_comparison(deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
+
+    @torch.no_grad()
+    def test_31b_real_dims_triton_path(self):
+        """31B geometry: mixed GQA ratios and K=V full layers on Triton."""
+        self._run_triton_path_comparison(deepcopy(GEMMA4_31B_REAL_DIMS_CONFIG))
+
+    @torch.no_grad()
+    def test_26b_real_dims_triton_path(self):
+        """26B-A4B geometry: GQA 16/8 sliding and K=V full layers on Triton."""
+        self._run_triton_path_comparison(deepcopy(GEMMA4_26B_REAL_DIMS_CONFIG))
+
+    @torch.no_grad()
+    def test_triton_path_is_actually_taken(self):
+        """Both Triton kernels must really run for the head_dim 512 layers.
+
+        Without this, a dispatch regression that quietly sent head_dim 512 back
+        to FlashInfer would only surface as a kernel error on some
+        architectures, and the comparisons above would look like passing
+        coverage of a path they never executed.
+        """
+        import tensorrt_llm._torch.attention_backend.triton_decode as decode_mod
+        import tensorrt_llm._torch.attention_backend.triton_prefill as prefill_mod
+
+        with (
+            unittest.mock.patch.object(
+                decode_mod, "triton_decode", wraps=decode_mod.triton_decode
+            ) as decode_spy,
+            unittest.mock.patch.object(
+                prefill_mod,
+                "triton_prefill_with_custom_mask",
+                wraps=prefill_mod.triton_prefill_with_custom_mask,
+            ) as prefill_spy,
+        ):
+            self._run_triton_path_comparison(deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
+
+        self.assertTrue(prefill_spy.called, "head_dim 512 prefill never reached Triton")
+        self.assertTrue(decode_spy.called, "head_dim 512 decode never reached Triton")
+
     @torch.no_grad()
     def test_kev_vnorm_order(self):
         """K=V: v_norm must apply to raw k_proj(x), NOT after k_norm.
@@ -2453,6 +2527,43 @@ class TestGemma4ModelDefaults(unittest.TestCase):
                 is_sliding=config.layer_types[layer_idx] == "sliding_attention",
             )
             self.assertEqual(attn.attn.flashinfer_backend, "fa2")
+
+    def test_only_full_attention_layers_exceed_flashinfer_head_dim_limit(self):
+        """Production head dims decide which layers FlashInfer can serve.
+
+        ``flashinfer_backend == "fa2"`` off Blackwell does not mean fa2 runs
+        every layer: ``FlashInferAttention.forward_impl`` sends anything above
+        ``_FLASHINFER_MAX_PAGED_HEAD_DIM`` to Triton instead, because fa2/fa3
+        have no paged kernel for it. Pin the geometry that split depends on --
+        Gemma4's sliding layers sit at the limit and its full-attention layers
+        sit above it, so a change to either would silently reroute layers.
+        """
+        from tensorrt_llm._torch.attention_backend.flashinfer import _FLASHINFER_MAX_PAGED_HEAD_DIM
+
+        config = Gemma4TextConfig(**deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG))
+        seen = set()
+        for layer_type in config.layer_types:
+            is_sliding = layer_type == "sliding_attention"
+            head_dim = config.head_dim if is_sliding else config.global_head_dim
+            seen.add(layer_type)
+            if is_sliding:
+                self.assertLessEqual(
+                    head_dim,
+                    _FLASHINFER_MAX_PAGED_HEAD_DIM,
+                    "sliding layers are expected to stay on FlashInfer",
+                )
+            else:
+                self.assertGreater(
+                    head_dim,
+                    _FLASHINFER_MAX_PAGED_HEAD_DIM,
+                    "full-attention layers are expected to need the Triton path",
+                )
+
+        self.assertEqual(
+            seen,
+            {"sliding_attention", "full_attention"},
+            "config must exercise both sides of the head_dim split",
+        )
 
 
 class TestGemma4CUDAGraph(unittest.TestCase):
