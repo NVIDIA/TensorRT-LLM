@@ -73,6 +73,20 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
         # `finish()` discards: the buffer holds exactly a delimiter. Passes on
         # `main` too - it guards against a fix that leaks the tag instead.
         ("deepseek-r1", f"a{R1_END}"),
+        # `finish()` flushes a complete tag that is *not* the delimiter it is
+        # waiting for. A `<think>` reaching a parser that is already inside
+        # the reasoning block opens nothing, so it is ordinary model output;
+        # discarding it deleted text the model produced.
+        ("deepseek-r1", f"a{R1_START}"),
+        ("qwen3_5", f"a{R1_START}"),
+        ("minimax_m2", f"a{R1_START}"),
+        ("minimax_m2_append_think", f"a{R1_START}"),
+        # The mirror case: with no reasoning block ever opened, a `</think>`
+        # closes nothing and is likewise output. `poolside_v1`/`laguna` reach
+        # the same code through their delegated `DeepSeekR1Parser`.
+        ("qwen3", f"a{R1_END}"),
+        ("poolside_v1", f"a{R1_END}"),
+        ("laguna", f"a{R1_END}"),
     ])
 def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(
         parser_key: str, text: str) -> None:
@@ -81,6 +95,9 @@ def test_deepseek_r1_reasoning_parser_stream_matches_non_stream(
     One `(parser_key, text)` pair per branch of `finish()`. This is the
     contract the missing flush violated, so it subsumes example-based tests
     of the individual branches.
+
+    `nano-v3`/`nemotron-v3` are absent on purpose: `NemotronV3ReasoningParser`
+    overrides `finish()` and never reaches these branches.
     """
     expected = ReasoningParserFactory.create_reasoning_parser(parser_key).parse(
         text)

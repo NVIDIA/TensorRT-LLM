@@ -310,13 +310,19 @@ class DeepSeekR1Parser(BaseReasoningParser):
         content.
 
         A buffer holding exactly a complete tag is a delimiter rather than
-        model output, so it is discarded as it would have been had more text
-        followed.
+        model output only while the parser is still waiting for that tag: a
+        `</think>` arriving inside a reasoning block closes it, so it is
+        discarded as it would have been had more text followed. Every other
+        complete tag opens or closes nothing - a `<think>` reaching a parser
+        already inside the block, or a `</think>` when no block was ever
+        entered - and is text the model emitted, which `parse()` likewise
+        keeps.
         """
         remaining = self._buffer
         self._buffer = ""
-        if not remaining or remaining in (self.reasoning_start,
-                                          self.reasoning_end):
+        if not remaining:
+            return ReasoningParserResult()
+        if remaining == self.reasoning_end and self.in_reasoning:
             return ReasoningParserResult()
         if self.in_reasoning:
             return ReasoningParserResult(reasoning_content=remaining)
