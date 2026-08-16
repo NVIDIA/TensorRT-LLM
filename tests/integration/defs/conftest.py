@@ -30,7 +30,7 @@ import urllib.request
 import warnings
 from functools import wraps
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import defs.ci_profiler
 import psutil
@@ -39,6 +39,7 @@ import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
+from _pytest.mark.structures import MarkDecorator
 # Dispatched explicitly (not via pytest_plugins, which pytest forbids in a
 # non-top-level conftest: a repo-root invocation like `pytest tests` loads
 # this file as a NESTED conftest and would fail collection; and not via "-p"
@@ -47,9 +48,6 @@ from _pytest.mark import ParameterSet
 # idempotent, so a repo-root run that also dispatches from tests/conftest.py
 # is harmless.
 from test_common import session_prefetcher_hooks as _prefetch_hooks
-
-from tensorrt_llm.bindings import ipc_nvls_supported
-from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from .perf.gpu_clock_lock import GPUClockLock
 from .perf.session_data_writer import SessionDataWriter
@@ -1534,6 +1532,13 @@ def skip_by_device_count(request):
                 f"Device count {device_count} is less than {expected_count}")
 
 
+def get_mpi_world_size() -> int:
+    """Lazy wrapper: keeps bindings out of conftest import (also re-exported)."""
+    from tensorrt_llm.llmapi.mpi_session import \
+        get_mpi_world_size as _get_mpi_world_size
+    return _get_mpi_world_size()
+
+
 @pytest.fixture(autouse=True)
 def skip_by_mpi_world_size(request):
     "fixture for skip less mpi world size"
@@ -1608,6 +1613,7 @@ def is_ipc_nvls_supported():
     if not torch.cuda.is_available():
         return False
     try:
+        from tensorrt_llm.bindings import ipc_nvls_supported
         return ipc_nvls_supported()
     except RuntimeError:
         return False
@@ -1657,8 +1663,21 @@ skip_device_contain_gb200 = pytest.mark.skipif(
     reason="This test is not supported on GB200 or GB100",
 )
 
-skip_no_nvls = pytest.mark.skipif(not is_ipc_nvls_supported(),
-                                  reason="NVLS is not supported")
+
+def skip_no_nvls(
+    func: Callable[..., object] | None = None
+) -> Callable[..., object] | MarkDecorator:
+    """Skip when NVLS is unsupported.
+
+    Deferred so importing conftest does not call into bindings.
+    """
+    mark = pytest.mark.skipif(not is_ipc_nvls_supported(),
+                              reason="NVLS is not supported")
+    if func is not None:
+        return mark(func)
+    return mark
+
+
 skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
     reason="This test is only  supported in Hopper architecture")

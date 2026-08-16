@@ -571,6 +571,23 @@ def launchReleaseCheck(pipeline, globalVars)
     })
 }
 
+def launchTestListCheck(pipeline, globalVars)
+{
+    def key = "Check Test List"
+    def image = globalVars["LLM_DOCKER_IMAGE"]
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
+        stage("[${key}] Run") {
+            echoNodeAndGpuInfo(pipeline, key)
+            sh "git config --global --add safe.directory \"*\""
+            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
+
+            def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
+               "python3 ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --check-duplicate-waives"
+        }
+    })
+}
+
 def getGitlabMRChangedFile(pipeline, function, filePath="") {
     def result = null
     def pageId = 0
@@ -1626,6 +1643,15 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 launchReleaseCheck(this, globalVars)
             }
         },
+        "Check Test List": {
+            script {
+                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping Check Test List (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
+                launchTestListCheck(this, globalVars)
+            }
+        },
         "x86_64-Linux": {
             script {
                 // CBTS deliberately does NOT short-circuit at the arch / Build
@@ -2103,15 +2129,25 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         echo "Will run job to build ngc containers and running in-pipeline scanning for them"
     }
 
+    def alwaysFailFastStages = ["Release-Check", "Check Test List"] as Set
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
             stage(key) {
-                value()
+                if (enableFailFast || key in alwaysFailFastStages) {
+                    value()
+                } else {
+                    // Avoid interrupting other stages on failure.
+                    catchError(catchInterruptions: false) {
+                        value()
+                    }
+                }
             }
         }
     }]}
 
-    parallelJobs.failFast = enableFailFast
+    // With --disable-fail-fast, ordinary build/test failures are suppressed above after
+    // marking their stage and build failed, so those branches do not trigger this fail-fast.
+    parallelJobs.failFast = true
     pipeline.parallel parallelJobs
 }
 
@@ -2203,11 +2239,20 @@ pipeline {
             steps {
                 script {
                     if (isReleaseCheckMode) {
-                        stage("Release-Check") {
-                            script {
-                                launchReleaseCheck(this, globalVars)
+                        def releaseCheckStages = [
+                            "Release-Check": {
+                                stage("Release-Check") {
+                                    launchReleaseCheck(this, globalVars)
+                                }
+                            },
+                            "Check Test List": {
+                                stage("Check Test List") {
+                                    launchTestListCheck(this, globalVars)
+                                }
                             }
-                        }
+                        ]
+                        releaseCheckStages.failFast = true
+                        parallel releaseCheckStages
                     } else {
                         // globalVars[CACHED_CHANGED_FILE_LIST] is only used in setupPipelineEnvironment
                         // Remove it to workaround the "Argument list too long" error

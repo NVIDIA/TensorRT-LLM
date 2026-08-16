@@ -4,10 +4,10 @@ This folder contains test definition which is consumed by `trt-test-db` tool bas
 
 ## Installation
 
-Install `trt-test-db` using the following command:
+Install `trt-test-db` using the following command (substitute `TRT_TEST_DB_VERSION` with the version from `jenkins/ci_versions.properties`):
 
 ```bash
-pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7
+pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==<TRT_TEST_DB_VERSION>
 ```
 
 ## Test Definition
@@ -57,6 +57,15 @@ pytest -v --test-list=/TensorRT-LLM/src/l0_e2e.txt --output-dir=/tmp/logs
 ```
 
 This command runs the tests specified in the test list and outputs the results to the specified directory.
+
+## Check Test List (CI)
+
+Jenkins **Check Test List** runs `scripts/check_test_list.py --l0 --qa --waive --validate`.
+L0/QA/waive collection uses pure-Python stubs of the compiled modules
+(`tests/integration/defs/stubify_bindings.py`, loaded only via
+`-p stubify_bindings`), so no TensorRT-LLM wheel or C++
+compile is required. Pre-commit runs check_test_list.py only with `--validate` and
+`--check-duplicate-waives`, which does not require stubs.
 
 ## Additional Information
 - The `--context` parameter in the `trt-test-db` command specifies which context to search in the YAML files.

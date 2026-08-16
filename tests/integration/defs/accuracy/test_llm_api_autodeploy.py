@@ -195,7 +195,6 @@ def reduced_model_kwargs(num_hidden_layers: int,
 
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
-    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
 
     # Configuration presets for different attention backends
     ATTN_BACKEND_CONFIGS = {
@@ -298,10 +297,11 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
         ],
     )
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
         kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH,
-                           tokenizer=self.MODEL_PATH,
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
                            world_size=world_size,
                            **kwargs) as llm:
             task = CnnDailymail(self.MODEL_NAME)
@@ -317,12 +317,13 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     ])
     def test_attention_dp(self, world_size):
         """Test attention data parallelism mode where TP sharding is disabled."""
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
         kwargs = self.get_default_kwargs(enable_chunked_prefill=True)
         # Enable attention DP - this disables TP sharding
         kwargs["transforms"]["detect_sharding"] = {"enable_attention_dp": True}
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH,
-                           tokenizer=self.MODEL_PATH,
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
                            world_size=world_size,
                            **kwargs) as llm:
             task = CnnDailymail(self.MODEL_NAME)
@@ -335,15 +336,13 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
     """Accuracy test for Eagle3 one-model speculative decoding with AutoDeploy."""
 
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
-    EAGLE_MODEL_PATH = hf_id_to_local_model_dir(
-        "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
+    EAGLE_MODEL_NAME = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 
     def get_default_kwargs(self, attn_backend="flashinfer"):
         yaml_paths, _ = _get_registry_yaml_extra(self.MODEL_NAME)
         speculative_config = Eagle3DecodingConfig(
             max_draft_len=3,
-            speculative_model=self.EAGLE_MODEL_PATH,
+            speculative_model=hf_id_to_local_model_dir(self.EAGLE_MODEL_NAME),
             eagle3_one_model=True,
             eagle3_layers_to_capture={1, 15, 28},
         )
@@ -391,11 +390,12 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     def test_eagle3_one_model(self, attn_backend):
         """Test Eagle3 one-model speculative decoding accuracy on GSM8K."""
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
         kwargs = self.get_default_kwargs(attn_backend=attn_backend)
 
         with AutoDeployLLM(
-                model=self.MODEL_PATH,
-                tokenizer=self.MODEL_PATH,
+                model=model_path,
+                tokenizer=model_path,
                 **kwargs,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)
@@ -548,13 +548,10 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
 
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "nano_v3.yaml")
-    MODEL_PATHS = {
-        "bf16":
-        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"),
-        "fp8":
-        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"),
-        "nvfp4":
-        hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"),
+    MODEL_NAMES = {
+        "bf16": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "fp8": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+        "nvfp4": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
     }
 
     def get_default_sampling_params(self):
@@ -587,7 +584,7 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
         # max_dp_num_tokens path; on world_size=1 it's a no-op.
         if enable_attention_dp and world_size < 2:
             pytest.skip("attention_dp requires world_size >= 2")
-        model_path = self.MODEL_PATHS[model_id]
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAMES[model_id])
         kwargs = {}
         device_memory_mib = get_device_memory()
         # bf16 always needs low-memory overrides; below H100-class total
@@ -622,16 +619,10 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "super_v3.yaml")
-    MODEL_PATHS = {
-        "bf16":
-        hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"),
-        "fp8":
-        hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8"),
-        "nvfp4":
-        hf_id_to_local_model_dir(
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"),
+    MODEL_NAMES = {
+        "bf16": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+        "fp8": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
+        "nvfp4": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     }
 
     def get_default_sampling_params(self):
@@ -667,7 +658,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         if model_id == "bf16" and world_size < 4:
             pytest.skip("bf16 Super V3 requires at least 4 GPUs")
 
-        model_path = self.MODEL_PATHS[model_id]
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAMES[model_id])
         kwargs = {}
         if model_id == "bf16":
             low_memory_overrides(kwargs)
@@ -712,7 +703,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
         No accuracy threshold is checked — the truncated model is not
         expected to produce meaningful text.
         """
-        model_path = self.MODEL_PATHS[dtype]
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAMES[dtype])
         kwargs = {}
         kwargs.update(
             reduced_model_kwargs(num_hidden_layers=16, model_path=model_path))
@@ -783,7 +774,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     )
     def test_mtp(self, world_size, attn_backend, model_id):
 
-        model_path = self.MODEL_PATHS[model_id]
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAMES[model_id])
         kwargs = {}
         # TODO: gate for bf16 only after replay lands
         low_memory_overrides(
@@ -837,8 +828,8 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
     CONFIG_YAML = str(
         Path(get_llm_root()) / "examples" / "auto_deploy" / "model_registry" /
         "configs" / "ultra_v3.yaml")
-    MODEL_PATHS = {
-        "nvfp4": hf_id_to_local_model_dir("nvidia/Nemotron-Ultra-V3-NVFP4"),
+    MODEL_NAMES = {
+        "nvfp4": "nvidia/Nemotron-Ultra-V3-NVFP4",
     }
 
     def get_default_sampling_params(self):
@@ -856,7 +847,7 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
 
-        model_path = self.MODEL_PATHS[model_id]
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAMES[model_id])
         print_memory_usage("test start")
         with AutoDeployLLM(
                 model=model_path,
@@ -1018,7 +1009,6 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
     MODEL_NAME_NVFP4 = "nvidia/Qwen3.5-397B-A17B-NVFP4"
     MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
-    MODEL_PATH_SMALL = hf_id_to_local_model_dir(MODEL_NAME_SMALL)
     GSM8K_MAX_OUTPUT_LEN = 512
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
@@ -1104,8 +1094,9 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH_SMALL,
-                           tokenizer=self.MODEL_PATH_SMALL,
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME_SMALL)
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
                            dtype="bfloat16",
                            world_size=world_size,
                            **config) as llm:
@@ -1129,7 +1120,6 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "MiniMaxAI/MiniMax-M2"
-    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
     # Set minimum possible seq len + small buffer, for test speed & memory usage
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
@@ -1158,9 +1148,10 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     def test_finegrained_fp8(self):
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
         kwargs = self.get_default_kwargs()
-        with AutoDeployLLM(model=self.MODEL_PATH,
-                           tokenizer=self.MODEL_PATH,
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
                            world_size=4,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -1333,7 +1324,6 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
     """Bench-run coverage for Gemma4 MoE via AutoDeploy."""
 
     MODEL_NAME = "google/gemma-4-26B-A4B-it"
-    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
     EXTRA_EVALUATOR_KWARGS = {
         "apply_chat_template": True,
     }
@@ -1357,8 +1347,9 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
             pytest.skip("Not enough devices for world size, skipping test")
 
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH,
-                           tokenizer=self.MODEL_PATH,
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
                            world_size=registry_world_size,
                            yaml_extra=yaml_paths) as llm:
             task = MMMU(self.MODEL_NAME)  # noqa: F821
