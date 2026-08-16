@@ -855,6 +855,61 @@ def test_cosmos3_edge_i2v_lpips_against_golden(_visual_gen_deps, request, tmp_pa
     _assert_lpips_below_threshold(score, COSMOS3_EDGE_I2V_LPIPS_THRESHOLD)
 
 
+def _ci_diag_hash(obj):
+    """sha256 of a tensor's bytes, plus shape/stats, for cross-machine diffing."""
+    import hashlib
+
+    t = obj.detach().float().cpu().contiguous()
+    return (
+        f"sha={hashlib.sha256(t.numpy().tobytes()).hexdigest()[:16]} "
+        f"shape={tuple(t.shape)} mean={t.mean().item():+.6e} std={t.std().item():.6e}"
+    )
+
+
+def _ci_diag_file(path):
+    import hashlib
+
+    data = open(str(path), "rb").read()
+    return f"sha={hashlib.sha256(data).hexdigest()[:16]} bytes={len(data)}"
+
+
+def _ci_diag_environment():
+    import hashlib
+    import platform
+
+    lines = []
+    try:
+        import torch
+
+        lines.append(
+            f"torch={torch.__version__} cuda={torch.version.cuda} "
+            f"cudnn={torch.backends.cudnn.version()} gpu={torch.cuda.get_device_name(0)} "
+            f"cap={torch.cuda.get_device_capability(0)}"
+        )
+        lines.append(
+            f"tf32_matmul={torch.backends.cuda.matmul.allow_tf32} "
+            f"tf32_cudnn={torch.backends.cudnn.allow_tf32} "
+            f"fp32_prec={torch.get_float32_matmul_precision()} "
+            f"deterministic={torch.are_deterministic_algorithms_enabled()} "
+            f"cublas_ws={os.environ.get('CUBLAS_WORKSPACE_CONFIG')}"
+        )
+    except Exception as exc:  # noqa: BLE001 - diagnostic only
+        lines.append(f"torch probe failed: {exc}")
+    for mod in ("diffusers", "transformers", "torchao", "tensorrt_llm"):
+        try:
+            lines.append(f"{mod}={__import__(mod).__version__}")
+        except Exception as exc:  # noqa: BLE001 - diagnostic only
+            lines.append(f"{mod}=UNAVAILABLE({type(exc).__name__})")
+    ckpt = _lpips_model_path("Cosmos3-Edge")
+    lines.append(f"python={platform.python_version()} models_root={os.path.dirname(ckpt)}")
+    for rel in ("model_index.json", "vae/config.json", "transformer/config.json"):
+        p = os.path.join(ckpt, rel)
+        if os.path.exists(p):
+            digest = hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
+            lines.append(f"ckpt:{rel}={digest}")
+    return lines
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cosmos3_edge_t2i_lpips_against_golden(request, tmp_path):
     from tensorrt_llm.media.encoding import save_image
@@ -863,14 +918,73 @@ def test_cosmos3_edge_t2i_lpips_against_golden(request, tmp_path):
     golden_path = _golden_media_path(
         tmp_path, "cosmos3_edge_t2i_lpips_golden.png", "Cosmos3-Edge T2I LPIPS golden image"
     )
-    result = _run_cosmos3_edge_lpips_pipeline(
-        prompt=COSMOS3_EDGE_T2I_LPIPS_PROMPT,
-        height=640,
-        width=640,
-        num_inference_steps=COSMOS3_EDGE_T2I_LPIPS_STEPS,
-        guidance_scale=4.0,
-        output_type="image",
+
+    # --- TEMPORARY CI DIAGNOSTIC (DO NOT MERGE) -----------------------------
+    # These goldens reproduce in CI but on no developer machine we can build:
+    # edge_t2i measures 0.117127 locally against 0.0056 recorded at creation,
+    # while every other VisualGen golden (qwenimage 50-step, wan, flux)
+    # reproduces locally. Ruled out locally, each by measurement and nearly all
+    # bit-identical: GPU generation (B200 vs B300), torch build (PyPI 2.11,
+    # 2.12, and NGC-patched 2.13a in a container), the container itself, the
+    # checkpoint, the models root, negative and system prompts, tokenization,
+    # per-step transformer parity against diffusers, VAE round-trip, the flow
+    # schedule, SDPA backend, diffusers/transformers versions, and test order.
+    # This captures CI's own inputs and intermediates so they can be diffed
+    # against the local ones, and reports through the assertion message because
+    # the CI report API returns empty stdout for tests that pass.
+    diag = list(_ci_diag_environment())
+    diag.append(f"golden {_ci_diag_file(golden_path)}")
+
+    import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as _p3
+    from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3VFMTransformer,
     )
+
+    _texts, _steps = [], []
+    _orig_tmpl = _p3.Cosmos3OmniMoTPipeline._apply_metadata_templates
+    _orig_fwd = Cosmos3VFMTransformer.forward
+
+    def _spy_tmpl(self, prompt, **kw):
+        out = _orig_tmpl(self, prompt, **kw)
+        _texts.append(out)
+        return out
+
+    def _spy_fwd(self, *a, **kw):
+        hs = kw.get("hidden_states", a[0] if a else None)
+        if isinstance(hs, torch.Tensor):
+            # Keep the first call (initial latent) and the most recent one, so
+            # a divergence can be attributed to the noise draw vs the trajectory.
+            if len(_steps) < 2:
+                _steps.append(_ci_diag_hash(hs))
+            else:
+                _steps[1] = _ci_diag_hash(hs)
+        return _orig_fwd(self, *a, **kw)
+
+    _p3.Cosmos3OmniMoTPipeline._apply_metadata_templates = _spy_tmpl
+    Cosmos3VFMTransformer.forward = _spy_fwd
+    try:
+        result = _run_cosmos3_edge_lpips_pipeline(
+            prompt=COSMOS3_EDGE_T2I_LPIPS_PROMPT,
+            height=640,
+            width=640,
+            num_inference_steps=COSMOS3_EDGE_T2I_LPIPS_STEPS,
+            guidance_scale=4.0,
+            output_type="image",
+        )
+    finally:
+        _p3.Cosmos3OmniMoTPipeline._apply_metadata_templates = _orig_tmpl
+        Cosmos3VFMTransformer.forward = _orig_fwd
+
+    import hashlib
+
+    for i, txt in enumerate(_texts):
+        diag.append(
+            f"text[{i}] sha={hashlib.sha256(txt.encode()).hexdigest()[:16]} chars={len(txt)}"
+        )
+    for i, st in enumerate(_steps):
+        diag.append(f"latent[{'first' if i == 0 else 'last'}] {st}")
+    # --- end diagnostic -----------------------------------------------------
+
     assert result is not None and result.image is not None, "Edge T2I produced no image"
     save_image(result.image[0], str(generated_path))
     score = _run_lpips_eval(
@@ -888,4 +1002,16 @@ def test_cosmos3_edge_t2i_lpips_against_golden(request, tmp_path):
         generated_path,
         "cosmos3_edge_t2i_lpips_golden.png",
     )
+
+    # --- TEMPORARY CI DIAGNOSTIC (DO NOT MERGE) -----------------------------
+    # Fail unconditionally so the fingerprint reaches the CI report, which only
+    # records error text -- a passing test reports empty stdout. Local values
+    # for the same fields, measured on B200 and B300 (identical to 6 dp):
+    #   score          0.117127          (CI's recorded creation value: 0.0056)
+    #   golden sha     59e2d3f30eb3c427  bytes=529144
+    diag.append(f"generated {_ci_diag_file(generated_path)}")
+    diag.append(f"SCORE={score:.6f} threshold={COSMOS3_EDGE_T2I_LPIPS_THRESHOLD} LOCAL=0.117127")
+    raise AssertionError("COSMOS3-CI-DIAG || " + " || ".join(diag))
+    # --- end diagnostic -----------------------------------------------------
+
     _assert_lpips_below_threshold(score, COSMOS3_EDGE_T2I_LPIPS_THRESHOLD)
