@@ -840,8 +840,6 @@ class TestForwardTransferChunks:
             return values.view(1, 1, 5, 1, 1).expand(1, 3, 5, 16, 16).clone()
 
         pipeline._decode_latents_raw = fake_decode
-        # Identity postprocess so assertions run on the raw float assembly.
-        monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
 
         # Input video: frame0 black (-1 normalized), frame1+ white (+1); the
         # control is an all-black clip. Both arrive as encoded bytes and are
@@ -888,10 +886,17 @@ class TestForwardTransferChunks:
 
         assert captured["conditional_frames"] == [2, 1]
         assert len(captured["decode_calls"]) == 2
-        assert output.video.shape == (1, 3, 8, 16, 16)
+        # (B, T, H, W, C) uint8 -- what postprocess_video_tensor declares.
+        assert output.video.shape == (1, 8, 16, 16, 3)
+        # The stitched sequence, run through the same conversion the pipeline
+        # applies, so this still asserts the chunk arithmetic rather than a
+        # hand-computed uint8 table.
+        expected = torch.tensor([-0.6, -0.5, -0.4, -0.3, -0.2, 0.2, 0.3, 0.4])
         torch.testing.assert_close(
-            output.video[0, 0, :, 0, 0],
-            torch.tensor([-0.6, -0.5, -0.4, -0.3, -0.2, 0.2, 0.3, 0.4]),
+            output.video[0, :, 0, 0, 0],
+            pipeline_module.postprocess_video_tensor(
+                expected.view(1, 1, 8, 1, 1).expand(1, 3, 8, 16, 16)
+            )[0, :, 0, 0, 0],
         )
         # First chunk target: frame0 = normalized black input, frame1 = white,
         # remainder filled by repeating the last conditional frame.
@@ -959,7 +964,6 @@ class TestControlLengthMismatch:
         tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
         pipeline._tokenize_prompt = lambda *a, **k: next(tokenized)
         pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)
-        monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
 
         lengths = {b"edge-clip": 4, b"seg-clip": 8}
 
@@ -997,7 +1001,8 @@ class TestControlLengthMismatch:
             transfer_config=cfg,
             video=None,
         )
-        assert output.video.shape[2] == 8
+        # (B, T, H, W, C): frames are dim 1.
+        assert output.video.shape[1] == 8
 
 
 class TestTransferFrameRateResolution:
@@ -1015,7 +1020,6 @@ class TestTransferFrameRateResolution:
         monkeypatch.setattr(
             transfer_module, "decode_video_reference_window", _fake_decode_window(5)
         )
-        monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
         tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
         pipeline._tokenize_prompt = lambda *a, **k: next(tokenized)
         pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)
@@ -1087,7 +1091,6 @@ class TestTransferSamplingAndSafety:
         monkeypatch.setattr(
             transfer_module, "decode_video_reference_window", _fake_decode_window(5)
         )
-        monkeypatch.setattr(pipeline_module, "postprocess_video_tensor", lambda video: video)
         tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
         pipeline._tokenize_prompt = tokenize or (lambda *a, **k: next(tokenized))
         pipeline._decode_latents_raw = lambda latents: torch.zeros(1, 3, 5, 16, 16)

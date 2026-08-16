@@ -2127,10 +2127,40 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             negative_prompt, max_sequence_length, use_system_prompt, system_prompt=system_prompt
         )
 
-        output_chunks: list[torch.Tensor] = []
-        control_chunks_per_hint: dict[str, list[torch.Tensor]] = {
-            key: [] for key in per_hint_frames
-        }
+        # Finished frames land in host memory as they are produced rather than
+        # stacking on the GPU for the whole run: at 720p a decoded chunk is
+        # ~0.5 GB, so a long generation would pile several GB of *completed*
+        # output on top of the denoise working set -- and `torch.cat` would then
+        # briefly double it. Only the next chunk's conditioning has to stay
+        # resident.
+        #
+        # Pinned, because the copy is then asynchronous and overlaps the next
+        # chunk's denoise; into pageable memory the same copy blocks and runs
+        # ~40x slower. Allocated per request rather than held, since torch's
+        # caching host allocator keeps the block and only the first request of a
+        # given size reaches cudaHostAlloc -- so deployments that never serve
+        # transfer page-lock nothing.
+        #
+        # Assembled on rank 0 alone: every rank decodes each chunk because the
+        # next one conditions on it, but the executor sends only rank 0's
+        # response, so assembling on the others allocates a pinned buffer per
+        # rank to build a video nobody reads.
+        assembles_output = self.rank == 0
+        show_controls = transfer_config.show_control_condition
+        show_input_panel = transfer_config.show_input and input_frames is not None
+        panels = (len(per_hint_frames) if show_controls else 0) + (1 if show_input_panel else 0)
+        host_output = (
+            torch.empty(
+                (1, total_frames, height, width * (panels + 1), 3),
+                dtype=torch.uint8,
+                # Page-locking needs a CUDA context; only the CPU-only unit
+                # tests run without one, and there is nothing to overlap there.
+                pin_memory=torch.cuda.is_available(),
+            )
+            if assembles_output
+            else None
+        )
+        frames_written = 0
         previous_output: torch.Tensor | None = None
 
         # Every chunk's decode is part of generation here (it feeds the next
@@ -2238,41 +2268,68 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # and serialize the loop behind a collective, which costs more than
             # recomputing the decode locally.
             output_video = self._decode_latents_raw(latents).clamp(-1, 1)
-            previous_output = output_video
 
-            if chunk_id == 0:
-                output_chunks.append(output_video)
-                for key, control in control_norms.items():
-                    control_chunks_per_hint[key].append(control)
-            else:
-                output_chunks.append(output_video[:, :, current_conditional_frames:])
-                for key, control in control_norms.items():
-                    control_chunks_per_hint[key].append(control[:, :, current_conditional_frames:])
+            # Chunk 0 keeps every frame; later chunks drop the overlap they were
+            # conditioned on. The tail trim that used to follow the final concat
+            # happens here instead, as a bound on what each chunk contributes.
+            skip = 0 if chunk_id == 0 else current_conditional_frames
+            take = min(output_video.shape[2] - skip, total_frames - frames_written)
+            if assembles_output and take > 0:
+                chunk = output_video[:, :, skip : skip + take]
+                panel_tensors = []
+                if show_controls:
+                    panel_tensors.extend(
+                        control_norms[key][:, :, skip : skip + take] for key in per_hint_frames
+                    )
+                if show_input_panel:
+                    panel_tensors.append(
+                        uint8_cthw_to_normalized_5d(
+                            input_frames[:, frames_written : frames_written + take],
+                            dtype=torch.float32,
+                        )
+                    )
+                if panel_tensors:
+                    chunk = torch.cat([p.to(chunk) for p in panel_tensors] + [chunk], dim=-1)
+                # Post-processing is elementwise, so doing it per chunk is
+                # bitwise identical to doing it on the assembled clip -- and it
+                # halves the transfer, since uint8 crosses instead of bf16.
+                host_output[:, frames_written : frames_written + take].copy_(
+                    postprocess_video_tensor(chunk), non_blocking=True
+                )
+                frames_written += take
 
-        full_output = torch.cat(output_chunks, dim=2)[:, :, :total_frames]
-        full_controls = {
-            key: torch.cat(chunks, dim=2)[:, :, :total_frames]
-            for key, chunks in control_chunks_per_hint.items()
-        }
+            # Only the tail is read as the next chunk's conditioning (one frame
+            # by default), so keep that slice rather than pinning the whole
+            # ~0.5 GB chunk across the next denoise.
+            keep = min(transfer_config.num_conditional_frames, output_video.shape[2])
+            previous_output = output_video[:, :, -keep:].clone() if keep > 0 else None
 
         timer.mark_post_start()
 
-        if transfer_config.show_control_condition:
-            all_controls = torch.cat([full_controls[key] for key in per_hint_frames], dim=-1)
-            full_output = torch.cat([all_controls.to(full_output), full_output], dim=-1)
-        if transfer_config.show_input and input_frames is not None:
-            normalized_input = uint8_cthw_to_normalized_5d(
-                input_frames[:, :total_frames], dtype=torch.float32
-            )
-            full_output = torch.cat([normalized_input.to(full_output), full_output], dim=-1)
-        video = postprocess_video_tensor(full_output)
+        # The chunk copies are asynchronous, so the host buffer is not readable
+        # until the stream drains. The upload below would be correctly ordered
+        # without this, but the guardrail reads the frames on the CPU.
+        #
+        # Only false under the CPU-only unit tests, where the copies above were
+        # host-to-host and there is no stream to wait on (``CudaPhaseTimer``
+        # disables itself on the same condition).
+        if torch.cuda.is_available():
+            torch.cuda.current_stream().synchronize()
 
         # Same screening the other modes get: rank 0, post-processed frames,
         # and a None result means the guardrail rejected the clip. With the
         # debug panels enabled the caller's own control frames ride along in
-        # the same tensor and are screened too, which errs safe.
+        # the same tensor and are screened too, which errs safe. Screening the
+        # host copy rather than a device one removes a full round trip:
+        # ``check_video_safety`` moves to CPU internally and returns on the
+        # input tensor's device.
+        video = host_output
         if self.rank == 0 and use_guardrails and self.safety_checker is not None:
             video = check_video_safety(video, self.safety_checker)
+        # Back to the device the other pipelines hand back, now that denoising
+        # has released its working set.
+        if video is not None:
+            video = video.to(self.device)
 
         timer.mark_end()
         return timer.fill(
