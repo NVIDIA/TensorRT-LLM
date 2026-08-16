@@ -450,12 +450,20 @@ class OpenAIServer(_VideoRoutesMixin):
                     "url": self.binding_addr
                 }
                 # TODO: add more metadata
-                # Register with ETCD using the existing key format
-                self.metadata_server.put(f"trtllm/{self.generator.llm_id}",
-                                         metadata)
+                # Off the loop: this lifespan now runs while the socket is
+                # already answering STARTING probes (see serve/lifecycle.py),
+                # so a slow etcd would leave /health accepted and never
+                # answered -- the third ambiguous state that contract removes.
+                await asyncio.to_thread(self.metadata_server.put,
+                                        f"trtllm/{self.generator.llm_id}",
+                                        metadata)
                 logger.info(f"trtllm/{self.generator.llm_id} is registered")
 
             if self.disagg_cluster_config:
+                # ON the loop, unlike the etcd put above: this constructs an
+                # aiohttp.ClientSession, which binds to the running loop, so
+                # building it on a worker thread breaks every later request.
+                # It also does not dial the backend, so it need not be off-loop.
                 self.disagg_cluster_storage = create_cluster_storage_client(
                     self.disagg_cluster_config.cluster_uri,
                     self.disagg_cluster_config.cluster_name)
@@ -532,6 +540,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self.disagg_cluster_worker.deregister_worker()
             if self.resource_governor is not None:
                 self.resource_governor.close()
+            # Deliberately inline on the loop despite being slow: blocking it
+            # means no asyncio timer can fire, so this teardown is never
+            # abandoned half-done. Off-loop it would keep running after its
+            # caller gave up, and BaseLLM.shutdown() takes no lock, so the two
+            # would drive ZeroMqQueue.close() from different threads -- not
+            # ZMQ-safe. Cost: /health and open connections stall until it
+            # finishes, accepted because the process is exiting anyway.
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -2644,14 +2659,55 @@ class OpenAIServer(_VideoRoutesMixin):
         return self._create_not_supported_error(
             "Image editing is not supported by any in-tree pipeline yet.")
 
+    def record_address(self, host, port) -> None:
+        """Record the address this server is reachable at.
+
+        Must be called before the app's lifespan runs: metadata-server
+        registration and the disagg cluster worker both read it. ``__call__``
+        does so implicitly; the lifecycle path (``serve_with_lifecycle``)
+        calls it explicitly because there the app is built after uvicorn is
+        already listening.
+        """
+        self.binding_addr = f"http://{host}:{port}"
+        self.host = host
+        self.port = port
+
+    def shutdown_generator(self) -> None:
+        """Tear the engine down outside the app's lifespan.
+
+        The engine is built before the app's lifespan runs, so if startup
+        fails between those two points the lifespan's own teardown never
+        executes and the engine's worker processes would outlive the
+        frontend. Safe to call when the lifespan did run: the underlying
+        shutdown is idempotent.
+
+        Blocking and synchronous; callers on an event loop must run it off
+        the loop (see ``serve_with_lifecycle``'s ``on_startup_failure``).
+        """
+        self.generator.shutdown()
+
+    async def register_with_disagg_cluster(self) -> bool:
+        """Register with the disagg cluster once the socket is serving.
+
+        Returns False if registration failed, in which case the caller is
+        expected to shut the server down rather than leave an unregistered
+        worker running.
+        """
+        if self.disagg_cluster_worker is None:
+            return True
+        try:
+            await self.disagg_cluster_worker.register_worker()
+        except Exception as e:
+            logger.error(f"Worker registration failed: {e}")
+            return False
+        return True
+
     async def __call__(self,
                        host,
                        port,
                        sockets: list[socket.socket] | None = None):
         # Store the binding address for server registration
-        self.binding_addr = f"http://{host}:{port}"
-        self.host = host
-        self.port = port
+        self.record_address(host, port)
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
@@ -2662,12 +2718,8 @@ class OpenAIServer(_VideoRoutesMixin):
         async def _register_after_serving():
             while not server.started:
                 await asyncio.sleep(0.1)
-            if self.disagg_cluster_worker:
-                try:
-                    await self.disagg_cluster_worker.register_worker()
-                except Exception as e:
-                    logger.error(f"Worker registration failed: {e}")
-                    server.should_exit = True
+            if not await self.register_with_disagg_cluster():
+                server.should_exit = True
 
         asyncio.create_task(_register_after_serving())
         await server.serve(sockets=sockets)

@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess  # nosec B404
 import sys
+import threading
 import time
 import uuid
 from importlib.util import find_spec
@@ -47,6 +48,8 @@ from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve.lifecycle import serve_with_lifecycle
+from tensorrt_llm.serve.openai_server import TIMEOUT_KEEP_ALIVE
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -414,7 +417,90 @@ def _init_multi_frontend_mode(llm_args: dict,
     return mode
 
 
-def _spawn_attached_frontends(llm, num_frontends: int) -> list:
+# How often an attached frontend re-checks that its launcher is still its
+# parent, and so the worst-case delay before an orphan releases the shared
+# port. One getppid() per second is unmeasurable next to serving work.
+_LAUNCHER_POLL_INTERVAL_SECONDS = 1.0
+
+
+def _wait_for_launcher_exit(launcher_pid: int) -> bool:
+    """Block until the launcher is gone; True once that is certain.
+
+    Polls ``os.getppid()``: it changes exactly once, when the kernel
+    reparents us on the launcher's death, and never changes back -- true
+    however it dies, SIGKILL included. Unlike ``os.kill(pid, 0)`` it cannot
+    be fooled by pid reuse, since the answer comes from our own parent link.
+
+    Returns False without waiting for a ``launcher_pid`` we could never be
+    reparented *away* from (1 is both a plausible in-container launcher pid
+    and the value reparenting produces, so no change is observable). The
+    caller kills this process on a True, so guessing would kill a healthy
+    frontend.
+    """
+    if launcher_pid <= 1:
+        logger.warning(
+            f"Launcher pid {launcher_pid} is indistinguishable from a "
+            "reparented one; this frontend can no longer detect the launcher "
+            "exiting, but is left running.")
+        return False
+    while os.getppid() == launcher_pid:
+        time.sleep(_LAUNCHER_POLL_INTERVAL_SECONDS)
+    return True
+
+
+def _watch_launcher_liveness(launcher_pid: int) -> None:
+    """Exit this attached frontend when the launcher process goes away.
+
+    An orphan still holds the shared SO_REUSEPORT port and would accept
+    connections it can never serve, since the engine it proxies belongs to
+    the launcher. The launcher's own `finally` is unreachable when a signal
+    kills it (uvicorn re-raises SIGTERM/SIGINT after restoring the default
+    handler, so neither `finally` nor `atexit` runs), hence this watchdog.
+
+    Deliberately not PR_SET_PDEATHSIG: that fires when the creating *thread*
+    exits, and these are spawned from the engine-init thread, which exits as
+    soon as startup finishes -- it would kill every child on a healthy start.
+
+    ``launcher_pid`` comes from the environment rather than ``os.getppid()``
+    here: a launcher that died before this thread started has already been
+    reparented away from, so comparing against the recorded value catches
+    that on the first poll instead of leaving an orphan.
+    """
+
+    def _watch() -> None:
+        if not _wait_for_launcher_exit(launcher_pid):
+            return  # Could not tell; leave a healthy frontend alone.
+        logger.error(
+            "The trtllm-serve launcher process exited; shutting this attached "
+            "frontend down so it does not hold the shared port.")
+        # Exit abruptly on purpose: the executor this frontend proxies is
+        # already gone, and uvicorn's graceful shutdown can block on
+        # keep-alive connections that will never be answered.
+        sys.stderr.flush()
+        os._exit(1)
+
+    threading.Thread(target=_watch,
+                     name="trtllm_launcher_watchdog",
+                     daemon=True).start()
+
+
+def _watch_launcher_liveness_from_env() -> None:
+    """Start the launcher watchdog from the pid the launcher passed down."""
+    launcher_pid = os.environ.pop("TLLM_FRONTEND_LAUNCHER_PID", None)
+    if launcher_pid is None:
+        return
+    try:
+        pid = int(launcher_pid)
+    except ValueError:
+        logger.warning(
+            f"Ignoring malformed TLLM_FRONTEND_LAUNCHER_PID={launcher_pid!r}; "
+            "this frontend cannot detect the launcher exiting, but is left "
+            "running.")
+        return
+    _watch_launcher_liveness(pid)
+
+
+def _spawn_attached_frontends(llm, num_frontends: int, children: list) -> None:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
     Each child re-execs this trtllm-serve command line with env vars
@@ -428,6 +514,11 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
     failure (or a missed deadline) fails the whole group, terminating
     the children already started, so num_serve_frontends=K never
     silently degrades to fewer frontends.
+
+    ``children`` is appended to as each child is created, not on return:
+    the READY wait can take minutes (TLLM_FRONTEND_READY_TIMEOUT), and a
+    caller aborting during that window must be able to see -- and clean up
+    -- the children that already exist.
     """
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -441,7 +532,7 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
     # once consumed (GenerationExecutor.create).
     attach_env = json.dumps(attach_info)
 
-    children, ready_fds = [], []
+    ready_fds = []
     try:
         for frontend_id in range(1, num_frontends):
             # Strip MPI/SLURM identity vars: an inherited rank identity would
@@ -450,6 +541,9 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
             env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_env
             env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
             env["TLLM_DISABLE_MPI"] = "1"
+            # The child watches this pid to notice the launcher going away;
+            # see _watch_launcher_liveness.
+            env["TLLM_FRONTEND_LAUNCHER_PID"] = str(os.getpid())
             read_fd, write_fd = os.pipe()
             ready_fds.append(read_fd)
             env["TLLM_FRONTEND_READY_FD"] = str(write_fd)
@@ -457,11 +551,11 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
                 child = subprocess.Popen([sys.executable] + sys.argv,
                                          env=env,
                                          pass_fds=(write_fd, ))  # nosec B603
+                children.append(child)
             finally:
                 # The child now holds the only write end; its exit before
                 # READY surfaces as EOF on read_fd.
                 os.close(write_fd)
-            children.append(child)
             logger.info(
                 f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
             )
@@ -472,7 +566,6 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> list:
     finally:
         for fd in ready_fds:
             os.close(fd)
-    return children
 
 
 def _wait_attached_frontends_ready(children: list, ready_fds: list) -> None:
@@ -585,51 +678,102 @@ def launch_server(
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
                                f"Port holder(s): {holder}")
 
-        if backend == 'pytorch':
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
-
         # The finally below is the cleanup boundary for the attached
         # frontends: it must cover everything from their spawn through
         # server construction, middleware registration, and runtime, or a
         # failure in between leaks the child processes.
         frontend_children = []
-        try:
-            if multi_frontend.is_launcher:
-                frontend_children = _spawn_attached_frontends(
-                    llm, multi_frontend.num_frontends)
 
-            server = OpenAIServer(
-                generator=llm,
-                model=model,
-                tool_parser=tool_parser,
-                server_role=server_role,
-                metadata_server_cfg=metadata_server_cfg,
-                disagg_cluster_config=disagg_cluster_config,
-                multimodal_server_config=multimodal_server_config,
-                chat_template=chat_template,
-                allow_request_chat_template=allow_request_chat_template,
-                input_processor_workers=num_input_processor_workers,
-                media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key)
-            _apply_fastapi_middlewares(server.app, middleware)
+        def build_frontend() -> OpenAIServer:
+            """Do every blocking startup step and return the ready server.
+
+            Runs on a worker thread under the lifecycle path, so nothing in
+            here may touch the event loop. Engine construction alone takes
+            minutes for a large model; on the loop it would make /health
+            accept connections it never answers.
+            """
+            if backend == 'pytorch':
+                llm_args.pop("build_config", None)
+                llm = PyTorchLLM(**llm_args)
+            elif backend == '_autodeploy':
+                from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+
+                # AutoDeploy does not support build_config
+                llm_args.pop("build_config", None)
+                llm = AutoDeployLLM(**llm_args)
+            else:
+                raise click.BadParameter(
+                    f"{backend} is not a known backend, check help for available options.",
+                    param_hint="backend")
+
+            # The engine is live but no reference has reached the caller yet,
+            # so if anything below raises, `server` stays None in
+            # serve_with_lifecycle and its on_startup_failure hook is skipped.
+            # The only teardown left would be the LLM atexit hook -- the
+            # unbounded interpreter-shutdown path this lifecycle avoids.
+            try:
+                if multi_frontend.is_launcher:
+                    _spawn_attached_frontends(llm, multi_frontend.num_frontends,
+                                              frontend_children)
+
+                server = OpenAIServer(
+                    generator=llm,
+                    model=model,
+                    tool_parser=tool_parser,
+                    server_role=server_role,
+                    metadata_server_cfg=metadata_server_cfg,
+                    disagg_cluster_config=disagg_cluster_config,
+                    multimodal_server_config=multimodal_server_config,
+                    chat_template=chat_template,
+                    allow_request_chat_template=allow_request_chat_template,
+                    input_processor_workers=num_input_processor_workers,
+                    media_load_workers=num_media_load_workers,
+                    internal_disagg_auth_key=internal_disagg_auth_key)
+                _apply_fastapi_middlewares(server.app, middleware)
+            except BaseException:
+                # BaseException, not Exception: a KeyboardInterrupt or a
+                # CancelledError landing here leaks the engine just as surely
+                # as a TypeError would.
+                try:
+                    llm.shutdown()
+                except Exception as shutdown_error:
+                    # Never let cleanup become the headline: this teardown can
+                    # wedge, and if it replaced the original error the real
+                    # cause would survive only as __context__.
+                    logger.error(
+                        "Engine shutdown after a failed frontend build did "
+                        f"not complete cleanly: {shutdown_error!r}")
+                raise
 
             # Optionally disable GC (default: not disabled)
             if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
                 gc.disable()
+            return server
 
-            _signal_frontend_ready(multi_frontend)
-            uvloop.run(server(host, port, sockets=[s]))
+        try:
+            if multi_frontend.is_attached_frontend:
+                # Attached frontends join the SO_REUSEPORT group only once
+                # ready, so the launcher is the sole listener during startup.
+                # Otherwise the kernel could route a probe to a still-
+                # initializing sibling and return 503 after the group is READY.
+                # Build first, signal READY, then listen.
+                _watch_launcher_liveness_from_env()
+                server = build_frontend()
+                _signal_frontend_ready(multi_frontend)
+                uvloop.run(server(host, port, sockets=[s]))
+            else:
+                # Listen immediately (503 while STARTING), build the engine
+                # off the event loop, then flip to READY on the same socket.
+                uvloop.run(
+                    serve_with_lifecycle(
+                        host=host,
+                        port=port,
+                        sockets=[s],
+                        build=build_frontend,
+                        timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                        on_ready=lambda srv: srv.register_with_disagg_cluster(),
+                        on_startup_failure=lambda srv: srv.shutdown_generator(),
+                    ))
         finally:
             if frontend_children:
                 _terminate_attached_frontends(frontend_children)

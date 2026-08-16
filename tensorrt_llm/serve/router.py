@@ -178,6 +178,11 @@ class KvCacheAwareServerState(ServerState):
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
                 f"{self._base_url}/kv_cache_events") as response:
+            # As in _fetch_server_info: without this a STARTING body reaches
+            # update_with_events and fails as a shape error deep in the event
+            # walk. poll_and_update() logs and moves on, so raising just
+            # defers the poll.
+            response.raise_for_status()
             events_raw = await response.json()
         return events_raw
 
@@ -395,6 +400,13 @@ class Router(ABC):
             url = self._ensure_url(server)
             async with self.session.get(f"{url}/server_info",
                                         timeout=timeout) as response:
+                # A still-initializing worker now answers 503 instead of
+                # refusing the connection, so an unchecked .json() would cache
+                # the STARTING body as the worker's server_info -- permanently,
+                # since _prepared_ready_servers is only dropped on removal and
+                # prepare_servers() runs before _wait_for_all_servers_ready().
+                # Raising restores the old retry-until-ready behaviour.
+                response.raise_for_status()
                 return await response.json()
         except Exception as e:
             logger.warning(

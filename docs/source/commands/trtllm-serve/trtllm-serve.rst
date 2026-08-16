@@ -20,6 +20,47 @@ The server also supports the following endpoints:
 
 The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
 
+.. _startup-lifecycle:
+
+Startup Lifecycle and ``/health``
+---------------------------------
+
+The server starts listening on ``--port`` immediately, before the engine is
+initialized, so that a health poller can always tell "still starting" apart
+from "crashed":
+
+.. list-table::
+   :header-rows: 1
+
+   * - State
+     - TCP connect
+     - ``GET /health``
+   * - Starting
+     - succeeds
+     - ``503`` with ``X-TRTLLM-Server-State: starting``
+   * - Ready
+     - succeeds
+     - ``200``
+   * - Exited or crashed
+     - refused
+     - n/a
+
+While the server is starting, *every* endpoint answers ``503`` (not ``404``),
+and the response carries a ``Retry-After`` header. Engine initialization runs
+off the HTTP event loop, so these responses stay prompt even during a
+multi-minute startup.
+
+The recommended client rule is therefore:
+
+- connection refused: the server is gone; fail fast instead of waiting.
+- ``503``: the server is alive and initializing; keep polling.
+- ``200``: the server is ready to serve requests.
+
+With ``--num_serve_frontends`` greater than 1, only the launcher process
+listens while the group is starting up; the additional frontends join the
+shared port once they are ready, which keeps the answer to ``/health``
+the same regardless of which frontend accepts the connection.
+
 For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the ``trtllm-serve embeddings`` subcommand starts a server that exposes an OpenAI-compatible ``/v1/embeddings`` endpoint with native dynamic batching. See :doc:`Embeddings <../../features/embeddings>` for details.
 
 Starting a Server
