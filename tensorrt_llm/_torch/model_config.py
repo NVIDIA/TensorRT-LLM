@@ -61,6 +61,11 @@ TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
+_KIMI_K3_ARCHITECTURES = {
+    "KimiK3ForConditionalGeneration",
+    "KimiLinearForCausalLM",
+}
+
 _MINIMAX_M3_ARCHITECTURES = {
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -366,6 +371,9 @@ class ModelConfig(Generic[TConfig]):
         """
         if moe_backend.upper() != "AUTO":
             return moe_backend
+
+        if architecture in _KIMI_K3_ARCHITECTURES:
+            return "TRTLLM"
 
         if architecture in _DEEPSEEK_V4_ARCHITECTURES:
             sm_version = get_sm_version()

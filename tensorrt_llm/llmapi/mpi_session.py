@@ -31,6 +31,91 @@ if ENABLE_MULTI_DEVICE:
 
 T = TypeVar("T")
 
+_FLASHINFER_WORKSPACE_ROOT = "~/.cache/tensorrt_llm/flashinfer"
+_FLASHINFER_WORKER_BOOTSTRAP = """
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+from mpi4py import MPI
+
+workspace_lock = None
+rank = "unknown"
+if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
+    try:
+        workspace_root = Path(sys.argv[1]).expanduser()
+        rank = MPI.COMM_WORLD.Get_rank()
+        slot = rank
+        slot_stride = MPI.COMM_WORLD.Get_size()
+        # Reuse the rank's cache when possible. Concurrent pools with the same
+        # rank skip locked slots in world-size strides, keeping every worker apart.
+        while True:
+            workspace = workspace_root / f"rank-{slot}"
+            workspace.mkdir(parents=True, exist_ok=True)
+            workspace_lock = (workspace / ".lock").open("a")
+            try:
+                fcntl.flock(workspace_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                workspace_lock.close()
+                workspace_lock = None
+                slot += slot_stride
+
+        # Preserve FlashInfer's default cubin cache before changing its workspace
+        # base. Importing flashinfer.jit.env here would initialize all of its
+        # workspace constants before the isolated base is configured.
+        os.environ.setdefault(
+            "FLASHINFER_CUBIN_DIR",
+            str(Path.home() / ".cache" / "flashinfer" / "cubins"),
+        )
+        os.environ["FLASHINFER_WORKSPACE_BASE"] = str(workspace)
+    # This isolation is only a cache optimization. Any setup failure must fall
+    # back to FlashInfer's shared defaults rather than prevent the MPI worker
+    # from starting.
+    except Exception as error:  # noqa: BLE001
+        if workspace_lock is not None:
+            try:
+                workspace_lock.close()
+            except Exception as close_error:  # noqa: BLE001
+                print(
+                    f"[trtllm] rank {rank} could not close a failed FlashInfer "
+                    f"workspace lock ({close_error})",
+                    file=sys.stderr,
+                )
+        workspace_lock = None
+        print(
+            f"[trtllm] rank {rank} could not isolate its FlashInfer workspace "
+            f"({error}); falling back to FlashInfer's shared defaults",
+            file=sys.stderr,
+        )
+
+from mpi4py.futures.server import main
+
+# Hold the lock for the server's lifetime. The kernel also releases it when a
+# worker exits abnormally, so a later launch can safely reuse the cache slot.
+try:
+    main()
+finally:
+    if workspace_lock is not None:
+        try:
+            fcntl.flock(workspace_lock, fcntl.LOCK_UN)
+        except OSError as error:
+            print(
+                f"[trtllm] rank {rank} could not unlock the FlashInfer "
+                f"workspace ({error})",
+                file=sys.stderr,
+            )
+        try:
+            workspace_lock.close()
+        except OSError as error:
+            print(
+                f"[trtllm] rank {rank} could not close the FlashInfer "
+                f"workspace lock ({error})",
+                file=sys.stderr,
+            )
+"""
+
 
 class MPINodeState:
     """MPINodeState acts as a central global state shares between tasks on MPI node.
@@ -434,12 +519,20 @@ class MpiPoolSession(MpiSession):
         env = {
             key: value
             for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM")
+            if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
+                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR")
         }
         env.update(self._env_overrides)
+        isolate_workspace = (self.n_workers > 1 and env.get(
+            "TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "0") == "1"
+                             and "FLASHINFER_WORKSPACE_BASE" not in env)
+        python_args = ([
+            "-c", _FLASHINFER_WORKER_BOOTSTRAP, _FLASHINFER_WORKSPACE_ROOT
+        ] if isolate_workspace else None)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
-                                        env=env)
+                                        env=env,
+                                        python_args=python_args)
 
     def __del__(self):
         self.shutdown_abort()

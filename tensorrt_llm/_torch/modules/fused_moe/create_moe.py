@@ -289,6 +289,9 @@ def create_moe_backend(
     swiglu_limit_scalar: Optional[float] = None,
     init_load_balancer: bool = True,
     activation_type: ActivationType = ActivationType.Swiglu,
+    activation: Optional[str] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
@@ -315,6 +318,9 @@ def create_moe_backend(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
+        activation: Optional MegaMoE DeepGEMM activation name
+        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
+        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
         trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
         trtllm_gen_activation_alpha: Optional backend-local activation alpha
         trtllm_gen_activation_beta: Optional backend-local activation beta
@@ -409,6 +415,12 @@ def create_moe_backend(
             trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
             trtllm_gen_activation_beta=trtllm_gen_activation_beta,
         )
+
+    if any(value is not None
+           for value in (activation, situ_beta,
+                         situ_linear_beta)) and moe_cls is not MegaMoEDeepGemm:
+        raise ValueError("MegaMoE DeepGEMM activation options require "
+                         f"MegaMoEDeepGemm, got {moe_cls.__name__}")
 
     if any(value is not None for value in (trtllm_gen_activation_type,
                                            trtllm_gen_activation_alpha,
@@ -554,7 +566,12 @@ def create_moe_backend(
                                               if swiglu_limit is not None else
                                               swiglu_limit_scalar)
         else:
-            megamoe_kwargs["swiglu_limit_scalar"] = swiglu_limit_scalar
+            megamoe_kwargs.update(
+                swiglu_limit_scalar=swiglu_limit_scalar,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+            )
         return moe_cls(**megamoe_kwargs)
     else:
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
@@ -579,6 +596,9 @@ def create_moe(
     swiglu_limit: Optional[torch.Tensor] = None,
     swiglu_limit_scalar: Optional[float] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
+    activation: Optional[str] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     trtllm_gen_activation_type: Optional[ActType_TrtllmGen] = None,
     trtllm_gen_activation_alpha: Optional[float] = None,
     trtllm_gen_activation_beta: Optional[float] = None,
@@ -606,6 +626,9 @@ def create_moe(
         swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
         swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
+        activation: Optional MegaMoE DeepGEMM activation name
+        situ_beta: Optional MegaMoE DeepGEMM SiTU beta
+        situ_linear_beta: Optional MegaMoE DeepGEMM SiTU linear beta
         trtllm_gen_activation_type: Optional TRTLLM-Gen backend-local activation type
         trtllm_gen_activation_alpha: Optional backend-local activation alpha
         trtllm_gen_activation_beta: Optional backend-local activation beta
@@ -635,6 +658,13 @@ def create_moe(
 
     moe_cls = resolve_moe_cls(model_config, routing_method, dtype,
                               override_quant_config, layer_idx)
+    if (any(value is not None
+            for value in (activation, situ_beta, situ_linear_beta))
+            and moe_cls is not MegaMoEDeepGemm):
+        raise ValueError(
+            "MegaMoE DeepGEMM activation options require "
+            "MegaMoEDeepGemm without backend fallback, but resolved "
+            f"{moe_cls.__name__}.")
     if (any(value is not None for value in (trtllm_gen_activation_type,
                                             trtllm_gen_activation_alpha,
                                             trtllm_gen_activation_beta))
@@ -666,6 +696,9 @@ def create_moe(
             swiglu_limit=swiglu_limit,
             swiglu_limit_scalar=swiglu_limit_scalar,
             activation_type=activation_type,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             trtllm_gen_activation_type=trtllm_gen_activation_type,
             trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
             trtllm_gen_activation_beta=trtllm_gen_activation_beta,
@@ -695,6 +728,9 @@ def create_moe(
         swiglu_limit=swiglu_limit,
         swiglu_limit_scalar=swiglu_limit_scalar,
         activation_type=activation_type,
+        activation=activation,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         trtllm_gen_activation_type=trtllm_gen_activation_type,
         trtllm_gen_activation_alpha=trtllm_gen_activation_alpha,
         trtllm_gen_activation_beta=trtllm_gen_activation_beta,
