@@ -314,17 +314,6 @@ def get_model_yaml_config(model_label: str,
                 },
             }
         },
-        # Qwen3.5-9B hybrid GDN: V2 KV/SSM pool split needs the real seq len.
-        {
-            'patterns': [
-                'qwen3.5_9b-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:500,2000',
-            ],
-            'config': {
-                'kv_cache_config': {
-                    'avg_seq_len': 2500,
-                },
-            }
-        },
         # MiniMax-M3 MXFP8 block-sparse MoE: sparse backend, no KV reuse, trust_remote_code, capped max_seq_len to avoid the 1M-default CUDA-graph OOM.
         {
             'patterns': ['minimax_m3_mxfp8'],

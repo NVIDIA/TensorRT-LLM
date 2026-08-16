@@ -20,7 +20,7 @@ import os
 import re
 import shutil
 import sys
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Optional
 
 import pytest
 import yaml
@@ -920,6 +920,32 @@ class PerfTestConfig:
         """
         return self.get_benchmark_type() == "enc_dec"
 
+    def get_fixed_dataset_sequence_length(self) -> Optional[int]:
+        """Return the common total sequence length for fixed-length data."""
+        if self.runtime not in ("bench", "serve"):
+            return None
+        if not self.output_lens or len(self.input_lens) != len(
+                self.output_lens):
+            return None
+
+        # LoRA bench data uses nonzero input/output length standard deviations.
+        if self.num_loras > 0:
+            return None
+
+        # These serve requests can terminate at EOS or contain image tokens, so
+        # input_len + output_len is not their fixed runtime sequence length.
+        if self.runtime == "serve" and (self.model_name in SPEC_DEC_MODELS or
+                                        self.model_name in SERVE_IMAGE_MODELS):
+            return None
+
+        sequence_lengths = {
+            input_len + output_len
+            for input_len, output_len in zip(self.input_lens, self.output_lens)
+        }
+        if len(sequence_lengths) != 1:
+            return None
+        return sequence_lengths.pop()
+
 
 class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     """
@@ -985,6 +1011,16 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
     def get_trtllm_bench_model(self):
         return get_model_dir(self._config.model_name)
+
+    def _get_model_yaml_config(self) -> dict:
+        config = get_model_yaml_config(self._config.to_string(),
+                                       lora_dirs=self.lora_dirs)
+        fixed_sequence_length = self._config.get_fixed_dataset_sequence_length()
+        if (self._config.backend == "pytorch"
+                and fixed_sequence_length is not None):
+            kv_cache_config = config.setdefault('kv_cache_config', {})
+            kv_cache_config.setdefault('avg_seq_len', fixed_sequence_length)
+        return config
 
     def get_trtllm_bench_build_command(self, engine_dir) -> list:
         model_dir = self.get_trtllm_bench_model()
@@ -1161,8 +1197,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                                "extra-llm-api-config.yml")
             if not os.path.exists(pytorch_config_path):
                 os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
-            config = get_model_yaml_config(self._config.to_string(),
-                                           lora_dirs=self.lora_dirs)
+            config = self._get_model_yaml_config()
             if config:
                 print_info(f"pytorch/TRT model config: {config}")
                 with open(pytorch_config_path, 'w') as f:
@@ -1225,8 +1260,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             "pytorch",
         ]
 
-        config = get_model_yaml_config(self._config.to_string(),
-                                       lora_dirs=self.lora_dirs)
+        config = self._get_model_yaml_config()
         serve_config = config or {}
         serve_config.setdefault('max_batch_size', self._config.max_batch_size)
         serve_config.setdefault('max_num_tokens', self._config.max_num_tokens)
