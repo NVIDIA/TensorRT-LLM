@@ -1648,8 +1648,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         request: LlmRequest, max_seq_len: int, beam_idx: int = DEFAULT_BEAM_IDX
     ) -> bool:
         num_tokens = request.get_num_tokens(beam_idx)
-        return (num_tokens - request.py_orig_prompt_len >= request.py_max_new_tokens) or (
-            num_tokens >= max_seq_len
+        return bool(
+            (num_tokens - request.py_orig_prompt_len >= request.py_max_new_tokens)
+            or (num_tokens >= max_seq_len)
         )
 
     @staticmethod
@@ -2537,7 +2538,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._finish_reasons_handler.store.num_accepted_draft_tokens_host[
                     req.py_seq_slot
                 ] = req.py_num_accepted_draft_tokens
-            if req.state == LlmRequestState.GENERATION_COMPLETE:
+            if req.state_value == LlmRequestState.GENERATION_COMPLETE.value:
                 self._top_p_decay.retire_slot(req)
 
         self._penalty_handler.update_token_counts(finalized_token_updates)
