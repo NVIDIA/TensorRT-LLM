@@ -202,6 +202,23 @@ def test_trtllm_worker_returns_length_for_streaming_step_error() -> None:
     assert task.finish_reason == "length"
 
 
+def test_trtllm_worker_returns_length_for_streaming_start_error() -> None:
+    error = RequestError(
+        "The sum of prompt length (4), query length (1) should not exceed "
+        "max_num_tokens (4)")
+    worker = TRTLLMWorker(_FailingLLM(error), tokenizer=None)
+    task = StreamGenerationTask.create_from_generation_task(
+        GenerationTask.create_from_prompt("hello"), streaming_step=1)
+
+    status = asyncio.run(worker.run_task(task))
+
+    assert status == TaskStatus.SUCCESS
+    assert task.end_flag
+    assert task.output_str == ""
+    assert task.output_tokens == []
+    assert task.finish_reason == "length"
+
+
 def test_trtllm_worker_generation(default_prompt, trtllm_model_path):
     worker = create_trtllm_worker(trtllm_model_path)
     try:
