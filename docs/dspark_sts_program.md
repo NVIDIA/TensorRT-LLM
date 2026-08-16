@@ -957,6 +957,15 @@ cap-accept 臂(2634604,poetry+arena × bs512/1024 × 3 reps,~1.01M 请求步)完
 - 过程沉淀(全部入册):AA 流水线十坑(helpers/OUT_DIR 挂载/ctx-MTP-spec/表挂载/STS 五护栏/GEN-only env/…);static×disagg 置信度 NaN(bug 数据点);短 ISL 冻结(已结案);SPS 几何(pin5=连接器);accept 先兆:正式表让 accept 从冒烟 2.17 → 2.22(planner 用真 θ 裁得更聪明)。
 - 余留:sched rep 加密(收窄 ±5%)、c80 档、STS 消融(如果之后想验标定增益)、短 ISL 与 static-NaN 两个上游修复。
 
+## 【08-16 02:00】slo20-true 战役(laliao 侧):v2 dangling-rawref 定罪(压力路径);slo20 原件 ×u128 = 99.9% 黄金点;四臂矩阵开跑
+
+**真凶(带完整栈)**:压力上来时 gen 多 rank 同步崩:`Error in event loop: Dereferencing a dangling rawref` @ `_apply_disagg_transfer_admission → _revert_deferred_disagg_gen_init_alloc → _revert_ctx_alloc`(py_executor.py:3793)→ executor 死 → uvicorn 僵尸收单 → 客户端 900s 零 chunk 超时 → 会话冷重启死亡螺旋。**只在传输准入的回滚路径触发**(资源压力/deferred 分配),所以 u128 低压 99.9% 绿、u512/c2600 必崩;与 D3 的 ctx 侧 dangling rawref 同族 = v2 生命周期 bug。主线 c2600 不踩的解释:你们的运行时是 main a8b540912c+wheel(新 v2),我们分支自建 sqsh(旧 v2)——**请确认 main 近期是否修过 rawref 生命周期**;分支自建用户都会踩。
+- 连带修正:此前"短 ISL 冻结"定罪降级为存疑(当时判别在 num_instances 带毒渲染器时代;见下)。
+- **自伤教训入册**:fork slo20 launcher 做 ctx reshape(6×tp4→3×tp8,DSpark 双份装载 OOM 所迫)时漏改 `server_config.num_instances` → router 永等 6 实例 → 一整代判别局(ADP/env/容量/swap 全系列)被毒,全部作废重跑。**渲染器改拓扑必须三处联动:启动命令/urls/num_instances。**
+- 搬家坑清单(全修):client 需 .venv 直调(镜像无 uv,--quiet 吞错)、base_url 烤死原节点、wait 1800s、DL 臂需显式 block_size=DL。
+- **黄金点:slo20 全套原件(ADP+DEEPGEMM+maxbs256+kv0.8)× u128 = 28,784 成功/27 失败**。与原始 slo20 唯二偏差:ctx 3×tp8、并发 128(均有硬归因)。
+- **四臂矩阵已在该点开跑**:notrim(r1=28.8k ✓)/DL4/DL3/sched(nvfp4 DSpark,sched 挂 aa_slo20_table_v1 + tiers2345 裸 sigmoid)——回答"收益属于置信度调度还是静态砍 draft len"(roofline best-static 之争的实测版)。
+
 # 分析
 
 ## Step 3 复现性判决(08-07 12:40,校准 + v2b 表条件下)
