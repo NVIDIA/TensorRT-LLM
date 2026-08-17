@@ -326,31 +326,138 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
 
         # A sitecustomize.py runs at the top of every Python child process
         # that has this directory on PYTHONPATH — including the
-        # mpi4py.futures.server workers spawned by MpiPoolSession. It gives
-        # each worker its own faulthandler file + re-dup'd stderr, so the
-        # fatal message from a silent worker crash (currently swallowed by
-        # pytest --capture=fd) lands in a real file.
+        # mpi4py.futures.server workers spawned by MpiPoolSession. Prior
+        # attempts had faulthandler + persistent stderr only, but every one
+        # of ~85 rep632-style H100 fp8 crashes in PR_Github #66364 left the
+        # per-worker faulthandler at 0 bytes — because the fault was inside
+        # CUDA driver code, so control never returned to Python and no
+        # Python-level SIGSEGV handler ever fired. This attempt widens
+        # capture to four independent channels:
+        #
+        #   1. libSegFault.so (LD_PRELOAD, set below in debug_env) —
+        #      glibc's fault handler, runs regardless of Python state,
+        #      writes addr2line-resolvable backtrace + registers.
+        #   2. resource.RLIMIT_CORE = unlimited — lets the kernel emit a
+        #      core file, retrievable via `docker cp` or SLURM staging.
+        #   3. py-spy watchdog + on-crash py-spy dump — walks the process
+        #      externally, so native frames survive even when Python does
+        #      not.
+        #   4. Faulthandler as before, for hangs the kernel doesn't kill.
         sitecustomize_dir = crash_dir / f"sitecustomize_rep{_repeat:03d}"
         sitecustomize_dir.mkdir(parents=True, exist_ok=True)
         (sitecustomize_dir / "sitecustomize.py").write_text(
             textwrap.dedent("""\
-            import os, sys, faulthandler, signal, pathlib
+            import os, sys, faulthandler, signal, pathlib, resource, \
+                   subprocess, threading, time, traceback
             _dd = pathlib.Path(os.environ.get(
                 "TLLM_HANG_DUMP_DIR", "/tmp/tllm_hang_dumps"))
             _dd.mkdir(parents=True, exist_ok=True)
             _pid = os.getpid()
             _exe = pathlib.Path(sys.argv[0] if sys.argv else "python").name
-            _fh = open(_dd / f"faulthandler_{_exe}_{_pid}.log",
-                       "a", buffering=1)
+            _slot = _dd / f"{_pid}_{_exe}"
+            _slot.mkdir(parents=True, exist_ok=True)
+
+            def _note(m):
+                try:
+                    with (_slot / "instrument.log").open("a") as _f:
+                        _f.write(f"[{time.strftime('%H:%M:%S')}] {m}\\n")
+                except Exception:
+                    pass
+
+            # 1) Faulthandler + stderr redirect, as before.
+            _fh = open(_slot / "faulthandler.log", "a", buffering=1)
             faulthandler.enable(file=_fh, all_threads=True)
-            faulthandler.dump_traceback_later(60, repeat=True, file=_fh)
+            faulthandler.dump_traceback_later(30, repeat=True, file=_fh)
             try:
                 faulthandler.register(signal.SIGUSR1, file=_fh,
                                       all_threads=True, chain=False)
             except Exception:
                 pass
-            _err = open(_dd / f"stderr_{_exe}_{_pid}.log", "a", buffering=1)
+            _err = open(_slot / "stderr.log", "a", buffering=1)
             os.dup2(_err.fileno(), 2)
+
+            # 2) Allow the kernel to write a core file. On some CI hosts
+            #    core_pattern lives outside our reach; the ulimit is enough
+            #    for the docker/slurm sandbox to keep the file if it lands
+            #    in cwd or the configured pattern dir.
+            try:
+                resource.setrlimit(resource.RLIMIT_CORE,
+                    (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+                _note("RLIMIT_CORE=unlimited")
+            except Exception as _e:
+                _note(f"setrlimit failed: {_e}")
+
+            # 3) py-spy: (a) periodic watchdog every 30s, (b) on-crash dump
+            #    from the signal handler. py-spy needs ptrace on the same
+            #    pid; SYS_PTRACE is granted in the CI container so this
+            #    works. Failure is silent — we still have (1) + (2).
+            _pyspy_done = [False]
+            def _pyspy(reason):
+                if _pyspy_done[0]:
+                    return
+                _pyspy_done[0] = True
+                out = _slot / f"pyspy_{reason}.log"
+                try:
+                    subprocess.run(
+                        ["py-spy", "dump", "--pid", str(_pid),
+                         "--native", "--nonblocking"],
+                        stdout=out.open("wb"),
+                        stderr=subprocess.STDOUT,
+                        timeout=30, check=False,
+                    )
+                    _note(f"pyspy_{reason}.log written")
+                except FileNotFoundError:
+                    _note("py-spy not installed")
+                except Exception as _e:
+                    _note(f"pyspy {reason} failed: {_e}")
+
+            def _watchdog():
+                n = 0
+                while True:
+                    time.sleep(30)
+                    n += 1
+                    _pyspy_done[0] = False
+                    out = _slot / f"pyspy_watchdog_{n:04d}.log"
+                    try:
+                        subprocess.run(
+                            ["py-spy", "dump", "--pid", str(_pid),
+                             "--native", "--nonblocking"],
+                            stdout=out.open("wb"),
+                            stderr=subprocess.STDOUT,
+                            timeout=15, check=False,
+                        )
+                    except Exception:
+                        return
+            threading.Thread(target=_watchdog, name="pyspy_watchdog",
+                             daemon=True).start()
+
+            # 4) Signal forensics. Faulthandler.enable already catches
+            #    SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL but sequences its
+            #    Python-frame dump BEFORE any C-level info. We chain a
+            #    py-spy invocation on top so we get native frames next
+            #    time a driver-level fault fires. Then re-raise via
+            #    default handler so the core file still gets written.
+            def _forensics(signum, frame):
+                try:
+                    with (_slot / f"crash_{signum}.txt").open("w") as _f:
+                        _f.write(f"pid={_pid} signum={signum} "
+                                 f"time={time.time()}\\n")
+                        _f.write(f"signal_name="
+                                 f"{signal.strsignal(signum)}\\n")
+                        _f.write("--- python stack ---\\n")
+                        traceback.print_stack(frame, file=_f)
+                    _pyspy(f"sig{signum}")
+                except Exception:
+                    pass
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(_pid, signum)
+            for _sig in (signal.SIGSEGV, signal.SIGABRT,
+                         signal.SIGBUS, signal.SIGFPE, signal.SIGILL):
+                try:
+                    signal.signal(_sig, _forensics)
+                except (ValueError, OSError):
+                    pass
+            _note(f"instrumentation live in {_slot}")
         """)
         )
 
