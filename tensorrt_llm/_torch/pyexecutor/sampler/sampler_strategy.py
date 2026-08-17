@@ -328,7 +328,7 @@ def sample(
             )
         case ("greedy", None):
             tokens, softmax = greedy_search_sampling_batch(logits, return_probs=return_probs)
-            temperature = None  # type: ignore[assignment]
+            temperature = None
         case (
             "beam_search",
             beam_width_in,
