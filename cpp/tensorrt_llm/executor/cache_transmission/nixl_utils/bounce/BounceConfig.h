@@ -63,13 +63,6 @@ struct BounceConfig
     // bidirectional deployment both sides can always still grant incoming regions (no mutual
     // eager-starvation); the credit-backed path is unaffected by the cap.
     bool enableEagerGather{true};
-    // TRTLLM_NIXL_BOUNCE_DISABLE_SCATTER_RUN_MERGING: DEBUG ONLY — disable scatter-run coalescing so the DATA
-    // message carries one entry per desc (per-desc plan, hundreds of KB per chunk). Used to A/B the
-    // control transports under large-message load; never enable in production.
-    bool disableScatterRunMerging{false};
-    // TRTLLM_NIXL_BOUNCE_USE_CUB_COPY: use cub::DeviceMemcpy::Batched instead of the custom copy
-    // kernel (experimental; benchmark before enabling).
-    bool useCubCopy{false};
     // TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS: the copy kernel reads [srcs|dsts|sizes] directly
     // from pinned host memory instead of staging them in device scratch first. Faster at every plan
     // size (same bytes over the bus, but no H2D-then-kernel serialization), so on by default.
@@ -222,11 +215,8 @@ struct BounceConfig
         cfg.receiverFlowTimeoutMs = envInt("TRTLLM_NIXL_BOUNCE_RECEIVER_FLOW_TIMEOUT_MS", cfg.receiverFlowTimeoutMs);
         cfg.quarantineMs = envInt("TRTLLM_NIXL_BOUNCE_QUARANTINE_MS", cfg.quarantineMs);
         cfg.disableFabricMemory = envBool("TRTLLM_NIXL_BOUNCE_DISABLE_FABRIC_MEMORY", cfg.disableFabricMemory);
-        cfg.useCubCopy = envBool("TRTLLM_NIXL_BOUNCE_USE_CUB_COPY", cfg.useCubCopy);
         cfg.useZeroCopyArguments = envBool("TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS", cfg.useZeroCopyArguments);
         cfg.enableEagerGather = envBool("TRTLLM_NIXL_BOUNCE_ENABLE_EAGER_GATHER", cfg.enableEagerGather);
-        cfg.disableScatterRunMerging
-            = envBool("TRTLLM_NIXL_BOUNCE_DISABLE_SCATTER_RUN_MERGING", cfg.disableScatterRunMerging);
         return cfg;
     }
 };
