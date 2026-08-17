@@ -604,19 +604,19 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
                     cls.load_diffusion_quant_config(quant_dict)
                 )
 
-        # Enable tunable FP4 quantize for visual gen: larger activation
-        # tensors (full image/video latents) amortize the AutoTuner overhead.
-        if quant_config.quant_algo == QuantAlgo.NVFP4:
-            from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
-
-            NVFP4LinearMethod.use_tunable_quantize = True
-
         if runtime_lora_cfg is not None and quant_config.quant_algo is not None:
             raise ValueError(
                 "runtime_lora_config does not currently support VisualGen weight "
                 f"quantization ({quant_config.quant_algo}). Fuse the adapter into "
                 "a full-precision checkpoint first, or disable quantization."
             )
+
+        # Enable tunable FP4 quantize for visual gen: larger activation
+        # tensors (full image/video latents) amortize the AutoTuner overhead.
+        if quant_config.quant_algo == QuantAlgo.NVFP4:
+            from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
+
+            NVFP4LinearMethod.use_tunable_quantize = True
 
         attention_metadata_state = (
             create_attention_metadata_state() if attention_cfg.backend == "TRTLLM" else None
