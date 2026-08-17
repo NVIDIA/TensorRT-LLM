@@ -1152,7 +1152,6 @@ class DSparkDraftModel(nn.Module):
 # --------------------------------------------------------------------------- #
 
 _DEFAULT_CTX_WINDOW = 2048
-_CTX_WINDOW_ENV = "TRTLLM_DSPARK_QWEN3_CTX_WINDOW"
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -1276,6 +1275,7 @@ class Qwen3DSparkDraftModel(nn.Module):
         model_config,
         block_size: Optional[int] = None,
         mask_token_id: Optional[int] = None,
+        ctx_window_size: Optional[int] = None,
         serving_max_seq_len: Optional[int] = None,
     ):
         super().__init__()
@@ -1349,8 +1349,15 @@ class Qwen3DSparkDraftModel(nn.Module):
             )
 
         # Ring-window length for the worker-owned context K/V buffer.
-        window = int(os.environ.get(_CTX_WINDOW_ENV, _DEFAULT_CTX_WINDOW))
-        window = max(self.block_size + 2, min(window, max_pos))
+        requested_window = int(
+            ctx_window_size if ctx_window_size is not None else _DEFAULT_CTX_WINDOW
+        )
+        window = max(self.block_size + 2, min(requested_window, max_pos))
+        if window != requested_window:
+            logger.warning(
+                f"DSpark ctx_window_size={requested_window} was clamped to "
+                f"{window} (must be in [{self.block_size + 2}, {max_pos}])."
+            )
         # Worker allocation contract (DSparkWorker._lazy_init):
         # kv_windows = [max_batch, num_stages, window_size, head_dim], where
         # "head_dim" is the per-position row width — here K||V flattened.
@@ -1827,6 +1834,7 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
         draft_config,
         block_size: Optional[int] = None,
         mask_token_id: Optional[int] = None,
+        ctx_window_size: Optional[int] = None,
         serving_max_seq_len: Optional[int] = None,
     ):
         super().__init__(
@@ -1834,6 +1842,7 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
                 draft_config,
                 block_size=block_size,
                 mask_token_id=mask_token_id,
+                ctx_window_size=ctx_window_size,
                 serving_max_seq_len=serving_max_seq_len,
             ),
             draft_config,

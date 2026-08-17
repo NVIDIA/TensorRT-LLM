@@ -112,11 +112,11 @@ def _rand_weights(gen):
     return w
 
 
-def _build_model(weights):
+def _build_model(weights, ctx_window_size=None):
     # Construct under a device context like the model loader does; load_weights
     # then follows the modules (params and the RoPE buffers) onto that device.
     with torch.device("cuda" if torch.cuda.is_available() else "cpu"):
-        model = Qwen3DSparkDraftModel(_make_config())
+        model = Qwen3DSparkDraftModel(_make_config(), ctx_window_size=ctx_window_size)
     model.load_weights(weights)
     device = model.fc.weight.device
     embed = torch.nn.Embedding(VOCAB, HID)
@@ -373,12 +373,11 @@ def test_batched_matches_eager_singletons(setup):
     torch.testing.assert_close(got_logits, torch.cat(exp_logits, dim=0))
 
 
-def test_ring_window_wraparound(setup, monkeypatch):
+def test_ring_window_wraparound(setup):
     """start_pos > window: the ring holds the last `win` positions and the
     draft attends to all of them (mask all-valid)."""
     weights, _, device = setup
-    monkeypatch.setenv("TRTLLM_DSPARK_QWEN3_CTX_WINDOW", "32")
-    model, device = _build_model(weights)
+    model, device = _build_model(weights, ctx_window_size=32)
     gen = torch.Generator().manual_seed(5)
     win = model._attn_params["window_size"]
     assert win == 32

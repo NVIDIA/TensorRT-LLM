@@ -2837,6 +2837,15 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
+    ctx_window_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Ring-window length, in tokens, of the worker-owned per-layer context "
+        "K/V buffer used by the dense (Qwen3-style) DSpark drafter. Clamped to "
+        "[block_size + 2, max_position_embeddings]. Only applies to the dense "
+        "Qwen3 DSpark drafter (ignored by the DeepSeek-V4 drafter, which uses "
+        "the checkpoint's own sliding_window instead). Defaults to 2048.")
+
     # NOTE: confidence-based dynamic drafting (the draft model's confidence head
     # that truncates the proposed block) is NOT enabled in this PR. The user-facing
     # ``enable_confidence_head`` / ``confidence_threshold`` knobs are intentionally

@@ -1928,6 +1928,7 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 draft_config,
                 block_size=model_config.spec_config.block_size,
                 mask_token_id=model_config.spec_config.mask_token_id,
+                ctx_window_size=model_config.spec_config.ctx_window_size,
                 serving_max_seq_len=model_config.max_seq_len)
         num_stages = count_dspark_stages(
             model_config.spec_config.speculative_model)
