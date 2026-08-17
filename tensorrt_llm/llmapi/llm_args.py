@@ -1750,6 +1750,15 @@ class AdvancedSamplingMode(StrEnum):
                         AdvancedSamplingMode.NO_TOPK_NO_TOPP)
 
 
+class _MTPDraftCheckpointType(StrEnum):
+    """Internal description of where a one-model MTP drafter comes from."""
+
+    UNRESOLVED = "unresolved"
+    TARGET = "target"
+    HEADS = "heads"
+    DRAFT_MODEL = "draft_model"
+
+
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
         default=None, description="The maximum number of draft tokens.")
@@ -1850,9 +1859,10 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
     # If set, the draft model attends directly over the target model KV cache.
     _use_shared_kv_cache: bool = PrivateAttr(False)
-    # If set, speculative_model resolves to the target checkpoint, so one-model
-    # MTP loads its heads from the target weights instead of a separate file.
-    _mtp_heads_in_target_checkpoint: bool = PrivateAttr(False)
+    # Describes whether one-model MTP is embedded in the target, supplied as a heads-only
+    # checkpoint, or supplied as a complete draft model.
+    _mtp_draft_checkpoint_type: _MTPDraftCheckpointType = PrivateAttr(
+        default=_MTPDraftCheckpointType.UNRESOLVED)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
@@ -1964,29 +1974,30 @@ class DecodingBaseConfig(StrictBaseModel):
         return True
 
     @property
-    def loads_mtp_from_separate_checkpoint(self) -> bool:
-        """Whether one-model MTP heads come from ``speculative_model``.
+    def uses_mtp_head_checkpoint(self) -> bool:
+        """Whether `speculative_model` contains only external MTP heads."""
+        if (not self.spec_dec_mode.is_mtp_one_model()
+                or self.speculative_model is None):
+            return False
+        return (
+            self._mtp_draft_checkpoint_type == _MTPDraftCheckpointType.HEADS)
 
-        False for shared-KV models, where ``speculative_model`` is a complete
-        draft model, and when it resolves to the target checkpoint, where the
-        heads are loaded from the target weights.
-        """
+    @property
+    def uses_full_draft_model_checkpoint(self) -> bool:
+        """Whether `speculative_model` contains a complete draft model."""
         return (self.spec_dec_mode.is_mtp_one_model()
-                and self.speculative_model is not None
-                and not self._use_shared_kv_cache
-                and not self._mtp_heads_in_target_checkpoint)
+                and self._mtp_draft_checkpoint_type
+                == _MTPDraftCheckpointType.DRAFT_MODEL)
 
     @property
     def needs_separate_draft_weights(self) -> bool:
         """Whether draft weights must be loaded from ``speculative_model``.
 
-        True for Eagle3 one-model / external drafters, Gemma4 shared-KV, and
-        one-model MTP when MTP heads live in a separate checkpoint.
+        This includes complete draft models and heads-only MTP checkpoints.
         """
-        if (self.spec_dec_mode.need_load_draft_weights()
-                or self._use_shared_kv_cache):
-            return True
-        return self.loads_mtp_from_separate_checkpoint
+        return (self.spec_dec_mode.need_load_draft_weights()
+                or self.uses_full_draft_model_checkpoint
+                or self.uses_mtp_head_checkpoint)
 
     @property
     def spec_dec_mode(self):
