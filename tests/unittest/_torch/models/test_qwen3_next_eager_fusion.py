@@ -16,6 +16,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import torch
 from torch import nn
 
@@ -26,6 +27,13 @@ from tensorrt_llm._torch.models.modeling_qwen3_next import (
     _eager_fusion_enabled,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+# Every case here builds its tensors on CPU (or on the meta device) and mocks the
+# collectives, so no GPU is needed: this file's home is the CPU-Generic stage
+# (l0_cpu.yml), which selects with `-m cpu_only`. Keep it off the GPU test lists --
+# every non-CPU stage runs the opposite `-m 'not cpu_only'`, which would deselect
+# all of these and fail that stage with pytest's "no tests collected" exit code.
+pytestmark = pytest.mark.cpu_only
 
 
 def _new_causal_lm() -> Qwen3NextForCausalLM:
