@@ -72,6 +72,8 @@ transforms:
     stage: pattern_matcher
   match_moe_routing_pattern:
     stage: pattern_matcher
+  match_noaux_tc_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
