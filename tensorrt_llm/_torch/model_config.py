@@ -360,6 +360,30 @@ class ModelConfig(Generic[TConfig]):
                             quant_config: Optional[QuantConfig] = None) -> str:
         """Resolve AUTO moe_backend to a specific backend based on model architecture.
 
+        **Not the implementation-selection entry point.** That is
+        ``moe_resolution.resolve_moe_impl``, and the two run in different
+        phases on different questions. This one turns the literal ``AUTO`` into
+        a concrete backend name while the checkpoint is being read; the other
+        turns a concrete backend name into an impl class while a layer is being
+        built, by asking each candidate's ``can_implement``.
+
+        The phases cannot be merged, and the reason is a genuine cycle rather
+        than an accident of layering: several quant formats pick their
+        ``quant_algo`` from the backend name (see ``get_mxfp4_quant_algo`` and
+        ``load_hf_quant_config``), so a backend name is needed to finish
+        building ``quant_config`` -- while ``resolve_moe_impl`` needs a
+        finished ``quant_config`` to state the problem at all. Hence the
+        deliberate two-step in ``from_pretrained``: an architecture-only hint
+        first, then a quant-aware resolution once ``quant_config`` exists.
+
+        What this must therefore never grow is capability knowledge. Every
+        rule here is a *preference* ("on Blackwell we would rather run
+        TRTLLM-Gen"), and preferences that turn out to be unservable are caught
+        downstream, where ``resolve_moe_impl`` records the substitution in a
+        ``MoEResolutionReport``. A "can it run" test added here would be a
+        second copy of a gate that already exists in a ``can_implement``, and
+        the two copies would drift.
+
         Args:
             moe_backend: The configured moe_backend (may be "AUTO")
             architecture: The model architecture name (e.g., "GptOssForCausalLM")
