@@ -173,6 +173,21 @@ class TestProcessLifecycleCounters:
         with patch.object(BaseLLM, "_shutdown_resources"):
             llm.shutdown()
 
+    def test_completion_tracking_failure_is_fail_silent(self, enable_telemetry):
+        """A telemetry completion error must not fail LLM construction."""
+        with (
+            patch.object(BaseLLM, "__init__", return_value=None),
+            patch(
+                "tensorrt_llm.usage.record_llm_initialized",
+                side_effect=RuntimeError("telemetry failure"),
+            ),
+            patch.object(BaseLLM, "_start_usage_reporting") as start_reporting,
+        ):
+            llm = LLM_torch(model="unused")
+
+        assert llm._usage_lifecycle_active is False
+        start_reporting.assert_called_once_with()
+
     def test_shutdown_decrements_once_per_object(self, enable_telemetry):
         """Repeated shutdown calls cannot decrement the active gauge twice."""
         with (

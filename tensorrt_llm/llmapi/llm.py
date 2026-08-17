@@ -1845,14 +1845,17 @@ class _TorchLLM(BaseLLM):
                 _usage.record_llm_initialization_failure()
             raise
 
-        if not usage_attempt_tracked and _usage is not None:
-            usage_attempt_tracked = _usage.record_llm_initialization_attempt(
-                getattr(self.args, 'telemetry_config', None),
-                default_usage_context=_usage.UsageContext.LLM_CLASS.value,
-            )
+        try:
+            if not usage_attempt_tracked and _usage is not None:
+                usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                    getattr(self.args, 'telemetry_config', None),
+                    default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+                )
 
-        if usage_attempt_tracked:
-            self._usage_lifecycle_active = _usage.record_llm_initialized()
+            if usage_attempt_tracked:
+                self._usage_lifecycle_active = _usage.record_llm_initialized()
+        except Exception as exc:
+            logger.debug("Usage telemetry completion tracking failed: %s", exc)
 
         self._start_usage_reporting()
 
