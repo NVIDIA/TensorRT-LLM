@@ -33,7 +33,7 @@ from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve._telemetry import TelemetryUvicornServer
+from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)
@@ -388,7 +388,7 @@ class OpenAIDisaggServer:
                                 port=port,
                                 log_level=logger.level,
                                 timeout_keep_alive=keep_alive_timeout)
-        server = TelemetryUvicornServer(config)
+        server = create_uvicorn_server(config)
         await server.serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):

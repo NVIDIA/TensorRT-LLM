@@ -110,7 +110,7 @@ from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark, set_prometheus_multiproc_dir
-from ._telemetry import TelemetryUvicornServer
+from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
 if TYPE_CHECKING:
@@ -2879,7 +2879,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                 port=port,
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        server = TelemetryUvicornServer(config)
+        server = create_uvicorn_server(config)
 
         async def _register_after_serving():
             while not server.started:

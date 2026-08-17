@@ -41,7 +41,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve._telemetry import TelemetryUvicornServer
+from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.cluster_storage import HttpClusterStorageServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.version import __version__ as VERSION
@@ -169,14 +169,14 @@ class CoordinatorServer:
                 uds_cfg = uvicorn.Config(self.app, uds=uds, lifespan="off", **kwargs)
                 tcp_cfg = uvicorn.Config(self.app, host=host, port=port, lifespan="off", **kwargs)
                 await _asyncio.gather(
-                    TelemetryUvicornServer(uds_cfg).serve(),
-                    TelemetryUvicornServer(tcp_cfg).serve(),
+                    create_uvicorn_server(uds_cfg).serve(),
+                    create_uvicorn_server(tcp_cfg).serve(),
                 )
             finally:
                 await self._coordinator.stop()
         else:
             config = uvicorn.Config(self.app, host=host, port=port, **kwargs)
-            await TelemetryUvicornServer(config).serve()
+            await create_uvicorn_server(config).serve()
 
 
 def serve_coordinator(host: str, port: int, coordinator: DisaggCoordinatorService) -> None:

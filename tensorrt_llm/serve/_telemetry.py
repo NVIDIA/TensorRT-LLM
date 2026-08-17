@@ -20,6 +20,11 @@ import socket
 import uvicorn
 
 import tensorrt_llm.usage as usage
+from tensorrt_llm.logger import logger
+
+
+class _UvicornSignalCompatibilityError(RuntimeError):
+    """Raised when Uvicorn cannot support signal terminal telemetry."""
 
 
 def _ensure_uvicorn_signal_api(server: uvicorn.Server) -> None:
@@ -35,7 +40,7 @@ def _ensure_uvicorn_signal_api(server: uvicorn.Server) -> None:
         or not isinstance(getattr(server, "_captured_signals", None), list)
     ):
         version = getattr(uvicorn, "__version__", "unknown")
-        raise RuntimeError(
+        raise _UvicornSignalCompatibilityError(
             "Unsupported Uvicorn signal API in version "
             f"{version}: TRT-LLM requires Server._serve(self, sockets) and "
             "Server._captured_signals for terminal telemetry"
@@ -67,3 +72,12 @@ class TelemetryUvicornServer(uvicorn.Server):
                 signal_number=signal_number,
             )
         )
+
+
+def create_uvicorn_server(config: uvicorn.Config) -> uvicorn.Server:
+    """Use signal telemetry when compatible, otherwise preserve serving."""
+    try:
+        return TelemetryUvicornServer(config)
+    except _UvicornSignalCompatibilityError as exc:
+        logger.warning(f"{exc}; continuing with standard Uvicorn without signal terminal telemetry")
+        return uvicorn.Server(config)
