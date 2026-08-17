@@ -1147,6 +1147,7 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
         self.kv_cache_map: dict[int, _KVCache] = {}
+        self._request_stats_enabled_ids: set[int] = set()
 
         # Tracks the draft length allocated by try_allocate_generation per
         # request.  Used by extend_capacity_for_tokens to compute the exact
@@ -2190,7 +2191,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return max_num_pages // self.kv_factor
 
     def commit_scheduled_kv_cache_stats(self, scheduled_batch: ScheduledRequests) -> None:
-        if self.is_draft or not self.enable_stats:
+        if self.is_draft or (not self.enable_stats and not self._request_stats_enabled_ids):
             return
         dirty_req_ids = self.impl.get_dirty_stats_kv_cache_ids()
         for req in scheduled_batch.all_requests():
@@ -2199,7 +2200,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 if kv_cache is None:
                     continue
                 request_stats = kv_cache.commit_pending_stats()
-                if not req.is_dummy and not request_stats.empty:
+                if (
+                    (self.enable_stats or req.return_perf_metrics)
+                    and not req.is_dummy
+                    and not request_stats.empty
+                ):
                     req.update_kv_cache_perf_metrics(
                         request_stats.alloc_total_blocks,
                         request_stats.alloc_new_blocks,
@@ -2378,6 +2383,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     tokens,
                     cache_salt=req.cache_salt,
                     is_dummy=req.is_dummy,
+                    enable_request_stats=req.return_perf_metrics,
                     expected_prompt_length=req.prompt_len - 1,
                 )
                 if kv_cache is None:
@@ -3402,6 +3408,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._request_stats_enabled_ids.discard(request.py_request_id)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -3645,6 +3652,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        self._request_stats_enabled_ids.clear()
         self.impl.shutdown()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
@@ -3837,6 +3845,7 @@ class KVCacheManagerV2(BaseResourceManager):
         *,
         cache_salt: str | None = None,
         is_dummy: bool = False,
+        enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
@@ -3853,13 +3862,17 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
+        enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
             id=request_id,
+            enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
         )
         self.kv_cache_map[request_id] = kv_cache
+        if enable_request_stats and not self.enable_stats:
+            self._request_stats_enabled_ids.add(request_id)
         if is_dummy:
             self.impl.mark_stats_excluded(request_id)
             kv_cache.discard_pending_stats()
