@@ -132,10 +132,49 @@ class DSATrtllmAttention(TrtllmAttention):
 
         if metadata.kv_cache_manager.dtype == tensorrt_llm.bindings.DataType.NVFP4:
             if not is_generation:
-                raise NotImplementedError(
-                    "NVFP4 DSA cache currently supports q_len=1 decode only; "
-                    "sparse context attention needs a chunked scratch path."
+                flat_indices = topk_indices_global.flatten()
+                valid_mask = (flat_indices >= 0) & (flat_indices < metadata._cached_num_pool_tokens)
+                valid_indices = flat_indices[valid_mask]
+                if valid_indices.numel() == 0:
+                    raise RuntimeError("NVFP4 DSA context TopK contains no valid cache indices")
+
+                # Context TopK contains substantial cross-query duplication.
+                # Dequantize every selected physical row exactly once, then
+                # remap per-query TopK entries into that compact FP8 pool.
+                unique_indices, inverse = torch.unique(
+                    valid_indices, sorted=True, return_inverse=True
                 )
+                num_unique = unique_indices.shape[0]
+                head_dim = metadata.kv_cache_manager.head_dim
+                scratch = torch.empty(
+                    (num_unique, 1, head_dim),
+                    dtype=torch.float8_e4m3fn,
+                    device=topk_indices_global.device,
+                )
+                gather_compact_indices = torch.empty(
+                    (num_unique, 1),
+                    dtype=torch.int32,
+                    device=topk_indices_global.device,
+                )
+                torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
+                    metadata.host_kv_cache_pool_pointers,
+                    metadata.host_kv_cache_pool_mapping,
+                    unique_indices.view(-1, 1),
+                    scratch,
+                    gather_compact_indices,
+                    self.kv_scale_quant_orig,
+                    local_layer_idx,
+                    metadata._cached_num_pool_tokens,
+                )
+                compact_indices = torch.full_like(flat_indices, -1)
+                compact_indices[valid_mask] = inverse.to(torch.int32)
+                compact_indices = compact_indices.view_as(topk_indices_global)
+
+                # Keep the raw-pointer backing allocation alive until the next
+                # layer/step has enqueued its work on the same CUDA stream.
+                metadata.nvfp4_mla_context_fp8_scratch = scratch
+                forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
+                return compact_indices, None
             if topk_indices_global.shape[0] != metadata.num_generations:
                 raise NotImplementedError(
                     "NVFP4 DSA cache currently supports exactly one query "

@@ -53,6 +53,7 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     split_prefill_chunks,
     transform_local_topk_and_prepare_pool_view,
 )
+from tensorrt_llm._torch.attention_backend.sparse.dsa.module import forward_context_sparse_attn
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
@@ -211,6 +212,102 @@ def test_shared_topk_lifecycle():
     metadata.on_update_kv_lens()
 
     assert metadata.shared_topk_indices is buffer
+
+
+def test_nvfp4_context_topk_is_deduplicated_into_compact_pool():
+    topk_indices = torch.tensor(
+        [[5, 2, 5, -1], [2, 7, 9, 5]],
+        dtype=torch.int32,
+    )
+    metadata = SimpleNamespace(
+        num_ctx_tokens=2,
+        num_tokens=2,
+        num_generations=0,
+        shared_topk_indices=None,
+        in_mtp_draft_loop=False,
+        kv_cache_manager=SimpleNamespace(dtype=DataType.NVFP4, head_dim=16),
+        host_kv_cache_pool_pointers=torch.zeros((1, 2, 2), dtype=torch.int64),
+        host_kv_cache_pool_mapping=torch.zeros((1, 2), dtype=torch.int32),
+        _cached_num_pool_tokens=8,
+        nvfp4_mla_context_fp8_scratch=None,
+    )
+    backend = SimpleNamespace(
+        indexer=SimpleNamespace(
+            forward_from_projected=Mock(return_value=topk_indices),
+        ),
+        get_local_layer_idx=Mock(return_value=0),
+        kv_scale_quant_orig=torch.ones(1, dtype=torch.float32),
+    )
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.context_only,
+        sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.attention_backend.sparse.dsa.backend."
+            "transform_local_topk_and_prepare_pool_view",
+            return_value=(topk_indices, None),
+        ),
+        patch("torch.ops.trtllm.nvfp4_mla_kv_cache_gather", create=True) as gather,
+    ):
+        compact_indices, _ = DSATrtllmAttention.sparse_attn_predict(
+            backend,
+            torch.empty((2, 1)),
+            None,
+            metadata,
+            forward_args,
+        )
+
+    expected = torch.tensor(
+        [[1, 0, 1, -1], [0, 2, -1, 1]],
+        dtype=torch.int32,
+    )
+    torch.testing.assert_close(compact_indices, expected)
+    unique_indices = gather.call_args.args[2]
+    torch.testing.assert_close(
+        unique_indices,
+        torch.tensor([[2], [5], [7]], dtype=torch.int32),
+    )
+    scratch = gather.call_args.args[3]
+    assert scratch.shape == (3, 1, 16)
+    assert scratch.dtype == torch.float8_e4m3fn
+    assert metadata.nvfp4_mla_context_fp8_scratch is scratch
+    assert forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr == scratch.data_ptr()
+
+
+def test_nvfp4_context_appends_before_attention():
+    output = torch.empty((2, 4))
+    latent_cache = torch.empty((2, 8))
+    mla = SimpleNamespace(
+        mqa=SimpleNamespace(
+            has_fp4_kv_cache=True,
+            mla_rope_append_paged_kv_assign_q=Mock(),
+        ),
+        forward_absorption_context=Mock(return_value=output),
+    )
+    q = torch.empty((2, 4))
+    compressed_kv = torch.empty((2, 4))
+    k_pe = torch.empty((2, 4))
+    metadata = SimpleNamespace()
+
+    result = forward_context_sparse_attn(
+        mla,
+        q,
+        compressed_kv,
+        k_pe,
+        metadata,
+        output,
+        latent_cache,
+        indexer_intermediates=[],
+    )
+
+    assert result is output
+    mla.mqa.mla_rope_append_paged_kv_assign_q.assert_called_once_with(
+        q, latent_cache, metadata, is_generation=False
+    )
+    assert mla.forward_absorption_context.call_args.kwargs["latent_cache"] is None
+    assert mla.forward_absorption_context.call_args.kwargs["q_rope_applied"] is True
 
 
 def test_indexer_post_load_weights_caches_fused_weight():

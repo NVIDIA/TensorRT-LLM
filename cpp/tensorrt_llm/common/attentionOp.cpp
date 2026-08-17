@@ -1888,7 +1888,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             params.mla_param->quant_scale_q = params.kv_scale_orig_quant;
             params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
             params.mla_param->dequant_scale_q = params.kv_scale_quant_orig;
-            params.mla_param->dequant_scale_kv = params.kv_scale_quant_orig;
+            params.mla_param->dequant_scale_kv
+                = cache_type == KvCacheDataType::NVFP4 ? nullptr : params.kv_scale_quant_orig;
             params.mla_param->host_bmm1_scale
                 = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
             // The sparse MLA is in the absorption mode for the context phase.
@@ -1898,6 +1899,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             bool const useFusedQFp8 = params.mla_param->fuse_q_fp8_in_rope && mFP8ContextMLA
                 && params.mla_param->absorption_mode && cache_type == KvCacheDataType::FP8
                 && params.mla_param->quant_q_buf != nullptr && params.mla_param->quant_scale_qkv != nullptr;
+            TLLM_CHECK_WITH_INFO(cache_type != KvCacheDataType::NVFP4 || params.mla_param->latent_cache == nullptr,
+                "NVFP4 sparse MLA context must append its latent cache before launching attention");
             if (params.mla_param->latent_cache != nullptr)
             {
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
@@ -2903,8 +2906,8 @@ int AttentionOp::initialize() noexcept
 
     // Check requirements for FP4 KV cache.
     TLLM_CHECK_WITH_INFO(!mKVCacheQuantMode.hasFp4KvCache() || mFP8ContextFMHA
-            || (mIsMLAEnabled && mUseSparseAttention && mFP8GenerationMLA),
-        "FP4 KV cache requires FP8 context FMHA or sparse MLA generation with an FP8 scratch pool");
+            || (mIsMLAEnabled && mUseSparseAttention && (mFP8ContextMLA || mFP8GenerationMLA)),
+        "FP4 KV cache requires FP8 context FMHA or sparse MLA with an FP8 scratch pool");
 
     TLLM_CHECK(isRoPE() == (mRotaryEmbeddingDim != 0));
     TLLM_CHECK_WITH_INFO((mSM >= 80) || (mType != tensorrt_llm::DataType::kBF16),
@@ -3017,7 +3020,7 @@ int AttentionOp::initialize() noexcept
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
             fmhaParams.dataTypeKv = DATA_TYPE_BF16;
         }
-        if (mFP8ContextMLA && mKVCacheQuantMode.hasFp8KvCache())
+        if (mFP8ContextMLA)
         {
             fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;

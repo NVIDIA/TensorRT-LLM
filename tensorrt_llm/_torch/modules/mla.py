@@ -1593,6 +1593,7 @@ class MLA(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
+        q_rope_applied = kwargs.pop("q_rope_applied", False)
 
         q_nope, q_pe = q.view([-1, self.num_heads_tp, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
@@ -1643,7 +1644,7 @@ class MLA(nn.Module):
                     f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}."
                 )
 
-            if self.apply_rotary_emb:
+            if self.apply_rotary_emb or q_rope_applied:
                 fused_q[..., self.kv_lora_rank :] = q_pe
             fused_q = fused_q.view(
                 [
