@@ -70,7 +70,6 @@ setup_github_auth() {
         if [ -n "$restore_x" ]; then set -x; fi
         return 0
     fi
-    export GITHUB_AUTH_CONFIGURED=1
 
     if ! git_env_config_supported; then
         local git_desc
@@ -87,19 +86,22 @@ setup_github_auth() {
         token=$(cat "$secret_file")
     fi
 
-    if [ -n "$token" ]; then
-        # Append rather than overwrite, in case the caller already carries its own
-        # GIT_CONFIG_* entries. Per-repo mirrors (GITHUB_MIRROR, the GitLab mirrors
-        # configured on CI agents) keep winning over this catch-all rewrite: git
-        # resolves insteadOf by longest matching prefix.
-        local idx="${GIT_CONFIG_COUNT:-0}"
-        export "GIT_CONFIG_KEY_${idx}=url.https://x-access-token:${token}@github.com/.insteadOf"
-        export "GIT_CONFIG_VALUE_${idx}=https://github.com/"
-        export GIT_CONFIG_COUNT=$((idx + 1))
-        echo "[github_auth] Using authenticated github.com access."
-    else
+    if [ -z "$token" ]; then
         echo "[github_auth] No GitHub token available, using anonymous github.com access."
+        if [ -n "$restore_x" ]; then set -x; fi
+        return 0
     fi
+
+    # Append rather than overwrite, in case the caller already carries its own
+    # GIT_CONFIG_* entries. Per-repo mirrors (GITHUB_MIRROR, the GitLab mirrors
+    # configured on CI agents) keep winning over this catch-all rewrite: git
+    # resolves insteadOf by longest matching prefix.
+    local idx="${GIT_CONFIG_COUNT:-0}"
+    export "GIT_CONFIG_KEY_${idx}=url.https://x-access-token:${token}@github.com/.insteadOf"
+    export "GIT_CONFIG_VALUE_${idx}=https://github.com/"
+    export GIT_CONFIG_COUNT=$((idx + 1))
+    export GITHUB_AUTH_CONFIGURED=1
+    echo "[github_auth] Using authenticated github.com access."
 
     if [ -n "$restore_x" ]; then set -x; fi
     return 0

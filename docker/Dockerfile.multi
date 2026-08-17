@@ -69,6 +69,9 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
     pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base numpy wandb || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
     rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
