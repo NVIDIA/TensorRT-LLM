@@ -78,7 +78,16 @@ class _MpiCommProtocol(Protocol):
     def py2f(self) -> int:
         ...
 
-    def Barrier(self) -> None:
+    def allreduce(self, value: int) -> int:
+        ...
+
+    def Get_size(self) -> int:
+        ...
+
+    def Dup(self) -> "_MpiCommProtocol":
+        ...
+
+    def Free(self) -> None:
         ...
 
 
@@ -87,7 +96,7 @@ class _MnnvlWorkspace(TypedDict):
     uc_buffer: torch.Tensor
     buffer_flags: torch.Tensor
     buffer_size_bytes: int
-    mpi_comm: _MpiCommProtocol
+    mpi_comm: Optional[_MpiCommProtocol]
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -122,22 +131,39 @@ def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     return
 
 
-def _initialize_allreduce_mnnvl_protocol(workspace: _MnnvlWorkspace) -> None:
+def _initialize_allreduce_mnnvl_protocol(workspace: _MnnvlWorkspace,
+                                         *,
+                                         converge_errors: bool = True) -> None:
     """Reset Lamport buffers and control flags after allocation or restore."""
     buffer_size_bytes = workspace["buffer_size_bytes"]
     num_bytes_to_clear = [0] * 4
-    # FlashInfer #3950: these tensors may have been created during CUDA graph
-    # warmup under inference mode, so reset them under inference mode as well.
-    with torch.inference_mode():
-        workspace["uc_buffer"].fill_(-0.0)
-        workspace["buffer_flags"].copy_(
-            torch.tensor(
-                [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
-                dtype=torch.uint32,
-                device=workspace["buffer_flags"].device,
-            ))
-    torch.cuda.synchronize()
-    workspace["mpi_comm"].Barrier()
+    local_error: Optional[Exception] = None
+    try:
+        # FlashInfer #3950: these tensors may have been created during CUDA
+        # graph warmup under inference mode, so reset them under inference
+        # mode as well.
+        with torch.inference_mode():
+            workspace["uc_buffer"].fill_(-0.0)
+            workspace["buffer_flags"].copy_(
+                torch.tensor(
+                    [0, 2, buffer_size_bytes, 0, *num_bytes_to_clear, 0],
+                    dtype=torch.uint32,
+                    device=workspace["buffer_flags"].device,
+                ))
+        torch.cuda.synchronize()
+    except Exception as error:
+        local_error = error
+
+    if converge_errors:
+        comm = workspace["mpi_comm"]
+        assert comm is not None
+        success_count = comm.allreduce(int(local_error is None))
+        if success_count != comm.Get_size():
+            raise RuntimeError(
+                "MNNVL all-reduce protocol reset failed on at least one rank"
+            ) from local_error
+    if local_error is not None:
+        raise local_error
 
 
 def get_or_scale_allreduce_mnnvl_workspace(
@@ -184,6 +210,7 @@ def get_or_scale_allreduce_mnnvl_workspace(
 
         else:
             comm = allreduce_mnnvl_workspaces[mapping]["mpi_comm"]
+            assert comm is not None
             # Safeguard against when buffer_size_bytes is None
             req_buffer_size_bytes = buffer_size_bytes or init_buffer_size_bytes
             # Increase the buffer size in 8 MiB granularity to avoid frequently scaling the buffer
@@ -192,42 +219,54 @@ def get_or_scale_allreduce_mnnvl_workspace(
             logger.debug(
                 f"[MNNVL] Requested {req_buffer_size_bytes} bytes, is larger than the current workspace size. Scaling workspace for pp_rank {mapping.pp_rank}, tp_size {mapping.tp_size} from {allreduce_mnnvl_workspaces[mapping]['buffer_size_bytes']} to {buffer_size_bytes} bytes"
             )
-        # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
-        workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
-        # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
-        mcast_buf_handle = McastGPUBuffer(
-            workspace_size_bytes,
-            mapping.tp_size,
-            mapping.tp_rank,
-            mapping.local_rank,
-            use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
-            comm.py2f(),  # Fortran handle for the MPI communicator
-        )
+        candidate_workspace: Optional[_MnnvlWorkspace] = None
+        candidate_error: Optional[Exception] = None
+        try:
+            # Each workspace contains NUM_LAMPORT_BUFFERS buffers.
+            workspace_size_bytes = NUM_LAMPORT_BUFFERS * buffer_size_bytes
+            # Pass the pre-split MPI communicator's Fortran handle to avoid
+            # redundant splitting in C++.
+            mcast_buf_handle = McastGPUBuffer(
+                workspace_size_bytes,
+                mapping.tp_size,
+                mapping.tp_rank,
+                mapping.local_rank,
+                use_fabric_handle,
+                comm.py2f(),
+            )
+            buffer = mcast_buf_handle.get_uc_buffer(
+                mapping.tp_rank,
+                (workspace_size_bytes // torch.float32.itemsize, ),
+                torch.float32,
+                0,
+            )
+            # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages,
+            # numBytesToClear[4], access count ptr].
+            buffer_flags = torch.tensor(
+                [0] * 9,
+                dtype=torch.uint32,
+                device=torch.device("cuda", mapping.local_rank),
+            )
+            candidate_workspace = {
+                "handle": mcast_buf_handle,
+                "uc_buffer": buffer,
+                "buffer_flags": buffer_flags,
+                "buffer_size_bytes": buffer_size_bytes,
+                "mpi_comm": comm,
+            }
+        except Exception as error:
+            candidate_error = error
 
-        # We use per FP32 element in the buffer for lamport sync
-        buffer = mcast_buf_handle.get_uc_buffer(mapping.tp_rank,
-                                                (workspace_size_bytes //
-                                                 (torch.float32.itemsize), ),
-                                                torch.float32, 0)
-        # This is a buffer to maintain the state of this allreduce Op
-        # Should have the same lifetime with self._buffer
-        # The flag should be binded to each buffer allocation
-        # Layout: [cur idx, dirty idx, bytes per buffer, dirty num stages, numBytesToClear[4], access count ptr]
-        buffer_flags = torch.tensor(
-            [0] * 9,
-            dtype=torch.uint32,
-            device=torch.device("cuda", mapping.local_rank),
-        )
-
-        allreduce_mnnvl_workspaces[mapping] = {
-            "handle": mcast_buf_handle,
-            "uc_buffer": buffer,
-            "buffer_flags": buffer_flags,
-            "buffer_size_bytes": buffer_size_bytes,
-            "mpi_comm": comm,
-        }
-        _initialize_allreduce_mnnvl_protocol(
-            allreduce_mnnvl_workspaces[mapping])
+        candidate_success_count = comm.allreduce(int(candidate_error is None))
+        if candidate_success_count != comm.Get_size():
+            raise RuntimeError(
+                "MNNVL workspace construction failed on at least one rank"
+            ) from candidate_error
+        if candidate_error is not None:
+            raise candidate_error
+        assert candidate_workspace is not None
+        _initialize_allreduce_mnnvl_protocol(candidate_workspace)
+        allreduce_mnnvl_workspaces[mapping] = candidate_workspace
     return allreduce_mnnvl_workspaces[mapping]
 
 
@@ -674,10 +713,16 @@ class MNNVLAllReduce(nn.Module):
 
         This internal, experimental hook assumes an engine-level coordinator
         has atomically stopped admission and drained all in-flight work on every
-        participating rank. It is not sufficient for live-serving checkpointing.
+        participating rank. It releases this workspace's communicator while the
+        current MPI runtime is still valid. It is not sufficient for live-serving
+        checkpointing.
         """
         workspace = self.allreduce_mnnvl_workspaces[self.mapping]
         workspace["handle"].checkpoint_prepare()
+        comm = workspace["mpi_comm"]
+        if comm is not None:
+            comm.Free()
+            workspace["mpi_comm"] = None
 
     def checkpoint_restore(self, comm: _MpiCommProtocol) -> None:
         """Collectively recreate handles under an external restore coordinator.
@@ -688,14 +733,35 @@ class MNNVLAllReduce(nn.Module):
         resume only after all resource hooks have completed successfully.
 
         Args:
-            comm: Communicator newly created after process restore.
+            comm: Communicator newly created after process restore. The workspace
+                retains its own duplicate, so the caller may release this object
+                after the method returns.
         """
         workspace = self.allreduce_mnnvl_workspaces[self.mapping]
-        if workspace["handle"].is_mapped():
+        restore_pending = workspace["handle"].checkpoint_restore(comm.py2f())
+        if not restore_pending:
             return
-        workspace["handle"].checkpoint_restore(comm.py2f())
-        workspace["mpi_comm"] = comm
-        _initialize_allreduce_mnnvl_protocol(workspace)
+        owned_comm: Optional[_MpiCommProtocol] = None
+        protocol_error: Optional[Exception] = None
+        try:
+            owned_comm = comm.Dup()
+            workspace["mpi_comm"] = owned_comm
+            _initialize_allreduce_mnnvl_protocol(workspace,
+                                                 converge_errors=False)
+        except Exception as error:
+            protocol_error = error
+        try:
+            workspace["handle"].checkpoint_restore_complete(
+                protocol_error is None)
+        except Exception as completion_error:
+            workspace["mpi_comm"] = None
+            if owned_comm is not None:
+                owned_comm.Free()
+            if protocol_error is not None:
+                raise protocol_error from completion_error
+            raise
+        if protocol_error is not None:
+            raise protocol_error
 
     def forward(
         self,

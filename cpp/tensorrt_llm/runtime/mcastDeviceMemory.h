@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cuda.h>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::runtime
@@ -38,6 +39,14 @@ namespace tensorrt_llm::runtime
 //! along with signal pads used for synchronization between devices.
 class McastDeviceMemory
 {
+    enum class State : int32_t
+    {
+        kUnmapped,
+        kMapped,
+        kTransitioning,
+        kBroken,
+    };
+
 public:
     // Disallow copy construction
     McastDeviceMemory(McastDeviceMemory const&) = delete;
@@ -87,14 +96,32 @@ public:
     }
 
     //! Release fabric-backed physical memory while retaining virtual-address reservations.
+    //!
+    //! \warning This is an internal, experimental resource hook. The caller must stop admission, drain every
+    //! in-flight request and collective on all participating ranks, and invoke the hook collectively. It is not
+    //! sufficient by itself for live-serving checkpointing. The current owned communicator duplicate is released
+    //! before this method returns, while it still belongs to the pre-checkpoint MPI runtime.
     void checkpointPrepare();
 
     //! Recreate fabric-backed physical memory and remap it at the retained virtual addresses.
-    void checkpointRestore(int64_t mpiCommFortranHandle);
+    //!
+    //! \param mpiCommFortranHandle A communicator created after process restore. Its ordered world-rank membership,
+    //! rank, and size must match the original communicator exactly. A successful restore retains an owned duplicate;
+    //! the caller may release the supplied communicator after this method returns.
+    //! \return True when new mappings were created and checkpointRestoreComplete() must be called; false when the
+    //! object was already mapped and the supplied communicator was not retained.
+    //! \warning Multi-node MPI, NCCL, and RDMA process-restore semantics are not supported without an external
+    //! engine-wide coordinator that keeps every participating rank quiescent through restore. Communicator validation
+    //! rejects before mutation and may be retried; any failure after mutation starts leaves the object unusable and
+    //! requires process teardown.
+    [[nodiscard]] bool checkpointRestore(int64_t mpiCommFortranHandle);
+
+    //! Publish or abort mappings created by checkpointRestore after the owner resets its protocol state.
+    void checkpointRestoreComplete(bool localProtocolResetSucceeded);
 
     [[nodiscard]] bool isMapped() const
     {
-        return mMapped;
+        return mState == State::kMapped;
     }
 
     ~McastDeviceMemory() noexcept;
@@ -112,7 +139,8 @@ private:
     CUmemGenericAllocationHandle mMcHandle;
     std::vector<CUmemGenericAllocationHandle> mUcHandles;
 
-    tensorrt_llm::mpi::MpiComm mGroupComm; //!< The MPI communicator for the group
+    std::optional<tensorrt_llm::mpi::MpiComm> mGroupComm; //!< Present only while the current MPI runtime is valid
+    std::vector<int> mGroupWorldRanks;                    //!< Ordered world-rank membership retained across restore
 
     // Host array of pointers
     std::vector<CUdeviceptr> mUcPtrs;
@@ -121,13 +149,16 @@ private:
     // Device array of pointers
     void** mUcPtrsDev;
     void** mSignalPadsDev;
-    bool mMapped;
+    State mState;
+    std::vector<bool> mUcMapped;
+    bool mMcMapped;
+    bool mMcBound;
 
     // For intra-node mcast
     tensorrt_llm::runtime::IpcNvlsHandle* mNvlsHandle;
 
     void createAndMapMnMcastMem(size_t bufSize);
-    void unmapAndReleaseMnMcastMem();
+    bool unmapAndReleaseMnMcastMem() noexcept;
     void allocNvlsMcastMem(size_t bufSize);
     void initializePointerTables();
 };

@@ -90,14 +90,24 @@ public:
             .make_tensor();
     }
 
+    //! \brief Internal, experimental hook that detaches fabric handles after engine-wide quiescence.
     void checkpointPrepare()
     {
         mMcastDeviceMemory.checkpointPrepare();
     }
 
-    void checkpointRestore(int64_t mpiCommFortranHandle)
+    //! \brief Internal, experimental hook that recreates fabric handles while the engine remains quiescent.
+    //! \param mpiCommFortranHandle A post-restore communicator with the same ordered membership as the original. The
+    //! native resource retains its own duplicate after a successful restore.
+    [[nodiscard]] bool checkpointRestore(int64_t mpiCommFortranHandle)
     {
-        mMcastDeviceMemory.checkpointRestore(mpiCommFortranHandle);
+        return mMcastDeviceMemory.checkpointRestore(mpiCommFortranHandle);
+    }
+
+    //! \brief Complete the collective restore only after the owner has reset its local protocol state.
+    void checkpointRestoreComplete(bool localProtocolResetSucceeded)
+    {
+        mMcastDeviceMemory.checkpointRestoreComplete(localProtocolResetSucceeded);
     }
 
     [[nodiscard]] bool isMapped() const
