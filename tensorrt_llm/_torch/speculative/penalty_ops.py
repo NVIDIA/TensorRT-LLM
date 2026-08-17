@@ -30,7 +30,69 @@ shapes, and all state lives in buffers ``SpecMetadata.prepare_penalty_buffers``
 allocated up front.
 """
 
+from dataclasses import dataclass
+
 import torch
+
+
+@dataclass(kw_only=True)
+class PenaltyState:
+    """Device state backing the occurrence penalties, one row per sequence slot.
+
+    Split by where a token came from, because the three penalties do not agree on
+    what the prompt means:
+
+    * ``counts`` -- int32 [rows, vocab_size]. How often the MODEL produced each
+      token, plus any prompt tokens past ``prompt_ignore_length``. Read as
+      ``count > 0`` by repetition and presence, and as the count itself by
+      frequency.
+    * ``prompt_mask`` -- int32 [rows, ceil(vocab_size / 32)], one bit per token id.
+      The ignored prompt prefix, which drives repetition ONLY: the user's own text
+      is not charged presence/frequency. Repetition only asks "seen or not", so a
+      bit carries everything a count would, at 1/32 the memory.
+
+    The parameter vectors hold their no-op defaults (1.0 / 0.0 / 0.0), so a slot
+    that was never filled leaves logits untouched, and ``active`` gates each row on
+    device -- which is what lets a captured CUDA graph decide per replay whether a
+    row is penalized.
+
+    ``rows`` is the slot pool plus one scratch row: CUDA-graph dummy/padding
+    requests (``py_seq_slot is None``) are routed to ``dummy_row`` so they can never
+    disturb a live request's history.
+    """
+
+    counts: torch.Tensor
+    prompt_mask: torch.Tensor
+    repetition: torch.Tensor
+    presence: torch.Tensor
+    frequency: torch.Tensor
+    active: torch.Tensor
+    dummy_row: int
+
+    @classmethod
+    def create(
+        cls, *, slot_capacity: int, vocab_size: int, device: torch.device | str = "cuda"
+    ) -> "PenaltyState":
+        """Allocate every buffer up front, at addresses that stay put.
+
+        Deliberately not lazy (unlike ``TorchSampler``'s
+        ``PenaltyStore.ensure_workspace``): a captured CUDA graph records fixed
+        pointers, so a first allocation after capture would leave the replayed
+        kernel reading the wrong memory.
+        """
+        rows = slot_capacity + 1
+        return cls(
+            counts=torch.zeros((rows, vocab_size), dtype=torch.int32, device=device),
+            # 32 token ids per int32 word.
+            prompt_mask=torch.zeros(
+                (rows, (vocab_size + 31) // 32), dtype=torch.int32, device=device
+            ),
+            repetition=torch.ones((rows,), dtype=torch.float32, device=device),
+            presence=torch.zeros((rows,), dtype=torch.float32, device=device),
+            frequency=torch.zeros((rows,), dtype=torch.float32, device=device),
+            active=torch.zeros((rows,), dtype=torch.bool, device=device),
+            dummy_row=slot_capacity,
+        )
 
 
 def _unpack_prompt_mask(
@@ -61,6 +123,20 @@ def _apply_penalties_impl(
     frequency: torch.Tensor,
     active: torch.Tensor,
 ) -> None:
+    """Rewrite ``logits`` in place with the three occurrence penalties.
+
+    NB: traced by ``torch.compile(fullgraph=True)`` and replayed inside a captured
+    CUDA graph. That imposes constraints invisible from the body:
+
+    * no data-dependent shapes and no host syncs -- every extent must come from the
+      argument shapes, never from a value read off a device tensor;
+    * ``logits`` is the ONLY tensor written; the workspaces are read-only here, so
+      the same graph can be replayed for any batch whose state has changed;
+    * dims the caller marked dynamic must not be read back as concrete sizes, or
+      dynamo specializes them and later batch shapes fall out of the graph.
+
+    Callers pass a private copy of ``logits``: see ``_apply_occurrence_penalties``.
+    """
     # Fold this step's earlier speculative positions into the counts each row sees.
     # Position k must be penalized against positions 0..k-1 of the SAME step, which
     # are not in ``counts`` yet (they are only committed once acceptance is known).
@@ -76,7 +152,7 @@ def _apply_penalties_impl(
     # a reduced-vocab draft head -- and an unbounded id would scatter out of bounds.
     vocab = logits.size(-1)
     in_range = (intra_step_tokens >= 0) & (intra_step_tokens < vocab)
-    safe_tokens = torch.where(in_range, intra_step_tokens, intra_step_tokens.new_zeros(()))
+    safe_tokens = intra_step_tokens.masked_fill(~in_range, 0)
     intra_counts = torch.zeros_like(logits, dtype=torch.int32)
     intra_counts.scatter_add_(
         1, safe_tokens.to(torch.int64), (intra_step_valid & in_range).to(torch.int32)
@@ -140,9 +216,10 @@ def apply_penalties(
     """
     if not getattr(spec_metadata, "enable_penalty", False) or not any_active:
         return
-    counts = spec_metadata.penalty_counts
-    if counts is None or logits.numel() == 0:
+    state = spec_metadata.penalty_state
+    if state is None or logits.numel() == 0:
         return
+    counts = state.counts
     # A vocab-sharded logits view cannot be penalized against full-vocab counts.
     if logits.size(-1) != counts.size(-1):
         return
@@ -150,14 +227,14 @@ def apply_penalties(
     _apply_penalties_impl(
         logits,
         counts,
-        spec_metadata.penalty_prompt_mask,
+        state.prompt_mask,
         row_slots,
         intra_step_tokens,
         intra_step_valid,
-        spec_metadata.penalty_repetition,
-        spec_metadata.penalty_presence,
-        spec_metadata.penalty_frequency,
-        spec_metadata.penalty_active,
+        state.repetition,
+        state.presence,
+        state.frequency,
+        state.active,
     )
 
 
@@ -228,46 +305,60 @@ def build_row_mapping(
     return row_slots, intra_tokens, intra_valid
 
 
-def seed_prompt_mask(
+def seed_prompt(
     spec_metadata,
     slot: int,
     prompt_tokens: torch.Tensor,
+    prompt_ignore_length: int = 0,
 ) -> None:
-    """Record a request's prompt tokens in its packed bitmask row.
+    """Seed a request's prompt into its occurrence state, once per sequence.
 
-    Called once per request, when its sequence starts. Only the fact that a token
-    occurred is stored, which is all repetition consumes; presence/frequency
-    deliberately ignore the prompt (see ``_apply_penalties_impl``).
+    ``prompt_ignore_length`` splits the prompt the same way the C++ penalty kernel
+    does: the first N tokens are recorded in the packed bitmask, so they drive
+    repetition only, while the remainder is counted like generated text and drives
+    all three penalties. N is clamped to the prompt length, and values <= 0 mean the
+    whole prompt is counted.
 
     ``prompt_tokens`` may legitimately contain ids outside ``[0, vocab_size)`` --
-    multimodal models place placeholders above the vocab -- so they are dropped here
-    rather than allowed to index the mask.
+    multimodal models place placeholders above the vocab -- so they are dropped
+    rather than allowed to index the workspace.
+
+    No-op unless the penalty buffers exist (i.e. ``enable_penalty``).
     """
     if not getattr(spec_metadata, "enable_penalty", False):
         return
-    prompt_mask = spec_metadata.penalty_prompt_mask
-    if prompt_mask is None or prompt_tokens.numel() == 0:
+    state = spec_metadata.penalty_state
+    if state is None or prompt_tokens.numel() == 0:
         return
+    prompt_mask, counts = state.prompt_mask, state.counts
     if slot >= prompt_mask.size(0):
         return
 
     vocab_size = spec_metadata.vocab_size
     tokens = prompt_tokens.to(device=prompt_mask.device, dtype=torch.int64)
-    tokens = tokens[(tokens >= 0) & (tokens < vocab_size)]
-    if tokens.numel() == 0:
-        return
-    # Deduplicate first: two ids in the same 32-id word must contribute both bits,
-    # so the reduction has to be a bitwise OR. scatter_reduce_ has no OR mode, and
-    # 'amax' would keep only the larger bit. Unique ids let a plain OR-accumulate
-    # over one-hot bits work instead.
-    tokens = torch.unique(tokens)
-    words = tokens // 32
-    bits = torch.ones_like(tokens, dtype=torch.int32) << (tokens % 32).to(torch.int32)
-    row = torch.zeros_like(prompt_mask[slot])
-    # Distinct ids in the same word contribute disjoint bits, so summing them is
-    # exactly their bitwise OR.
-    row.scatter_add_(0, words, bits)
-    prompt_mask[slot] = prompt_mask[slot].bitwise_or(row)
+    ignore = max(0, min(prompt_ignore_length, tokens.numel()))
+    ignored, counted = tokens[:ignore], tokens[ignore:]
+
+    ignored = ignored[(ignored >= 0) & (ignored < vocab_size)]
+    if ignored.numel():
+        # Deduplicate first: two ids in the same 32-id word must contribute both
+        # bits, so the reduction has to be a bitwise OR. scatter_reduce_ has no OR
+        # mode and 'amax' would keep only the larger bit; over unique ids the bits
+        # within a word are disjoint, so a plain sum IS their bitwise OR.
+        unique = torch.unique(ignored)
+        row = torch.zeros_like(prompt_mask[slot])
+        row.scatter_add_(
+            0,
+            unique // 32,
+            torch.ones_like(unique, dtype=torch.int32) << (unique % 32).to(torch.int32),
+        )
+        prompt_mask[slot] = prompt_mask[slot].bitwise_or(row)
+
+    counted = counted[(counted >= 0) & (counted < vocab_size)]
+    if counted.numel():
+        # Counted like generated tokens: repeats must accumulate, so this is a real
+        # count rather than a bitmask.
+        counts[slot].scatter_add_(0, counted, torch.ones_like(counted, dtype=counts.dtype))
 
 
 @torch.compile(dynamic=None, fullgraph=True)
@@ -277,8 +368,14 @@ def _update_penalty_counts_impl(
     tokens: torch.Tensor,
     valid: torch.Tensor,
 ) -> None:
+    """Accumulate ``tokens`` into ``counts`` in place, one row per request.
+
+    NB: traced by ``torch.compile(fullgraph=True)``. Keep it free of
+    data-dependent shapes and host syncs -- ``valid`` masks the entries to skip
+    rather than filtering them out, precisely so the shapes stay static.
+    """
     vocab = counts.size(-1)
-    safe_tokens = torch.where(valid, tokens, tokens.new_zeros(()))
+    safe_tokens = tokens.masked_fill(~valid, 0)
     flat = slot_rows.unsqueeze(1) * vocab + safe_tokens
     counts.view(-1).scatter_add_(0, flat.reshape(-1), valid.to(counts.dtype).reshape(-1))
 
@@ -305,9 +402,10 @@ def update_penalty_counts(
     """
     if not getattr(spec_metadata, "enable_penalty", False):
         return
-    counts = spec_metadata.penalty_counts
-    if counts is None or accepted_tokens.numel() == 0:
+    state = spec_metadata.penalty_state
+    if state is None or accepted_tokens.numel() == 0:
         return
+    counts = state.counts
 
     vocab = counts.size(-1)
     positions = torch.arange(accepted_tokens.size(1), device=accepted_tokens.device)
@@ -321,8 +419,6 @@ def update_penalty_counts(
     )
     # Dummy rows keep active=False, so their counts never reach a real request,
     # but they still must not corrupt a shared row: they are masked out here too.
-    active = spec_metadata.penalty_active
-    if active is not None:
-        valid = valid & active[slot_rows].unsqueeze(1)
+    valid = valid & state.active[slot_rows].unsqueeze(1)
 
     _update_penalty_counts_impl(counts, slot_rows, tokens, valid)

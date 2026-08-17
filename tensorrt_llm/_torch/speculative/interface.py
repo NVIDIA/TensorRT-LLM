@@ -606,17 +606,10 @@ class SpecMetadata:
     # Whether the occurrence penalties are enabled (deploy-time; from
     # DecodingBaseConfig.enable_penalty). Gates the occurrence workspace allocation.
     enable_penalty: bool = False
-    # --- Occurrence-penalty state (allocated by prepare_penalty_buffers) ---
-    # int32 [num_slot_rows, vocab_size]; how often each token the MODEL generated has
-    # occurred. Read as ``count > 0`` by repetition/presence and as the count itself
-    # by frequency.
-    penalty_counts: Optional[torch.Tensor] = None
-    # int32 [num_slot_rows, ceil(vocab_size / 32)]; one bit per token id recording
-    # whether it appeared in the PROMPT. Prompt tokens feed repetition only -- the
-    # user's own text should not be charged presence/frequency -- and repetition only
-    # asks "seen or not", so a bitmask carries all the information a count would at
-    # 1/32 the memory of a full-width count tensor.
-    penalty_prompt_mask: Optional[torch.Tensor] = None
+    # Occurrence-penalty device state; None until prepare_penalty_buffers runs.
+    # See penalty_ops.PenaltyState for what each buffer holds and why the prompt is
+    # split from generated tokens.
+    penalty_state: Optional["penalty_ops.PenaltyState"] = None
     # Whether any request in the current batch has a penalty. Diagnostic only: it
     # must NOT gate the apply pass, because decode steps replay a CUDA graph
     # captured during warmup, when the flag is necessarily False. Whether a row is
@@ -636,15 +629,6 @@ class SpecMetadata:
     def batch_uses_penalty(self, value: bool) -> None:
         self._batch_uses_penalty[0] = value
 
-    # Per-slot penalty parameters, with their no-op defaults (1.0 / 0.0 / 0.0).
-    penalty_repetition: Optional[torch.Tensor] = None
-    penalty_presence: Optional[torch.Tensor] = None
-    penalty_frequency: Optional[torch.Tensor] = None
-    # bool [num_slot_rows]; whether the slot has any active occurrence penalty.
-    penalty_active: Optional[torch.Tensor] = None
-    # Row that CUDA-graph dummy/padding requests (py_seq_slot is None) route to,
-    # so they never touch a real request's counts. Mirrors dummy_slot_row.
-    penalty_dummy_row: int = 0
     # Sampling parameters for non-greedy sampling (per-request)
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
@@ -899,13 +883,7 @@ class SpecMetadata:
                 device='cuda')
 
     def prepare_penalty_buffers(self):
-        """Allocate the slot-indexed occurrence-penalty buffers.
-
-        Idempotent and gated on ``enable_penalty``. Allocated up front rather than
-        on first use (the way ``TorchSampler``'s ``PenaltyStore.ensure_workspace``
-        does it) because a captured CUDA graph reads fixed buffer addresses: a lazy
-        first allocation would land after capture and the replayed kernel would read
-        the wrong pointer.
+        """Allocate the occurrence-penalty state. Idempotent; no-op when disabled.
 
         Sized and indexed exactly like the rejection buffers -- see
         ``prepare_rejection_sampling_buffers`` for why the slot pool is
@@ -914,42 +892,18 @@ class SpecMetadata:
         """
         if not self.enable_penalty or self.vocab_size <= 0:
             return
-
         slot_capacity = self.num_seq_slots or self.max_num_requests
         if slot_capacity <= 0:
             return
-        num_slot_rows = slot_capacity + 1
 
-        if self.penalty_counts is None:
-            self.penalty_counts = torch.zeros((num_slot_rows, self.vocab_size),
-                                              dtype=torch.int32,
-                                              device='cuda')
-            self.penalty_dummy_row = slot_capacity
-        if self.penalty_prompt_mask is None:
-            # 32 token ids per int32 word.
-            self.penalty_prompt_mask = torch.zeros(
-                (num_slot_rows, (self.vocab_size + 31) // 32),
-                dtype=torch.int32,
-                device='cuda')
+        if self.penalty_state is None:
+            self.penalty_state = penalty_ops.PenaltyState.create(
+                slot_capacity=slot_capacity, vocab_size=self.vocab_size)
         if self.batch_slot_ids is None and self.max_num_requests > 0:
             # Normally allocated by prepare_rejection_sampling_buffers; the penalties
             # need the same row -> slot table even when rejection sampling is off.
             self.batch_slot_ids = torch.empty((self.max_num_requests, ),
                                               dtype=torch.long,
-                                              device='cuda')
-        if self.penalty_repetition is None:
-            # No-op defaults, so a slot that was never filled leaves logits untouched.
-            self.penalty_repetition = torch.ones((num_slot_rows, ),
-                                                 dtype=torch.float32,
-                                                 device='cuda')
-            self.penalty_presence = torch.zeros((num_slot_rows, ),
-                                                dtype=torch.float32,
-                                                device='cuda')
-            self.penalty_frequency = torch.zeros((num_slot_rows, ),
-                                                 dtype=torch.float32,
-                                                 device='cuda')
-            self.penalty_active = torch.zeros((num_slot_rows, ),
-                                              dtype=torch.bool,
                                               device='cuda')
 
     @staticmethod
@@ -999,7 +953,8 @@ class SpecMetadata:
         reason. Requests without a slot (CUDA-graph dummies) are skipped; their
         rows keep the no-op defaults.
         """
-        if not self.enable_penalty or self.penalty_counts is None:
+        state = self.penalty_state
+        if not self.enable_penalty or state is None:
             return
 
         slots: list[int] = []
@@ -1009,7 +964,7 @@ class SpecMetadata:
         active: list[bool] = []
         reset_slots: list[int] = []
         seed_requests: list[tuple] = []
-        num_rows = self.penalty_counts.size(0)
+        num_rows = state.counts.size(0)
 
         for request in requests:
             slot = getattr(request, "py_seq_slot", None)
@@ -1019,6 +974,8 @@ class SpecMetadata:
             rep = self._penalty_value(config, "repetition_penalty", 1.0)
             pre = self._penalty_value(config, "presence_penalty", 0.0)
             freq = self._penalty_value(config, "frequency_penalty", 0.0)
+            ignore_len = int(
+                self._penalty_value(config, "prompt_ignore_length", 0.0))
             slots.append(slot)
             repetition.append(rep)
             presence.append(pre)
@@ -1037,7 +994,7 @@ class SpecMetadata:
                     request, "is_last_context_chunk", True):
                 reset_slots.append(slot)
                 if active[-1]:
-                    seed_requests.append((slot, request))
+                    seed_requests.append((slot, request, ignore_len))
 
         # Host-side gate for the apply pass: with no penalized request in the batch,
         # the whole vocab-sized rewrite is a no-op worth skipping.
@@ -1054,10 +1011,10 @@ class SpecMetadata:
                               dtype=torch.float32,
                               pin_memory=prefer_pinned()).to('cuda',
                                                              non_blocking=True)
-        self.penalty_repetition.index_copy_(0, slots_cuda, params[0])
-        self.penalty_presence.index_copy_(0, slots_cuda, params[1])
-        self.penalty_frequency.index_copy_(0, slots_cuda, params[2])
-        self.penalty_active.index_copy_(
+        state.repetition.index_copy_(0, slots_cuda, params[0])
+        state.presence.index_copy_(0, slots_cuda, params[1])
+        state.frequency.index_copy_(0, slots_cuda, params[2])
+        state.active.index_copy_(
             0, slots_cuda,
             torch.tensor(active, dtype=torch.bool,
                          pin_memory=prefer_pinned()).to('cuda',
@@ -1067,16 +1024,16 @@ class SpecMetadata:
                                       dtype=torch.long,
                                       pin_memory=prefer_pinned()).to(
                                           'cuda', non_blocking=True)
-            self.penalty_counts.index_fill_(0, reset_cuda, 0)
+            state.counts.index_fill_(0, reset_cuda, 0)
             # The prompt bitmask is per-sequence too: a reused slot must not inherit
             # the previous occupant's prompt.
-            self.penalty_prompt_mask.index_fill_(0, reset_cuda, 0)
+            state.prompt_mask.index_fill_(0, reset_cuda, 0)
 
         # Seeded after the reset above, or the clear would wipe what we just wrote.
-        for slot, request in seed_requests:
+        for slot, request, ignore_len in seed_requests:
             prompt = self._request_prompt_tokens(request)
             if prompt is not None:
-                penalty_ops.seed_prompt_mask(self, slot, prompt)
+                penalty_ops.seed_prompt(self, slot, prompt, ignore_len)
 
     def write_padding_onehot_draft_probs(self, padding_slot_ids, draft_len):
         """Write a one-hot draft-prob row (prob 1.0 at draft-vocab token id 0,
