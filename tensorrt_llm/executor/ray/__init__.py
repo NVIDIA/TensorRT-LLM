@@ -12,27 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compatibility shim for ``tensorrt_llm.executor.ray_gpu_worker``.
+"""Ray executor integration.
 
-Will be removed once all usages are migrated to
-``tensorrt_llm.executor.ray.gpu_worker``.
-
-DO NOT ADD ANYTHING TO THIS FILE.
+This package deliberately re-exports nothing.  ``executor`` and ``gpu_worker``
+import ``ray`` at module scope, while ``stub`` is the stand-in used when Ray is
+*not* installed -- so a re-export here would make importing the stub require the
+very package the stub exists to replace, and it would fail only in environments
+without Ray.  Import the submodules directly.
 """
-
-import warnings
-
-from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker, RayWorkerWrapper  # noqa: F401
-
-warnings.warn(
-    "tensorrt_llm.executor.ray_gpu_worker has moved to "
-    "tensorrt_llm.executor.ray.gpu_worker and will be removed in a future "
-    "release.",
-    FutureWarning,
-    stacklevel=2,
-)
-
-__all__ = [
-    "RayGPUWorker",
-    "RayWorkerWrapper",
-]
