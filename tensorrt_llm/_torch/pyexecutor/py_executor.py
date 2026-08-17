@@ -167,6 +167,14 @@ _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
+# How many executor iterations between KV pool rebalance checks.  The V2
+# auto-tuner rate-limits itself to one adjustment per 120s, so a check every
+# iteration is pure overhead -- and under TP each check costs a broadcast (see
+# PyExecutor._agreed_need_adjustment).  At typical iteration times this adds a
+# fraction of a second of latency to a rebalance that happens at most twice a
+# minute, while cutting the collective rate by an order of magnitude.
+KV_POOL_REBALANCE_CHECK_INTERVAL = 10
+
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
     """Return whether an ACK is ready without blocking on recv."""
@@ -621,6 +629,13 @@ class PyExecutor:
         self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
+        # Iteration throttle for the KV pool rebalance check.  See
+        # _can_pause_for_rebalance / _agreed_need_adjustment.
+        self._rebalance_check_interval = KV_POOL_REBALANCE_CHECK_INTERVAL
+        # Countdown of drain iterations remaining before a pipeline-parallel
+        # rebalance can run; None when no rebalance is pending.  Only
+        # _executor_loop_pp uses it -- see _start_pp_rebalance_drain.
+        self._pp_rebalance_drain_iters: Optional[int] = None
         self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
 
@@ -2699,6 +2714,16 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                # A rebalance cannot run inline here the way it does in the
+                # other two loops -- the ring has to drain first -- so this
+                # only starts the drain.  Skipped while one is already
+                # pending so the decision is not retaken mid-drain.
+                if (self._uses_kv_manager_v2()
+                        and self._pp_rebalance_drain_iters is None
+                        and self._can_pause_for_rebalance()
+                        and self._agreed_need_adjustment()):
+                    self._start_pp_rebalance_drain()
+
                 self._handle_disagg_cache_errors_synced()
 
                 # Fetch new requests from request queue
@@ -2777,6 +2802,12 @@ class PyExecutor:
                     self._run_encoder_step(scheduled_batch.encoder_requests)
 
                 can_queue, _ = self._can_queue(scheduled_batch)
+                if self._pp_rebalance_drain_iters is not None:
+                    # Draining for a KV pool rebalance: stop feeding the ring
+                    # so it can empty out.  Every rank starts and ends the
+                    # drain on the same iteration, so suppressing the queue
+                    # here keeps them in lockstep rather than breaking it.
+                    can_queue = False
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
                 if not can_queue:
@@ -3007,6 +3038,11 @@ class PyExecutor:
 
                 # Stage 3.3: Handle executed batches.
                 handle_executed_batches(executed_batch_num)
+
+                # Stage 3.4: Rebalance the KV pools once the drain started at
+                # the top of some earlier iteration has emptied the ring.
+                if self._uses_kv_manager_v2():
+                    self._maybe_finish_pp_rebalance()
 
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -4574,15 +4610,33 @@ class PyExecutor:
                 raise ValueError(f"Invalid request type: {type(request)}.")
 
     def _can_pause_for_rebalance(self) -> bool:
-        """Gate KV pool rebalance to the cases the v1 hook supports.
+        """Gate KV pool rebalance to the cases the hook supports.
 
-        MVP scope: single-GPU aggregated, no in-flight disagg transfer,
-        no beam search, no drafter, not during warmup or shutdown.
-        Honors the ``enable_kv_pool_rebalance`` opt-in flag (default off).
+        Scope: no in-flight disagg transfer, no beam search, no drafter, not
+        during warmup or shutdown.  Honors the ``enable_kv_pool_rebalance``
+        opt-in flag (default off).
+
+        Pipeline parallelism *is* supported, but not in the same shape as the
+        other two loops.  ``_executor_loop`` and ``_executor_loop_overlap``
+        rebalance inline, because at the top of an iteration at most one
+        in-flight batch exists (``previous_batch``) and it can be consumed on
+        the spot.  ``_executor_loop_pp`` keeps up to ``num_micro_batches``
+        batches in flight in a ring, so a ``True`` here only *starts* a drain;
+        the rebalance itself happens once the ring is empty.  See
+        ``_start_pp_rebalance_drain``.
+
+        A ``True`` here is what puts a TP rank into
+        ``_agreed_need_adjustment``'s collective, so ranks that disagree on this
+        predicate *on the same iteration* would enter that collective in
+        different numbers.  The config checks are identical across ranks by
+        construction, and ``is_warmup`` / ``is_shutdown`` are phase flags the
+        executor loop already has to keep in lockstep for the many other
+        per-iteration collectives it runs, so relying on them adds no new
+        requirement.  Note that the throttle below reads ``iter_counter``
+        instead of keeping its own counter precisely so that a rank which does
+        return early here cannot carry a lasting cadence offset out of it.
         """
         if not self.enable_kv_pool_rebalance:
-            return False
-        if self.dist.pp_size > 1:
             return False
         if self.kv_cache_transceiver is not None:
             return False
@@ -4594,7 +4648,166 @@ class PyExecutor:
             return False
         if self.drafter is not None:
             return False
+
+        # Throttle the check itself.  Rebalance is rate-limited to once per
+        # 120s by the V2 auto-tuner's own cooldown, so polling every iteration
+        # buys nothing and costs a collective per iteration in the TP case
+        # (see _agreed_need_adjustment).  At typical iteration times this
+        # delays a rebalance by a couple of seconds at most.
+        #
+        # Throttling on iter_counter rather than on a counter of our own is
+        # deliberate.  A private counter would only advance on iterations where
+        # every gate above already passed, so a single iteration on which one
+        # rank returned early would leave that rank's counter permanently offset
+        # from its peers -- and the ranks would then reach the collective in
+        # _agreed_need_adjustment on different iterations from then on.
+        # iter_counter is bumped unconditionally at the end of every executor
+        # loop iteration, so being a pure function of the iteration index it
+        # cannot accumulate that offset.  This file already throttles the same
+        # way for iter stats (see _kv_iter_stats_interval).
+        if self.iter_counter % self._rebalance_check_interval != 0:
+            return False
         return True
+
+    def _agreed_need_adjustment(self) -> bool:
+        """Decide whether to rebalance, identically on every TP rank.
+
+        Every input to ``need_adjustment`` is a deterministic function of the
+        request stream -- the sample counters and the moving averages that
+        produce the target ratios are all fed from request-derived values with
+        no randomness -- **except** the 120s cooldown, which compares against a
+        per-rank ``steady_clock`` reading (``kvCacheManager.cpp:855``, stamped
+        per rank at ``:126`` and ``:873``).
+
+        Two TP ranks can therefore straddle the cooldown boundary on different
+        iterations and rebalance one iteration apart.  That window is enough to
+        break TP: ``_prepare_and_schedule_batch`` runs ``_schedule()`` on every
+        rank independently with no broadcast, so ranks holding different pool
+        geometry can admit different requests and issue mismatched collectives.
+
+        So rank 0 of the TP group decides and broadcasts.  Only the *trigger*
+        needs agreement -- the resulting ratios do not, because they are pure
+        functions of statistics that are already identical across TP ranks, and
+        those statistics keep being maintained on every rank regardless (they
+        are updated from the KvCache close path, not from this read).
+
+        Context parallelism needs the same treatment.  A request is split across
+        CP ranks, so they must admit it together, and CP runs on the same
+        executor loops as TP -- the loop choice keys only on ``pp_size`` -- which
+        means CP ranks also compute ``_schedule()`` independently.  Note that
+        ``dist.tp_size`` is ``mapping.tp_size``, which is 1 for a pure-CP job, so
+        keying on it alone would silently leave CP unsynchronized.  Under
+        Ulysses, CP is folded into attention TP (``attn_tp_size = tp_size *
+        cp_size``), making those ranks TP-shaped for KV purposes.
+
+        Broadcasting over the CP group and then the TP group propagates global
+        rank 0's decision to everyone: after the CP step each rank holds
+        ``V(its tp_rank, cp_rank 0)``, and the TP step then replaces that with
+        ``V(tp_rank 0, cp_rank 0)``.  Dedicated sub-communicators are used rather
+        than the global one, which carries regular executor traffic.
+
+        Attention DP suppresses the **TP** hop only, matching the scheduler's
+        own propagation (``py_executor.py:2470-2477``), which likewise gates its
+        ``tp_broadcast`` on ``not enable_attention_dp`` while running its
+        ``cp_broadcast`` unconditionally.  Under ADP the TP dimension *is* the
+        DP dimension (``mapping.py``: ``dp_size = tp_size if
+        enable_attention_dp else 1``), so those ranks own independent request
+        streams and independent KV caches and legitimately need different pool
+        ratios at different times.
+
+        That independence covers the *ratios*, but not the *timing*: the ranks
+        must still enter the rebalance together, so under ADP the TP hop
+        becomes an OR-reduction instead of being skipped.  The reason is that
+        the rebalance path is itself collective under ADP.
+        ``_consume_previous_batch_for_rebalance`` calls
+        ``_flush_pending_transfer_responses``, which -- as its own docstring
+        requires -- enters ``_enqueue_responses`` on every DP rank even with an
+        empty response list, and that performs a ``tp_gather``.  A rank
+        rebalancing alone therefore joins a collective its peers are not in, and
+        pairs up against whatever they happen to be running (in a live 4-rank
+        Qwen3-Next run: the ``tp_allgather`` of batch sizes in ``_can_queue``,
+        which returned ints where responses were expected and crashed the
+        executor loop).
+
+        ``any()`` rather than rank 0's reading is what keeps the starvation
+        argument intact: a rank that needs to rebalance still gets one instead
+        of waiting for rank 0 to want the same thing.
+
+        The cost to a rank that did *not* need one is not zero.  It runs the
+        whole hook: the stream sync, ``_consume_previous_batch_for_rebalance``
+        (which in the overlap loop collapses that iteration's overlap), then
+        suspend-all / ``adjust()`` / resume-all.  Measured end to end on
+        Qwen3-Next-80B (tp4 = ep4, ADP, 2 pool groups, 17 active requests) with
+        one rank needing the rebalance and three pulled in by it:
+
+            rank that needed it   21.1 ms  = 0.4 drain + 7.3 sync/agree + 13.5 rebalance
+            ranks pulled in        8.1 ms  = 0.3 drain + 7.3 sync/agree +  0.5 rebalance
+
+        So an uninvolved rank pays ~8 ms, not the 0.04 ms its no-op ``adjust()``
+        suggests, and the dominant term is the pre-existing
+        ``torch.cuda.current_stream().synchronize()`` below rather than anything
+        this agreement adds -- a check that decides *not* to rebalance, which
+        skips that sync, costs 0.1-1.5 ms.
+
+        Note the cooldown couples too: ``adjust()`` stamps
+        ``_last_adjustment_time`` unconditionally, so a rank dragged into a peer's
+        rebalance has its own 120s clock reset by it.  That keeps the group's
+        cadence aligned rather than letting N ranks each rebalance on their own
+        schedule, at the price of deferring a need that arises immediately
+        afterwards by up to one cooldown.
+
+        The extra collective costs one allgather per check, and the check is
+        already throttled to one iteration in
+        ``KV_POOL_REBALANCE_CHECK_INTERVAL``, against the ``tp_allgather`` that
+        ``_can_queue`` runs every iteration under ADP anyway.  It does add a
+        lockstep requirement that ADP did not have before: every TP rank must
+        reach this on the same iteration, so the ``_can_pause_for_rebalance``
+        gates above must stay rank-uniform under ADP as well as under plain TP.
+
+        CP is orthogonal to that and must **not** be skipped.  Within a single
+        DP replica the CP ranks still split the same request along the sequence
+        dimension, so they must admit it together for exactly the reason given
+        above for pure CP.  Nothing in ``Mapping`` or ``LlmArgs`` rejects
+        ``enable_attention_dp`` with ``cp_size > 1``, so skipping the CP hop
+        under ADP would reintroduce this PR's divergence inside every replica.
+        The net effect is that each DP replica decides on its own ``cp_rank``-0
+        reading, and its CP ranks follow it.
+
+        Pipeline parallelism needs agreement too, for a different reason.  PP
+        ranks do *not* schedule independently -- the first PP rank schedules and
+        propagates the result (``_pp_schedule_and_propagate``) -- so the
+        divergent-``_schedule()`` argument above does not apply.  What does
+        apply is the drain: rebalancing under PP requires every rank to stop
+        feeding the microbatch ring **on the same iteration**
+        (``_start_pp_rebalance_drain``).  A rank that drained alone while its
+        peers kept queueing microbatches would desynchronize the per-iteration
+        send/recv chain -- the sample-state relay and
+        ``ring_broadcast_executed_batch_num`` -- and hang the pipeline.  Each PP
+        rank also holds a *different* slice of layers, hence its own pools, its
+        own ``need_adjustment`` reading and its own cooldown clock, so left
+        alone they would not agree by construction.
+
+        Unlike the TP hop, the PP hop must **not** be suppressed under attention
+        DP.  ADP replicates along the TP dimension, so a replica's pipeline
+        stages all serve that replica's own request stream and must drain
+        together; ``pp_group`` for a given ``tp_rank`` holds exactly those
+        stages, so broadcasting over it propagates the replica's first-stage
+        decision to its own stages and nothing wider.
+
+        Chaining CP, then TP, then PP leaves every rank holding global rank 0's
+        value (or, under ADP, its own replica's first-stage value).
+        """
+        need = self.kv_cache_manager.impl.need_adjustment
+        if self.dist.cp_size > 1:
+            need = self.dist.cp_broadcast(need, root=0)
+        if self.dist.tp_size > 1:
+            if self.enable_attention_dp:
+                need = any(self.dist.tp_allgather(need))
+            else:
+                need = self.dist.tp_broadcast(need, root=0)
+        if self.dist.pp_size > 1:
+            need = self.dist.pp_broadcast(need, root=0)
+        return need
 
     def _consume_previous_batch_for_rebalance(self) -> None:
         """Drain ``previous_batch`` so its _KVCache instances are quiescent.
@@ -4633,13 +4846,28 @@ class PyExecutor:
         scheduler reactivates them through prepare_context /
         try_allocate_generation on the next iteration, the same path it
         uses today after eviction.
+
+        This is the inline path used by ``_executor_loop`` and
+        ``_executor_loop_overlap``, where consuming ``previous_batch`` is
+        enough to reach quiescence.  ``_executor_loop_pp`` cannot rebalance
+        inline and instead drains its microbatch ring first, then calls
+        ``_rebalance_kv_pools_now`` directly.
         """
-        mgr = self.kv_cache_manager
-        if not mgr.impl.need_adjustment:
+        if not self._agreed_need_adjustment():
             return
 
         torch.cuda.current_stream().synchronize()
         self._consume_previous_batch_for_rebalance()
+        self._rebalance_kv_pools_now()
+
+    def _rebalance_kv_pools_now(self) -> None:
+        """Suspend every active request, ``adjust()``, resume.
+
+        The caller guarantees quiescence -- no forward may be in flight and
+        no _KVCache may be mid-update -- because ``adjust()`` moves pages
+        underneath whatever holds them.
+        """
+        mgr = self.kv_cache_manager
 
         paused: List[LlmRequest] = []
         for req in self.active_requests:
@@ -4656,6 +4884,83 @@ class PyExecutor:
         for req in paused:
             mgr.resume_request(req)
         self._resume_padding_dummies_after_rebalance(mgr, paused_dummies)
+
+    def _start_pp_rebalance_drain(self) -> None:
+        """Begin emptying the microbatch ring ahead of a PP rebalance.
+
+        ``adjust()`` needs every _KVCache quiescent, but ``_executor_loop_pp``
+        keeps up to ``num_micro_batches`` batches in flight across the pipeline
+        at once.  Those cannot be consumed on the spot the way the overlap
+        loop's single ``previous_batch`` can: a microbatch is completed by the
+        sample-state relay travelling around the PP ring, which only advances
+        as iterations run.
+
+        So instead of draining inline we stop *feeding* the ring and let the
+        loop drain it: while a drain is pending, ``_executor_loop_pp`` forces
+        ``can_queue`` to False, which is the loop's existing "skip this
+        microbatch slot" path -- the same one an empty batch takes on an idle
+        server (``_can_queue`` is just ``batch_size > 0``).  Each iteration
+        retires one slot and queues nothing new, so ``num_micro_batches``
+        iterations empty the ring.
+
+        The countdown is a rank-independent constant and every rank starts it
+        on the same iteration (``_agreed_need_adjustment`` broadcasts over the
+        PP group), so all ranks stop feeding, reach quiescence, and rebalance
+        together.  That is what keeps the per-iteration send/recv chain in
+        lockstep through the drain.
+        """
+        self._pp_rebalance_drain_iters = self.num_micro_batches
+
+    def _pp_ring_is_quiescent(self) -> bool:
+        """True when no microbatch is in flight anywhere in the ring.
+
+        Both halves matter: ``micro_batches`` covers batches this rank has
+        queued but not yet retired, and ``unhandled_batch_counter`` covers
+        sample states that have been handed to the relay but whose results
+        have not been applied to the requests yet.
+        """
+        return (self._pp_rebalance_drain_iters is not None
+                and self.unhandled_batch_counter == 0
+                and all(mb is None for mb in self.micro_batches))
+
+    def _maybe_finish_pp_rebalance(self) -> None:
+        """Run the pending PP rebalance once the ring has drained.
+
+        Called at the end of every ``_executor_loop_pp`` iteration.  Counts
+        down the drain and, when it expires, rebalances.  Both the countdown
+        and the quiescence test are pure functions of state that the loop keeps
+        symmetric across ranks, so every rank takes the same branch on the same
+        iteration.
+
+        If the ring is somehow still busy when the countdown expires the
+        rebalance is skipped rather than forced: adjusting underneath a live
+        _KVCache would corrupt it, and skipping costs only a delay -- the
+        auto-tuner still wants the adjustment and will ask again on the next
+        check interval.
+        """
+        if self._pp_rebalance_drain_iters is None:
+            return
+        self._pp_rebalance_drain_iters -= 1
+        if self._pp_rebalance_drain_iters > 0:
+            return
+
+        if not self._pp_ring_is_quiescent():
+            logger.warning(
+                "KV pool rebalance skipped: the PP microbatch ring was still "
+                f"busy after {self.num_micro_batches} drain iterations "
+                f"(unhandled_batch_counter={self.unhandled_batch_counter}, "
+                f"in-flight slots="
+                f"{sum(mb is not None for mb in self.micro_batches)}).")
+            self._pp_rebalance_drain_iters = None
+            return
+
+        torch.cuda.current_stream().synchronize()
+        if self.pp_multi_stream_sample:
+            # Sampling for the last microbatch runs on its own stream; its
+            # writes must land before pages move underneath them.
+            self.sample_stream.synchronize()
+        self._rebalance_kv_pools_now()
+        self._pp_rebalance_drain_iters = None
 
     def _suspend_padding_dummies_for_rebalance(
             self, mgr: KVCacheManagerV2) -> List[Tuple[int, LlmRequest]]:
@@ -5288,8 +5593,13 @@ class PyExecutor:
         if len(self.control_requests) != 0:
             return
 
-        # Calculate timeout
-        idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
+        # Calculate timeout. Never wait once the shutdown sentinel has been
+        # consumed: no further item will arrive to wake a blocking get(), so
+        # blocking would keep the loop from reaching the
+        # `should_stop_processing` check that ends it, deadlocking shutdown()
+        # on `shutdown_event`.
+        idle = (total_num_active_requests == 0 and len(waiting_queue) == 0
+                and not self.is_shutdown)
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -5845,18 +6155,58 @@ class PyExecutor:
         reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
         (`blocks_in_primary_pool` forwards `get_page_index_upper_bound`, not the available-page count).
         A carried value of None -- non-fp8-MLA model, no reservation needed (reuse off / chunked prefill),
-        or estimation skipped -- means no admission cap is applied.
+        or estimation skipped -- means no admission cap is applied. A carried 0 is a real cap (a budget so
+        tight the reserve covers under one token), not "no cap", so it must not be collapsed into None.
         """
         cap = getattr(self, "_ctx_mla_kv_len_cap", "unset")
         if cap != "unset":
             return cap
-        if getattr(self, "is_warmup", False):
+        if self.is_warmup:
             # Estimation/warmup runs fresh-prefill dummies against a throwaway manager that reserved
             # nothing; don't cap them (and don't cache -- real serving recomputes from the real manager).
             return None
+        # getattr: managers not built by the estimator (and test doubles) never carry the attribute.
         carried = getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None)
-        self._ctx_mla_kv_len_cap = int(carried) if carried else None
+        self._ctx_mla_kv_len_cap = int(carried) if carried is not None else None
+        self._warn_if_ctx_mla_kv_len_cap_degenerate()
         return self._ctx_mla_kv_len_cap
+
+    def _warn_if_ctx_mla_kv_len_cap_degenerate(self) -> None:
+        """Surface an fp8 context-MLA admission cap too tight to batch context requests on.
+
+        `_cap_context_by_total_kv_len` logs its deferrals at debug level, so a deployment whose budget
+        lands here sees context throughput collapse with nothing in the log at default level. Called from
+        the cached resolution in `_get_ctx_mla_kv_len_cap`, so it fires at most once per executor.
+
+        Only the memory budget can produce a cap this small: the reserve is clamped to
+        `budget * w / (k + w)` (`get_mla_context_workspace_reserve`) and the cap is that reserve divided
+        by `w`, while the `fp8_context_mla_kv_len_cap` override is floored at `max_seq_len`
+        (`get_mla_context_workspace_kv_len_cap`). So the override is never the cause, and raising it is
+        never the fix -- point at the budget instead.
+        """
+        cap = self._ctx_mla_kv_len_cap
+        if cap is None:
+            return
+        if cap == 0:
+            consequence = (
+                "every forward step will schedule exactly one context request -- the "
+                "forward-progress request kept unconditionally -- whatever its length"
+            )
+        elif self.max_seq_len and cap < self.max_seq_len:
+            consequence = (
+                f"a single request attending max_seq_len={self.max_seq_len} already exceeds it, so "
+                "context requests near that length will be scheduled one per forward step"
+            )
+        else:
+            return
+        logger.warning(
+            f"fp8 context-MLA admission cap resolved to {cap} token(s) of summed attended KV: "
+            f"{consequence}. Prefill batching is degraded, not incorrect -- generation is unaffected "
+            "and requests still complete. The cap is the workspace reserve the KV-cache estimator "
+            "could afford divided by its per-token cost, so the KV cache memory budget is the binding "
+            "constraint: raise free_gpu_memory_fraction or max_gpu_total_bytes. Raising "
+            "KvCacheConfig.fp8_context_mla_kv_len_cap will not help (it is already floored at "
+            "max_seq_len).")
 
     @staticmethod
     def _context_attended_kv_len(ctx_req) -> int:
