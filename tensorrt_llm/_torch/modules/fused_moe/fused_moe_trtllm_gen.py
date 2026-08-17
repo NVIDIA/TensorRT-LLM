@@ -677,7 +677,7 @@ class TRTLLMGenFusedMoE(MoE):
         self,
         x: Union[torch.Tensor, MxFp8QuantizedTensor],
         router_logits: torch.Tensor,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                         torch.Tensor]]:
         """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
 

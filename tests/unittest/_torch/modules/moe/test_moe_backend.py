@@ -49,7 +49,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
-<<<<<<< HEAD
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
@@ -62,10 +62,6 @@ from tensorrt_llm._torch.modules.fused_moe.impl_environment import (
     collect_moe_environment,
     override_moe_environment,
 )
-=======
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
->>>>>>> 953f131bc9 ([None][test] cover prequantized Kimi route handoff)
 from tensorrt_llm._torch.modules.fused_moe.interface import (
     MoE,
     MoESchedulerKind,
