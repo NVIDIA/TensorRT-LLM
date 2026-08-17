@@ -112,11 +112,13 @@ The codebase is transitioning between two architectures:
 | Entry | `XXFusedMoE` (e.g., `CutlassFusedMoE`) | `ConfigurableMoE` + `XXBackend` + `MoEScheduler` |
 | Communication | Embedded inside each backend | Separated into `communication/` (or fused into kernel for `FUSED_COMM`) |
 | Forward execution | Inline in backend | `MoEScheduler` (`moe_scheduler.py`) |
-| EPLB | Not supported | Available to all backends |
+| EPLB | Not supported | Available on EPLB-capable backends |
 | Status | Being replaced | Active development |
 
 ConfigurableMoE currently supports these backends (`create_moe.py`):
-- `CutlassFusedMoE`, `TRTLLMGenFusedMoE`, `DeepGemmFusedMoE`, `CuteDslFusedMoE`, `DenseGEMMFusedMoE`, `MegaMoEDeepGemm`, `MegaMoECuteDsl`
+- `CutlassFusedMoE`, `TRTLLMGenFusedMoE`, `DeepGemmFusedMoE`, `CuteDslFusedMoE`,
+  `CuteDslB12xFusedMoE`, `DenseGEMMFusedMoE`, `MegaMoEDeepGemm`,
+  `MegaMoECuteDsl`, `MarlinFusedMoE`
 
 Still on old path (standalone, with embedded communication):
 - `TritonFusedMoE`, `VanillaMoE`

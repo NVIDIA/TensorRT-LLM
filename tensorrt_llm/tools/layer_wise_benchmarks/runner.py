@@ -462,9 +462,6 @@ class Runner:
             # To run the problem size of $B$ GPUs on $A$ GPUs, we need:
             # (1) Attention: If TP, reduce the number of attention heads; If DP, nothing to change.
             # (2) MoE: If EP, reduce the number of experts; If TP, reduce head size.
-            # MoE communication does not need a scaling hook: CommunicationFactory
-            # selects an alltoall strategy for any EP size under attention DP, so the
-            # scaled-down run already exercises the same communication path.
             def load_pretrained_config(*args, **kwargs):
                 pretrained_config = load_pretrained_config_orig(*args, **kwargs)
                 if not mapping.enable_attention_dp:
