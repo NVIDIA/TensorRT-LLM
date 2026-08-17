@@ -3102,9 +3102,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
             # token_num - 1 is the past history length in generation.
-            history_hint = (
-                max(0, token_num - 1) if is_gen and not materialize_history else None
-            )
+            history_hint = max(0, token_num - 1) if is_gen and not materialize_history else None
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
             encoder_input_tokens = (
                 [1] * encoder_output_len if encoder_output_len is not None else None

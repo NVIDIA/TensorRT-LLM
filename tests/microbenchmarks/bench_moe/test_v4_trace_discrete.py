@@ -82,7 +82,8 @@ def _split_template_args(s: str) -> list[str]:
         elif ch in ">)]":
             depth -= 1
         if ch == "," and depth == 0:
-            out.append("".join(cur).strip()); cur = []
+            out.append("".join(cur).strip())
+            cur = []
         else:
             cur.append(ch)
     if cur:
@@ -111,10 +112,12 @@ def _deep_gemm_shape(demangled: str):
     args = _split_template_args(m.group(1))
     if len(args) != _DG_ARITY:
         return None
+
     def _int(a):
-        v = re.sub(r"^\((?:unsigned )?int\)\s*", "", a.strip())   # nsys form
-        v = re.sub(r"[uU]+$", "", v.strip())                       # cxxfilt form
+        v = re.sub(r"^\((?:unsigned )?int\)\s*", "", a.strip())  # nsys form
+        v = re.sub(r"[uU]+$", "", v.strip())  # cxxfilt form
         return int(v) if re.fullmatch(r"-?\d+", v) else None
+
     n, k, g = _int(args[_DG_N]), _int(args[_DG_K]), _int(args[_DG_GROUPS])
     return None if None in (n, k, g) else (n, k, g)
 
@@ -126,8 +129,10 @@ def _current_sm() -> str:
 
 def _manifest() -> dict:
     if not _MANIFEST_PATH.exists():
-        pytest.skip(f"{_MANIFEST_PATH.name} absent; run tools/gen_module_cases.py "
-                    "against a layer-wise artifact directory to generate it")
+        pytest.skip(
+            f"{_MANIFEST_PATH.name} absent; run tools/gen_module_cases.py "
+            "against a layer-wise artifact directory to generate it"
+        )
     m = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
     dims = m.get("derived_dims")
     if not dims or not dims.get("consistent"):
@@ -135,7 +140,8 @@ def _manifest() -> dict:
             "manifest carries no self-consistent hidden/intermediate pair "
             f"({dims}); the traced shapes are not the gate-up/down pair this "
             "file assumes, so building a module from them would guard the wrong "
-            "thing. Regenerate, or extend gen_module_cases.py for this layout.")
+            "thing. Regenerate, or extend gen_module_cases.py for this layout."
+        )
     if not m.get("experts_per_rank"):
         pytest.skip("manifest has no grouped GEMM, so no experts-per-rank to mirror")
     return m
@@ -143,8 +149,10 @@ def _manifest() -> dict:
 
 def _case_id(m: dict) -> str:
     w, d = m["case_inputs"], m["derived_dims"]
-    return (f"{w['moe_backend'].lower()}_e{m['experts_per_rank']}"
-            f"_h{d['hidden_size']}_i{d['intermediate_size']}_t{w['num_tokens']}")
+    return (
+        f"{w['moe_backend'].lower()}_e{m['experts_per_rank']}"
+        f"_h{d['hidden_size']}_i{d['intermediate_size']}_t{w['num_tokens']}"
+    )
 
 
 def _build_traced_moe(m: dict):
@@ -227,6 +235,7 @@ def _cupti_before_any_cuda_context():
         yield None
         return
     from .timing.cupti import _try_init_cupti
+
     yield _try_init_cupti()
 
 
@@ -239,10 +248,18 @@ def _forward_kernels(request, moe, model, routing_logits_dtype, num_tokens: int)
 
     x = torch.randn(num_tokens, model.hidden_size, dtype=torch.bfloat16, device="cuda")
     router_logits = torch.randn(
-        num_tokens, model.num_experts, dtype=routing_logits_dtype, device="cuda")
+        num_tokens, model.num_experts, dtype=routing_logits_dtype, device="cuda"
+    )
     _times, stats = _time_moe_forward_cuda_graph(
-        moe, x, router_logits, all_rank_num_tokens=[num_tokens],
-        warmup=3, iters=1, cupti_ctx=cupti_ctx, flush_l2=True)
+        moe,
+        x,
+        router_logits,
+        all_rank_num_tokens=[num_tokens],
+        warmup=3,
+        iters=1,
+        cupti_ctx=cupti_ctx,
+        flush_l2=True,
+    )
     kernels = stats.get("moe_forward_kernels") or []
     if not kernels:
         # Not a bootstrap condition. An empty breakdown means the capture itself
@@ -256,7 +273,8 @@ def _forward_kernels(request, moe, model, routing_logits_dtype, num_tokens: int)
             f"({other} landed outside it). This is a broken capture, not a missing "
             "golden. cupti.py returns None when it does not see exactly 2*iters "
             "CUDA_EVENT records, usually because CUPTI was registered after the "
-            "CUDA context existed; re-run with -s to see its diagnostic.")
+            "CUDA context existed; re-run with -s to see its diagnostic."
+        )
     return kernels
 
 
@@ -277,7 +295,8 @@ def test_v4_moe_backend_honored():
     got = _backend_name_from_module(moe)
     assert got == want, (
         f"traced run used MoE backend {want!r}; this build silently produced "
-        f"{got!r} for the same shape (fallback regression).")
+        f"{got!r} for the same shape (fallback regression)."
+    )
 
 
 @_GPU
@@ -303,17 +322,20 @@ def test_v4_moe_traced_gemm_shapes_present(request):
     # Only the grouped shapes: the num_groups=1 ones come from the dense
     # GatedMLP branch, which this single-expert-group build does not exercise.
     wanted = [g for g in m["gemm_shapes"] if g["num_groups"] > 1]
-    missing = [g for g in wanted
-               if (g["N"], g["K"], g["num_groups"]) not in observed]
+    missing = [g for g in wanted if (g["N"], g["K"], g["num_groups"]) not in observed]
 
     assert not missing, (
         "GEMM shapes present in the traced run are absent from this build: "
-        + ", ".join(f"N={g['N']} K={g['K']} groups={g['num_groups']} "
-                    f"({g['share_of_iteration']*100:.1f}% of a traced iteration)"
-                    for g in missing)
+        + ", ".join(
+            f"N={g['N']} K={g['K']} groups={g['num_groups']} "
+            f"({g['share_of_iteration'] * 100:.1f}% of a traced iteration)"
+            for g in missing
+        )
         + "\nobserved deep_gemm shapes (N, K, groups): "
         + (", ".join(str(s) for s in sorted(observed)) or "none")
-        + "\nall kernels:\n" + "\n".join(k["name"] for k in kernels))
+        + "\nall kernels:\n"
+        + "\n".join(k["name"] for k in kernels)
+    )
 
 
 @_GPU
@@ -334,8 +356,10 @@ def test_v4_moe_launch_count(request):
         pytest.skip(
             f"No golden pinned for {case_id!r} on {sm}. Observed {observed} kernels. "
             f"Confirm zero variance over K runs, then pin "
-            f"_EXPECTED_LAUNCH_COUNT[{case_id!r}][{sm!r}] = {observed} to gate.")
+            f"_EXPECTED_LAUNCH_COUNT[{case_id!r}][{sm!r}] = {observed} to gate."
+        )
     assert observed == expected, (
         f"MoE forward launch count changed for {case_id} on {sm}: observed "
         f"{observed}, golden {expected}. Update the golden in the same PR if the "
-        f"change is intentional; otherwise this is a fusion or graph regression.")
+        f"change is intentional; otherwise this is a fusion or graph regression."
+    )
