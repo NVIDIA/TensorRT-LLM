@@ -2228,10 +2228,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Allocation pressure is part of the scheduler's normal control
             # flow. Let it suspend victims and retry instead of
             # terminating the executor event loop.
-            logger.debug(
-                "KV cache allocation ran out of memory for request %s",
-                req.py_request_id,
-            )
+            logger.debug(f"KV cache allocation ran out of memory for request {req.py_request_id}")
             return False
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:

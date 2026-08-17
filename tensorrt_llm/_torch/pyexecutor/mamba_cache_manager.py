@@ -3330,6 +3330,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _build_cache_config(
             self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        if self.local_num_mamba_layers == 0:
+            # A PP rank without a local recurrent layer is an ordinary
+            # attention-only V2 manager. In particular, do not reinterpret
+            # its batch descriptors as recurrent-state constraints.
+            return config
+
         kv_cache_config = self.kv_cache_config
         cache_tiers = config.cache_tiers
         gpu_quota = cache_tiers[0].quota
@@ -3361,16 +3367,21 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             for _ in range(self._num_reserved_dummy_slots)
         ]
         # Base warmup constraints describe max_batch_size concurrent requests.
-        # For hybrid V2 that would turn max_batch_size into a non-offloadable
-        # SSM floor. Keep the largest request from each constraint so one
-        # request can always make progress; larger batches are admitted from
-        # actual free pages.
-        constraints = [
-            replace(
-                batch,
-                kv_caches=[*batch.kv_caches[:1], *dummy_requests],
-            ) for batch in config.constraints
-        ]
+        # Keeping the whole batch would turn max_batch_size into a
+        # non-offloadable SSM floor. Descriptor order is not semantic, though,
+        # and different capacity/history pairs can be worst-case for different
+        # attention pool groups. Split each distinct descriptor into its own
+        # one-request constraint. StorageManager takes the per-pool maximum
+        # across constraints, preserving every one-request worst case without
+        # charging the recurrent pool for the original batch size.
+        constraints = []
+        for batch in config.constraints:
+            unique_kv_caches = dict.fromkeys(batch.kv_caches)
+            constraints.extend(
+                replace(
+                    batch,
+                    kv_caches=[kv_cache, *dummy_requests],
+                ) for kv_cache in unique_kv_caches)
 
         typical_step = config.typical_step
         if config.initial_pool_ratio is None:
@@ -3386,16 +3397,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # max_util_for_resume headroom to this logical constraint. Additional
         # requests consume the ratio-sized pool and are suspended to a colder
         # tier when their GPU state is not resident.
-        if any(isinstance(layer, SsmLayerConfig) for layer in layers):
-            ssm_floor_slots = (self._minimum_gpu_resident_sequences() +
-                               self._num_reserved_dummy_slots)
-            constraints = [
-                *constraints,
-                BatchDesc([
-                    KVCacheDesc(capacity=0, history_length=0)
-                    for _ in range(ssm_floor_slots)
-                ]),
-            ]
+        ssm_floor_slots = (self._minimum_gpu_resident_sequences() +
+                           self._num_reserved_dummy_slots)
+        constraints = [
+            *constraints,
+            BatchDesc([
+                KVCacheDesc(capacity=0, history_length=0)
+                for _ in range(ssm_floor_slots)
+            ]),
+        ]
         return replace(
             config,
             layers=layers,

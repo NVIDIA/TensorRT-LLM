@@ -588,6 +588,36 @@ class TestKVCacheFailuresGen:
         assert ids(out.generation_requests) == []
         assert ids(out.paused_requests) == []
 
+    def test_scheduled_encoder_prevents_false_deadlock(self):
+        """Encoder work is progress even when a suspended decode cannot resume."""
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+        )
+        sched = make_encoder_scheduler(mgr, max_num_tokens=100)
+        encoder = make_encoder_request(0, encoder_output_len=50)
+        waiting = make_gen_request(1)
+        mgr.kv_cache_map[waiting.py_request_id].is_active = False
+
+        out = sched.schedule_request([encoder, waiting], set())
+
+        assert ids(out.encoder_requests) == [0]
+        assert ids(out.generation_requests) == []
+
+    def test_disagg_candidate_prevents_false_deadlock(self):
+        """Starting a disaggregated transfer is scheduler progress."""
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        disagg = make_disagg_request(0)
+        waiting = make_gen_request(1)
+        mgr.kv_cache_map[waiting.py_request_id].is_active = False
+
+        out = sched.schedule_request([disagg, waiting], set())
+
+        assert ids(out.fitting_disagg_gen_init_requests) == [0]
+        assert ids(out.generation_requests) == []
+
     def test_suspended_request_without_progress_raises_deadlock(self):
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,

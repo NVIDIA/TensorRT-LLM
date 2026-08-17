@@ -438,11 +438,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 scheduled_ctx.append(req)
                 budget.commit(req, tokens, peft_pages)
 
-        # Deadlock detection: if generation requests exist but none were
-        # scheduled or evicted, the scheduler will spin forever unless an
-        # inflight batch or a request pending teardown can still release
-        # pages after this scheduling call.
-        if not scheduled_gen and not scheduled_ctx:
+        # Deadlock detection: if no forward work or disaggregated transfer was
+        # admitted, the scheduler will spin forever unless an inflight batch or
+        # a request pending teardown can still release pages after this call.
+        made_scheduler_progress = bool(
+            scheduled_encoder or scheduled_ctx or scheduled_gen or disagg_candidates
+        )
+        if not made_scheduler_progress:
             has_inflight_requests = any(
                 r.request_id in inflight_request_ids for r in active_requests
             )

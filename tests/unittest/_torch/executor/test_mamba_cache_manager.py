@@ -1645,7 +1645,9 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
             [
                 KVCacheDesc(capacity=64, history_length=0),
                 KVCacheDesc(capacity=1, history_length=0),
-            ]
+                KVCacheDesc(capacity=1, history_length=0),
+            ],
+            system_prompt_length=32,
         )
     ]
     base_layers = _base_attention_layer_configs(2)
@@ -1665,16 +1667,31 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
         [KVCacheDesc(capacity=32, history_length=31)] * (3 * 512)
         + [KVCacheDesc(capacity=0, history_length=0)]
     )
-    # The caller-provided max-batch constraint is reduced to the one request
-    # that must always make progress, while keeping dummy-slot padding.
+    # Each distinct caller-provided request shape becomes a one-request
+    # constraint. This preserves the worst case independently for each pool
+    # group without relying on descriptor order or retaining duplicate shapes.
+    for capacity in (64, 1):
+        assert (
+            BatchDesc(
+                [
+                    KVCacheDesc(capacity=capacity, history_length=0),
+                    KVCacheDesc(capacity=0, history_length=0),
+                ],
+                system_prompt_length=32,
+            )
+            in config.constraints
+        )
     assert (
         BatchDesc(
             [
                 KVCacheDesc(capacity=64, history_length=0),
+                KVCacheDesc(capacity=1, history_length=0),
+                KVCacheDesc(capacity=1, history_length=0),
                 KVCacheDesc(capacity=0, history_length=0),
-            ]
+            ],
+            system_prompt_length=32,
         )
-        in config.constraints
+        not in config.constraints
     )
     # The explicit SSM floor is independent of max_batch_size: suspended live
     # states can reside in host memory. Zero capacity avoids charging attention
@@ -1687,6 +1704,34 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     )
     assert sum(kv.capacity for kv in config.typical_step.kv_caches) == 512 * 96
     assert not hasattr(config.typical_step.kv_caches[0], "num_ssm_slots")
+
+
+def test_v2_hybrid_mamba_free_rank_preserves_base_cache_config():
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = 0
+    base_config = KVCacheManagerConfig(
+        tokens_per_block=32,
+        cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+        layers=_base_attention_layer_configs(2),
+        typical_step=BatchDesc(
+            [
+                KVCacheDesc(capacity=96, history_length=63),
+                KVCacheDesc(capacity=32, history_length=0),
+            ]
+        ),
+        constraints=[
+            BatchDesc(
+                [
+                    KVCacheDesc(capacity=128, history_length=127),
+                    KVCacheDesc(capacity=1, history_length=0),
+                ]
+            )
+        ],
+    )
+
+    config = mgr._build_cache_config(base_config)
+
+    assert config == base_config
 
 
 def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):
