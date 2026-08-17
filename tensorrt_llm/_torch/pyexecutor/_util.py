@@ -187,6 +187,22 @@ def get_kv_cache_manager_cls(
         if is_disagg:
             backend, runtime = _resolve_disagg_transceiver_route(
                 cache_transceiver_config)
+            if is_kimi_linear(config) and (runtime != "PYTHON"
+                                           or backend != "NIXL"):
+                # Only the Python NIXL transceiver can move KDA recurrent
+                # state; the C++ transceiver would silently serve wrong
+                # results. Model loading resolves ``auto`` to PYTHON via
+                # KimiLinearForCausalLM.get_preferred_transceiver_runtime
+                # (NIXL-gated); this rejects explicit non-Python routes and
+                # paths that skip model defaults (e.g. AutoDeploy).
+                raise ValueError(
+                    "Kimi K3 disaggregated serving requires the Python "
+                    "transceiver: set cache_transceiver_config "
+                    "backend='NIXL' with transceiver_runtime='PYTHON' (or "
+                    "leave transceiver_runtime='auto' with the NIXL "
+                    "backend). The C++ transceiver cannot transfer KDA "
+                    f"recurrent state (got backend={backend!r}, "
+                    f"transceiver_runtime={runtime!r}).")
             if use_v2:
                 if runtime != "PYTHON" or backend != "NIXL":
                     raise ValueError(
