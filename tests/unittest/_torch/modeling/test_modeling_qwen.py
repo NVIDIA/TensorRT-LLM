@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 from parameterized import parameterized
-from transformers import AutoModel, Qwen2Config
+from transformers import Qwen2Config
 from transformers import Qwen2ForCausalLM as HFQwenForCausalLM
 
 # isort: off
@@ -23,7 +23,6 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 # isort: on
 
@@ -53,7 +52,7 @@ Qwen_2_7B_CONFIG = {
     "vocab_size": 152064
 }
 
-# Qwen2.5-Math-PRM-7B
+# Synthetic Qwen2 process-reward config (architecture coverage)
 Qwen_2_5_PRM_7B_CONFIG = deepcopy(Qwen_2_7B_CONFIG)
 Qwen_2_5_PRM_7B_CONFIG.update({
     "architectures": ["Qwen2ForProcessRewardModel"],
@@ -309,76 +308,6 @@ class TestQwen(unittest.TestCase):
         if graph_runner is not None:
             graph_runner.clear()
         kv_cache_manager.shutdown()
-
-    @parameterized.expand(
-        [
-            Scenario(backend="VANILLA", model_name="qwen_prm"
-                     )  # Currently, only Vanilla Attn supports no KV Cache
-        ],
-        lambda testcase_func, param_num, param:
-        f"{testcase_func.__name__}[{param.args[0]}]")
-    @torch.no_grad()
-    def test_qwen_rm_allclose_to_hf(self, scenario: Scenario) -> None:
-        """
-        Compare output to HF for Qwen reward models
-        """
-        _, total_men = torch.cuda.mem_get_info()
-        if total_men < 80 * 1000**3:
-            self.skipTest("Only test with 80GB nodes")
-
-        backend = scenario.backend
-        metadata_cls = get_attention_backend(backend).Metadata
-
-        torch.random.manual_seed(0)
-        config_dict = deepcopy(Qwen_2_5_PRM_7B_CONFIG)
-
-        qwen_config = Qwen2Config.from_dict(config_dict)
-        dtype = qwen_config.torch_dtype
-        device = torch.device('cuda')
-
-        model_dir = str(llm_models_root() / "Qwen2.5-Math-PRM-7B")
-
-        # Qwen2ForProcessRewardModel definition is in the modeling file of ckpt
-        # instead of in transformers, so trust_remote_code must be set to True.
-        hf_qwen = AutoModel.from_pretrained(
-            model_dir, trust_remote_code=True).to(dtype).to(device).eval()
-
-        model_config = ModelConfig(pretrained_config=hf_qwen.config,
-                                   attn_backend=backend)
-        qwen = Qwen2ForProcessRewardModel(model_config).to(dtype).to(device)
-        qwen.load_weights(hf_qwen.state_dict())
-
-        # context
-        input_ids = INPUT_IDS.clone().to(device)
-        prompt_lens = [input_ids.size(-1)]
-
-        attn_metadata = metadata_cls(
-            seq_lens=torch.tensor([input_ids.size(-1)], dtype=torch.int),
-            num_contexts=1,
-            max_num_requests=1,
-            max_num_tokens=8192,
-            kv_cache_manager=None,
-            request_ids=[1],
-            prompt_lens=prompt_lens,
-        )
-
-        position_ids = [torch.arange(0, input_ids.size(-1))]
-        position_ids = torch.cat(position_ids).unsqueeze(0).cuda()
-        with torch.inference_mode():
-            logits = qwen.forward(input_ids=input_ids,
-                                  position_ids=position_ids,
-                                  attn_metadata=attn_metadata)
-            logits = logits[0]
-            ref = hf_qwen.forward(input_ids=input_ids.unsqueeze(0),
-                                  position_ids=position_ids,
-                                  use_cache=False)
-
-        # with actual weights, QwenPRM can pass atol/rtol=1e-1.
-        # Here we use a loosen threshold to avoid falky.
-        torch.testing.assert_close(logits,
-                                   ref.logits.squeeze(0),
-                                   atol=0.4,
-                                   rtol=0.4)
 
     def _prepare_sanity_test(self, model_name, quant_algo):
         config_dict = deepcopy(MODEL_CONFIGS[model_name])

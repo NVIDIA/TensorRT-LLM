@@ -175,7 +175,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
-            "Qwen/Qwen2.5-3B-Instruct",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
             {
                 "transforms": {
                     "insert_cached_attention": {"backend": "triton"},
@@ -184,7 +184,7 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
-            "Qwen/Qwen2.5-3B-Instruct",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
             {
                 "transforms": {
                     "transformers_replace_cached_attn": {"backend": "triton"},

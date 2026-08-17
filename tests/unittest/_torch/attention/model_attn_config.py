@@ -145,30 +145,9 @@ _STANDARD = [
     ),
     ModelAttnConfig(
         "qwen2_7b_gqa",
-        "Qwen2-7B, Qwen2.5-VL-7B, Qwen2-MoE-57B, LLaVA-OneVision-Qwen2",
+        "Shared GQA shape (kept for architecture coverage; Qwen2-7B/Qwen2.5-VL-7B pruned from scope)",
         num_heads=28,
         num_kv_heads=4,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
-        "qwen2_0_5b_gqa_hd64",
-        "Qwen2/Qwen2.5-0.5B",
-        num_heads=14,
-        num_kv_heads=2,
-        head_dim=64,
-    ),
-    ModelAttnConfig(
-        "qwen2_1_5b_gqa",
-        "Qwen2/Qwen2.5-1.5B",
-        num_heads=12,
-        num_kv_heads=2,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
-        "qwen2_3b_gqa",
-        "Qwen2.5-3B, Qwen2.5-VL-3B",
-        num_heads=16,
-        num_kv_heads=2,
         head_dim=128,
     ),
     ModelAttnConfig(

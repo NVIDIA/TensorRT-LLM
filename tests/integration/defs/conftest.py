@@ -1243,32 +1243,13 @@ def llm_qwen_model_root(request, llm_venv):
         elif request.param == "qwen1.5_14b_chat_int4":
             qwen_model_root = os.path.join(models_root,
                                            "Qwen1.5-14B-Chat-GPTQ-Int4")
-        elif request.param == "qwen2_0.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-0.5B-Instruct")
-        elif request.param == "qwen2_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-7B-Instruct")
-        elif request.param == "qwen2_7b_awq":
-            qwen_model_root = os.path.join(models_root, "Qwen2-7B-Instruct-AWQ")
         elif request.param == "qwen2_57b_a14b":
             qwen_model_root = os.path.join(models_root, "Qwen2-57B-A14B")
         elif request.param == "qwen2_72b_instruct":
             qwen_model_root = os.path.join(models_root, "Qwen2-72B-Instruct")
-        elif request.param == "qwen2_vl_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2-VL-7B-Instruct")
         elif request.param == "qwen2_audio_7b_instruct":
             qwen_model_root = os.path.join(models_root,
                                            "Qwen2-Audio-7B-Instruct")
-        elif request.param == "qwen2.5_0.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-0.5B-Instruct")
-        elif request.param == "qwen2.5_1.5b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-1.5B-Instruct")
-        elif request.param == "qwen2.5_7b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-7B-Instruct")
-        elif request.param == "qwen2.5_14b_instruct_int4":
-            qwen_model_root = os.path.join(models_root,
-                                           "Qwen2.5-14B-Instruct-GPTQ-Int4")
-        elif request.param == "qwen2.5_72b_instruct":
-            qwen_model_root = os.path.join(models_root, "Qwen2.5-72B-Instruct")
 
     assert exists(qwen_model_root), f"{qwen_model_root} does not exist!"
 

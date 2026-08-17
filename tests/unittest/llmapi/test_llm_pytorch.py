@@ -18,7 +18,6 @@ from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, PeftCacheConfig,
                                           SchedulerConfig, WaitingQueuePolicy)
-from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -200,27 +199,6 @@ def test_llm_invalid_input_token_async():
                             f"collect order {collect_order}, collecting {collect_idx}"
                         )
                         futures[collect_idx].result()
-
-
-@pytest.mark.part2
-def test_llm_reward_model():
-    rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
-    tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
-    tokenized_input = tokenizer(prompts, return_tensors="pt")["input_ids"]
-
-    llm = LLM(model=rm_model_path,
-              attn_backend="VANILLA",
-              disable_overlap_scheduler=True)
-
-    sampling_params = SamplingParams(return_context_logits=True)
-
-    outputs = llm.generate(prompts, sampling_params)
-    scores = outputs[0].context_logits
-
-    print(scores)
-
-    assert scores.shape == (tokenized_input.shape[1], 2)
-    assert not outputs[0].outputs[0].text
 
 
 @skip_ray

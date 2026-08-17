@@ -49,7 +49,7 @@ def model_with_connector():
         def model_fn(*args, **kwargs):
 
             default_kwargs = {
-                "model": f"{llm_models_root()}/Qwen2-0.5B",
+                "model": f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
                 "backend": "pytorch",
                 "kv_connector_config": kv_connector_config,
                 "cuda_graph_config": None,
@@ -600,7 +600,7 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
         )
 
         llm_kwargs = dict(
-            model=f"{llm_models_root()}/Qwen2-0.5B",
+            model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
             backend="pytorch",
             kv_connector_config=kv_connector_config,
             cuda_graph_config=None,

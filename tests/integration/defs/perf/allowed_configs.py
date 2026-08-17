@@ -1230,24 +1230,6 @@ _allowed_configs = {
                n_positions=8192,
                inter_size=13696,
            )),
-    "qwen2_7b_instruct":
-    Config(name="qwen2_7b_instruct",
-           family="qwen2",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=64,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=28,
-               num_heads=28,
-               hidden_size=3584,
-               vocab_size=152064,
-               hidden_act='silu',
-               n_positions=32768,
-               inter_size=18944,
-           )),
     "mamba_2.8b":
     Config(name="mamba_2.8b",
            family="mamba",

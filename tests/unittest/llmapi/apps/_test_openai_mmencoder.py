@@ -14,9 +14,9 @@ from .openai_server import RemoteMMEncoderServer
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-@pytest.fixture(scope="module", ids=["Qwen2.5-VL-3B-Instruct"])
+@pytest.fixture(scope="module", ids=["Qwen3/Qwen3-VL-2B-Instruct"])
 def model_name():
-    return "Qwen2.5-VL-3B-Instruct"
+    return "Qwen3/Qwen3-VL-2B-Instruct"
 
 
 @pytest.fixture(scope="module",
