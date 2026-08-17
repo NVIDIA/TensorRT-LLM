@@ -4629,8 +4629,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 // Build fail signatures list for rerun eligibility
                 def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
 
-                // Use unified run_tests.py for render + regular + isolated + rerun + merge
-                try {
+                // Use unified run_tests.py for render + regular + isolated + rerun + merge.
+                // catchError lets execution continue to the report-upload and timeout-XML steps
+                // below even when run_tests.py exits non-zero (test failures), preserving the
+                // same behaviour as main where those steps ran inside a catch block before the
+                // terminal error.
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     sh """
                         rm -rf ${stageName}/ && \
                         cd ${llmSrc}/tests/integration/defs && \
@@ -4648,13 +4652,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             --max-rerun-tests 5 \
                             ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
                     """
-                } finally {
-                    if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
-                        sh """
-                            python3 ${llmSrc}/tests/test_common/s3_output.py \
-                                --drain-spool "${WORKSPACE}/${stageName}" || true
-                        """
-                    }
+                }
+                if (ENABLE_UPLOAD_TEST_RESULTS && !testFilter[(DETAILED_LOG)]) {
+                    sh """
+                        python3 ${llmSrc}/tests/test_common/s3_output.py \
+                            --drain-spool "${WORKSPACE}/${stageName}" || true
+                    """
                 }
             }
 
