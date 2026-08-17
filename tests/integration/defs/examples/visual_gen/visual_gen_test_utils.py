@@ -410,6 +410,31 @@ def _cleanup_cuda():
 
 
 @contextlib.contextmanager
+def _lpips_pinned_fp32_matmul_precision():
+    """Pin fp32-matmul arithmetic so LPIPS goldens are portable across hosts.
+
+    NGC PyTorch containers default matmul TF32 on (``float32_matmul_precision
+    == "high"``); PyPI torch defaults it off (``"highest"``). A model with fp32
+    GEMMs inside its denoising loop (Cosmos3: the RoPE frequency matmul and the
+    fp32 timestep embedder) therefore produces a different trajectory under
+    each default, and a golden cut under one fails under the other -- measured
+    LPIPS-to-golden moved 0.132 -> 0.054 from this single flag. Pin "highest"
+    (IEEE fp32, measured bit-stable across torch 2.11/2.12 and B200/B300), and
+    pin cuDNN TF32 to its universal default so the second knob cannot drift.
+    bf16 compute -- all of the heavy kernels -- is unaffected by either knob.
+    """
+    previous_precision = torch.get_float32_matmul_precision()
+    previous_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    try:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cudnn.allow_tf32 = True
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
+        torch.backends.cudnn.allow_tf32 = previous_cudnn_tf32
+
+
+@contextlib.contextmanager
 def _lpips_deterministic_algorithms(*, fully_eager=False):
     previous_deterministic = torch.are_deterministic_algorithms_enabled()
     previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
@@ -421,7 +446,7 @@ def _lpips_deterministic_algorithms(*, fully_eager=False):
         compiler_context = (
             torch.compiler.set_stance("force_eager") if fully_eager else contextlib.nullcontext()
         )
-        with compiler_context:
+        with compiler_context, _lpips_pinned_fp32_matmul_precision():
             yield
     finally:
         torch.use_deterministic_algorithms(
