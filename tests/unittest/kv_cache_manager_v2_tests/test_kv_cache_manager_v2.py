@@ -2491,6 +2491,45 @@ class TestSSMSupport(unittest.TestCase):
         kv4.resume(stream)
         kv4.close()
 
+    def test_num_tokens_before_hybrid_pruning_isolates_recurrent_truncation(self) -> None:
+        """The diagnostic separates a short attention match from recurrent pruning.
+
+        Partial reuse is required for the two numbers to differ at all: without
+        it a match is block-aligned, so the attention-only prefix and the final
+        committed prefix are cut at the same block boundary and the diagnostic
+        is indistinguishable from num_committed_tokens.
+        """
+        cfg = self._make_ssm_config(tokens_per_block=32, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(96)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = 32
+        kv1.commit(prompt[:32])
+        kv1.capacity = 64
+        kv1.commit(prompt[32:64])
+        kv1.close()
+
+        # Attention pages partially cover all 48 lookup tokens, but the latest
+        # reusable SSM snapshot sits at 32 — so recurrent pruning, not a short
+        # attention match, is what cut the reuse.
+        kv = self.manager.create_kv_cache(input_tokens=prompt[:48])
+        self.assertEqual(kv.num_committed_tokens, 32)
+        self.assertEqual(kv._get_num_tokens_before_hybrid_pruning(), 48)
+        kv.resume(stream)
+        kv.close()
+
+        # When the snapshot and the attention match agree, the diagnostic must
+        # collapse onto num_committed_tokens rather than reporting the lookup.
+        kv = self.manager.create_kv_cache(input_tokens=prompt[:64])
+        self.assertEqual(kv.num_committed_tokens, 64)
+        self.assertEqual(kv._get_num_tokens_before_hybrid_pruning(), 64)
+        kv.resume(stream)
+        kv.close()
+
     def test_ssm_planned_drop_targets_latest_snapshot_with_shared_plans(self) -> None:
         """Shared plans drop only their conversation endpoint snapshot."""
         cfg = self._make_ssm_config(tokens_per_block=32)

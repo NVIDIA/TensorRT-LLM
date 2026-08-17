@@ -238,6 +238,7 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
+        "_num_tokens_before_hybrid_pruning",
         "_num_committed_blocks",
         "_finish_event",
         "_tokens_per_block",
@@ -273,6 +274,8 @@ class _KVCache:
     # be computed on the fly, but that would be slow due to python.
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
+    # Internal diagnostic captured from the reuse match: see ReuseMatch.
+    _num_tokens_before_hybrid_pruning: int
     # Sometimes we can't commit a block because all its tokens are already covered by another block in
     # the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric
     # difference, 2. if our block is a partial block, we can't write to memory of the other blocks.
@@ -330,6 +333,9 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
+        self._num_tokens_before_hybrid_pruning = (
+            reuse_match.num_tokens_before_hybrid_pruning if reuse_match is not None else 0
+        )
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
         self._tokens_per_block = manager.tokens_per_block
@@ -1076,6 +1082,10 @@ class _KVCache:
     @property
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
+
+    def _get_num_tokens_before_hybrid_pruning(self) -> int:
+        """Return the pre-hybrid-pruning prefix for internal diagnostics."""
+        return self._num_tokens_before_hybrid_pruning
 
     @property
     def committed_tokens(self) -> list[TokenIdExt]:
