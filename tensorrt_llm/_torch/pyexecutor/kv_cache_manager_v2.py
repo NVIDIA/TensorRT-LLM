@@ -994,10 +994,9 @@ class KVCacheManagerV2(BaseResourceManager):
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
-            # evict and later restore KV cache pages.  Without a host tier,
-            # suspended pages have nowhere to be offloaded and resume()
-            # always fails, causing a scheduling deadlock where no
-            # generation request can ever make progress.
+            # evict and later restore KV cache pages. Without a secondary
+            # tier, suspended held pages cannot migrate out of GPU, so
+            # suspension cannot free capacity and scheduling can deadlock.
             #
             # Automatically provision a host tier matching the GPU quota so
             # suspend/resume works out of the box.  Cap at available host
@@ -1052,10 +1051,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
             )
 
-        self.has_host_cache_tier = any(
-            isinstance(tier, HostCacheTierConfig) for tier in cache_tiers
-        )
-
         self.vocab_size = vocab_size
 
         config = self._build_base_config(
@@ -1064,34 +1059,36 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_tiers=cache_tiers,
         )
         config = self._build_cache_config(config)
+        has_host_cache_tier = any(
+            isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
+        )
 
         self.kv_cache_manager_py_config = config
 
         try:
             self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
         except (CuError, KVCacheOutOfMemoryError):
-            if self.has_host_cache_tier:
+            if has_host_cache_tier:
                 logger.warning(
                     "Failed to initialize KV cache manager with host cache "
                     "tier (cuMemHostRegister may have failed). "
                     "Retrying without host cache tier."
                 )
-                cache_tiers_gpu_only = [
-                    tier for tier in cache_tiers if isinstance(tier, GpuCacheTierConfig)
+                cache_tiers_without_host = [
+                    tier for tier in config.cache_tiers if not isinstance(tier, HostCacheTierConfig)
                 ]
-                config = replace(config, cache_tiers=cache_tiers_gpu_only)
-                cache_tiers = cache_tiers_gpu_only
-                self.has_host_cache_tier = False
+                config = replace(config, cache_tiers=cache_tiers_without_host)
                 self.kv_cache_manager_py_config = config
                 self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
             else:
                 raise
+        self.can_evict = len(config.cache_tiers) > 1
         if self.event_manager is not None:
             self.event_manager.set_layer_group_window_sizes(
                 self._get_event_window_sizes_by_layer_group()
             )
             self.event_manager.add_created_event(
-                self._get_event_num_blocks_per_cache_level(cache_tiers, tokens_per_block),
+                self._get_event_num_blocks_per_cache_level(config.cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
             )
 
@@ -2479,7 +2476,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
     def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache (move to host tier)."""
+        """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()

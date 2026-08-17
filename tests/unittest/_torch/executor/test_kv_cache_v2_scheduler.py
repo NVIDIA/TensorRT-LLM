@@ -164,11 +164,11 @@ def make_kv_cache_manager(
     resize_context_fn=None,
     prepare_disagg_gen_init_fn=None,
     try_allocate_generation_fn=None,
-    has_host_tier=False,
+    can_evict=False,
 ):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
-    mgr.has_host_cache_tier = has_host_tier
+    mgr.can_evict = can_evict
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
@@ -176,7 +176,7 @@ def make_kv_cache_manager(
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
 
     def suspend_request(req):
-        if has_host_tier:
+        if can_evict:
             mgr.kv_cache_map[req.py_request_id].is_active = False
 
     mgr.suspend_request.side_effect = suspend_request
@@ -515,7 +515,7 @@ class TestKVCacheFailuresGen:
         # gen99 evicted as victim for gen1; gen1 self-evicts after
         assert set(ids(out.paused_requests)) == {1, 99}
 
-    def test_host_tier_recompute_pause_retries_immediately(self):
+    def test_secondary_tier_recompute_pause_retries_immediately(self):
         """Full teardown is retried without conservatively waiting one pass."""
         call_count = [0]
 
@@ -525,7 +525,7 @@ class TestKVCacheFailuresGen:
             # after its ordinary victim is upgraded to full recompute teardown.
             return call_count[0] in (1, 4)
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, has_host_tier=True)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), make_gen_request(1), victim]
@@ -544,7 +544,7 @@ class TestKVCacheFailuresGen:
             call_count[0] += 1
             return call_count[0] == 1
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, has_host_tier=True)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
         sched = make_scheduler(
             mgr,
             max_num_tokens=100,
@@ -603,7 +603,7 @@ class TestKVCacheFailuresGen:
 
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=alloc_fn,
-            has_host_tier=True,
+            can_evict=True,
         )
         mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
         sched = make_scheduler(mgr, max_num_tokens=100)
@@ -626,14 +626,14 @@ class TestKVCacheFailuresGen:
         mgr.free_resources.assert_called_once_with(suspended_tail)
 
     def test_recompute_frontier_falls_back_to_evicted_victim(self):
-        """Host-tier fallback sees an evicted victim outside the frontier."""
+        """Secondary-tier fallback sees an evicted victim outside the frontier."""
         from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _RecomputePauseState
 
         victim = make_gen_request(0)
         current = make_gen_request(1)
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: True,
-            has_host_tier=True,
+            can_evict=True,
         )
         mgr.kv_cache_map[victim.py_request_id].is_active = False
         sched = make_scheduler(mgr, max_num_tokens=100)
@@ -2247,15 +2247,13 @@ class TestMixedOrdering:
         assert len(out.generation_requests) == 0
         assert set(ids(out.paused_requests)) == {0, 1, 2}
 
-    def test_host_tier_recompute_pause_multiple_victims(self):
-        """Host-tier evicted victims are recompute-paused before self-evict."""
+    def test_secondary_tier_recompute_pause_multiple_victims(self):
+        """Evicted victims are recompute-paused before self-evict when eviction is supported."""
 
         def selective_gen_alloc(req):
             return req.request_id != 0
 
-        mgr = make_kv_cache_manager(
-            try_allocate_generation_fn=selective_gen_alloc, has_host_tier=True
-        )
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=selective_gen_alloc, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=1000)
         reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(2)]
         out = sched.schedule_request(reqs, set())

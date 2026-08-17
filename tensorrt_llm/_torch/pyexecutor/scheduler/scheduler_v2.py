@@ -455,8 +455,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Deadlock detection: if generation requests exist but none were
         # scheduled and none were evicted, no forward pass will run and no
         # KV cache pages will ever be freed — the scheduler will spin
-        # forever.  This typically happens when the KV cache pool is
-        # exhausted and no host cache tier is available for suspend/resume.
+        # forever. This typically happens when the KV cache pool is exhausted
+        # and no secondary cache tier is available for suspend/resume.
         if not scheduled_gen and not scheduled_ctx:
             num_gen_candidates = sum(
                 1
@@ -475,8 +475,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                     f"V2 scheduler deadlock: {num_gen_candidates} generation "
                     f"request(s) active but none could be scheduled or "
                     f"evicted or recompute-paused. KV cache pool is likely exhausted with no "
-                    f"host cache tier for suspend/resume offload. "
-                    f"Configure kv_cache_config.host_cache_size or increase "
+                    f"secondary cache tier for suspend/resume offload. "
+                    f"Configure kv_cache_config.host_cache_size or "
+                    f"kv_cache_config.disk_cache_size, or increase "
                     f"kv_cache_config.max_tokens."
                 )
 
@@ -1154,12 +1155,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 candidate = requests_list[i]
                 was_evicted = any(evicted_req is candidate for evicted_req in evicted)
                 if (
-                    self.kv_cache_manager.has_host_cache_tier or not was_evicted
+                    self.kv_cache_manager.can_evict or not was_evicted
                 ) and self._is_recompute_pause_candidate(candidate, inflight_request_ids):
                     victim_idx = i
                     break
 
-            if victim_idx is None and self.kv_cache_manager.has_host_cache_tier:
+            if victim_idx is None and self.kv_cache_manager.can_evict:
                 victim = next(
                     (
                         candidate
@@ -1193,10 +1194,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_pause_state.frontier = min(recompute_pause_state.frontier, victim_idx)
 
             # Retry immediately: full teardown can make the allocation fit even
-            # for an already-suspended victim. If it still fails, use any host
-            # capacity just released to ordinary-suspend another active victim.
+            # for an already-suspended victim. If it still fails, use any
+            # secondary-tier capacity just released to ordinary-suspend another
+            # active victim.
             success = self.kv_cache_manager.try_allocate_generation(req)
-            if not success and self.kv_cache_manager.has_host_cache_tier:
+            if not success and self.kv_cache_manager.can_evict:
                 req_it_end, success = self._try_evict_for_gen(
                     req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
                 )
