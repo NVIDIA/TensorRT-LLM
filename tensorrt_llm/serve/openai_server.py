@@ -112,7 +112,8 @@ from tensorrt_llm.serve.visual_gen_utils import (
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
-from .._utils import nvtx_mark, set_prometheus_multiproc_dir
+from .._utils import (AdjustedSteadyClock, nvtx_mark,
+                      set_prometheus_multiproc_dir)
 from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
@@ -753,8 +754,8 @@ class OpenAIServer(_VideoRoutesMixin):
         # the loop for the queue. Created lazily when the loop starts.
         # See nvbug 6102381.
         self._iteration_stats_buffer: Optional[deque] = None
-        # The steady clock offset (in seconds) between this server and the disagg server
-        self.disagg_server_steady_clock_offset = 0
+        # Rank-adjusted clock mapped to the disaggregated server's clock domain.
+        self._adjusted_steady_clock = AdjustedSteadyClock()
 
         # Energy monitoring
         self.energy_monitor = None
@@ -905,9 +906,9 @@ class OpenAIServer(_VideoRoutesMixin):
             self.app.add_middleware(PerfMetricsMiddleware,
                                     expose_headers=self._expose_perf_metrics,
                                     writer=self._perf_metrics_writer,
-                                    clock_offset_provider=lambda: self.
-                                    disagg_server_steady_clock_offset)
-        self.app.add_middleware(ServerArrivalTimeMiddleware)
+                                    adjusted_clock=self._adjusted_steady_clock)
+        self.app.add_middleware(ServerArrivalTimeMiddleware,
+                                adjusted_clock=self._adjusted_steady_clock)
 
     def _init_visual_gen(self):
         self.processor = None
@@ -1290,7 +1291,7 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/steady_clock_offset",
                                self.get_steady_clock_offset,
                                methods=["GET"])
-        # Called by the disagg server to set the disagg_server_steady_clock_offset
+        # Called by the disagg server to update the worker reference clock.
         self.app.add_api_route("/steady_clock_offset",
                                self.set_steady_clock_offset,
                                methods=["POST"])
@@ -1741,7 +1742,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def set_steady_clock_offset(
             self, offset: Annotated[float, Body(embed=True)]) -> Response:
-        self.disagg_server_steady_clock_offset = offset
+        self._adjusted_steady_clock.set_reference_offset(offset)
         logger.info(
             f"The steady clock offset between local and disagg server: {offset} second"
         )
@@ -1773,11 +1774,11 @@ class OpenAIServer(_VideoRoutesMixin):
             if raw_request and not getattr(raw_request.state,
                                            "server_first_token_time", None):
                 raw_request.state.server_first_token_time = (
-                    get_steady_clock_now_in_seconds())
+                    self._adjusted_steady_clock.now())
             record = build_request_metrics_record(
                 res,
                 raw_request,
-                steady_clock_offset=self.disagg_server_steady_clock_offset)
+                adjusted_clock=self._adjusted_steady_clock)
             if record is not None and raw_request is not None:
                 raw_request.state.perf_metrics_records.append(record)
         if self.metrics_collector:
@@ -1885,7 +1886,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 first_response = await anext(promise)
-                raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds(
+                raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
                 )
                 pp_results = first_response.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
@@ -2515,7 +2516,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
         async def generator_wrapper(generator: AsyncIterator[Any]):
             first_response = await anext(generator)
-            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds(
+            raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
             )
             yield first_response
             async for output in generator:
@@ -2649,7 +2650,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 first_response = await anext(promise)
                 raw_request.state.server_first_token_time = (
-                    get_steady_clock_now_in_seconds())
+                    self._adjusted_steady_clock.now())
                 pp_results = (first_response.outputs[0]._postprocess_result if
                               self.postproc_worker_enabled else post_processor(
                                   first_response, args))

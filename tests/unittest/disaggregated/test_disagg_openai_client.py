@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import aiohttp
 import pytest
 
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve.disagg_auth import INTERNAL_DISAGG_AUTH_HEADER
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
@@ -36,9 +37,10 @@ from tensorrt_llm.serve.perf_metrics import (
     SSE_METRICS_EVENT,
     START_END_TIME_HEADER,
     PerfMetricsMiddleware,
-    clock_offset_from_headers,
+    adjusted_clock_from_headers,
 )
-from tensorrt_llm.serve.responses_utils import ResponseHooks
+from tensorrt_llm.serve.responses_utils import (ResponseHooks,
+                                                 ServerArrivalTimeMiddleware)
 from tensorrt_llm.serve.router import Router
 
 pytestmark = pytest.mark.cpu_only
@@ -49,6 +51,17 @@ def _reset_prometheus_registry():
 
     REGISTRY._names_to_collectors = {}
     REGISTRY._collector_to_names = {}
+
+
+def test_adjusted_steady_clock_uses_reference_domain():
+    source = Mock(return_value=10.0)
+    clock = AdjustedSteadyClock(2.0, time_source=source)
+
+    assert clock.now() == 12.0
+    assert clock.to_reference_time(20.0) == 22.0
+
+    clock.set_reference_offset(-3.0)
+    assert clock.now() == 7.0
 
 
 @pytest.fixture
@@ -121,21 +134,22 @@ async def test_perf_metrics_middleware_reports_effective_frontend_clock(process_
     async def send(message):
         sent.append(message)
 
-    middleware = PerfMetricsMiddleware(
-        app,
-        expose_headers=True,
-        clock_offset_provider=lambda: process_offset,
+    clock = AdjustedSteadyClock(
+        process_offset, time_source=Mock(side_effect=[10.0, 10.25])
+    )
+    middleware = ServerArrivalTimeMiddleware(
+        PerfMetricsMiddleware(
+            app,
+            expose_headers=True,
+            adjusted_clock=clock,
+        ),
+        adjusted_clock=clock,
     )
     scope = {
         "type": "http",
         "headers": [(RETURN_METRICS_HEADER.lower().encode(), b"1")],
-        "state": {"server_arrival_time": 10.0},
     }
-    with patch(
-        "tensorrt_llm.serve.perf_metrics.get_steady_clock_now_in_seconds",
-        return_value=10.25,
-    ):
-        await middleware(scope, AsyncMock(), send)
+    await middleware(scope, AsyncMock(), send)
 
     response_headers = dict(sent[0]["headers"])
     assert response_headers[CLOCK_SYNC_HEADER.encode()].decode() == (
@@ -153,7 +167,8 @@ async def test_perf_metrics_middleware_reports_effective_frontend_clock(process_
     ],
 )
 def test_invalid_clock_sync_header_is_ignored(header):
-    assert clock_offset_from_headers(header, 1.0, 2.0) == 0
+    clock = adjusted_clock_from_headers(header, 1.0, 2.0)
+    assert clock.to_reference_time(1.0) == 1.0
 
 
 class TestOpenAIHttpClient:
@@ -684,6 +699,8 @@ class TestHttpErrorBodyPreservation:
 
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
+
+
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]
         router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
@@ -744,6 +761,8 @@ class TestDisaggIdRegenOnRetry:
 
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
+
+
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]
         router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
@@ -844,6 +863,8 @@ class TestSelectiveTransientTcpRetry:
 
         REGISTRY._names_to_collectors = {}
         REGISTRY._collector_to_names = {}
+
+
         router = AsyncMock(spec=Router)
         router.servers = ["localhost:8000"]
         router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
