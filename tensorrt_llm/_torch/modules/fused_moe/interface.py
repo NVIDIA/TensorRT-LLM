@@ -22,11 +22,9 @@ from typing import Dict, List, Optional, Tuple, Union, final
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import QuantAlgo
-
 from ...distributed.ops import reducescatter
-from .impl_contract import (MoEInputRequirement, MoERunContext,
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
+                            MoEProblem, MoERejectReason, MoERunContext,
                             MoEStaticCapability)
 
 # Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
@@ -42,22 +40,9 @@ FORCE_SEPARATED_ROUTING = os.environ.get(
     "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
 
-def _warn_and_return(reason: str) -> Tuple[bool, Optional[str]]:
-    """
-    Log a warning and return (False, reason) for can_implement() checks.
-
-    This is a common utility function used by all MoE backend implementations
-    to provide consistent logging and return values when a configuration
-    is not supported.
-
-    Args:
-        reason: The reason why the configuration is not supported.
-
-    Returns:
-        Tuple[bool, Optional[str]]: Always returns (False, reason)
-    """
-    logger.warning(reason)
-    return False, reason
+def _reject(reason: MoERejectReason, detail: str) -> MoEEligibility:
+    """Create a silent ``can_implement`` rejection."""
+    return MoEEligibility.no(reason, detail)
 
 
 from ...model_config import ModelConfig
@@ -241,26 +226,10 @@ class MoE(nn.Module):
     # override this to ``MoESchedulerKind.FUSED_COMM``.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
 
-    # What this backend can do, read by callers that would otherwise test its
-    # class. A backend deriving from another backend MUST restate every field
-    # rather than inherit it: the exact-class comparisons these fields replace
-    # answered False for subclasses, so a capability picked up through
-    # inheritance would silently widen behaviour.
-    #
-    # That restatement rule is transitional, not the intended end state. It only
-    # has to exist while backends still derive from other backends, which today
-    # they do: CuteDsl, DeepGemm and Marlin derive from Cutlass, B12x from
-    # CuteDsl, and Llama4MinLatency from Cutlass. The per-backend tickets
-    # TRTLLM-14960..14969 cut those inheritance edges as each impl moves its
-    # run_moe into its own leaf class, and once no impl derives from another the
-    # rule has nothing left to guard and should be deleted with it.
+    # Subclasses must restate capabilities to preserve exact-class behavior.
     capabilities: MoEStaticCapability = MoEStaticCapability()
 
-    # What this backend needs the scheduler to hand it. Unlike
-    # ``capabilities``, the checks these fields replace used isinstance, so
-    # inheriting a value is correct here. Overriding is not partial though:
-    # the whole object is replaced, so a subclass that sets one field must
-    # restate the ones it still wants from its parent.
+    # Scheduler-provided inputs; inherited values remain valid for subclasses.
     input_requirement: MoEInputRequirement = MoEInputRequirement()
 
     # Opt-in flag for non-divisible EP (num_experts % ep_size != 0). False by default
@@ -271,34 +240,10 @@ class MoE(nn.Module):
 
     @classmethod
     @abstractmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        Check if this MoE backend can implement the given quantization algorithm.
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Purely evaluate ``p`` and ``d`` without probing runtime state.
 
-        NOTE: This is a TRANSITIONAL interface. In the future, this method will be moved
-        to the MoEBackend interface as part of the backend abstraction layer. During this
-        transition period, it remains in the MoE base class to maintain compatibility.
-
-        This method checks both:
-        1. Whether the backend supports the specified quantization algorithm
-        2. Whether the current platform (SM version) supports the backend and quantization
-
-        Each backend MUST override this method to provide accurate capability information.
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation data type.
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-                - can_implement: True if the backend can implement this configuration
-                - skip_reason: None if can_implement is True, otherwise a string explaining why not
+        Abstain rather than reject when a required problem field is unknown.
         """
         raise NotImplementedError(
             f"{cls.__name__} must implement can_implement method")

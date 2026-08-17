@@ -12,24 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-MoE Backend Unit Tests
-
-This module provides a unified test framework for testing different MoE backends
-through the backend-level interfaces (quantize_input + run_moe), rather than
-the high-level forward() interface.
-
-Design Goals:
-1. Test backend interfaces directly: routing_method.apply -> quantize_input -> run_moe
-2. Cover all quantization + backend combinations
-3. Use can_implement() interface to determine test skip logic
-4. Support autotune and tactic capture testing
-"""
+"""MoE backend unit tests."""
 
 import importlib
 import itertools
 import logging
-import os
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
@@ -59,16 +46,28 @@ from tensorrt_llm._torch.modules.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
+from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoECommPlan, MoERunContext
+from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+    MoECommPlan,
+    MoEDeployment,
+    MoEEnvironment,
+    MoEProblem,
+    MoERejectReason,
+    MoERunContext,
+)
+from tensorrt_llm._torch.modules.fused_moe.impl_environment import (
+    collect_moe_environment,
+    override_moe_environment,
+)
 from tensorrt_llm._torch.modules.fused_moe.interface import (
     MoE,
     MoESchedulerKind,
     MoEWeightLoadingMode,
 )
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.modules.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -131,25 +130,20 @@ def test_fp8_block_scale_moe_fallback_tactic_is_explicit_and_deterministic():
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
-    """Every MegaMoE backend (DG + CuteDSL) resolves an EP ProcessGroup
-    at construction time via ``_resolve_ep_pg``. Single-process tests
-    must therefore initialise ``torch.distributed`` even when the test
-    only exercises ``ep_size == 1`` -- otherwise the constructor raises
-    ``MegaMoe*Unavailable``. Both MegaMoE backends need the same fixture
-    so the dist helper must accept the full set."""
+    """Initialize the process group required by MegaMoE constructors."""
     if backend_type not in _MEGAMOE_BACKEND_TYPES:
         return
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for MegaMoE tests")
     if dist.is_initialized():
         return
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29561")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("LOCAL_RANK", str(rank))
     torch.cuda.set_device(rank)
-    dist.init_process_group(backend="nccl", rank=0, world_size=1)
+    dist.init_process_group(
+        backend="nccl",
+        store=dist.HashStore(),
+        rank=0,
+        world_size=1,
+    )
 
 
 def should_skip_gptoss(
@@ -406,8 +400,17 @@ def _marlin_model_config(quant_algo=QuantAlgo.NVFP4):
     return cfg
 
 
-def test_get_moe_cls_marlin_selects_marlin_for_nvfp4():
-    assert get_moe_cls(_marlin_model_config()) is MarlinFusedMoE
+def _marlin_environment(sm: int = 90) -> MoEEnvironment:
+    """Marlin's own SM window, so quantization stays the only variable."""
+    return MoEEnvironment(sm=sm)
+
+
+def test_marlin_is_selected_for_nvfp4():
+    with override_moe_environment(_marlin_environment()):
+        report = resolve_moe_impl(_marlin_model_config())
+    assert impl_class_for(report) is MarlinFusedMoE
+    assert report.selected_by == "pinned"
+    assert not report.degraded
 
 
 @pytest.mark.parametrize(
@@ -417,21 +420,24 @@ def test_get_moe_cls_marlin_selects_marlin_for_nvfp4():
         pytest.param(QuantAlgo.FP8, id="fp8"),
     ],
 )
-def test_get_moe_cls_marlin_falls_back_to_cutlass_on_non_nvfp4(quant_algo):
-    """MARLIN + non-NVFP4 layers (e.g. unquantized MTP draft layers in
-    MIXED_PRECISION checkpoints) fall back to CutlassFusedMoE instead of
-    raising, matching CUTEDSL/DENSEGEMM fallback behavior."""
-    assert get_moe_cls(_marlin_model_config(quant_algo)) is CutlassFusedMoE
+def test_marlin_degrades_to_cutlass_on_non_nvfp4(quant_algo):
+    with override_moe_environment(_marlin_environment()):
+        report = resolve_moe_impl(_marlin_model_config(quant_algo))
+    assert impl_class_for(report) is CutlassFusedMoE
+    assert report.degraded
+    assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
 
 
-def test_get_moe_cls_marlin_override_quant_config_per_layer():
-    """Per-layer override (the MTP draft-layer path): an unquantized per-layer
-    override falls back to Cutlass even though the global config is NVFP4."""
+def test_marlin_override_quant_config_degrades_per_layer():
     cfg = _marlin_model_config()
-    assert (
-        get_moe_cls(cfg, override_quant_config=QuantConfig(quant_algo=None), layer_idx=52)
-        is CutlassFusedMoE
-    )
+    with override_moe_environment(_marlin_environment()):
+        report = resolve_moe_impl(
+            cfg,
+            override_quant_config=QuantConfig(quant_algo=None),
+            layer_idx=52,
+        )
+    assert impl_class_for(report) is CutlassFusedMoE
+    assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
 
 
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
@@ -1057,7 +1063,7 @@ TEST_PARAMS += generate_element_wise_test_params()
 # Skip Logic
 # =============================================================================
 # Tests are automatically skipped for unsupported configurations using:
-# - backend.can_implement(): Check dtype/quant_algo/swiglu_gptoss_style support
+# - backend.can_implement(p, d): declared quant / dtype / SM / dependency support
 # - should_skip_trtllm(): TRTLLM-specific constraints (num_experts % 4, etc.)
 # - should_skip_cutedsl(): CuteDSL-specific accuracy issues
 # - 128-alignment requirements for quantization
@@ -1339,14 +1345,32 @@ def test_trtllm_bf16_unquantized_moe(
     backend_type = MoeBackendType.TRTLLM
     dtype = torch.bfloat16
 
-    can_impl, skip_reason = get_backend_class(backend_type).can_implement(
-        None, dtype_activation=dtype
-    )
-    if not can_impl:
-        pytest.skip(skip_reason)
-
+    num_experts = _BF16_UNQUANT_NUM_EXPERTS
+    top_k = _BF16_UNQUANT_TOP_K
     hidden_size = _BF16_UNQUANT_HIDDEN
     intermediate_size = _BF16_UNQUANT_INTERMEDIATE
+
+    # This test constructs the backend directly, so query it directly.
+    verdict = get_backend_class(backend_type).can_implement(
+        MoEProblem(
+            quant=None,
+            dtype_act=dtype,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            top_k=top_k,
+        ),
+        MoEDeployment(
+            ep_size=1,
+            tp_size=1,
+            parallel_size=1,
+            use_dp=False,
+            num_slots=num_experts,
+            env=collect_moe_environment(),
+        ),
+    )
+    if not verdict.eligible:
+        pytest.skip(verdict.detail)
 
     skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype)
 
