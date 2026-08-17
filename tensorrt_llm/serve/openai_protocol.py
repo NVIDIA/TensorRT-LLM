@@ -61,6 +61,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
+from tensorrt_llm.visual_gen.params import Role
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
@@ -2024,12 +2025,10 @@ class MediaReferenceItem(OpenAIBaseModel):
     content: str = Field(
         description="Base64-encoded media bytes, optionally as a ``data:`` URI."
     )
-    role: Optional[str] = Field(
+    role: Optional[Role] = Field(
         default=None,
-        description=
-        ("Reference role (e.g. 'reference', 'first_frame', 'last_frame'). "
-         "Required only when the model accepts multiple roles for the modality."
-         ),
+        description="Reference role. Required only when the model accepts "
+        "multiple roles for the modality.",
     )
 
 

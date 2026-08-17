@@ -27,9 +27,11 @@ from pydantic import Field
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.visual_gen.params import Role
 
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
@@ -73,7 +75,7 @@ class ExtraParamSchema(StrictBaseModel):
 class RoleSpec(StrictBaseModel):
     """One accepted role for a reference modality, with its count bounds."""
 
-    role: str = Field(description="'reference' | 'first_frame' | 'last_frame'.")
+    role: Role = Field(description="Role of the reference input.")
     min: int = Field(default=1, description="Minimum count for this role.")
     max: Optional[int] = Field(
         default=1, description="Maximum count for this role (None = unbounded)."
@@ -90,7 +92,7 @@ class RefSlotSpec(StrictBaseModel):
     Pickled to the coordinator in the READY handshake, so keep it plain data.
     """
 
-    modality: str = Field(description="'image' | 'video' | 'audio'.")
+    modality: MediaModality = Field(description="Reference modality.")
     roles: List[RoleSpec] = Field(description="Accepted roles + counts for this modality.")
 
 
