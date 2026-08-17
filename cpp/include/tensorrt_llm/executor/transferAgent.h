@@ -383,6 +383,13 @@ public:
     {
         return false;
     }
+
+    /// Human-readable detail for the most recent terminal state (empty when unavailable). Backends
+    /// override this so a kFAILURE from wait() can carry its cause to the caller.
+    [[nodiscard]] virtual std::string getLastStatusStr() const
+    {
+        return {};
+    }
 };
 
 struct BaseAgentConfig

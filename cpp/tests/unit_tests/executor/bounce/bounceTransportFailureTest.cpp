@@ -226,7 +226,8 @@ TEST(BounceTransportFailure, NoGrantTimesOutNotHang)
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
     auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "ghostPeer");
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "request hung with no grant";
-    EXPECT_EQ(fut.get(), kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kNoProgressTimeout);
 
     t->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
@@ -253,7 +254,8 @@ TEST(BounceTransportFailure, EngineFailureFailsRequest)
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
     auto fut = A->submit(bufs.srcDescs, bufs.dstDescs, "feB");
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "engine failure hung";
-    EXPECT_EQ(fut.get(), kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kWriteFailed);
 
     A->shutdown();
     B->shutdown();
@@ -415,7 +417,7 @@ TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)
     legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
     legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-    EXPECT_EQ(fut.get(), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
 
     sender->shutdown();
     bounce_test::freeXferBufs(bufs);
@@ -436,7 +438,8 @@ TEST(BounceTransportFailure, ShutdownFailsInflight)
     EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout); // still pending
     t->tx->shutdown();
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "shutdown left request hanging";
-    EXPECT_EQ(fut.get(), kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
 
     bounce_test::freeXferBufs(bufs);
 }
@@ -476,7 +479,8 @@ TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
     sender->shutdown();
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(1)), std::future_status::ready);
-    EXPECT_EQ(fut.get(), kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
     EXPECT_EQ(senderEngine.releaseCount.load(std::memory_order_acquire), 2);
     EXPECT_EQ(senderEngine.outstandingHandle.load(std::memory_order_acquire), 1);
 
@@ -502,7 +506,8 @@ TEST(BounceTransportFailure, ForgetPeerFailsInflightRequest)
     EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout); // still pending
     t->tx->forgetPeer("gonePeer");
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "forgetPeer left request hanging";
-    EXPECT_EQ(fut.get(), kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
+    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kPeerDropped);
 
     // forgetPeer for an unrelated/unknown peer must be a harmless no-op (no crash).
     t->tx->forgetPeer("someoneElse");
@@ -531,9 +536,13 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
     auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "fpB");
     A->tx->forgetPeer("fpB"); // drop the peer (queued; applied on A's IO thread)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "request hung after forgetPeer";
-    auto const st = fut.get();
-    EXPECT_TRUE(st == kvc::TransferState::kSUCCESS || st == kvc::TransferState::kFAILURE)
-        << "unexpected state " << static_cast<int>(st);
+    auto const res = fut.get();
+    EXPECT_TRUE(res.state == kvc::TransferState::kSUCCESS || res.state == kvc::TransferState::kFAILURE)
+        << "unexpected state " << static_cast<int>(res.state);
+    if (res.state == kvc::TransferState::kFAILURE)
+    {
+        EXPECT_EQ(res.reason, b::BounceFailReason::kPeerDropped);
+    }
     bounce_test::freeXferBufs(bufs);
 
     // Recovery + no-leak: forgetPeer is a one-shot event; the scheduler/request reclaim is drained by
@@ -550,7 +559,7 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
         auto rf = A->tx->submit(rb.srcDescs, rb.dstDescs, "fpB");
         ASSERT_EQ(rf.wait_for(std::chrono::seconds(30)), std::future_status::ready)
             << "post-forget transfer hung k=" << k;
-        EXPECT_EQ(rf.get(), kvc::TransferState::kSUCCESS) << "post-forget transfer failed k=" << k;
+        EXPECT_EQ(rf.get().state, kvc::TransferState::kSUCCESS) << "post-forget transfer failed k=" << k;
         EXPECT_TRUE(bounce_test::verifyXferBufs(rb)) << "post-forget byte mismatch k=" << k;
         bounce_test::freeXferBufs(rb);
     }
@@ -595,7 +604,7 @@ TEST(BounceTransportFailure, MultiPeerSharedOutgoingPoolNoDeadlock)
         {
             auto fut = A->tx->submit(toB.srcDescs, toB.dstDescs, B->name);
             if (fut.wait_for(std::chrono::seconds(40)) == std::future_status::ready
-                && fut.get() == kvc::TransferState::kSUCCESS)
+                && fut.get().state == kvc::TransferState::kSUCCESS)
                 ok.fetch_add(1);
         });
     threads.emplace_back(
@@ -603,7 +612,7 @@ TEST(BounceTransportFailure, MultiPeerSharedOutgoingPoolNoDeadlock)
         {
             auto fut = A->tx->submit(toC.srcDescs, toC.dstDescs, C->name);
             if (fut.wait_for(std::chrono::seconds(40)) == std::future_status::ready
-                && fut.get() == kvc::TransferState::kSUCCESS)
+                && fut.get().state == kvc::TransferState::kSUCCESS)
                 ok.fetch_add(1);
         });
     for (auto& th : threads)
@@ -651,7 +660,7 @@ TEST(BounceTransportFailure, ConcurrentMultiThreadedSubmit)
             {
                 auto fut = A->tx->submit(bufs[i].srcDescs, bufs[i].dstDescs, B->name);
                 if (fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready
-                    && fut.get() == kvc::TransferState::kSUCCESS)
+                    && fut.get().state == kvc::TransferState::kSUCCESS)
                 {
                     ok.fetch_add(1);
                 }

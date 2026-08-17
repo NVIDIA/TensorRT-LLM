@@ -1599,6 +1599,12 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     request: pytest.FixtureRequest,
 ) -> None:
     """Exercise C++ bounce v2 through representative Python NIXL transceiver paths."""
+    # BindingsNixlTransferStatus.last_status_str() resolves this exact attribute on the C++
+    # status; if the binding name drifts, failure details silently degrade to "<unavailable>".
+    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferStatus
+
+    assert hasattr(TransferStatus, "get_last_status_str")
+
     if os.environ.get(_NIXL_BOUNCE_SUBPROCESS_ENV) == "1":
         run_transfer_test(
             ctx_tp=ctx_tp,

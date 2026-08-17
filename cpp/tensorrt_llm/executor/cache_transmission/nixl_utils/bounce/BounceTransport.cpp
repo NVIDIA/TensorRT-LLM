@@ -33,6 +33,25 @@
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
+char const* toString(BounceFailReason reason)
+{
+    // Prefixed with the module name: these strings travel up through TransferStatus::
+    // getLastStatusStr() into upper-layer error logs, where "RDMA write failed" alone would not
+    // say WHICH transport failed.
+    switch (reason)
+    {
+    case BounceFailReason::kNone: return "bounce: none";
+    case BounceFailReason::kPlanRejected: return "bounce: plan rejected (request did not fit a transfer plan)";
+    case BounceFailReason::kNoProgressTimeout: return "bounce: no GRANT/ACK progress within requestTimeoutMs";
+    case BounceFailReason::kPeerDropped: return "bounce: peer dropped (forgetPeer/invalidateRemoteAgent)";
+    case BounceFailReason::kGatherFailed: return "bounce: gather kernel failed (CUDA error)";
+    case BounceFailReason::kWriteFailed: return "bounce: RDMA write failed";
+    case BounceFailReason::kProtocolError: return "bounce: protocol error (GRANT mispair/plan overflow)";
+    case BounceFailReason::kShutdown: return "bounce: transport shut down while pending";
+    }
+    return "bounce: unknown";
+}
+
 namespace
 {
 constexpr char kSep = '\x1f'; // unit separator: agent names won't contain it
@@ -658,10 +677,10 @@ BounceSender::BounceSender(BounceContext& ctx)
 {
 }
 
-std::shared_future<TransferState> BounceSender::submit(
+std::shared_future<BounceResult> BounceSender::submit(
     TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
 {
-    auto promise = std::make_shared<std::promise<TransferState>>();
+    auto promise = std::make_shared<std::promise<BounceResult>>();
     auto fut = promise->get_future().share();
     BounceTransferPlan plan;
     try
@@ -680,13 +699,13 @@ std::shared_future<TransferState> BounceSender::submit(
         // silently absorbed as a slow success. Whether to retry is the caller's decision.
         TLLM_LOG_WARNING(
             "BounceTransport(%s): plan build for peer %s rejected: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
-        promise->set_value(TransferState::kFAILURE);
+        promise->set_value({TransferState::kFAILURE, BounceFailReason::kPlanRejected});
         return fut;
     }
     auto const numChunks = static_cast<std::uint32_t>(plan.numChunks());
     if (numChunks == 0)
     {
-        promise->set_value(TransferState::kSUCCESS);
+        promise->set_value({TransferState::kSUCCESS, BounceFailReason::kNone});
         return fut;
     }
 
@@ -809,6 +828,7 @@ void BounceSender::attachCredits(std::uint64_t rid, Request& req)
                 "mispair/reorder); abandoning flow",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), target->chunkIdx,
                 static_cast<std::size_t>(chunk.packedBytes), static_cast<unsigned int>(credit.len));
+            req.abandonReason = BounceFailReason::kProtocolError;
             req.pendingCredits.clear();
             return;
         }
@@ -867,6 +887,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
                 "mispair/reorder); abandoning flow",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx,
                 static_cast<std::size_t>(chunk.packedBytes), static_cast<unsigned int>(req.pendingCredits.front().len));
+            req.abandonReason = BounceFailReason::kProtocolError;
             req.pendingCredits.clear();
             break;
         }
@@ -922,6 +943,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx, nTotal, maxEntries);
             mCtx.exec->release(ctx);
             mCtx.sendGrants(mCtx.scheduler.releaseLocal(*localOff));
+            req.abandonReason = BounceFailReason::kProtocolError;
             req.pendingCredits.clear(); // abandon: the request then fails via checkTimeouts
             break;
         }
@@ -1078,7 +1100,7 @@ bool BounceSender::drainGatherReady()
         auto it = mRequests.find(rid);
         if (it != mRequests.end())
         {
-            failRequest(rid, it->second);
+            failRequest(rid, it->second, BounceFailReason::kGatherFailed);
             didWork = true;
         }
     }
@@ -1140,7 +1162,7 @@ bool BounceSender::pollSenderHandles()
         auto it = mRequests.find(rid);
         if (it != mRequests.end())
         {
-            failRequest(rid, it->second);
+            failRequest(rid, it->second, BounceFailReason::kWriteFailed);
             didWork = true;
         }
     }
@@ -1202,7 +1224,7 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
         bounceRangeEnd(req.nvtxReq);
         try
         {
-            req.promise->set_value(TransferState::kSUCCESS);
+            req.promise->set_value({TransferState::kSUCCESS, BounceFailReason::kNone});
         }
         catch (...)
         {
@@ -1238,7 +1260,7 @@ void BounceSender::checkTimeouts()
             {
                 // Peer never granted or stopped making progress (unreachable / not bounce-ready /
                 // congested). Fail the request so wait() returns FAILURE instead of hanging.
-                failRequest(rid, it->second);
+                failRequest(rid, it->second, BounceFailReason::kNoProgressTimeout);
             }
         }
     }
@@ -1291,8 +1313,19 @@ bool BounceSender::drainOrphanLocal()
     return didWork;
 }
 
-void BounceSender::failRequest(std::uint64_t rid, Request& req)
+void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason reason)
 {
+    // An abandoned flow (GRANT mispair / plan overflow) reaches here through the timeout path;
+    // report the specific abandon cause, not the generic timeout.
+    if (req.abandonReason != BounceFailReason::kNone)
+    {
+        reason = req.abandonReason;
+    }
+    // The one log line every sender-side failure passes through (timeout, peer drop, write/gather
+    // failure) — keep it WARNING and keep the progress context.
+    TLLM_LOG_WARNING("BounceTransport(%s): request FAILED rid=%llu peer=%s reason=\"%s\" chunks acked=%u posted=%u/%u",
+        mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.peer.c_str(), toString(reason), req.acked,
+        req.nextPost, req.numChunks);
     // Release in-flight transfer handles and return each gather-staging region to the shared arena —
     // but only once nothing is still touching the region's memory, else recycling races a live DMA:
     //   - Writing: the RDMA write may still be reading the region as its source. Defer to mOrphanLocal;
@@ -1347,7 +1380,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req)
     bounceRangeEnd(req.nvtxReq);
     try
     {
-        req.promise->set_value(TransferState::kFAILURE);
+        req.promise->set_value({TransferState::kFAILURE, reason});
     }
     catch (...)
     {
@@ -1374,7 +1407,7 @@ void BounceSender::forget(std::string const& peer)
         auto it = mRequests.find(rid);
         if (it != mRequests.end())
         {
-            failRequest(rid, it->second);
+            failRequest(rid, it->second, BounceFailReason::kPeerDropped);
         }
     }
 }
@@ -1415,7 +1448,7 @@ void BounceSender::failAll()
         bounceRangeEnd(req.nvtxReq);
         try
         {
-            req.promise->set_value(TransferState::kFAILURE);
+            req.promise->set_value({TransferState::kFAILURE, BounceFailReason::kShutdown});
         }
         catch (...)
         {

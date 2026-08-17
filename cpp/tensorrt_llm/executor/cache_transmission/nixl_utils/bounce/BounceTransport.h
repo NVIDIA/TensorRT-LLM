@@ -81,7 +81,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // Sender requests are keyed by a monotonic rid; the receiver-side scheduler is keyed by
 // "peer\x1f rid" so multiple concurrent requests from one peer are independent flows.
 //
-// Lifetime: submit() returns a shared_future<TransferState>; it resolves SUCCESS on full ACK and
+// Lifetime: submit() returns a shared_future<BounceResult>; it resolves SUCCESS on full ACK and
 // FAILURE on transfer error, peer invalidation, shutdown, or request timeout. Setting
 // requestTimeoutMs to 0 intentionally disables timeout-based failure.
 //
@@ -89,6 +89,31 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // unchanged in tests and production (both over the real NIXL/zmq stack; tests may inject a
 // fault-injecting engine to exercise the failure path).
 // ============================================================================
+
+/// Why a bounce request resolved kFAILURE — carried inside the request's result future and
+/// surfaced to the upper layer through TransferStatus::getLastStatusStr(); the bare kFAILURE
+/// enum alone tells an operator nothing.
+enum class BounceFailReason : std::uint8_t
+{
+    kNone = 0,
+    kPlanRejected,      // request did not fit a transfer plan (submit-time TLLM_CHECK)
+    kNoProgressTimeout, // no GRANT/ACK progress within requestTimeoutMs (peer unreachable/stalled)
+    kPeerDropped,       // forgetPeer()/invalidateRemoteAgent while the request was in flight
+    kGatherFailed,      // gather kernel launch / event-record / async poll failure (CUDA error)
+    kWriteFailed,       // the RDMA write reported failure (getXferStatus == failed)
+    kProtocolError,     // GRANT mispair or plan overflow — the flow was abandoned
+    kShutdown,          // transport shut down while the request was still pending
+};
+
+[[nodiscard]] char const* toString(BounceFailReason reason);
+
+/// A bounce request's single result: the terminal state plus, on kFAILURE, its cause. The future
+/// is the ONE source of truth — no side channel to keep in sync.
+struct BounceResult
+{
+    TransferState state{TransferState::kFAILURE};
+    BounceFailReason reason{BounceFailReason::kNone};
+};
 
 /// Shared dependencies used by both roles. Holds the injected channel/engine/arena/exec (borrowed,
 /// not owned), the one CreditScheduler that carves the shared arena for both roles, and
@@ -225,10 +250,11 @@ public:
     explicit BounceSender(BounceContext& ctx);
 
     /// Submit a WRITE of (src -> dst) descriptors to `peer`. Returns a future that resolves
-    /// kSUCCESS once every chunk is scattered+ACKed, or kFAILURE on error/shutdown. Chunks are cut
-    /// to cfg.maxChunkSizeBytes. NixlTransferAgent validates peer compatibility before calling this;
-    /// direct users of BounceTransport must establish the same invariant themselves.
-    [[nodiscard]] std::shared_future<TransferState> submit(
+    /// {kSUCCESS} once every chunk is scattered+ACKed, or {kFAILURE, reason} on error/shutdown.
+    /// Chunks are cut to cfg.maxChunkSizeBytes. NixlTransferAgent validates peer compatibility
+    /// before calling this; direct users of BounceTransport must establish the same invariant
+    /// themselves.
+    [[nodiscard]] std::shared_future<BounceResult> submit(
         TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer);
 
     void onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob);
@@ -318,7 +344,10 @@ private:
         // credit is about to be attached. The IO thread NEVER blocks on acquire; it parks the credit
         // here and retries each loop iteration as ACKs free regions. FIFO: paired with chunks in order.
         std::deque<BounceCreditEntry> pendingCredits;
-        std::shared_ptr<std::promise<TransferState>> promise;
+        std::shared_ptr<std::promise<BounceResult>> promise;
+        // Set by the abandon sites (GRANT mispair / plan overflow): the request then dies through
+        // the timeout path, but failRequest reports THIS more specific cause instead.
+        BounceFailReason abandonReason{BounceFailReason::kNone};
         // Last time this request made forward progress (granted+posted a chunk, or got an ACK).
         // A request stuck with no progress for requestTimeoutMs (e.g. the peer never GRANTs because
         // it is unreachable / not bounce-ready) is failed rather than hanging wait() forever.
@@ -354,7 +383,10 @@ private:
     /// (rest parked/retried).
     /// Caller MUST hold mReqMu. Runs attachCredits() first so credit pairing stays in chunk order.
     void pumpRequest(std::uint64_t rid, Request& req);
-    void failRequest(std::uint64_t rid, Request& req);
+    /// Resolve `rid` to kFAILURE, recording `reason` (unless a more specific one was tagged earlier)
+    /// and logging ONE warning with the request's progress context — the single choke point that
+    /// keeps every failure mode observable. See the body for the region-recycling rules.
+    void failRequest(std::uint64_t rid, Request& req, BounceFailReason reason);
 
     BounceContext& mCtx;
 
@@ -420,8 +452,8 @@ public:
     void forgetPeer(std::string const& peer);
 
     /// Submit a WRITE of (src -> dst) descriptors to `peer`. Returns a future that resolves
-    /// kSUCCESS once every chunk is scattered+ACKed, or kFAILURE on error/shutdown.
-    [[nodiscard]] std::shared_future<TransferState> submit(
+    /// {kSUCCESS} once every chunk is scattered+ACKed, or {kFAILURE, reason} on error/shutdown.
+    [[nodiscard]] std::shared_future<BounceResult> submit(
         TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
     {
         return mSender.submit(srcDescs, dstDescs, peer);
