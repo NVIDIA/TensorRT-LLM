@@ -17,7 +17,8 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import Qwen2MoeHfWeightMapper
+from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
+    Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen_moe import Qwen2MoeForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
