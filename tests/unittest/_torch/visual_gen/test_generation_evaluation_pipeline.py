@@ -26,9 +26,7 @@ def test_extract_json_from_response_ignores_thinking_and_code_fence():
 ```
 """
 
-    assert extract_json_from_response(response) == {
-        "Realism": {"Physical Logic": {"score": 2}}
-    }
+    assert extract_json_from_response(response) == {"Realism": {"Physical Logic": {"score": 2}}}
 
 
 def test_dimension_score_maps_qwen_bench_scores():
@@ -78,6 +76,14 @@ def test_aggregate_total_score_ignores_none_dimensions():
 class _FakeVisualGenOutput:
     image: object | None = None
     error: str | None = None
+
+    def save(self, path):
+        from pathlib import Path
+
+        image_path = Path(path)
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_text(str(self.image), encoding="utf-8")
+        return image_path
 
 
 class _FakeGenerator:
@@ -136,11 +142,23 @@ def test_pipeline_handles_partial_generation_and_evaluation_failures():
 
 
 def test_pipeline_omits_images_unless_requested():
-    response = ImageGenerationEvaluationPipeline(
-        _FakeGenerator(), _FakeEvaluator()
-    ).run(["good"], dimensions=["Quality"])
+    response = ImageGenerationEvaluationPipeline(_FakeGenerator(), _FakeEvaluator()).run(
+        ["good"], dimensions=["Quality"]
+    )
 
     assert response.results[0].image is None
+
+
+def test_pipeline_saves_images_for_evaluator(tmp_path):
+    evaluator = _FakeEvaluator()
+    response = ImageGenerationEvaluationPipeline(_FakeGenerator(), evaluator).run(
+        ["good"], dimensions=["Quality"], image_output_dir=tmp_path / "images"
+    )
+
+    image_path = str(tmp_path / "images" / "0000.png")
+    assert evaluator.calls == [(["good"], [image_path], ["Quality"])]
+    assert response.results[0].image_path == image_path
+    assert (tmp_path / "images" / "0000.png").read_text() == "image:good"
 
 
 @pytest.mark.parametrize(

@@ -16,13 +16,22 @@
 from .audio_asr import AudioASREvaluator
 from .cnn_dailymail import CnnDailymail
 from .covost2 import CoVoST2
+from .image_generation_eval import ImageGenerationEval
 from .json_mode_eval import JsonModeEval
-from .lm_eval import (AIME2025, AIME2026, GSM8K, MMMU, GPQADiamond,
-                      GPQAExtended, GPQAMain, LongBenchV1, MMMUPro)
+from .lm_eval import (
+                      AIME2025,
+                      AIME2026,
+                      GSM8K,
+                      MMMU,
+                      GPQADiamond,
+                      GPQAExtended,
+                      GPQAMain,
+                      LongBenchV1,
+                      MMMUPro,
+)
 from .longbench_v2 import LongBenchV2
 from .mmlu import MMLU
-from .nemo_skills_eval import (AALCR, HLE, ArenaHard, GPQANemoSkills, IFBench,
-                               SciCode)
+from .nemo_skills_eval import AALCR, HLE, ArenaHard, GPQANemoSkills, IFBench, SciCode
 
 __all__ = [
     "CnnDailymail",
@@ -32,6 +41,7 @@ __all__ = [
     "GPQAMain",
     "GPQAExtended",
     "JsonModeEval",
+    "ImageGenerationEval",
     "MMMU",
     "MMMUPro",
     "CoVoST2",

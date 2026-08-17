@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-
 SCORE_MAP = {0: 0.0, 1: 60.0, 2: 100.0}
 
 QUALITY_CHECKLIST = """## Realism
@@ -269,6 +268,7 @@ class ImageGenerationEvaluationResult:
     )
     parse_failures: list[str] = field(default_factory=list)
     image: Any | None = None
+    image_path: str | None = None
     error: str | None = None
 
 
@@ -330,9 +330,7 @@ def mean_non_none(values: Sequence[float | None]) -> float | None:
     return sum(valid) / len(valid) if valid else None
 
 
-def fix_score_json(
-    score_json: dict[str, Any] | None, level1_dim: str
-) -> dict[str, Any] | None:
+def fix_score_json(score_json: dict[str, Any] | None, level1_dim: str) -> dict[str, Any] | None:
     if not score_json:
         return score_json
 
@@ -418,6 +416,17 @@ def validate_generation_evaluation_request(
     if aggregation_method != "mean":
         raise ValueError("Only mean aggregation is supported for the Phase 1 pipeline")
     return prompt_list, dimension_list
+
+
+def save_generated_image_for_evaluation(output: Any, image_path: Path) -> str:
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    save = getattr(output, "save", None)
+    if callable(save):
+        return str(save(image_path))
+
+    from tensorrt_llm.visual_gen.output import VisualGenOutput
+
+    return str(VisualGenOutput(image=getattr(output, "image", None)).save(image_path))
 
 
 def make_qwen_image_bench_input(
@@ -536,8 +545,7 @@ class QwenImageBenchEvaluator:
         config_path = self.model_path / "config.json"
         if not config_path.exists():
             raise FileNotFoundError(
-                "Expected local Qwen-Image-Bench checkpoint with config.json: "
-                f"{self.model_path}"
+                f"Expected local Qwen-Image-Bench checkpoint with config.json: {self.model_path}"
             )
 
         model_config = json.loads(config_path.read_text())
@@ -592,9 +600,7 @@ class QwenImageBenchEvaluator:
             for prompt, image in zip(prompt_list, image_list)
         ]
 
-    def _evaluate_one(
-        self, prompt: str, image: Any, dimensions: list[str]
-    ) -> QwenImageBenchResult:
+    def _evaluate_one(self, prompt: str, image: Any, dimensions: list[str]) -> QwenImageBenchResult:
         assert self._llm is not None
         assert self._processor is not None
         assert self._model_type is not None
@@ -616,13 +622,13 @@ class QwenImageBenchEvaluator:
                     level1_dim=level1_dim,
                     image_data_format=self.args.image_data_format,
                 )
-                output_text = self._llm.generate(
-                    [trtllm_input], sampling_params=self._sampling_params
-                )[0].outputs[0].text
-                raw_outputs[level1_dim] = output_text
-                fixed_score_json, dimension_score = parse_dimension_output(
-                    output_text, level1_dim
+                output_text = (
+                    self._llm.generate([trtllm_input], sampling_params=self._sampling_params)[0]
+                    .outputs[0]
+                    .text
                 )
+                raw_outputs[level1_dim] = output_text
+                fixed_score_json, dimension_score = parse_dimension_output(output_text, level1_dim)
                 parsed_scores[level1_dim] = fixed_score_json
                 if dimension_score is None:
                     parse_failures.append(level1_dim)
@@ -640,16 +646,13 @@ class QwenImageBenchEvaluator:
             prompt=prompt,
             dimensions=dimensions,
             level1_scores={
-                dim: (dimension_results.get(dim) or {}).get("level1_score")
-                for dim in dimensions
+                dim: (dimension_results.get(dim) or {}).get("level1_score") for dim in dimensions
             },
             level2_scores={
-                dim: (dimension_results.get(dim) or {}).get("level2_scores")
-                for dim in dimensions
+                dim: (dimension_results.get(dim) or {}).get("level2_scores") for dim in dimensions
             },
             level3_scores={
-                dim: (dimension_results.get(dim) or {}).get("level3_scores")
-                for dim in dimensions
+                dim: (dimension_results.get(dim) or {}).get("level3_scores") for dim in dimensions
             },
             total_score=aggregate_total_score(dimension_results),
             parse_failures=parse_failures,
@@ -674,6 +677,7 @@ class ImageGenerationEvaluationPipeline:
         dimensions: Sequence[str] | None = None,
         aggregation_method: str = "mean",
         return_images: bool = False,
+        image_output_dir: str | Path | None = None,
     ) -> GenerationEvaluationResponse:
         prompt_list, dimension_list = validate_generation_evaluation_request(
             prompts=prompts,
@@ -689,14 +693,14 @@ class ImageGenerationEvaluationPipeline:
 
         outputs = generated if isinstance(generated, list) else [generated]
         if len(outputs) != len(prompt_list):
-            raise ValueError(
-                "Generator returned a different number of outputs than input prompts"
-            )
+            raise ValueError("Generator returned a different number of outputs than input prompts")
 
         results: list[ImageGenerationEvaluationResult | None] = [None] * len(prompt_list)
         eval_prompts: list[str] = []
         eval_images: list[Any] = []
         eval_indices: list[int] = []
+        eval_image_paths: dict[int, str] = {}
+        image_output_path = Path(image_output_dir) if image_output_dir is not None else None
 
         for idx, (prompt, output) in enumerate(zip(prompt_list, outputs)):
             error = getattr(output, "error", None)
@@ -716,8 +720,15 @@ class ImageGenerationEvaluationPipeline:
                     error="Generator output did not contain an image",
                 )
                 continue
+            eval_image = image
+            if image_output_path is not None:
+                image_path = save_generated_image_for_evaluation(
+                    output, image_output_path / f"{idx:04d}.png"
+                )
+                eval_image_paths[idx] = image_path
+                eval_image = image_path
             eval_prompts.append(prompt)
-            eval_images.append(image)
+            eval_images.append(eval_image)
             eval_indices.append(idx)
 
         evaluation_start = time.monotonic()
@@ -742,6 +753,7 @@ class ImageGenerationEvaluationPipeline:
                 level3_scores=eval_result.level3_scores,
                 parse_failures=eval_result.parse_failures,
                 image=image if return_images else None,
+                image_path=eval_image_paths.get(idx),
                 error=eval_result.error,
             )
 

@@ -19,11 +19,29 @@ import click
 import tensorrt_llm.profiler as profiler
 
 from .. import LLM as PyTorchLLM
-from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
-                        ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
-                        GPQAExtended, GPQAMain, GPQANemoSkills, IFBench,
-                        JsonModeEval, LongBenchV1, LongBenchV2, MMMUPro,
-                        SciCode)
+from ..evaluate import (
+    AALCR,
+    AIME2025,
+    AIME2026,
+    GSM8K,
+    HLE,
+    MMLU,
+    MMMU,
+    ArenaHard,
+    CnnDailymail,
+    CoVoST2,
+    GPQADiamond,
+    GPQAExtended,
+    GPQAMain,
+    GPQANemoSkills,
+    IFBench,
+    ImageGenerationEval,
+    JsonModeEval,
+    LongBenchV1,
+    LongBenchV2,
+    MMMUPro,
+    SciCode,
+)
 from ..llmapi import KvCacheConfig
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
@@ -34,6 +52,7 @@ from .utils import collect_explicit_cli_keys
 # CLI defaults are sourced from the TorchLlmArgs field defaults so they stay in
 # lock-step with the args class and can't drift.
 _LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
+_IMAGE_GENERATION_EVAL_COMMAND = "image_generation_eval"
 
 # Map Click parameter names to the LlmArgs field name (or merge-function CLI
 # scalar name) used by `update_llm_args_with_extra_options`.
@@ -150,6 +169,15 @@ def main(ctx, model: str, tokenizer: Optional[str],
          telemetry: bool):
     logger.set_level(log_level)
 
+    if ctx.invoked_subcommand == _IMAGE_GENERATION_EVAL_COMMAND:
+        ctx.obj = {
+            "model": model,
+            "extra_llm_api_options": extra_llm_api_options,
+            "log_level": log_level,
+            "telemetry": telemetry,
+        }
+        return
+
     explicit_cli_keys = collect_explicit_cli_keys(
         exclude=("extra_llm_api_options", "config"),
         translate=_CLICK_TO_LLM_ARG)
@@ -230,6 +258,7 @@ main.add_command(AIME2026.command)
 main.add_command(GPQANemoSkills.command)
 main.add_command(IFBench.command)
 main.add_command(SciCode.command)
+main.add_command(ImageGenerationEval.command)
 main.add_command(HLE.command)
 main.add_command(AALCR.command)
 main.add_command(ArenaHard.command)
