@@ -1709,58 +1709,61 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         return False
 
-    def _handle_finish_reasons_impl(
-        self,
-        request: LlmRequest,
-        beam_width: int,
-        finish_reasons: torch.Tensor,
-        finish_reasons_list: list[int],
-    ) -> bool:
-        """Check if all beams of a request have finished and set the request state accordingly
+    @staticmethod
+    def _finished_beam_prefix_lengths(finish_reasons: torch.Tensor) -> list[int]:
+        """Count the leading finished beams of every slot in one batched reduction.
+
+        A request is complete once all of the beams it actually uses have a finish
+        reason, i.e. once its leading ``py_beam_width`` entries are all set. Rather
+        than reducing each request's row separately, reduce the whole tensor once
+        and return, per slot, how many leading beams have finished. The per-request
+        check then degenerates to ``prefix_length >= beam_width``, which needs no
+        tensor work and stays correct for mixed beam widths regardless of what the
+        columns past a request's width hold.
 
         Args:
-            request: LlmRequest. The request to check.
-            beam_width: int. The beam width of the request.
-            finish_reasons: torch.Tensor. Shape: (beam_width)
-                            The finish reasons for each beam.
-            finish_reasons_list: list[int]. The finish reasons for each beam.
+            finish_reasons: Shape ``(max_batch_size, max_beam_width)``. The finish
+                reasons of every beam of every slot.
+
         Returns:
-            True if all beams have finished, False otherwise.
+            Per slot, the number of leading beams whose finish reason is set.
         """
-        if (finish_reasons[:beam_width] != FinishReason.NOT_FINISHED.value).sum() == beam_width:
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            for beam_idx in range(beam_width):
-                request.set_finished_reason(
-                    FinishReason(finish_reasons_list[beam_idx]),
-                    beam_idx,
-                )
-            return True
-        return False
+        unfinished = finish_reasons == FinishReason.NOT_FINISHED.value
+        # A beam belongs to the finished prefix iff no unfinished beam precedes it
+        # and it is finished itself, i.e. iff the running count of unfinished beams
+        # up to and including it is still zero. Counting those positions yields the
+        # prefix length directly, and needs no special case for a fully finished
+        # row (every position counts) or a row finishing at beam 0 (none do).
+        return (unfinished.cumsum(dim=1) == 0).sum(dim=1).tolist()
 
     def _handle_first_finish_reasons(
         self,
         request: LlmRequest,
-        finish_reasons: torch.Tensor,
+        finished_beam_prefix_lengths: list[int],
         finish_reasons_list: list[list[int]],
     ) -> bool:
         """Check if all beams of a request have finished and set the request state accordingly
 
         Args:
             request: LlmRequest. The request to check.
-            finish_reasons: torch.Tensor. Shape: (max_batch_size, max_beam_width)
-                            The finish reasons for each beam.
+            finished_beam_prefix_lengths: Per slot, the number of leading beams that
+                have finished, as returned by ``_finished_beam_prefix_lengths``.
             finish_reasons_list: list[list[int]]. The finish reasons for each beam.
         Returns:
             True if all beams have finished, False otherwise.
         """
         assert request.py_seq_slot is not None
         beam_width = request.py_beam_width
-        return self._handle_finish_reasons_impl(
-            request,
-            beam_width,
-            finish_reasons[request.py_seq_slot, :beam_width],
-            finish_reasons_list[request.py_seq_slot],
-        )
+        if finished_beam_prefix_lengths[request.py_seq_slot] < beam_width:
+            return False
+        request.state = LlmRequestState.GENERATION_COMPLETE
+        request_finish_reasons = finish_reasons_list[request.py_seq_slot]
+        for beam_idx in range(beam_width):
+            request.set_finished_reason(
+                FinishReason(request_finish_reasons[beam_idx]),
+                beam_idx,
+            )
+        return True
 
     @staticmethod
     @nvtx_range("update_original_tokens")
@@ -2361,11 +2364,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons_list()
-        first_finish_reasons = (
-            state.host.first_finish_reasons.tolist()
-            if state.host.first_finish_reasons is not None
-            else []
-        )
+        first_finish_reasons_host = state.host.first_finish_reasons
+        if first_finish_reasons_host is not None:
+            first_finish_reasons = first_finish_reasons_host.tolist()
+            # Reduce every slot at once; the per-request loop below only reads the
+            # result and updates the request objects.
+            finished_beam_prefix_lengths = self._finished_beam_prefix_lengths(
+                first_finish_reasons_host
+            )
+        else:
+            first_finish_reasons = []
+            finished_beam_prefix_lengths = []
 
         new_tokens_list = new_tokens.tolist()
 
@@ -2465,10 +2474,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         # Beam search does not support speculative decoding.
                         add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1)
-                first_finish_reasons_host = state.host.first_finish_reasons
                 assert first_finish_reasons_host is not None
                 self._handle_first_finish_reasons(
-                    req, first_finish_reasons_host, first_finish_reasons
+                    req, finished_beam_prefix_lengths, first_finish_reasons
                 )
                 if self._use_speculative_beam_history_d2h:
                     # Snapshot for the next step's predictor.
