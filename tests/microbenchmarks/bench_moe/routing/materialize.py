@@ -27,7 +27,7 @@ The materialiser:
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -102,6 +102,138 @@ def _pack_slots_column_major(flat: List[int], local_num_tokens: int, top_k: int)
     return out
 
 
+def _pack_slots_group_aware(
+    flat: List[int],
+    local_num_tokens: int,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    num_experts: int,
+    moe_ep_size: int,
+) -> Optional[List[List[int]]]:
+    """Pack flat slots so every token row spans at most ``topk_group`` groups.
+
+    Grouped routing methods (DeepSeek-V3 style ``noaux_tc``) score a group by
+    the sum of its top-2 expert scores and then keep only ``topk_group``
+    groups. The high/low logits built by ``_project_router_logits_for_plan``
+    give a group with >=2 selected experts a score of ``2*sigmoid(high)``, a
+    group with exactly one ``sigmoid(high) + sigmoid(low)``, and an unselected
+    group ``2*sigmoid(low)``. Column-major packing spreads a token's ``top_k``
+    slots over every group, so all groups tie on the middle value and the
+    kernel's tie-break decides which ``topk_group`` survive -- collapsing the
+    load onto the lowest-indexed groups (and therefore the lowest-indexed EP
+    ranks) no matter what the plan asked for.
+
+    Packing each token into at most ``topk_group`` groups instead makes the
+    selected groups score strictly above the unselected ones, so the routing
+    kernel reproduces the plan exactly. Groups are picked one per EP rank
+    (stride ``n_group // moe_ep_size``) with a per-token rotation, which keeps
+    the per-rank slot counts balanced -- the property the plan encodes but the
+    old packing silently lost.
+
+    ``flat`` is consumed as a multiset, so the realised per-expert slot counts
+    still match ``plan.expert_histogram`` exactly.
+
+    Returns ``None`` when the constraint cannot be satisfied from the available
+    slots (for example a hotspot histogram that concentrates on one group), so
+    the caller can fall back to the previous behaviour.
+    """
+    if local_num_tokens <= 0 or top_k <= 0 or n_group <= 1:
+        return None
+    if num_experts % n_group != 0:
+        return None
+    experts_per_group = num_experts // n_group
+    # A token cannot need more slots than ``topk_group`` groups can supply
+    # with distinct experts.
+    if top_k > topk_group * experts_per_group:
+        return None
+
+    # Remaining slot count per expert, bucketed by group.
+    pools: List[Dict[int, int]] = [{} for _ in range(n_group)]
+    for eid in flat:
+        g = eid // experts_per_group
+        if g >= n_group:
+            return None
+        pools[g][eid] = pools[g].get(eid, 0) + 1
+
+    # Per-group quota for one token: split ``top_k`` over ``topk_group`` groups
+    # (8/4 -> 2,2,2,2; 6/4 -> 2,2,1,1). Rotated per token so the remainder does
+    # not always land on the same group.
+    base_quota = _largest_remainder_split(top_k, [1.0] * topk_group)
+    # Pick one group per EP rank when the topology allows it, so each token
+    # reaches as many ranks as ``topk_group`` permits.
+    groups_per_rank = max(1, n_group // max(moe_ep_size, 1))
+
+    out: List[List[int]] = []
+    for t in range(local_num_tokens):
+        # ``groups_per_rank`` is the stride, so one group is taken per EP rank;
+        # the start advances by one group per token so consecutive tokens cover
+        # different groups within each rank and every pool drains evenly.
+        candidates = [(t + j * groups_per_rank) % n_group for j in range(topk_group)]
+        # De-duplicate while preserving order, then top up with the groups that
+        # still hold the most slots (keeps drain even for odd topologies).
+        chosen: List[int] = []
+        for g in candidates:
+            if g not in chosen:
+                chosen.append(g)
+        if len(chosen) < topk_group:
+            for g in sorted(range(n_group), key=lambda gg: (-sum(pools[gg].values()), gg)):
+                if g not in chosen:
+                    chosen.append(g)
+                if len(chosen) == topk_group:
+                    break
+        quota = base_quota[t % len(base_quota) :] + base_quota[: t % len(base_quota)]
+
+        row: List[int] = []
+        deficit = 0
+        for g, want in zip(chosen, quota):
+            took = _drain_distinct_from_pool(pools[g], want)
+            deficit += want - len(took)
+            row.extend(took)
+        # Re-balance inside the chosen groups when one of them ran dry.
+        if deficit:
+            for g in chosen:
+                if deficit <= 0:
+                    break
+                extra = _drain_distinct_from_pool(pools[g], deficit, exclude=set(row))
+                row.extend(extra)
+                deficit -= len(extra)
+        if len(row) != top_k or len(set(row)) != top_k:
+            return None
+        out.append(row)
+
+    if any(pool for pool in pools if sum(pool.values()) > 0):
+        # Slots left over means the rows do not reproduce the histogram.
+        return None
+    return out
+
+
+def _drain_distinct_from_pool(
+    pool: Dict[int, int], want: int, exclude: Optional[set] = None
+) -> List[int]:
+    """Take up to ``want`` distinct expert ids from ``pool``, most-loaded first.
+
+    Draining the experts with the largest remaining slot count first keeps the
+    per-expert histogram from developing a tail of leftovers that no token can
+    absorb. ``pool`` is mutated in place.
+    """
+    if want <= 0:
+        return []
+    taken: List[int] = []
+    for eid in sorted(pool, key=lambda e: (-pool[e], e)):
+        if len(taken) == want:
+            break
+        if pool[eid] <= 0:
+            continue
+        if exclude is not None and eid in exclude:
+            continue
+        taken.append(eid)
+        pool[eid] -= 1
+        if pool[eid] == 0:
+            del pool[eid]
+    return taken
+
+
 def _repair_duplicate_experts(out: List[List[int]], top_k: int) -> None:
     """Best-effort repair so each token row has distinct selected experts."""
     max_passes = 4
@@ -167,6 +299,7 @@ def _materialize_selected_experts_for_rank(
     moe_ep_size: int,
     device: torch.device,
     scale_dtype: torch.dtype,
+    group_constraint: Optional[Tuple[int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Materialise ``[local_num_tokens, top_k]`` expert ids + uniform scales.
 
@@ -180,6 +313,14 @@ def _materialize_selected_experts_for_rank(
          per-token expert ids stay distinct in practice.
       4. Run a small repair pass that swaps duplicated expert ids between
          rows until each token has ``top_k`` distinct experts.
+
+    ``group_constraint`` is ``(n_group, topk_group)`` for routing methods that
+    enforce DeepSeek-V3 style expert grouping. When set, step 3 is replaced by
+    :func:`_pack_slots_group_aware`, which keeps each token inside at most
+    ``topk_group`` groups so the routing kernel can realise the plan exactly
+    (see that function for why column-major packing cannot). The group-aware
+    packer falls back to the column-major path when the requested histogram
+    cannot satisfy the constraint.
     """
     # Derive the effective token count from the dispatch-matrix row sum so that
     # MoE-TP + attention-DP layouts (DTP / CUSTOM-DP) are handled correctly.
@@ -194,8 +335,21 @@ def _materialize_selected_experts_for_rank(
         return ids, scales
 
     flat = _flatten_plan_slots_for_rank(plan, src_rank, top_k, experts_per_rank, moe_ep_size)
-    out = _pack_slots_column_major(flat, local_num_tokens, top_k)
-    _repair_duplicate_experts(out, top_k)
+    out = None
+    if group_constraint is not None:
+        n_group, topk_group = group_constraint
+        out = _pack_slots_group_aware(
+            list(flat),
+            local_num_tokens,
+            top_k,
+            int(n_group),
+            int(topk_group),
+            num_experts=int(experts_per_rank) * int(moe_ep_size),
+            moe_ep_size=int(moe_ep_size),
+        )
+    if out is None:
+        out = _pack_slots_column_major(flat, local_num_tokens, top_k)
+        _repair_duplicate_experts(out, top_k)
 
     ids = torch.tensor(out, dtype=torch.int32, device=device)
     scales = _make_uniform_topk_scales(local_num_tokens, top_k, device=device, dtype=scale_dtype)

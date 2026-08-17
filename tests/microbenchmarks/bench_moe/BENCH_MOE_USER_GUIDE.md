@@ -181,7 +181,6 @@ mpirun --allow-run-as-root --oversubscribe --bind-to none --map-by slot -np 4 \
   --model deepseek_v3 \
   --parallel_mode DEP \
   --backend TRTLLM \
-  --balanced_total_num_tokens 896 \
   --per_rank_num_tokens 128 128 512 128 \
   --routing_dump_matrix \
   --output_file out/per_rank_skew.json
@@ -488,12 +487,28 @@ Routing-method projection capability:
 | `native` | Any custom comm or expert pattern | Keep off to avoid conflicting with projection. |
 | `forced` | Any pattern | Keep off; the supplied-topk path already owns the routing inputs. |
 
-In `forced` mode, `routing_control.actual.observation_source` is `plan_exact`
-because the benchmark patches the kernel inputs to consume the materialized
-plan. In `native` mode, it is `plan_simulation`: observed matrix fields are
-deterministic re-materializations of the requested plan, not a runtime capture
-of the kernel's final selected experts. Use `routing_realization.status` and
-`max_abs_slot_error` to decide whether the projection is close enough.
+`routing_control.actual.observation_source` records where the observed matrices
+come from:
+
+| Value | When | Meaning |
+|---|---|---|
+| `plan_exact` | `forced` mode | The benchmark patches the kernel inputs to consume the materialized plan, so observed == plan by construction. |
+| `plan_simulation` | `native` mode | The matrices are deterministic re-materializations of the requested plan, not a runtime capture of the kernel's final selected experts. |
+
+`max_abs_slot_error` / `max_relative_slot_error` compare the observed matrix
+with the requested plan, so they are only published under `plan_exact`, where
+the kernel really consumes that plan. Under `plan_simulation` they are `null`,
+because comparing a re-materialized plan with itself would always yield `0` and
+read as "the projection was perfect" even for a request the routing method could
+not realize. In native mode, judge a run by `routing_realization.status`
+instead (`exact` means the projected logits drive the kernel to the plan), and
+treat a `null` error as "not measured", not as "no error".
+
+Grouped routing methods (DeepSeek-V3 style `noaux_tc`) constrain each token to
+at most `topk_group` expert groups. The materializer packs the requested plan to
+respect that constraint, so balanced plans stay realizable and expert load stays
+even across EP ranks; if a requested histogram cannot satisfy it, packing falls
+back and `routing_realization.status` becomes `projected`.
 
 ## Reading Outputs
 
@@ -549,7 +564,7 @@ not run."
 | `latency_ms.raw_score` | Unfiltered slowest-rank mean. |
 | `latency_ms.iter_max_stats` | Mean, median, p90, min, max, and stdev over per-iteration slowest-rank latency. |
 | `latency_ms.iter_max_outliers` | Outliers detected by robust scoring, including index, value, center, and modified z-score. |
-| `kernel_breakdown` | CUDA kernel-name statistics when `--analysis kernels` succeeds. |
+| `kernel_breakdown` | CUDA kernel-name statistics when `--analysis kernels` succeeds and `--nsys` is off (`--nsys` disables CUPTI collection). |
 | `raw_data.forward_times_ms` | Per-rank forward latency samples for every timed iteration. |
 | `raw_data.kernel_times_ms` | Per-rank per-kernel samples when CUPTI collection succeeds. |
 | `routing_control` | Requested routing shape and observed/planned routing shape. |
@@ -599,9 +614,10 @@ per-iteration samples.
 
 `routing_path` can be `logits_native`, `logits_projected`,
 `supplied_topk_apply`, or `supplied_topk_run_moe`. `routing_realization.status`
-can be `exact`, `projected`, `rejected`, or `forced_exact`. With
-`--routing_dump_matrix`, the row also includes full requested and observed
-dispatch/expert matrices.
+can be `exact`, `projected`, `rejected`, or `forced_exact`. The
+`max_abs_slot_error` fields are `null` when `observation_source` is
+`plan_simulation` (see above). With `--routing_dump_matrix`, the row also
+includes full requested and observed dispatch/expert matrices.
 
 ## Pitfalls and Limitations
 
@@ -609,7 +625,7 @@ dispatch/expert matrices.
 |---|---|
 | `Custom shapes ... AUTO has no safe default` | Custom shapes must explicitly set `--routing_method`. |
 | Forced communication candidate is skipped | Some communication methods do not make sense for non-DP layouts, MoE TP, or `world_size=1`. |
-| `routing_realization.status="projected"` | The routing method cannot exactly express the requested shape. Inspect `max_abs_slot_error`. |
+| `routing_realization.status="projected"` | The routing method cannot exactly express the requested shape, so the expert load is NOT the requested pattern. `max_abs_slot_error` is `null` here (see `observation_source`); it is only reported in `forced` mode. |
 | `routing_realization.status="rejected"` | `--projection_policy reject` was used with an inexact native-routing request. The skipped row still keeps routing-control context. |
 | Forced mode under TEP is not directly comparable with native | `forced` supplies top-k inputs and skips fused scoring; use it for controlled execution-path experiments. |
 | Routing pattern file row-sum error | Each dispatch row must equal `per_rank_num_tokens[src] * top_k`, and `ep_size` must match runtime EP size. |
@@ -618,6 +634,7 @@ dispatch/expert matrices.
 | `phase_times_ms` is empty | Scheduler-side phase markers are not implemented yet; use latency and kernel breakdown. |
 | Backend appears as skipped | Backend `can_implement()`, mapping, or communication capability gates rejected the candidate. Read `skip_reason`. |
 | CUDA Graph timing has no kernel breakdown | CUPTI must initialize before CUDA context creation. If that fails, breakdown is unavailable. |
+| `--analysis kernels` produced no kernel breakdown | `--nsys` disables CUPTI collection (CUPTI and Nsight Systems cannot trace the same process), so the two are mutually exclusive in practice. Drop `--nsys` to get `kernel_breakdown`, or keep it and read kernel statistics from the `.nsys-rep` instead. Latency measurement is unaffected either way. |
 | Excel `raw_data` sheet only has headers | The JSON may come from an older run without raw data, or the run had no successful candidate. Rerun with current code to capture raw samples. |
 | `--search comm` does not include `AUTO` | This is intentional: `AUTO` is a runtime alias, not a concrete forced strategy. Run a separate base case with `--comm_method AUTO` when you need that number. |
 | Bare `python3 -m bench_moe --world_size 4` hangs or reports `MPI_ERR_SPAWN` | This path calls `MPI.COMM_SELF.Spawn`. Many Slurm/Pyxis systems disable MPI dynamic spawn. Use external `mpirun` or `srun --mpi=pmix`. |
@@ -631,7 +648,9 @@ dispatch/expert matrices.
 | `qwen1.5_moe` | 60 | 4 | 2048 | 1408 | `FP8` | `RENORMALIZE` |
 | `deepseek_v2_lite` | 64 | 6 | 2048 | 1408 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `deepseek_v3` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
+| `deepseek_r1` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k2` | 384 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
+| `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
 | `mixtral_8x7b` | 8 | 2 | 4096 | 14336 | `FP8` | `RENORMALIZE` |
