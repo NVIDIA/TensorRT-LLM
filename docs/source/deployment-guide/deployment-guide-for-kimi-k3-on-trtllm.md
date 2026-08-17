@@ -210,6 +210,16 @@ These options are set within the YAML file passed to `trtllm-serve` via the `--c
 
 * **Description:** Required to load the Kimi K3 configuration and tokenizer code shipped with the checkpoint.
 
+### Kimi-Specific API Behavior and Environment Variables
+
+When the served model is Kimi K3, `trtllm-serve` applies Kimi/Moonshot API semantics on `/v1/chat/completions` (all of these are exercised by Moonshot's [Kimi Vendor Verifier](https://www.kimi.com/blog/kimi-vendor-verifier.html)):
+
+* **Request extensions:** the `thinking` object (`{"type": "enabled"|"disabled", "keep": "all", "effort": "low"|"high"|"max"}`), `reasoning_effort` values `"max"` and `"none"` (an explicit `thinking` object takes precedence), `tool_choice: "required"`, message-level (dynamic) tools declared on system messages, and `response_format` `json_object`/`json_schema` (the `json_schema` wrapper must carry a non-empty `name` and a `schema` object). These map onto the checkpoint chat template's native control messages; explicit `chat_template_kwargs` always win.
+* **Streaming usage:** `usage` is reported in the final streaming chunk even when the client does not send `stream_options` (Kimi API parity).
+* **Prompt-token accounting:** reported `usage.prompt_tokens` excludes the trailing 3-token generation channel opener, matching Kimi's reference accounting; the model still consumes the full rendered prompt.
+* **`TRTLLM_KIMI_PARAM_POLICY`** (default `1`): enforces Kimi's immutable sampling parameters — `top_p` pinned to 0.95 (unset or the OpenAI default `1.0` are coerced to 0.95; other values are rejected with HTTP 400), `presence_penalty`/`frequency_penalty` 0, `n` 1, and `temperature` bounded to [0, 1]. Set to `0` to serve unconstrained (a Kimi-Vendor-Verifier certification run requires the policy on).
+* **`TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR`** (default `0`): opt-in constrained decoding for tools with `strict: true` (requires `guided_decoding_backend: xgrammar`). Disabled by default pending the investigation of a device-side assert observed under sustained concurrent guided load; strict tools otherwise fall back to warn-and-continue.
+
 ## Testing API Endpoint
 
 The server (the OpenAI-compatible REST endpoint) runs on the rank-0 node, listening on port `8000`. Send requests to that node's hostname or IP; `localhost` only works from the rank-0 node itself.

@@ -329,7 +329,8 @@ class BaseToolParser(ABC):
         """Return True if this detector supports structural tag format."""
         return True
 
-    def build_strict_structural_tag_format(self, tools) -> Optional[dict]:
+    def build_strict_structural_tag_format(
+            self, tools: List[Tool]) -> Optional[Dict[str, Any]]:
         """Build a complete structural-tag format for strict-tool decoding.
 
         Override on parsers whose wire format cannot be expressed through

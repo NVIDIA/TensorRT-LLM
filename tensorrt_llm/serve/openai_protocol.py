@@ -17,7 +17,6 @@
 # https://github.com/vllm-project/vllm/blob/4db5176d9758b720b05460c50ace3c01026eb158/vllm/entrypoints/openai/protocol.py
 import base64
 import math
-import re
 import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -924,10 +923,6 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
-# Valid function-tool name: no leading digit, word chars/dash only, at most
-# 256 chars (Kimi Vendor Verifier contract for message-level tools).
-_DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}\Z")
-
 
 class ChatCompletionThinkingParam(OpenAIBaseModel):
     """Kimi/Moonshot ``thinking`` extension controlling reasoning output.
@@ -1203,65 +1198,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def check_dynamic_tools(cls, data):
-        """Validate message-level (dynamic) tool declarations.
+    def check_message_tools_role(cls, data):
+        """Message-level tool declarations ride on system messages only.
 
-        Kimi-style dynamic tools ride on system messages. Enforce the
-        contract checked by the Kimi Vendor Verifier: system-only carrier,
-        empty content, well-formed function tools with valid unique names
-        (unique also against request-level tools).
+        Union validation strips unknown keys from non-system messages, so
+        this raw-payload validator is the only layer that can reject the
+        misuse loudly instead of silently dropping the client's tools. The
+        rest of the dynamic-tools contract is model-specific and validated
+        in the serving layer (kimi_k3 only).
         """
         if not isinstance(data, dict):
             return data
-        messages = data.get("messages")
-        if not isinstance(messages, list):
-            return data
-        seen_names = set()
-        tools = data.get("tools")
-        if isinstance(tools, list):
-            for tool in tools:
-                if isinstance(tool, dict) and isinstance(
-                        tool.get("function"), dict):
-                    name = tool["function"].get("name")
-                    if isinstance(name, str):
-                        seen_names.add(name)
-        for message in messages:
-            # A null tools key is treated as absent (some SDKs serialize
-            # optional fields as null); only declared tools are validated.
-            if not isinstance(message,
-                              dict) or message.get("tools") is None:
-                continue
-            if message.get("role") != "system":
+        for message in data.get("messages") or []:
+            if (isinstance(message, dict)
+                    and message.get("tools") is not None
+                    and message.get("role") != "system"):
                 raise ValueError(
                     "Message-level `tools` are only allowed on system "
                     "messages.")
-            if message.get("content"):
-                raise ValueError(
-                    "A system message carrying `tools` must have empty "
-                    "content.")
-            message_tools = message["tools"]
-            if not isinstance(message_tools, list):
-                raise ValueError("Message-level `tools` must be an array.")
-            for tool in message_tools:
-                if not isinstance(tool, dict):
-                    raise ValueError(
-                        "Each message-level tool must be an object.")
-                if tool.get("type") != "function":
-                    raise ValueError(
-                        f"Unsupported message-level tool type: "
-                        f"{tool.get('type')!r}.")
-                function = tool.get("function")
-                if not isinstance(function, dict):
-                    raise ValueError(
-                        "Message-level tools must carry a `function` object.")
-                name = function.get("name")
-                if not isinstance(
-                        name, str) or not _DYNAMIC_TOOL_NAME_RE.match(name):
-                    raise ValueError(
-                        f"Invalid message-level tool name: {name!r}.")
-                if name in seen_names:
-                    raise ValueError(f"Duplicate tool name: {name!r}.")
-                seen_names.add(name)
         return data
 
     @model_validator(mode="before")

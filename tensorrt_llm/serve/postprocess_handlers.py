@@ -888,7 +888,7 @@ def completion_response_post_processor(
 class ChatCompletionPostprocArgs(PostprocArgs):
     model: str
     tools: Optional[List[ChatCompletionToolsParam]]
-    tool_choice: Optional[Union[Literal["none", "auto"],
+    tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
     stream_options: Optional[StreamOptions] = None
