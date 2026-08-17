@@ -428,7 +428,9 @@ With the default `"response_format": "url"` the response carries a
   `Image generation failed`): the pipeline returns an empty result rather than a
   distinguishable error.
 - **Distilled checkpoints** (`...-4Step`) fix their step count and guidance;
-  sending `num_inference_steps` or `guidance_scale` returns HTTP 400.
+  simplest is to omit `num_inference_steps` and `guidance_scale`. A value that
+  matches the checkpoint is accepted, a conflicting one returns HTTP 400 naming
+  the value it requires.
 - **Prompt quality**: the checkpoints were tuned on the structured captions the
   model cards ship, which give noticeably cleaner output than a one-line summary.
   Send one as the `prompt` string, and the offline example's
