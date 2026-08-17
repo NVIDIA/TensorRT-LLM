@@ -892,12 +892,18 @@ class _TelemetrySession:
             if not self.disabled and not self.terminal_reported:
                 self.observed_signal = signal_number
 
-    def record_termination_observation(self, outcome: TerminalOutcome) -> None:
-        """Remember a causal classification until the process actually exits."""
+    def record_termination_observation(
+        self,
+        outcome: TerminalOutcome,
+        lifecycle_phase: Optional[schema.LifecyclePhase] = None,
+    ) -> None:
+        """Atomically remember a causal classification and its lifecycle phase."""
         with self.lock:
             if self.disabled or self.terminal_reported or self.observed_outcome is not None:
                 return
             self.observed_outcome = outcome
+            if lifecycle_phase is not None:
+                self.lifecycle_phase = lifecycle_phase
 
     def _snapshot_unlocked(self) -> dict[str, Any]:
         self._refresh_metadata_unlocked()
@@ -1239,9 +1245,19 @@ def record_observed_signal(signal_number: int) -> None:
     _session_call(lambda session: session.record_observed_signal(signal_number), None)
 
 
-def record_termination_observation(outcome: TerminalOutcome) -> None:
-    """Remember a terminal cause for a surviving authoritative boundary."""
-    _session_call(lambda session: session.record_termination_observation(outcome), None)
+def record_termination_observation(
+    outcome: TerminalOutcome,
+    *,
+    lifecycle_phase: Optional[schema.LifecyclePhase] = None,
+) -> None:
+    """Remember a terminal cause and phase for an authoritative boundary."""
+    _session_call(
+        lambda session: session.record_termination_observation(
+            outcome,
+            lifecycle_phase,
+        ),
+        None,
+    )
 
 
 def get_observed_signal() -> int:

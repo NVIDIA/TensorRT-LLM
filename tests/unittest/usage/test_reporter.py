@@ -886,13 +886,15 @@ class TestProcessTelemetrySession:
                 exit_code_known=True,
                 exit_code=137,
                 signal_number=9,
-            )
+            ),
+            lifecycle_phase="serving",
         )
         usage_lib.record_termination_observation(
             usage_lib.TerminalOutcome(
                 termination_kind="signal",
                 component="server",
-            )
+            ),
+            lifecycle_phase="shutdown",
         )
 
         session = usage_lib._get_session()
@@ -907,7 +909,8 @@ class TestProcessTelemetrySession:
             )
         )
         assert terminal is not None
-        _, outcome = terminal
+        snapshot, outcome = terminal
+        assert snapshot["lifecyclePhase"] == "serving"
         assert outcome == usage_lib.TerminalOutcome(
             termination_kind="worker_failure",
             component="engine_worker",
