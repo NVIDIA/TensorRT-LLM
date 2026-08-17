@@ -14,6 +14,7 @@
 # limitations under the License.
 """Laguna / Laguna-XS model for TensorRT-LLM PyTorch backend."""
 
+import math
 from typing import Dict, List, Optional, Type
 
 import torch
@@ -33,7 +34,12 @@ from ..distributed import AllReduce, AllReduceParams
 from ..modules.attention import _helix_cp_allgather_input, _helix_cp_output_projection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe, get_moe_cls
+from ..modules.fused_moe import (
+    MiniMaxM2MoeRoutingMethod,
+    RoutingMethodType,
+    create_moe,
+    resolve_moe_cls,
+)
 from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.fused_moe.interface import MoE as MoEInterface
 from ..modules.gated_mlp import GatedMLP
@@ -126,7 +132,15 @@ class LagunaMoE(nn.Module):
             num_experts=self.num_experts,
             top_k=self.top_k,
             dtype=config.torch_dtype,
-            moe_backend_cls=get_moe_cls(model_config),
+            moe_backend_cls=resolve_moe_cls(
+                model_config,
+                routing=RoutingMethodType.MiniMax2,
+                # Match the create_moe call below, which passes no bias and no
+                # swiglu alpha/beta. Left unknown, gates that create_moe
+                # rejects abstain here and the gate would name a backend the
+                # layer does not run.
+                swiglu_gptoss_style=False,
+            ),
         )
 
         self.experts = create_moe(
@@ -304,7 +318,14 @@ class LagunaAttention(QKNormRoPEAttention):
             rp.beta_slow = float(rp_dict.get("beta_slow", 1.0))
             attention_factor = rp_dict.get("attention_factor")
             if attention_factor is not None:
-                rp.mscale = float(attention_factor)
+                attention_factor = float(attention_factor)
+                # attention_factor is the FINAL YaRN scaling (HF semantics).
+                # create_sinusoidal_positions_yarn applies get_mscale(factor, rp.mscale)
+                # = 0.1*rp.mscale*ln(factor)+1 (mscale_all_dim=0), so setting mscale to the
+                # final value routes it through the log twice. Invert to reproduce it exactly.
+                rp.mscale = (
+                    ((attention_factor - 1.0) / (0.1 * math.log(rp.scale))) if rp.scale > 1 else 1.0
+                )
             rp.original_max_positions = int(
                 rp_dict.get("original_max_position_embeddings", config.max_position_embeddings)
             )

@@ -1,4 +1,3 @@
-import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -9,21 +8,12 @@ from tensorrt_llm._utils import prefer_pinned
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 from .sa_enhancer import SADraftEnhancer
-from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
-
-if sys.version_info[:2] >= (3, 12):
-    from typing import override
-else:
-    from typing_extensions import override
-
-SampleStateMTP = SampleStateSpec
 
 
 def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
@@ -243,38 +233,6 @@ class MTPSpecMetadata(SpecMetadata):
             gen_request_ids = self.request_ids[num_contexts:]
             if gen_request_ids:
                 sa_manager.prepare(gen_request_ids, self.runtime_draft_len)
-
-
-class MTPSampler(SpecSamplerBase):
-    """
-    MTP sampler.
-
-    Inherits from SpecSamplerBase with overrides for tree-based speculation
-    using max_total_draft_tokens instead of draft_len.
-    """
-
-    SampleState = SampleStateMTP
-
-    @override
-    def is_generation_model(self) -> bool:
-        return True
-
-    def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
-        pass
-
-    def __init__(self, args: TorchSampler.Args, *, nextn: int):
-        super().__init__(args, draft_len=nextn)
-
-    @override
-    def _get_max_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
-        """MTP uses max_total_draft_tokens + 1 for tree-based speculation."""
-        return args.max_total_draft_tokens + 1
-
-    @override
-    def _get_draft_tokens_storage_size(self, args: TorchSampler.Args,
-                                       draft_len: int) -> int:
-        """MTP uses max_total_draft_tokens for draft token storage."""
-        return args.max_total_draft_tokens
 
 
 class MTPWorker(SpecWorkerBase):

@@ -84,6 +84,12 @@ reviews:
         Adding or removing entries here changes what CI runs either in every PR (pre-merge) or three times a day (post-merge).
         Do NOT suggest cross-syncing with the QA lists under
         tests/integration/test_lists/qa/.
+    - path: "tests/integration/test_lists/**"
+      instructions: |
+        Files here (waives.txt and the *.txt/*.yml list files) are plain-text
+        test-list data files, not source code. By repo convention they carry no
+        NVIDIA copyright/license header. Do NOT require or suggest adding a
+        copyright header to these files.
 knowledge_base:
   code_guidelines:
     enabled: true

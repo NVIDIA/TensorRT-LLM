@@ -34,12 +34,12 @@ from utils.torch_ref import RefHFModel
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import LLM
-from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
     _dequantize_nvfp4,
     _quantize_nvfp4,
 )
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
@@ -247,6 +247,17 @@ def _qwen35_35b_model_kwargs() -> dict:
         },
         "vision_config": {"depth": 1},
     }
+
+
+def _qwen35_35b_sampling_params() -> SamplingParams:
+    """Sample enough positions to resolve GDN recurrent-state drift.
+
+    compare_logits averages a top-k overlap ratio over the generated positions,
+    so at max_tokens=8 it only resolves 1/(8 * topk) steps — too coarse to tell
+    real state drift from one arbitrary top-k tie-break. 32 positions also let
+    the state accumulate long enough to diverge. Matches _nemotron_h_body.
+    """
+    return SamplingParams(temperature=0, return_generation_logits=True, max_tokens=32)
 
 
 def _qwen35_35b_is_test_weight(name: str) -> bool:
@@ -469,16 +480,20 @@ def _run_qwen35_35b_update(
             "max_batch_size": 2,
             "max_seq_len": 256,
             "max_num_tokens": 256,
+            # The HF reference always carries the GDN state in fp32, so only
+            # the engine accumulates rounding with a bf16 state cache. Serving
+            # keeps bf16 for throughput (see resolve_ssm_cache_dtype), so a
+            # test comparing against HF has to opt in explicitly.
             "kv_cache_config": KvCacheConfig(
                 enable_block_reuse=True,
                 free_gpu_memory_fraction=0.05,
-                mamba_ssm_cache_dtype="bfloat16",
+                mamba_ssm_cache_dtype="float32",
             ),
             **({"cuda_graph_config": cuda_graph_config} if cuda_graph_config is not None else {}),
             "model_kwargs": _qwen35_35b_model_kwargs(),
             "moe_config": MoeConfig(backend="TRTLLM"),
         },
-        sampling_params=SamplingParams(temperature=0, return_generation_logits=True, max_tokens=8),
+        sampling_params=_qwen35_35b_sampling_params(),
         partial=partial,
         weight_group=_qwen35_35b_weight_group,
         prompts_texts=["Hello, my name is", "The future of AI is"],
@@ -505,7 +520,7 @@ def _run_qwen35_35b_fp8_update(partial: bool) -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
     del tokenizer
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=8)
+    sampling_params = _qwen35_35b_sampling_params()
 
     def generate_logits(llm):
         return [
@@ -596,7 +611,7 @@ def _run_qwen35_35b_tp8_multinode_update() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
     del tokenizer
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=8)
+    sampling_params = _qwen35_35b_sampling_params()
 
     def generate_logits(llm):
         return [
