@@ -134,7 +134,7 @@ def _run_signal_test_child(
     """Run a minimal instrumented Uvicorn server in a fresh interpreter."""
     _install_lightweight_tensorrt_llm_package()
 
-    from tensorrt_llm.serve._telemetry import TelemetryUvicornServer
+    from tensorrt_llm.serve._telemetry import create_uvicorn_server
     from tensorrt_llm.usage import usage_lib
 
     usage_lib._OPT_OUT_FILE = ready_path.parent / "no-opt-out-file"
@@ -190,7 +190,7 @@ def _run_signal_test_child(
     )
     # An explicit empty socket list exercises Uvicorn's real lifecycle and
     # signal machinery without binding a network port in the unit-test sandbox.
-    asyncio.run(TelemetryUvicornServer(config).serve(sockets=[]))
+    asyncio.run(create_uvicorn_server(config).serve(sockets=[]))
 
 
 def _run_locked_signal_test_child(ready_path: Path, payload_path: Path) -> None:
@@ -233,20 +233,16 @@ def _run_locked_signal_test_child(ready_path: Path, payload_path: Path) -> None:
 
 
 def _run_incompatible_uvicorn_child() -> None:
-    """Verify a changed private Uvicorn lifecycle fails explicitly."""
+    """Verify private signal incompatibility falls back to normal serving."""
     _install_lightweight_tensorrt_llm_package()
     import uvicorn
 
-    from tensorrt_llm.serve._telemetry import TelemetryUvicornServer
+    from tensorrt_llm.serve._telemetry import create_uvicorn_server
 
     uvicorn.Server._serve = None
     config = uvicorn.Config(lambda scope, receive, send: None)
-    try:
-        TelemetryUvicornServer(config)
-    except RuntimeError as exc:
-        assert "Unsupported Uvicorn signal API" in str(exc)
-        return
-    raise AssertionError("Incompatible Uvicorn signal API was accepted")
+    server = create_uvicorn_server(config)
+    assert type(server) is uvicorn.Server
 
 
 @pytest.mark.parametrize("signal_count", [1, 2])
@@ -296,8 +292,8 @@ def test_signal_handler_unwinds_before_recording(tmp_path: Path) -> None:
     assert parameters["exitCode"] == 128 + signal.SIGTERM
 
 
-def test_incompatible_uvicorn_signal_api_fails_predictably() -> None:
-    """A changed private Uvicorn lifecycle cannot silently drop telemetry."""
+def test_incompatible_uvicorn_signal_api_falls_back() -> None:
+    """A private Uvicorn change disables signal telemetry, not serving."""
     with _signal_test_child("incompatible") as process:
         stdout, stderr = process.communicate(timeout=10)
     assert process.returncode == 0, (stdout, stderr)
