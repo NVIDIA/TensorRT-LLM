@@ -2103,6 +2103,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         echo "Will run job to build ngc containers and running in-pipeline scanning for them"
     }
 
+    // DO NOT MERGE (e2e scoping): this validation run only needs one architecture.
+    // Drop the SBSA arch so its Build sub-job does not run; the x86_64 build plus a
+    // couple of --stage-list-selected A10 single-GPU stages are enough to exercise
+    // the infra-defer path. Remove before merge.
+    stages.remove("SBSA-Linux")
+
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
             stage(key) {
