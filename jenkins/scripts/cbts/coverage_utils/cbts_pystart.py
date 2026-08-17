@@ -16,9 +16,10 @@
 import os
 import secrets
 import socket
-import sqlite3
 import sys
 import threading
+
+from compact_db import write_leaf_database
 
 _MON = getattr(sys, "monitoring", None)
 _DEFAULT_TOOL_ID = int(os.environ.get("CBTS_PYSTART_TOOL_ID", "4"))
@@ -108,7 +109,7 @@ class PyStartTracker:
         self._expected[key] = self._expected.get(key, 0) + int(n)
 
     def save(self):
-        # Write a per-process SQLite the downstream merge reads directly; uploaded compressed only.
+        # Write a compact per-process SQLite that downstream reducers can union directly.
         snap = self._data.copy()  # atomic shallow copy; each set snapshotted below
         outcomes = dict(self._outcomes)
         expected = dict(self._expected)
@@ -124,29 +125,15 @@ class PyStartTracker:
             tmp = path + ".tmp"
             if os.path.exists(tmp):
                 os.remove(tmp)
-            con = sqlite3.connect(tmp)
-            try:
-                con.execute("CREATE TABLE touch (test TEXT, file TEXT, qualname TEXT)")
-                rows = ((ctx, f, q) for ctx, fs in snap.items() for (f, q) in fs.copy())
-                con.executemany("INSERT INTO touch VALUES (?, ?, ?)", rows)
-                # Stage rides in the file content so the merge attributes rows without parsing the filename.
-                con.execute("CREATE TABLE proc_meta (stage TEXT)")
-                con.execute("INSERT INTO proc_meta VALUES (?)", (self.stage,))
-                # Per-test completeness signal; only the coordinator process fills outcome / expected.
-                con.execute(
-                    "CREATE TABLE test_meta "
-                    "(test TEXT PRIMARY KEY, outcome TEXT, expected_workers INTEGER)"
-                )
-                con.executemany(
-                    "INSERT OR REPLACE INTO test_meta VALUES (?, ?, ?)",
-                    [
-                        (k, outcomes.get(k), expected.get(k, 0))
-                        for k in set(outcomes) | set(expected)
-                    ],
-                )
-                con.commit()
-            finally:
-                con.close()
+            process_uid = f"{self.stage}/{self._suffix}.pid{os.getpid()}"
+            write_leaf_database(
+                tmp,
+                stage=self.stage,
+                process_uid=process_uid,
+                touches={context: symbols.copy() for context, symbols in snap.items()},
+                outcomes=outcomes,
+                expected_workers=expected,
+            )
             os.replace(tmp, path)
         return path
 
