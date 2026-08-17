@@ -351,7 +351,7 @@ def sample(
                 logits,
                 beam_width_in=cast(int, beam_width_in),
                 beam_width_out=cast(int, beam_width_out),
-                row_stride=cast(int, row_stride),
+                row_stride=row_stride,
                 beam_search_args=group_metadata,
                 temperature=cast(float, temperature),
                 early_stopping=cast(int, early_stopping),
@@ -1341,7 +1341,7 @@ class FlashInferGroupedStrategySampler:
             # variable-beam-width step; the op slices down to the live beams.
             rows_per_request = beam_width_in
             if strategies and strategies[0][0] == "beam_search":
-                rows_per_request = cast(BeamSearch, strategies[0]).row_stride
+                rows_per_request = strategies[0].row_stride
             assert logits.size(0) == rows_per_request * len(strategies)
         else:
             assert group_logit_indices.size(0) == beam_width_in * len(strategies)
