@@ -108,11 +108,32 @@ def launch_multimodal_encoder_pd_llm(
     """Launch separate encoder and combined prefill/decode llmapi instances."""
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "1"}))
-        thread_pool = stack.enter_context(MyThreadPoolExecutor(max_workers=max_workers))
         encoder = MultimodalEncoder(model=model_name, **encoder_llm_config)
         pd_llm = LLM(model=model_name, **pd_llm_config)
-        with encoder, pd_llm:
-            yield _MultimodalEncoderPDAdapter(encoder, pd_llm, thread_pool)
+
+        # Teardown order matters here (nvbugs/6327718). Everything goes on the
+        # one ExitStack, entered LLMs-first and pool-last, so unwinding runs:
+        #     thread_pool -> pd_llm -> encoder -> env patch
+        # i.e. the pool is fully drained before either proxy shuts down.
+        #
+        # The previous form entered the pool on the stack but wrapped the LLMs
+        # in a nested `with encoder, pd_llm:`. Being inner, that nested block
+        # always unwound FIRST, so the pool outlived both LLMs. When a worker
+        # died mid-run, generate_async().result() raised, the nested `with`
+        # tore down each proxy, and proxy.shutdown() -> ZeroMqQueue.close() ran
+        # socket.close()/context.term() while this pool's threads were still
+        # inside proxy.submit() -> ipc.py _send_data() -> socket.send() on those
+        # same sockets. Destroying a ZMQ socket under a live sender trips
+        # libzmq's signaler.cpp assert -> abort(), which CI reports as the
+        # opaque "Test terminated unexpectedly".
+        #
+        # MyThreadPoolExecutor.__exit__ cancels rather than waits on the
+        # exception path, so draining first cannot deadlock on futures blocked
+        # against an already-dead engine.
+        stack.enter_context(encoder)
+        stack.enter_context(pd_llm)
+        thread_pool = stack.enter_context(MyThreadPoolExecutor(max_workers=max_workers))
+        yield _MultimodalEncoderPDAdapter(encoder, pd_llm, thread_pool)
 
 
 @dataclass(frozen=True)
@@ -207,6 +228,9 @@ class EPDVariant:
             ),
             max_batch_size=64,
             expected_quant_algo=QuantAlgo.FP8,
+            # Default 128 workers trips a native-library abort in the CPU-side
+            # multimodal preprocessing path on H100 (nvbugs/6478692).
+            max_workers=16,
         )
 
     @classmethod
@@ -266,6 +290,12 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
+    # TEMPORARY (NVBUG-6327718): repetition parameter used only to measure the
+    # `Test terminated unexpectedly` rate against the proxy-shutdown fix in this
+    # branch. Sized for statistical power: the pre-fix nvfp4 rate is ~1.24%
+    # (14 native aborts / 1133 runs over 14 days in OpenSearch), so ~250 reps
+    # give p<0.05 and 500 give p<0.01 for a "zero aborts" result. Revert before
+    # merge; the reps carry no functional coverage of their own.
     @pytest.mark.parametrize("_repeat", range(560, 1060), ids=lambda i: f"rep{i:02d}")
     @pytest.mark.parametrize(
         "variant",
@@ -285,289 +315,7 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     )
     # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
     @pytest.mark.threadleak(enabled=False)
-    def test_disaggregated_videomme(
-        self, variant: EPDVariant, _repeat: int, request: pytest.FixtureRequest
-    ) -> None:
+    def test_disaggregated_videomme(self, variant: EPDVariant, _repeat: int) -> None:
         """Run VideoMME shard through a model-specific llmapi E/PD config."""
-        import faulthandler
-        import subprocess
-        import sys
-        import tempfile
-        import textwrap
-        from pathlib import Path
-
-        # Pass an OS-level file (not sys.stderr) to faulthandler so the
-        # SIGSEGV / SIGABRT thread dump survives pytest's --capture=fd
-        # buffering. Writing to sys.stderr goes into the capture pipe;
-        # if pytest is killed by the signal before flushing, the dump is
-        # lost. Writing to a real file gets a direct write() from the
-        # signal handler before the process dies.
-        output_dir_opt = request.config.getoption("--output-dir", default=None)
-        crash_dir = Path(output_dir_opt) if output_dir_opt else Path(tempfile.gettempdir())
-        crash_dir.mkdir(parents=True, exist_ok=True)
-        variant_slug = variant.model_name.rsplit("/", 1)[-1]
-        crash_log_path = crash_dir / f"faulthandler_{variant_slug}_rep{_repeat:03d}.log"
-        crash_log_file = open(crash_log_path, "w", buffering=1)
-        # Route the path to sys.__stderr__ (pre-capture) so the CI console
-        # can locate the file even if pytest capture ate the write above.
-        print(
-            f"[NVBUG-6327718] faulthandler log: {crash_log_path}",
-            file=sys.__stderr__,
-            flush=True,
-        )
-
-        # ==== NVBUG-6327718 full-coverage hang instrumentation ====
-        # Every knob below is an existing in-tree mechanism, so this only
-        # wires them together — nothing new to install in the CI container.
-        # Artifacts land under --output-dir, which pytest packs into the
-        # results tarball that CI uploads to urm.
-        dump_dir = crash_dir / f"hang_dumps_rep{_repeat:03d}"
-        dump_dir.mkdir(parents=True, exist_ok=True)
-
-        # Detached reaper subprocess. When pytest itself dies from a native
-        # SIGSEGV/SIGABRT, its faulthandler + sitecustomize files are already
-        # on disk under dump_dir, but the CI SLURM node may be torn down
-        # (walltime, orchestrator kill) before Jenkins post-stage archival can
-        # rsync test-results to urm — which is what left the H100 tarball at
-        # 1 KB on PR_Github #66663 despite all our in-process capture.
-        #
-        # The reaper below is a bash `nohup`/`setsid`-detached child that
-        # every 5 s tars all hang_dumps + sitecustomize dirs and writes an
-        # atomic-replace snapshot at crash_dir/nvbug6327718_snapshot.tgz.
-        # It also does one final snapshot after detecting the parent's death
-        # via `kill -0`. Even if pytest SIGSEGVs, the snapshot on disk is at
-        # most 5 s stale and lives inside --output-dir so Jenkins archival
-        # will grab it if the SLURM node's filesystem survives long enough.
-        reaper_script = crash_dir / f"reaper_rep{_repeat:03d}.sh"
-        reaper_marker = crash_dir / f"reaper_rep{_repeat:03d}.status"
-        reaper_marker.write_text("spawning\n")
-        reaper_script.write_text(
-            textwrap.dedent(f"""\
-            #!/bin/bash
-            # Detached; survives parent SIGSEGV.
-            PARENT_PID={os.getpid()}
-            SNAP_TMP="{crash_dir}/nvbug6327718_snapshot.tgz.tmp"
-            SNAP="{crash_dir}/nvbug6327718_snapshot.tgz"
-            MARKER="{reaper_marker}"
-            echo "$$ started $(date -Is), watching pid=$PARENT_PID" > "$MARKER"
-            while kill -0 $PARENT_PID 2>/dev/null; do
-                sleep 5
-                # Atomic snapshot: tar to tmp, then mv over. Never leaves a
-                # half-written tarball on disk.
-                tar czf "$SNAP_TMP" -C "{crash_dir}" \\
-                    hang_dumps_rep{_repeat:03d} sitecustomize_rep{_repeat:03d} \\
-                    2>/dev/null && mv -f "$SNAP_TMP" "$SNAP"
-            done
-            # Parent died. One final snapshot in case /proc entries about the
-            # dying process are still around and produced last-second dumps.
-            sleep 2
-            tar czf "$SNAP_TMP" -C "{crash_dir}" \\
-                hang_dumps_rep{_repeat:03d} sitecustomize_rep{_repeat:03d} \\
-                2>/dev/null && mv -f "$SNAP_TMP" "$SNAP"
-            echo "final snapshot written $(date -Is)" >> "$MARKER"
-        """)
-        )
-        reaper_script.chmod(0o755)
-        subprocess.Popen(
-            ["setsid", "nohup", "bash", str(reaper_script)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-
-        # A sitecustomize.py runs at the top of every Python child process
-        # that has this directory on PYTHONPATH — including the
-        # mpi4py.futures.server workers spawned by MpiPoolSession. Prior
-        # attempts had faulthandler + persistent stderr only, but every one
-        # of ~85 rep632-style H100 fp8 crashes in PR_Github #66364 left the
-        # per-worker faulthandler at 0 bytes — because the fault was inside
-        # CUDA driver code, so control never returned to Python and no
-        # Python-level SIGSEGV handler ever fired. This attempt widens
-        # capture to four independent channels:
-        #
-        #   1. libSegFault.so (LD_PRELOAD, set below in debug_env) —
-        #      glibc's fault handler, runs regardless of Python state,
-        #      writes addr2line-resolvable backtrace + registers.
-        #   2. resource.RLIMIT_CORE = unlimited — lets the kernel emit a
-        #      core file, retrievable via `docker cp` or SLURM staging.
-        #   3. py-spy watchdog + on-crash py-spy dump — walks the process
-        #      externally, so native frames survive even when Python does
-        #      not.
-        #   4. Faulthandler as before, for hangs the kernel doesn't kill.
-        sitecustomize_dir = crash_dir / f"sitecustomize_rep{_repeat:03d}"
-        sitecustomize_dir.mkdir(parents=True, exist_ok=True)
-        (sitecustomize_dir / "sitecustomize.py").write_text(
-            textwrap.dedent("""\
-            import os, sys, faulthandler, signal, pathlib, resource, \
-                   subprocess, threading, time, traceback
-            _dd = pathlib.Path(os.environ.get(
-                "TLLM_HANG_DUMP_DIR", "/tmp/tllm_hang_dumps"))
-            _dd.mkdir(parents=True, exist_ok=True)
-            _pid = os.getpid()
-            _exe = pathlib.Path(sys.argv[0] if sys.argv else "python").name
-            _slot = _dd / f"{_pid}_{_exe}"
-            _slot.mkdir(parents=True, exist_ok=True)
-
-            def _note(m):
-                try:
-                    with (_slot / "instrument.log").open("a") as _f:
-                        _f.write(f"[{time.strftime('%H:%M:%S')}] {m}\\n")
-                except Exception:
-                    pass
-
-            # 1) Faulthandler + stderr redirect, as before.
-            _fh = open(_slot / "faulthandler.log", "a", buffering=1)
-            faulthandler.enable(file=_fh, all_threads=True)
-            faulthandler.dump_traceback_later(30, repeat=True, file=_fh)
-            try:
-                faulthandler.register(signal.SIGUSR1, file=_fh,
-                                      all_threads=True, chain=False)
-            except Exception:
-                pass
-            _err = open(_slot / "stderr.log", "a", buffering=1)
-            os.dup2(_err.fileno(), 2)
-
-            # 2) Allow the kernel to write a core file. On some CI hosts
-            #    core_pattern lives outside our reach; the ulimit is enough
-            #    for the docker/slurm sandbox to keep the file if it lands
-            #    in cwd or the configured pattern dir.
-            try:
-                resource.setrlimit(resource.RLIMIT_CORE,
-                    (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
-                _note("RLIMIT_CORE=unlimited")
-            except Exception as _e:
-                _note(f"setrlimit failed: {_e}")
-
-            # 3) py-spy: (a) periodic watchdog every 30s, (b) on-crash dump
-            #    from the signal handler. py-spy needs ptrace on the same
-            #    pid; SYS_PTRACE is granted in the CI container so this
-            #    works. Failure is silent — we still have (1) + (2).
-            _pyspy_done = [False]
-            def _pyspy(reason):
-                if _pyspy_done[0]:
-                    return
-                _pyspy_done[0] = True
-                out = _slot / f"pyspy_{reason}.log"
-                try:
-                    subprocess.run(
-                        ["py-spy", "dump", "--pid", str(_pid),
-                         "--native", "--nonblocking"],
-                        stdout=out.open("wb"),
-                        stderr=subprocess.STDOUT,
-                        timeout=30, check=False,
-                    )
-                    _note(f"pyspy_{reason}.log written")
-                except FileNotFoundError:
-                    _note("py-spy not installed")
-                except Exception as _e:
-                    _note(f"pyspy {reason} failed: {_e}")
-
-            def _watchdog():
-                n = 0
-                while True:
-                    time.sleep(30)
-                    n += 1
-                    _pyspy_done[0] = False
-                    out = _slot / f"pyspy_watchdog_{n:04d}.log"
-                    try:
-                        subprocess.run(
-                            ["py-spy", "dump", "--pid", str(_pid),
-                             "--native", "--nonblocking"],
-                            stdout=out.open("wb"),
-                            stderr=subprocess.STDOUT,
-                            timeout=15, check=False,
-                        )
-                    except Exception:
-                        return
-            threading.Thread(target=_watchdog, name="pyspy_watchdog",
-                             daemon=True).start()
-
-            # 4) Signal forensics. Faulthandler.enable already catches
-            #    SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL but sequences its
-            #    Python-frame dump BEFORE any C-level info. We chain a
-            #    py-spy invocation on top so we get native frames next
-            #    time a driver-level fault fires. Then re-raise via
-            #    default handler so the core file still gets written.
-            def _forensics(signum, frame):
-                try:
-                    with (_slot / f"crash_{signum}.txt").open("w") as _f:
-                        _f.write(f"pid={_pid} signum={signum} "
-                                 f"time={time.time()}\\n")
-                        _f.write(f"signal_name="
-                                 f"{signal.strsignal(signum)}\\n")
-                        _f.write("--- python stack ---\\n")
-                        traceback.print_stack(frame, file=_f)
-                    _pyspy(f"sig{signum}")
-                except Exception:
-                    pass
-                signal.signal(signum, signal.SIG_DFL)
-                os.kill(_pid, signum)
-            for _sig in (signal.SIGSEGV, signal.SIGABRT,
-                         signal.SIGBUS, signal.SIGFPE, signal.SIGILL):
-                try:
-                    signal.signal(_sig, _forensics)
-                except (ValueError, OSError):
-                    pass
-            _note(f"instrumentation live in {_slot}")
-        """)
-        )
-
-        # In-tree debug knobs, propagated to MPI workers via LLM.env_overrides.
-        # ZMQ + executor-loop trace knobs were removed after the first attempt
-        # because they inflate the Jenkins console 10-100x per rep — for
-        # ~500 reps that would truncate the tail where the crash lives.
-        # The framework's --periodic-hang-traceback already dumps main-thread
-        # stacks on hang, so the added value here is:
-        #   * worker-side faulthandler (catches SIGSEGV / SIGABRT in the MPI
-        #     worker itself; framework only introspects pytest)
-        #   * persistent stderr (survives --capture=fd when worker dies)
-        #   * TORCH_NCCL_DUMP_ON_TIMEOUT (only fires on collective timeout,
-        #     so quiet on success)
-        debug_env = {
-            "TLLM_HANG_DUMP_DIR": str(dump_dir),
-            "PYTHONPATH": str(sitecustomize_dir) + os.pathsep + os.environ.get("PYTHONPATH", ""),
-            "TRTLLM_WORKER_PRINT_STACKS_PERIOD": "60",
-            "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
-            "TORCH_NCCL_TRACE_BUFFER_SIZE": "20000",
-            "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": str(dump_dir / "nccl_dump"),
-            "NCCL_DEBUG_SUBSYS": "INIT,COLL,GRAPH",
-            "PYTHONFAULTHANDLER": "1",
-        }
-        os.environ.update(debug_env)
-
-        # Best-effort py-spy install for native stack capture. The CI container
-        # has SYS_ADMIN + seccomp=unconfined (jenkins/L0_Test.groovy:1280) so
-        # ptrace works if py-spy is on PATH. Silent failure is fine — the
-        # sitecustomize bootstrap above covers the Python-side signal already.
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--user", "--quiet", "py-spy"],
-                timeout=60,
-                check=False,
-            )
-        except Exception:
-            pass
-
-        # variant.encoder_config / pd_config are frozen dataclass mappings;
-        # overlay env_overrides here so both LLM instances widen the debug
-        # env into their MPI workers (worker.py:198 applies env_overrides
-        # after MPI_Init, which caches the OS env at import time).
-        encoder_config = {**variant.encoder_config, "env_overrides": debug_env}
-        pd_config = {**variant.pd_config, "env_overrides": debug_env}
-        # ==== end NVBUG-6327718 instrumentation ====
-
-        faulthandler.enable(file=crash_log_file, all_threads=True)
-        faulthandler.dump_traceback_later(60, repeat=True, file=crash_log_file)
-        try:
-            with launch_multimodal_encoder_pd_llm(
-                encoder_config,
-                pd_config,
-                variant.model_path,
-                max_workers=variant.max_workers,
-            ) as llm:
-                self._run_videomme(llm, variant)
-        finally:
-            faulthandler.cancel_dump_traceback_later()
-            crash_log_file.flush()
-            crash_log_file.close()
+        with self._launch_epd(variant) as llm:
+            self._run_videomme(llm, variant)
