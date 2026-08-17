@@ -899,6 +899,12 @@ class SpecMetadata:
         if self.penalty_state is None:
             self.penalty_state = penalty_ops.PenaltyState.create(
                 slot_capacity=slot_capacity, vocab_size=self.vocab_size)
+        # The scratch row padding requests route to. Normally published by
+        # prepare_rejection_sampling_buffers, which returns early when rejection
+        # sampling is off -- leaving it at 0, a live request's row -- so publish it
+        # here too. Both buffers append their scratch row at the same index, so the
+        # single value stays correct for either consumer.
+        self.dummy_slot_row = slot_capacity
         if self.batch_slot_ids is None and self.max_num_requests > 0:
             # Normally allocated by prepare_rejection_sampling_buffers; the penalties
             # need the same row -> slot table even when rejection sampling is off.
