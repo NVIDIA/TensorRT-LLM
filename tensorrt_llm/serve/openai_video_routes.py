@@ -71,13 +71,13 @@ def _preflight_encoder_format(fmt):
         raise ValueError(str(exc)) from exc
 
 
-def _path_json_video_response(video_id: str, path: Union[str, Path]) -> JSONResponse:
+def _path_json_video_response(video_id: str, path: Union[str, Path], headers=None) -> JSONResponse:
     """Build the ``{id, output_path}`` path-transport envelope.
 
-    Returns the single server-side output path so a co-located client reads
-    the file directly. Multi-file (n>1) is deferred (TRTLLM-11579 residual).
+    Returns the server-side output path so a co-located client reads the file
+    directly. ``headers`` (Server-Timing metrics) are attached to the response.
     """
-    return JSONResponse(content={"id": video_id, "output_path": str(path)})
+    return JSONResponse(content={"id": video_id, "output_path": str(path)}, headers=headers)
 
 
 class _VideoRoutesMixin:
@@ -163,9 +163,12 @@ class _VideoRoutesMixin:
                     f"Video {video_id} serialized as tensor: latency={latency:.3f}s "
                     f"generation={getattr(output.metrics, 'generation', 0.0):.3f}s"
                 )
+                headers = build_visual_gen_timing_headers(output.metrics)
                 if request.response_format == "path":
-                    return _path_json_video_response(video_id, target)
-                return FileResponse(str(target), media_type=media_type, filename=target.name)
+                    return _path_json_video_response(video_id, target, headers)
+                return FileResponse(
+                    str(target), media_type=media_type, filename=target.name, headers=headers
+                )
 
             # Encoder formats: one file per item; ship the first item as
             # the route's primary download (OpenAI sync video API does
@@ -203,7 +206,7 @@ class _VideoRoutesMixin:
             # download while persisting all of them to disk.
             actual_path = saved_paths[0]
             if request.response_format == "path":
-                return _path_json_video_response(video_id, actual_path)
+                return _path_json_video_response(video_id, actual_path, headers)
             return FileResponse(
                 str(actual_path),
                 media_type=_video_content_type(actual_path.suffix),

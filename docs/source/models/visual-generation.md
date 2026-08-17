@@ -110,9 +110,11 @@ When served via `trtllm-serve`, the following OpenAI-compatible endpoints are av
 | `/v1/videos/sync` | POST | Synchronous video generation |
 | `/v1/videos/generations` | POST | Deprecated alias of `/v1/videos/sync` (kept for back-compat) |
 | `/v1/videos/{id}` | GET | Video status / metadata |
-| `/v1/videos/{id}/content` | GET | Download generated video |
+| `/v1/videos/{id}/content` | GET | Download generated video (or path JSON under `response_format="path"`) |
 | `/v1/videos/{id}` | DELETE | Delete generated video |
 | `/v1/videos` | GET | List all videos |
+
+`response_format="path"` returns the generated file's server-side path (under `TRTLLM_MEDIA_STORAGE_PATH`) for co-located clients, enabled by default. Since it discloses server paths and `trtllm-serve` has no auth, set `TRTLLM_DISABLE_RESPONSE_FORMAT_PATH=1` to reject such requests with HTTP 400. See the [serve examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve) for the full `response_format` reference.
 
 ## Optimizations
 

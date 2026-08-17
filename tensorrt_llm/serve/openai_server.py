@@ -2696,8 +2696,13 @@ class OpenAIServer(_VideoRoutesMixin):
         """
         if response_format != "path":
             return None
-        if os.environ.get("TRTLLM_DISABLE_RESPONSE_FORMAT_PATH",
-                          "0").strip().lower() in ("1", "true", "yes", "on"):
+        raw = os.environ.get("TRTLLM_DISABLE_RESPONSE_FORMAT_PATH", "0")
+        if raw not in ("0", "1"):
+            logger.warning(
+                "Unrecognized value for TRTLLM_DISABLE_RESPONSE_FORMAT_PATH: "
+                f"{raw!r}. Expected '0' or '1'. Treating as '0' "
+                "(response_format='path' enabled).")
+        if raw == "1":
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
                 "(TRTLLM_DISABLE_RESPONSE_FORMAT_PATH=1); it returns "
