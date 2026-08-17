@@ -140,9 +140,11 @@ def _apply_penalties_impl(
     # Fold this step's earlier speculative positions into the counts each row sees.
     # Position k must be penalized against positions 0..k-1 of the SAME step, which
     # are not in ``counts`` yet (they are only committed once acceptance is known).
-    # ``intra_step_tokens`` is [T, T] lower-triangular-masked: entry [r, j] is the
-    # token position j contributed to row r, or -1 when it must not count. Only
-    # strictly-earlier positions contribute; a position never penalizes itself.
+    # ``intra_step_tokens`` is [T, draft_len]: entry [r, j] is the token row r's own
+    # request drafted at position j, and ``intra_step_valid`` keeps only the
+    # positions strictly earlier than r's -- a position never penalizes itself.
+    # Because a row only holds its own request's drafts, requests cannot leak into
+    # each other regardless of how the batch is packed.
     #
     # One-hot accumulate rather than scatter_add_, because rows sharing a slot would
     # otherwise race on the same counts entry -- and a captured graph cannot rely on
@@ -203,9 +205,11 @@ def apply_penalties(
         row_slots: ``int64[T]`` slot row owning each logits row. Rows belonging to
             no live request must point at ``penalty_dummy_row``, whose parameters
             keep their no-op defaults.
-        intra_step_tokens: ``int64[T, T]`` token each earlier position of the same
-            step contributes to this row, ``-1`` where it does not apply.
-        intra_step_valid: ``bool[T, T]`` mask matching ``intra_step_tokens``.
+        intra_step_tokens: ``int64[T, draft_len]`` -- column j is the token this
+            row's own request drafted at position j. Only ``intra_step_valid``
+            decides which of them count, so entries are never sentinels.
+        intra_step_valid: ``bool[T, draft_len]`` mask matching ``intra_step_tokens``;
+            true only for positions strictly earlier than the row's own.
         any_active: whether any request in this batch actually has a penalty. False
             skips the launch entirely -- the whole pass is a vocab-sized read/write
             that would otherwise be paid to compute a no-op. The caller knows this
@@ -257,7 +261,11 @@ def build_row_mapping(
     root path rather than the rows before it. They are rejected at admission.
 
     Returns ``(row_slots, intra_tokens, intra_valid)`` shaped for
-    :func:`apply_penalties`, or ``None`` when there is nothing to penalize.
+    :func:`apply_penalties`, or ``None`` when there is nothing to penalize. The two
+    intra-step tensors are ``[total_rows, draft_len]``: a row only ever reads its own
+    request's draft positions, so the width is the draft length rather than the batch
+    row count. (The wide ``[T, T]`` form would reach hundreds of MiB per step at
+    serving batch sizes while leaving all but ``draft_len`` columns per row unused.)
     """
     slot_ids = spec_metadata.batch_slot_ids
     if slot_ids is None:
@@ -283,25 +291,22 @@ def build_row_mapping(
     # Intra-step prefix: within one gen request, row k must see the draft tokens at
     # positions 0..k-1 -- they are this step's earlier speculative positions, not yet
     # committed to the counts. Strictly earlier: a position never penalizes itself.
-    intra_tokens = torch.full((total_rows, total_rows), -1, dtype=torch.int64, device=device)
-    intra_valid = torch.zeros((total_rows, total_rows), dtype=torch.bool, device=device)
+    #
+    # Column j of a row means "this request's draft position j", so requests cannot
+    # see each other's tokens by construction -- no cross-request masking needed.
+    intra_tokens = torch.zeros((total_rows, max(draft_len, 0)), dtype=torch.int64, device=device)
+    intra_valid = torch.zeros((total_rows, max(draft_len, 0)), dtype=torch.bool, device=device)
     if num_gens > 0 and draft_len > 0 and draft_tokens.numel() > 0:
         drafts = draft_tokens.reshape(num_gens, -1)[:, :draft_len].to(torch.int64)
-        # Build the block-diagonal placement without a Python loop, so the shapes stay
-        # static and the whole thing is capturable.
         gen_rows = torch.arange(num_gens * rows_per_gen, device=device)
         g_of_row = gen_rows // rows_per_gen  # which request owns the row
         k_of_row = gen_rows % rows_per_gen  # the row's speculative position
-        # Each gen row writes into its own request's column block, so requests can
-        # never read each other's tokens.
-        col_base = num_contexts + g_of_row * rows_per_gen
-        cols = col_base.unsqueeze(1) + torch.arange(draft_len, device=device)
-        rows = (num_contexts + gen_rows).unsqueeze(1).expand(-1, draft_len)
-        # Column j counts for row k iff j < k: strictly earlier positions only.
-        valid = torch.arange(draft_len, device=device).unsqueeze(0) < k_of_row.unsqueeze(1)
-        vals = drafts[g_of_row]
-        intra_tokens[rows.reshape(-1), cols.reshape(-1)] = vals.reshape(-1)
-        intra_valid[rows.reshape(-1), cols.reshape(-1)] = valid.reshape(-1)
+        # Every gen row carries its own request's drafts; validity alone selects the
+        # strictly-earlier prefix. Column j counts for row k iff j < k.
+        intra_tokens[num_contexts:] = drafts[g_of_row]
+        intra_valid[num_contexts:] = torch.arange(draft_len, device=device).unsqueeze(
+            0
+        ) < k_of_row.unsqueeze(1)
     return row_slots, intra_tokens, intra_valid
 
 

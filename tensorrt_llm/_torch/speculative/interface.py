@@ -1860,9 +1860,11 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return accepted_tokens, num_accepted_tokens
 
-    def _apply_occurrence_penalties(self, logits, draft_tokens, num_contexts,
-                                    batch_size, spec_metadata):
-        """Penalize the target logits in place, before acceptance reads them.
+    def _apply_occurrence_penalties(
+            self, logits: torch.Tensor, draft_tokens: torch.Tensor,
+            num_contexts: int, batch_size: int,
+            spec_metadata: SpecMetadata) -> torch.Tensor:
+        """Return the target logits acceptance should read, penalized.
 
         No-op unless the deploy enabled the penalties and some request in the batch
         actually uses one. ``logits`` must already be in the normalized
@@ -1951,7 +1953,9 @@ class SpecWorkerBase(nn.Module, ABC):
         return self._commit_occurrence_counts(accepted, batch_size,
                                               spec_metadata)
 
-    def _commit_occurrence_counts(self, accepted, batch_size, spec_metadata):
+    def _commit_occurrence_counts(
+            self, accepted: tuple[torch.Tensor, torch.Tensor], batch_size: int,
+            spec_metadata: SpecMetadata) -> tuple[torch.Tensor, torch.Tensor]:
         """Record the tokens this step accepted, so later steps penalize them.
 
         Rejected speculative tokens never entered the sequence and are excluded by
