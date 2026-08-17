@@ -230,19 +230,19 @@ def _assert_pipeline_matches_hf(
     residual_call = None
     with ExitStack() as stack:
         if is_sm100:
-            wan_transformer = importlib.import_module(
-                "tensorrt_llm._torch.visual_gen.models.wan.transformer_wan"
+            wan_adaln = importlib.import_module(
+                "tensorrt_llm._torch.visual_gen.models.wan.utils_wan"
             )
-            plain_op = wan_transformer._fused_pertoken_adaln
-            residual_op = wan_transformer._fused_pertoken_adaln_residual
+            plain_op = wan_adaln._fused_pertoken_adaln
+            residual_op = wan_adaln._fused_pertoken_adaln_residual
             assert plain_op is not None
             assert residual_op is not None
             plain_call = stack.enter_context(
-                mock.patch.object(wan_transformer, "_fused_pertoken_adaln", wraps=plain_op)
+                mock.patch.object(wan_adaln, "_fused_pertoken_adaln", wraps=plain_op)
             )
             residual_call = stack.enter_context(
                 mock.patch.object(
-                    wan_transformer,
+                    wan_adaln,
                     "_fused_pertoken_adaln_residual",
                     wraps=residual_op,
                 )
@@ -262,14 +262,6 @@ def _assert_pipeline_matches_hf(
     if is_sm100:
         assert plain_call is not None and plain_call.call_count > 0
         assert residual_call is not None and residual_call.call_count > 0
-        pta_blocks = [
-            module
-            for module in trtllm_pipe.transformer.modules()
-            if hasattr(module, "_fused_pertoken_adaln_eligible")
-        ]
-        assert pta_blocks
-        assert trtllm_pipe.transformer._fused_pta_runtime_enabled is True
-        assert all(block._use_fused_pertoken_adaln for block in pta_blocks)
     del trtllm_pipe
     gc.collect()
     torch.cuda.empty_cache()

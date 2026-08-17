@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -24,6 +26,7 @@ from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln import (
     fused_pertoken_adaln,
     fused_pertoken_adaln_residual,
 )
+from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import WanPerTokenAdaLN
 
 _EPS = 1e-6
 
@@ -164,6 +167,33 @@ def test_fused_pertoken_adaln_torch_compile_fullgraph() -> None:
 
     eager = run_ops(x, temb, table)
     compiled = torch.compile(run_ops, fullgraph=True)(x, temb, table)
+
+    for actual, expected in zip(compiled, eager):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_wan_pertoken_adaln_module_torch_compile_fullgraph() -> None:
+    hidden_size = 768
+    x, temb, table = _make_inputs(hidden_size)
+    adaln = WanPerTokenAdaLN(
+        SimpleNamespace(quant_config=None, quant_config_dict=None),
+        hidden_size,
+        x.dtype,
+        competing_fusion=False,
+    )
+    adaln.set_runtime_enabled(True)
+
+    def run_module(
+        x: torch.Tensor, temb: torch.Tensor, table: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        context = adaln.prepare(x, temb, table.unsqueeze(0))
+        assert context is not None
+        plain = adaln.normalize_input(x, context, _EPS)
+        modulated, residual = adaln.add_cross_attention_and_normalize(x, x, context, _EPS)
+        return plain, modulated, residual
+
+    eager = run_module(x, temb, table)
+    compiled = torch.compile(run_module, fullgraph=True)(x, temb, table)
 
     for actual, expected in zip(compiled, eager):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
