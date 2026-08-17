@@ -175,6 +175,32 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         containerConfig = """
                   - name: docker
                     image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202505221445_docker_dind_withbash
+                    command: ['/bin/sh', '-ec']
+                    args:
+                      - |
+                        # Match nested Docker bridges to the pod network MTU.
+                        networkInterface="\$(ip -4 route show default | awk '{ for (i = 1; i <= NF; i++) if (\$i == "dev") { print \$(i + 1); exit } }')"
+                        if [ -z "\${networkInterface}" ]; then
+                          echo "Unable to detect the pod network interface" >&2
+                          exit 1
+                        fi
+
+                        networkMtu="\$(cat "/sys/class/net/\${networkInterface}/mtu")"
+                        case "\${networkMtu}" in
+                          ''|*[!0-9]*)
+                            echo "Invalid MTU '\${networkMtu}' for interface '\${networkInterface}'" >&2
+                            exit 1
+                            ;;
+                        esac
+
+                        dindEntrypoint="\$(command -v dockerd-entrypoint.sh || true)"
+                        if [ -z "\${dindEntrypoint}" ]; then
+                          echo "Unable to find dockerd-entrypoint.sh" >&2
+                          exit 1
+                        fi
+
+                        echo "Starting Docker with MTU \${networkMtu} from interface \${networkInterface}"
+                        exec "\${dindEntrypoint}" --mtu="\${networkMtu}"
                     tty: true
                     resources:
                       requests:
