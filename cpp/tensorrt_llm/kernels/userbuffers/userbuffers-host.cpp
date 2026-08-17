@@ -434,6 +434,9 @@ error:
     return comm->free_region++;
 }
 
+// This teardown is a fail-stop collective. Every rank must unregister the same handles, the same number of times,
+// and in the same LIFO order. If a rank violates this contract or fails after teardown starts, the communicator is
+// unrecoverable and peer ranks may block in a barrier.
 void unregister_user_buffer_collective(int handle, communicator* comm)
 {
     TLLM_CHECK(handle > 0);
