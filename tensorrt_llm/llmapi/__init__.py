@@ -1,7 +1,7 @@
 from .._torch.async_llm import AsyncLLM
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
-from ..executor import CompletionOutput, LoRARequest, RequestError
+from ..executor import CompletionOutput, KvHint, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .llm import LLM, RequestOutput
@@ -83,6 +83,7 @@ __all__ = [
     'AutoDecodingConfig',
     'AttentionDpConfig',
     'LoRARequest',
+    'KvHint',
     'SaveHiddenStatesDecodingConfig',
     'RocketSparseAttentionConfig',
     'ReorderRequestPolicyConfig',

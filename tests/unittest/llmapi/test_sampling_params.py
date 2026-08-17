@@ -31,6 +31,7 @@ from tensorrt_llm.serve.openai_protocol import (
     KVCacheTruncateRequest,
     ResponsesRequest,
     ensure_request_chat_template_allowed,
+    to_llm_kv_hint,
 )
 from tensorrt_llm.serve.resource_governor import ResourceGovernor
 
@@ -48,6 +49,49 @@ def _apply_generation_config_sampling_defaults(
     )
     BaseLLM._apply_generation_config_sampling_defaults(llm, sampling_params)
     return sampling_params
+
+
+def test_openai_request_kv_transfer_params_to_llm_kv_hint():
+    request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        kv_transfer_params={
+            "kv_hint": {
+                "source_control_endpoint": "http://127.0.0.1:8000"
+            }
+        },
+    )
+
+    kv_hint = to_llm_kv_hint(request.kv_transfer_params)
+
+    assert kv_hint.source_control_endpoint == "http://127.0.0.1:8000"
+
+    empty_request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        kv_transfer_params={"kv_hint": {}},
+    )
+    assert to_llm_kv_hint(empty_request.kv_transfer_params) is None
+
+    empty_endpoint_request = ChatCompletionRequest(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        kv_transfer_params={"kv_hint": {"source_control_endpoint": ""}},
+    )
+    assert to_llm_kv_hint(empty_endpoint_request.kv_transfer_params) is None
+
+    responses_request = ResponsesRequest(
+        model="test",
+        input="hi",
+        kv_transfer_params={
+            "kv_hint": {
+                "source_control_endpoint": "http://127.0.0.1:8000"
+            }
+        },
+    )
+    assert to_llm_kv_hint(
+        responses_request.kv_transfer_params).source_control_endpoint == (
+            "http://127.0.0.1:8000")
 
 
 def test_generation_config_mode_controls_sampling_defaults():

@@ -365,6 +365,10 @@ methods:
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
         default: null
+      kv_hint:
+        annotation: Union[tensorrt_llm.executor.request.KvHint, Sequence[tensorrt_llm.executor.request.KvHint], NoneType]
+        default: null
+        status: prototype
       priority:
         annotation: Union[float, List[float]]
         default: 0.5
@@ -388,6 +392,10 @@ methods:
       cache_salt:
         annotation: Optional[str]
         default: null
+      kv_hint:
+        annotation: Optional[tensorrt_llm.executor.request.KvHint]
+        default: null
+        status: prototype
       trace_headers:
         annotation: Optional[Mapping[str, str]]
         default: null

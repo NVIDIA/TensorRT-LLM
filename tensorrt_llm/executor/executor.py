@@ -37,8 +37,8 @@ from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
 from ..scheduling_params import SchedulingParams
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
-from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, LoRARequest,
-                      PromptAdapterRequest)
+from .request import (DEFAULT_REQUEST_PRIORITY, GenerationRequest, KvHint,
+                      LoRARequest, PromptAdapterRequest)
 from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
@@ -138,6 +138,7 @@ class GenerationExecutor(ABC):
         scheduling_params: Optional[SchedulingParams] = None,
         conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
+        kv_hint: Optional[KvHint] = None,
         arrival_time: Optional[float] = None,
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
@@ -168,6 +169,7 @@ class GenerationExecutor(ABC):
             scheduling_params=scheduling_params,
             conversation_params=conversation_params,
             cache_salt=cache_salt,
+            kv_hint=kv_hint,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority)

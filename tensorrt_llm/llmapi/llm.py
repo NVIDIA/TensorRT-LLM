@@ -47,7 +47,7 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
 from ..executor.postproc_worker import PostprocParams
 from ..executor.postprocessor_hook import (PostProcessorHook,
                                            load_post_processor_hook)
-from ..executor.request import DEFAULT_REQUEST_PRIORITY
+from ..executor.request import DEFAULT_REQUEST_PRIORITY, KvHint
 from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
@@ -659,6 +659,7 @@ class BaseLLM:
         conversation_params: Optional[Union[ConversationParams,
                                             List[ConversationParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
+        kv_hint: Optional[Union[KvHint, Sequence[KvHint]]] = None,
         priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
@@ -683,6 +684,7 @@ class BaseLLM:
             conversation_params (tensorrt_llm.conversation_params.ConversationParams, List[tensorrt_llm.conversation_params.ConversationParams], optional):
                 Conversation parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
+            kv_hint (tensorrt_llm.executor.request.KvHint, Sequence[tensorrt_llm.executor.request.KvHint], optional): KV cache transfer hint for the request. Defaults to None.
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
 
         Returns:
@@ -728,6 +730,7 @@ class BaseLLM:
                 scheduling_params=self._item_at(scheduling_params, i),
                 conversation_params=self._item_at(conversation_params, i),
                 cache_salt=self._item_at(cache_salt, i),
+                kv_hint=self._item_at(kv_hint, i),
                 priority=self._item_at(priority, i),
                 streaming=False,
             )
@@ -759,6 +762,7 @@ class BaseLLM:
         scheduling_params: Optional[SchedulingParams] = None,
         conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
+        kv_hint: Optional[KvHint] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
@@ -777,6 +781,7 @@ class BaseLLM:
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
             conversation_params (tensorrt_llm.conversation_params.ConversationParams, optional): Conversation parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
+            kv_hint (tensorrt_llm.executor.request.KvHint, optional): KV cache transfer hint for the request. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
 
         Returns:
@@ -847,6 +852,7 @@ class BaseLLM:
             scheduling_params=scheduling_params,
             conversation_params=conversation_params,
             cache_salt=cache_salt,
+            kv_hint=kv_hint,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,

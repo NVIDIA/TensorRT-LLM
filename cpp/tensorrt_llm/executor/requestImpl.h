@@ -63,7 +63,8 @@ public:
         std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
         std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
-        std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt = std::nullopt,
+        std::optional<KvHint> kvHint = std::nullopt)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -102,6 +103,7 @@ public:
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSalt(validateCacheSalt(std::move(cacheSalt)))
         , mDisaggRequestId(disaggRequestId)
+        , mKvHint(std::move(kvHint))
     {
         validate();
     }
@@ -328,6 +330,11 @@ public:
         return mDisaggRequestId;
     }
 
+    [[nodiscard]] std::optional<KvHint> getKvHint() const
+    {
+        return mKvHint;
+    }
+
     void setStreaming(bool streaming)
     {
         mStreaming = streaming;
@@ -512,6 +519,11 @@ public:
         mDisaggRequestId = disaggRequestId;
     }
 
+    void setKvHint(std::optional<KvHint> kvHint)
+    {
+        mKvHint = std::move(kvHint);
+    }
+
 private:
     void validate()
     {
@@ -587,6 +599,7 @@ private:
         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
         lambda(mDisaggRequestId);
         lambda(mCacheSalt);
+        lambda(mKvHint);
     }
 
     VecTokens mInputTokenIds;
@@ -627,6 +640,7 @@ private:
     std::optional<MillisecondsType> mAllottedTimeMs;
     std::optional<std::string> mCacheSalt;
     std::optional<IdType> mDisaggRequestId;
+    std::optional<KvHint> mKvHint;
 };
 
 } // namespace tensorrt_llm::executor

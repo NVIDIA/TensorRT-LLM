@@ -135,6 +135,27 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
 
 
+def test_executor_request_to_llm_request_preserves_kv_hint() -> None:
+    request_id = 42
+    source_control_endpoint = "http://127.0.0.1:8000"
+    kv_hint = trtllm.KvHint(source_control_endpoint=source_control_endpoint)
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        kv_hint=kv_hint,
+    )
+
+    llm_request = executor_request_to_llm_request(
+        request_id,
+        executor_request,
+        child_req_ids=[],
+        exclude_last_generation_logits=False,
+    )
+
+    assert llm_request.kv_hint == kv_hint
+    assert llm_request.kv_hint.source_control_endpoint == source_control_endpoint
+
+
 def test_merge_helix_requests_with_padding():
     """Test merge_helix_requests with basic valid input."""
 

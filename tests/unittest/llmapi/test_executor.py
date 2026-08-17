@@ -16,7 +16,7 @@ from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationRequest, GenerationResult,
-                                   GenerationResultBase, PostprocWorker)
+                                   GenerationResultBase, KvHint, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
@@ -107,6 +107,58 @@ def test_GenerationResultBase():
     print(result.outputs[0])
     assert len(result.outputs[0].token_ids) == 3
     assert result._done
+
+
+def test_kv_hint_from_extra_args():
+    kv_hint = KvHint.from_extra_args({
+        "kv_transfer_params": {
+            "kv_hint": {
+                "source_control_endpoint": "http://127.0.0.1:8000"
+            }
+        }
+    })
+
+    assert kv_hint == KvHint(source_control_endpoint="http://127.0.0.1:8000")
+    assert KvHint.from_extra_args({
+        "kv_transfer_params": {
+            "kv_hint": {}
+        }
+    }) is None
+    assert KvHint.from_extra_args({
+        "kv_transfer_params": {
+            "kv_hint": {
+                "source_control_endpoint": ""
+            }
+        }
+    }) is None
+
+
+def test_kv_hint_requires_non_empty_endpoint():
+    with pytest.raises(TypeError):
+        KvHint()
+    with pytest.raises(TypeError, match="source_control_endpoint must be"):
+        KvHint(source_control_endpoint=None)
+    with pytest.raises(ValueError, match="source_control_endpoint must be"):
+        KvHint(source_control_endpoint="")
+
+
+def test_generation_request_carries_kv_hint():
+    kv_hint = KvHint(source_control_endpoint="http://127.0.0.1:8000")
+    request = GenerationRequest(prompt_token_ids=[12, 23, 34],
+                                sampling_params=SamplingParams(max_tokens=4),
+                                kv_hint=kv_hint)
+
+    assert request.kv_hint == kv_hint
+
+
+def test_generation_request_rejects_invalid_kv_hint():
+    with pytest.raises(TypeError, match="kv_hint must be KvHint or None"):
+        GenerationRequest(prompt_token_ids=[12, 23, 34],
+                          sampling_params=SamplingParams(max_tokens=4),
+                          kv_hint={
+                              "source_control_endpoint":
+                              "http://127.0.0.1:8000"
+                          })
 
 
 def test_GenerationResult():

@@ -517,6 +517,23 @@ private:
     std::optional<std::string> mDisaggInfoEndpoint;
 };
 
+struct KvHint
+{
+    KvHint() = default;
+
+    explicit KvHint(std::optional<std::string> sourceControlEndpoint)
+        : sourceControlEndpoint(std::move(sourceControlEndpoint))
+    {
+    }
+
+    std::optional<std::string> sourceControlEndpoint;
+
+    [[nodiscard]] bool operator==(KvHint const& other) const noexcept
+    {
+        return sourceControlEndpoint == other.sourceControlEndpoint;
+    }
+};
+
 /// @brief Configuration for speculative decoding (both draft and target models)
 class SpeculativeDecodingConfig
 {
@@ -720,6 +737,7 @@ public:
     /// @param disaggRequestId Disaggregated request ID.
     /// @param cacheSalt Optional cache salt string. If provided, KV cache blocks are tagged so reuse is limited to
     /// requests with the same salt. The string is also surfaced in KV cache events. Defaults to std::nullopt.
+    /// @param kvHint Optional router-provided KV cache transfer hint.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -747,7 +765,8 @@ public:
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<IdType> disaggRequestId = std::nullopt, std::optional<std::string> cacheSalt = std::nullopt);
+        std::optional<IdType> disaggRequestId = std::nullopt, std::optional<std::string> cacheSalt = std::nullopt,
+        std::optional<KvHint> kvHint = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -799,6 +818,7 @@ public:
     [[nodiscard]] std::optional<std::string> getCacheSalt() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
     [[nodiscard]] std::optional<IdType> getDisaggRequestId() const;
+    [[nodiscard]] std::optional<KvHint> getKvHint() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -835,6 +855,7 @@ public:
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
     void setCacheSalt(std::optional<std::string> cacheSalt);
     void setDisaggRequestId(IdType disaggRequestId);
+    void setKvHint(std::optional<KvHint> kvHint);
 
 private:
     friend class Serialization;

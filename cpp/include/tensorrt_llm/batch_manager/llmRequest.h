@@ -164,7 +164,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, std::optional<executor::KvHint> kvHint = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -256,7 +256,7 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, std::optional<executor::KvHint> kvHint = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
@@ -298,6 +298,7 @@ public:
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
         , mCacheSalt(std::move(cacheSalt))
+        , mKvHint(std::move(kvHint))
     {
         if (mEncoderTokens.has_value())
         {
@@ -339,6 +340,7 @@ public:
         , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
         , mCacheSalt(req.getCacheSalt())
+        , mKvHint(req.getKvHint())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
         {
@@ -553,6 +555,11 @@ public:
     [[nodiscard]] std::optional<executor::ContextPhaseParams> const& getContextPhaseParams() const noexcept
     {
         return mContextPhaseParams;
+    }
+
+    [[nodiscard]] std::optional<executor::KvHint> const& getKvHint() const noexcept
+    {
+        return mKvHint;
     }
 
     /// @brief Get the number of generation tokens carried by context phase handoff.
@@ -2252,6 +2259,8 @@ protected:
 
     std::optional<executor::ContextPhaseParams> mContextPhaseParams{std::nullopt};
 
+    std::optional<executor::KvHint> mKvHint{std::nullopt};
+
     std::shared_ptr<ContextProgress> mContextProgress{nullptr};
 
     std::optional<std::shared_ptr<VecTokenExtraIds>> mInputTokenExtraIds{std::nullopt};
@@ -2522,7 +2531,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, std::optional<executor::KvHint> kvHint = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, endId, padId, std::move(embeddingBias), std::move(badWordsList),
             std::move(stopWordsList),
@@ -2566,7 +2575,7 @@ public:
             multimodalRunLengths.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunLengths.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(cacheSalt))
+            std::move(cacheSalt), std::move(kvHint))
     {
     }
 

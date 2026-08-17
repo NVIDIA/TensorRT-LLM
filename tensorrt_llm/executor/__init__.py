@@ -12,6 +12,7 @@ __all__ = [
     "GenerationRequest",
     "LoRARequest",
     "PromptAdapterRequest",
+    "KvHint",
     "GenerationExecutorWorker",
     "GenerationExecutorProxy",
     "RequestError",

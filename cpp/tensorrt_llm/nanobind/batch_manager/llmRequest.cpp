@@ -132,6 +132,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mMultimodalItemRunCuOffsets,                               //
         mMultimodalRunPositions,                                   //
         mMultimodalRunLengths,                                     //
-        mCacheSalt                                                 //
+        mCacheSalt,                                                //
+        mKvHint                                                    //
     );
 }
