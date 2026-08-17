@@ -2016,7 +2016,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_gentp2_cute_dsl_mla_smoke(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root):
+        deepseek_v3_model_root) -> None:
     """Decode-only smoke for the CuTe DSL MLA decode FMHA lib in disagg.
 
     A disaggregated generation server runs decode-only batches, so this
