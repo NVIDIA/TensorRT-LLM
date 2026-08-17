@@ -19,7 +19,7 @@ FROM docker:dind
 RUN apk add --no-cache bash git make python3 py3-pip wget
 
 ENV PATH=/usr/local/cmake/bin:$PATH
-ENV ENV=${ENV:-/etc/shinit_v2}
+ENV ENV=/etc/shinit_v2
 COPY jenkins/docker/dind_mtu.sh jenkins/docker/test_dind_mtu.sh /tmp/dind-mtu/
 RUN chmod 0755 /tmp/dind-mtu/*.sh && \
     /tmp/dind-mtu/test_dind_mtu.sh && \

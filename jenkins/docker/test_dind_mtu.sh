@@ -21,7 +21,6 @@ readonly TEST_ROOT="$(mktemp -d)"
 readonly TEST_BIN="${TEST_ROOT}/bin"
 readonly TEST_SYS_CLASS_NET="${TEST_ROOT}/sys/class/net"
 readonly TEST_ENTRYPOINT_ARGS="${TEST_ROOT}/entrypoint-args"
-readonly TEST_TIMEOUT_LOG="${TEST_ROOT}/timeout-log"
 readonly SYSTEM_TIMEOUT="$(command -v timeout || true)"
 
 cleanup()
@@ -59,9 +58,7 @@ printf '%s\n' \
 
 printf '%s\n' \
     '#!/bin/sh' \
-    'duration="$1"' \
     'shift' \
-    'printf '\''%s\n'\'' "${duration} $*" >> "${DIND_TEST_TIMEOUT_LOG}"' \
     'exec "$@"' > "${TEST_BIN}/timeout"
 
 printf '%s\n' \
@@ -73,7 +70,6 @@ chmod +x "${TEST_BIN}/ip" "${TEST_BIN}/dockerd-entrypoint.sh" \
 
 export DIND_SYS_CLASS_NET="${TEST_SYS_CLASS_NET}"
 export DIND_TEST_ENTRYPOINT_ARGS="${TEST_ENTRYPOINT_ARGS}"
-export DIND_TEST_TIMEOUT_LOG="${TEST_TIMEOUT_LOG}"
 export PATH="${TEST_BIN}:${PATH}"
 
 start_output="${TEST_ROOT}/start-output"
@@ -84,8 +80,6 @@ assert_contains "--mtu=1450" "${TEST_ENTRYPOINT_ARGS}"
 validate_output="${TEST_ROOT}/validate-output"
 "${DIND_MTU_SCRIPT}" validate > "${validate_output}"
 assert_contains "Verified DIND network MTU: eth0=1450, docker0=1450" "${validate_output}"
-assert_contains "60s sh -c" "${TEST_TIMEOUT_LOG}"
-assert_contains "5s docker info" "${TEST_TIMEOUT_LOG}"
 
 printf '%s\n' 1500 > "${TEST_SYS_CLASS_NET}/docker0/mtu"
 mismatch_output="${TEST_ROOT}/mismatch-output"

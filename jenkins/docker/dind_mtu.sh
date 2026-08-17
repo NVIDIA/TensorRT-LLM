@@ -15,9 +15,9 @@
 
 set -eu
 
-readonly DIND_SYS_CLASS_NET="${DIND_SYS_CLASS_NET:-/sys/class/net}"
-readonly DIND_DOCKER_READY_TIMEOUT_SECONDS="${DIND_DOCKER_READY_TIMEOUT_SECONDS:-60}"
-readonly DIND_DOCKER_INFO_TIMEOUT_SECONDS="${DIND_DOCKER_INFO_TIMEOUT_SECONDS:-5}"
+DIND_SYS_CLASS_NET="${DIND_SYS_CLASS_NET:-/sys/class/net}"
+DIND_DOCKER_READY_TIMEOUT_SECONDS="${DIND_DOCKER_READY_TIMEOUT_SECONDS:-60}"
+DIND_DOCKER_INFO_TIMEOUT_SECONDS="${DIND_DOCKER_INFO_TIMEOUT_SECONDS:-5}"
 
 fail()
 {
@@ -31,69 +31,47 @@ detect_network_interface()
         awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
 }
 
-read_interface_mtu()
+interface_mtu()
 {
-    interface_name="$1"
-    mtu_path="${DIND_SYS_CLASS_NET}/${interface_name}/mtu"
+    mtu_path="${DIND_SYS_CLASS_NET}/$1/mtu"
 
     if [ ! -r "${mtu_path}" ]; then
-        echo "Unable to read MTU for interface '${interface_name}'" >&2
+        echo "Unable to read MTU for interface '$1'" >&2
         return 1
     fi
 
-    interface_mtu="$(cat "${mtu_path}")"
-    case "${interface_mtu}" in
+    mtu="$(cat "${mtu_path}")"
+    case "${mtu}" in
         ''|*[!0-9]*)
-            echo "Invalid MTU '${interface_mtu}' for interface '${interface_name}'" >&2
+            echo "Invalid MTU '${mtu}' for interface '$1'" >&2
             return 1
             ;;
     esac
 
-    printf '%s\n' "${interface_mtu}"
+    printf '%s\n' "${mtu}"
 }
 
-require_positive_integer()
+load_pod_network()
 {
-    value="$1"
-    value_name="$2"
-    case "${value}" in
-        ''|0|*[!0-9]*)
-            fail "${value_name} must be a positive integer, got '${value}'"
-            ;;
-    esac
+    pod_interface="$(detect_network_interface)"
+    [ -n "${pod_interface}" ] || fail "Unable to detect the pod network interface"
+    pod_mtu="$(interface_mtu "${pod_interface}")"
 }
 
 start_docker()
 {
-    network_interface="$(detect_network_interface)"
-    if [ -z "${network_interface}" ]; then
-        fail "Unable to detect the pod network interface"
-    fi
-
-    pod_mtu="$(read_interface_mtu "${network_interface}")"
+    load_pod_network
     dind_entrypoint="$(command -v dockerd-entrypoint.sh || true)"
-    if [ -z "${dind_entrypoint}" ]; then
-        fail "Unable to find dockerd-entrypoint.sh"
-    fi
+    [ -n "${dind_entrypoint}" ] || fail "Unable to find dockerd-entrypoint.sh"
 
-    echo "Starting Docker with MTU ${pod_mtu} from interface ${network_interface}"
+    echo "Starting Docker with MTU ${pod_mtu} from interface ${pod_interface}"
     exec "${dind_entrypoint}" --mtu="${pod_mtu}" "$@"
 }
 
 wait_for_docker()
 {
-    require_positive_integer "${DIND_DOCKER_READY_TIMEOUT_SECONDS}" \
-        "DIND_DOCKER_READY_TIMEOUT_SECONDS"
-    require_positive_integer "${DIND_DOCKER_INFO_TIMEOUT_SECONDS}" \
-        "DIND_DOCKER_INFO_TIMEOUT_SECONDS"
-
-    if ! command -v timeout >/dev/null 2>&1; then
-        fail "Unable to find timeout for bounded Docker readiness probes"
-    fi
-
     if ! timeout "${DIND_DOCKER_READY_TIMEOUT_SECONDS}s" sh -c '
-        probe_timeout_seconds="$1"
-        until timeout "${probe_timeout_seconds}s" docker info >/dev/null 2>&1; do
+        until timeout "${1}s" docker info >/dev/null 2>&1; do
             sleep 1
         done
     ' dind-mtu-wait "${DIND_DOCKER_INFO_TIMEOUT_SECONDS}"; then
@@ -104,20 +82,14 @@ wait_for_docker()
 validate_docker_mtu()
 {
     wait_for_docker
-
-    network_interface="$(detect_network_interface)"
-    if [ -z "${network_interface}" ]; then
-        fail "Unable to detect the pod network interface"
-    fi
-
-    pod_mtu="$(read_interface_mtu "${network_interface}")"
-    docker_mtu="$(read_interface_mtu docker0)"
+    load_pod_network
+    docker_mtu="$(interface_mtu docker0)"
 
     if [ "${pod_mtu}" != "${docker_mtu}" ]; then
-        fail "DIND MTU mismatch: ${network_interface}=${pod_mtu}, docker0=${docker_mtu}"
+        fail "DIND MTU mismatch: ${pod_interface}=${pod_mtu}, docker0=${docker_mtu}"
     fi
 
-    echo "Verified DIND network MTU: ${network_interface}=${pod_mtu}, docker0=${docker_mtu}"
+    echo "Verified DIND network MTU: ${pod_interface}=${pod_mtu}, docker0=${docker_mtu}"
 }
 
 usage()
@@ -125,13 +97,9 @@ usage()
     echo "Usage: dind-mtu {start|validate}"
 }
 
-mode="${1:-}"
-if [ "$#" -gt 0 ]; then
-    shift
-fi
-
-case "${mode}" in
+case "${1:-}" in
     start)
+        shift
         start_docker "$@"
         ;;
     validate)
