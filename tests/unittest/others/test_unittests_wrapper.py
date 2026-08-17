@@ -64,12 +64,12 @@ def test_loader_restores_stub_modules_after_context() -> None:
 
 def test_executor_unittest_group_disables_threadleak_checker(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_test_unittests_module(monkeypatch)
-    command = ["-m", "pytest", "unittest/_torch/executor"]
+    command = ["-m", "pytest"]
 
     module._append_case_specific_pytest_options(command, "unittest/_torch/executor")
+    command += ["unittest/_torch/executor"]
 
-    assert "-o" in command
-    assert "threadleak=False" in command
+    assert command == ["-m", "pytest", "-o", "threadleak=False", "unittest/_torch/executor"]
 
 
 @pytest.mark.parametrize(
@@ -77,6 +77,7 @@ def test_executor_unittest_group_disables_threadleak_checker(monkeypatch: pytest
     [
         "unittest/_torch/executor/test_example.py",
         "unittest/_torch/executor -k test_example",
+        'unittest/_torch/executor "unterminated',
     ],
 )
 def test_executor_unittest_subsets_keep_threadleak_checker(
