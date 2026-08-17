@@ -1,7 +1,4 @@
 /*
- * Vendored from https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/libtorch_stable/quantization/w8a8/fp8/common.cu
- * Copyright (c) 2023 vLLM contributors. Licensed under the Apache License, Version 2.0.
- *
  * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
+ * Adapted from vLLM (Apache-2.0):
+ * https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/libtorch_stable/quantization/w8a8/fp8/common.cu
  * Extracted: dynamic_per_token_scaled_fp8_quant_kernel_strided only.
  */
 

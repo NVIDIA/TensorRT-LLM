@@ -1,8 +1,4 @@
 /*
- * Vendored from
- * https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/libtorch_stable/quantization/vectorization_utils.cuh Copyright
- * (c) 2023 vLLM contributors. Licensed under the Apache License, Version 2.0.
- *
  * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +12,9 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Adapted from vLLM (Apache-2.0):
+ * https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/libtorch_stable/quantization/vectorization_utils.cuh
  */
 
 #pragma once
