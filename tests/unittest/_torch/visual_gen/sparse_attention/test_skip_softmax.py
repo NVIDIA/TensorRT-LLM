@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 import pytest
+import torch
 import yaml
 from pydantic import ValidationError
 
@@ -492,6 +493,50 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
         phase_fn = runner.extra_key_fns["skip_softmax_phase"]
         assert phase_fn(timestep=0.6) == 0
         assert phase_fn(timestep=0.59) == 1
+
+    def test_forward_threads_timestep_and_sparse_params_to_kernel_call(self, monkeypatch):
+        """The timestep-gating feature hinges on `_fwd`'s `kwargs.get("timestep")`
+        reaching `cute_dsl_fmha_fwd` unchanged; nothing else in this chain would
+        raise if that silently dropped to `None` (the scheduler would just apply
+        the full threshold during early, high-noise steps -- a quality
+        regression, not an error). This exercises `CuTeDSLAttention.forward`
+        (the boundary `_attn_impl`/`Attention.forward` call into, and the one
+        `Attention._attn_impl` also threads `timestep` through unchanged to)
+        directly, monkeypatching the actual kernel launcher so no CUDA/cutlass
+        runtime is required.
+        """
+        sparse_params = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor=5000.0,
+            disabled_until_timestep=0.6,
+        ).to_sparse_params()
+
+        captured_kwargs = {}
+
+        def _fake_cute_dsl_fmha_fwd(q, k, v, o, **kwargs):
+            captured_kwargs.update(kwargs)
+            o.zero_()
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha.cute_dsl_fmha_fwd",
+            _fake_cute_dsl_fmha_fwd,
+        )
+
+        attn = CuTeDSLAttention(
+            layer_idx=0,
+            num_heads=2,
+            head_dim=8,
+            sparse_params=sparse_params,
+        )
+
+        batch, seq_len, num_heads, head_dim = 1, 4, 2, 8
+        q = torch.zeros(batch, seq_len, num_heads, head_dim, dtype=torch.bfloat16)
+        k = torch.zeros(batch, seq_len, num_heads, head_dim, dtype=torch.bfloat16)
+        v = torch.zeros(batch, seq_len, num_heads, head_dim, dtype=torch.bfloat16)
+
+        attn.forward(q, k, v, timestep=0.59)
+
+        assert captured_kwargs.get("timestep") == 0.59
+        assert captured_kwargs.get("sparse_params") is sparse_params
 
 
 class TestVisualGenSkipSoftmaxPipelineConfig:

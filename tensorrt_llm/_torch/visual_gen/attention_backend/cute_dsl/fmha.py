@@ -607,6 +607,11 @@ class CuTeDSLAttention(AttentionBackend):
         num_kv_heads: int | None = None,
         dtype: torch.dtype | None = None,
         quant_attention_config: QuantAttentionConfig | None = None,
+        # Legacy static threshold, superseded by `sparse_params`'s timestep-aware
+        # scheduler for every in-tree construction path (`create_attention` never
+        # forwards this). Kept only for direct-construction debug/testing use
+        # (e.g. unit tests that want a fixed threshold without a scheduler);
+        # mutually exclusive with `sparse_params` below.
         skip_softmax_threshold_scale: float | None = None,
         sparse_params: SkipSoftmaxParams | None = None,
         **kwargs,
