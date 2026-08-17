@@ -212,6 +212,9 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     int32_t max_num_padded_tokens_gemm1
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, 2 * args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
+    int32_t max_num_padded_tokens_activation
+        = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
+            max_num_padded_tokens, args.intermediate_size, btg::dtypeGetNumBits(args.mDtypeElt));
     int32_t max_num_padded_tokens_gemm2
         = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::maybeGetMinTokenCount(
             max_num_padded_tokens, args.hidden_size, btg::dtypeGetNumBits(args.mDtypeOut));
@@ -254,10 +257,11 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
     at::Tensor gemm1_output_scale = at::detail::empty_cuda({2 * intermediate_size / 128, max_num_padded_tokens_gemm1},
         at::ScalarType::Float, routing_device, std::nullopt);
-    at::Tensor activation_output = at::detail::empty_cuda(
-        {max_num_padded_tokens_gemm1, intermediate_size}, at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
-    at::Tensor activation_output_scale = at::detail::empty_cuda(
-        {intermediate_size / 128, max_num_padded_tokens_gemm1}, at::ScalarType::Float, routing_device, std::nullopt);
+    at::Tensor activation_output = at::detail::empty_cuda({max_num_padded_tokens_activation, intermediate_size},
+        at::ScalarType::Float8_e4m3fn, routing_device, std::nullopt);
+    at::Tensor activation_output_scale
+        = at::detail::empty_cuda({intermediate_size / 128, max_num_padded_tokens_activation}, at::ScalarType::Float,
+            routing_device, std::nullopt);
     at::Tensor gemm2_output = at::detail::empty_cuda(
         {max_num_padded_tokens_gemm2, args.hidden_size}, at::ScalarType::BFloat16, routing_device, std::nullopt);
 
