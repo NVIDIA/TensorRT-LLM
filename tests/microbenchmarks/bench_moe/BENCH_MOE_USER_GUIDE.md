@@ -505,10 +505,16 @@ instead (`exact` means the projected logits drive the kernel to the plan), and
 treat a `null` error as "not measured", not as "no error".
 
 Grouped routing methods (DeepSeek-V3 style `noaux_tc`) constrain each token to
-at most `topk_group` expert groups. The materializer packs the requested plan to
-respect that constraint, so balanced plans stay realizable and expert load stays
-even across EP ranks; if a requested histogram cannot satisfy it, packing falls
-back and `routing_realization.status` becomes `projected`.
+at most `topk_group` expert groups. The materializer packs the requested plan
+to respect that constraint. The per-expert slot counts are always preserved
+exactly: a balanced plan stays balanced and a hotspot plan stays a hotspot;
+the packing only changes which experts share a token row.
+
+If the requested histogram cannot be packed within `topk_group` groups, packing
+falls back to column-major. `routing_realization.status` is then decided by the
+ids the fallback actually produced: it stays `exact` when those rows happen to
+respect the constraint anyway (typical at small token counts), and becomes
+`projected` when they do not.
 
 ## Reading Outputs
 
@@ -596,19 +602,26 @@ per-iteration samples.
   "routing_path": "logits_projected",
   "routing_realization": {
     "status": "projected",
-    "reason": "DeepSeekV3 grouped routing: ...",
-    "max_abs_slot_error": 3,
-    "max_relative_slot_error": 0.004
+    "reason": "DeepSeekV3 grouped routing: row needs experts in 8 groups but topk_group=4",
+    "max_abs_slot_error": null,
+    "max_relative_slot_error": null
   },
   "enable_perfect_router": false,
+  "effective_src_axis": "dp_rank",
   "max_num_tokens_per_rank": 256,
   "num_chunks_observed": 1,
+  "use_dp_padding": false,
+  "observation_source": "plan_simulation",
   "observed_dispatch_matrix_summary": {
     "row_sums": [2048, 2048, 2048, 2048],
-    "col_sums": [6144, 682, 683, 683],
+    "col_sums": [2048, 2048, 2048, 2048],
     "off_diagonal_ratio": 0.75,
-    "max_abs_slot_error": 3
-  }
+    "max_abs_slot_error": null,
+    "matrix_dump_path": null
+  },
+  "observed_expert_histogram_summary": { "min": 30, "max": 34, "active_experts": 256 },
+  "selected_scales": { "distribution": "uniform", "dtype": "torch.float32", "seed": 0 },
+  "warnings": ["observed_* fields are derived from RoutingPlan re-materialisation, ..."]
 }
 ```
 

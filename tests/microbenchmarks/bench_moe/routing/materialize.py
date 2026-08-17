@@ -19,6 +19,10 @@ The materialiser:
 
 * turns the per-rank slot dispatch matrix into a flat list of expert ids,
 * repacks it column-major so each token row spans different destinations,
+* repacks it group-aware instead for grouped routing methods (DeepSeek-V3 style
+  ``noaux_tc``), keeping every token row within ``topk_group`` expert groups so
+  the routing kernel can realise the plan, and falling back to the column-major
+  packing when the requested histogram cannot satisfy that constraint,
 * runs a small repair pass to enforce per-token expert uniqueness,
 * derives uniform top-k scales,
 * observes the realised plan to compute slot / token traffic and per-rank
@@ -109,7 +113,6 @@ def _pack_slots_group_aware(
     n_group: int,
     topk_group: int,
     num_experts: int,
-    moe_ep_size: int,
 ) -> Optional[List[List[int]]]:
     """Pack flat slots so every token row spans at most ``topk_group`` groups.
 
@@ -126,17 +129,29 @@ def _pack_slots_group_aware(
 
     Packing each token into at most ``topk_group`` groups instead makes the
     selected groups score strictly above the unselected ones, so the routing
-    kernel reproduces the plan exactly. Groups are picked one per EP rank
-    (stride ``n_group // moe_ep_size``) with a per-token rotation, which keeps
-    the per-rank slot counts balanced -- the property the plan encodes but the
-    old packing silently lost.
+    kernel reproduces the plan exactly.
+
+    Each token takes the group with the most unused experts left plus the
+    ``topk_group - 1`` emptiest non-empty groups, then draws experts from those
+    round-robin. Pairing the fullest group with the emptiest ones drains
+    stragglers while a group that can still carry the rest is open; picking
+    groups by a rotation fixed up front instead keeps landing on groups that
+    are already empty, and gives up on layouts that are in fact packable --
+    most visibly for small ``local_num_tokens``, where a balanced plan only
+    populates a fraction of the experts. Equally loaded groups are ordered by a
+    per-token rotation, so a balanced plan -- where capacity never decides --
+    still spreads consecutive tokens over different groups.
 
     ``flat`` is consumed as a multiset, so the realised per-expert slot counts
     still match ``plan.expert_histogram`` exactly.
 
-    Returns ``None`` when the constraint cannot be satisfied from the available
-    slots (for example a hotspot histogram that concentrates on one group), so
-    the caller can fall back to the previous behaviour.
+    The packing is greedy and does not backtrack, so it returns ``None`` for a
+    histogram it cannot place -- always for a genuinely unsatisfiable one (a
+    hotspot needing more groups per token than ``topk_group``), and in rare
+    cases for one a full search could still place. The caller then falls back
+    to column-major packing, and ``_classify_native_projection`` reports
+    ``status="projected"`` because it inspects the materialised ids, so the
+    fallback is never silent.
     """
     if local_num_tokens <= 0 or top_k <= 0 or n_group <= 1:
         return None
@@ -156,82 +171,62 @@ def _pack_slots_group_aware(
             return None
         pools[g][eid] = pools[g].get(eid, 0) + 1
 
-    # Per-group quota for one token: split ``top_k`` over ``topk_group`` groups
-    # (8/4 -> 2,2,2,2; 6/4 -> 2,2,1,1). Rotated per token so the remainder does
-    # not always land on the same group.
-    base_quota = _largest_remainder_split(top_k, [1.0] * topk_group)
-    # Pick one group per EP rank when the topology allows it, so each token
-    # reaches as many ranks as ``topk_group`` permits.
-    groups_per_rank = max(1, n_group // max(moe_ep_size, 1))
-
     out: List[List[int]] = []
     for t in range(local_num_tokens):
-        # ``groups_per_rank`` is the stride, so one group is taken per EP rank;
-        # the start advances by one group per token so consecutive tokens cover
-        # different groups within each rank and every pool drains evenly.
-        candidates = [(t + j * groups_per_rank) % n_group for j in range(topk_group)]
-        # De-duplicate while preserving order, then top up with the groups that
-        # still hold the most slots (keeps drain even for odd topologies).
-        chosen: List[int] = []
-        for g in candidates:
-            if g not in chosen:
-                chosen.append(g)
-        if len(chosen) < topk_group:
-            for g in sorted(range(n_group), key=lambda gg: (-sum(pools[gg].values()), gg)):
-                if g not in chosen:
-                    chosen.append(g)
-                if len(chosen) == topk_group:
-                    break
-        quota = base_quota[t % len(base_quota) :] + base_quota[: t % len(base_quota)]
+        live = [g for g in range(n_group) if pools[g]]
+        if not live:
+            return None
+
+        def rotated(g: int, _t: int = t) -> int:
+            return (g - _t) % n_group
+
+        fullest = max(live, key=lambda g: (len(pools[g]), -rotated(g)))
+        others = sorted(
+            (g for g in live if g != fullest), key=lambda g: (len(pools[g]), rotated(g))
+        )
+        chosen = [fullest] + others[: topk_group - 1]
 
         row: List[int] = []
-        deficit = 0
-        for g, want in zip(chosen, quota):
-            took = _drain_distinct_from_pool(pools[g], want)
-            deficit += want - len(took)
-            row.extend(took)
-        # Re-balance inside the chosen groups when one of them ran dry.
-        if deficit:
+        while len(row) < top_k:
+            progressed = False
             for g in chosen:
-                if deficit <= 0:
+                if len(row) == top_k:
                     break
-                extra = _drain_distinct_from_pool(pools[g], deficit, exclude=set(row))
-                row.extend(extra)
-                deficit -= len(extra)
+                eid = _take_loaded_expert(pools[g], exclude=set(row))
+                if eid is not None:
+                    row.append(eid)
+                    progressed = True
+            if not progressed:
+                break
         if len(row) != top_k or len(set(row)) != top_k:
             return None
         out.append(row)
 
-    if any(pool for pool in pools if sum(pool.values()) > 0):
+    if any(sum(pool.values()) > 0 for pool in pools):
         # Slots left over means the rows do not reproduce the histogram.
         return None
     return out
 
 
-def _drain_distinct_from_pool(
-    pool: Dict[int, int], want: int, exclude: Optional[set] = None
-) -> List[int]:
-    """Take up to ``want`` distinct expert ids from ``pool``, most-loaded first.
+def _take_loaded_expert(pool: Dict[int, int], exclude: set) -> Optional[int]:
+    """Take the expert with the most remaining slots, skipping ``exclude``.
 
     Draining the experts with the largest remaining slot count first keeps the
     per-expert histogram from developing a tail of leftovers that no token can
-    absorb. ``pool`` is mutated in place.
+    absorb. ``pool`` is mutated in place; ``None`` means nothing usable is left.
     """
-    if want <= 0:
-        return []
-    taken: List[int] = []
-    for eid in sorted(pool, key=lambda e: (-pool[e], e)):
-        if len(taken) == want:
-            break
-        if pool[eid] <= 0:
+    best = None
+    for eid, count in pool.items():
+        if eid in exclude:
             continue
-        if exclude is not None and eid in exclude:
-            continue
-        taken.append(eid)
-        pool[eid] -= 1
-        if pool[eid] == 0:
-            del pool[eid]
-    return taken
+        if best is None or count > pool[best] or (count == pool[best] and eid < best):
+            best = eid
+    if best is None:
+        return None
+    pool[best] -= 1
+    if pool[best] == 0:
+        del pool[best]
+    return best
 
 
 def _repair_duplicate_experts(out: List[List[int]], top_k: int) -> None:
@@ -345,7 +340,6 @@ def _materialize_selected_experts_for_rank(
             int(n_group),
             int(topk_group),
             num_experts=int(experts_per_rank) * int(moe_ep_size),
-            moe_ep_size=int(moe_ep_size),
         )
     if out is None:
         out = _pack_slots_column_major(flat, local_num_tokens, top_k)
