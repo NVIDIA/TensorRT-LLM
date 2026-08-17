@@ -593,7 +593,7 @@ def test_attention_mla_flashinfer(scenario: Scenario,
 
 @pytest.mark.parametrize("v2_kv_cache", [True, False],
                          ids=["v2_kv_cache", "v1_kv_cache"])
-def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool):
+def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
     """Cover the CuTe DSL MLA decode AutoTuner path.
 
     The plain test_attention_mla runs with the autotuner off, so the op
@@ -642,7 +642,7 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool):
         model_type=scenario.model_type,
     )
 
-    def run_once():
+    def run_once() -> None:
         # Numerics vs the reference implementation are asserted inside.
         _run_test_for_backend("TRTLLM", scenario.num_heads,
                               scenario.num_kv_heads, scenario.num_layers,
