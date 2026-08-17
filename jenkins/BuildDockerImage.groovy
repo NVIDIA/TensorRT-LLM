@@ -174,7 +174,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         // Use a customized docker:dind image with essential dependencies
         containerConfig = """
                   - name: docker
-                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202608172108_docker_dind_mtu_helper
+                    image: artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:202608172149_docker_dind_mtu_helper
                     command: ['/usr/local/bin/dind-mtu']
                     args: ['start']
                     tty: true
