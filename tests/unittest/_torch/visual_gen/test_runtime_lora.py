@@ -315,6 +315,18 @@ def test_pipeline_runtime_lora_requires_target_components_for_multi_transformer(
         pipe._setup_runtime_lora()
 
 
+def test_pipeline_runtime_lora_rejects_duplicate_target_components() -> None:
+    pipe = TinyPipelineWithTwoTransformers(
+        RuntimeLoRAConfig(
+            path="/tmp/lora.safetensors",
+            target_components=["transformer", "transformer"],
+        )
+    )
+
+    with pytest.raises(ValueError, match="target_components contains duplicates"):
+        pipe._setup_runtime_lora()
+
+
 def test_pipeline_runtime_lora_strict_failure_does_not_mutate_components(
     tmp_path: Path,
 ) -> None:

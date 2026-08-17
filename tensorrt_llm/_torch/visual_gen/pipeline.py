@@ -431,6 +431,10 @@ class BasePipeline(nn.Module):
                 "to every component."
             )
         component_names = runtime_lora.target_components or transformer_component_names
+        if len(component_names) != len(set(component_names)):
+            raise ValueError(
+                f"runtime_lora_config.target_components contains duplicates: {component_names}"
+            )
         total_applied = 0
         plans = []
         require_each_component_match = runtime_lora.strict and bool(runtime_lora.target_components)
