@@ -96,10 +96,16 @@ def _report_observed_child_failure(return_code: int, component: str,
 
 
 def _apply_effective_telemetry_config(llm_args: dict,
+                                      *,
+                                      telemetry: bool,
                                       component: str = "server") -> None:
     """Apply a parsed config opt-out before later setup can fail."""
     telemetry_config = llm_args.get("telemetry_config")
     if telemetry_config is not None:
+        if not telemetry:
+            telemetry_config = telemetry_config.model_copy(
+                update={"disabled": True})
+            llm_args["telemetry_config"] = telemetry_config
         apply_usage_session_config(
             telemetry_config,
             default_usage_context="cli_serve",
@@ -1421,12 +1427,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
-        # CLI --no-telemetry always wins over YAML config
-        if not telemetry:
-            llm_args["telemetry_config"] = llm_args[
-                "telemetry_config"].model_copy(update={"disabled": True})
-
-        _apply_effective_telemetry_config(llm_args)
+        _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
@@ -1688,12 +1689,7 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     encoder_args = update_llm_args_with_extra_dict(
         llm_args, encoder_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
-    # CLI --no-telemetry always wins over YAML config
-    if not telemetry:
-        encoder_args["telemetry_config"] = encoder_args[
-            "telemetry_config"].model_copy(update={"disabled": True})
-
-    _apply_effective_telemetry_config(encoder_args)
+    _apply_effective_telemetry_config(encoder_args, telemetry=telemetry)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
@@ -1813,12 +1809,7 @@ def serve_embedding(
     llm_args = update_llm_args_with_extra_dict(
         llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
 
-    # CLI --no-telemetry always wins over YAML config.
-    if not telemetry:
-        llm_args["telemetry_config"] = llm_args["telemetry_config"].model_copy(
-            update={"disabled": True})
-
-    _apply_effective_telemetry_config(llm_args)
+    _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
 
     # The CLI does not expose TP/PP/CP, but a --config YAML could still set them. Reject
     # that explicitly rather than hang: the in-process encode-only path cannot shard.
