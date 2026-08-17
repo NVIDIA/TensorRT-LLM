@@ -112,7 +112,7 @@ The codebase is transitioning between two architectures:
 | Entry | `XXFusedMoE` (e.g., `CutlassFusedMoE`) | `ConfigurableMoE` + `XXBackend` + `MoEScheduler` |
 | Communication | Embedded inside each backend | Separated into `communication/` (or fused into kernel for `FUSED_COMM`) |
 | Forward execution | Inline in backend | `MoEScheduler` (`moe_scheduler.py`) |
-| EPLB | Only in the removed `WideEPMoE` | Available to all backends |
+| EPLB | Not supported | Available to all backends |
 | Status | Being replaced | Active development |
 
 ConfigurableMoE currently supports these backends (`create_moe.py`):
@@ -120,10 +120,6 @@ ConfigurableMoE currently supports these backends (`create_moe.py`):
 
 Still on old path (standalone, with embedded communication):
 - `TritonFusedMoE`, `VanillaMoE`
-
-The `WIDEEP` backend is removed: `create_moe.py` raises a deprecation error for it.
-Wide EP and EPLB are available on the ConfigurableMoE backends — use `DEEPGEMM` for
-FP8 block-scale checkpoints, or `TRTLLM` / `CUTEDSL` / `CUTLASS` otherwise.
 
 **Rule: All new features should target ConfigurableMoE + Backend + Scheduler architecture.**
 
@@ -312,26 +308,21 @@ unconditionally, not here.
 
 Each backend's `can_implement(p, d)` classmethod declares what it supports. Source of truth: the `can_implement` classmethod in each backend file.
 
-| Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | MegaMoE-CuteDSL | Triton | Marlin | WideEP (retired)† | Vanilla |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103, BF16, needs FlashInfer `trtllm_bf16_moe`)§ | N | N | N | N | N | Y (SM90, BF16) | N | Y | Y |
-| FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y | Y |
-| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | N‡ | N | N | N | N | Y | Y |
-| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/120/121) | N | Y (SM100/103, cu13 cutlass-dsl + NVSHMEM provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y | Y |
-| W4A16 NVFP4 | Y (SM80+, dequant-on-the-fly) | N | N | N | Y (SM120/121 via `CuteDslB12xFusedMoE`, needs flashinfer) | N | N | N | Y (SM89-SM99, BF16) | N | Y |
-| W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N | N |
-| W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N | N |
-| W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N | N |
-| W4A8 MXFP4 MXFP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | Y (SM100/103, requires `hidden_size % 512 == 0`) | N | N | N | N | N |
-| W8A8 MXFP8 MXFP8 | Y (SM100/103) | N | N | N | N | N | N | N | N | N | N |
-| W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N | N |
-| W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N | N |
-| INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | Y | N |
-
-† The `WideEP` column is history, not an option. `resolve_moe_impl` raises on the
-`WIDEEP` literal, so nothing in that column can be selected — read a `Y` there as
-"the retired class implemented this", never as "you may request this". For
-`INT4 WoQ (W4AFP8)` that leaves the row without a selectable backend.
+| Quantization | Cutlass | TRTLLMGen | DeepGemm | DenseGEMM | CuteDSL | MegaMoE-DG | MegaMoE-CuteDSL | Triton | Marlin | Vanilla |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103, BF16, needs FlashInfer `trtllm_bf16_moe`)§ | N | N | N | N | N | Y (SM90, BF16) | N | Y |
+| FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y |
+| FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | N‡ | N | N | N | N | Y |
+| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/120/121) | N | Y (SM100/103, cu13 cutlass-dsl + NVSHMEM provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
+| W4A16 NVFP4 | Y (SM80+, dequant-on-the-fly) | N | N | N | Y (SM120/121 via `CuteDslB12xFusedMoE`, needs flashinfer) | N | N | N | Y (SM89-SM99, BF16) | Y |
+| W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N |
+| W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
+| W4A8 MXFP4 FP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |
+| W4A8 MXFP4 MXFP8 | Y (SM100/103) | Y (SM100/103) | N | N | N | Y (SM100/103, requires `hidden_size % 512 == 0`) | N | N | N | N |
+| W8A8 MXFP8 MXFP8 | Y (SM100/103) | N | N | N | N | N | N | N | N | N |
+| W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
+| W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
+| INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | N |
 
 § The unquantized `TRTLLMGenFusedMoE` path is not a TRTLLM-Gen kernel at all: it
 calls FlashInfer's `trtllm_bf16_moe` / `trtllm_bf16_routed_moe`, which is why it
