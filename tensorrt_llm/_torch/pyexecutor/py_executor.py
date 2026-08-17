@@ -5288,8 +5288,13 @@ class PyExecutor:
         if len(self.control_requests) != 0:
             return
 
-        # Calculate timeout
-        idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
+        # Calculate timeout. Never wait once the shutdown sentinel has been
+        # consumed: no further item will arrive to wake a blocking get(), so
+        # blocking would keep the loop from reaching the
+        # `should_stop_processing` check that ends it, deadlocking shutdown()
+        # on `shutdown_event`.
+        idle = (total_num_active_requests == 0 and len(waiting_queue) == 0
+                and not self.is_shutdown)
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -5845,18 +5850,58 @@ class PyExecutor:
         reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
         (`blocks_in_primary_pool` forwards `get_page_index_upper_bound`, not the available-page count).
         A carried value of None -- non-fp8-MLA model, no reservation needed (reuse off / chunked prefill),
-        or estimation skipped -- means no admission cap is applied.
+        or estimation skipped -- means no admission cap is applied. A carried 0 is a real cap (a budget so
+        tight the reserve covers under one token), not "no cap", so it must not be collapsed into None.
         """
         cap = getattr(self, "_ctx_mla_kv_len_cap", "unset")
         if cap != "unset":
             return cap
-        if getattr(self, "is_warmup", False):
+        if self.is_warmup:
             # Estimation/warmup runs fresh-prefill dummies against a throwaway manager that reserved
             # nothing; don't cap them (and don't cache -- real serving recomputes from the real manager).
             return None
+        # getattr: managers not built by the estimator (and test doubles) never carry the attribute.
         carried = getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None)
-        self._ctx_mla_kv_len_cap = int(carried) if carried else None
+        self._ctx_mla_kv_len_cap = int(carried) if carried is not None else None
+        self._warn_if_ctx_mla_kv_len_cap_degenerate()
         return self._ctx_mla_kv_len_cap
+
+    def _warn_if_ctx_mla_kv_len_cap_degenerate(self) -> None:
+        """Surface an fp8 context-MLA admission cap too tight to batch context requests on.
+
+        `_cap_context_by_total_kv_len` logs its deferrals at debug level, so a deployment whose budget
+        lands here sees context throughput collapse with nothing in the log at default level. Called from
+        the cached resolution in `_get_ctx_mla_kv_len_cap`, so it fires at most once per executor.
+
+        Only the memory budget can produce a cap this small: the reserve is clamped to
+        `budget * w / (k + w)` (`get_mla_context_workspace_reserve`) and the cap is that reserve divided
+        by `w`, while the `fp8_context_mla_kv_len_cap` override is floored at `max_seq_len`
+        (`get_mla_context_workspace_kv_len_cap`). So the override is never the cause, and raising it is
+        never the fix -- point at the budget instead.
+        """
+        cap = self._ctx_mla_kv_len_cap
+        if cap is None:
+            return
+        if cap == 0:
+            consequence = (
+                "every forward step will schedule exactly one context request -- the "
+                "forward-progress request kept unconditionally -- whatever its length"
+            )
+        elif self.max_seq_len and cap < self.max_seq_len:
+            consequence = (
+                f"a single request attending max_seq_len={self.max_seq_len} already exceeds it, so "
+                "context requests near that length will be scheduled one per forward step"
+            )
+        else:
+            return
+        logger.warning(
+            f"fp8 context-MLA admission cap resolved to {cap} token(s) of summed attended KV: "
+            f"{consequence}. Prefill batching is degraded, not incorrect -- generation is unaffected "
+            "and requests still complete. The cap is the workspace reserve the KV-cache estimator "
+            "could afford divided by its per-token cost, so the KV cache memory budget is the binding "
+            "constraint: raise free_gpu_memory_fraction or max_gpu_total_bytes. Raising "
+            "KvCacheConfig.fp8_context_mla_kv_len_cap will not help (it is already floored at "
+            "max_seq_len).")
 
     @staticmethod
     def _context_attended_kv_len(ctx_req) -> int:
