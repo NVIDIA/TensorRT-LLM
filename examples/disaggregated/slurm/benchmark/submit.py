@@ -291,15 +291,17 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
         upsert_env_config(env_config, 'worker_env_var',
                           'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY',
                           'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1')
-    if benchmark_mode == "gen_only":
-        upsert_env_config(env_config, 'worker_env_var',
+    if benchmark_mode == "gen_only" and role == "GEN":
+        # GEN worker only: skipping transfer-state polling helps the generation
+        # worker, but the same flag on the CTX worker has been seen to hang
+        # gen_only runs with KV blocks never released.
+        upsert_env_config(env_config, 'gen_worker_env_var',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP',
                           'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
-        if role == "GEN":
-            concurrency = _parse_positive_concurrency(concurrency)
-            upsert_env_config(env_config, 'gen_worker_env_var',
-                              'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
-                              f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
+        concurrency = _parse_positive_concurrency(concurrency)
+        upsert_env_config(env_config, 'gen_worker_env_var',
+                          'TLLM_BENCHMARK_REQ_QUEUES_SIZE',
+                          f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
 
     # 2. Add profiling env vars to env_config (conditional)
     if nsys_on:
