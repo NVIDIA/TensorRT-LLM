@@ -1085,7 +1085,6 @@
    "unittest/_torch/modeling -k \"modeling_out_of_tree\"": 144.867929456112,
    "unittest/_torch/modeling -k \"modeling_phi3\"": 35.700971046770604,
    "unittest/_torch/modeling -k \"modeling_qwen\"": 621.8826172566372,
-   "unittest/_torch/modeling -k \"modeling_qwen_moe\"": 203.9329757709251,
    "unittest/_torch/modeling -k \"modeling_siglip\"": 204.05294545454547,
    "unittest/_torch/modeling -k \"modeling_speculative\"": 29.387126086956524,
    "unittest/_torch/modeling -k \"modeling_whisper\"": 23.888484210526315,

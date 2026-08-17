@@ -1243,8 +1243,6 @@ def llm_qwen_model_root(request, llm_venv):
         elif request.param == "qwen1.5_14b_chat_int4":
             qwen_model_root = os.path.join(models_root,
                                            "Qwen1.5-14B-Chat-GPTQ-Int4")
-        elif request.param == "qwen2_57b_a14b":
-            qwen_model_root = os.path.join(models_root, "Qwen2-57B-A14B")
         elif request.param == "qwen2_72b_instruct":
             qwen_model_root = os.path.join(models_root, "Qwen2-72B-Instruct")
         elif request.param == "qwen2_audio_7b_instruct":

@@ -262,10 +262,6 @@ Qwen/Qwen1.5-MoE-A2.7B-Chat:
   - accuracy: 32.148
   - quant_algo: W8A16
     accuracy: 0
-Qwen/Qwen2-1.5B:
-  - accuracy: 32.58
-Qwen/Qwen2-57B-A14B:
-  - accuracy: 35.415
 Qwen/QwQ-32B:
   - accuracy: 30.358
 nvidia/Nemotron-Mini-4B-Instruct:

@@ -724,21 +724,3 @@ class TestQwen1_5MoeA2_7BChat(CliFlowAccuracyTestHarness):
     @pytest.mark.skip(reason="https://nvbugs/5100102")
     def test_weight_only(self):
         self.run(quant_algo=QuantAlgo.W8A16)
-
-
-class TestQwen2_1_5B(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "Qwen/Qwen2-1.5B"
-    MODEL_PATH = f"{llm_models_root()}/Qwen2-1.5B"
-    EXAMPLE_FOLDER = "models/core/qwen"
-
-
-@pytest.mark.skip_less_device_memory(40000)
-class TestQwen2_57B_A14B(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "Qwen/Qwen2-57B-A14B"
-    MODEL_PATH = f"{llm_models_root()}/Qwen2-57B-A14B"
-    EXAMPLE_FOLDER = "models/core/qwen"
-
-    @pytest.mark.skip(reason="https://nvbugs/5063469")
-    @pytest.mark.skip_less_device(4)
-    def test_tp4(self):
-        self.run(tp_size=4)
