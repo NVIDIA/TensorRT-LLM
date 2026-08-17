@@ -5726,15 +5726,22 @@ class TorchLlmArgs(BaseLlmArgs):
                     with open(draft_config_path) as f:
                         draft_cfg = json.load(f)
                     dspark_cfg = draft_cfg.get("dspark_config", {})
+                    # DeepSpec-released dense drafter checkpoints (e.g.
+                    # Qwen3DSparkModel) use unprefixed top-level keys in their
+                    # own config.json; gate that fallback on the checkpoint's
+                    # architectures (mirroring the dispatch in
+                    # get_draft_model) so a V4-style checkpoint that happens
+                    # to carry an unrelated top-level key with the same name
+                    # (e.g. `block_size`) doesn't get silently misread.
+                    draft_arches = draft_cfg.get("architectures") or []
+                    is_dense_drafter = any("Qwen3DSpark" in arch
+                                           for arch in draft_arches)
 
                     def _dspark_get(key, top_level_key):
                         value = dspark_cfg.get(key)
                         if value is None:
                             value = draft_cfg.get(top_level_key)
-                        if value is None:
-                            # DeepSpec-released dense drafter checkpoints
-                            # (e.g. Qwen3DSparkModel) use unprefixed top-level
-                            # keys in their own config.json.
+                        if value is None and is_dense_drafter:
                             value = draft_cfg.get(key)
                         return value
 
