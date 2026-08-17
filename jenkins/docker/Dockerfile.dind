@@ -16,7 +16,7 @@
 
 FROM docker:dind
 
-RUN apk add --no-cache bash git make python3 py3-pip
+RUN apk add --no-cache bash git make python3 py3-pip wget
 
 ENV PATH=/usr/local/cmake/bin:$PATH
 ENV ENV=${ENV:-/etc/shinit_v2}
