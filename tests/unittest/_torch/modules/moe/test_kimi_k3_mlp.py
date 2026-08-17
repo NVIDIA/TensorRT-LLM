@@ -235,7 +235,11 @@ def test_kimi_k3_shared_expert_parallel_construction(
         tp_size=tp_size,
         enable_attention_dp=attention_dp,
     )
-    model_config = ModelConfig(mapping=mapping, quant_config=QuantConfig())
+    model_config = ModelConfig(
+        mapping=mapping,
+        quant_config=QuantConfig(),
+        moe_backend="TRTLLM",
+    )
     config = _runtime_config()
     runtime = modeling_kimi_linear.KimiK3MoERuntime(model_config, config, layer_idx=1)
 
