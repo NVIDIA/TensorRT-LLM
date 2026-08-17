@@ -19,6 +19,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import weakref
 from queue import Empty
 from typing import Dict, List, Optional, Union
@@ -43,11 +44,12 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
-from .utils import (EngineDeadError, ErrorResponse, RequestError,
-                    WorkerCommIpcAddrs, create_mpi_comm_session,
+from .utils import (WORKER_INIT_STALL_WARN_ENV, EngineDeadError, ErrorResponse,
+                    RequestError, WorkerCommIpcAddrs, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response,
                     multi_frontend_request_addr, multi_frontend_result_addr,
-                    namespace_client_id, print_alive_threads)
+                    namespace_client_id, print_alive_threads,
+                    worker_init_stall_warn_sec)
 from .worker import GenerationExecutorWorker, worker_main
 from .worker_process_monitor import WorkerProcessIdentity, WorkerProcessMonitor
 
@@ -605,6 +607,10 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def _start_executor_workers(self, worker_kwargs):
 
+        # Read the knob before anything is spawned: a bad value raises, and it
+        # must do so while there are still no ranks to leave behind.
+        stall_warn_sec = worker_init_stall_warn_sec()
+
         self_ref = weakref.ref(self)
 
         def mpi_done_callback(future: concurrent.futures.Future):
@@ -647,6 +653,17 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.workers_started = True
 
+        # This loop still exits only on the leader's status (ready or init
+        # error) or on a rank dying.  A third case exists -- every rank alive
+        # but nothing happening -- which neither exit covers; it is not given
+        # a deadline here (a slow-but-healthy startup must not be killed), but
+        # it is no longer silent: the stall report below, together with the
+        # per-rank stack dumps every worker emits on the same schedule, says
+        # which rank is stuck and where.
+        start_time = time.monotonic()
+        next_warn_time = (start_time +
+                          stall_warn_sec) if stall_warn_sec > 0 else None
+
         while True:
             if self.worker_init_status_queue.poll(1):
                 status = self.worker_init_status_queue.get()
@@ -659,6 +676,11 @@ class GenerationExecutorProxy(GenerationExecutor):
                 raise RuntimeError("Executor worker died during initialization")
             self._handle_background_error()
 
+            now = time.monotonic()
+            if next_warn_time is not None and now >= next_warn_time:
+                next_warn_time = now + stall_warn_sec
+                logger.warning(self._worker_init_stall_report(now - start_time))
+
         ready_signal, error_trace = status[:2]
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             logger.error(f"Executor worker initialization error: {error_trace}")
@@ -670,6 +692,48 @@ class GenerationExecutorProxy(GenerationExecutor):
                 "Executor worker returned error") from ready_signal
 
         self._register_worker_processes(status)
+
+    def _worker_init_stall_report(self, elapsed: float) -> str:
+        """Describe a startup that has gone quiet, and where to attribute it.
+
+        The proxy has no IPC channel to ranks other than the leader before the
+        ready signal arrives, so it cannot collect worker stacks itself.  What
+        it can state is (a) whether any rank has exited -- which distinguishes
+        a stalled initialization from a crash, the two being indistinguishable
+        from the client side today -- and (b) where the per-rank stacks that
+        each worker dumps on the same schedule can be found.
+
+        (a) is only answerable when the session actually hands back worker
+        futures.  ``RemoteMpiCommSessionClient.submit()`` returns ``[]`` (the
+        ranks live in a separate ``mgmn_leader_node`` process under
+        ``trtllm-llmapi-launch``), so on that session type the proxy has *no*
+        liveness signal here and must say so rather than read an empty list as
+        "everyone is fine" -- the same empty-list trap ``pre_shutdown()``
+        documents below.  ``check_worker_error()`` on the session is the
+        authoritative channel there; it is not consulted from this report
+        because reading it consumes the death notice that
+        ``_check_remote_worker_death()`` acts on.
+        """
+        total = len(self.mpi_futures)
+        if total:
+            running = sum(1 for fut in self.mpi_futures if not fut.done())
+            liveness = (
+                f"{running}/{total} worker task(s) are still running, so no "
+                f"rank has exited (a stalled initialization, not a worker "
+                f"crash)")
+        else:
+            liveness = (
+                "whether a rank has exited cannot be told from here: this MPI "
+                "session hands back no worker futures, so the proxy has no "
+                "liveness signal during startup and this report can neither "
+                "confirm nor rule out a crashed rank. The session's "
+                "check_worker_error() channel is authoritative for that")
+        return (f"Executor worker initialization has not completed after "
+                f"{elapsed:.0f}s; {liveness}. Every rank dumps its own thread "
+                f"stacks on the same schedule: search the worker logs for 'has "
+                f"not finished initialization' to see which rank is stuck and "
+                f"where. Tune or silence this report with "
+                f"{WORKER_INIT_STALL_WARN_ENV}.")
 
     def _register_worker_processes(self, status: tuple) -> None:
         """Register identities returned by locally spawned MPI workers.
