@@ -353,8 +353,10 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             // Download timeout test results
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
             def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, timeoutTestFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
-            // Non-fatal SCP of timeout_data.jsonl; absence is handled gracefully by generateTimeoutTestResultXml
-            Utils.exec(pipeline, script: scpFromRemoteCmd(remote, "/home/svc_tensorrt/bloom/scripts/${nodeName}/timeout_data.jsonl", "${stageName}/"), returnStatus: true, numRetries: 3)
+            // Each Slurm rank records independently. Download all completed
+            // rank files after the job exits; no cross-rank write is needed.
+            sh "rm -f '${stageName}'/timeout_data_step*_rank*.jsonl || true"
+            Utils.exec(pipeline, script: scpFromRemoteCmd(remote, "/home/svc_tensorrt/bloom/scripts/${nodeName}/timeout_data_step*_rank*.jsonl", "${stageName}/"), returnStatus: true, numRetries: 3)
             if (downloadTimeoutTestSucceed) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
@@ -3625,10 +3627,13 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
     ).trim()
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
-    def timeoutDataFile = "${curPath}/${stageName}/timeout_data.jsonl"
-    def timeoutDataArg = fileExists(timeoutDataFile) ? "--timeout-data-file '${timeoutDataFile}'" : ""
-    sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}' ${timeoutDataArg}"""
-    sh "rm -f '${timeoutDataFile}' || true"
+    def timeoutDataFiles = sh(
+        script: "find '${curPath}/${stageName}' -maxdepth 1 -type f -name 'timeout_data*.jsonl' -print | sort",
+        returnStdout: true,
+    ).trim().split("\\n").findAll { it }
+    def timeoutDataArgs = timeoutDataFiles.collect { "--timeout-data-file '${it}'" }.join(" ")
+    sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}' ${timeoutDataArgs}"""
+    sh "find '${curPath}/${stageName}' -maxdepth 1 -type f -name 'timeout_data*.jsonl' -delete || true"
     if (fileExists(outputFilePath)) {
         return true
     }
