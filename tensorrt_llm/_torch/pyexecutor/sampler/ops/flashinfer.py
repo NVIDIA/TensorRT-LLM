@@ -59,7 +59,7 @@ else:
                 "requirements.txt."
             )
 
-    flashinfer = _FlashInferUnavailable()
+    flashinfer = _FlashInferUnavailable()  # type: ignore[assignment]
 
 SeedOrTensor = Union[int, torch.Tensor]
 
