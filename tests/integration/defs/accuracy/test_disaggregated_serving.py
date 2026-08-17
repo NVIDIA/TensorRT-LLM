@@ -1105,6 +1105,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize("disable_overlap_scheduler", [True, False],
+                             ids=["overlap_off", "overlap_on"])
     @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
         (1, 2, 2, False),
         (1, 2, 2, True),
@@ -1119,7 +1121,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["cudagraph:with_padding"])
     @pytest.mark.parametrize("comms_medium", ["fifo_v2"])
     def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
-                                   gen_pp, gen_tp, gen_cp, enable_attention_dp):
+                                   gen_pp, gen_tp, gen_cp, enable_attention_dp,
+                                   disable_overlap_scheduler):
         # Parse comms_medium to get use_nccl_for_alltoall and fifo_version.
         if comms_medium == "nccl":
             use_nccl_for_alltoall = True
@@ -1166,7 +1169,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "use_nccl_for_alltoall": use_nccl_for_alltoall,
                 "fifo_version": fifo_version,
             },
-            "disable_overlap_scheduler": True,
+            "disable_overlap_scheduler": disable_overlap_scheduler,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
@@ -1853,6 +1856,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
+    # overlap_on is the regression guard for the helix x overlap-scheduler
+    # position_id off-by-one: generation batches are prepared one iteration
+    # ahead of py_decoding_iter, and an uncompensated helix position repeats
+    # once and corrupts the KV cache from the second decode step on. GSM8K
+    # fails hard without the compensation.
+    @pytest.mark.parametrize("disable_overlap_scheduler", [True, False],
+                             ids=["overlap_off", "overlap_on"])
     @pytest.mark.parametrize("gen_pp,gen_tp,gen_cp,enable_attention_dp", [
         (1, 2, 2, False),
         (1, 2, 2, True),
@@ -1867,34 +1877,16 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                              ids=["cudagraph:with_padding"])
     @pytest.mark.parametrize("comms_medium", ["fifo_v2"])
     def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
-                                   gen_pp, gen_tp, gen_cp, enable_attention_dp):
-        self._run_helix_test(comms_medium,
-                             cuda_graph_config,
-                             gen_pp,
-                             gen_tp,
-                             gen_cp,
-                             enable_attention_dp,
-                             disable_overlap_scheduler=True)
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
-    def test_auto_dtype_with_helix_overlap(self):
-        # Regression test for the helix x overlap-scheduler position_id
-        # off-by-one: with the overlap scheduler enabled, generation batches
-        # are prepared one iteration ahead of py_decoding_iter, and an
-        # uncompensated helix position repeats once and corrupts the KV
-        # cache from the second decode step on. GSM8K fails hard without
-        # the compensation.
-        self._run_helix_test(comms_medium="fifo_v2",
-                             cuda_graph_config={
-                                 "enable_padding": True,
-                                 "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
-                             },
-                             gen_pp=1,
-                             gen_tp=2,
-                             gen_cp=2,
-                             enable_attention_dp=False,
-                             disable_overlap_scheduler=False)
+                                   gen_pp, gen_tp, gen_cp, enable_attention_dp,
+                                   disable_overlap_scheduler):
+        self._run_helix_test(
+            comms_medium,
+            cuda_graph_config,
+            gen_pp,
+            gen_tp,
+            gen_cp,
+            enable_attention_dp,
+            disable_overlap_scheduler=disable_overlap_scheduler)
 
     @pytest.mark.skip_less_device(2)
     def test_gen_first(self):

@@ -5744,6 +5744,10 @@ class PyTorchModelEngine(ModelEngine):
                         # once (L, L, L+1, ...) and the new token's K is roped
                         # at the wrong position before being written to the KV
                         # cache, corrupting every later step.
+                        # TODO: revisit for helix x speculative decoding -
+                        # the base formula and this +1 both assume exactly
+                        # one new token per step (draft-token modes are
+                        # currently rejected under helix).
                         position_id += 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
