@@ -328,3 +328,97 @@ def test_cute_dsl_fmha_blockscaled_forward(
     out_ref = _sdpa_ref(q_bf16, k_bf16, v_bf16, is_causal, sm_scale)
     assert torch.isfinite(out).all(), "Block-scaled FMHA produced NaN / Inf"
     torch.testing.assert_close(out, out_ref, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    ("qk_sf_vec", "qk_cutlass_dtype_name"),
+    [
+        pytest.param(32, "Float8E4M3FN", id="mxfp8"),
+        pytest.param(16, "Float4E2M1FN", id="nvfp4"),
+    ],
+)
+@pytest.mark.parametrize(
+    "skip_softmax_threshold_scale_factor",
+    [
+        pytest.param(0.0, id="dense"),
+        pytest.param(0.3, id="skip_softmax"),
+    ],
+)
+def test_cute_dsl_fmha_blockscaled_forward_skip_softmax(
+    qk_sf_vec: int,
+    qk_cutlass_dtype_name: str,
+    skip_softmax_threshold_scale_factor: float,
+) -> None:
+    """SkipSoftmax composed with the block-scaled (MXFP8 / NVFP4) Q@K path.
+
+    SkipSoftmax approximates the dense softmax, so unlike
+    ``test_cute_dsl_fmha_blockscaled_forward`` this asserts cosine similarity
+    against the dense SDPA reference rather than a tight elementwise
+    tolerance, mirroring ``test_attention_trtllm_sage.py``'s skip_softmax
+    check for the TRTLLM backend.
+    """
+    _require_supported_gpu_arch()
+
+    device = torch.device("cuda:0")
+    batch_size, seq_len_q, seq_len_kv = 1, 512, 512
+    num_heads, num_heads_kv = 4, 2
+    head_dim = 128  # kernel-imposed for block-scaled MXFP8 / NVFP4
+    sm_scale = head_dim**-0.5
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+
+    q_bf16 = (
+        torch.randn(batch_size, seq_len_q, num_heads, head_dim, dtype=torch.bfloat16, device=device)
+        * 0.5
+    )
+    k_bf16 = (
+        torch.randn(
+            batch_size, seq_len_kv, num_heads_kv, head_dim, dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+    v_bf16 = (
+        torch.randn(
+            batch_size, seq_len_kv, num_heads_kv, head_dim, dtype=torch.bfloat16, device=device
+        )
+        * 0.5
+    )
+
+    q_q, q_sf, scale_q = _quantize_blockscaled_one(q_bf16, qk_sf_vec)
+    k_q, k_sf, scale_k = _quantize_blockscaled_one(k_bf16, qk_sf_vec)
+    v_q, scale_v, scale_v_channels = _quantize_fp8_v(v_bf16, per_head_channel=False)
+    qk_cutlass_dtype = getattr(cutlass, qk_cutlass_dtype_name)
+
+    out = torch.empty(
+        batch_size, seq_len_q, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    lse = torch.empty(batch_size, seq_len_q, num_heads, dtype=torch.float32, device=device)
+
+    cute_dsl_fmha_fwd(
+        q_q,
+        k_q,
+        v_q,
+        out,
+        is_causal=False,
+        scale_v=scale_v,
+        scale_v_channels=scale_v_channels,
+        sm_scale=sm_scale,
+        lse=lse,
+        scale_q=scale_q,
+        scale_k=scale_k,
+        qk_sf_vec=qk_sf_vec,
+        q_sf=q_sf,
+        k_sf=k_sf,
+        qk_cutlass_dtype=qk_cutlass_dtype,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    )
+    torch.cuda.synchronize()
+
+    out_ref = _sdpa_ref(q_bf16, k_bf16, v_bf16, is_causal=False, sm_scale=sm_scale)
+    assert torch.isfinite(out).all(), "SkipSoftmax block-scaled FMHA produced NaN / Inf"
+
+    cos_sim = F.cosine_similarity(
+        out.reshape(-1).float(), out_ref.reshape(-1).float(), dim=0
+    ).item()
+    assert cos_sim > 0.990, f"Cosine similarity {cos_sim:.6f} below threshold"
