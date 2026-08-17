@@ -99,7 +99,9 @@ Run the TP=2 rank-mapping qualification on four GPUs by selecting
 checkpoint path. `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model,
 or NIXL prerequisites from skips into failures and must be set by a CI
 qualification stage. That stage must also allocate the GPUs declared by the
-selected test row.
+selected test row. `TRTLLM_MX_E2E_TIMEOUT_S` controls the 1200-second timeout
+used for the baseline worker, receiver worker, and donor-readiness wait;
+increase it for slow model storage or startup.
 
 The dedicated H100 CI stages own isolated Redis and ModelExpress 0.4.1
 sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs

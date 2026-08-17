@@ -3153,7 +3153,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     def nodeLabelPrefix = ""
     def tolerations = ""
     def extraDeviceEnv = ""
-    def serviceInitContainerConfig = ""
     def serviceContainerConfig = ""
 
     def archSuffix = arch == "arm64" ? "arm" : "amd"
@@ -3482,7 +3481,6 @@ ${blockedNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
-${serviceInitContainerConfig}
                 containers:
                   ${containerConfig}
                     env:
