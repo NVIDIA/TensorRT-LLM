@@ -32,11 +32,8 @@ from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
 from tensorrt_llm.serve.visual_gen_metrics import build_visual_gen_timing_headers
-from tensorrt_llm.serve.visual_gen_utils import (
-    VIDEO_STORE,
-    cleanup_reference_files,
-    parse_visual_gen_params,
-)
+from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
+from tensorrt_llm.visual_gen.media_refs import cleanup_reference_files
 
 if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
