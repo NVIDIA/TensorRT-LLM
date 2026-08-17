@@ -1742,18 +1742,16 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
 
 
 @pytest.mark.parametrize(
-    ("architecture", "one_model", "expected"),
+    ("architecture", "expected"),
     [
-        ("Gemma4ForCausalLM", True, True),
-        ("Gemma4ForConditionalGeneration", False, False),
-        ("LlamaForCausalLM", True, False),
+        ("Gemma4ForCausalLM", True),
+        ("LlamaForCausalLM", False),
     ],
 )
-def test_mtp_shared_kv_config(architecture, one_model, expected):
+def test_mtp_shared_kv_config(architecture, expected):
     spec_config = MTPDecodingConfig(
         max_draft_len=3,
         speculative_model="/tmp/assistant",
-        mtp_eagle_one_model=one_model,
     )
     model_config = SimpleNamespace(
         architectures=[architecture],

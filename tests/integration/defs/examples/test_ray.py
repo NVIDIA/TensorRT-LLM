@@ -1,10 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import asyncio
+import json
 import os
 import subprocess
+
+import aiohttp
 
 try:
     import ray
 except ImportError:
-    import tensorrt_llm.ray_stub as ray
+    import tensorrt_llm.executor.ray.stub as ray
 
 import pytest
 from defs.common import venv_check_call, wait_for_server
@@ -62,8 +69,17 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
 def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
-    if tp_size == 1:
-        pytest.skip("https://nvbugs/5682551")
+    _run_ray_disaggregated_serving(ray_example_root, tp_size, "NIXL", "CPP")
+
+
+@pytest.mark.skip_less_device(2)
+@pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
+def test_ray_disaggregated_serving_python(ray_example_root, llm_venv, tp_size):
+    _run_ray_disaggregated_serving(ray_example_root, tp_size, "NIXL", "PYTHON")
+
+
+def _run_ray_disaggregated_serving(ray_example_root, tp_size,
+                                   transceiver_backend, transceiver_runtime):
 
     if get_device_count() < tp_size * 2:
         pytest.skip(f"Need {tp_size * 2} GPUs.")
@@ -94,7 +110,8 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
             [
                 "bash", script_path, "--executor", "ray", "--attach", "--model",
                 model_dir, "--tp_size",
-                str(tp_size)
+                str(tp_size), "--transceiver_backend", transceiver_backend,
+                "--transceiver_runtime", transceiver_runtime
             ],
                 cwd=disagg_dir,
                 stdout=subprocess.PIPE,
@@ -104,24 +121,80 @@ def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
             assert wait_for_server("localhost", 8000, timeout_seconds=180), \
                 "Disaggregated server failed to start within 3 minutes"
 
-            result = subprocess.run([
-                "curl", "-sS", "-w", "\n%{http_code}",
-                "http://localhost:8000/v1/completions", "-H",
-                "Content-Type: application/json", "-d",
-                '{"model":"TinyLlama-1.1B-Chat-v1.0","prompt":"NVIDIA is a great company because","max_tokens":16,"temperature":0}'
-            ],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=30)
-
-            *body_lines, status_line = result.stdout.strip().splitlines()
-            body = "\n".join(body_lines)
-            status = int(status_line)
-
-            print("HTTP status:", status)
-            print("Response body:", body)
-
-            assert result.returncode == 0, f"curl exit {result.returncode}"
-            assert status == 200, f"Expected 200, got {status}"
+            _run_completion_requests()
     finally:
         ray.shutdown()
+
+
+def _run_completion_requests():
+    prompts = [
+        "What is the capital of Germany?",
+        "Explain the theory of relativity.",
+        "What are the benefits of using asyncio in Python?",
+        "Describe the process of photosynthesis.",
+        "How does a blockchain work?",
+    ]
+    max_tokens = 32
+
+    async def send_request(session, prompt):
+        payload = {
+            "model": "TinyLlama-1.1B-Chat-v1.0",
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "ignore_eos": True,
+        }
+        async with session.post("http://localhost:8000/v1/completions",
+                                json=payload) as response:
+            response_text = await response.text()
+            assert response.status == 200, (
+                f"Completion request failed with HTTP {response.status}: "
+                f"{response_text}")
+            return json.loads(response_text)
+
+    async def run_requests():
+        timeout = aiohttp.ClientTimeout(total=60)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            return await asyncio.gather(
+                *[send_request(session, prompt) for prompt in prompts])
+
+    responses = asyncio.run(run_requests())
+    response_ids = set()
+    generated_texts = []
+    for index, response in enumerate(responses):
+        choices = response.get("choices") or []
+        assert choices, f"Request {index} has no choices: {response}"
+
+        choice = choices[0]
+        text = choice.get("text") or ""
+        assert text.strip(), f"Request {index} returned empty text: {response}"
+        assert choice.get("finish_reason") == "length", (
+            f"Request {index} has unexpected finish reason: {response}")
+        assert choice.get("disaggregated_params") is not None, (
+            f"Request {index} is missing disaggregated metadata: {response}")
+
+        usage = response.get("usage") or {}
+        assert usage.get("completion_tokens") == max_tokens, (
+            f"Request {index} completion_tokens mismatch: "
+            f"got={usage.get('completion_tokens')} expected={max_tokens}")
+        assert usage.get("total_tokens") == (
+            usage.get("prompt_tokens", 0) +
+            max_tokens), (f"Request {index} has inconsistent usage: {usage}")
+
+        response_id = response.get("id")
+        assert response_id, f"Request {index} is missing response id: {response}"
+        assert response_id not in response_ids, (
+            f"Request {index} reused response id {response_id}")
+        response_ids.add(response_id)
+        generated_texts.append(text)
+        print(f"Request {index} response: {text}")
+
+    content = "\n".join(generated_texts)
+    for expected_string in [
+            "The capital of Germany is Berlin",
+            "Asyncio is a Python library",
+    ]:
+        assert expected_string in content, (
+            f"Expected string {expected_string!r} not found in responses")
+    assert "Berlin Berlin" not in content, (
+        "Unexpected string 'Berlin Berlin' found in responses")

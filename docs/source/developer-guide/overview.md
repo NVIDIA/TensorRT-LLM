@@ -122,3 +122,32 @@ export TLLM_LOG_LEVEL_BY_MODULE="debug:_torch,runtime;info:serve"
 ```
 
 This example sets the global level to `warning` but enables `debug` output for `_torch` and `runtime` modules, and `info` for `serve`. Valid levels: `trace`, `debug`, `verbose`, `info`, `warning`, `error`, `internal_error`.
+
+## Multi-Rank Crash Handling
+
+When one rank's executor loop dies in a multi-rank job, the peer ranks have
+nothing to fail on: they sit in a collective waiting for a rank that will never
+arrive. Left alone they hold every GPU in the job until an external wall-clock
+kill.
+
+To avoid that, a rank whose executor loop crashes tears the whole job down
+(`MPI_Abort`, falling back to self-`SIGKILL`) after a short grace period. The
+grace exists so cleaner paths can win the race: if the crash is reported to a
+client first — the caller gets the real traceback — the kill stands down, so a
+symmetric crash still ends in N tracebacks rather than a bare exit 137.
+
+**This is on by default for multi-rank runs.** Single-rank runs are unaffected;
+there are no peers to strand.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TLLM_RANK_CRASH_HARD_KILL_GRACE` | `10` | Seconds to wait before killing the job. `0` kills immediately. Any negative value (e.g. `-1`) **disables** the kill entirely — peers then fall back to the hang detector. Unparsable and non-finite values (`nan`, `inf`) fall back to the default. |
+
+```bash
+# Opt out: let the hang detector handle it instead (slower, but no world kill).
+export TLLM_RANK_CRASH_HARD_KILL_GRACE=-1
+```
+
+Use the escape hatch when you would rather have peer ranks reach their own
+timeouts — for example when attaching a debugger to a surviving rank, or when a
+harness collects per-rank state that a job-wide abort would destroy.

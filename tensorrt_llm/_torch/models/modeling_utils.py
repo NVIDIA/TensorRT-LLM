@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
+import importlib
 import inspect
 import math
 import os
@@ -32,6 +33,7 @@ from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
+from ._arch_index import MODEL_ARCH_TO_MODULE, is_builtin_zoo_module
 
 
 @contextlib.contextmanager
@@ -664,6 +666,23 @@ class DecoderModelForCausalLM(nn.Module,
         return {}
 
     @classmethod
+    def get_preferred_kv_cache_manager_version(
+            cls,
+            pretrained_config: Any = None) -> Optional[Literal["V1", "V2"]]:
+        """Return the model's preferred KV cache manager version.
+
+        The preference is adopted only when the user leaves
+        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Return
+        ``None`` to use the built-in V1 fallback.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config. Shared model
+                implementations can inspect it to select a preference for the
+                original checkpoint architecture.
+        """
+        return None
+
+    @classmethod
     def get_preferred_transceiver_runtime(
             cls,
             pretrained_config: Any = None
@@ -849,13 +868,113 @@ MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
 CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING = {}
 
 
+# Registration priority under lazy loading: on main the built-in zoo imported
+# first and external code (--custom_module_dirs, user modules) overrode it
+# later. With the zoo imported lazily, built-in modules may run their
+# decorators *after* an external registration, so every registry applies one
+# rule: built-in registrations only fill empty slots, never overwrite.
+# Anything already present outranks a built-in — it is either an external
+# registration (which must keep its main-order priority) or another built-in
+# (no architecture is double-registered among built-ins, so filling empty
+# slots is equivalent to main). External registrations always overwrite.
+def _is_builtin_model_class(cls) -> bool:
+    return is_builtin_zoo_module(getattr(cls, "__module__", ""))
+
+
+# Architecture names each decorated class declared via ``register_auto_model``,
+# kept per class (``cls.__dict__``, never inherited). Recorded even when the
+# class loses the ``MODEL_CLASS_MAPPING`` slot to an external registration, so
+# stacked decorators (``register_vision_encoder``) can still map the class to
+# its architectures instead of scanning the mapping by identity.
+_REGISTERED_ARCHS_ATTR = "_registered_architectures"
+
+
 def register_auto_model(name: str):
 
     def decorator(cls):
+        archs = cls.__dict__.get(_REGISTERED_ARCHS_ATTR)
+        if archs is None:
+            archs = set()
+            setattr(cls, _REGISTERED_ARCHS_ATTR, archs)
+        archs.add(name)
+
+        existing = MODEL_CLASS_MAPPING.get(name)
+        if (existing is not None and existing is not cls
+                and _is_builtin_model_class(cls)):
+            logger.info(
+                f"Keeping existing registration "
+                f"{existing.__module__}.{existing.__name__} for architecture "
+                f"{name}; built-in {cls.__module__}.{cls.__name__} not "
+                f"registered.")
+            return cls
         MODEL_CLASS_MAPPING[name] = cls
         return cls
 
     return decorator
+
+
+def _ensure_model_registered(model_arch: str) -> None:
+    """Import the module that provides ``model_arch``, if it isn't loaded yet.
+
+    Model implementations register themselves in ``MODEL_CLASS_MAPPING`` (and
+    the sibling registries) as an import side effect. With the model zoo
+    imported lazily, this is the hook that turns an architecture name into
+    "the decorators have run". Architectures missing from the static index
+    (e.g. registered dynamically by user code) are left to the caller's
+    normal missing-architecture handling.
+
+    Internal: consumers go through ``get_registered_model_class`` /
+    ``get_registered_vision_encoder`` instead of pairing this with a raw
+    registry read. Each resolver short-circuits on *its own* registry only:
+    an external registration satisfies the model-class lookup without
+    importing the built-in provider, but a lookup in a sibling registry
+    (vision encoder, placeholder metadata) still triggers the import when
+    its slot is empty. Priority on that import is enforced inside each
+    registration decorator; the import itself is idempotent via
+    ``sys.modules``.
+    """
+    module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+    if module_name is None:
+        return
+    full_name = f"tensorrt_llm._torch.models.{module_name}"
+    try:
+        importlib.import_module(full_name)
+    except ModuleNotFoundError as e:
+        # Only swallow "the providing module itself is missing" (stale index
+        # entry); a missing dependency *inside* the module is a real error
+        # and must not be masked as "unknown architecture".
+        if e.name != full_name:
+            raise
+        logger.warning(f"Lazy import of {module_name} for architecture "
+                       f"{model_arch} failed: {e!r}")
+
+
+def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
+    """Resolve ``model_arch`` to its registered model class, or ``None``.
+
+    The single entry point for architecture lookups: the model zoo is
+    imported lazily, so this resolves the built-in provider on demand before
+    reading the registry. Do not read ``MODEL_CLASS_MAPPING`` directly for
+    lookups — a raw ``.get()`` silently misses every not-yet-imported
+    built-in model.
+    """
+    if model_arch not in MODEL_CLASS_MAPPING:
+        _ensure_model_registered(model_arch)
+    return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def get_registered_vision_encoder(
+        model_arch: str) -> Optional[Tuple[Type[nn.Module], Optional[Type]]]:
+    """Resolve ``model_arch`` to its ``(vision_encoder_cls, vlm_base_model)``.
+
+    Same on-demand resolution as ``get_registered_model_class``, for the
+    vision-encoder sibling registry: the provider import triggers when
+    *this* registry misses, even if an external class holds the
+    model-class slot.
+    """
+    if model_arch not in MODEL_CLASS_VISION_ENCODER_MAPPING:
+        _ensure_model_registered(model_arch)
+    return MODEL_CLASS_VISION_ENCODER_MAPPING.get(model_arch)
 
 
 def register_vision_encoder(
@@ -874,17 +993,34 @@ def register_vision_encoder(
     """
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
-        registered = False
-        for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
-            if registered_cls is model_cls:
-                MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
-                    vision_encoder_cls, vlm_base_model)
-                registered = True
-        if not registered:
+        # The architectures this class declared via register_auto_model. Do
+        # not scan MODEL_CLASS_MAPPING by identity: a built-in class may have
+        # lost its mapping slot to an external registration, and its module
+        # must still import cleanly.
+        archs = model_cls.__dict__.get(_REGISTERED_ARCHS_ATTR)
+        if not archs:
+            # Fallback for classes placed into the mapping directly instead
+            # of via the register_auto_model decorator.
+            archs = {
+                arch_name
+                for arch_name, registered_cls in MODEL_CLASS_MAPPING.items()
+                if registered_cls is model_cls
+            }
+        if not archs:
             raise ValueError(
                 f"register_vision_encoder: model class {model_cls.__name__} is not registered "
                 f"via register_auto_model; decorator order must ensure registration occurs first."
             )
+        for arch_name in archs:
+            if (arch_name in MODEL_CLASS_VISION_ENCODER_MAPPING
+                    and _is_builtin_model_class(model_cls)):
+                # Built-in registrations only fill empty slots (see the
+                # priority rule above register_auto_model).
+                logger.info(f"Keeping existing vision encoder registration for "
+                            f"architecture {arch_name}.")
+                continue
+            MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (vision_encoder_cls,
+                                                             vlm_base_model)
 
         return model_cls
 
@@ -956,7 +1092,7 @@ def get_model_architecture(
     cls = None
     if model_config.architectures is not None and len(
             model_config.architectures) > 0:
-        cls = MODEL_CLASS_MAPPING.get(model_config.architectures[0])
+        cls = get_registered_model_class(model_config.architectures[0])
     else:
         raise RuntimeError("Model architecture is not provided.")
 

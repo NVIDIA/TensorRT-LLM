@@ -139,6 +139,7 @@ class FP8MLP(nn.Module):
         pytest.param(576, 4, 128, id="non_aligned_uneven_n-N576-ws4"),
     ],
 )
+@pytest.mark.cpu_only
 def test_finegrained_fp8_get_sharded_scale(weight_original_n, world_size, block_n):
     """Tests FineGrained FP8 scale sharding for all shard boundary cases.
 
@@ -481,6 +482,7 @@ class SymbolicShapeView(nn.Module):
         return torch.ops.aten.view.default(x, (b, s, 32, 128))
 
 
+@pytest.mark.cpu_only
 def test_update_node_args_preserves_nested_symbolic_shape_nodes():
     gm = torch.fx.symbolic_trace(SymbolicShapeView())
     view_node = next(node for node in gm.graph.nodes if is_op(node, [torch.ops.aten.view]))

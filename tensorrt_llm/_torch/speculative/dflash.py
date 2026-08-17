@@ -27,10 +27,38 @@ from tensorrt_llm.mapping import Mapping
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
+from .accept_stats import maybe_create_recorder
+from .dflash_attention import get_dflash_trtllm_gen_ops, validate_dflash_trtllm_gen_runtime
 from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
+
+
+def dflash_draft_slot_ids(
+    num_gens: int,
+    block_size: int,
+    num_draft_tokens: int,
+    shift_label: bool,
+    device="cuda",
+) -> torch.Tensor:
+    """Flat indices into the [num_gens * block_size] drafter block outputs
+    whose hidden states produce the K draft-token logits per request.
+
+    Plain DFlash (K2.7 convention, shift_label off): the hidden state at
+    mask slot j (j = 1..K) predicts draft token j; slot 0 (which holds the
+    anchor/bonus token) is unused.
+
+    DSpark shift_label convention (DeepSpec: labels for a block anchored at
+    position p are input_ids[p+1 .. p+block_size], so the hidden state at
+    block slot j predicts the token at position p+1+j): slots 0..K-1 are
+    used, and slot 0 — the anchor token slot — predicts the first draft
+    token.
+    """
+    request_bases = torch.arange(num_gens, dtype=torch.long, device=device) * block_size
+    offsets = torch.arange(num_draft_tokens, dtype=torch.long, device=device)
+    first_slot = 0 if shift_label else 1
+    return (request_bases.unsqueeze(1) + first_slot + offsets.unsqueeze(0)).flatten()
 
 
 @dataclass
@@ -186,11 +214,29 @@ class DFlashWorker(SpecWorkerBase):
         self._max_ctx = 0
         self._ctx_k_buf = None  # [max_batch+1, L, max_ctx+block, nkv, hd]
         self._ctx_v_buf = None
+        self._ctx_kv_buf = None
+        self._ctx_page_table = None
+        self._ctx_kv_indptr = None
+        self._ctx_kv_last_page_len = None
+        self._ctx_page_size = 32
+        self._ctx_pages_per_slot = 0
+        self._dflash_attention_backend = spec_config.attention_backend
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
         self._dummy_slot = None  # for cudagraph padding or warmup dummy requests
+
+        # Opt-in acceptance-statistics recorder (None unless
+        # TLLM_DFLASH_ACCEPT_STATS_DIR is set; see accept_stats.py). Only
+        # consulted behind `is not None` checks — zero overhead when off.
+        self._accept_stats = maybe_create_recorder(
+            spec_config.max_draft_len, getattr(mapping, "rank", 0) or 0
+        )
+        if self._accept_stats is not None:
+            logger.info(
+                f"DFlash: acceptance-statistics recording enabled -> {self._accept_stats.path}"
+            )
 
         logger.info(
             f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
@@ -211,7 +257,25 @@ class DFlashWorker(SpecWorkerBase):
         """
         return self.max_draft_len + 1
 
+    def _validate_draft_attention_backend(self, draft_model) -> None:
+        draft_model_dflash_attention_backend = getattr(
+            draft_model, "dflash_attention_backend", None
+        )
+        if draft_model_dflash_attention_backend is None:
+            raise ValueError("DFlash draft model is missing dflash_attention_backend.")
+        if draft_model_dflash_attention_backend != self._dflash_attention_backend:
+            raise ValueError(
+                "DFlash worker and draft model attention backends must match; "
+                f"worker={self._dflash_attention_backend}, "
+                f"model={draft_model_dflash_attention_backend}."
+            )
+
+    def set_draft_model(self, draft_model) -> None:
+        super().set_draft_model(draft_model)
+        self._validate_draft_attention_backend(draft_model)
+
     def _lazy_init_ctx_buffers(self, draft_model, spec_metadata, attn_metadata):
+        self._validate_draft_attention_backend(draft_model)
         if self._ctx_buf_inited:
             return
 
@@ -248,24 +312,91 @@ class DFlashWorker(SpecWorkerBase):
             self.max_draft_len + 1
         )
 
-        # +block_size slack lets per-iter noise K/V scatter into the gathered
-        # view and flash_attn read it in place.
+        # +block_size slack lets each backend append the per-iteration noise
+        # K/V after the accumulated request context.
         assert hasattr(draft_model, "_build_fused_kv_buffers"), (
             "DFlash draft model must define _build_fused_kv_buffers."
         )
         draft_model._build_fused_kv_buffers()
         L = draft_model._num_attn_layers
+        nh = draft_model._num_heads
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
-        kv_shape = (num_slots, L, self._max_ctx + self._resolved_block_size, nkv, hd)
-        self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
-        self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
+        capacity = self._max_ctx + self._resolved_block_size
+        if self._dflash_attention_backend == "TRTLLM":
+            page_size = self._ctx_page_size
+            has_context_attention = any(
+                not draft_model._get_attention_mask_args(layer_idx)[0] for layer_idx in range(L)
+            )
+            validate_dflash_trtllm_gen_runtime(
+                dtype=dtype,
+                num_heads=nh,
+                num_kv_heads=nkv,
+                head_dim=hd,
+                tokens_per_block=page_size,
+                has_context_attention=has_context_attention,
+            )
+            self._ctx_pages_per_slot = (capacity + page_size - 1) // page_size
+            total_pages = num_slots * self._ctx_pages_per_slot
+            # HND layout consumed by both FlashInfer's paged append and the
+            # TRTLLM-Gen launcher: [L, pages, K/V, Hkv, page, D].
+            self._ctx_kv_buf = torch.zeros(
+                (L, total_pages, 2, nkv, page_size, hd),
+                dtype=dtype,
+                device="cuda",
+            )
+            self._ctx_page_table = torch.arange(total_pages, dtype=torch.int32, device="cuda").view(
+                num_slots, self._ctx_pages_per_slot
+            )
+            self._ctx_kv_indptr = torch.arange(
+                0,
+                total_pages + 1,
+                self._ctx_pages_per_slot,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            self._ctx_kv_last_page_len = torch.full(
+                (num_slots,), page_size, dtype=torch.int32, device="cuda"
+            )
+        else:  # VANILLA DFlash backend (FlashAttention)
+            kv_shape = (num_slots, L, capacity, nkv, hd)
+            self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
+            self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_buf_inited = True
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
-            f"max_ctx={self._max_ctx}, dtype={dtype}"
+            f"max_ctx={self._max_ctx}, dtype={dtype}, "
+            f"dflash_attention_backend={self._dflash_attention_backend}"
         )
+
+    def _store_context_kv_paged(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        slots: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        trtllm_gen_ops = get_dflash_trtllm_gen_ops()
+
+        # Convert at most once and reuse for every layer. Calling ``.to()`` in
+        # the op call would allocate converted tensors once per layer when the
+        # inputs are not already int32.
+        slots_i32 = slots.to(torch.int32)
+        positions_i32 = positions.to(torch.int32)
+        kv_indices = self._ctx_page_table.flatten().contiguous()
+        for layer_idx in range(k.size(1)):
+            trtllm_gen_ops.append_paged_kv_cache(
+                append_key=k[:, layer_idx].contiguous(),
+                append_value=v[:, layer_idx].contiguous(),
+                batch_indices=slots_i32,
+                positions=positions_i32,
+                paged_kv_cache=self._ctx_kv_buf[layer_idx],
+                kv_indices=kv_indices,
+                kv_indptr=self._ctx_kv_indptr,
+                kv_last_page_len=self._ctx_kv_last_page_len,
+                kv_layout="HND",
+            )
 
     def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
         """Save attn_metadata fields that DFlash modifies during forward."""
@@ -375,7 +506,12 @@ class DFlashWorker(SpecWorkerBase):
             end = min(cur + slen, self._max_ctx)
             actual = end - cur
             if actual > 0:
-                chunk_proj_cast = chunk_proj[:actual].to(self._ctx_k_buf.dtype)
+                cache_dtype = (
+                    self._ctx_kv_buf.dtype
+                    if self._dflash_attention_backend == "TRTLLM"
+                    else self._ctx_k_buf.dtype
+                )
+                chunk_proj_cast = chunk_proj[:actual].to(cache_dtype)
                 self._ctx_len[slot] = end
                 # Precompute post-norm/post-RoPE K,V for this prefill chunk
                 # so decode iters can read without re-projecting.
@@ -383,8 +519,16 @@ class DFlashWorker(SpecWorkerBase):
                     chunk_proj_cast, chunk_pos[:actual]
                 )
                 # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
-                self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
-                self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
+                if self._dflash_attention_backend == "TRTLLM":
+                    self._store_context_kv_paged(
+                        chunk_k,
+                        chunk_v,
+                        torch.full((actual,), slot, dtype=torch.long, device="cuda"),
+                        torch.arange(cur, end, dtype=torch.long, device="cuda"),
+                    )
+                else:  # VANILLA DFlash backend (FlashAttention)
+                    self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
+                    self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
@@ -460,6 +604,21 @@ class DFlashWorker(SpecWorkerBase):
             logits, attn_metadata, spec_metadata
         )
 
+        # Opt-in acceptance recording (env-gated; eager-mode measurement
+        # runs only). Skipped for CUDA-graph batches (capture/replay/warmup
+        # use synthetic requests and forbid the host sync).
+        if (
+            self._accept_stats is not None
+            and num_gens > 0
+            and not spec_metadata.is_cuda_graph
+            and not torch.cuda.is_current_stream_capturing()
+            and spec_metadata.request_ids is not None
+        ):
+            self._accept_stats.on_accept(
+                spec_metadata.request_ids[num_contexts:batch_size],
+                num_accepted_tokens[num_contexts:batch_size].tolist(),
+            )
+
         # Update GDN/Mamba recurrent states to the accepted token's state.
         if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
             attn_metadata.kv_cache_manager.update_mamba_states(
@@ -523,15 +682,19 @@ class DFlashWorker(SpecWorkerBase):
                     ctx_k_cache=inputs["ctx_k_cache"],
                     ctx_v_cache=inputs["ctx_v_cache"],
                     ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
+                    ctx_kv_cache=inputs["ctx_kv_cache"],
+                    ctx_page_table=inputs["ctx_page_table"],
                 )
 
-                # Gather K logits per gen request from mask positions (1..K).
-                # hidden_states_out is flat: [num_gens * block_size, hidden_dim]
+                # Gather K logits per gen request from the block outputs.
+                # hidden_states_out is flat: [num_gens * block_size, hidden_dim].
+                # Plain DFlash reads mask slots 1..K; dspark shift_label reads
+                # slots 0..K-1 (see dflash_draft_slot_ids).
                 block_size = self._resolved_block_size
-                request_bases = torch.arange(num_gens, dtype=torch.long, device="cuda") * block_size
-                offsets = torch.arange(K, dtype=torch.long, device="cuda")
-                # Masks are at positions 1..K in each request's block_size output
-                gen_gather_ids = (request_bases.unsqueeze(1) + 1 + offsets.unsqueeze(0)).flatten()
+                shift_label = getattr(draft_model, "_dspark_shift_label", False)
+                gen_gather_ids = dflash_draft_slot_ids(
+                    num_gens, block_size, K, shift_label, device="cuda"
+                )
                 gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
 
                 gen_logits = draft_model.logits_processor(
@@ -541,12 +704,41 @@ class DFlashWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
+                # DSpark Markov head: add the greedy-chained intra-block
+                # logit bias before sampling (no-op for plain DFlash).
+                if getattr(draft_model, "has_markov_head", False):
+                    gen_logits = self._apply_dspark_markov_bias(
+                        draft_model, gen_logits, inputs["first_prev_tokens"], spec_metadata
+                    )
+
                 gen_draft_tokens = self.sample_draft_tokens(
                     gen_logits,
                     spec_metadata,
                     batch_size,
                     num_contexts=num_contexts,
                 )
+
+                # Opt-in confidence-calibration recording (env-gated). The
+                # confidence values come from an optional provider on the
+                # recorder (None here -> no calibration rows collected; the
+                # DSpark confidence-scheduled verification MR supplies the
+                # real provider, see accept_stats.py). Guarded off for
+                # CUDA-graph batches and d2t vocab-mapped drafters.
+                if (
+                    self._accept_stats is not None
+                    and self._accept_stats.confidence_provider is not None
+                    and not spec_metadata.is_cuda_graph
+                    and not torch.cuda.is_current_stream_capturing()
+                    and spec_metadata.request_ids is not None
+                    and self._d2t is None
+                ):
+                    self._accept_stats.record_draft_confidence(
+                        spec_metadata.request_ids[num_contexts:batch_size],
+                        draft_model,
+                        hidden_states_out[gen_gather_ids].reshape(num_gens, K, -1),
+                        inputs["first_prev_tokens"],
+                        gen_draft_tokens,
+                    )
 
         else:
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
@@ -588,6 +780,61 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _apply_dspark_markov_bias(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        spec_metadata,
+    ) -> torch.Tensor:
+        """Apply the dspark vanilla-Markov intra-block bias to block logits.
+
+        Reference (DeepSpec VanillaMarkov.sample_block_tokens, temperature 0):
+        step i adds bias = markov_w2 @ markov_w1[prev_i] to the shared-lm_head
+        logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
+        is the greedy token from step i-1's biased logits. Greedy per-position
+        argmax of the returned logits therefore reproduces the reference
+        sampled chain; the rejection-sampling path samples from the same
+        biased distributions (proposal conditioned on the greedy chain).
+
+        Handles a TP vocab-sharded draft lm_head by slicing markov_w2's rows
+        to this rank's contiguous shard and chaining through the TP-aware
+        global argmax.
+        """
+        if self._d2t is not None:
+            raise NotImplementedError(
+                "DSpark Markov head requires a shared draft/target vocab "
+                "(d2t vocab mapping is not supported)."
+            )
+        full_vocab = draft_model.markov_w2.shape[0]
+        shard = gen_logits.shape[-1]
+        vocab_slice = None
+        if shard != full_vocab:
+            mapping = self.mapping
+            if (
+                mapping is None
+                or getattr(mapping, "enable_attention_dp", False)
+                or shard * mapping.tp_size != full_vocab
+            ):
+                raise NotImplementedError(
+                    f"DSpark Markov head: draft logits width {shard} does not "
+                    f"match the drafter vocab {full_vocab} and is not a plain "
+                    "TP column shard of it."
+                )
+            vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
+
+        def argmax_fn(step_logits):
+            # Full-vocab token ids (TP-aware when sharded); tokens stay in
+            # draft-vocab space, which is what markov_w1 indexes.
+            return self.greedy_sample_draft_with_tp_gather(step_logits, spec_metadata).long()
+
+        return draft_model.apply_markov_chain_logits(
+            gen_logits,
+            first_prev_tokens,
+            argmax_fn=argmax_fn,
+            vocab_slice=vocab_slice,
+        )
 
     def prepare_1st_drafter_inputs(
         self,
@@ -710,16 +957,24 @@ class DFlashWorker(SpecWorkerBase):
 
                 # Fast path: store the pre-projected/pre-RoPE'd K/V.
                 # dflash_forward reads these directly via cache_batch_idx.
+                cache_dtype = (
+                    self._ctx_kv_buf.dtype
+                    if self._dflash_attention_backend == "TRTLLM"
+                    else self._ctx_k_buf.dtype
+                )
                 k_new, v_new = draft_model.precompute_context_kv(
-                    proj_flat.to(self._ctx_k_buf.dtype), pos_flat
+                    proj_flat.to(cache_dtype), pos_flat
                 )
                 mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
                 k_new.mul_(mask_bc)
                 v_new.mul_(mask_bc)
                 slot_long = slot_flat.long()
                 col_long = col_flat.long()
-                self._ctx_k_buf[slot_long, :, col_long] = k_new
-                self._ctx_v_buf[slot_long, :, col_long] = v_new
+                if self._dflash_attention_backend == "TRTLLM":
+                    self._store_context_kv_paged(k_new, v_new, slot_long, col_long)
+                else:  # VANILLA DFlash backend (FlashAttention)
+                    self._ctx_k_buf[slot_long, :, col_long] = k_new
+                    self._ctx_v_buf[slot_long, :, col_long] = v_new
 
                 self._ctx_len[slots] += gen_num_accepted_long
                 self._ctx_len.clamp_(max=self._max_ctx)
@@ -739,6 +994,7 @@ class DFlashWorker(SpecWorkerBase):
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
             num_ctx_per_req_t = torch.empty(0, dtype=torch.long, device="cuda")
             slots = torch.empty(0, dtype=torch.long, device="cuda")
+            bonus = torch.empty(0, dtype=torch.long, device="cuda")
 
         return {
             "noise_embedding": noise_embedding,
@@ -747,4 +1003,9 @@ class DFlashWorker(SpecWorkerBase):
             "ctx_k_cache": self._ctx_k_buf,
             "ctx_v_cache": self._ctx_v_buf,
             "ctx_cache_batch_idx": slots,
+            # Anchor token per gen request (block slot 0): last accepted
+            # token. The dspark Markov chain conditions its first step on it.
+            "first_prev_tokens": bonus,
+            "ctx_kv_cache": self._ctx_kv_buf,
+            "ctx_page_table": self._ctx_page_table,
         }

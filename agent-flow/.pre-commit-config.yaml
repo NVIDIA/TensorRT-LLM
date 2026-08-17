@@ -1,0 +1,41 @@
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+-   repo: https://github.com/Lucas-C/pre-commit-hooks.git
+    rev: v1.5.5
+    hooks:
+    -   id: remove-crlf
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    -   id: check-added-large-files
+    -   id: check-merge-conflict
+    -   id: check-symlinks
+    -   id: detect-private-key
+    -   id: end-of-file-fixer
+    -   id: check-yaml
+        args: [--allow-multiple-documents, --unsafe]
+        exclude: ".*/gitlab/.*.yml"
+    -   id: trailing-whitespace
+        exclude: '(\.(patch|md))$'
+    -   id: check-toml
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+    -   id: codespell
+        additional_dependencies:
+        - tomli
+        # add ignore words list
+        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,indx,therefrom", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*"]
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.4
+    hooks:
+    -   id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+    -   id: ruff-format
+-   repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.17
+    hooks:
+    -   id: mdformat
+        additional_dependencies:
+        - mdformat_frontmatter
+        files: ".*/auto_deploy/.*"
