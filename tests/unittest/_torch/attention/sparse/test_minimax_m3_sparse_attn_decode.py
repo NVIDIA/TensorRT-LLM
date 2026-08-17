@@ -39,9 +39,9 @@ skip_not_sm100 = pytest.mark.skipif(
 def _flat_page_table(block_table: torch.Tensor, kv_lens_cpu: torch.Tensor) -> torch.Tensor:
     """Flatten a block table into the per-request page ids fmha_sm100 consumes.
 
-    build_kv_page_indices reads the ids out of a token-level slot map, so
-    rebuild the map this block table implies rather than reimplementing the
-    flattening the production path uses.
+    build_kv_page_indices reads those ids out of a token-level slot map, so this
+    rebuilds the map the block table implies and lets the production helper do
+    the flattening.
     """
     batch, max_pages = block_table.shape
     intra = torch.arange(PAGE_SIZE, dtype=torch.int32)
@@ -132,6 +132,11 @@ def _make_inputs(
     topk=MSA_REQUIRED_TOPK,
     seed=0,
 ):
+    """Build (q, k_paged, v_paged, topk_idx, block_table, seq_lens), in that order.
+
+    The order matches both the kernel wrapper and the oracle, so a test can
+    splat the tuple into either.
+    """
     generator = torch.Generator(device="cuda").manual_seed(seed)
     batch = len(seq_lens)
     total_q = batch * decode_query_len
@@ -205,6 +210,7 @@ def _run(q, k_paged, v_paged, topk_idx, block_table, seq_lens, decode_query_len,
     ids=["one-block", "short-mixed", "two-req", "batch6"],
 )
 def test_sparse_decode_matches_reference(kv_dtype, num_kv_heads, group, decode_query_len, seq_lens):
+    """Attention over the selected blocks must match the oracle across shapes."""
     seq_lens = [max(s, decode_query_len) for s in seq_lens]
     inputs = _make_inputs(
         seq_lens,
@@ -371,7 +377,12 @@ def test_sparse_decode_matches_msa_kernel():
     [(1, 1, 16), (8, 1, 16), (64, 2, 16), (512, 4, 16), (4096, 8, 16)],
 )
 def test_resolve_num_topk_chunks_is_shape_only_power_of_two(total_q, num_kv_heads, max_topk):
-    """The split-K factor is frozen by shape, so a captured graph keeps it."""
+    """A power of two no larger than max_topk, decided by shape alone.
+
+    The kernel splits the top-k blocks by shifting, and the launch geometry has
+    to be the same at capture and at replay, so it may not depend on anything
+    the shapes do not carry.
+    """
     chunks = resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
     assert 1 <= chunks <= max_topk
     assert chunks & (chunks - 1) == 0

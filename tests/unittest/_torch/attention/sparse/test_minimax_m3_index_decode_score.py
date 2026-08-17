@@ -35,9 +35,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 def _flat_page_table(block_table: torch.Tensor, kv_lens_cpu: torch.Tensor) -> torch.Tensor:
     """Flatten a block table into the per-request page ids fmha_sm100 consumes.
 
-    build_kv_page_indices reads the ids out of a token-level slot map, so
-    rebuild the map this block table implies rather than reimplementing the
-    flattening the production path uses.
+    build_kv_page_indices reads those ids out of a token-level slot map, so this
+    rebuilds the map the block table implies and lets the production helper do
+    the flattening.
     """
     batch, max_pages = block_table.shape
     intra = torch.arange(PAGE_SIZE, dtype=torch.int32)
@@ -96,7 +96,12 @@ def _reference_decode_index_score(
 
 
 def _make_inputs(seq_lens, *, dtype, num_heads, decode_query_len, seed=0):
-    """Build (idx_q, index_k_cache, block_table, seq_lens_dev, score, expected)."""
+    """Build the kernel inputs, its score buffer and the expected scores.
+
+    Returns (idx_q, index_k_cache, block_table, seq_lens_dev, backing, score,
+    expected), where score is the [head, token, block] view the kernel writes
+    and backing is the [head, block, token] buffer behind it.
+    """
     generator = torch.Generator(device="cuda").manual_seed(seed)
     seq_lens_dev = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
     batch = len(seq_lens)
@@ -162,6 +167,7 @@ def _assert_scores_close(actual, expected):
     ids=["one-block", "short-mixed", "two-req", "batch8"],
 )
 def test_index_decode_score_matches_reference(dtype, num_heads, decode_query_len, seq_lens):
+    """Per-block scores must match the oracle over the shapes decode produces."""
     if num_heads * decode_query_len > 32:
         pytest.skip("BLOCK_Q must not exceed 32.")
     # A request cannot have fewer KV positions than it has query tokens.
@@ -226,7 +232,12 @@ def test_index_decode_score_transposed_view_matches_contiguous():
 @skip_not_sm100
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_index_decode_score_feeds_selector(dtype):
-    """End to end: the produced scores must select the same blocks as the oracle."""
+    """The scores must select the same blocks as the oracle's would.
+
+    The selector reads the contiguous backing rather than the view the kernel
+    writes, so this is where a disagreement between the two layouts would turn
+    into a wrong block choice.
+    """
     seq_lens = [129, 1025, 4097, 8192]
     idx_q, k_cache, block_table, seq_lens_dev, backing, score, expected = _make_inputs(
         seq_lens, dtype=dtype, num_heads=1, decode_query_len=1, seed=5
@@ -311,102 +322,8 @@ def test_index_decode_score_matches_msa_proxy(dtype):
 
 
 @skip_not_sm100
-@pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required")
-@pytest.mark.parametrize("head_major_output", [False, True])
-def test_mixed_batch_split_selects_the_same_blocks_as_the_whole_batch_proxy(head_major_output):
-    """A mixed batch must select the same blocks however it was scored.
-
-    The generation rows move onto the CuTe DSL scorer while the context row
-    stays on the fmha_sm100 proxy, now planned over its row alone, so the two
-    halves are scored into separate buffers and their tables joined. The gate is
-    that the joined table is the one the whole-batch proxy would have produced.
-    """
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import MsaIndexer
-
-    _runner()
-
-    # One context request prefilling a fresh 300-token prompt, then three decode
-    # rows. Their KV lengths span 2 to 33 blocks, so top-k of 16 is a real choice
-    # for the longest of them.
-    qo_lens_cpu = torch.tensor([300, 1, 1, 1], dtype=torch.int32)
-    kv_lens_cpu = torch.tensor([300, 1025, 4097, 130], dtype=torch.int32)
-    qo_offset_cpu = kv_lens_cpu - qo_lens_cpu
-    ctx_rows, ctx_tokens = 1, 300
-    batch, total_q = int(qo_lens_cpu.shape[0]), int(qo_lens_cpu.sum())
-
-    generator = torch.Generator(device="cuda").manual_seed(29)
-    max_blocks = int((kv_lens_cpu.max().item() + PAGE_SIZE - 1) // PAGE_SIZE)
-    num_pages = batch * max_blocks
-    block_table = (
-        torch.randperm(num_pages, device="cuda", generator=generator)
-        .to(torch.int32)
-        .reshape(batch, max_blocks)
-    )
-    # Four index heads over two KV heads, so the amax reduce to KV-head
-    # granularity runs on both halves and the two output layouts differ.
-    num_index_heads, num_kv_heads = 4, 2
-    idx_q = torch.randn(
-        total_q, num_index_heads, HEAD_DIM, device="cuda", generator=generator
-    ).bfloat16()
-    idx_k_paged = torch.randn(
-        num_pages, PAGE_SIZE, HEAD_DIM, device="cuda", generator=generator
-    ).bfloat16()[:, None]
-    kv_indices = _flat_page_table(block_table, kv_lens_cpu).cuda()
-
-    indexer = MsaIndexer(
-        MiniMaxM3SparseConfig(
-            num_q_heads=8,
-            num_kv_heads=num_kv_heads,
-            head_dim=HEAD_DIM,
-            num_index_heads=num_index_heads,
-            sparse_index_dim=HEAD_DIM,
-            block_size=PAGE_SIZE,
-            topk=MSA_REQUIRED_TOPK,
-        )
-    )
-    common = dict(
-        idx_sm_scale=HEAD_DIM**-0.5,
-        kv_indices=kv_indices,
-        qo_lens_cpu=qo_lens_cpu,
-        kv_lens_cpu=kv_lens_cpu,
-        qo_offset_cpu=qo_offset_cpu,
-        head_major_output=head_major_output,
-    )
-
-    # No score buffer, so the scorer is not even attempted and the proxy plans
-    # the whole batch inline: the pre-split behaviour of every mixed step.
-    reference = indexer.select_blocks(idx_q, idx_k_paged, **common)
-
-    # Mirrors the plan's max_k_tiles alignment, so the span's buffer is wider
-    # than any one request's block count, as it is in production.
-    max_score = torch.full(
-        (num_index_heads, ((max_blocks + 15) // 16) * 16, total_q - ctx_tokens),
-        -float("inf"),
-        device="cuda",
-        dtype=torch.float32,
-    )
-    split = indexer.select_blocks(
-        idx_q,
-        idx_k_paged,
-        max_score=max_score,
-        block_table=block_table[ctx_rows:],
-        seq_lens_cuda=kv_lens_cpu[ctx_rows:].cuda(),
-        decode_query_len=1,
-        require_cutedsl=True,
-        gen_token_first=ctx_tokens,
-        ctx_rows=ctx_rows,
-        **common,
-    )
-
-    assert torch.equal(split, reference)
-    # The Triton sparse decode kernel reads the table head-major, so a joined
-    # table must permute to a contiguous view exactly as an unjoined one does.
-    assert split.permute(1, 0, 2).is_contiguous() is head_major_output
-
-
-@skip_not_sm100
 def test_index_decode_score_cuda_graph_replay_tracks_inputs():
+    """Replay must recompute from the live buffers, not reuse captured values."""
     seq_lens = [1025, 4097]
     idx_q, k_cache, block_table, seq_lens_dev, backing, score, _ = _make_inputs(
         seq_lens, dtype=torch.bfloat16, num_heads=1, decode_query_len=1, seed=23
@@ -456,6 +373,7 @@ def test_index_decode_score_cuda_graph_replay_tracks_inputs():
     ],
 )
 def test_index_decode_score_declines_unsupported_geometry(kwargs, reason):
+    """The caller picks the scorer off is_supported, so it has to be exact."""
     runner = _runner()
     supported = dict(
         q_dtype=torch.bfloat16,

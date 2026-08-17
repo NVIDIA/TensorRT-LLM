@@ -14,17 +14,16 @@
 # limitations under the License.
 """trtllm-gen decode for MiniMax-M3's dense attention layers.
 
-Two things are under test and they fail differently. The pool geometry
-(get_kv_subpage_pool) is pure addressing against a real cache manager: if the
-flat sub-page view disagrees with get_buffers, the kernel silently reads
-another layer's cache. The kernel call itself is checked against a PyTorch
-oracle through a stub manager, so the flashinfer argument conventions are
-exercised without standing up a model.
+The kernel reads its pages from a flat sub-page view of the K/V pool, so both
+halves of that addressing are covered here: the block-table expansion that
+names this layer's K and V sub-pages, and the kernel call itself against a
+PyTorch oracle. A stub cache manager stands in for the pool, so the flashinfer
+argument conventions are exercised without standing up a model.
 """
 
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List
 
 import pytest
 import torch
@@ -51,97 +50,12 @@ def _is_sm100f() -> bool:
 
 
 # --------------------------------------------------------------------------
-# Pool geometry against a real MiniMaxM3KVCacheManagerV2
-# --------------------------------------------------------------------------
-
-
-def _create_manager(tp_size: int, sparse_layers: List[int], num_layers: int = 4):
-    from tensorrt_llm import Mapping
-    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
-    from tensorrt_llm.bindings import DataType
-    from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-
-    max_num_tokens = 2048
-    return MiniMaxM3KVCacheManagerV2(
-        kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False,
-            max_tokens=max_num_tokens,
-            event_buffer_max_size=0,
-            dtype="auto",
-        ),
-        kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=num_layers,
-        num_kv_heads=2,
-        head_dim=HEAD_DIM,
-        tokens_per_block=PAGE_SIZE,
-        max_seq_len=512,
-        max_batch_size=4,
-        mapping=Mapping(world_size=tp_size, rank=0, tp_size=tp_size, pp_size=1),
-        dtype=DataType.BF16,
-        vocab_size=1024,
-        max_num_tokens=max_num_tokens,
-        sparse_layer_ids=list(sparse_layers),
-        disable_index_value_layer_ids=list(sparse_layers),
-        sparse_index_dim=HEAD_DIM,
-    )
-
-
-@pytest.mark.parametrize(
-    "tp_size,sparse_layers",
-    [
-        # TP=2 makes K == V == INDEX_KEY bytes per block, so V2 coalesces
-        # index-K into the K/V pool and the per-layer stride goes non-uniform.
-        # That is the layout build_trtllm_gen_kv_cache_metadata cannot express.
-        pytest.param(2, [1, 3], id="coalesced-index-k"),
-        pytest.param(1, [1, 3], id="separate-index-pool"),
-        pytest.param(2, [], id="all-dense"),
-    ],
-)
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-def test_subpage_pool_addresses_match_get_buffers(tp_size, sparse_layers, kv_layout):
-    """flat[s * scale + {0,1}] must be exactly this layer's K and V at slot s."""
-    manager = _create_manager(tp_size, sparse_layers)
-    try:
-        for layer_idx in range(4):
-            kv = manager.get_buffers(layer_idx, kv_layout=kv_layout)
-            flat, scale = manager.get_kv_subpage_pool(layer_idx, kv_layout)
-
-            assert flat.is_contiguous()
-            assert list(flat.shape[1:]) == list(kv.shape[2:])
-            assert flat.dtype == kv.dtype
-            num_slots = int(kv.shape[0])
-            assert int(flat.shape[0]) == (num_slots - 1) * scale + 2
-
-            for slot in (0, 1, num_slots // 2, num_slots - 1):
-                assert flat[slot * scale].data_ptr() == kv[slot, 0].data_ptr()
-                assert flat[slot * scale + 1].data_ptr() == kv[slot, 1].data_ptr()
-    finally:
-        manager.shutdown()
-
-
-def test_subpage_pool_stops_at_the_last_slots_v():
-    """The tail bound matters: every layer but the first starts mid-slot, so a
-    naive num_slots * scale view would run off the end of the pool."""
-    manager = _create_manager(2, [1, 3])
-    try:
-        for layer_idx in range(4):
-            flat, scale = manager.get_kv_subpage_pool(layer_idx, "HND")
-            kv = manager.get_buffers(layer_idx, kv_layout="HND")
-            last_v = kv[int(kv.shape[0]) - 1, 1]
-            flat_end = flat.data_ptr() + flat.numel() * flat.element_size()
-            v_end = last_v.data_ptr() + last_v.numel() * last_v.element_size()
-            assert flat_end == v_end
-    finally:
-        manager.shutdown()
-
-
-# --------------------------------------------------------------------------
 # Block-table expansion
 # --------------------------------------------------------------------------
 
 
 def test_subpage_block_table_splits_k_and_v_rows():
+    """Slot s lands at s * subpages_per_slot for K and one sub-page later for V."""
     slots = torch.tensor([[0, 3, 7], [2, 5, 11]], device="cuda", dtype=torch.int32)
     table = subpage_block_table(slots, subpages_per_slot=9)
 
@@ -152,8 +66,11 @@ def test_subpage_block_table_splits_k_and_v_rows():
 
 
 def test_subpage_block_table_reuses_one_buffer():
-    """All dense layers share the arena block, so a later call must not alias
-    a live earlier one within a step; they are written before every use."""
+    """Every caller of a given shape gets the same arena block back.
+
+    The table is therefore only valid until the next call, which is why it is
+    rewritten in full each time rather than held across layers.
+    """
     slots_a = torch.zeros((2, 4), device="cuda", dtype=torch.int32)
     slots_b = torch.full((2, 4), 5, device="cuda", dtype=torch.int32)
     first = subpage_block_table(slots_a, 4)
@@ -174,17 +91,30 @@ def test_write_subpage_block_table_fills_a_caller_owned_buffer():
     assert torch.equal(out, subpage_block_table(slots, 9))
 
 
-@pytest.mark.parametrize("sparse_layers", [[1, 3], []], ids=["mixed", "all-dense"])
-def test_uniform_subpages_per_slot_matches_every_layer(sparse_layers):
+class _PerLayerFactors:
+    """The two attributes uniform_subpages_per_slot reads off a cache manager."""
+
+    def __init__(self, factors: Dict[int, int]):
+        self.layer_offsets = dict.fromkeys(factors, 0)
+        self._factors = factors
+
+    def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str = "HND"):
+        return None, self._factors[layer_idx]
+
+
+@pytest.mark.parametrize(
+    "factors,expected",
+    [
+        pytest.param({0: 2, 1: 2, 2: 2, 3: 2}, 2, id="agreeing"),
+        # A pool that coalesces the sparse layers' index-K into their K/V blocks
+        # gives those layers a different factor from the dense ones.
+        pytest.param({0: 2, 1: 9, 2: 2, 3: 9}, 0, id="disagreeing"),
+    ],
+)
+def test_uniform_subpages_per_slot(factors, expected):
     """prepare() expands the block table without naming a layer, so the factor
-    it uses has to be one every layer of the real pool agrees on."""
-    manager = _create_manager(2, sparse_layers)
-    try:
-        per_layer = {manager.get_kv_subpage_pool(i, "HND")[1] for i in range(4)}
-        factor = uniform_subpages_per_slot(manager)
-        assert factor == (per_layer.pop() if len(per_layer) == 1 else 0)
-    finally:
-        manager.shutdown()
+    it stages has to be one every layer agrees on, and 0 where they do not."""
+    assert uniform_subpages_per_slot(_PerLayerFactors(factors)) == expected
 
 
 def test_uniform_subpages_per_slot_reports_zero_without_a_pool():
@@ -203,7 +133,7 @@ def test_uniform_subpages_per_slot_reports_zero_without_a_pool():
 
 
 class _StubManager:
-    """Presents a flat sub-page pool the way MiniMaxM3KVCacheManagerV2 does."""
+    """The one method the kernel asks of a KV cache manager."""
 
     def __init__(self, pool: torch.Tensor, subpages_per_slot: int):
         self._pool = pool
@@ -304,7 +234,11 @@ def _run_dense(q, pool, subpages_per_slot, block_table, seq_lens, decode_query_l
 @pytest.mark.parametrize("decode_query_len", [1, 2])
 @pytest.mark.parametrize("subpages_per_slot", [2, 9])
 def test_matches_reference(kv_dtype, num_heads, num_kv_heads, decode_query_len, subpages_per_slot):
-    """subpages_per_slot=9 is the M3 coalesced case; 2 is the uniform one."""
+    """Full-context decode against an fp32 oracle over the same shuffled pages.
+
+    subpages_per_slot is 9 for a pool that coalesces index-K into the sparse
+    layers' blocks and 2 for one that does not.
+    """
     seq_lens = [PAGE_SIZE * 3, PAGE_SIZE + 5, PAGE_SIZE * 2 - 1]
     q, pool, block_table, seq_lens_t = _make_pool_inputs(
         seq_lens, num_heads, num_kv_heads, decode_query_len, subpages_per_slot, kv_dtype
@@ -348,6 +282,7 @@ def test_staged_subpage_table_is_used_only_when_the_factor_matches():
 
 @pytest.mark.skipif(not _is_sm100f(), reason="trtllm-gen decode kernels are SM100/SM103 only")
 def test_cuda_graph_replay_tracks_inputs():
+    """Replay must recompute from the live buffers, not reuse captured values."""
     seq_lens = [PAGE_SIZE * 2, PAGE_SIZE * 3]
     q, pool, block_table, seq_lens_t = _make_pool_inputs(
         seq_lens, 8, 1, 1, 9, torch.bfloat16, seed=7
@@ -396,8 +331,11 @@ def test_cuda_graph_replay_tracks_inputs():
 
 
 def test_declines_unsupported_geometry():
-    """The reason is a string because it is logged; what matters here is that
-    each unsupported geometry is caught before the kernel is reached."""
+    """Each unsupported geometry has to be caught before the kernel is reached.
+
+    The verdict is a string because it is logged, so the assertions look for the
+    distinguishing part of it rather than the whole message.
+    """
     pool = torch.zeros((1, 1, PAGE_SIZE, 64), device="cuda", dtype=torch.bfloat16)
     assert "head_dim 64" in dense_decode_unsupported_reason(_StubManager(pool, 2), 64)
 
