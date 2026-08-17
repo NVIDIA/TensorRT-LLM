@@ -12,9 +12,24 @@ from tensorrt_llm.quantization.utils import fp4_utils
 
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, swizzle_sf, unswizzle_sf
-from .impl_contract import MoEInputRequirement, MoERunContext, require_comm_plan
-from .interface import MoE, MoEWeightLoadingMode
+from ...utils import (
+    ActivationType,
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    swizzle_sf,
+    unswizzle_sf,
+)
+from .impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEInputRequirement,
+    MoEProblem,
+    MoERejectReason,
+    MoERunContext,
+    require_comm_plan,
+)
+from .interface import MoE, MoEWeightLoadingMode, _reject
 from .quantization import NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
@@ -80,6 +95,11 @@ def gen_fc2_alpha_fused(
     return fc2_alpha.scatter_(1, token_selected_experts.long(), scaled_values)
 
 
+# MMA tile size the FC2 DenseGEMM kernel tiles the K dimension with. Module
+# level so that the selection gate and its rejection message read one number.
+_FC2_MMA_TILE_K = 256
+
+
 class DenseGEMMFusedMoE(MoE):
     """CuteDSL DenseGEMM flow of fused mixture of experts (MoE) Layer.
 
@@ -111,38 +131,53 @@ class DenseGEMMFusedMoE(MoE):
     _SUPPORTED_SM_VERSIONS = (100, 103)
 
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> tuple:
-        """Check if DenseGEMMFusedMoE can implement the given configuration.
-
-        DenseGEMMFusedMoE supports:
-        - NVFP4 quantization only
-        - SM100/SM103 (Blackwell) only
-        - SwiGLU activation only (swiglu_gptoss_style not supported)
-        """
-        from tensorrt_llm._utils import get_sm_version
-
-        from .interface import _warn_and_return
-
-        sm_version = get_sm_version()
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """DenseGEMM CuTe DSL kernels: NVFP4 on SM100/SM103, SwiGLU only."""
+        sm_version = d.env.sm
         if sm_version not in cls._SUPPORTED_SM_VERSIONS:
-            return _warn_and_return(
-                f"DenseGEMMFusedMoE requires SM {cls._SUPPORTED_SM_VERSIONS}, got SM{sm_version}"
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
+                f"DenseGEMMFusedMoE requires SM {cls._SUPPORTED_SM_VERSIONS}, got SM{sm_version}",
             )
 
-        if quant_algo != QuantAlgo.NVFP4:
-            return _warn_and_return(
-                f"DenseGEMMFusedMoE only supports NVFP4 quantization (got quant_algo={quant_algo})"
+        if p.quant_algo != QuantAlgo.NVFP4:
+            return _reject(
+                MoERejectReason.QUANT_UNSUPPORTED,
+                f"DenseGEMMFusedMoE only supports NVFP4 quantization (got quant_algo={p.quant_algo})",
             )
 
-        if swiglu_gptoss_style:
-            return _warn_and_return("DenseGEMMFusedMoE does not support swiglu_gptoss_style")
+        if p.swiglu_gptoss_style:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "DenseGEMMFusedMoE does not support swiglu_gptoss_style",
+            )
 
-        return (True, None)
+        if p.activation_type != ActivationType.Swiglu:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                f"DenseGEMMFusedMoE fuses SwiGLU into the FC1 GEMM epilogue "
+                f"and serves no other activation (got {p.activation})",
+            )
+
+        if d.ep_size != 1:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"DenseGEMMFusedMoE is TP-only; expert parallelism would need "
+                f"an alltoall this backend does not implement (got "
+                f"ep_size={d.ep_size})",
+            )
+
+        # The FC2 kernel tiles K by an MMA tile of 256 and splits alpha_scale
+        # at expert boundaries, so a weight_per_expert that is not tile-aligned
+        # silently applies the wrong scale rather than failing.
+        if p.intermediate_size is not None and p.intermediate_size % _FC2_MMA_TILE_K != 0:
+            return _reject(
+                MoERejectReason.SHAPE_UNALIGNED,
+                f"DenseGEMMFusedMoE requires intermediate_size divisible by "
+                f"{_FC2_MMA_TILE_K} (FC2 MMA tile-K); got {p.intermediate_size}",
+            )
+
+        return MoEEligibility.ok()
 
     def __init__(
         self,
@@ -161,45 +196,10 @@ class DenseGEMMFusedMoE(MoE):
         init_load_balancer: bool = True,
         activation_type=None,
     ):
-        # DenseGEMM CuTe DSL kernels only support SM100 and SM103.
-        from tensorrt_llm._utils import get_sm_version
-
-        from ...utils import ActivationType
-
-        sm_version = get_sm_version()
-        assert sm_version in self._SUPPORTED_SM_VERSIONS, (
-            f"DenseGEMMFusedMoE only supports SM {self._SUPPORTED_SM_VERSIONS} "
-            f"(got SM {sm_version}). The CuTe DSL kernels require Blackwell architecture."
-        )
-
-        # DenseGEMM kernel hardcodes SwiGLU fusion — reject other activation types
-        # before calling super().__init__() to fail fast with a clear message.
+        # Eligibility (SM / quant / SwiGLU / EP / intermediate alignment) is
+        # owned by ``can_implement``; do not re-assert it here.
         if activation_type is None:
             activation_type = ActivationType.Swiglu
-        assert activation_type == ActivationType.Swiglu, (
-            f"DenseGEMMFusedMoE only supports SwiGLU activation "
-            f"(got activation_type={activation_type}). "
-            f"The FC1 kernel fuses SwiGLU into the GEMM epilogue."
-        )
-
-        # FC2 DenseGEMM kernel tiles K dimension with MMA tile size 256.
-        # weight_per_expert (= intermediate_size) must be 256-aligned so that
-        # expert boundaries align with MMA tile boundaries.
-        _MMA_TILE_K = 256
-        assert intermediate_size % _MMA_TILE_K == 0, (
-            f"DenseGEMMFusedMoE requires intermediate_size to be a multiple of "
-            f"{_MMA_TILE_K} (got intermediate_size={intermediate_size}). "
-            f"FC2 kernel cannot correctly split alpha_scale at expert boundaries "
-            f"when weight_per_expert is not MMA tile-K aligned."
-        )
-
-        # DenseGEMM only supports TP; EP requires alltoall communication not implemented here.
-        ep_size = model_config.mapping.moe_ep_size
-        assert ep_size == 1, (
-            f"DenseGEMMFusedMoE does not support Expert Parallelism "
-            f"(got ep_size={ep_size}). Use a different MoE backend (e.g. CutlassFusedMoE) "
-            f"when EP is enabled."
-        )
 
         # Call MoE base class directly (not CutlassFusedMoE).
         # Note: `apply_router_weight_on_input` is accepted for API

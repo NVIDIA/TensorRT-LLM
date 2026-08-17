@@ -130,7 +130,8 @@ pipeline {
                 container('trt-llm') {
                     script {
                         def sourceRepo = "https://github.com/${params.SOURCE_REPO}.git"
-                        trtllm_utils.checkoutSource(sourceRepo, params.TARGET_BRANCH, LLM_ROOT, false, false)
+                        // Initialize submodules for older arbitrary refs; this is a no-op after their removal.
+                        trtllm_utils.checkoutSource(sourceRepo, params.TARGET_BRANCH, LLM_ROOT, true, false)
                     }
                 }
             }
