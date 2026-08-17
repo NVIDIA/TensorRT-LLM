@@ -404,6 +404,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
 
         // Promote progress tar to final path, or fall back to direct upload.
         // progress_upload_snapshot.sh writes the sentinel on each successful PUT.
+        ensureStageResultNotUploaded("${stageName}${postTag}")
         if (suppressTestReporting || !promoteProgressTar(stageName, postTag)) {
             if (suppressTestReporting) {
                 echo "[PROGRESS-UPLOAD] ${stageName}: results*.xml changed on disk, re-uploading instead of promoting progress tar"
@@ -418,7 +419,6 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             if (suppressTestReporting || xmlCount > 0) {
                 def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
                 sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-                ensureStageResultNotUploaded("${stageName}${postTag}")
                 trtllm_utils.uploadArtifacts(
                     "results-${stageName}${postTag}.tar.gz",
                     "${UPLOAD_PATH}/test-results/"
@@ -491,7 +491,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     }
 }
 
-def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
+def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
     def isolateTestLines = readFile(file: isolateTestList).readLines()
@@ -523,7 +523,8 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}")
+            def isRerunFailed = rerunFailedTests(
+                stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag)
             if (isRerunFailed) {
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                     error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
@@ -2454,7 +2455,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         credentialsId: 'urm-artifactory-creds',
                         usernameVariable: 'ART_USER',
                         passwordVariable: 'ART_PASS')]) {
-                    sh """
+                    sh """#!/bin/bash
                         set +e
                         export STAGE_NAME='${stageName}'
                         export PROGRESS_TAR='${progressTar}'
@@ -4281,7 +4282,7 @@ def getSSHConnectionPorts(portConfigFile, stageName)
 }
 
 // Return true means the test rerun also fails. Return false otherwise.
-def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular") {
+def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
         echo "There is no ${resultFileName} file, skip the rerun step"
         return true
@@ -4343,7 +4344,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             "--periodic-junit-xmlpath ${xmlFile}",
             "--reruns ${times - 1}"
         ]
-        def rerunProgressTar = "results-${stageName}-progress.tar.gz"
+        def rerunProgressTar = "results-${stageName}${postTag}-progress.tar.gz"
         def rerunProgressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/${rerunProgressTar}"
         def rerunDoneFile = "${WORKSPACE}/.rerun${times}-done-${stageName}"
         sh "rm -f ${rerunDoneFile}"
@@ -4357,6 +4358,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                     export STAGE_NAME='${stageName}'
                     export PROGRESS_TAR='${rerunProgressTar}'
                     export PROGRESS_URL='${rerunProgressUrl}'
+                    export POST_TAG='${postTag}'
                     # ---- background watcher for rerun${times} ----
                     PROGRESS_DONE_FILE='${rerunDoneFile}' \\
                     PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
@@ -4680,7 +4682,8 @@ REUSED_TESTS_EOF
 
 // Promotes the progress tar to the final results path via an Artifactory
 // server-side move (no data re-transfer). Returns true when a progress
-// snapshot existed and was promoted; false when no snapshot was ever uploaded.
+// snapshot existed and was promoted; false when no snapshot was uploaded or
+// the server-side move failed.
 // Virtual repo sw-tensorrt-generic does not support move; rewrite to the
 // backing local repo as we do for DELETE in deleteProgressArtifact().
 def promoteProgressTar(stageName, postTag="") {
@@ -4691,11 +4694,12 @@ def promoteProgressTar(stageName, postTag="") {
     def localUploadPath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
     def srcArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
     def dstArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}.tar.gz"
+    def rc
     withCredentials([usernamePassword(
             credentialsId: 'urm-artifactory-creds',
             usernameVariable: 'ART_USER',
             passwordVariable: 'ART_PASS')]) {
-        def rc = sh(
+        rc = sh(
             script: """curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" -X POST \
                 'https://urm.nvidia.com/artifactory/api/move/${srcArtPath}?to=/${dstArtPath}'""",
             returnStatus: true
@@ -4706,14 +4710,14 @@ def promoteProgressTar(stageName, postTag="") {
             echo "[PROGRESS-UPLOAD] ${stageName}: move failed (rc=${rc}); results may already be at destination or progress tar was deleted"
         }
     }
-    return true
+    return rc == 0
 }
 
 // Removes the in-progress checkpoint tarball uploaded by the inline
 // shell watcher in runLLMTestlistOnPlatformImpl / runLLMTestlistWithSbatch.
-// Called only when the pytest+rerun execution
-// succeeded -- forensic checkpoints from failed runs are kept so the
-// orphan reflects "this attempt did not finish cleanly".
+// Called after final-result handling in both execution paths, including when
+// test execution failed. Progress checkpoints are not intentionally retained
+// based on the test outcome; interruption or upload failure may skip cleanup.
 //
 // Build-scoped: ${UPLOAD_PATH} is per-build, so unswept progress tars are
 // garbage-collected with the rest of the build's artifacts anyway.
@@ -5179,7 +5183,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
+                        def isRerunFailed = rerunFailedTests(
+                            stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
                         if (isRerunFailed) {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Regular tests failed after rerun attempt"
@@ -5199,7 +5204,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     if (preprocessedLists.isolateCount > 0) {
                         stage ("[${stageName}] Run Pytest (Isolated)") {
                             echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                            rerunFailed = runIsolatedTests(preprocessedLists, pytestCommand, llmSrc, stageName) || rerunFailed
+                            rerunFailed = runIsolatedTests(
+                                preprocessedLists, pytestCommand, llmSrc, stageName, postTag) || rerunFailed
                         }
                     } else {
                         echo "No isolated tests to run for stage ${stageName}"
