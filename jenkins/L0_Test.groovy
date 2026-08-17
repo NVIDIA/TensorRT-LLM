@@ -3611,7 +3611,7 @@ def runPytestWithLog(stageName, pytestCommand, invIdx, unfinishedFile, timeoutDa
     def cmdFile = "${WORKSPACE}/pytest_cmd_${safeStageName}_${invIdx}.sh"
     def wrapperScript = "${llmSrc}/jenkins/scripts/run_pytest_with_log.sh"
 
-    writeFile file: cmdFile, text: "#!/usr/bin/env bash\ncd '${llmSrc}/tests/integration/defs'\n${pytestCommand.join(' ')}"
+    writeFile file: cmdFile, text: "#!/usr/bin/env bash\ncd '${llmSrc}/tests/integration/defs' || exit 1\n${pytestCommand.join(' ')}"
     try {
         sh "mkdir -p '${outDir}'"
         sh "bash '${wrapperScript}' '${cmdFile}' '${outDir}' '${timeoutDataFile}' '${invIdx}' '${unfinishedFile}'"

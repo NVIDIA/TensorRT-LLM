@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Set up error handling
 set -xEeuo pipefail
@@ -90,7 +104,9 @@ fi
 # atomic), so concurrent writes are avoided entirely.
 # After the Slurm job finishes, uploadResults() downloads every rank file and
 # generate_timeout_xml.py merges them while it creates results-timeout.xml.
-PYTEST_LOG="${jobWorkspace}/pytest_output_step${slurm_step_id}_rank${SLURM_PROCID}.log"
+# The full pytest log is transient, so keep it on the worker node rather than
+# streaming it to the shared workspace.
+PYTEST_LOG="/tmp/pytest_output_job${SLURM_JOB_ID:-unknown}_step${slurm_step_id}_rank${SLURM_PROCID}.log"
 TIMEOUT_DATA_RANK="${jobWorkspace}/timeout_data_step${slurm_step_id}_rank${SLURM_PROCID}.jsonl"
 UNFINISHED_FILE="${jobWorkspace}/unfinished_test.txt"
 CLASSIFY_SCRIPT="${llmSrcNode}/jenkins/scripts/classify_timeout.py"

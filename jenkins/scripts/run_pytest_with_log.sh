@@ -20,9 +20,9 @@
 # Usage:
 #   bash run_pytest_with_log.sh \
 #       <cmd-script>       # bash script containing "cd ... && pytest ..."
-#       <out-dir>          # directory for pytest_output.log
+#       <out-dir>          # directory for per-invocation pytest output logs
 #       <timeout-data>     # path to timeout_data.jsonl (appended, dir auto-created)
-#       <invocation-idx>   # integer index (unused at runtime, kept for callers)
+#       <invocation-idx>   # integer index used to name the temporary log
 #       <unfinished>       # path to unfinished_test.txt
 #
 # Exit code: always equals pytest's own exit code regardless of whether
@@ -39,10 +39,10 @@ fi
 CMD_SCRIPT="$1"
 OUT_DIR="$2"
 TIMEOUT_DATA="$3"
-# $4 (invocation-idx) is accepted but not used inside this script
+INVOCATION_IDX="$4"
 UNFINISHED="$5"
 
-LOG="${OUT_DIR}/pytest_output.log"
+LOG="${OUT_DIR}/pytest_output_inv${INVOCATION_IDX}.log"
 CLASSIFY="$(dirname "$0")/classify_timeout.py"
 
 # Ensure the output directory exists before writing the log.
