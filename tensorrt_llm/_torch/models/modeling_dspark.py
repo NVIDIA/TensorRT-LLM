@@ -1276,6 +1276,7 @@ class Qwen3DSparkDraftModel(nn.Module):
         model_config,
         block_size: Optional[int] = None,
         mask_token_id: Optional[int] = None,
+        serving_max_seq_len: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -1306,14 +1307,46 @@ class Qwen3DSparkDraftModel(nn.Module):
         )
 
         # Plain-RoPE parameters. transformers>=5 nests rope_theta under
-        # rope_parameters; older versions keep the flat attribute.
-        rope_params = getattr(config, "rope_parameters", None) or {}
+        # rope_parameters; older versions keep the flat attribute (and expose
+        # ``rope_scaling`` as a back-compat alias of ``rope_parameters``, so
+        # its mere presence means nothing — ``rope_type`` is the discriminator).
+        rope_params = (
+            getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {}
+        )
+        # Only plain RoPE is implemented here (no YaRN / linear / dynamic
+        # scaling), so reject a scaled drafter config rather than silently
+        # ignoring the scaling and drafting on the wrong rotary phases.
+        rope_type = rope_params.get("rope_type") or rope_params.get("type") or "default"
+        if rope_type != "default":
+            raise ValueError(
+                f"Qwen3 DSpark drafter does not support rope_type={rope_type!r}; "
+                "only plain RoPE (rope_type='default') is implemented."
+            )
         self._rope_theta = float(
             rope_params.get("rope_theta", None) or getattr(config, "rope_theta", 1000000.0)
         )
         max_pos = int(getattr(config, "max_position_embeddings", 40960))
         self._freqs_cap = max_pos + self.block_size + 2
         self._build_rope_tables()
+
+        # RoPE phases are precomputed up to max_pos and clamped beyond that
+        # (see _gather_cos_sin) for graph-safety; this is silent by design
+        # (correctness is unaffected, target verification always corrects the
+        # draft), but once the serving max_seq_len runs past the drafter's
+        # trained range every draft query/context position collapses onto the
+        # same rotary phase, which shows up only as an unexplained
+        # acceptance-rate/perf cliff. Warn once at construction time so the
+        # cliff is attributable. The drafter's own ModelConfig never carries the
+        # serving length (external_drafter_config_kwargs does not propagate it),
+        # so the target's value is passed in by ``get_draft_model``.
+        if serving_max_seq_len is not None and serving_max_seq_len > max_pos:
+            logger.warning(
+                f"Qwen3 DSpark drafter max_position_embeddings ({max_pos}) is "
+                f"smaller than the serving max_seq_len ({serving_max_seq_len}); "
+                "draft RoPE phases beyond that clamp to the last trained "
+                "position, which degrades draft acceptance rate (not "
+                "correctness) for requests running past that length."
+            )
 
         # Ring-window length for the worker-owned context K/V buffer.
         window = int(os.environ.get(_CTX_WINDOW_ENV, _DEFAULT_CTX_WINDOW))
@@ -1794,9 +1827,15 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
         draft_config,
         block_size: Optional[int] = None,
         mask_token_id: Optional[int] = None,
+        serving_max_seq_len: Optional[int] = None,
     ):
         super().__init__(
-            Qwen3DSparkDraftModel(draft_config, block_size=block_size, mask_token_id=mask_token_id),
+            Qwen3DSparkDraftModel(
+                draft_config,
+                block_size=block_size,
+                mask_token_id=mask_token_id,
+                serving_max_seq_len=serving_max_seq_len,
+            ),
             draft_config,
         )
 
