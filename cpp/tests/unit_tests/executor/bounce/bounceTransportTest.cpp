@@ -69,7 +69,7 @@ void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t des
     auto bufs = bounce_test::makeXferBufs(nDescs, descBytes, /*seed=*/1);
     auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, B->name);
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "transfer hung";
-    EXPECT_EQ(fut.get(), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
     EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
 
     A->tx->shutdown();
@@ -177,7 +177,7 @@ TEST(BounceTransport, MaxChunkSizeBytesClampedToUsableArena)
     auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, B->name);
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready)
         << "transfer hung -> maxChunkSizeBytes was not clamped to usable arena capacity";
-    EXPECT_EQ(fut.get(), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
     EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
 
     A->tx->shutdown();
@@ -219,7 +219,7 @@ TEST(BounceTransport, SenderArenaBackpressureParksCredits)
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/32, /*descBytes=*/4096, /*seed=*/11);
     auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, B->name);
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "transfer hung";
-    EXPECT_EQ(fut.get(), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
     EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
 
     A->tx->shutdown();
