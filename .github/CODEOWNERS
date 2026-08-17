@@ -69,7 +69,7 @@
 /docker @NVIDIA/trt-llm-infra-devs
 /enroot @NVIDIA/trt-llm-infra-devs
 /jenkins @NVIDIA/trt-llm-infra-devs
-/jenkins/scripts/cbts @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa
+/jenkins/scripts/cbts @NVIDIA/trt-llm-devs
 /ruff-legacy-baseline.json @NVIDIA/trt-llm-infra-devs
 /ruff-legacy.toml @NVIDIA/trt-llm-infra-devs
 /scripts @NVIDIA/trt-llm-infra-devs
