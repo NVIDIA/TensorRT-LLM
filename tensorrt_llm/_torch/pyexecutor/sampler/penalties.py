@@ -973,7 +973,9 @@ def seed_prompt(
     if state is None or prompt_tokens.numel() == 0:
         return
     prompt_mask, counts = state.prompt_mask, state.counts
-    if slot >= prompt_mask.size(0):
+    # Live rows only. A negative index would wrap onto another request's row, and
+    # the scratch row at dummy_row belongs to CUDA-graph padding, not to a sequence.
+    if not 0 <= slot < state.dummy_row:
         return
 
     vocab_size = spec_metadata.vocab_size

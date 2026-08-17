@@ -226,8 +226,13 @@ def occurrence_penalized_logits(
         presence + frequency * count.to(torch.float32),
         penalized.new_zeros(()),
     )
+    # Clamp only what the arithmetic above could have pushed out of range. A logit
+    # that arrived non-finite -- a -inf from an embedding bias, say, since bias runs
+    # before penalties -- must stay that way; clamping it to the finite minimum would
+    # make a token the user masked out eligible for sampling again.
     limit = torch.finfo(logits.dtype).max
-    return penalized.clamp(-limit, limit).to(logits.dtype)
+    clamped = penalized.clamp(-limit, limit)
+    return torch.where(torch.isfinite(logits), clamped, logits.float()).to(logits.dtype)
 
 
 class Fusions:

@@ -968,7 +968,9 @@ class SpecMetadata:
 
         for request in requests:
             slot = getattr(request, "py_seq_slot", None)
-            if slot is None or slot >= num_rows:
+            # Live rows only: a negative slot would wrap onto another request's
+            # row, and the last row is the CUDA-graph padding scratch row.
+            if slot is None or not 0 <= slot < num_rows - 1:
                 continue
             config = getattr(request, "sampling_config", None)
             rep = self._penalty_value(config, "repetition_penalty", 1.0)
