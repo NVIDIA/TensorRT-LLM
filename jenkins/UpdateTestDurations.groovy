@@ -21,7 +21,26 @@ UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
 DURATION_FILE_PATH = "tests/integration/defs/.test_durations"
 // Target repository the updated duration file is committed straight back into.
 TARGET_REPO = "NVIDIA/TensorRT-LLM"
-LLM_REPO = "https://github.com/${TARGET_REPO}.git"
+
+def sanityCheckItemCount(String oldPath, String newPath) {
+    def countItems = { path ->
+        sh(script: "python3 -c \"import json; print(len(json.load(open('${path}'))))\"",
+           returnStdout: true).trim() as Integer
+    }
+    def oldCount = countItems(oldPath)
+    def newCount = countItems(newPath)
+    echo "Duration-file item counts -> old: ${oldCount}, new: ${newCount}"
+    if (oldCount == 0) {
+        error("Existing duration file is empty or missing; aborting.")
+    }
+    def diffPct = Math.abs(newCount - oldCount) * 100.0 / oldCount
+    echo "Item-count difference: ${String.format('%.1f', diffPct)}%"
+    if (diffPct >= 50.0) {
+        error("Item-count difference ${String.format('%.1f', diffPct)}% " +
+              ">= 50%; refusing to auto-commit. Download the archived " +
+              "new_test_durations.json, review, and upload manually.")
+    }
+}
 
 def createKubernetesPodConfig(image, arch = "amd64")
 {
@@ -117,6 +136,11 @@ pipeline {
         stage('Setup') {
             steps {
                 container('trt-llm') {
+                    script {
+                        if (!(params.DAYS ==~ /^[1-9][0-9]*$/)) {
+                            error("DAYS parameter must be a positive integer (got: '${params.DAYS}').")
+                        }
+                    }
                     sh """
                         apt-get update -qq && \
                         apt-get install -y -qq git python3-pip curl && \
@@ -157,25 +181,20 @@ pipeline {
                         artifacts: "${LLM_ROOT}/new_test_durations.json",
                         fingerprint: true)
 
-                    // Sanity gate: if the new file diverges too much from the one in use,
-                    // fail the job instead of committing a possibly-broken duration file.
+                    // Sanity gate for DRY_RUN only: fetch TARGET_REPO baseline via HTTP
+                    // (no credentials available here) and fail early if the generated file
+                    // diverges too much. For non-dry-runs the gate runs after the git reset
+                    // in 'Commit and Push', where the baseline comes from the authoritative
+                    // TARGET_REPO workspace rather than a separate HTTP fetch.
                     script {
-                        def countItems = { path ->
-                            sh(script: "python3 -c \"import json; print(len(json.load(open('${path}'))))\"",
-                               returnStdout: true).trim() as Integer
-                        }
-                        def oldCount = countItems("${LLM_ROOT}/${DURATION_FILE_PATH}")
-                        def newCount = countItems("${LLM_ROOT}/new_test_durations.json")
-                        echo "Duration-file item counts -> old: ${oldCount}, new: ${newCount}"
-                        if (oldCount == 0) {
-                            error("Existing duration file is empty or missing; aborting.")
-                        }
-                        def diffPct = Math.abs(newCount - oldCount) * 100.0 / oldCount
-                        echo "Item-count difference: ${String.format('%.1f', diffPct)}%"
-                        if (diffPct >= 50.0) {
-                            error("Item-count difference ${String.format('%.1f', diffPct)}% " +
-                                  ">= 50%; refusing to auto-commit. Download the archived " +
-                                  "new_test_durations.json, review, and upload manually.")
+                        if (params.DRY_RUN) {
+                            sh """
+                                curl -sSf "https://raw.githubusercontent.com/${TARGET_REPO}/${params.TARGET_BRANCH}/${DURATION_FILE_PATH}" \
+                                    -o ${LLM_ROOT}/target_test_durations.json
+                            """
+                            sanityCheckItemCount(
+                                "${LLM_ROOT}/target_test_durations.json",
+                                "${LLM_ROOT}/new_test_durations.json")
                         }
                     }
                 }
@@ -210,9 +229,8 @@ pipeline {
                             credentialsId: 'github-cred-trtllm-ci',
                             usernameVariable: 'NOT_IN_USE',
                             passwordVariable: 'GITHUB_API_TOKEN')]) {
-                            def authedUrl = LLM_REPO.replaceFirst(
-                                'https://', "https://svc_tensorrt:${GITHUB_API_TOKEN}@")
-
+                            // Use the token directly in the URL (shell variable, not Groovy interpolation)
+                            // to avoid persisting credentials to .git/config via git remote set-url.
                             int maxRetries = 3
                             for (int attempt = 1; attempt <= maxRetries; attempt++) {
                                 if (attempt > 1) {
@@ -222,37 +240,17 @@ pipeline {
 
                                 // Fetch and reset to the latest remote HEAD before applying the
                                 // generated file, so concurrent pushes don't cause conflicts.
-                                // Validated params are passed via env vars to single-quoted sh.
-                                withEnv(["_AUTHED_URL=${authedUrl}",
-                                         "_TARGET_BRANCH=${params.TARGET_BRANCH}"]) {
-                                    sh '''
-                                        cd ''' + LLM_ROOT + '''
-                                        git remote set-url origin "$_AUTHED_URL"
-                                        git fetch origin "$_TARGET_BRANCH"
-                                        git reset --hard "origin/$_TARGET_BRANCH"
-                                    '''
-                                }
+                                sh """
+                                    cd ${LLM_ROOT}
+                                    git fetch "https://svc_tensorrt:\${GITHUB_API_TOKEN}@github.com/${TARGET_REPO}.git" ${params.TARGET_BRANCH}
+                                    git reset --hard FETCH_HEAD
+                                """
 
-                                // Re-run the count gate against the post-reset baseline.
-                                // SOURCE_REPO may differ from TARGET_REPO, so the baseline
-                                // must reflect the file that will actually be committed.
-                                def countItems = { path ->
-                                    sh(script: "python3 -c \"import json; print(len(json.load(open('${path}'))))\"",
-                                       returnStdout: true).trim() as Integer
-                                }
-                                def baselineCount = countItems("${LLM_ROOT}/${DURATION_FILE_PATH}")
-                                def newCount = countItems("${LLM_ROOT}/new_test_durations.json")
-                                echo "Post-reset counts -> baseline: ${baselineCount}, new: ${newCount}"
-                                if (baselineCount == 0) {
-                                    error("Baseline duration file is empty after reset; aborting.")
-                                }
-                                def diffPct = Math.abs(newCount - baselineCount) * 100.0 / baselineCount
-                                echo "Post-reset item-count difference: ${String.format('%.1f', diffPct)}%"
-                                if (diffPct >= 50.0) {
-                                    error("Post-reset item-count difference ${String.format('%.1f', diffPct)}% " +
-                                          ">= 50%; refusing to auto-commit. Download the archived " +
-                                          "new_test_durations.json, review, and upload manually.")
-                                }
+                                // Sanity gate against the authoritative TARGET_REPO baseline
+                                // (post-reset workspace, not SOURCE_REPO or a separate HTTP fetch).
+                                sanityCheckItemCount(
+                                    "${LLM_ROOT}/${DURATION_FILE_PATH}",
+                                    "${LLM_ROOT}/new_test_durations.json")
 
                                 sh "cp ${LLM_ROOT}/new_test_durations.json ${LLM_ROOT}/${DURATION_FILE_PATH}"
 
@@ -275,9 +273,10 @@ pipeline {
                                 }
 
                                 try {
-                                    withEnv(["_TARGET_BRANCH=${params.TARGET_BRANCH}"]) {
-                                        sh 'cd ' + LLM_ROOT + ' && git push origin "HEAD:$_TARGET_BRANCH"'
-                                    }
+                                    sh """
+                                        cd ${LLM_ROOT}
+                                        git push "https://svc_tensorrt:\${GITHUB_API_TOKEN}@github.com/${TARGET_REPO}.git" HEAD:${params.TARGET_BRANCH}
+                                    """
                                     break  // push succeeded
                                 } catch (Exception pushErr) {
                                     echo "Push attempt ${attempt} failed: ${pushErr.getMessage()}"
