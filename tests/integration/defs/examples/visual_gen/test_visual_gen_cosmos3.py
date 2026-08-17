@@ -902,11 +902,29 @@ def _ci_diag_environment():
             lines.append(f"{mod}=UNAVAILABLE({type(exc).__name__})")
     ckpt = _lpips_model_path("Cosmos3-Edge")
     lines.append(f"python={platform.python_version()} models_root={os.path.dirname(ckpt)}")
-    for rel in ("model_index.json", "vae/config.json", "transformer/config.json"):
+    for rel in ("model_index.json", "vae/config.json", "transformer/config.json", "tokenizer.json"):
         p = os.path.join(ckpt, rel)
         if os.path.exists(p):
             digest = hashlib.sha256(open(p, "rb").read()).hexdigest()[:16]
             lines.append(f"ckpt:{rel}={digest}")
+    # Weight identity, not just configs: size plus head/tail 1 MiB of every
+    # safetensors file. Full hashes of 9 GB are too slow for a test; head+tail
+    # covers the header (tensor offsets) and trailing data, so any resave,
+    # truncation, or requantization shows up.
+    for root, _dirs, files in sorted(os.walk(ckpt)):
+        for fn in sorted(files):
+            if not fn.endswith(".safetensors"):
+                continue
+            p = os.path.join(root, fn)
+            size = os.path.getsize(p)
+            h = hashlib.sha256()
+            with open(p, "rb") as fh:
+                h.update(fh.read(1 << 20))
+                if size > (2 << 20):
+                    fh.seek(-(1 << 20), os.SEEK_END)
+                    h.update(fh.read(1 << 20))
+            rel = os.path.relpath(p, ckpt)
+            lines.append(f"wt:{rel}={h.hexdigest()[:16]},{size}")
     return lines
 
 
