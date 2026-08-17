@@ -33,6 +33,44 @@ The following abbreviated command syntax shows the commonly used arguments to st
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
 
+.. _startup-states:
+
+Startup States
+~~~~~~~~~~~~~~
+
+The server starts listening before the model is initialized, so a client can
+tell a server that is still starting up from one that died. There are three
+observable states:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - State
+     - Behavior
+   * - Starting
+     - The port accepts connections and every endpoint, ``/health`` included,
+       answers ``503 Service Unavailable`` with a ``Retry-After: 1`` header
+       and ``x-trtllm-server-state: starting``.
+   * - Ready
+     - Requests reach the model and ``/health`` answers ``200``.
+   * - Dead
+     - Nothing is listening, so the connection is refused.
+
+Poll ``/health`` until it returns ``200``; treat ``503`` as "not yet" and a
+refused connection as "not running". Model initialization can take many
+minutes for a large model, so a readiness probe should allow for it. There is
+no separate "failed" state: if initialization fails, the server logs the
+error, stops listening, and exits with a nonzero status, which a poller sees
+as the dead state.
+
+.. code-block:: bash
+
+   curl -i http://localhost:8000/health
+   # HTTP/1.1 503 Service Unavailable
+   # retry-after: 1
+   # x-trtllm-server-state: starting
+
 Inference Endpoints
 -------------------
 

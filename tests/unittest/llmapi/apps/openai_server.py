@@ -105,26 +105,32 @@ class RemoteOpenAIServer:
         # run health check on the first rank only.
         start = time.time()
         while True:
+            err = None
             try:
                 if self.rank == 0:
                     if requests.get(url).status_code == 200:
                         break
                     else:
+                        # A server that is still initializing now answers 503
+                        # rather than refusing the connection, so this branch
+                        # has to enforce the deadline too -- otherwise a
+                        # server that never becomes ready loops here forever.
                         time.sleep(0.5)
                 else:
                     time.sleep(timeout)
                     break
-            except Exception as err:
+            except Exception as e:
+                err = e
                 result = self.proc.poll()
                 if result is not None and result != 0:
                     raise RuntimeError("Server exited unexpectedly.") from err
 
                 time.sleep(0.5)
-                if time.time() - start > timeout:
-                    # Terminate the server to avoid the process keeping running in background after timeout
-                    self.terminate()
-                    raise RuntimeError(
-                        "Server failed to start in time.") from err
+
+            if time.time() - start > timeout:
+                # Terminate the server to avoid the process keeping running in background after timeout
+                self.terminate()
+                raise RuntimeError("Server failed to start in time.") from err
 
     @property
     def url_root(self) -> str:
