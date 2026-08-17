@@ -13,6 +13,7 @@ from tensorrt_llm._torch.peft.lora import layer as lora_layer
 def _make_runner(
     layer_idx: int = 3,
     input_hidden_size: int = 256,
+    dtype: torch.dtype = torch.float16,
 ) -> lora_layer._LoraGroupedGemmRunner:
     layer = lora_layer.LoraLayer(
         [
@@ -28,7 +29,7 @@ def _make_runner(
         max_rank=16,
         max_lora_size=4,
         problem_count=8,
-        dtype=torch.float16,
+        dtype=dtype,
     )
 
 
@@ -64,6 +65,56 @@ def test_lora_split_k_runner_uses_default_tactic(monkeypatch):
     x = torch.empty(2, runner.input_hidden_size)
     assert runner([x], tactic=-1) is x
     assert split_ks == [lora_layer._LORA_DEFAULT_SPLIT_K]
+
+
+def test_fp8_lora_tuning_uses_private_synthetic_host_ranks(monkeypatch):
+    runner = _make_runner(dtype=torch.float8_e4m3fn)
+    layer_params = SimpleNamespace(
+        d_b_ptrs=torch.zeros((2, 4), dtype=torch.int64),
+        d_b_prime_ptrs=torch.zeros((2, 4), dtype=torch.int64),
+        d_output_sizes=torch.tensor([128, 64]),
+        d_output_sizes_offset=torch.tensor([0, 128]),
+    )
+    cuda_graph_params = SimpleNamespace(
+        layer_params={runner.layer_key: layer_params},
+        slot_ranks_host=torch.zeros(4, dtype=torch.int32),
+    )
+    cuda_graph_params.get_layer_params = cuda_graph_params.layer_params.get
+    live_slot_ranks_host = cuda_graph_params.slot_ranks_host
+    runner.lora_params = runner.copy_lora_params({"cuda_graph_params": cuda_graph_params})
+
+    observed_slot_ranks_host = []
+
+    def fake_forward_impl(x, lora_params, layer_idx, split_k):
+        del layer_idx, split_k
+        observed_slot_ranks_host.append(lora_params["cuda_graph_params"].slot_ranks_host.clone())
+        return x
+
+    monkeypatch.setattr(runner.layer, "_forward_cuda_graph_mode_impl", fake_forward_impl)
+
+    x = torch.empty((2, runner.input_hidden_size), dtype=torch.float8_e4m3fn)
+    synthetic_inputs = [
+        x,
+        torch.tensor([2, 0, 0, 0]),
+        torch.tensor([runner.max_rank, 0, 0, 0]),
+        torch.tensor([0, 2, 2, 2, 2]),
+        layer_params.d_b_ptrs,
+        layer_params.d_b_prime_ptrs,
+        torch.arange(2),
+        layer_params.d_output_sizes,
+        layer_params.d_output_sizes_offset,
+    ]
+
+    assert runner(synthetic_inputs, tactic=1) is x
+    torch.testing.assert_close(
+        observed_slot_ranks_host[0],
+        torch.tensor([runner.max_rank, 0, 0, 0], dtype=torch.int32),
+    )
+    assert cuda_graph_params.slot_ranks_host is live_slot_ranks_host
+    torch.testing.assert_close(
+        live_slot_ranks_host,
+        torch.zeros(4, dtype=torch.int32),
+    )
 
 
 def test_lora_layer_reuses_runner_across_cuda_graph_warmups(monkeypatch):
