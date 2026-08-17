@@ -91,8 +91,9 @@ def _report_observed_child_failure(return_code: int, component: str,
             exit_code_known=True,
             exit_code=exit_code,
             signal_number=signal_number,
-        ))
-    set_lifecycle_phase(lifecycle_phase)
+        ),
+        lifecycle_phase=lifecycle_phase,
+    )
 
 
 def _apply_effective_telemetry_config(llm_args: dict,
