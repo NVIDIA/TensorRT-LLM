@@ -2756,6 +2756,7 @@ class TestPendingTransferResponseFlush:
         executor.enable_iter_perf_stats = False
         executor._resource_governor_enabled = False
         executor._is_kv_manager_v2 = False
+        executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
         executor._handle_disagg_cache_errors_synced = Mock()
         executor._flush_pending_transfer_responses = Mock()
