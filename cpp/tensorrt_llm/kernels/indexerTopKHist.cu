@@ -55,7 +55,7 @@
 // EXACT-MATCH row-length contract (see topKPerRowDecode in indexerTopK.cu):
 //   seq_len       = seqLens[rowIdx / next_n]   (clamped >= 0, read as uint32)
 //   actual_kv_len = seq_len - next_n + (rowIdx % next_n) + 1
-//   rowEnd        = actual_kv_len / compressRatio
+//   rowEnd        = actual_kv_len / compressRatio   (clamped to [0, numColumns])
 // ============================================================================
 
 #include "tensorrt_llm/kernels/indexerTopKHist.h"
@@ -1255,11 +1255,13 @@ struct SelectParams
     uint32_t topK;
     uint32_t next_n;
     uint32_t compressRatio;
+    uint32_t numColumns; // allocated per-row width; rowEnd is clamped to this to bound logits reads.
     uint32_t clusterFloor;
 };
 
-// Per-row length, matching topKPerRowDecode exactly (indexerTopK.cu L667-669),
-// with the requested safety clamp of padded/negative rows to 0.
+// Per-row length, matching topKPerRowDecode (indexerTopK.cu L667-669), plus a
+// safety clamp to [0, numColumns] so padded/negative or oversized seqLens rows
+// can never drive logits reads out of the allocated row width.
 INDEXER_TOPK_HIST_DEVICE uint32_t computeRowEnd(SelectParams const& p, uint32_t rowIdx)
 {
     // seqLens read as uint32 (matching the upstream convention); a padded/garbage negative
@@ -1267,7 +1269,10 @@ INDEXER_TOPK_HIST_DEVICE uint32_t computeRowEnd(SelectParams const& p, uint32_t 
     int const seq_len = p.seqLens[rowIdx / p.next_n];
     int const actual_kv_len = seq_len - static_cast<int>(p.next_n) + static_cast<int>(rowIdx % p.next_n) + 1;
     int const rowEnd = actual_kv_len > 0 ? actual_kv_len / static_cast<int>(p.compressRatio) : 0;
-    return static_cast<uint32_t>(rowEnd < 0 ? 0 : rowEnd);
+    // Clamp to the allocated column width: a padded/stale seqLens value larger than
+    // the logits buffer would otherwise drive for_each_input past the row end (OOB read).
+    int const clamped = rowEnd < static_cast<int>(p.numColumns) ? rowEnd : static_cast<int>(p.numColumns);
+    return static_cast<uint32_t>(clamped < 0 ? 0 : clamped);
 }
 
 // The cluster size is supplied at launch via cudaLaunchAttributeClusterDimension
@@ -1349,28 +1354,38 @@ __global__ __launch_bounds__(kBlockSize, kOccupancy) void topkSelectSmallBatchKe
 // Public launcher
 // ---------------------------------------------------------------------------
 
-bool indexerTopKDecodeHistSupported(int numRows, int topK, int stride1, int compressRatio)
+bool indexerTopKDecodeHistSupported(int numRows, int topK, int stride0, int stride1, int compressRatio)
 {
+    // The long-context tier launches an 8-way thread-block cluster. Cluster launch is
+    // supported on Hopper (SM90) and datacenter Blackwell (SM100/SM103), but NOT on
+    // workstation Blackwell (SM120/SM121) which lacks cluster launch hardware -- mirrors
+    // the gate in allReduceFusionKernels.cu. Gate the fast path out on unsupported
+    // devices so the caller falls back to the stock split/merge path instead of aborting
+    // at launch. Cache the SM query: getSMVersion() issues cudaGetDevice +
+    // cudaDeviceGetAttribute, too costly to repeat on this per-launch path.
+    static int const kSmVersion = tensorrt_llm::common::getSMVersion();
+    bool const smOk = (kSmVersion >= 90 && kSmVersion < 120);
     bool const topKOk = (topK == 512 || topK == 1024 || topK == 2048);
-    bool const strideOk = (stride1 == 1);
+    // stride1 == 1: unit inner stride. stride0 % 4 == 0: 16-byte vectorized row loads
+    // require the row stride to be a multiple of 4 floats (matches the upstream
+    // score_stride % 4 == 0 runtime check).
+    bool const strideOk = (stride1 == 1) && (stride0 % 4 == 0);
     bool const compressOk = (compressRatio == 1 || compressRatio == 4);
     bool const rowsOk = (numRows > 0 && numRows <= static_cast<int>(topk_hist::kClusterMaxBatch));
-    return topKOk && strideOk && compressOk && rowsOk;
+    return smOk && topKOk && strideOk && compressOk && rowsOk;
 }
 
 void invokeIndexerTopKDecodeHist(float const* logits, int const* seqLens, int* outIndices, int numRows, int numColumns,
     int stride0, int next_n, int topK, int compressRatio, bool usePDL, cudaStream_t stream)
 {
     using namespace topk_hist;
-    (void) numColumns; // per-row length is recomputed on-device; kept for API fidelity.
 
     // The caller (invokeIndexerTopKDecode) gates on stride1 == 1 (unit inner
     // stride); the launcher assumes it and passes 1 to the support predicate.
-    TLLM_CHECK_WITH_INFO(indexerTopKDecodeHistSupported(numRows, topK, /*stride1=*/1, compressRatio),
+    // The predicate also enforces the cluster-capable SM and stride0 % 4 == 0
+    // requirements; this is a defensive assert since the caller already gated on it.
+    TLLM_CHECK_WITH_INFO(indexerTopKDecodeHistSupported(numRows, topK, stride0, /*stride1=*/1, compressRatio),
         "invokeIndexerTopKDecodeHist called with an unsupported shape");
-    // Vectorized 16-byte row loads require the row stride to be a multiple of 4
-    // floats (matches the upstream score_stride % 4 == 0 runtime check).
-    TLLM_CHECK_WITH_INFO(stride0 % 4 == 0, "invokeIndexerTopKDecodeHist: stride0 must be a multiple of 4");
     TLLM_CHECK_WITH_INFO(next_n > 0, "invokeIndexerTopKDecodeHist: next_n must be > 0");
 
     SelectParams params;
@@ -1381,6 +1396,7 @@ void invokeIndexerTopKDecodeHist(float const* logits, int const* seqLens, int* o
     params.topK = static_cast<uint32_t>(topK);
     params.next_n = static_cast<uint32_t>(next_n);
     params.compressRatio = static_cast<uint32_t>(compressRatio);
+    params.numColumns = static_cast<uint32_t>(numColumns);
     params.clusterFloor = (numRows <= static_cast<int>(kSmallBatchLowFloor)) ? kClusterFloorSmall : kClusterFloor;
 
     cudaLaunchConfig_t config;

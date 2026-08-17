@@ -922,7 +922,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
                         "top-k through the ported coarse-histogram kernel.");
                 }
             });
-        if (sHistEnabled && stride1 == 1 && indexerTopKDecodeHistSupported(numRows, topK, stride1, compressRatio))
+        if (sHistEnabled && stride1 == 1
+            && indexerTopKDecodeHistSupported(numRows, topK, stride0, stride1, compressRatio))
         {
             invokeIndexerTopKDecodeHist(logits, seqLens, indices, numRows, numColumns, stride0, next_n, topK,
                 compressRatio, tensorrt_llm::common::getEnvEnablePDL(), stream);

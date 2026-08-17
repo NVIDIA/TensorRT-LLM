@@ -38,7 +38,7 @@
 // (row-major, width `topK`), padding with -1, using the SAME per-row length
 //   seq_len       = seqLens[rowIdx / next_n]
 //   actual_kv_len = seq_len - next_n + (rowIdx % next_n) + 1
-//   rowEnd        = actual_kv_len / compressRatio      (clamped to >= 0)
+//   rowEnd        = actual_kv_len / compressRatio      (clamped to [0, numColumns])
 // so that dsa.py and the downstream convertReqIndexToGlobal are unchanged.
 // It does NOT fuse the page-table gather (that is v2).
 // ============================================================================
@@ -50,10 +50,14 @@ namespace kernels
 
 // Returns true iff invokeIndexerTopKDecodeHist supports this shape. The stock
 // dispatcher uses this to decide whether the TRTLLM_DSA_TOPK_HIST env
-// override may take over: topK in {512,1024,2048}, unit inner stride, and
+// override may take over: cluster-capable SM (>= 90 and < 120, i.e. Hopper /
+// datacenter Blackwell -- the cluster tier needs thread-block clusters, absent
+// on SM120/121 workstation Blackwell), topK in {512,1024,2048}, unit inner
+// stride with stride0 a multiple of 4 (16-byte vectorized loads), and
 // compressRatio in {1,4}. numRows must be small enough to map one 8-block
-// cluster per row (bounded by the small-batch launch geometry).
-bool indexerTopKDecodeHistSupported(int numRows, int topK, int stride1, int compressRatio);
+// cluster per row (bounded by the small-batch launch geometry). Any unsupported
+// shape/device falls back to the stock path.
+bool indexerTopKDecodeHistSupported(int numRows, int topK, int stride0, int stride1, int compressRatio);
 
 // Raw-pointer launcher for the selection-only decode top-k.
 //
@@ -62,7 +66,8 @@ bool indexerTopKDecodeHistSupported(int numRows, int topK, int stride1, int comp
 // seqLens       : [numRows / next_n] int32 per-batch sequence lengths.
 // outIndices    : [numRows, topK] int32, local indices, -1 padded (output).
 // numRows        = batch * next_n (one logical top-k per row).
-// numColumns     = max row width (informational; per-row length is recomputed).
+// numColumns     = allocated per-row width; the recomputed per-row length is
+//                  clamped to this to bound logits reads.
 // stride0        = row stride of `logits` in elements (must be a multiple of 4).
 // next_n         = MTP staggering factor (>=1).
 // topK           = output width == index_topk (512 / 1024 / 2048).
