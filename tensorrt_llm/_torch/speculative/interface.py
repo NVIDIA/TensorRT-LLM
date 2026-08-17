@@ -2682,7 +2682,24 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
+        # [TRTLLM-14874 repro hook] Gated on TRTLLM_REPRO_14874; no-op
+        # otherwise. This is the actual argmax-vs-sample decision point. If
+        # this executes while a CUDA graph is being recorded, whichever
+        # branch runs here is frozen into the graph body -- printing here
+        # (rather than inferring from key/copy state afterward) shows
+        # directly whether the recorded body is argmax or advanced sampling.
+        # Once the graph is captured, replay bypasses this Python code
+        # entirely, so a print seen during live serving means the eager path
+        # ran, not a graph replay.
+        _repro_14874 = os.environ.get("TRTLLM_REPRO_14874")
+
         if not spec_metadata.is_all_greedy_sample:
+            if _repro_14874:
+                print(
+                    f"[repro-14874] branch=sample "
+                    f"spec_metadata.is_all_greedy_sample="
+                    f"{spec_metadata.is_all_greedy_sample}",
+                    flush=True)
             # Use logits.shape[0] directly: for PARD under CUDA graph capture
             # runtime_draft_len may reflect the PARD-max while the captured
             # graph was built for a shorter draft_len, causing a shape mismatch
@@ -2705,6 +2722,12 @@ class SpecWorkerBase(nn.Module, ABC):
                                                    seed=seed,
                                                    offset=offset)
         else:
+            if _repro_14874:
+                print(
+                    f"[repro-14874] branch=argmax "
+                    f"spec_metadata.is_all_greedy_sample="
+                    f"{spec_metadata.is_all_greedy_sample}",
+                    flush=True)
             sampled_tokens = torch.argmax(logits, dim=-1)
 
         return sampled_tokens
