@@ -638,6 +638,7 @@ class TestKVCacheFailuresGen:
         out = sched.schedule_request([waiting], set())
 
         assert ids(out.generation_requests) == []
+        assert ids(out.paused_requests) == []
 
 
 class TestKVCacheFailuresCtx:
