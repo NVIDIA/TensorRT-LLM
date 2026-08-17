@@ -61,12 +61,12 @@ TEST(GatherScatterKernel, ZeroBuffersIsNoop)
 
 namespace
 {
-// Round-trip driver shared by all copy-backend tests: gather scattered source buffers into one
+// Round-trip driver shared by both plan-placement tests: gather scattered source buffers into one
 // packed arena region, then scatter that region into fresh dst buffers, asserting byte-exact.
-// Mixes 16B-aligned sizes (uint4 path) and unaligned sizes (byte path). `useCub` selects
-// cub::DeviceMemcpy::Batched over the custom kernel; `mappedPlan` puts the [srcs|dsts|sizes] plan
-// arrays in MAPPED host memory (the zero-copy-args path) instead of device memory.
-void runBackendRoundTrip(bool useCub, bool mappedPlan)
+// Mixes 16B-aligned sizes (uint4 path) and unaligned sizes (byte path). `mappedPlan` puts the
+// [srcs|dsts|sizes] plan arrays in MAPPED host memory (the zero-copy-args path) instead of device
+// memory.
+void runRoundTrip(bool mappedPlan)
 {
     int devs = 0;
     CUDA_OK(cudaGetDeviceCount(&devs));
@@ -134,28 +134,8 @@ void runBackendRoundTrip(bool useCub, bool mappedPlan)
 
     cudaStream_t stream{};
     CUDA_OK(cudaStreamCreate(&stream));
-    void* dTemp = nullptr;
-    std::size_t tmpBytes = 0;
-    if (useCub)
-    {
-        CUDA_OK(b::batchedCopyCubTempBytes(n, tmpBytes));
-        if (tmpBytes > 0)
-        {
-            CUDA_OK(cudaMalloc(&dTemp, tmpBytes));
-        }
-    }
-    auto gather = [&]
-    {
-        return useCub ? b::launchBatchedCopyCub(dgSrc, dgDst, dSizes, n, stream, dTemp, tmpBytes)
-                      : b::launchBatchedCopy(dgSrc, dgDst, dSizes, n, stream);
-    };
-    auto scatter = [&]
-    {
-        return useCub ? b::launchBatchedCopyCub(dsSrc, dsDst, dSizes, n, stream, dTemp, tmpBytes)
-                      : b::launchBatchedCopy(dsSrc, dsDst, dSizes, n, stream);
-    };
-    CUDA_OK(gather());
-    CUDA_OK(scatter());
+    CUDA_OK(b::launchBatchedCopy(dgSrc, dgDst, dSizes, n, stream)); // gather
+    CUDA_OK(b::launchBatchedCopy(dsSrc, dsDst, dSizes, n, stream)); // scatter
     CUDA_OK(cudaStreamSynchronize(stream));
 
     std::vector<unsigned char> dstHost(total, 0xEE);
@@ -171,33 +151,19 @@ void runBackendRoundTrip(bool useCub, bool mappedPlan)
         cudaFree(p);
     for (void* p : mappedHosts)
         cudaFreeHost(p);
-    if (dTemp != nullptr)
-        cudaFree(dTemp);
     cudaStreamDestroy(stream);
 }
 } // namespace
 
-// Default backend: custom kernel, plan arrays staged in device memory.
+// Plan arrays staged in device memory (TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS=0).
 TEST(GatherScatterKernel, GatherThenScatterRoundTrip)
 {
-    runBackendRoundTrip(/*useCub=*/false, /*mappedPlan=*/false);
-}
-
-// cub::DeviceMemcpy::Batched backend (TRTLLM_NIXL_BOUNCE_USE_CUB_COPY).
-TEST(GatherScatterKernel, CubBatchedCopyRoundTrip)
-{
-    runBackendRoundTrip(/*useCub=*/true, /*mappedPlan=*/false);
+    runRoundTrip(/*mappedPlan=*/false);
 }
 
 // Zero-copy plan args: kernel reads [srcs|dsts|sizes] from mapped host
-// (TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS).
+// (TRTLLM_NIXL_BOUNCE_USE_ZERO_COPY_ARGUMENTS=1, the default).
 TEST(GatherScatterKernel, ZeroCopyPlanArgsRoundTrip)
 {
-    runBackendRoundTrip(/*useCub=*/false, /*mappedPlan=*/true);
-}
-
-// Both options together.
-TEST(GatherScatterKernel, CubPlusZeroCopyPlanArgsRoundTrip)
-{
-    runBackendRoundTrip(/*useCub=*/true, /*mappedPlan=*/true);
+    runRoundTrip(/*mappedPlan=*/true);
 }

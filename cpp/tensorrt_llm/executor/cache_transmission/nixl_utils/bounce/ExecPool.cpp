@@ -17,8 +17,6 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
 
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/GatherScatterKernel.h"
-
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -26,20 +24,12 @@
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
-ExecPool::ExecPool(
-    std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool useZeroCopyArguments, bool useCubCopy)
+ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool useZeroCopyArguments)
     : mDeviceId(deviceId)
 {
     TLLM_CHECK_WITH_INFO(count > 0, "ExecPool: count must be > 0");
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
     std::size_t const scratchBytes = maxDescsPerChunk * (2 * sizeof(std::uint64_t) + sizeof(std::uint32_t));
-    // cub workspace size depends only on the buffer count -> size it once for the worst case (maxDescs);
-    // per-call we re-query for the actual n (<= maxDescs, so <= this) and validate it fits.
-    std::size_t cubTempBytes = 0;
-    if (useCubCopy)
-    {
-        TLLM_CUDA_CHECK(batchedCopyCubTempBytes(static_cast<std::uint32_t>(maxDescsPerChunk), cubTempBytes));
-    }
     // Gather/scatter copies sit on the KV-transfer critical path but share the GPU with model
     // kernels (prefill/decode). At default priority a copy kernel queues behind those (measured
     // ~260us avg, >1ms tail, vs ~65us of actual copy time). Greatest priority lets its blocks be
@@ -64,11 +54,6 @@ ExecPool::ExecPool(
             if (useZeroCopyArguments)
             {
                 TLLM_CUDA_CHECK(cudaHostGetDevicePointer(&c.hostPinnedDev, c.hostPinned, 0));
-            }
-            if (useCubCopy && cubTempBytes > 0)
-            {
-                TLLM_CUDA_CHECK(cudaMalloc(&c.cubTemp, cubTempBytes));
-                c.cubTempBytes = cubTempBytes;
             }
             TLLM_CUDA_CHECK(cudaStreamCreateWithPriority(&c.stream, cudaStreamNonBlocking, greatestPriority));
             TLLM_CUDA_CHECK(cudaEventCreateWithFlags(&c.event, cudaEventDisableTiming));
@@ -98,10 +83,6 @@ void ExecPool::destroyContexts()
         if (c.scratch != nullptr)
         {
             TLLM_CUDA_CHECK_WARN(cudaFree(c.scratch));
-        }
-        if (c.cubTemp != nullptr)
-        {
-            TLLM_CUDA_CHECK_WARN(cudaFree(c.cubTemp));
         }
         if (c.hostPinned != nullptr)
         {

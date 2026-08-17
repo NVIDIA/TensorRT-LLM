@@ -183,8 +183,7 @@ inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig c
     }
     n->eng = std::make_unique<b::NixlTransferEngine>(n->agent->getRawAgent(), 0);
     n->arena = std::make_unique<b::BounceArena>(cfg.arenaSizeBytes, 0, /*allowFabric=*/false);
-    n->exec = std::make_unique<b::ExecPool>(
-        cfg.maxInflightChunksPerRequest + 4, maxDescs, 0, cfg.useZeroCopyArguments, cfg.useCubCopy);
+    n->exec = std::make_unique<b::ExecPool>(cfg.maxInflightChunksPerRequest + 4, maxDescs, 0, cfg.useZeroCopyArguments);
     if (!n->eng->registerRegion(n->arena->base(), n->arena->bytes()))
     {
         return nullptr;
