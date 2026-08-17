@@ -1027,6 +1027,13 @@ class KvCacheCreator:
             logger.info(
                 "KV cache size estimation is not supported for context parallelism, disable it."
             )
+            if self._is_kv_cache_manager_v2:
+                # Like the encoder-decoder case below: promote to _skip_est
+                # so build_managers runs configure_kv_cache_capacity(), which
+                # sets the explicit quota KVCacheManagerV2 requires at
+                # construction (V1 sizes itself from the fraction
+                # internally, so it stays on the local flag).
+                self._skip_est = True
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
             estimating_kv_cache = False
@@ -1069,6 +1076,35 @@ class KvCacheCreator:
                 self._kv_cache_config.max_tokens = max_tokens
         return estimating_kv_cache
 
+    def _configure_helix_kv_cache_capacity(self) -> None:
+        """Set the helix KV quota without profiling (not CP-aware).
+
+        An explicit quota is honored as-is; otherwise fall back to V1's
+        fraction sizing of free memory. KVCacheManagerV2 min-syncs the
+        derived max_tokens across ranks.
+        """
+        if (self._kv_cache_config.max_gpu_total_bytes or 0) > 0 or \
+                self._kv_cache_config.max_tokens:
+            logger.info("Helix CP: skipping KV cache capacity profiling; using "
+                        "the explicitly configured quota.")
+            return
+        fraction = self._kv_cache_config.free_gpu_memory_fraction
+        free_mem, _total = torch.cuda.mem_get_info()
+        cost = self._get_kv_size_per_token()
+        max_tokens = cost.tokens_for_budget(int(free_mem * fraction))
+        if max_tokens <= 0:
+            raise ValueError(
+                "Helix CP: fraction-based KV sizing found no usable free "
+                "memory; set kv_cache_config.max_tokens or "
+                "max_gpu_total_bytes.")
+        logger.warning(
+            "Helix CP: capacity profiling is unsupported; sizing the KV "
+            f"cache as fraction {fraction} of free memory -> "
+            f"max_tokens={max_tokens} (rank-local). Set "
+            "kv_cache_config.max_tokens or max_gpu_total_bytes to "
+            "override.")
+        self._kv_cache_config.max_tokens = max_tokens
+
     def configure_kv_cache_capacity(self,
                                     py_executor: PyExecutor = None) -> None:
         """Perform KV cache capacity estimation.
@@ -1079,6 +1115,9 @@ class KvCacheCreator:
         mapping = self._mapping
 
         # TODO: support CP by generating dummy requests for it.
+        if mapping.cp_config.get('cp_type') == CpType.HELIX:
+            self._configure_helix_kv_cache_capacity()
+            return
         assert 'cp_type' not in mapping.cp_config
 
         fraction = self._kv_cache_config.free_gpu_memory_fraction

@@ -2201,6 +2201,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
         tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+        if mapping.has_cp_helix():
+            # Helix repurposes CP ranks as TP for non-attention layers:
+            # this rank's mamba state is a 1/(tp*cp) head slice; bare
+            # tp_size would allocate a full replica per CP rank.
+            tp_size = mapping.tp_size * mapping.cp_size
         d_inner = mamba_head_dim * mamba_num_heads
         conv_dim = d_inner + 2 * mamba_n_groups * mamba_d_state
         nheads = mamba_num_heads
@@ -2936,6 +2941,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         if self.local_num_mamba_layers > 0:
             tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
+            if mapping.has_cp_helix():
+                # Helix repurposes CP ranks as TP for non-attention layers:
+                # this rank's mamba state is a 1/(tp*cp) head slice; bare
+                # tp_size would allocate a full replica per CP rank.
+                tp_size = mapping.tp_size * mapping.cp_size
             d_inner = mamba_head_dim * mamba_num_heads
             grouped_state_dim = mamba_n_groups * mamba_d_state
             conv_dim = d_inner + 2 * grouped_state_dim

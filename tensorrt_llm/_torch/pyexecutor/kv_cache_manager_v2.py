@@ -783,6 +783,29 @@ class KVCacheManagerV2(BaseResourceManager):
             "Star attention is not supported for KVCacheManagerV2"
         )
 
+        # ---- Helix (decode context parallelism) bookkeeping --------------
+        # V1 rotates decode-KV ownership across CP ranks in
+        # prepare_resources; V2 grows KV at scheduling time, so the gate
+        # lives in try_allocate_generation / revert_allocate_generation. The
+        # backend stays helix-ignorant: it only sees rank-local token counts.
+        self._has_cp_helix = mapping.has_cp_helix()
+        if self._has_cp_helix:
+            self._helix_cp_rank = mapping.cp_rank
+            self._helix_cp_size = mapping.cp_size
+            if kv_cache_config.enable_block_reuse:
+                raise ValueError(
+                    "Helix CP requires enable_block_reuse=False: each rank "
+                    "holds an interleaved slice of the sequence, so radix "
+                    "prefix matching over the local token stream is "
+                    "meaningless."
+                )
+            if is_draft:
+                raise ValueError(
+                    "Helix CP does not support speculative decoding with "
+                    "KVCacheManagerV2 yet (draft-manager mirroring and "
+                    "rewind are not round-robin aware)."
+                )
+
         self.kv_cache_type = kv_cache_type
         self.pp_layers, self.num_layers = get_pp_layers(
             num_layers,
@@ -2227,9 +2250,32 @@ class KVCacheManagerV2(BaseResourceManager):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
+        if self._has_cp_helix and not req.is_dummy_request:
+            # Round-robin gate (V1 parity). The V2 scheduler runs before
+            # the disagg handler seeds py_decoding_iter = 1, so the first
+            # schedule reads 0 and the negative modulo would silently pick
+            # rank cp_size - 1; clamping to 1 reproduces V1's owner sequence.
+            decode_iter = max(1, req.py_decoding_iter)
+            decode_block_id = (decode_iter - 1) // self.tokens_per_block
+            if decode_block_id % self._helix_cp_size != self._helix_cp_rank:
+                # Inactive rank this step: materialize nothing but report
+                # success — False would trigger per-rank eviction hunting
+                # and desynchronize the CP group.
+                req.py_helix_is_inactive_rank = True
+                return True
+            req.py_helix_is_inactive_rank = False
+            req.seqlen_this_rank_cp += 1
+
         draft_len = self._effective_draft_len(req)
         self._allocated_draft_lens[req.py_request_id] = draft_len
-        return kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity))
+        if not kv_cache.resize(self._required_gen_capacity(req, kv_cache.capacity)):
+            if self._has_cp_helix and not req.is_dummy_request:
+                # Undo the bookkeeping above: the scheduler may retry this
+                # request in the same pass (after evicting a victim) and
+                # try_allocate_generation would increment again.
+                req.seqlen_this_rank_cp -= 1
+            return False
+        return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
@@ -2247,6 +2293,10 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
+        if self._has_cp_helix and not req.is_dummy_request and req.py_helix_is_inactive_rank:
+            # Inactive rank grew nothing this step; the default path would
+            # shrink capacity below the materialized history.
+            return
         draft_len = self._allocated_draft_lens.pop(
             req.py_request_id, self._effective_draft_len(req)
         )
@@ -2259,6 +2309,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{req.py_request_id} from {kv_cache.capacity} to "
                 f"{reverted_cap}"
             )
+        if self._has_cp_helix and not req.is_dummy_request:
+            # Symmetric to the += 1 in try_allocate_generation (active rank
+            # only; inactive ranks returned above).
+            req.seqlen_this_rank_cp -= 1
 
     def revert_allocate_context(self, req: LlmRequest) -> None:
         """Undo the capacity growth from this iteration's context resize."""
@@ -3134,6 +3188,11 @@ class KVCacheManagerV2(BaseResourceManager):
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
+            if self._has_cp_helix:
+                # token_num >= 2 keeps the active rank's
+                # past_seen_token_num (= seqlen_this_rank_cp - 1)
+                # non-negative (V1 parity).
+                token_num = max(token_num, 2)
             # token_num - 1 is the past history length in generation.
             history_hint = max(0, token_num - 1) if is_gen else None
             encoder_output_len = encoder_output_lens[i] if encoder_output_lens is not None else None
@@ -3205,6 +3264,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
+                if self._has_cp_helix:
+                    # Frozen helix fields (V1 parity): padding dummies are
+                    # appended inside forward and never pass the scheduling
+                    # gate, so these values must stay permanently valid —
+                    # last CP rank active, shared synthetic global length.
+                    if self._helix_cp_rank == self._helix_cp_size - 1:
+                        req.py_helix_is_inactive_rank = False
+                        req.prompt_len = token_num - 1
+                    else:
+                        req.py_helix_is_inactive_rank = True
+                        req.prompt_len = token_num
+                    req.py_prompt_len = req.prompt_len
+                    req.seqlen_this_rank_cp = req.prompt_len
+                    req.total_input_len_cp = token_num * self._helix_cp_size - 1
+                    req.py_decoding_iter = 1
                 if prepare_resource:
                     new_capacity = kv_cache.capacity + _kv_draft + 1
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
@@ -3633,14 +3707,32 @@ class KVCacheManagerV2(BaseResourceManager):
                 # it accumulates in the draft KV cache after every generation
                 # step. Target managers do not allocate this reserve slack.
                 rewind_len += max(self._kv_reserve_draft_tokens - runtime_draft_len, 0)
-            new_capacity = (
-                None
-                if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
-                else kv_cache.capacity - rewind_len
-            )
-            history_length = (
-                None if self.kv_compression_manages_history else req.max_beam_num_tokens - 1
-            )
+            if self._has_cp_helix and not req.is_dummy_request:
+                # max_beam_num_tokens is the GLOBAL length; on a rank
+                # holding ~1/cp of the tokens it would inflate capacity past
+                # the gate. Floor at the rank-local count; history stays
+                # untouched (its consumers are disabled under helix and it
+                # must never decrease per the backend resize contract).
+                new_capacity = (
+                    None
+                    if req.state
+                    in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
+                    else max(
+                        kv_cache.capacity - rewind_len,
+                        req.seqlen_this_rank_cp,
+                    )
+                )
+                history_length = None
+            else:
+                new_capacity = (
+                    None
+                    if req.state
+                    in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
+                    else kv_cache.capacity - rewind_len
+                )
+                history_length = (
+                    None if self.kv_compression_manages_history else req.max_beam_num_tokens - 1
+                )
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
