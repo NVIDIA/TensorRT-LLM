@@ -2131,7 +2131,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
                     export perfMode=$effectivePerfMode
-                    export infraDryRun=$infraDryRun
+                    ${infraDryRun ? "export infraDryRun=true" : ""}
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
@@ -3814,7 +3814,7 @@ def runInfraDryRunInPreparedWorkspace(pipeline, String llmSrc, String stageName)
     }
 }
 
-def runLLMDocBuild(pipeline, config, stageName)
+def runLLMDocBuild(pipeline, config)
 {
     // Step 1: cloning source code
     sh "pwd && ls -alh"
@@ -3840,7 +3840,7 @@ def runLLMDocBuild(pipeline, config, stageName)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
     if (isInfraDryRun()) {
-        runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)
+        runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, "CPU-Build_Docs")
         return
     }
 
@@ -3889,10 +3889,10 @@ def runLLMAgentFlowTest(pipeline, stageName)
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
 
-    def llmSrc = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
     // Dry acceptance validates the shared benchmark/JUnit/upload path for every
     // selected stage; it must not install or execute this product test suite.
     if (isInfraDryRun()) {
+        def llmSrc = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
         // The build pod used by AgentFlow does not run the normal TRT-LLM test
         // environment setup, so install only the pytest, test-list, and upload
         // tooling consumed by the shared dry-run adapter. Keep the AgentFlow
@@ -3905,7 +3905,7 @@ def runLLMAgentFlowTest(pipeline, stageName)
         return
     }
 
-    def agentFlowRoot = "${llmSrc}/agent-flow"
+    def agentFlowRoot = "${LLM_ROOT}/agent-flow"
 
     // Install agent-flow with its test extras (pytest, pytest-asyncio) and the
     // runtime deps from pyproject.toml (claude-agent-sdk, openai-codex, ...).
@@ -6426,7 +6426,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     docBuildConfigs = [
         "CPU-Build_Docs": [docBuildSpec, {
             sh "rm -rf **/*.xml *.tar.gz"
-            runLLMDocBuild(pipeline, VANILLA_CONFIG, "CPU-Build_Docs")
+            runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
         }],
     ]
 
