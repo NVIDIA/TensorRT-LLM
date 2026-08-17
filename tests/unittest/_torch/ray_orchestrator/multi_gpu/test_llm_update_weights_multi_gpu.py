@@ -34,12 +34,12 @@ from utils.torch_ref import RefHFModel
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import LLM
-from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
     _dequantize_nvfp4,
     _quantize_nvfp4,
 )
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
