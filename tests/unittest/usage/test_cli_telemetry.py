@@ -77,14 +77,16 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
 def terminal_mocks():
     """Provide the standard fail-silent session boundary dependencies."""
     with (
-        patch.object(_telemetry.usage, "start_usage_session", return_value=True) as start,
+        patch.object(
+            _telemetry.usage, "apply_usage_session_config", return_value=True
+        ) as apply_config,
         patch.object(_telemetry.usage, "set_lifecycle_phase") as set_phase,
         patch.object(_telemetry.usage, "get_observed_signal", return_value=0) as signal,
         patch.object(_telemetry.usage, "record_observed_signal") as record_signal,
         patch.object(_telemetry.usage, "report_exit") as report_exit,
     ):
         yield SimpleNamespace(
-            start=start,
+            apply_config=apply_config,
             set_phase=set_phase,
             signal=signal,
             record_signal=record_signal,
@@ -136,19 +138,19 @@ class TestTelemetryGroup:
             "telemetry_config": {"disabled": True},
             "another_option": object(),
         }
-        with patch.object(_telemetry.usage, "start_usage_session") as start_session:
+        with patch.object(_telemetry.usage, "apply_usage_session_config") as apply_config:
             _telemetry.apply_raw_config_telemetry_opt_out(
                 config,
                 usage_context=UsageContext.CLI_SERVE,
                 component="server",
             )
 
-        assert start_session.call_args.args[0] == {"disabled": True}
-        assert start_session.call_args.kwargs["lifecycle_phase"] == "config_validation"
+        assert apply_config.call_args.args[0] == {"disabled": True}
+        assert apply_config.call_args.kwargs["lifecycle_phase"] == "config_validation"
 
     def test_explicit_cli_telemetry_overrides_yaml_opt_out(self):
         """A typed --telemetry flag retains Click/YAML precedence."""
-        with patch.object(_telemetry.usage, "start_usage_session") as start_session:
+        with patch.object(_telemetry.usage, "apply_usage_session_config") as apply_config:
             _telemetry.apply_raw_config_telemetry_opt_out(
                 {"telemetry_config": {"disabled": True}},
                 usage_context=UsageContext.CLI_SERVE,
@@ -156,7 +158,7 @@ class TestTelemetryGroup:
                 explicit_cli_telemetry=True,
             )
 
-        start_session.assert_not_called()
+        apply_config.assert_not_called()
 
     @pytest.mark.parametrize(
         ("yaml_config", "telemetry", "expected_disabled"),
@@ -189,7 +191,7 @@ class TestTelemetryGroup:
         config_path.write_text(yaml_config, encoding="utf-8")
         monkeypatch.delenv(_telemetry._TELEMETRY_OPT_OUT_ENV, raising=False)
 
-        with patch.object(_telemetry.usage, "start_usage_session") as start_session:
+        with patch.object(_telemetry.usage, "apply_usage_session_config") as apply_config:
             disabled = _telemetry.apply_disaggregated_telemetry_config(
                 str(config_path),
                 telemetry=telemetry,
@@ -198,10 +200,10 @@ class TestTelemetryGroup:
         assert disabled is expected_disabled
         if expected_disabled:
             assert os.environ[_telemetry._TELEMETRY_OPT_OUT_ENV] == "1"
-            assert start_session.call_args.args == ({"disabled": True},)
+            assert apply_config.call_args.args == ({"disabled": True},)
         else:
             assert _telemetry._TELEMETRY_OPT_OUT_ENV not in os.environ
-            start_session.assert_not_called()
+            apply_config.assert_not_called()
 
     def test_disaggregated_opt_out_deactivates_and_propagates(
         self,
@@ -216,7 +218,7 @@ class TestTelemetryGroup:
             "telemetry_config:\n  disabled: true\n",
             encoding="utf-8",
         )
-        assert usage_lib.start_usage_session(default_usage_context="cli_serve")
+        assert usage_lib.apply_usage_session_config(default_usage_context="cli_serve")
         assert usage_lib._get_session() is not None
 
         assert _telemetry.apply_disaggregated_telemetry_config(
@@ -270,7 +272,7 @@ class TestTelemetryGroup:
         with pytest.raises(SystemExit):
             cli.main(args=["--no-telemetry", "run"], prog_name="test-cli")
 
-        config = terminal_mocks.start.call_args.args[0]
+        config = terminal_mocks.apply_config.call_args.args[0]
         assert config.disabled is True
 
     def test_keyboard_interrupt_reports_signal(self, terminal_mocks):

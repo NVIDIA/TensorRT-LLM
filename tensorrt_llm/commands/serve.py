@@ -54,12 +54,11 @@ from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
-from tensorrt_llm.usage import TerminalOutcome
+from tensorrt_llm.usage import TerminalOutcome, apply_usage_session_config
 from tensorrt_llm.usage import config as _telemetry_config
 from tensorrt_llm.usage import (get_observed_signal, record_observed_signal,
                                 record_termination_observation,
-                                set_lifecycle_phase, set_usage_context,
-                                start_usage_session)
+                                set_lifecycle_phase, set_usage_context)
 
 if TYPE_CHECKING:
     # Type-only: the visual_gen tree is imported lazily inside the VisualGen
@@ -101,7 +100,7 @@ def _apply_effective_telemetry_config(llm_args: dict,
     """Apply a parsed config opt-out before later setup can fail."""
     telemetry_config = llm_args.get("telemetry_config")
     if telemetry_config is not None:
-        start_usage_session(
+        apply_usage_session_config(
             telemetry_config,
             default_usage_context="cli_serve",
             component=component,
@@ -2317,7 +2316,7 @@ def _run_fleet_worker():
     Each ``Popen`` receives an explicit ``TLLM_DISAGG_WORKER_PROCESS_ID`` and
     binds its own ``SO_REUSEPORT`` socket on the shared public port.
     """
-    start_usage_session(
+    apply_usage_session_config(
         default_usage_context=_telemetry_config.UsageContext.DISAGGREGATED.
         value,
         component="server",

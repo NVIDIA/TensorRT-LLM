@@ -148,7 +148,7 @@ def _run_signal_test_child(
 
     usage_lib._is_reporting_rank = is_reporting_rank
     usage_lib._send_to_gxt = capture_payload
-    assert usage_lib.start_usage_session(
+    assert usage_lib.apply_usage_session_config(
         default_usage_context="cli_serve",
         component="server",
         lifecycle_phase="serving",
