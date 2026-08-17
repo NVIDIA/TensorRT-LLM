@@ -11,137 +11,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Merge per-process CBTS PY_START data files (streamed, deduped) into the touch DB / HTML report / JSON map."""
+"""Merge compact CBTS coverage databases into a compact touch DB and reports."""
 
 import argparse
 import ast
 import glob
-import gzip
 import hashlib
 import json
 import os
 import re
-import sqlite3
 import tempfile
 from collections import defaultdict
 from html import escape
 
+from compact_db import SCHEMA_VERSION, canonicalize_path, merge_databases
+
 
 def canon(path):
     """Collapse an absolute install/src path to the ``tensorrt_llm/...`` product-relative form."""
-    m = re.search(r"(tensorrt_llm/.*)$", path)
-    return m.group(1) if m else path
-
-
-def _read_data_file(fp):
-    """Open one per-process file once and return (stage, touch_rows, test_meta_rows).
-
-    ``touch_rows`` are canon'd ``(test, file, qualname)`` tuples; a corrupt/unreadable input yields
-    empty lists. Legacy ``.json`` / ``.json.gz`` files carry no stage or test_meta.
-    """
-    if fp.endswith(".sqlite"):
-        try:
-            con = sqlite3.connect(f"file:{fp}?mode=ro", uri=True)
-        except sqlite3.Error:
-            return "", [], []
-        try:
-            try:
-                row = con.execute("SELECT stage FROM proc_meta LIMIT 1").fetchone()
-                stage = row[0] if row and row[0] else ""
-            except sqlite3.Error:
-                stage = ""
-            try:
-                touch = [
-                    (test, canon(file), qual)
-                    for test, file, qual in con.execute("SELECT test, file, qualname FROM touch")
-                ]
-            except sqlite3.Error:
-                touch = []
-            try:
-                meta = list(con.execute("SELECT test, outcome, expected_workers FROM test_meta"))
-            except sqlite3.Error:
-                meta = []
-            return stage, touch, meta
-        finally:
-            con.close()
-    try:
-        opener = gzip.open if fp.endswith(".gz") else open
-        with opener(fp, "rt") as f:
-            data = json.load(f)
-        touch = [(ctx, canon(file), qual) for ctx, pairs in data.items() for file, qual in pairs]
-    except (OSError, ValueError):
-        touch = []
-    return "", touch, []
+    return canonicalize_path(path)
 
 
 def merge_to_sqlite(pattern, out_path):
-    """Stream every per-process file into a deduped touch DB. Returns (connection, n_data_files)."""
+    """Union every matching compact DB. Returns ``(connection, input_count)``."""
     files = sorted(glob.glob(pattern))
-    if os.path.exists(out_path):
-        os.remove(out_path)
-    con = sqlite3.connect(out_path)
-    con.execute("PRAGMA journal_mode=OFF")
-    con.execute("PRAGMA synchronous=OFF")
-    con.execute(
-        "CREATE TABLE touch (test TEXT, file TEXT, qualname TEXT, stage TEXT, "
-        "UNIQUE(test, file, qualname, stage))"
-    )
-    con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
-
-    # Per-(test, stage) completeness signal: saved_procs counts the per-process files that
-    # contributed rows; outcome / expected_workers come from the coordinator's test_meta.
-    test_procs = defaultdict(set)
-    test_outcome = {}
-    test_expected = defaultdict(int)
-
-    for fp in files:
-        # One open per file; input errors degrade to empty, destination-write errors abort the merge.
-        stage, touch_rows, meta_rows = _read_data_file(fp)
-        batch = []
-        seen_tests = set()
-        for test, file, qual in touch_rows:
-            seen_tests.add(test)
-            batch.append((test, file, qual, stage))
-            if len(batch) >= 20000:
-                con.executemany("INSERT OR IGNORE INTO touch VALUES (?, ?, ?, ?)", batch)
-                batch = []
-        if batch:
-            con.executemany("INSERT OR IGNORE INTO touch VALUES (?, ?, ?, ?)", batch)
-        for test in seen_tests:
-            if test:
-                test_procs[(test, stage)].add(fp)
-        for test, outcome, expected in meta_rows:
-            if not test:
-                continue
-            if outcome is not None:
-                test_outcome[(test, stage)] = outcome
-            if expected:
-                test_expected[(test, stage)] += int(expected)
-
-    con.execute(
-        "CREATE TABLE test_meta (test TEXT, stage TEXT, outcome TEXT, "
-        "expected_workers INTEGER, saved_procs INTEGER, PRIMARY KEY(test, stage))"
-    )
-    con.executemany(
-        "INSERT OR REPLACE INTO test_meta VALUES (?, ?, ?, ?, ?)",
-        [
-            (
-                t,
-                s,
-                test_outcome.get((t, s)),
-                test_expected.get((t, s), 0),
-                len(test_procs.get((t, s), ())),
-            )
-            for (t, s) in set(test_procs) | set(test_outcome) | set(test_expected)
-        ],
-    )
-
-    con.execute("CREATE INDEX ix_file ON touch(file)")
-    con.execute("CREATE INDEX ix_func ON touch(file, qualname)")
-    con.execute("CREATE INDEX ix_test ON touch(test)")
-    con.execute("CREATE INDEX ix_stage ON touch(stage)")
-    con.commit()
-    return con, len(files)
+    return merge_databases(files, out_path), len(files)
 
 
 def _collect_defs(node, prefix, rel, funcs):
@@ -193,14 +87,15 @@ def write_html_tree(out_dir, con, rate_line, n_tests, n_data_files):
     files_dir = os.path.join(out_dir, "files")
     os.makedirs(files_dir, exist_ok=True)
     files = [
-        r[0] for r in con.execute("SELECT DISTINCT file FROM touch WHERE test != '' ORDER BY file")
+        r[0]
+        for r in con.execute("SELECT DISTINCT file FROM touch_rows WHERE test != '' ORDER BY file")
     ]
 
     for file in files:
         # one file's (qualname -> tests) held at a time
         funcs = defaultdict(list)
         for qual, test in con.execute(
-            "SELECT DISTINCT qualname, test FROM touch WHERE file = ? AND test != '' "
+            "SELECT DISTINCT qualname, test FROM touch_rows WHERE file = ? AND test != '' "
             "ORDER BY qualname, test",
             (file,),
         ):
@@ -227,7 +122,7 @@ def write_html_tree(out_dir, con, rate_line, n_tests, n_data_files):
         f: (nf, nt)
         for f, nf, nt in con.execute(
             "SELECT file, COUNT(DISTINCT qualname), COUNT(DISTINCT test) "
-            "FROM touch WHERE test != '' GROUP BY file"
+            "FROM touch_rows WHERE test != '' GROUP BY file"
         )
     }
     by_dir = defaultdict(list)
@@ -265,7 +160,7 @@ def write_json(con, out_path):
         cur_test = None
         touched = []
         rows = con.execute(
-            "SELECT DISTINCT test, file, qualname FROM touch WHERE test != '' "
+            "SELECT DISTINCT test, file, qualname FROM touch_rows WHERE test != '' "
             "ORDER BY test, file, qualname"
         )
         for test, file, qual in rows:
@@ -292,11 +187,13 @@ def write_json(con, out_path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Merge CBTS PY_START data into touch artifacts.")
-    ap.add_argument("--glob", default=".cbtscov.*.sqlite", help="glob for per-process data files")
+    ap = argparse.ArgumentParser(description="Merge compact CBTS data into touch artifacts.")
     ap.add_argument(
-        "--out-sqlite", default=None, help="indexed touch(test,file,qualname) DB for the selector"
+        "--glob",
+        default=".cbtscov.*.sqlite",
+        help="glob for compact leaf or aggregate SQLite inputs",
     )
+    ap.add_argument("--out-sqlite", default=None, help="indexed compact touch DB for the selector")
     ap.add_argument(
         "--out-dir",
         default=None,
@@ -321,10 +218,14 @@ def main():
         os.close(fd)
     con, n_data_files = merge_to_sqlite(a.glob, db_path)
 
-    n_tests = con.execute("SELECT COUNT(DISTINCT test) FROM touch WHERE test != ''").fetchone()[0]
-    n_files = con.execute("SELECT COUNT(DISTINCT file) FROM touch WHERE test != ''").fetchone()[0]
+    n_tests = con.execute(
+        "SELECT COUNT(DISTINCT test) FROM touch_rows WHERE test != ''"
+    ).fetchone()[0]
+    n_files = con.execute(
+        "SELECT COUNT(DISTINCT file) FROM touch_rows WHERE test != ''"
+    ).fetchone()[0]
     n_funcs = con.execute(
-        "SELECT COUNT(*) FROM (SELECT DISTINCT file, qualname FROM touch WHERE test != '')"
+        "SELECT COUNT(*) FROM (SELECT DISTINCT file, qualname FROM touch_rows WHERE test != '')"
     ).fetchone()[0]
     print(
         f"CBTS PY_START: merged {n_data_files} data files -> "
@@ -333,9 +234,9 @@ def main():
 
     # Completeness: a (test, stage) is safe to skip only if it passed and every expected
     # process saved (saved_procs >= expected_workers + 1, the +1 being the coordinator).
-    n_meta = con.execute("SELECT COUNT(*) FROM test_meta WHERE test != ''").fetchone()[0]
+    n_meta = con.execute("SELECT COUNT(*) FROM test_case_meta WHERE test != ''").fetchone()[0]
     n_unsafe = con.execute(
-        "SELECT COUNT(*) FROM test_meta WHERE test != '' AND "
+        "SELECT COUNT(*) FROM test_case_meta WHERE test != '' AND "
         "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)"
     ).fetchone()[0]
     print(
@@ -344,7 +245,7 @@ def main():
     )
 
     meta = {
-        "schema_version": "2",
+        "schema_version": SCHEMA_VERSION,
         "tests": str(n_tests),
         "files": str(n_files),
         "functions": str(n_funcs),
@@ -353,10 +254,11 @@ def main():
     if a.source_root:
         coverable_files, all_funcs = enumerate_defs(a.source_root)
         touched_files = {
-            r[0] for r in con.execute("SELECT DISTINCT file FROM touch WHERE test != ''")
+            r[0] for r in con.execute("SELECT DISTINCT file FROM touch_rows WHERE test != ''")
         } & coverable_files
         touched_funcs = {
-            t for t in con.execute("SELECT DISTINCT file, qualname FROM touch WHERE test != ''")
+            t
+            for t in con.execute("SELECT DISTINCT file, qualname FROM touch_rows WHERE test != ''")
         } & all_funcs
         fr = 100.0 * len(touched_files) / len(coverable_files) if coverable_files else 0.0
         qr = 100.0 * len(touched_funcs) / len(all_funcs) if all_funcs else 0.0
