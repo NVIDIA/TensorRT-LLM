@@ -584,7 +584,12 @@ class _KVCache:
         self.stop_committing()
         assert NDEBUG or self._check_sanity()
         manager = self.manager
-        if self.capacity > 0:
+        # Dummy/warmup caches are reserved at the model's full declared context,
+        # not at a realistic sequence length, and _avg_sqr_capacity is an RMS --
+        # so a handful of them dominates the statistic outright and the tuner
+        # sizes pools for sequences that never arrive. They are already tracked
+        # as stats-excluded at creation; honour that here too.
+        if self.capacity > 0 and not manager.is_stats_excluded(self.id):
             self._avg_capacity.update(self.capacity)
             manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
