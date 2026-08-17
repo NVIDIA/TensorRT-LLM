@@ -34,6 +34,8 @@ _XML_ILLEGAL_RE = re.compile(
     r"\ud800-\udfff￾￿]"
 )
 
+_RANK_TIMEOUT_DATA_FILE_RE = re.compile(r"timeout_data_step(\d+)_rank(\d+)\.jsonl$")
+
 
 def sanitize_for_xml(text):
     """Remove ANSI escapes and XML-illegal characters, then XML-escape the result."""
@@ -59,46 +61,67 @@ def format_timeout_system_out(nodeid, snippet):
     )
 
 
-def load_timeout_map(path):
-    """Load *path* as NDJSON and return a ``{nodeid: snippet}`` mapping.
+def timeout_data_sort_key(path):
+    """Return a deterministic numeric sort key for timeout-data files."""
+    path = os.fspath(path)
+    match = _RANK_TIMEOUT_DATA_FILE_RE.search(os.path.basename(path))
+    if match:
+        return (0, int(match.group(1)), int(match.group(2)), path)
+    return (1, 0, 0, path)
 
-    Returns an empty dict when *path* is ``None``, does not exist, or cannot
-    be read.  Corrupt JSON lines are skipped with a warning so that a single
-    bad record never blocks the entire XML generation.
+
+def load_timeout_map(paths, expected_nodeids=None):
+    """Load NDJSON files and return a ``{nodeid: snippet}`` mapping.
+
+    Args:
+        paths: Paths to rank-specific or per-invocation timeout-data files.
+        expected_nodeids: Optional nodeids that remain unfinished. Records for
+            other tests are ignored before their snippets are retained.
+
+    Returns:
+        Timeout records keyed by nodeid. When duplicate rank records exist,
+        the first record by numeric step and rank order wins deterministically.
+        Unreadable files and corrupt lines are reported and skipped.
     """
-    if not path:
+    if not paths:
         return {}
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
     timeout_map = {}
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for lineno, raw in enumerate(f, 1):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    rec = json.loads(raw)
-                    if (
-                        not isinstance(rec, dict)
-                        or not isinstance(rec.get("nodeid"), str)
-                        or not isinstance(rec.get("snippet"), str)
-                    ):
-                        raise ValueError(
-                            f'expected {{"nodeid": str, "snippet": str}}, '
-                            f"got {type(rec).__name__} with keys "
-                            f"{list(rec.keys()) if isinstance(rec, dict) else 'N/A'}"
+    for path in sorted(map(os.fspath, paths), key=timeout_data_sort_key):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for lineno, raw in enumerate(f, 1):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                        if (
+                            not isinstance(rec, dict)
+                            or not isinstance(rec.get("nodeid"), str)
+                            or not isinstance(rec.get("snippet"), str)
+                        ):
+                            raise ValueError(
+                                f'expected {{"nodeid": str, "snippet": str}}, '
+                                f"got {type(rec).__name__} with keys "
+                                f"{list(rec.keys()) if isinstance(rec, dict) else 'N/A'}"
+                            )
+                        nodeid = rec["nodeid"]
+                        if expected_nodeids is not None and nodeid not in expected_nodeids:
+                            continue
+                        timeout_map.setdefault(nodeid, rec["snippet"])
+                    except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                        print(
+                            f"WARNING: generate_timeout_xml: skipping corrupt line "
+                            f"{lineno} in {path}: {exc}",
+                            file=sys.stderr,
                         )
-                    timeout_map[rec["nodeid"]] = rec["snippet"]
-                except (json.JSONDecodeError, KeyError, ValueError) as exc:
-                    print(
-                        f"WARNING: generate_timeout_xml: skipping corrupt line "
-                        f"{lineno} in {path}: {exc}",
-                        file=sys.stderr,
-                    )
-    except OSError as exc:
-        print(
-            f"WARNING: generate_timeout_xml: cannot read {path}: {exc}",
-            file=sys.stderr,
-        )
+        except OSError as exc:
+            print(
+                f"WARNING: generate_timeout_xml: cannot read {path}: {exc}",
+                file=sys.stderr,
+            )
     return timeout_map
 
 
@@ -226,8 +249,9 @@ def main():
     parser.add_argument("--output-file", required=True, help="Output file path")
     parser.add_argument(
         "--timeout-data-file",
-        default=None,
-        help="Optional path to timeout_data.jsonl produced by classify_timeout.py",
+        action="append",
+        default=[],
+        help="Optional timeout-data file; may be passed once per Slurm rank",
     )
     args = parser.parse_args(sys.argv[1:])
     stageName = args.stage_name
@@ -250,7 +274,7 @@ def main():
         print(f"No timeout tests found in {full_path}, skipping timeout XML generation")
         return
 
-    timeout_map = load_timeout_map(args.timeout_data_file)
+    timeout_map = load_timeout_map(args.timeout_data_file, set(timeoutTests))
     generate_timeout_xml(stageName, timeoutTests, outputFilePath, timeout_map)
 
 
