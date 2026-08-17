@@ -76,6 +76,8 @@ TORCH_TO_CUTE_DTYPE = {
 
 _COMPILE_CACHE = {}
 
+_REQUIRED_ALIGNMENT = 32
+
 # Elements per thread. 8 -> one LDG.128 per bf16 operand per thread,
 # num_warps = D/256 (12 warps at D=3072). 16 halves the CTA thread count
 # (more ILP, shorter reduce tree) at double the registers; it measures
@@ -85,8 +87,13 @@ _COMPILE_CACHE = {}
 # the plain op accepts 8 or 16 (both compile).
 DEFAULT_VEC = 8
 
+# CuTe DSL specialization requires the tensor-or-scalar-sentinel operands in
+# ``PerTokenAdaLN`` and its nested helpers to remain unannotated. Python union
+# annotations are not valid CuTe argument types in the pinned cutlass-dsl 4.5.0;
+# the decorator derives their concrete MLIR types from each compiled call.
 
-def _to_fake_cute_arg(t):
+
+def _to_fake_cute_arg(t: torch.Tensor | int | float) -> object:
     """Symbolic shapes/strides everywhere except the last dim (compile-time D)
     so one compilation covers any B/S and any D-divisible outer strides —
     including the temb chunk views with strides (S*6*D, 6*D, 1)."""
@@ -144,15 +151,15 @@ class PerTokenAdaLN:
     """
 
     @classmethod
-    def make_hash_key(cls, *inputs):
-        def _sig(val):
+    def make_hash_key(cls, *inputs: torch.Tensor | int | float) -> tuple[object, ...]:
+        def _sig(val: torch.Tensor | int | float) -> object:
             if isinstance(val, torch.Tensor):
                 return (val.dtype, val.ndim, val.shape[-1])
             return val
 
         return tuple(_sig(val) for val in inputs)
 
-    def __init__(self, D: int, vec: int = DEFAULT_VEC):
+    def __init__(self, D: int, vec: int = DEFAULT_VEC) -> None:
         assert D % (WARP_SIZE * vec) == 0, f"D={D} must be a multiple of {WARP_SIZE * vec}"
         self.D = D
         self.vec = vec
@@ -325,23 +332,26 @@ class PerTokenAdaLN:
 # ---------------------------------------------------------------------------
 # Validation + dispatch
 # ---------------------------------------------------------------------------
-_ROW_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_ROW_DTYPES = (torch.bfloat16,)
 
 
-def _normalize_lastdim(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    """Last-resort stride normalization. The ops are tagged
-    needs_fixed_stride_order so inductor delivers eager-layout inputs; this
-    fallback only fires for eager callers holding genuinely lastdim-strided
-    views. Outer-strided chunk views (stride(-1) == 1) pass through
-    untouched — the kernel supports them natively."""
-    if t is not None and t.stride(-1) != 1:
-        return t.contiguous()
-    return t
-
-
-def _validate_bsd(t: torch.Tensor, B: int, S: int, D: int, name: str):
+def _validate_bsd(
+    t: torch.Tensor,
+    B: int,
+    S: int,
+    D: int,
+    name: str,
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> None:
     if t.dtype not in _ROW_DTYPES:
         raise ValueError(f"{name}: unsupported dtype {t.dtype}")
+    if dtype is not None and t.dtype != dtype:
+        raise ValueError(f"{name}: expected dtype {dtype}, got {t.dtype}")
+    if not t.is_cuda:
+        raise ValueError(f"{name}: expected a CUDA tensor, got device {t.device}")
+    if device is not None and t.device != device:
+        raise ValueError(f"{name}: expected device {device}, got {t.device}")
     if t.shape != (B, S, D):
         raise ValueError(f"{name}: expected shape {(B, S, D)}, got {tuple(t.shape)}")
     if t.stride(-1) != 1:
@@ -349,36 +359,53 @@ def _validate_bsd(t: torch.Tensor, B: int, S: int, D: int, name: str):
     for i in range(t.ndim - 1):
         if t.stride(i) % D != 0:
             raise ValueError(f"{name}: stride({i})={t.stride(i)} not divisible by D={D}")
+    if t.data_ptr() % _REQUIRED_ALIGNMENT != 0:
+        raise ValueError(f"{name}: data pointer must be {_REQUIRED_ALIGNMENT}-byte aligned")
 
 
-def _validate_row(t: Optional[torch.Tensor], D: int, name: str):
+def _validate_row(t: Optional[torch.Tensor], D: int, name: str, device: torch.device) -> None:
     if t is None:
         return
     if t.dtype != torch.float32:
         raise ValueError(f"{name}: expected fp32, got {t.dtype}")
+    if not t.is_cuda or t.device != device:
+        raise ValueError(f"{name}: expected device {device}, got {t.device}")
     if t.shape != (D,):
         raise ValueError(f"{name}: expected shape ({D},), got {tuple(t.shape)}")
     if t.stride(-1) != 1:
         raise ValueError(f"{name}: must be contiguous")
+    if t.data_ptr() % _REQUIRED_ALIGNMENT != 0:
+        raise ValueError(f"{name}: data pointer must be {_REQUIRED_ALIGNMENT}-byte aligned")
 
 
-def _check_d(D: int, vec: int):
-    if D % 256 != 0 or D > 8192:
+def _check_d(D: int, vec: int) -> None:
+    if vec not in (8, 16):
+        raise ValueError(f"vec={vec} not supported: expected 8 or 16")
+    if D <= 0 or D % 256 != 0 or D > 8192:
         raise ValueError(f"D={D} not supported: must be a multiple of 256 and <= 8192")
     if D % (WARP_SIZE * vec) != 0:
         raise ValueError(f"D={D} not divisible by {WARP_SIZE * vec} (vec={vec})")
 
 
-def _launch(torch_tensors, D, vec, eps):
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    hash_key = (vec, *PerTokenAdaLN.make_hash_key(*torch_tensors))
-    compiled_fn = _COMPILE_CACHE.get(hash_key)
-    if compiled_fn is None:
-        kernel = PerTokenAdaLN(D, vec)
-        fake_sig_args = [_to_fake_cute_arg(t) for t in torch_tensors]
-        compiled_fn = cute.compile(kernel, *fake_sig_args, options="--enable-tvm-ffi")
-        _COMPILE_CACHE[hash_key] = compiled_fn
-    compiled_fn(*torch_tensors, eps, stream)
+def _launch(
+    torch_tensors: list[torch.Tensor | int | float],
+    D: int,
+    vec: int,
+    eps: float,
+    device: torch.device,
+) -> None:
+    with torch.cuda.device(device):
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        hash_key = (device, vec, *PerTokenAdaLN.make_hash_key(*torch_tensors))
+        compiled_fn = _COMPILE_CACHE.get(hash_key)
+        if compiled_fn is None:
+            if torch.cuda.get_device_capability(device) != (10, 0):
+                raise ValueError("fused per-token AdaLN requires an SM100 GPU")
+            kernel = PerTokenAdaLN(D, vec)
+            fake_sig_args = [_to_fake_cute_arg(t) for t in torch_tensors]
+            compiled_fn = cute.compile(kernel, *fake_sig_args, options="--enable-tvm-ffi")
+            _COMPILE_CACHE[hash_key] = compiled_fn
+        compiled_fn(*torch_tensors, eps, stream)
 
 
 @torch.library.custom_op(
@@ -399,7 +426,7 @@ def fused_pertoken_adaln(
            + (table_shift + shift_chunk.float())  -> x.dtype
 
     Expects:
-      - x:                        [B, S, D] (bf16/fp16/fp32), stride(-1)==1
+      - x:                        [B, S, D] bf16, stride(-1)==1
       - shift_chunk, scale_chunk: [B, S, D] views (e.g. temb[:, :, i, :] chunk
                                   views of a [B, S, 6, D] temb — strides
                                   (S*6*D, 6*D, 1)); stride(-1)==1, outer
@@ -407,29 +434,36 @@ def fused_pertoken_adaln(
       - table_shift, table_scale: [D] fp32 contiguous rows of scale_shift_table
       - D: multiple of 256, <= 8192 (unpredicated LDG.128 vectorized loads)
     """
+    if x.ndim != 3:
+        raise ValueError(f"x: expected a 3D [B, S, D] tensor, got {x.ndim}D")
     B, S, D = x.shape
+    if B == 0 or S == 0:
+        raise ValueError(f"x: B and S must be nonzero, got shape {tuple(x.shape)}")
     _check_d(D, vec)
-    x = _normalize_lastdim(x)
-    shift_chunk = _normalize_lastdim(shift_chunk)
-    scale_chunk = _normalize_lastdim(scale_chunk)
     _validate_bsd(x, B, S, D, "x")
-    _validate_bsd(shift_chunk, B, S, D, "shift_chunk")
-    _validate_bsd(scale_chunk, B, S, D, "scale_chunk")
-    _validate_row(table_shift, D, "table_shift")
-    _validate_row(table_scale, D, "table_scale")
+    _validate_bsd(shift_chunk, B, S, D, "shift_chunk", x.dtype, x.device)
+    _validate_bsd(scale_chunk, B, S, D, "scale_chunk", x.dtype, x.device)
+    _validate_row(table_shift, D, "table_shift", x.device)
+    _validate_row(table_scale, D, "table_scale", x.device)
     y = torch.empty_like(x)
     # Scalar placeholders for absent operands (CuTe DSL TVM-FFI backend does
     # not accept None); they generate no code (const_expr isinstance checks).
     torch_tensors = [y, 0, 0, x, 1, 1, 1, 0, shift_chunk, scale_chunk, table_shift, table_scale]
-    _launch(torch_tensors, D, vec, eps)
+    _launch(torch_tensors, D, vec, eps, x.device)
     return y
 
 
 @fused_pertoken_adaln.register_fake
 def _fused_pertoken_adaln_fake(
-    x, shift_chunk, scale_chunk, table_shift, table_scale, eps=1e-6, vec=DEFAULT_VEC
-):
-    return x.new_empty(x.shape)
+    x: torch.Tensor,
+    shift_chunk: torch.Tensor,
+    scale_chunk: torch.Tensor,
+    table_shift: torch.Tensor,
+    table_scale: torch.Tensor,
+    eps: float = 1e-6,
+    vec: int = DEFAULT_VEC,
+) -> torch.Tensor:
+    return torch.empty_like(x)
 
 
 @torch.library.custom_op(
@@ -466,36 +500,34 @@ def fused_pertoken_adaln_residual(
     `.to(x.dtype)`), then normalizes/modulates in fp32 with one final
     rounding.
     """
+    if x.ndim != 3:
+        raise ValueError(f"x: expected a 3D [B, S, D] tensor, got {x.ndim}D")
     B, S, D = x.shape
+    if B == 0 or S == 0:
+        raise ValueError(f"x: B and S must be nonzero, got shape {tuple(x.shape)}")
     if vec != 8:
         # cutlass-dsl 4.5.0 (requirements.txt pin) crashes compiling the
         # residual configs at vec=16; vec=8 is also the measured-best at the
         # production shape.
         raise ValueError("fused_pertoken_adaln_residual supports vec=8 only")
     _check_d(D, vec)
-    x = _normalize_lastdim(x)
-    residual = _normalize_lastdim(residual)
-    gate_chunk = _normalize_lastdim(gate_chunk)
-    shift_chunk = _normalize_lastdim(shift_chunk)
-    scale_chunk = _normalize_lastdim(scale_chunk)
     _validate_bsd(x, B, S, D, "x")
-    _validate_bsd(residual, B, S, D, "residual")
+    _validate_bsd(residual, B, S, D, "residual", x.dtype, x.device)
     if (gate_chunk is None) != (table_gate is None):
         raise ValueError("gate_chunk and table_gate must be passed together")
-    if (shift_chunk is None) != (scale_chunk is None) or (shift_chunk is None) != (
-        table_shift is None
-    ):
+    mod_operands = (shift_chunk, scale_chunk, table_shift, table_scale)
+    if any(t is None for t in mod_operands) and not all(t is None for t in mod_operands):
         raise ValueError("shift_chunk/scale_chunk/table_shift/table_scale must be passed together")
     if gate_chunk is not None:
-        _validate_bsd(gate_chunk, B, S, D, "gate_chunk")
-        _validate_row(table_gate, D, "table_gate")
-    _validate_row(weight, D, "weight")
-    _validate_row(bias, D, "bias")
+        _validate_bsd(gate_chunk, B, S, D, "gate_chunk", x.dtype, x.device)
+        _validate_row(table_gate, D, "table_gate", x.device)
+    _validate_row(weight, D, "weight", x.device)
+    _validate_row(bias, D, "bias", x.device)
     if shift_chunk is not None:
-        _validate_bsd(shift_chunk, B, S, D, "shift_chunk")
-        _validate_bsd(scale_chunk, B, S, D, "scale_chunk")
-        _validate_row(table_shift, D, "table_shift")
-        _validate_row(table_scale, D, "table_scale")
+        _validate_bsd(shift_chunk, B, S, D, "shift_chunk", x.dtype, x.device)
+        _validate_bsd(scale_chunk, B, S, D, "scale_chunk", x.dtype, x.device)
+        _validate_row(table_shift, D, "table_shift", x.device)
+        _validate_row(table_scale, D, "table_scale", x.device)
     y = torch.empty_like(x)
     residual_out = torch.empty_like(x)
     torch_tensors = [
@@ -512,23 +544,23 @@ def fused_pertoken_adaln_residual(
         0 if table_shift is None else table_shift,
         0 if table_scale is None else table_scale,
     ]
-    _launch(torch_tensors, D, vec, eps)
+    _launch(torch_tensors, D, vec, eps, x.device)
     return y, residual_out
 
 
 @fused_pertoken_adaln_residual.register_fake
 def _fused_pertoken_adaln_residual_fake(
-    residual,
-    x,
-    gate_chunk,
-    table_gate,
-    weight,
-    bias,
-    shift_chunk,
-    scale_chunk,
-    table_shift,
-    table_scale,
-    eps=1e-6,
-    vec=DEFAULT_VEC,
-):
-    return x.new_empty(x.shape), x.new_empty(x.shape)
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    gate_chunk: Optional[torch.Tensor],
+    table_gate: Optional[torch.Tensor],
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    shift_chunk: Optional[torch.Tensor],
+    scale_chunk: Optional[torch.Tensor],
+    table_shift: Optional[torch.Tensor],
+    table_scale: Optional[torch.Tensor],
+    eps: float = 1e-6,
+    vec: int = DEFAULT_VEC,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(x)

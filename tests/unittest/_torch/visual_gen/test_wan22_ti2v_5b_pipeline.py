@@ -26,7 +26,9 @@ import os
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import gc
+from contextlib import ExitStack
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -223,18 +225,51 @@ def _assert_pipeline_matches_hf(
     assert trtllm_pipe.transformer_2 is None
     assert trtllm_pipe.expand_timesteps is True
 
-    trtllm_video = _capture_trtllm_video(
-        trtllm_pipe,
-        mode=mode,
-        prompt=PROMPT,
-        negative_prompt=NEGATIVE_PROMPT,
-        height=height,
-        width=width,
-        num_frames=num_frames,
-        num_inference_steps=NUM_STEPS,
-        guidance_scale=guidance_scale,
-        seed=SEED,
-    )
+    is_sm100 = torch.cuda.get_device_capability() == (10, 0)
+    plain_call = None
+    residual_call = None
+    with ExitStack() as stack:
+        if is_sm100:
+            wan_transformer = importlib.import_module(
+                "tensorrt_llm._torch.visual_gen.models.wan.transformer_wan"
+            )
+            plain_op = wan_transformer._fused_pertoken_adaln
+            residual_op = wan_transformer._fused_pertoken_adaln_residual
+            assert plain_op is not None
+            assert residual_op is not None
+            plain_call = stack.enter_context(
+                mock.patch.object(wan_transformer, "_fused_pertoken_adaln", wraps=plain_op)
+            )
+            residual_call = stack.enter_context(
+                mock.patch.object(
+                    wan_transformer,
+                    "_fused_pertoken_adaln_residual",
+                    wraps=residual_op,
+                )
+            )
+        trtllm_video = _capture_trtllm_video(
+            trtllm_pipe,
+            mode=mode,
+            prompt=PROMPT,
+            negative_prompt=NEGATIVE_PROMPT,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=NUM_STEPS,
+            guidance_scale=guidance_scale,
+            seed=SEED,
+        )
+    if is_sm100:
+        assert plain_call is not None and plain_call.call_count > 0
+        assert residual_call is not None and residual_call.call_count > 0
+        pta_blocks = [
+            module
+            for module in trtllm_pipe.transformer.modules()
+            if hasattr(module, "_fused_pertoken_adaln_eligible")
+        ]
+        assert pta_blocks
+        assert trtllm_pipe.transformer._fused_pta_runtime_enabled is True
+        assert all(block._use_fused_pertoken_adaln for block in pta_blocks)
     del trtllm_pipe
     gc.collect()
     torch.cuda.empty_cache()
