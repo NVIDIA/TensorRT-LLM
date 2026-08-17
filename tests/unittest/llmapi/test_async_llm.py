@@ -142,7 +142,7 @@ async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
 @pytest.mark.asyncio
 async def test_async_llm_reset_prefix_cache():
     llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
-    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True, use_kv_cache_manager_v2=False)
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0, max_tokens=5, return_perf_metrics=True)
 

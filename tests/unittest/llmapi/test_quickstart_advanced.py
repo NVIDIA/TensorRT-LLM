@@ -44,9 +44,9 @@ def test_use_kv_cache_manager_v2_cli_values(cli_value: str, expected: str | bool
     assert args.use_kv_cache_manager_v2 == expected
 
 
-def test_use_kv_cache_manager_v2_cli_default_is_auto() -> None:
+def test_use_kv_cache_manager_v2_cli_default_is_true() -> None:
     parser = _MODULE.add_llm_args(argparse.ArgumentParser())
 
     args = parser.parse_args(["--model_dir", "dummy-model"])
 
-    assert args.use_kv_cache_manager_v2 == "auto"
+    assert args.use_kv_cache_manager_v2 is True
