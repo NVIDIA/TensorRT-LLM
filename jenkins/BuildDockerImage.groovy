@@ -170,6 +170,32 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
         containerConfig = """
                   - name: docker
                     image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
+                    command: ['/bin/sh', '-ec']
+                    args:
+                      - |
+                        # Match nested Docker bridges to the pod network MTU.
+                        networkInterface="\$(ip -4 route show default | awk '{ for (i = 1; i <= NF; i++) if (\$i == "dev") { print \$(i + 1); exit } }')"
+                        if [ -z "\${networkInterface}" ]; then
+                          echo "Unable to detect the pod network interface" >&2
+                          exit 1
+                        fi
+
+                        networkMtu="\$(cat "/sys/class/net/\${networkInterface}/mtu")"
+                        case "\${networkMtu}" in
+                          ''|*[!0-9]*)
+                            echo "Invalid MTU '\${networkMtu}' for interface '\${networkInterface}'" >&2
+                            exit 1
+                            ;;
+                        esac
+
+                        dindEntrypoint="\$(command -v dockerd-entrypoint.sh || true)"
+                        if [ -z "\${dindEntrypoint}" ]; then
+                          echo "Unable to find dockerd-entrypoint.sh" >&2
+                          exit 1
+                        fi
+
+                        echo "Starting Docker with MTU \${networkMtu} from interface \${networkInterface}"
+                        exec "\${dindEntrypoint}" --mtu="\${networkMtu}"
                     tty: true
                     resources:
                       requests:
@@ -305,6 +331,40 @@ def buildImage(config, imageKeyToTag)
 
     // Step 2: Build the images
     stage ("Install Package") {
+        sh(label: "Validate Docker bridge MTU", script: '''#!/bin/sh
+set -eu
+
+attempt=0
+until docker info >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    if [ "${attempt}" -ge 60 ]; then
+        echo "Docker daemon did not become ready within 60 seconds" >&2
+        exit 1
+    fi
+    sleep 1
+done
+
+networkInterface="$(ip -4 route show default |
+    awk '{ for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+if [ -z "${networkInterface}" ]; then
+    echo "Unable to detect the pod network interface" >&2
+    exit 1
+fi
+
+podMtu="$(cat "/sys/class/net/${networkInterface}/mtu")"
+if [ ! -r /sys/class/net/docker0/mtu ]; then
+    echo "Docker bridge interface docker0 is unavailable" >&2
+    exit 1
+fi
+dockerMtu="$(cat /sys/class/net/docker0/mtu)"
+
+if [ "${podMtu}" != "${dockerMtu}" ]; then
+    echo "DIND MTU mismatch: ${networkInterface}=${podMtu}, docker0=${dockerMtu}" >&2
+    exit 1
+fi
+
+echo "Verified DIND network MTU: ${networkInterface}=${podMtu}, docker0=${dockerMtu}"
+''')
         sh "pwd && ls -alh"
         sh "env | sort"
         sh "apk add make git"
