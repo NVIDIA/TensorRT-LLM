@@ -108,14 +108,20 @@ class TouchDB:
     @classmethod
     def open(cls, sqlite_path: Path | str) -> "TouchDB":
         """Open the DB read-only (`mode=ro`) and verify the compact schema."""
-        uri = f"file:{Path(sqlite_path).resolve()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        touch_cols = {row[1] for row in conn.execute("PRAGMA table_info(touch)")}
-        row_cols = {row[1] for row in conn.execute("PRAGMA table_info(touch_rows)")}
+        path = Path(sqlite_path).resolve()
+        uri = f"file:{path}?mode=ro"
         try:
+            conn = sqlite3.connect(uri, uri=True)
+        except sqlite3.Error as exc:
+            raise ValueError(f"{path}: unable to open compact touch database: {exc}") from exc
+
+        try:
+            touch_cols = {row[1] for row in conn.execute("PRAGMA table_info(touch)")}
+            row_cols = {row[1] for row in conn.execute("PRAGMA table_info(touch_rows)")}
             metadata = dict(conn.execute("SELECT key, value FROM meta"))
-        except sqlite3.OperationalError:
-            metadata = {}
+        except sqlite3.Error as exc:
+            conn.close()
+            raise ValueError(f"{path}: unable to read compact touch database: {exc}") from exc
         if (
             not {"case_stage_id", "symbol_id"} <= touch_cols
             or not {

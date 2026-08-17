@@ -221,21 +221,30 @@ def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
 
 def validate_database(path: str | os.PathLike[str]) -> None:
     """Raise ``ValueError`` unless ``path`` is a compact CBTS database."""
-    connection = sqlite3.connect(read_only_uri(path), uri=True)
+    database_path = Path(path).resolve()
+    try:
+        connection = sqlite3.connect(read_only_uri(database_path), uri=True)
+    except sqlite3.Error as exc:
+        raise ValueError(f"{database_path}: unable to open compact CBTS database: {exc}") from exc
+
     try:
         for table, required in _REQUIRED_COLUMNS.items():
             missing = required - _table_columns(connection, table)
             if missing:
-                raise ValueError(f"{path}: {table} is missing columns: {sorted(missing)}")
+                raise ValueError(f"{database_path}: {table} is missing columns: {sorted(missing)}")
         metadata = dict(connection.execute("SELECT key, value FROM meta"))
         if metadata.get("schema_version") != SCHEMA_VERSION:
             raise ValueError(
-                f"{path}: expected schema {SCHEMA_VERSION}, found {metadata.get('schema_version')}"
+                f"{database_path}: expected schema {SCHEMA_VERSION}, "
+                f"found {metadata.get('schema_version')}"
             )
         if metadata.get("storage_schema") != STORAGE_SCHEMA:
             raise ValueError(
-                f"{path}: expected storage {STORAGE_SCHEMA}, found {metadata.get('storage_schema')}"
+                f"{database_path}: expected storage {STORAGE_SCHEMA}, "
+                f"found {metadata.get('storage_schema')}"
             )
+    except sqlite3.Error as exc:
+        raise ValueError(f"{database_path}: unable to read compact CBTS database: {exc}") from exc
     finally:
         connection.close()
 
