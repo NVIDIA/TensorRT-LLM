@@ -5,7 +5,7 @@ in OpenAIServer.register_visual_gen_routes():
 
     POST /v1/images/generations
     POST /v1/images/edits
-    POST /v1/videos/sync   (sync)
+    POST /v1/videos/sync          (sync)
     POST /v1/videos               (async)
     GET  /v1/videos               (list)
     GET  /v1/videos/{video_id}    (metadata)

@@ -2686,7 +2686,8 @@ class OpenAIServer(_VideoRoutesMixin):
         base = str(raw_request.base_url).rstrip("/")
         return f"{base}/v1/images/{image_id}/content?i={i}"
 
-    def _reject_disabled_path(self, response_format) -> Optional[Response]:
+    def _reject_disabled_path(
+            self, response_format: Optional[str]) -> Optional[Response]:
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
         ``path`` discloses absolute server-side filesystem paths, so it can be

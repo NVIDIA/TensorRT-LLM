@@ -20,7 +20,7 @@ import traceback
 import uuid
 from http import HTTPStatus
 from pathlib import Path
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -71,7 +71,9 @@ def _preflight_encoder_format(fmt):
         raise ValueError(str(exc)) from exc
 
 
-def _path_json_video_response(video_id: str, path: Union[str, Path], headers=None) -> JSONResponse:
+def _path_json_video_response(
+    video_id: str, path: Union[str, Path], headers: Optional[dict[str, str]] = None
+) -> JSONResponse:
     """Build the ``{id, output_path}`` path-transport envelope.
 
     Returns the server-side output path so a co-located client reads the file
