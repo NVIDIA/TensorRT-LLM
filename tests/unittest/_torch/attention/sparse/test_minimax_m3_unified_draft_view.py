@@ -39,6 +39,9 @@ class _FakeManager:
     tokens_per_block = 128
     max_blocks_per_seq = 16
     num_pools = 1
+    # V2's flattened bound uses the target pool's 128-token page units and
+    # base pointer. The draft view must not delegate this value.
+    blocks_in_primary_pool = 1024 * SCALE
 
     def __init__(self):
         self.layer_offsets = {DRAFT_LAYER: DRAFT_LAYER}
@@ -70,6 +73,11 @@ def test_view_geometry():
     assert view.kv_cache_pool_pointers.tolist() == [[ADDR, 0]]
     # The draft layer's mapping row is rewritten to the view's single pool.
     assert view.kv_cache_pool_mapping[DRAFT_LAYER].tolist() == [0, 0]
+    # FlashInfer wraps the pool as a flat tensor rooted at the draft K
+    # pointer. Its upper bound must use 32-token sub-page units and stop after
+    # the last slot's V pages, not delegate the target manager's 128-token
+    # page bound.
+    assert view.blocks_in_primary_pool == (1024 - 1) * SCALE * 4 + 8
 
 
 def test_block_table_expansion():
@@ -127,6 +135,7 @@ def test_subdiv_one_degenerates_to_identity():
     assert view._subdiv == 1
     assert view.tokens_per_block == 128
     assert view.max_blocks_per_seq == 16
+    assert view.blocks_in_primary_pool == (1024 - 1) * SCALE + 2
     dst = torch.zeros((1, 1, 2, view.max_blocks_per_seq), dtype=torch.int32)
     view.copy_batch_block_offsets(dst, request_ids=[1], beam_width=1, num_contexts=1, num_seqs=1)
     assert dst[0, 0, 0, :2].tolist() == [5 * SCALE, 7 * SCALE]

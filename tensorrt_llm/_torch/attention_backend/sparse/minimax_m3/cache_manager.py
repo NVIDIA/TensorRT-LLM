@@ -335,7 +335,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             )
             logger.info(
                 f"[unified-kv] draft sub-page view active "
-                f"(tokens_per_block={self._draft_subpage_view_obj.tokens_per_block})"
+                f"(tokens_per_block={self._draft_subpage_view_obj.tokens_per_block}, "
+                f"flat_page_bound={self._draft_subpage_view_obj.blocks_in_primary_pool})"
             )
         return self._draft_subpage_view_obj
 
@@ -698,6 +699,7 @@ class MiniMaxM3DraftSubpageView:
             f"{manager.kv_cache_pool_mapping[int(local)].tolist()}"
         )
         addr_key, _dt, num_slots, scale, _shape = manager._kv_slot_geometry(layer_id, None)
+        self._num_slots = num_slots
         self._slot_units = scale * self._subdiv  # slot stride in 32-tok units
         self.num_pools = 1
         self.num_attention_op_pools = 1
@@ -718,6 +720,20 @@ class MiniMaxM3DraftSubpageView:
         )
         self._slots_host: Optional[np.ndarray] = None
         self._arange: Optional[torch.Tensor] = None
+
+    @property
+    def blocks_in_primary_pool(self) -> int:
+        """Flattened sub-page index bound relative to the draft K pointer.
+
+        ``FlashInferTrtllmGenFmha`` uses this value to size the flat paged-KV
+        tensor passed to FlashInfer. The wrapped V2 manager reports its bound
+        in 128-token page units relative to a different pool base, so
+        delegating that property through ``__getattr__`` under-describes this
+        32-token, draft-K-rooted view. The final slot contributes only this
+        layer's K and V pages; inter-layer padding after V is not addressable
+        from the view and need not be included.
+        """
+        return (self._num_slots - 1) * self._slot_units + 2 * self._subdiv
 
     def __getattr__(self, name):
         manager = self.__dict__.get("_manager")
