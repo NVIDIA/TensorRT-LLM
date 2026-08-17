@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
 from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
@@ -59,26 +60,33 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered() -> None:
 
 
 @pytest.mark.parametrize(
-    ("sparse_index_dim", "indexer_kv_dtype"),
-    [(96, "bf16"), (128, "fp8")],
+    ("sparse_index_dim", "indexer_kv_dtype", "expected_dtype"),
+    [(96, "bf16", torch.bfloat16), (128, "fp8", torch.float8_e4m3fn)],
 )
 def test_cache_manager_honors_executor_sparse_attention_config(
-    monkeypatch: pytest.MonkeyPatch, sparse_index_dim: int, indexer_kv_dtype: str
+    monkeypatch: pytest.MonkeyPatch,
+    sparse_index_dim: int,
+    indexer_kv_dtype: str,
+    expected_dtype: torch.dtype,
 ) -> None:
     """The production keyword controls both index width and storage dtype."""
+
+    observed_index_buffer_args = {}
 
     def fake_base_init(self, *args, **kwargs) -> None:
         del args, kwargs
         self.is_disagg = False
+        self.dtype = DataType.BF16
         self.layer_offsets = {}
 
+    def fake_get_index_k_buffer(self, layer_idx, **kwargs):
+        del self, layer_idx
+        observed_index_buffer_args.update(kwargs)
+        return None
+
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
+    monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", fake_get_index_k_buffer)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
-    monkeypatch.setattr(
-        MiniMaxM3KVCacheManagerV2,
-        "_torch_dtype_for_index_cache",
-        lambda self: torch.float8_e4m3fn,
-    )
     sparse_config = SimpleNamespace(
         sparse_index_dim=sparse_index_dim,
         indexer_kv_dtype=indexer_kv_dtype,
@@ -91,6 +99,10 @@ def test_cache_manager_honors_executor_sparse_attention_config(
 
     assert manager.sparse_index_dim == sparse_index_dim
     assert manager.indexer_kv_dtype == indexer_kv_dtype
+    assert manager._torch_dtype_for_index_cache() is expected_dtype
+    assert manager.get_index_k_buffer(3) is None
+    assert observed_index_buffer_args["head_dim"] == sparse_index_dim
+    assert observed_index_buffer_args["dtype"] is expected_dtype
 
 
 def test_msa_metadata_rejects_undersized_max_score_buffer():

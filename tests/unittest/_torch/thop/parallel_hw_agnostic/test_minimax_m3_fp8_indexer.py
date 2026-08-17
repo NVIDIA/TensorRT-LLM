@@ -250,7 +250,7 @@ def test_minimax_m3_fp8_indexer_rejects_bad_cache_contracts() -> None:
     weights = torch.ones(128, dtype=torch.bfloat16, device="cuda")
     positions = torch.zeros(2, dtype=torch.int32, device="cuda")
 
-    with pytest.raises(RuntimeError, match="must use torch.float8_e4m3fn"):
+    with pytest.raises(RuntimeError, match=r"must use torch\.float8_e4m3fn"):
         _run(
             qk,
             torch.empty(1, 1, 128, 128, dtype=torch.bfloat16, device="cuda"),
@@ -284,8 +284,10 @@ def test_minimax_m3_fp8_indexer_rejects_bad_cache_contracts() -> None:
     [
         ({"eps": 0.0}, "eps must be finite and greater than zero"),
         ({"eps": float("nan")}, "eps must be finite and greater than zero"),
+        ({"eps": 1e300}, "eps must remain finite and positive in float32"),
         ({"base": 0.0}, "RoPE base must be finite and greater than zero"),
         ({"base": float("inf")}, "RoPE base must be finite and greater than zero"),
+        ({"base": 1e300}, "RoPE base must remain finite and positive in float32"),
     ],
 )
 def test_minimax_m3_fp8_indexer_rejects_invalid_scalars(
