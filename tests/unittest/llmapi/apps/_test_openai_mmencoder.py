@@ -104,9 +104,9 @@ def test_multimodal_content_mm_encoder(
     mm_handle = choice.mm_embedding_handle
     assert "tensor_size" in mm_handle
     assert mm_handle["tensor_size"][
-        0] == 324  # qwen2.5-vl: 324 tokens for the same image
+        0] == 324  # qwen3-vl: 324 tokens for seashore.png
     assert mm_handle["tensor_size"][
-        1] == 2048  # qwen2.5-vl: hidden_size of the vision encoder
+        1] == 8192  # qwen3-vl: hidden_size * (1 + 3 deepstack streams)
 
     return messages, mm_handle  # used by tests/unittest/llmapi/apps/_test_openai_chat_multimodal.py
 
