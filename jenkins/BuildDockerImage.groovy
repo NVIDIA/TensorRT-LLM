@@ -846,7 +846,7 @@ pipeline {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                            def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
+                            def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {
                                 echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
@@ -874,7 +874,10 @@ pipeline {
                             }
                             cmd += "--image "
                             cmd += imageKeyToTag.values().join(" ")
-                            withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                            withCredentials([
+                                usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET'),
+                                usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'ARTIFACTORY_USERNAME', passwordVariable: 'ARTIFACTORY_PASSWORD')
+                            ]) {
                                 trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
                             }
                         }

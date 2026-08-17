@@ -41,6 +41,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
+from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -76,7 +77,9 @@ from .kv_cache_transceiver import (KvCacheTransceiver,
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length)
+                          MultimodalEncoderRequestError, get_draft_token_length,
+                          initialize_multimodal_encoder_request,
+                          is_multimodal_encoder_ready)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -246,7 +249,7 @@ def _load_iteration_indexes(env_var: str):
 
 
 def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
-    """Drop pinned encoder cache and raw pre-encoder tensors after prefill completes.
+    """Drop encoder outputs and raw inputs after prefill or early termination.
 
     Wraps `strip_mm_data_for_generation` and mutates the shared `request.py_multimodal_data`
     in-place so the `LlmRequest`'s multimodal tensors actually get freed (unlike
@@ -254,9 +257,15 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     and leaves the request's dict untouched).
     """
     mm_data = getattr(request, "py_multimodal_data", None)
-    if not mm_data:
-        return
-    strip_mm_data_for_generation(mm_data)
+    if mm_data:
+        strip_mm_data_for_generation(mm_data)
+    # Drop the per-item encoder state alongside the dict clear above. The
+    # state and the published `multimodal_embedding` are two references to
+    # one embedding buffer, so both have to go for the GPU memory to be
+    # freed -- and a request stripped mid-encode only has the state's.
+    # Clearing it is also the byte-budget release: the scheduler derives
+    # occupancy from live states, so this request stops counting next tick.
+    request.py_mm_encoder_state = None
 
 
 @dataclasses.dataclass
@@ -590,7 +599,6 @@ class PyExecutor:
 
         # related modules
         self.resource_manager = resource_manager
-        self.scheduler = scheduler
         self.model_engine = model_engine
         self._enable_adp_dummy_fixes = getattr(model_engine,
                                                "_enable_adp_dummy_fixes", False)
@@ -598,6 +606,12 @@ class PyExecutor:
             model_engine, "_enable_scheduler_aware_adp_dummy", False)
         self._enable_non_overlap_adp_forward_intent = getattr(
             model_engine, "_enable_non_overlap_adp_forward_intent", False)
+        # Compatibility checks and MultimodalScheduler wrapping live in
+        # `create_py_executor_instance`; the executor only keeps the flag
+        # its loop paths branch on.
+        self._mm_encoder_item_scheduling_enabled = getattr(
+            model_engine, "mm_encoder_item_scheduling_enabled", False)
+        self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
@@ -1196,7 +1210,7 @@ class PyExecutor:
                 self._terminate_request(request)
 
     def _flush_pending_transfer_responses(self):
-        """Enqueue buffered transfer-completion responses.
+        """Enqueue responses buffered by rank-divergent executor paths.
 
         Must be called at a point where ALL DP ranks execute in lockstep so
         that the tp_gather inside _enqueue_responses does not deadlock.
@@ -2728,6 +2742,10 @@ class PyExecutor:
                             local_disagg_candidates,
                             fitting_disagg_gen_init_requests)
 
+                if (self._mm_encoder_item_scheduling_enabled
+                        and scheduled_batch.scheduled_mm_encoder_items):
+                    self._forward_multimodal_encoder_step(scheduled_batch)
+
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
                     self._prepare_disagg_gen_init(
@@ -4230,6 +4248,10 @@ class PyExecutor:
                     self._flush_pending_transfer_responses()
                     continue
 
+                if (self._mm_encoder_item_scheduling_enabled
+                        and scheduled_batch.scheduled_mm_encoder_items):
+                    self._forward_multimodal_encoder_step(scheduled_batch)
+
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
@@ -4775,6 +4797,10 @@ class PyExecutor:
                     self._flush_pending_transfer_responses()
                     continue
 
+                if (self._mm_encoder_item_scheduling_enabled
+                        and scheduled_batch.scheduled_mm_encoder_items):
+                    self._forward_multimodal_encoder_step(scheduled_batch)
+
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
@@ -5262,8 +5288,13 @@ class PyExecutor:
         if len(self.control_requests) != 0:
             return
 
-        # Calculate timeout
-        idle = (total_num_active_requests == 0) and len(waiting_queue) == 0
+        # Calculate timeout. Never wait once the shutdown sentinel has been
+        # consumed: no further item will arrive to wake a blocking get(), so
+        # blocking would keep the loop from reaching the
+        # `should_stop_processing` check that ends it, deadlocking shutdown()
+        # on `shutdown_event`.
+        idle = (total_num_active_requests == 0 and len(waiting_queue) == 0
+                and not self.is_shutdown)
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -5326,6 +5357,79 @@ class PyExecutor:
                 f"{self.benchmark_req_queues_size} to prevent an unreachable "
                 f"benchmark disagg fill gate.")
 
+    def _apply_mm_encoder_admission(
+            self, waiting_queue: WaitingQueue,
+            new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
+        """Apply MM encoder item/token budgets to capacity-admitted requests.
+
+        Active requests consume this iteration's encoder budget first. New
+        requests then preserve waiting-queue FCFS order: once the head request
+        cannot make encoder progress, all later requests are deferred and
+        prepended to the waiting queue.
+        """
+        remaining_batch_slots = self.model_engine.encoder_batch_size
+        remaining_tokens = self.model_engine.encoder_max_num_tokens
+
+        def consume_pending(costs, pending_indices=None):
+            nonlocal remaining_batch_slots, remaining_tokens
+            if pending_indices is None:
+                pending_indices = range(len(costs))
+            progressed = False
+            for item_idx in pending_indices:
+                cost = costs[item_idx]
+                if remaining_batch_slots == 0 or cost > remaining_tokens:
+                    break
+                remaining_batch_slots -= 1
+                remaining_tokens -= cost
+                progressed = True
+            return progressed
+
+        for request in self.active_requests:
+            state = request.py_mm_encoder_state
+            if state is None or is_multimodal_encoder_ready(request):
+                continue
+            consume_pending(state.encoder_token_lengths,
+                            state.pending_item_indices())
+
+        admitted = []
+        deferred = []
+        blocked = False
+        for queue_item in new_requests:
+            if blocked:
+                deferred.append(queue_item)
+                continue
+            mm_data = getattr(queue_item.request, "py_multimodal_data", None)
+            try:
+                item_metadata = (get_multimodal_encoder_item_metadata(mm_data)
+                                 if isinstance(mm_data, dict) else None)
+            except (TypeError, ValueError):
+                # Admission only estimates capacity. Pass malformed requests
+                # through so the normal request-scoped validation path can
+                # report the error without terminating the executor loop or
+                # blocking later FCFS entries behind an invalid request.
+                admitted.append(queue_item)
+                continue
+            costs = (item_metadata.encoder_token_lengths
+                     if item_metadata is not None else None)
+            has_full_embedding = (isinstance(mm_data, dict)
+                                  and mm_data.get("multimodal_embedding")
+                                  is not None)
+            if costs and any(cost > self.model_engine.encoder_max_num_tokens
+                             for cost in costs):
+                # Admit the invalid request so normal request validation can
+                # return an error instead of leaving the FCFS queue blocked.
+                admitted.append(queue_item)
+                continue
+            if costs and not has_full_embedding and not consume_pending(costs):
+                blocked = True
+                deferred.append(queue_item)
+                continue
+            admitted.append(queue_item)
+
+        if deferred:
+            waiting_queue.prepend_requests(deferred)
+        return admitted
+
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
@@ -5347,12 +5451,17 @@ class PyExecutor:
                                            admission_capacity)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
-        return get_from_waiting_queue(
+        new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
+        if (not new_requests or
+                not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
+                or self.enable_attention_dp):
+            return new_requests
+        return self._apply_mm_encoder_admission(waiting_queue, new_requests)
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -5489,6 +5598,17 @@ class PyExecutor:
             """
             try:
                 self._validate_request(request)
+                if self._mm_encoder_item_scheduling_enabled:
+                    initialize_multimodal_encoder_request(
+                        request,
+                        max_num_tokens=self.model_engine.encoder_max_num_tokens,
+                        max_output_bytes=self.model_engine.
+                        mm_encoder_output_budget_bytes,
+                        bytes_per_encoder_embedding=getattr(
+                            self.model_engine,
+                            "bytes_per_mm_encoder_embedding",
+                            0,
+                        ))
                 return False
             except Exception as e:
                 self._handle_errors(str(e),
@@ -5730,18 +5850,58 @@ class PyExecutor:
         reads that decision directly rather than re-deriving it from pool layout, which V2 overstates
         (`blocks_in_primary_pool` forwards `get_page_index_upper_bound`, not the available-page count).
         A carried value of None -- non-fp8-MLA model, no reservation needed (reuse off / chunked prefill),
-        or estimation skipped -- means no admission cap is applied.
+        or estimation skipped -- means no admission cap is applied. A carried 0 is a real cap (a budget so
+        tight the reserve covers under one token), not "no cap", so it must not be collapsed into None.
         """
         cap = getattr(self, "_ctx_mla_kv_len_cap", "unset")
         if cap != "unset":
             return cap
-        if getattr(self, "is_warmup", False):
+        if self.is_warmup:
             # Estimation/warmup runs fresh-prefill dummies against a throwaway manager that reserved
             # nothing; don't cap them (and don't cache -- real serving recomputes from the real manager).
             return None
+        # getattr: managers not built by the estimator (and test doubles) never carry the attribute.
         carried = getattr(self.kv_cache_manager, "fp8_ctx_mla_kv_len_cap", None)
-        self._ctx_mla_kv_len_cap = int(carried) if carried else None
+        self._ctx_mla_kv_len_cap = int(carried) if carried is not None else None
+        self._warn_if_ctx_mla_kv_len_cap_degenerate()
         return self._ctx_mla_kv_len_cap
+
+    def _warn_if_ctx_mla_kv_len_cap_degenerate(self) -> None:
+        """Surface an fp8 context-MLA admission cap too tight to batch context requests on.
+
+        `_cap_context_by_total_kv_len` logs its deferrals at debug level, so a deployment whose budget
+        lands here sees context throughput collapse with nothing in the log at default level. Called from
+        the cached resolution in `_get_ctx_mla_kv_len_cap`, so it fires at most once per executor.
+
+        Only the memory budget can produce a cap this small: the reserve is clamped to
+        `budget * w / (k + w)` (`get_mla_context_workspace_reserve`) and the cap is that reserve divided
+        by `w`, while the `fp8_context_mla_kv_len_cap` override is floored at `max_seq_len`
+        (`get_mla_context_workspace_kv_len_cap`). So the override is never the cause, and raising it is
+        never the fix -- point at the budget instead.
+        """
+        cap = self._ctx_mla_kv_len_cap
+        if cap is None:
+            return
+        if cap == 0:
+            consequence = (
+                "every forward step will schedule exactly one context request -- the "
+                "forward-progress request kept unconditionally -- whatever its length"
+            )
+        elif self.max_seq_len and cap < self.max_seq_len:
+            consequence = (
+                f"a single request attending max_seq_len={self.max_seq_len} already exceeds it, so "
+                "context requests near that length will be scheduled one per forward step"
+            )
+        else:
+            return
+        logger.warning(
+            f"fp8 context-MLA admission cap resolved to {cap} token(s) of summed attended KV: "
+            f"{consequence}. Prefill batching is degraded, not incorrect -- generation is unaffected "
+            "and requests still complete. The cap is the workspace reserve the KV-cache estimator "
+            "could afford divided by its per-token cost, so the KV cache memory budget is the binding "
+            "constraint: raise free_gpu_memory_fraction or max_gpu_total_bytes. Raising "
+            "KvCacheConfig.fp8_context_mla_kv_len_cap will not help (it is already floored at "
+            "max_seq_len).")
 
     @staticmethod
     def _context_attended_kv_len(ctx_req) -> int:
@@ -5837,8 +5997,44 @@ class PyExecutor:
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
+        scheduled_requests.scheduled_mm_encoder_items = (
+            scheduler_output.scheduled_mm_encoder_items)
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
+
+    def _forward_multimodal_encoder_step(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        """Run scheduler-selected MM encoder work before LLM resources."""
+        scheduled_items = scheduled_requests.scheduled_mm_encoder_items
+        if not scheduled_items:
+            return
+        try:
+            self.model_engine.forward_multimodal_encoder_items(
+                self.active_requests, scheduled_items)
+        except MultimodalEncoderRequestError as e:
+            error_msg = str(e)
+            logger.error(f"Encountered an error in multimodal encoder forward: "
+                         f"{error_msg}\n{traceback.format_exc()}")
+
+            failed_request_ids = set(scheduled_items)
+            failed_requests = [
+                request for request in self.active_requests
+                if request.request_id in failed_request_ids
+            ]
+
+            # Capacity scheduling may already have placed requests whose last
+            # pending item was selected into this iteration's context batch.
+            # Remove the failed owners before the LLM forward; unrelated
+            # context and generation work remains intact.
+            scheduled_requests.reset_context_requests([
+                request for request in scheduled_requests.context_requests
+                if request.request_id not in failed_request_ids
+            ])
+            scheduled_requests.scheduled_mm_encoder_items = None
+
+            self._handle_errors(error_msg,
+                                requests=failed_requests,
+                                charge_budget=False)
 
     # ---------------------------------------------------------------
     # Encoder-decoder support: encoder iteration in the executor loop.
@@ -7582,6 +7778,9 @@ class PyExecutor:
 
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
+        # Cancellation and request-scoped failures can terminate before the
+        # normal post-prefill release point, including with a partial buffer.
+        _strip_py_multimodal_data_post_prefill(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)

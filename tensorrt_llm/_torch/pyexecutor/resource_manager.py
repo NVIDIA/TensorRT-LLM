@@ -18,6 +18,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
@@ -49,6 +50,7 @@ from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
                        nvtx_range)
 from ...logger import logger
 from ...mapping import CpType, Mapping
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
@@ -208,6 +210,10 @@ def get_pp_layers(
 
 
 def request_context(is_draft: bool, scheduled_requests: ScheduledRequests):
+    # The non-draft scope has nothing to do, and this runs on the executor's
+    # per-iteration path, so return before executing the class statement below.
+    if not is_draft:
+        return nullcontext()
 
     class RequestContext:
 
@@ -461,8 +467,7 @@ class KVCacheManager(BaseResourceManager):
         # Determine if this is VSWA (Variable Sliding Window Attention).
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
         # values (negative) used by hybrid linear attention models.
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
-            w > 0 for w in self.max_attention_window_vec)
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
