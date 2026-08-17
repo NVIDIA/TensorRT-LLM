@@ -351,13 +351,14 @@ class ConversationMessage(TypedDict, total=False):
             This is used by `interleave_mm_placeholders` to insert multimodal placeholders at the
             correct positions, and to reconstruct the OpenAI-style content list for templates that
             handle media natively.
+        tools: Message-level (dynamic) tool declarations carried on system messages. Only
+            populated for models whose python-renderer chat template consumes them (kimi_k3);
+            absent for other models.
     """
     role: str
     content: str
     media: List[MultimodalData]
     content_parts: List[Union[str, dict]]
-    # Message-level (dynamic) tool declarations on system messages, consumed
-    # by python-renderer chat templates (kimi_k3).
     tools: List[dict]
 
 

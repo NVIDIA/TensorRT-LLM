@@ -248,7 +248,8 @@ def parse_chat_message_content_parts(
 def parse_chat_message_content(
         message: ChatCompletionMessageParam,
         mm_data_tracker: MultimodalDataTracker,
-        lenient_tool_call_arguments: bool = False) -> ConversationMessage:
+        lenient_tool_call_arguments: bool = False,
+        keep_message_tools: bool = False) -> ConversationMessage:
     """Parse the content of a chat message."""
     role = message["role"]
     content = message.get("content")
@@ -271,10 +272,11 @@ def parse_chat_message_content(
                                              lenient_tool_call_arguments))
     elif role == "tool":
         result.update(_parse_tool_message_content(message))
-    elif role == "system" and message.get("tools"):
+    elif keep_message_tools and role == "system" and message.get("tools"):
         # Message-level (dynamic) tool declarations: python-renderer chat
         # templates (kimi_k3) render these as an in-conversation tool
-        # declare block at this message's position.
+        # declare block at this message's position. Other models keep the
+        # pre-existing behavior of silently ignoring the key.
         result["tools"] = message["tools"]
     return result
 
@@ -503,7 +505,8 @@ def parse_chat_messages_coroutines(
         parsed_msg = parse_chat_message_content(
             msg,
             mm_data_tracker,
-            lenient_tool_call_arguments=(model_type == "kimi_k3"))
+            lenient_tool_call_arguments=(model_type == "kimi_k3"),
+            keep_message_tools=(model_type == "kimi_k3"))
         conversation.append(parsed_msg)
 
         # Track placeholders added for this message only.
