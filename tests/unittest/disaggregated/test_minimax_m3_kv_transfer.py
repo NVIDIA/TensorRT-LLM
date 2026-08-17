@@ -97,7 +97,7 @@ def test_v2_disagg_role_mapper_kind_defaults() -> None:
 
 @pytest.mark.parametrize(
     "implementation,expected_main_mapper",
-    [("triton", MapperKind.NHD), ("msa", MapperKind.INDEXED)],
+    [("triton", MapperKind.NHD), ("msa", MapperKind.HND)],
 )
 def test_minimax_disagg_role_mapper_kinds(
     monkeypatch: pytest.MonkeyPatch,
@@ -347,12 +347,12 @@ def _fill_position_dependent(
     *,
     layer_idx: int,
     first_global_head: int,
-    layout: str,
+    layout: MapperKind,
 ) -> None:
     """Fill an NHD or HND cache view with exact position-dependent integers."""
     block = torch.arange(tensor.shape[0], device=tensor.device)[:, None, None, None, None]
     role = torch.arange(tensor.shape[1], device=tensor.device)[None, :, None, None, None]
-    if layout == "HND":
+    if layout == MapperKind.HND:
         head = (first_global_head + torch.arange(tensor.shape[2], device=tensor.device))[
             None, None, :, None, None
         ]
@@ -374,7 +374,7 @@ def _as_nvfp4_scale_tensor(
     scale_view = _get_nvfp4_scale_view(manager, layer_idx)
     if scale_view is None:
         return None
-    if manager._main_kv_layout != "NHD":
+    if manager._main_kv_mapper_kind != MapperKind.NHD:
         raise AssertionError("MSA uses an FP8 KV cache; NVFP4 scale pools are NHD-only")
     local_layer_id = manager.layer_offsets[layer_idx]
     local_heads = manager.num_kv_heads_per_layer[local_layer_id]
@@ -453,7 +453,7 @@ def _initialize_cache(
                 kv,
                 layer_idx=layer_idx,
                 first_global_head=first_global_head,
-                layout=manager._main_kv_layout,
+                layout=manager._main_kv_mapper_kind,
             )
 
             index_key = manager.get_index_k_buffer(layer_idx)
@@ -463,7 +463,7 @@ def _initialize_cache(
                     index_tensor,
                     layer_idx=layer_idx,
                     first_global_head=0,
-                    layout=manager._main_kv_layout,
+                    layout=manager._main_kv_mapper_kind,
                 )
 
             scale_tensor = _as_nvfp4_scale_tensor(manager, layer_idx)
@@ -472,7 +472,7 @@ def _initialize_cache(
                     scale_tensor,
                     layer_idx=layer_idx,
                     first_global_head=first_global_head,
-                    layout=manager._main_kv_layout,
+                    layout=manager._main_kv_mapper_kind,
                 )
 
 
@@ -503,7 +503,7 @@ def _verify_cache(
                 assert gen_indices
 
                 gen_kv = manager.get_buffers(layer_idx)[gen_indices]
-                head_axis = 2 if manager._main_kv_layout == "HND" else 3
+                head_axis = 2 if manager._main_kv_mapper_kind == MapperKind.HND else 3
                 local_heads = gen_kv.shape[head_axis]
                 first_global_head = _first_global_head(manager)
                 for kv_idx in range(2):
@@ -521,7 +521,7 @@ def _verify_cache(
                             ctx_manager, ctx_request_ids[req_idx], layer_idx
                         )
                         ctx_kv = ctx_manager.get_buffers(layer_idx)
-                        if manager._main_kv_layout == "HND":
+                        if manager._main_kv_mapper_kind == MapperKind.HND:
                             actual = gen_kv[:, kv_idx, local_head, :, :]
                             expected = ctx_kv[ctx_indices, kv_idx, ctx_local_head, :, :]
                         else:
@@ -566,7 +566,7 @@ def _verify_cache(
                         )
                         ctx_scales = _as_nvfp4_scale_tensor(ctx_manager, layer_idx)
                         assert ctx_scales is not None
-                        if manager._main_kv_layout == "HND":
+                        if manager._main_kv_mapper_kind == MapperKind.HND:
                             actual = gen_scales[gen_indices, :, local_head, :, :]
                             expected = ctx_scales[ctx_indices, :, ctx_local_head, :, :]
                         else:

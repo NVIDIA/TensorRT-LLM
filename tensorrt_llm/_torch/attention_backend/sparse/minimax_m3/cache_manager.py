@@ -150,7 +150,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
       * ``sparse_index_dim`` — width of the index-K/V vectors.
     """
 
-    _main_kv_layout = "NHD"
+    _main_kv_mapper_kind = MapperKind.NHD
 
     def __init__(
         self,
@@ -167,7 +167,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         sparse_attn_config = kwargs.get("sparse_attn_config")
         num_layers = kwargs.get("num_layers")
         implementation = getattr(sparse_attn_config, "implementation", "triton")
-        self._main_kv_layout = "HND" if implementation == "msa" else "NHD"
+        self._main_kv_mapper_kind = MapperKind.HND if implementation == "msa" else MapperKind.NHD
 
         if sparse_index_dim is None:
             sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
@@ -235,11 +235,14 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Declare the backend's main K/V layout and replicated index-K."""
-        main_kv_mapper = MapperKind.INDEXED if self._main_kv_layout == "HND" else MapperKind.NHD
         return {
-            Role.ALL: main_kv_mapper,
+            Role.ALL: self._main_kv_mapper_kind,
             Role.INDEX_KEY: MapperKind.REPLICATED,
         }
+
+    def _main_kv_layout_name(self) -> str:
+        """Return the tensor-view layout name for the selected mapper kind."""
+        return "HND" if self._main_kv_mapper_kind == MapperKind.HND else "NHD"
 
     def _compute_num_total_slots(self) -> int:
         """Total token slots across all blocks in the main K pool.
@@ -273,7 +276,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         When omitted, ``kv_layout`` follows the selected sparse backend.
         """
         if kv_layout is None:
-            kv_layout = self._main_kv_layout
+            kv_layout = self._main_kv_layout_name()
         return super().get_index_k_buffer(
             layer_idx,
             num_heads=1,
@@ -310,7 +313,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         When omitted, ``kv_layout`` follows the selected sparse backend.
         """
         if kv_layout is None:
-            kv_layout = self._main_kv_layout
+            kv_layout = self._main_kv_layout_name()
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
         if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
