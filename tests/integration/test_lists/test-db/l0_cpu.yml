@@ -76,6 +76,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
+  - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/test_bench_async.py

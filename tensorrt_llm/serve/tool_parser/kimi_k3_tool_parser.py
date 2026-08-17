@@ -110,9 +110,8 @@ class KimiK3ToolParser(BaseToolParser):
             "kimi_k3 XTML tool calls do not support structural-tag constrained decoding"
         )
 
-    def build_strict_structural_tag_format(
-            self, tools: List[Tool]) -> Dict[str, Any] | None:
-        """xgrammar structural-tag format enforcing well-formed K3 tool calls.
+    def build_strict_structural_tag_format(self, tools: List[Tool]) -> Dict[str, Any] | None:
+        """Xgrammar structural-tag format enforcing well-formed K3 tool calls.
 
         Any generated tools section is constrained to calls of the declared
         tools; a strict tool with a parameters schema additionally gets its
@@ -133,62 +132,75 @@ class KimiK3ToolParser(BaseToolParser):
             return None
         if not tools:
             return None
+        for tool in tools:
+            if "<" in tool.function.name:
+                # A literal '<' in an attribute value has no escaped form in
+                # the K3 wire format (the checkpoint renderer escapes only
+                # '&' and '"'), and the parser's attribute regex stops at
+                # '<' — a grammar-forced call with such a name would be
+                # dropped. Skip constrained decoding rather than teach the
+                # model a dialect the reference renderer never produces.
+                logger.warning(
+                    "Tool name %r contains '<'; skipping the kimi_k3 "
+                    "strict-tool grammar for this request.",
+                    tool.function.name,
+                )
+                return None
         call_tags: List[Dict[str, Any]] = []
         for tool in tools:
             begin = f'<|open|>call tool="{_escape_attr(tool.function.name)}"'
             if tool.function.strict and tool.function.parameters:
-                call_tags.append({
-                    "type": "tag",
-                    "begin": begin,
-                    "content": {
-                        "type":
-                        "sequence",
-                        "elements": [
-                            {
-                                "type": "regex",
-                                "pattern": ' index="[1-9][0-9]{0,2}"',
-                            },
-                            {
-                                "type": "const_string",
-                                "value":
-                                '<|sep|><|open|>json type="object"<|sep|>',
-                            },
-                            {
-                                "type": "json_schema",
-                                "json_schema": tool.function.parameters,
-                            },
-                        ],
-                    },
-                    "end": "<|close|>json<|sep|><|close|>call<|sep|>",
-                })
+                call_tags.append(
+                    {
+                        "type": "tag",
+                        "begin": begin,
+                        "content": {
+                            "type": "sequence",
+                            "elements": [
+                                {
+                                    "type": "regex",
+                                    "pattern": ' index="[1-9][0-9]{0,2}"',
+                                },
+                                {
+                                    "type": "const_string",
+                                    "value": '<|sep|><|open|>json type="object"<|sep|>',
+                                },
+                                {
+                                    "type": "json_schema",
+                                    "json_schema": tool.function.parameters,
+                                },
+                            ],
+                        },
+                        "end": "<|close|>json<|sep|><|close|>call<|sep|>",
+                    }
+                )
             else:
-                call_tags.append({
-                    "type": "tag",
-                    "begin": begin,
-                    "content": {
-                        "type": "any_text"
-                    },
-                    "end": "<|close|>call<|sep|>",
-                })
+                call_tags.append(
+                    {
+                        "type": "tag",
+                        "begin": begin,
+                        "content": {"type": "any_text"},
+                        "end": "<|close|>call<|sep|>",
+                    }
+                )
         return {
-            "type":
-            "triggered_tags",
+            "type": "triggered_tags",
             "triggers": [self.bot_token],
-            "tags": [{
-                "type": "tag",
-                "begin": self.bot_token,
-                "content": {
-                    "type": "tags_with_separator",
-                    "separator": "",
-                    "at_least_one": True,
-                    "tags": call_tags,
-                },
-                "end": self.eot_token,
-            }],
-            "at_least_one":
-            False,
-            "stop_after_first":
-            False,
+            "tags": [
+                {
+                    "type": "tag",
+                    "begin": self.bot_token,
+                    "content": {
+                        "type": "tags_with_separator",
+                        "separator": "",
+                        "at_least_one": True,
+                        "tags": call_tags,
+                    },
+                    "end": self.eot_token,
+                }
+            ],
+            "at_least_one": False,
+            "stop_after_first": False,
         }
 
     @staticmethod
