@@ -8,7 +8,7 @@ ATTACH_MODE=false
 MODEL_DIR="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 TP_SIZE=1
 TRANSCEIVER_BACKEND="NIXL"
-TRANSCEIVER_RUNTIME="CPP"
+TRANSCEIVER_RUNTIME="PYTHON"
 USAGE="Usage: $0 [--executor ray|mpi] [--attach] [--model model_dir] [--tp_size N] [--transceiver_backend UCX|NIXL] [--transceiver_runtime CPP|PYTHON] [--help]"
 
 while [[ $# -gt 0 ]]; do
@@ -45,7 +45,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --model model_dir    Model directory (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)"
             echo "  --tp_size N          Tensor parallel size (default: 1)"
             echo "  --transceiver_backend UCX|NIXL  Cache-transceiver backend (default: NIXL)"
-            echo "  --transceiver_runtime CPP|PYTHON  Cache transceiver runtime (default: CPP)"
+            echo "  --transceiver_runtime CPP|PYTHON  Cache transceiver runtime (default: PYTHON)"
             echo "  --help, -h           Show this help message"
             exit 0
             ;;
