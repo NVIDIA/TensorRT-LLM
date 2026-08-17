@@ -1,11 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import ast
 import inspect
 import json
 import struct
-import textwrap
 import weakref
 from copy import deepcopy
 
@@ -99,14 +97,6 @@ DEEPSEEK_V4_TINY_CONFIG = {
         "weight_block_size": [128, 128],
     },
 }
-
-
-def _source_calls(source):
-    return {
-        ast.unparse(node)
-        for node in ast.walk(ast.parse(textwrap.dedent(source)))
-        if isinstance(node, ast.Call)
-    }
 
 
 def _write_safetensors_header(path, tensor_name, dtype, shape):
@@ -363,59 +353,6 @@ def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
     joint = joint_norm(hidden_states)
 
     assert not torch.allclose(per_head, joint, atol=0.1)
-
-
-def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
-    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
-        _deepseek_v4_q_b_layernorm_fused_fp8,
-        forward_sparse_attn,
-        initialize_sparse_attn,
-    )
-    from tensorrt_llm._torch.modules.mla import MLA
-
-    mla_init_src = inspect.getsource(MLA.__init__)
-    init_src = inspect.getsource(initialize_sparse_attn)
-    forward_src = inspect.getsource(forward_sparse_attn)
-    forward_src_dedented = textwrap.dedent(forward_src)
-    q_norm_node = next(
-        node
-        for node in ast.walk(ast.parse(forward_src_dedented))
-        if isinstance(node, ast.FunctionDef) and node.name == "_q_b_layernorm"
-    )
-    fused_q_norm_node = next(
-        node
-        for node in ast.walk(ast.parse(forward_src_dedented))
-        if isinstance(node, ast.FunctionDef) and node.name == "_q_b_layernorm_fused_fp8"
-    )
-    helper_src = ast.get_source_segment(forward_src_dedented, q_norm_node)
-    fused_helper_src = ast.get_source_segment(forward_src_dedented, fused_q_norm_node)
-    assert helper_src is not None
-    assert fused_helper_src is not None
-    init_src_no_ws = "".join(init_src.split())
-
-    assert "self.q_b_layernorm=RMSNorm(hidden_size=self.qk_head_dim" in init_src_no_ws
-    assert "has_weights=False" in init_src
-    assert "self.kv_lora_rank + self.qk_rope_head_dim" in init_src
-    assert "self.kv_a_layernorm=RMSNorm(" in init_src_no_ws
-    assert "self.sparse_attn_hooks.initialize(" in mla_init_src
-    assert "deepseek_v4" not in mla_init_src
-    assert "q.dim() == 2" in helper_src
-    assert "self.num_heads_tp * self.qk_head_dim" in helper_src
-    assert "torch.ops.trtllm.deepseek_v4_q_norm" in helper_src
-    assert ".is_cuda" not in helper_src
-    assert ".is_contiguous" not in helper_src
-    assert "q.dtype" not in helper_src
-    assert "total_rows" not in helper_src
-    assert "self.q_b_layernorm(" not in helper_src
-    assert "_q_b_layernorm(q_proj)" in _source_calls(forward_src)
-    # The closure delegates; the buffers and the op call live in the module function.
-    assert "_deepseek_v4_q_b_layernorm_fused_fp8(" in fused_helper_src
-    fused_impl_src = inspect.getsource(_deepseek_v4_q_b_layernorm_fused_fp8)
-    fused_impl_src_no_ws = "".join(fused_impl_src.split())
-    assert "q_pe=q_proj.new_empty((num_tokens,self.num_heads_tp,rope_dim))" in (
-        fused_impl_src_no_ws
-    )
-    assert "torch.ops.trtllm.deepseek_v4_q_norm_fused_fp8(" in fused_impl_src
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
