@@ -21,7 +21,8 @@ import struct
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
+from typing import (TYPE_CHECKING, Any, Dict, Generic, Iterator, List, Optional,
+                    TypeVar)
 
 import filelock
 import torch
@@ -31,7 +32,7 @@ from transformers.utils import HF_MODULES_CACHE
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, local_mpi_size,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -102,8 +103,22 @@ def _release_lock_ignoring_infra_errors(lock: "filelock.BaseFileLock") -> None:
         logger.warning(f"HF remote-code lock release failed ({e}), continuing")
 
 
+def _remote_code_lock_timeout(seconds_per_rank: int = 2,
+                              floor: int = 20) -> int:
+    """Wait budget covering every rank that contends for the remote-code lock.
+
+    Ranks sharing one ``HF_MODULES_CACHE`` take the lock in turn, so the last
+    one waits for all the others. A fixed budget would therefore silently
+    degrade to running unlocked on a node wide enough to exhaust it, which is
+    the very race this lock exists to prevent. Scale with the node-local rank
+    count instead: the cache lives on node-local storage, so ranks on other
+    nodes do not contend for it.
+    """
+    return max(floor, seconds_per_rank * local_mpi_size())
+
+
 @contextlib.contextmanager
-def hf_remote_code_lock(timeout: int = 10):
+def hf_remote_code_lock(timeout: Optional[int] = None) -> Iterator[None]:
     """
     Serialize loads of HuggingFace ``trust_remote_code`` files across processes.
 
@@ -121,8 +136,11 @@ def hf_remote_code_lock(timeout: int = 10):
     overlapping sets of files into the same directory.
 
     Args:
-        timeout: Maximum time to wait for lock acquisition in seconds
+        timeout: Maximum time to wait for lock acquisition in seconds.
+            Defaults to a budget scaled by the node-local rank count.
     """
+    if timeout is None:
+        timeout = _remote_code_lock_timeout()
     # One lock file inside the cache directory it guards, so that every rank
     # sharing that cache contends on the same file.
     lock_path = Path(HF_MODULES_CACHE) / "hf_remote_code.lock"
@@ -134,9 +152,14 @@ def hf_remote_code_lock(timeout: int = 10):
     except filelock.Timeout:
         # Contention, not broken infra: a tempdir lock can't serialize against
         # the holder, so degrade to no lock instead of crashing the process.
+        # The load then runs unserialized, so it can hit the very race this
+        # lock prevents: a rank may read a module file another rank is still
+        # copying, see it as empty, and raise AttributeError for the class it
+        # expected. Treat this warning as a failed run rather than a slow one.
         logger.warning(
-            f"could not acquire HF remote-code lock within {timeout}s, proceeding without lock"
-        )
+            f"could not acquire HF remote-code lock within {timeout}s, "
+            "proceeding without lock; a concurrent rank may import a "
+            "partially written module and fail with AttributeError")
         yield
     except (PermissionError, OSError) as e:
         # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
@@ -149,9 +172,11 @@ def hf_remote_code_lock(timeout: int = 10):
         try:
             tmp_lock.acquire(timeout=timeout)
         except (PermissionError, OSError, filelock.Timeout):
+            # Unserialized as well; same failure mode as the timeout above.
             logger.warning(
-                "tempdir HF remote-code lock unavailable, proceeding without lock"
-            )
+                "tempdir HF remote-code lock unavailable, proceeding without "
+                "lock; a concurrent rank may import a partially written "
+                "module and fail with AttributeError")
             yield
         else:
             try:
