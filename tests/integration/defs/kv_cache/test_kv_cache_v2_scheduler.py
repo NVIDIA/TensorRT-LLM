@@ -22,6 +22,8 @@ import gc
 
 import pytest
 import torch
+from test_common.session_prefetcher import PREFETCHER
+from test_common.session_reuse import REUSE
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -232,6 +234,15 @@ class TestKVCacheV2Llama:
     """Functional tests for V2 scheduler using Llama-3.2-1B (1 GPU)."""
 
     MODEL_PATH = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
+
+    @pytest.fixture(autouse=True)
+    def _test_scoped_session_reuse(self, monkeypatch):
+        """Keep V1 -> V2 reuse, but never carry an MPI pool across tests."""
+        monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "0")
+        PREFETCHER.discard_shadow()
+        REUSE.drain()
+        yield
+        REUSE.drain()
 
     def _compare(self, prompts, max_tokens=32, kv_extra=None, **llm_kwargs):
         """Run V1 vs V2 with greedy sampling; assert outputs match."""

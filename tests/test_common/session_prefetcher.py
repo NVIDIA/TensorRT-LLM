@@ -513,6 +513,13 @@ class SessionPrefetcher:
         ).start()
         return None
 
+    def discard_shadow(self) -> None:
+        """Shut down an unused shadow without disabling future prefetching."""
+        built = self._drain()
+        if built is not None:
+            self.stats["pools_discarded_test_boundary"] += 1
+            built.session.shutdown()
+
     def _make_factory(self, real_cls):
         """A drop-in for ``MpiPoolSession`` that consumes and re-arms the shadow."""
 
