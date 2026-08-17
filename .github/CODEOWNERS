@@ -121,11 +121,8 @@
 /tensorrt_llm/inputs @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/llmapi @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/llmapi/mm_encoder.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-models-devs
-/tensorrt_llm/lora_helper.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/lora_manager.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/mapping.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/metrics @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/prompt_adapter_manager.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/sampling_params.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/scheduling_params.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/serve @NVIDIA/trt-llm-runtime-devs

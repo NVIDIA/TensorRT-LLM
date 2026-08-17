@@ -2,9 +2,9 @@ import pytest
 from utils.util import skip_ray
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .lora_test_utils import (

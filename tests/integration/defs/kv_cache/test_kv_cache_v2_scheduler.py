@@ -24,9 +24,9 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor import request as executor_request
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig, SamplingParams, SchedulerConfig
-from tensorrt_llm.lora_helper import LoraConfig
 
 from ..conftest import llm_models_root, skip_pre_hopper
 

@@ -35,10 +35,10 @@ from tensorrt_llm.llmapi.llm_args import (
     SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
     WaitingQueuePolicy)
 # isort: on
+from tensorrt_llm._torch.peft.lora.config import (
+    LoraConfig, get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm._torch.peft.lora.manager import load_torch_lora
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import (LoraConfig,
-                                      get_default_trtllm_modules_to_hf_modules)
-from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
@@ -3392,7 +3392,8 @@ def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
     import json
 
     try:
-        from tensorrt_llm.lora_manager import get_model_path, load_state_dict
+        from tensorrt_llm.models.convert_utils import (get_model_path,
+                                                       load_state_dict)
         model_path = get_model_path(adapter_dir, "adapter_model")
         if model_path is None:
             return 0

@@ -11,6 +11,7 @@ from utils.llm_data import llm_models_root
 from utils.util import duplicate_list_to_length, flatten_list, similar
 
 from tensorrt_llm import SamplingParams
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import \
     CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import (GroupedGemmParamsInput,
@@ -19,7 +20,6 @@ from tensorrt_llm._torch.peft.lora.layer import (GroupedGemmParamsInput,
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
-from tensorrt_llm.lora_helper import LoraConfig
 
 from .test_utils import DelayedAssert
 

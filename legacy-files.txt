@@ -290,6 +290,7 @@ tensorrt_llm/_torch/modules/swiglu.py
 tensorrt_llm/_torch/modules/triton_linear.py
 tensorrt_llm/_torch/peft/__init__.py
 tensorrt_llm/_torch/peft/lora/__init__.py
+tensorrt_llm/_torch/peft/lora/config.py
 tensorrt_llm/_torch/peft/lora/layer.py
 tensorrt_llm/_torch/pyexecutor/__init__.py
 tensorrt_llm/_torch/pyexecutor/_util.py
@@ -403,7 +404,6 @@ tensorrt_llm/llmapi/tokenizer.py
 tensorrt_llm/llmapi/tracer.py
 tensorrt_llm/llmapi/tracing.py
 tensorrt_llm/llmapi/utils.py
-tensorrt_llm/lora_helper.py
 tensorrt_llm/mapping.py
 tensorrt_llm/math_utils.py
 tensorrt_llm/metrics/__init__.py

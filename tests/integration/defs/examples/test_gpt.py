@@ -19,8 +19,8 @@ import pytest
 from defs.common import similar, similarity_score
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 
