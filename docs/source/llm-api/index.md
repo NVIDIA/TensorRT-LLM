@@ -71,6 +71,21 @@ The following tips typically assist new LLM API users who are familiar with othe
 
   This limitation is applicable for multi-GPU inference only.
 
+### FlashInfer JIT workspace for dynamically spawned MPI workers
+
+When the LLM API dynamically spawns multiple MPI workers, users affected by
+concurrent FlashInfer source-generation races can enable persistent, per-worker
+cache slots for FlashInfer JIT artifacts. Set
+`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1` before creating the LLM instance.
+The workaround preserves compiled artifacts between launches, and downloaded
+cubins remain in FlashInfer's shared cache. It is disabled by default and can
+be removed once FlashInfer guards source generation before writing shared
+workspace files.
+
+An explicitly configured `FLASHINFER_WORKSPACE_BASE` takes precedence. Workers
+started outside the LLM API's dynamic MPI pool must configure their own
+workspace isolation.
+
 ### Cannot quit after generation
 
   The LLM instance manages threads and processes, which may prevent its reference count from reaching zero. To address this issue, there are two common solutions:

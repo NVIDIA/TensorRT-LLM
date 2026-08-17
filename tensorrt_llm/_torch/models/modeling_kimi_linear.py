@@ -78,7 +78,7 @@ import gc
 import json
 import os
 from contextlib import ExitStack
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple
 
 import torch
 from safetensors import safe_open
@@ -108,6 +108,12 @@ _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
 )
 
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
+# Heuristic ported from SGLang's Blackwell cutoff:
+# https://github.com/sgl-project/sglang/blob/e84bbf68efb683c9e2eef4168c5198042544599d/python/sglang/srt/models/kimi_k3.py#L946-L954
+# It has not been tuned for TensorRT-LLM; benchmark and retune it for TRT-LLM's
+# projection kernels. Verify intentionally counts B * num_steps because those
+# flattened token rows form the projection GEMMs' M dimension.
+_KDA_BFA_MULTISTREAM_MAX_ROWS = 128
 
 # Routed-expert MoE TP/EP split overrides (read per model init, not import).
 # Highest precedence; either one may be set alone, the other is derived from
@@ -165,14 +171,12 @@ _KIMI_K3_FP8_WEIGHT_READ_KDA_ENV = "KIMI_K3_FP8_WEIGHT_READ_KDA"
 # the SM100 gate still apply.
 _KIMI_K3_FP8_WEIGHT_READ_MLA_ENV = "KIMI_K3_FP8_WEIGHT_READ_MLA"
 
-# Opt-in (prototype): keep the KimiKDARuntime decode fast path — fused
-# in-projection + persistent conv staging + precomputed kernel-layout
-# constants (``_forward_decode``) — when the KDA projections are read at FP8
-# block-scale. By default the FP8 KDA read routes decode through the
-# reference path, which re-does ~70 us/layer of glue per decode step around
-# the 5 us kernel (see ``_forward_decode``'s docstring). With this set to
-# "1", the fast path issues the loader's fused FP8 ``qkvg_proj`` GEMM for
-# q/k/v/g plus one small BF16 GEMV for [f_a | b]
+# Expert override (prototype): set to "0" to drop the KimiKDARuntime decode
+# fast path — fused qkvg and [f_a | b] projections, persistent conv staging,
+# and precomputed kernel-layout constants (``_forward_decode``) — when the
+# KDA projections are read at FP8 block-scale. With the fast path kept (the
+# default on an enabled master), decode issues the loader's fused FP8
+# ``qkvg_proj`` GEMM for q/k/v/g plus one small BF16 GEMV for [f_a | b]
 # (``finalize_decode_weights_fp8``), so FP8 weight storage and the decode
 # glue savings coexist. Requires the FP8 KDA read to be active; no effect
 # otherwise. Default on ("0" disables).
@@ -483,13 +487,11 @@ def _convert_kda_projections_to_fp8_weight_read(model: nn.Module) -> int:
 
     ``q_proj``/``k_proj``/``v_proj`` and the full-rank ``g_proj`` all read the
     same normed hidden, so their weights are additionally concatenated into one
-    fused ``qkvg_proj`` FP8 GEMM used by the decode path
-    (``KimiKDALinearAttention._decode_via_optimized``): the decode step is
-    launch-bound at the small generation batch, and one GEMM (with one shared
-    activation quant) replaces four. The fused weight is the only storage — the
-    individual ``q_proj``/``k_proj``/``v_proj``/``g_proj`` modules are rebuilt to
-    read a **view** of their slice of it (with their own block scale), so the
-    prefill/verify paths keep calling them per projection with no extra memory.
+    fused ``qkvg_proj`` FP8 GEMM used by prefill, decode, and verification;
+    all three consume all four outputs. The fused weight is the only storage —
+    the individual ``q_proj``/``k_proj``/``v_proj``/``g_proj`` modules are
+    rebuilt to read a **view** of their slice of it (with their own block
+    scale), so verify and fallback paths can still call them per projection.
     ``o_proj`` reads the decode-kernel output (not the shared hidden) and is
     converted on its own. Returns the number of projections converted.
     """
@@ -662,7 +664,7 @@ def _convert_mla_projections_to_fp8_weight_read(model: nn.Module) -> int:
 
 
 class KimiK3MoERuntime(nn.Module):
-    """Kimi K3 latent MoE block backed by ConfigurableMoE/TRTLLM-Gen."""
+    """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
     def __init__(
         self,
@@ -706,7 +708,7 @@ class KimiK3MoERuntime(nn.Module):
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
         routed_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
-        self.routed_experts = create_moe(
+        routed_moe_kwargs = dict(
             routing_method=self.gate.routing_method,
             num_experts=self.num_experts,
             hidden_size=self.moe_hidden_size,
@@ -716,20 +718,38 @@ class KimiK3MoERuntime(nn.Module):
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
             layer_idx=layer_idx,
-            trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
-            # Cubin alpha is the gate-side SiTU beta; cubin beta is the
-            # linear-side SiTU beta.
-            trtllm_gen_activation_alpha=float(situ_beta),
-            trtllm_gen_activation_beta=float(
-                situ_linear_beta if situ_linear_beta is not None else 1.0
-            ),
             # Let CommunicationFactory select the best available strategy.
             communication_method=None,
         )
+        if routed_moe_model_config.moe_backend == "TRTLLM":
+            routed_moe_kwargs.update(
+                trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
+                # Cubin alpha is the gate-side SiTU beta; cubin beta is the
+                # linear-side SiTU beta.
+                trtllm_gen_activation_alpha=float(situ_beta),
+                trtllm_gen_activation_beta=float(
+                    situ_linear_beta if situ_linear_beta is not None else 1.0
+                ),
+            )
+        elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
+            routed_moe_kwargs.update(
+                activation="situ",
+                situ_beta=float(situ_beta),
+                situ_linear_beta=float(situ_linear_beta if situ_linear_beta is not None else 1.0),
+            )
+        self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
             raise RuntimeError(
                 "Kimi K3 requires ConfigurableMoE; ENABLE_CONFIGURABLE_MOE must not be disabled."
             )
+        if routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
+            from ..modules.fused_moe.mega_moe import MegaMoEDeepGemm
+
+            if not isinstance(self.routed_experts.backend, MegaMoEDeepGemm):
+                raise RuntimeError(
+                    "Kimi K3 explicitly requested MEGAMOE_DEEPGEMM, but the "
+                    f"MoE factory selected {type(self.routed_experts.backend).__name__}."
+                )
         if self.routed_experts.layer_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
@@ -820,6 +840,13 @@ class KimiK3MoERuntime(nn.Module):
     def _routed_moe_model_config(model_config: ModelConfig) -> ModelConfig:
         """Build a private routed-expert mapping without mutating the shared
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
+        supported_backends = {"TRTLLM", "MEGAMOE_DEEPGEMM"}
+        if model_config.moe_backend not in supported_backends:
+            raise ValueError(
+                "Kimi K3 SiTU routed experts only support the TRTLLM and "
+                "MEGAMOE_DEEPGEMM backends; "
+                f"got {model_config.moe_backend!r}."
+            )
         if model_config.moe_load_balancer is not None:
             raise NotImplementedError(
                 "Kimi K3 packed-checkpoint streaming does not yet support "
@@ -857,7 +884,29 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = False
         routed_model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         routed_model_config.mapping = routed_mapping
-        routed_model_config.moe_backend = "TRTLLM"
+        routed_model_config.moe_backend = model_config.moe_backend
+        # MegaMoE uses this value as global DP SymmBuffer capacity, then
+        # divides it by EP size for the per-rank allocation. Other backends
+        # keep the user-configured value as their MoE chunking bound.
+        # Preserve an explicitly larger capacity.
+        if routed_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
+            default_moe_max_num_tokens = routed_model_config.max_num_tokens * routed_mapping.dp_size
+            configured_moe_max_num_tokens = int(routed_model_config.moe_max_num_tokens or 0)
+            if configured_moe_max_num_tokens < default_moe_max_num_tokens:
+                logger.info_once(
+                    "Kimi K3 MegaMoE raises moe_max_num_tokens from "
+                    f"{configured_moe_max_num_tokens} to {default_moe_max_num_tokens} "
+                    "because the global DP SymmBuffer requires capacity for "
+                    "max_num_tokens * dp_size.",
+                    key=(
+                        "kimi_k3_megamoe_capacity_override_"
+                        f"{configured_moe_max_num_tokens}_{default_moe_max_num_tokens}"
+                    ),
+                )
+            routed_model_config.moe_max_num_tokens = max(
+                configured_moe_max_num_tokens,
+                default_moe_max_num_tokens,
+            )
         routed_model_config._frozen = True
         return routed_model_config
 
@@ -941,7 +990,12 @@ class KimiKDARuntime(nn.Module):
     """
 
     def __init__(
-        self, cfg, layer_idx: int, mapping=None, allreduce_strategy=AllReduceStrategy.AUTO
+        self,
+        cfg,
+        layer_idx: int,
+        mapping=None,
+        allreduce_strategy=AllReduceStrategy.AUTO,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         # Lazy import: pulls in fla/einops.
@@ -986,18 +1040,19 @@ class KimiKDARuntime(nn.Module):
             use_optimized_decode=True,
         )
         self.proj_size = (num_heads // self._kda_tp_size) * lin["head_dim"]
-        # Decode fast-path constants, built once by
-        # ``finalize_decode_weights()`` after checkpoint load:
-        # fused in-projection weight + kernel-layout conv weights + fp32
-        # copies of the small parameters. ``None`` routes decode through
-        # the reference (module-level) path.
-        self._in_proj_weight: Optional[torch.Tensor] = None
-        # FP8 variant (``finalize_decode_weights_fp8``): q/k/v/g stay in the
-        # mixer's fused FP8 ``qkvg_proj`` GEMM and only the small [f_a | b]
-        # GEMV weight is fused here. ``None`` when the FP8 fast path is off.
-        self._in_proj_small_weight: Optional[torch.Tensor] = None
+        # Fused prefill/decode/verify projection weights, built after checkpoint
+        # load. BF16 uses separate fused [q | k | v | g] and [f_a | b]
+        # GEMMs; FP8 supplies qkvg through the mixer's fused projection and
+        # reuses the BF16 [f_a | b] weight.
+        self._qkvg_proj_weight: Optional[torch.Tensor] = None
+        self._bfa_proj_weight: Optional[torch.Tensor] = None
         self._w_q_t = self._w_k_t = self._w_v_t = None
         self._A_log_f32 = self._dt_bias_f32 = self._onorm_w_f32 = None
+        # Fork/join state for overlapping the small [f_a | b] -> f_b chain
+        # with the wide qkvg projection during CUDA-graph execution.
+        self._projection_aux_stream = aux_stream
+        self._projection_fork_event = torch.cuda.Event()
+        self._projection_join_event = torch.cuda.Event()
         # Persistent batch-row-dense staging for the fused decode kernel's
         # per-section conv windows. Sized once, on the first decode call,
         # to the conv pool's slot count and never reallocated (see
@@ -1008,14 +1063,13 @@ class KimiKDARuntime(nn.Module):
         self._mtp_conv_weights: Optional[Tuple[torch.Tensor, ...]] = None
 
     def finalize_decode_weights(self) -> None:
-        """Build the decode fast-path constants (once, after weight load).
+        """Build fused projection weights and decode constants after weight load.
 
-        1. Fused in-projection ``[q | k | v | g | f_a | b]``: all six
-           projections consume the same hidden state, so one GEMV replaces
-           five GEMV+splitK-reduce pairs plus a cublas dot per layer per
-           decode step. The source parameters are repointed to row views
-           of the fused buffer (no extra memory; prefill/verify paths keep
-           using them unchanged).
+        1. Separate fused ``[q | k | v | g]`` and ``[f_a | b]`` projections.
+           Keeping the wide qkvg output aligned avoids degrading its GEMM
+           kernel selection with the small f_a and b tails. Source parameters
+           are repointed to row views of the fused buffers, so prefill and
+           verify paths keep using them without duplicate weight storage.
         2. Kernel-layout constants that ``_decode_via_optimized`` used to
            rebuild with ~6 device kernels per layer per decode step:
            transposed conv weights (bf16 ``[W, D]``) and fp32 copies of
@@ -1027,23 +1081,39 @@ class KimiKDARuntime(nn.Module):
         if mixer.q_proj.weight.device.type != "cuda":
             return
         with torch.no_grad():
-            mods = (
+            qkvg_modules = (
                 mixer.q_proj,
                 mixer.k_proj,
                 mixer.v_proj,
                 mixer.g_proj,
-                mixer.f_a_proj,
-                mixer.b_proj,
             )
-            fused = torch.cat([m.weight.data for m in mods], dim=0).contiguous()
-            off = 0
-            for m in mods:
-                n = m.weight.shape[0]
-                m.weight.data = fused[off : off + n]
-                off += n
+            qkvg_weight = self._merge_projection_weights(qkvg_modules)
+            # Eight BF16 outputs occupy 16 bytes, so padding keeps each output row
+            # aligned for vectorized f_b consumption; it is not a kernel requirement.
+            bfa_weight = self._merge_projection_weights(
+                (mixer.f_a_proj, mixer.b_proj), pad_rows_to=8
+            )
             self._build_decode_kernel_constants()
-            # Publish last: `_in_proj_weight is not None` gates the fast path.
-            self._in_proj_weight = fused
+            self._bfa_proj_weight = bfa_weight
+            # Publish last: both weights are required by the BF16 fast path.
+            self._qkvg_proj_weight = qkvg_weight
+
+    @staticmethod
+    def _merge_projection_weights(
+        modules: tuple[nn.Linear, ...], pad_rows_to: int = 1
+    ) -> torch.Tensor:
+        """Concatenate linear weights and repoint the modules to row views."""
+        weights = [module.weight.data for module in modules]
+        padding = (-sum(weight.shape[0] for weight in weights)) % pad_rows_to
+        if padding:
+            weights.append(weights[0].new_zeros((padding, weights[0].shape[1])))
+        fused = torch.cat(weights, dim=0).contiguous()
+        offset = 0
+        for module in modules:
+            rows = module.weight.shape[0]
+            module.weight.data = fused[offset : offset + rows]
+            offset += rows
+        return fused
 
     def _build_decode_kernel_constants(self) -> None:
         """Kernel-layout constants shared by both finalize variants."""
@@ -1080,16 +1150,14 @@ class KimiKDARuntime(nn.Module):
         """FP8 counterpart of ``finalize_decode_weights()``.
 
         Runs AFTER ``_convert_kda_projections_to_fp8_weight_read``, so
-        q/k/v/g already live in the mixer's fused FP8 ``qkvg_proj`` GEMM
-        and the fast path's big projection is that GEMM as-is. Only the
-        two small BF16 projections reading the same hidden — ``f_a_proj``
-        and ``b_proj`` (kept BF16 by the FP8 conversion: outputs are not
-        128-multiples and feed the accuracy-sensitive recurrent decay) —
-        are fused here into one ``[f_a | b]`` GEMV weight, with the source
-        parameters repointed to row views. The decode step then issues two
-        GEMMs (FP8 qkvg + BF16 small) instead of the reference path's four
-        plus its per-step glue; the kernel-layout constants are shared with
-        the BF16 finalize.
+        q/k/v/g already live in the mixer's fused FP8 ``qkvg_proj`` GEMM.
+        Only the two small BF16 projections reading the same hidden —
+        ``f_a_proj`` and ``b_proj`` (kept BF16 by the FP8 conversion: outputs
+        are not 128-multiples and feed the accuracy-sensitive recurrent
+        decay) — are fused here into one ``[f_a | b]`` weight, with the source
+        parameters repointed to row views. Prefill, decode, and verification
+        then share both fused projections; the kernel-layout constants are
+        decode-only.
         """
         mixer = self.mixer
         if mixer._dispatch.decode_kernel_path != "optimized" or not mixer.use_full_rank_gate:
@@ -1101,16 +1169,12 @@ class KimiKDARuntime(nn.Module):
         if mixer.f_a_proj.weight.device.type != "cuda":
             return
         with torch.no_grad():
-            mods = (mixer.f_a_proj, mixer.b_proj)
-            fused = torch.cat([m.weight.data for m in mods], dim=0).contiguous()
-            off = 0
-            for m in mods:
-                n = m.weight.shape[0]
-                m.weight.data = fused[off : off + n]
-                off += n
+            bfa_weight = self._merge_projection_weights(
+                (mixer.f_a_proj, mixer.b_proj), pad_rows_to=8
+            )
             self._build_decode_kernel_constants()
-            # Publish last: gates the FP8 decode fast path.
-            self._in_proj_small_weight = fused
+            # Publish last: enables fused [f_a | b] in prefill/decode/verify.
+            self._bfa_proj_weight = bfa_weight
 
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
@@ -1236,9 +1300,27 @@ class KimiKDARuntime(nn.Module):
         d = self.proj_size
         x = x2d.unsqueeze(0)  # [1, T, hidden]
 
-        q_proj_states = mixer.q_proj(x)
-        k_proj_states = mixer.k_proj(x)
-        v_proj_states = mixer.v_proj(x)
+        onorm_g = None
+        if self._qkvg_proj_weight is not None:
+            qkvg = torch.nn.functional.linear(x, self._qkvg_proj_weight)
+            q_proj_states, k_proj_states, v_proj_states = qkvg[..., : 3 * d].split(d, dim=-1)
+            onorm_g = qkvg[..., 3 * d : 4 * d]
+        else:
+            fused_qkvg = getattr(mixer, "qkvg_proj", None)
+            if fused_qkvg is not None:
+                qkvg = fused_qkvg(x)
+                q_proj_states, k_proj_states, v_proj_states = qkvg[..., : 3 * d].split(d, dim=-1)
+                qkvg_split_sizes = getattr(mixer, "qkvg_split_sizes", None)
+                if (
+                    mixer.use_full_rank_gate
+                    and qkvg_split_sizes is not None
+                    and len(qkvg_split_sizes) == 4
+                ):
+                    onorm_g = qkvg[..., 3 * d : 4 * d]
+            else:
+                q_proj_states = mixer.q_proj(x)
+                k_proj_states = mixer.k_proj(x)
+                v_proj_states = mixer.v_proj(x)
 
         # Initial states: present for continuation chunks (chunked prefill)
         # and for prefix-cache hits (block reuse), where the previous
@@ -1263,9 +1345,15 @@ class KimiKDARuntime(nn.Module):
             v_proj_states, cache=conv_v_in, output_final_state=True, cu_seqlens=cu_seqlens
         )
 
-        g = mixer.f_b_proj(mixer.f_a_proj(x))
+        if self._bfa_proj_weight is not None:
+            bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
+            f_a = bfa[..., : mixer.head_dim]
+            beta = bfa[..., mixer.head_dim : mixer.head_dim + mixer.num_heads].float()
+            g = mixer.f_b_proj(f_a)
+        else:
+            g = mixer.f_b_proj(mixer.f_a_proj(x))
+            beta = mixer.b_proj(x).float()
         g = rearrange(g, "... (h d) -> ... h d", d=mixer.head_dim)
-        beta = mixer.b_proj(x).float()
 
         q = rearrange(q, "... (h d) -> ... h d", d=mixer.head_k_dim)
         k = rearrange(k, "... (h d) -> ... h d", d=mixer.head_k_dim)
@@ -1300,7 +1388,7 @@ class KimiKDARuntime(nn.Module):
         # are zero for a fresh request, so the tail columns are unused).
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_q, conv_k, conv_v)
 
-        return self._output_gate_and_proj(x, o)
+        return self._output_gate_and_proj(x, o, onorm_g)
 
     def _forward_decode(
         self,
@@ -1321,7 +1409,9 @@ class KimiKDARuntime(nn.Module):
         copies, per-call torch.arange defaults, and redundant dtype
         casts):
 
-        * one fused in-projection GEMV (``finalize_decode_weights``);
+        * one wide fused qkvg GEMV on the main stream, overlapped with the
+          fused [f_a | b] GEMV and f_b GEMV on the auxiliary stream for
+          CUDA-graph batches up to 128 tokens;
         * conv windows staged with one gather + one repack copy into a
           persistent dense per-section buffer;
         * conv-pool write-back with one cat + one index_copy_;
@@ -1345,8 +1435,12 @@ class KimiKDARuntime(nn.Module):
             logger.info_once(
                 "Kimi K3 KDA static recurrent-state path is active", key="kimi_k3_kda_static_state"
             )
+        has_qkvg_projection = (
+            self._qkvg_proj_weight is not None or getattr(mixer, "qkvg_proj", None) is not None
+        )
         if (
-            (self._in_proj_weight is None and self._in_proj_small_weight is None)
+            not has_qkvg_projection
+            or self._bfa_proj_weight is None
             or mamba_metadata is None
             or ssm_pool.dtype != torch.float32
         ):
@@ -1388,24 +1482,32 @@ class KimiKDARuntime(nn.Module):
                 f"captured CUDA graphs"
             )
 
-        if self._in_proj_weight is not None:
-            # One GEMV over [q | k | v | g | f_a | b]; slices below are views.
-            proj = torch.nn.functional.linear(x2d, self._in_proj_weight)
-            x_qkv = proj[:, : 3 * d]
-            onorm_g = proj[:, 3 * d : 4 * d]
-            f_a = proj[:, 4 * d : 4 * d + hd]
-            beta = proj[:, 4 * d + hd : 4 * d + hd + H]
-        else:
-            # FP8 weight read (KIMI_K3_KDA_GLUE_FP8=1): the loader's fused
-            # FP8 [q | k | v | g] GEMM plus one BF16 GEMV over [f_a | b];
-            # slices below are views.
-            qkvg = mixer.qkvg_proj(x2d)
-            small = torch.nn.functional.linear(x2d, self._in_proj_small_weight)
-            x_qkv = qkvg[:, : 3 * d]
-            onorm_g = qkvg[:, 3 * d : 4 * d]
-            f_a = small[:, :hd]
-            beta = small[:, hd : hd + H]
-        g = mixer.f_b_proj(f_a)  # [B, d]
+        def _project_qkvg() -> torch.Tensor:
+            if self._qkvg_proj_weight is not None:
+                return torch.nn.functional.linear(x2d, self._qkvg_proj_weight)
+            # FP8 weight read (KIMI_K3_KDA_GLUE_FP8=1) uses the loader's
+            # fused FP8 [q | k | v | g] GEMM.
+            return mixer.qkvg_proj(x2d)
+
+        def _project_bfa_and_fb() -> tuple[torch.Tensor, torch.Tensor]:
+            bfa = torch.nn.functional.linear(x2d, self._bfa_proj_weight)
+            f_a = bfa[:, :hd]
+            beta = bfa[:, hd : hd + H]
+            return beta, mixer.f_b_proj(f_a)
+
+        projection_aux_stream = (
+            self._projection_aux_stream if B <= _KDA_BFA_MULTISTREAM_MAX_ROWS else None
+        )
+        qkvg, (beta, g) = maybe_execute_in_parallel(
+            _project_qkvg,
+            _project_bfa_and_fb,
+            self._projection_fork_event,
+            self._projection_join_event,
+            projection_aux_stream,
+            disable_on_compile=True,
+        )
+        x_qkv = qkvg[:, : 3 * d]
+        onorm_g = qkvg[:, 3 * d : 4 * d]
 
         # Gather the HF-layout conv windows once, then repack the
         # historical W-1 columns into the kernel's dense per-section
@@ -1554,6 +1656,66 @@ class KimiKDARuntime(nn.Module):
             x2d, num_steps, layer_cache, conv_pool, ssm_pool, slot_indices
         )
 
+    def _project_verify_inputs(
+        self, x: torch.Tensor, num_rows: int
+    ) -> Optional[
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Optional[torch.Tensor],
+        ]
+    ]:
+        """Project fused QKVG and [f_a | b] inputs for target verification."""
+        mixer = self.mixer
+        qkvg_weight = self._qkvg_proj_weight
+        fused_qkvg = getattr(mixer, "qkvg_proj", None)
+        if qkvg_weight is None and fused_qkvg is None:
+            return None
+
+        def _project_qkvg() -> torch.Tensor:
+            if qkvg_weight is not None:
+                return torch.nn.functional.linear(x, qkvg_weight)
+            return fused_qkvg(x)
+
+        bfa_weight = self._bfa_proj_weight
+        if bfa_weight is not None:
+
+            def _project_bfa_and_fb() -> tuple[torch.Tensor, torch.Tensor]:
+                bfa = torch.nn.functional.linear(x, bfa_weight)
+                f_a = bfa[..., : mixer.head_dim]
+                beta = bfa[..., mixer.head_dim : mixer.head_dim + mixer.num_heads]
+                return beta, mixer.f_b_proj(f_a)
+
+            projection_aux_stream = (
+                self._projection_aux_stream
+                if 0 < num_rows <= _KDA_BFA_MULTISTREAM_MAX_ROWS
+                else None
+            )
+            qkvg, (beta, forget_gate) = maybe_execute_in_parallel(
+                _project_qkvg,
+                _project_bfa_and_fb,
+                self._projection_fork_event,
+                self._projection_join_event,
+                projection_aux_stream,
+                disable_on_compile=True,
+            )
+        else:
+            qkvg = _project_qkvg()
+            beta = mixer.b_proj(x)
+            forget_gate = mixer.f_b_proj(mixer.f_a_proj(x))
+
+        d = self.proj_size
+        q_proj, k_proj, v_proj = (part.contiguous() for part in qkvg[..., : 3 * d].split(d, dim=-1))
+        qkvg_split_sizes = getattr(mixer, "qkvg_split_sizes", None)
+        has_onorm_gate = qkvg_weight is not None or (
+            mixer.use_full_rank_gate and qkvg_split_sizes is not None and len(qkvg_split_sizes) == 4
+        )
+        onorm_g = qkvg[..., 3 * d : 4 * d].contiguous() if has_onorm_gate else None
+        return q_proj, k_proj, v_proj, forget_gate, beta, onorm_g
+
     def _forward_verify_fused(
         self, x2d, num_steps, layer_cache, ssm_pool, slot_indices
     ) -> torch.Tensor:
@@ -1575,13 +1737,23 @@ class KimiKDARuntime(nn.Module):
         x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
         T_total = num_decodes * num_steps
 
-        x_q = mixer.q_proj(x).view(1, T_total, H, K)
-        x_k = mixer.k_proj(x).view(1, T_total, H, K)
-        x_v = mixer.v_proj(x).view(1, T_total, H, mixer.head_dim)
+        projections = self._project_verify_inputs(x, T_total)
+        if projections is None:
+            q_proj = mixer.q_proj(x)
+            k_proj = mixer.k_proj(x)
+            v_proj = mixer.v_proj(x)
+            forget_gate = mixer.f_b_proj(mixer.f_a_proj(x))
+            beta_proj = mixer.b_proj(x)
+            onorm_g = None
+        else:
+            q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g = projections
+        x_q = q_proj.view(1, T_total, H, K)
+        x_k = k_proj.view(1, T_total, H, K)
+        x_v = v_proj.view(1, T_total, H, mixer.head_dim)
         # Raw gate / beta: the kernel applies dt_bias, A_log, the
         # lower-bound sigmoid gate, and the beta sigmoid itself.
-        g = mixer.f_b_proj(mixer.f_a_proj(x)).view(1, T_total, H, K)
-        beta = mixer.b_proj(x).view(1, T_total, H)
+        g = forget_gate.view(1, T_total, H, K)
+        beta = beta_proj.contiguous().view(1, T_total, H)
 
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         lower_bound = (
@@ -1626,7 +1798,7 @@ class KimiKDARuntime(nn.Module):
             scale=mixer.head_k_dim**-0.5,
         )
         o = out.view(num_decodes, num_steps, H, mixer.head_dim)
-        return self._output_gate_and_proj(x, o)
+        return self._output_gate_and_proj(x, o, onorm_g)
 
     def _build_mtp_conv_weights(self) -> None:
         """Prebuild the fp32 ``[dim, W]`` conv weights for the fused verify
@@ -1674,12 +1846,18 @@ class KimiKDARuntime(nn.Module):
         num_decodes = x2d.shape[0] // num_steps
         x = x2d.view(num_decodes, num_steps, -1)  # [B, T, hidden]
 
-        q_proj_states = mixer.q_proj(x)
-        k_proj_states = mixer.k_proj(x)
-        v_proj_states = mixer.v_proj(x)
-        g = mixer.f_b_proj(mixer.f_a_proj(x))
+        projections = self._project_verify_inputs(x, x2d.shape[0])
+        if projections is None:
+            q_proj_states = mixer.q_proj(x)
+            k_proj_states = mixer.k_proj(x)
+            v_proj_states = mixer.v_proj(x)
+            g = mixer.f_b_proj(mixer.f_a_proj(x))
+            beta = mixer.b_proj(x).float()
+            onorm_g = None
+        else:
+            q_proj_states, k_proj_states, v_proj_states, g, beta, onorm_g = projections
+            beta = beta.float()
         g = rearrange(g, "... (h d) -> ... h d", d=mixer.head_dim)
-        beta = mixer.b_proj(x).float()
 
         # Gathered copies — mutated across steps, never written back to the
         # live pools.
@@ -1730,13 +1908,17 @@ class KimiKDARuntime(nn.Module):
             intermediate_ssm[:num_decodes, t] = state.to(intermediate_ssm.dtype)
 
         o = torch.cat(step_outputs, dim=1)  # [B, T, H, V]
-        return self._output_gate_and_proj(x, o)
+        return self._output_gate_and_proj(x, o, onorm_g)
 
-    def _output_gate_and_proj(self, x: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+    def _output_gate_and_proj(
+        self, x: torch.Tensor, o: torch.Tensor, onorm_g: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         from einops import rearrange
 
         mixer = self.mixer
-        if mixer.use_full_rank_gate:
+        if onorm_g is not None:
+            g_out = onorm_g
+        elif mixer.use_full_rank_gate:
             g_out = mixer.g_proj(x)
         else:
             g_out = mixer.g_b_proj(mixer.g_a_proj(x))
@@ -1859,6 +2041,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 layer_idx,
                 mapping=model_config.mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
+                aux_stream=aux_stream,
             )
         else:
             # Forward only the KV-cache quantization to the MLA attention
@@ -2014,9 +2197,10 @@ class KimiLinearModel(DecoderModel):
         self._text_cfg = cfg
         dtype = torch.bfloat16
 
-        # One side stream shared across all layers, used by KimiK3MoERuntime
-        # to overlap the replicated shared-expert compute with the routed EP
-        # dispatch/combine collectives.
+        # One side stream shared across all layers. KDA overlaps its small
+        # forget-gate projection chain with qkvg during decode and verify;
+        # MoE overlaps replicated shared-expert compute with routed
+        # dispatch/expert/combine.
         self.aux_stream = torch.cuda.Stream()
 
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size, dtype=dtype)
@@ -2143,6 +2327,23 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 "tokens_per_block": 64,
             }
         }
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Literal["PYTHON"]:
+        """Kimi K3 disaggregated serving requires the Python transceiver.
+
+        Only the Python NIXL transceiver (KvCacheTransceiverV2) can move
+        the KDA recurrent state; the C++ transceiver has no KDA support.
+        Adopted when the user leaves
+        ``cache_transceiver_config.transceiver_runtime`` at 'auto' and the
+        effective backend is NIXL. An explicit non-Python runtime is
+        rejected by ``get_kv_cache_manager_cls`` rather than silently
+        routed to a path that cannot transfer the recurrent state.
+        """
+        return "PYTHON"
 
     # ------------------------------------------------------------------
     # Weight loading (streams the 1.5TB checkpoint; only the rank-local
@@ -2616,7 +2817,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             backend._weights_transformed = False
 
     def _finalize_weight_load(self, num_params: int, num_moe_layers: int) -> None:
-        """Post-load finalization: build the KDA decode fast-path constants
+        """Post-load finalization: build the KDA fused projection constants
         and apply the FP8 weight-read conversions (all behind their env
         switches)."""
         # FP8 weight-read master switch (see the conversion block below).
@@ -2631,15 +2832,17 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # conversion (finalize_decode_weights_fp8), so neither is traded away.
         fp8_weight_read, kda_fp8, kda_glue_fp8 = _resolve_fp8_weight_read_gates()
 
-        # Build the KDA decode fast-path constants (fused in-projection
-        # weight views + kernel-layout conv weights + fp32 params). Must
-        # run after every KDA parameter is loaded/sharded.
+        # Build the KDA fused projection views and decode kernel constants.
+        # This must run after every KDA parameter is loaded and sharded.
         num_kda_fused = 0
         for layer in self.model.layers:
             if getattr(layer, "is_kda", False):
                 if not kda_fp8:
                     layer.self_attn.finalize_decode_weights()
-                num_kda_fused += int(layer.self_attn._in_proj_weight is not None)
+                num_kda_fused += int(
+                    layer.self_attn._qkvg_proj_weight is not None
+                    and layer.self_attn._bfa_proj_weight is not None
+                )
                 # The fused-verify conv constants are needed on every
                 # configuration that can reach _forward_verify_fused,
                 # including ones where neither finalize variant runs (e.g.
@@ -2650,8 +2853,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 layer.self_attn._build_mtp_conv_weights()
         logger.info(
             f"Kimi K3: loaded {num_params} parameters and the expert "
-            f"slices of {num_moe_layers} MoE layers; fused decode "
-            f"in-projections on {num_kda_fused} KDA layers"
+            f"slices of {num_moe_layers} MoE layers; fused prefill/decode/verify "
+            f"projections on {num_kda_fused} KDA layers"
         )
 
         # FP8 block-scale weight read for the replicated MoE-layer MLPs. The
@@ -2678,22 +2881,22 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 n_kda = _convert_kda_projections_to_fp8_weight_read(self.model)
                 logger.info(
                     f"Kimi K3: reading {n_kda} KDA q/k/v/g/o projections "
-                    f"at FP8 block-scale (q/k/v/g fused into one decode GEMM "
+                    f"at FP8 block-scale (q/k/v/g fused into one prefill/decode/verify GEMM "
                     f"per layer)"
                 )
                 if kda_glue_fp8:
-                    # Rebuild the wrapper decode fast path on top of the FP8
-                    # modules (must run after the conversion above so the
+                    # Rebuild the fused projection path on top of the FP8
+                    # modules. This must run after the conversion above so
                     # fused FP8 qkvg_proj exists and only [f_a | b] is fused
-                    # in bf16).
+                    # in BF16.
                     n_glue = 0
                     for layer in self.model.layers:
                         if getattr(layer, "is_kda", False):
                             layer.self_attn.finalize_decode_weights_fp8()
-                            n_glue += int(layer.self_attn._in_proj_small_weight is not None)
+                            n_glue += int(layer.self_attn._bfa_proj_weight is not None)
                     logger.info(
-                        f"Kimi K3: FP8 fused decode glue on {n_glue} KDA "
-                        f"layers ({_KIMI_K3_KDA_GLUE_FP8_ENV}=1)"
+                        f"Kimi K3: FP8 fused prefill/decode/verify projections on "
+                        f"{n_glue} KDA layers"
                     )
             # The MLA q_a/q_b/o and output-gate projections are the remaining
             # replicated attention weight read the MLP and KDA passes above
