@@ -426,7 +426,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         llmRequest.has_value() ? std::to_string((*llmRequest)->mRequestId).c_str() : "<request-free>");
 
     auto transferLease = prepareBlockRangeForTransfer(
-        *mCacheManager, blockRange, kvWindowSizes, session.getRequestId(), bufferManager, llmRequest.value_or(nullptr));
+        *mCacheManager, blockRange, kvWindowSizes, bufferManager, llmRequest.value_or(nullptr));
 
     bool layerWise = common::getEnvDisaggLayerwise() && numKvPools == 1;
     if (layerWise)

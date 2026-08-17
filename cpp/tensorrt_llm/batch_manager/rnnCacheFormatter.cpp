@@ -98,7 +98,7 @@ void RnnCacheFormatter::format(TransferSession& session)
     }
 
     auto transferLease = kv_cache_manager::prepareBlockRangeForTransfer(
-        *mKvCacheManager, blockRange, rnnWindowSizes, session.getRequestId(), bufferManager, &llmRequest);
+        *mKvCacheManager, blockRange, rnnWindowSizes, bufferManager, &llmRequest);
 
     for (auto const& ws : rnnWindowSizes)
     {

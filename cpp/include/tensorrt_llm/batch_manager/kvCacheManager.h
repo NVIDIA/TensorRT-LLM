@@ -1217,7 +1217,7 @@ public:
     //! \brief Pin block IDs and make sure they are resident in primary memory for cache transfer.
     //! \return Pair of block IDs that were pinned and whether any onboard copies were issued.
     [[nodiscard]] std::pair<std::vector<KVCacheBlock::IdType>, bool> pinAndOnboardBlocksById(
-        std::vector<KVCacheBlock::IdType> const& blockIds, LlmRequest::RequestIdType requestId,
+        std::vector<KVCacheBlock::IdType> const& blockIds,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     //! \brief Bring block from primary to secondary memory.
@@ -1236,9 +1236,6 @@ public:
 
     //! \brief Sync internal streams used by transfer manager with buffer manager stream
     void syncTransferManagerWithBufferManager();
-
-    //! \brief Make the buffer manager stream wait for scheduled transfer-manager work.
-    void syncTransferManagerToBufferManager();
 
     //! \brief Make a formatter buffer-manager stream wait for scheduled onboard work.
     void syncOnboardTransferManagerToBufferManager(runtime::BufferManager const& bufferManager);
@@ -1379,17 +1376,20 @@ private:
     //! \param sequence Sequence which the free block is allocated for
     //! \param wantPlaceholder If true, return a pre-allocated placeholder block instead of a normal block
     //! \param countAllocationStats If true, update request-allocation counters for the returned block
+    //! \param suppressEvents If true, do not emit cache update/remove events while acquiring the block. This is used
+    //! when transfer preparation borrows a scratch primary block for an already-pinned cache block; the cache ownership
+    //! visible to scheduling has not changed, so update/remove events would incorrectly invalidate reusable prefixes.
     [[nodiscard]] BlockPtr getFreeBlock(GenerationRequest& sequence,
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
-        bool wantPlaceholder = false, bool countAllocationStats = true);
+        bool wantPlaceholder = false, bool countAllocationStats = true, bool suppressEvents = false);
 
-    [[nodiscard]] BlockPtr getFreeBlock(LlmRequest::RequestIdType requestId,
+    [[nodiscard]] BlockPtr getFreeBlock(std::optional<LlmRequest::RequestIdType> requestId,
         executor::RetentionPriority = executor::KvCacheRetentionConfig::kDefaultRetentionPriority,
         std::optional<std::chrono::milliseconds> durationMs = std::nullopt,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
-        bool wantPlaceholder = false, bool countAllocationStats = true);
+        bool wantPlaceholder = false, bool countAllocationStats = true, bool suppressEvents = false);
 
     void unpinBlocksByIdNoLock(std::vector<KVCacheBlock::IdType> const& blockIds);
 
@@ -1630,8 +1630,7 @@ public:
     //! \brief Pin block IDs and make sure they are primary-resident for cache transfer formatting.
     [[nodiscard]] KvCacheTransferLease prepareBlocksForTransfer(
         std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
-        LlmRequest::RequestIdType requestId, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
-        std::string const& directory = "");
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1945,9 +1944,6 @@ public:
 
     //! \brief Sync internal streams used by transfer manager with buffer manager stream
     void syncTransferManagerWithBufferManager();
-
-    //! \brief Make the buffer manager stream wait for scheduled transfer-manager work.
-    void syncTransferManagerToBufferManager();
 
     //! \brief Make a formatter buffer-manager stream wait for scheduled onboard work.
     void syncOnboardTransferManagerToBufferManager(runtime::BufferManager const& bufferManager);
@@ -2351,8 +2347,7 @@ public:
     //! \brief Pin block IDs and make sure they are primary-resident for cache transfer formatting.
     [[nodiscard]] virtual KvCacheTransferLease prepareBlocksForTransfer(
         std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
-        LlmRequest::RequestIdType requestId, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
-        std::string const& directory = "")
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "")
         = 0;
 
     /// @brief Release cached blocks for a token sequence beyond a given prefix length.
@@ -2718,7 +2713,7 @@ public:
     //! \brief Pin block IDs and make sure they are primary-resident for cache transfer formatting.
     [[nodiscard]] KvCacheTransferLease prepareBlocksForTransfer(
         std::unordered_map<SizeType32, std::vector<KVCacheBlock::IdType>> const& blockIdsPerWindow,
-        LlmRequest::RequestIdType requestId, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
+        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "") override;
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
