@@ -173,7 +173,7 @@ def _resolve_reference_string(reference: str) -> bytes:
             ) from exc
 
 
-def _reference_payload_and_role(ref) -> tuple[bytes, Optional[str]]:
+def _reference_payload_and_role(ref: Any) -> tuple[bytes, Optional[str]]:
     """Extract ``(payload_bytes, role)`` from one raw HTTP reference.
 
     ``ref`` is a string (base64/``data:`` URI, ``http(s)`` URL, or a local file
@@ -246,7 +246,9 @@ def cleanup_reference_files(media_storage_path: Optional[str], request_id: str) 
             pass
 
 
-def _build_reference_list(value, *, modality: str, id: str, media_storage_path: Optional[str]):
+def _build_reference_list(
+    value: Any, *, modality: str, id: str, media_storage_path: Optional[str]
+) -> Optional[list]:
     """Materialize an HTTP reference field into a list of ``MediaRef`` objects.
 
     ``value`` is None, a base64/data-URI string, a multipart ``UploadFile``, a
