@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+// DO NOT MERGE -- e2e validation of shared-lib MR !97 (Artifactory Jackson
+// JsonParseException PATTERN_CATALOG row). Repointed from @main to the MR branch
+// so FailureClassifier here carries the new row. Revert to @main before merge.
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/brnguyen/artifactory-json-parse-signature']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -5405,9 +5408,26 @@ def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
     // plain list append from the catch blocks below is safe -- there is no
     // JVM-level concurrency to guard against here.
     def deferred = []
+    // ======================= DO NOT MERGE (e2e validation) =======================
+    // Validates shared-lib MR !97: throws a synthetic Jackson JsonParseException in
+    // the FIRST branch of this group so FailureClassifier (loaded from the repointed
+    // @Library branch) classifies it as infra -> the branch is deferred and its live
+    // siblings survive (sub-job resolves UNSTABLE). Only fires with the flag on and
+    // >=2 branches, so a real sibling always exists to prove non-cascade. Remove this
+    // block and revert the @Library line before merge.
+    def e2eInjectStage = (jobs.size() >= 2) ? jobs.keySet().toList()[0] : null
+    if (e2eInjectStage) {
+        echo "[E2E-INJECT] DO NOT MERGE: will inject a JsonParseException into '${e2eInjectStage}'; " +
+             "live siblings: ${jobs.keySet().toList()[1..-1].join(', ')}"
+    }
+    // =============================================================================
     def wrapped = jobs.collectEntries { stageName, body ->
         [(stageName), {
             try {
+                if (stageName == e2eInjectStage) {  // DO NOT MERGE (e2e validation)
+                    throw new RuntimeException("com.fasterxml.jackson.core.JsonParseException: " +
+                        "Unexpected character ('s' (code 115)): was expecting a colon to separate field name and value")
+                }
                 body()
             } catch (InterruptedException e) {
                 throw e
