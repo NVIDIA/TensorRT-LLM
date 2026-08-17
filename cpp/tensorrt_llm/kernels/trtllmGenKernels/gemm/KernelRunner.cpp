@@ -84,7 +84,12 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
         }
     }
 
-    TLLM_CHECK_WITH_INFO(mPassingConfigIndices.size() != 0, "No kernel found for the given output type");
+    TLLM_CHECK_WITH_INFO(mPassingConfigIndices.size() != 0,
+        "No kernel found for the given options: eltTypeA: %s, eltTypeB: %s, outputType: %s, deepSeekFp8: %d, "
+        "transposeMmaOutput: %d, gpuSM: %d",
+        tg::dtypeToString(mOptions.eltTypeA).c_str(), tg::dtypeToString(mOptions.eltTypeB).c_str(),
+        tg::dtypeToString(mOptions.outputType).c_str(), mOptions.deepSeekFp8, mOptions.transposeMmaOutput,
+        gpuNativeSmVersion);
 }
 
 size_t TrtllmGenGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k)
