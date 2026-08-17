@@ -1950,6 +1950,7 @@ def disaggregated(
     # (c) url absent, num_workers==1 -> single self-contained server.
     num_workers = disagg_cfg.num_workers
     coordinator_url = disagg_cfg.disagg_coordinator_url
+    os.environ.pop(DisaggLauncherEnvs.TLLM_DISAGG_ROLE, None)
 
     # Only topology (c) below binds the public socket in this process. The fleet
     # paths hand the port to N SO_REUSEPORT workers, which with port 0 would each
@@ -1973,6 +1974,7 @@ def disaggregated(
     if num_workers > 1:
         # (b) Implicit coordinator in this process (on port-1) + a delegating
         # uvicorn fleet (workers=N) on the public port. See below.
+        os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = "coordinator"
         _serve_coordinator_and_fleet(disagg_cfg, config_file,
                                      metadata_server_config_file,
                                      metadata_server_cfg, request_timeout,
@@ -1981,6 +1983,7 @@ def disaggregated(
 
     # (c) num_workers==1, no external coordinator: a single disagg server with an
     # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = "server_coordinator"
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         # See launch_server: without this, TIME_WAIT tombstones from the
         # connections this server accepted refuse a restart for ~60s.
@@ -2046,6 +2049,8 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
         if not k.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_",
                              "I_MPI_", "HYDRA_", "MPI_"))
     }
+    # Fleet frontends delegate to the coordinator; do not inherit its role.
+    base_env.pop(DisaggLauncherEnvs.TLLM_DISAGG_ROLE, None)
     # num_workers is explicit config now; ensure no stale WEB_CONCURRENCY leaks in
     # and re-forks each plain-HTTP worker into a nested fleet.
     base_env.pop("WEB_CONCURRENCY", None)

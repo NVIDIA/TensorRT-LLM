@@ -86,7 +86,39 @@ def test_disaggregated_command_sets_shared_deployment_id(monkeypatch) -> None:
         )
 
     assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_DEPLOYMENT_ID] == "deploy123"
+    assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE] == "server_coordinator"
     fake_socket.bind.assert_called_once_with(("127.0.0.1", 0))
+
+
+def test_disaggregated_command_identifies_coordinator(monkeypatch) -> None:
+    """A multi-frontend deployment labels its coordinator process explicitly."""
+    disagg_config = SimpleNamespace(
+        hostname="127.0.0.1",
+        port=8000,
+        schedule_style=None,
+        num_workers=2,
+        disagg_coordinator_url=None,
+    )
+
+    with (
+        mock.patch.object(serve, "parse_disagg_config_file", return_value=disagg_config),
+        mock.patch.object(serve._command_telemetry, "apply_disaggregated_telemetry_config"),
+        mock.patch.object(serve, "parse_metadata_server_config_file", return_value=None),
+        mock.patch.object(serve, "_serve_coordinator_and_fleet") as serve_coordinator,
+    ):
+        serve.disaggregated.callback(
+            config_file="disagg.yaml",
+            metadata_server_config_file=None,
+            server_start_timeout=180,
+            request_timeout=180,
+            log_level="info",
+            metrics_log_interval=0,
+            schedule_style=None,
+            telemetry=True,
+        )
+
+    assert os.environ[serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE] == "coordinator"
+    serve_coordinator.assert_called_once()
 
 
 def test_disaggregated_command_accepts_no_telemetry() -> None:
@@ -168,6 +200,7 @@ def test_launch_disagg_fleet_propagates_resolved_schedule_style(
         lambda signal_number, handler: signal_handlers.__setitem__(signal_number, handler),
     )
     monkeypatch.setenv("TRTLLM_NO_USAGE_STATS", "1")
+    monkeypatch.setenv(serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE, "coordinator")
 
     serve._launch_disagg_fleet(
         disagg_config,
@@ -181,6 +214,7 @@ def test_launch_disagg_fleet_propagates_resolved_schedule_style(
 
     assert observed_envs[0][serve.DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE] == schedule_style
     assert observed_envs[0]["TRTLLM_NO_USAGE_STATS"] == "1"
+    assert serve.DisaggLauncherEnvs.TLLM_DISAGG_ROLE not in observed_envs[0]
     assert signal_handlers[signal.SIGTERM] is serve._command_telemetry.raise_signal_exit
     with pytest.raises(serve._command_telemetry.SignalExit):
         signal_handlers[signal.SIGTERM](signal.SIGTERM, None)
