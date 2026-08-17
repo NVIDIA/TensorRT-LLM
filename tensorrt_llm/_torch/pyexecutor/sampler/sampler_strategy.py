@@ -287,6 +287,7 @@ def sample(
     return_probs: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, float | None]:
     softmax: torch.Tensor | None
+    temperature: float | None
     # 'cast' needed b/c of https://github.com/python/mypy/issues/19081
     match strategy:
         case ("top_k", top_k, temperature):
