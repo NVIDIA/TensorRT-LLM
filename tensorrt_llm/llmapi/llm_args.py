@@ -1967,12 +1967,13 @@ class DecodingBaseConfig(StrictBaseModel):
     def loads_mtp_from_separate_checkpoint(self) -> bool:
         """Whether one-model MTP heads come from ``speculative_model``.
 
-        False when ``speculative_model`` resolves to the target checkpoint:
-        the heads are then loaded from the target weights, as they were
-        before separate MTP checkpoints were supported.
+        False for shared-KV models, where ``speculative_model`` is a complete
+        draft model, and when it resolves to the target checkpoint, where the
+        heads are loaded from the target weights.
         """
         return (self.spec_dec_mode.is_mtp_one_model()
                 and self.speculative_model is not None
+                and not self._use_shared_kv_cache
                 and not self._mtp_heads_in_target_checkpoint)
 
     @property

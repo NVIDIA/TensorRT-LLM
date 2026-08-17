@@ -17,6 +17,7 @@ from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager, MTPSpecM
 from tensorrt_llm._torch.speculative.utils import (
     get_num_extra_kv_tokens,
     get_num_spec_layers,
+    loads_mtp_from_speculative_model,
     update_spec_config_from_model_config,
 )
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
@@ -1761,6 +1762,9 @@ def test_mtp_shared_kv_config(architecture, expected):
     update_spec_config_from_model_config(spec_config, model_config)
 
     assert spec_config._use_shared_kv_cache is expected
+    assert spec_config.loads_mtp_from_separate_checkpoint is not expected
+    assert loads_mtp_from_speculative_model(spec_config) is not expected
+    assert spec_config.needs_separate_draft_weights
     if expected:
         assert get_num_spec_layers(spec_config) == 0
         assert get_num_extra_kv_tokens(spec_config) == 0

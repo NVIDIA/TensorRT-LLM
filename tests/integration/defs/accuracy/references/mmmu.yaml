@@ -19,6 +19,10 @@ google/gemma-4-26B-A4B-it:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 54.0
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 54.0
 google/gemma-3-12b-it:
   - accuracy: 50.44
   - quant_algo: FP8
