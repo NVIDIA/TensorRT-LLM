@@ -90,7 +90,7 @@ User configuration is supplied through Python or YAML and controls how the check
 
 `threshold_scale_factor` and `target_sparsity` are alternatives: if both are present, `threshold_scale_factor` takes precedence and the calibration formula is not used. User-provided `target_sparsity` and `disabled_until_timestep` override checkpoint defaults. Checkpoint `ignore` patterns always disable Skip Softmax Attention for matching layers.
 
-Skip Softmax Attention only works with the **TRTLLM** attention backend in VisualGen. Set `attention_config.backend` to `TRTLLM` when enabling it.
+Skip Softmax Attention works with both the **TRTLLM** and **CUTEDSL** attention backends in VisualGen. Set `attention_config.backend` to either when enabling it. On CUTEDSL, Skip Softmax Attention can also be combined with `quant_attention_config`'s block-scaled Q/K recipes (MXFP8, NVFP4); VSA is the only CUTEDSL sparse-attention algorithm that is mutually exclusive with quantized attention.
 
 #### Python API
 
@@ -130,6 +130,19 @@ args = VisualGenArgs(
 )
 ```
 
+```python
+# CUTEDSL backend:
+args = VisualGenArgs(
+    model="<path_or_hf_id>",
+    attention_config=AttentionConfig(
+        backend="CUTEDSL",
+        sparse_attention_config=SkipSoftmaxAttentionConfig(
+            threshold_scale_factor=5000.0,
+        ),
+    ),
+)
+```
+
 #### YAML
 
 ```yaml
@@ -149,6 +162,15 @@ attention_config:
     algorithm: skip_softmax
     target_sparsity: 0.5
     disabled_until_timestep: 0.6
+```
+
+```yaml
+# CUTEDSL backend:
+attention_config:
+  backend: CUTEDSL
+  sparse_attention_config:
+    algorithm: skip_softmax
+    threshold_scale_factor: 5000.0
 ```
 
 ### CUDA Graphs
