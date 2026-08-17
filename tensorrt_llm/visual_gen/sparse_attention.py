@@ -99,8 +99,19 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             return None
         return SkipSoftmaxParams(scheduler=scheduler)
 
-    def resolve_disabled_until_timestep(self, **kwargs) -> Optional[float]:
-        """Resolve the user override or checkpoint-provided timestep cutoff."""
+    def resolve_disabled_until_timestep(
+        self,
+        *,
+        checkpoint_config: Optional[Dict[str, Any]] = None,
+        pretrained_config: Any = None,
+    ) -> Optional[float]:
+        """Resolve the user override or checkpoint-provided timestep cutoff.
+
+        Exactly one of ``checkpoint_config`` (a raw checkpoint config dict) or
+        ``pretrained_config`` (the model's pretrained config object/dict) is
+        expected per call site; both default to ``None`` so a mistyped keyword
+        raises ``TypeError`` here instead of silently resolving to ``None``.
+        """
         if self.disabled_until_timestep is not None:
             return self.disabled_until_timestep
 
@@ -108,7 +119,9 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
             skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
         )
 
-        ckpt_sparse_attention_config = self._ckpt_sparse_attention_config_from_kwargs(kwargs)
+        ckpt_sparse_attention_config = self._ckpt_sparse_attention_config_from_kwargs(
+            {"checkpoint_config": checkpoint_config, "pretrained_config": pretrained_config}
+        )
         return skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config(
             ckpt_sparse_attention_config
         )
