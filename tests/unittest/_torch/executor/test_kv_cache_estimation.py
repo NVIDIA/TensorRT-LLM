@@ -19,6 +19,7 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
@@ -135,6 +136,8 @@ def _make_creator(
     model_max_seq_len=1,
     max_cuda_graph_batch_size=1,
     layer_types=None,
+    sliding_window=None,
+    use_sliding_window=None,
     max_attention_window=None,
 ):
     """Build a minimal KvCacheCreator (bypasses __init__) wired up for
@@ -150,10 +153,12 @@ def _make_creator(
 
     c._llm_args = Mock(disable_overlap_scheduler=True)
 
-    pretrained = Mock()
-    # spec=False so attribute access doesn't accept arbitrary fields; set only
-    # the ones the production path reads.
-    pretrained.layer_types = layer_types
+    pretrained = SimpleNamespace(
+        layer_types=layer_types,
+        num_hidden_layers=(len(layer_types) if isinstance(layer_types, (list, tuple)) else None),
+        sliding_window=sliding_window,
+        use_sliding_window=use_sliding_window,
+    )
 
     model_config = Mock()
     model_config.pretrained_config = pretrained
@@ -312,7 +317,7 @@ def test_reserve_adds_only_unprofiled_output_capacity():
 # blocks.  A single long-context request then overflows the full-attention
 # pool and the scheduler livelocks on suspend/retry.  The fix scales
 # num_cache_blocks by the number of distinct attention-window sizes inferred
-# either from ``layer_types`` on the pretrained config (preferred) or from
+# effective per-layer sliding windows on the pretrained config (preferred) or
 # an explicit ``max_attention_window`` list on kv_cache_config (fallback).
 
 
@@ -341,6 +346,21 @@ def test_uniform_layer_types_no_scaling():
     assert uniform._get_token_num_for_estimation() == baseline._get_token_num_for_estimation()
 
 
+def test_get_layer_attention_window_honors_max_window_layers():
+    config = SimpleNamespace(
+        use_sliding_window=True,
+        sliding_window=4096,
+        max_window_layers=2,
+    )
+
+    assert [get_layer_attention_window(config, layer_idx) for layer_idx in range(4)] == [
+        None,
+        None,
+        4096,
+        4096,
+    ]
+
+
 def test_gemma4_hybrid_scales_by_num_pool_groups():
     """Gemma4 hybrid attention (mixed sliding/full layers) must scale the
     estimated block count by the number of distinct layer types.  Otherwise
@@ -349,6 +369,9 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
     tpb = 32
     max_seq_len = 12288
     layer_types = ["sliding_attention"] * 28 + ["full_attention"] * 7
+    # Mixed sliding/full attention must include the model's actual window size;
+    # Gemma4-E2B uses a 512-token sliding window.
+    sliding_window = 512
     assert len(set(layer_types)) == 2
 
     hybrid = _make_creator(
@@ -359,6 +382,7 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         model_max_seq_len=max_seq_len,
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
+        sliding_window=sliding_window,
     )
     uniform = _make_creator(
         tpb,
@@ -376,6 +400,72 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         f"Expected 2x scaling for 2 pool groups, got "
         f"hybrid={hybrid_tokens}, uniform={uniform_tokens}"
     )
+
+
+def test_hybrid_linear_attention_scales_by_num_pool_groups():
+    """Hybrid linear/attention V2 managers retain both estimation pools."""
+    tpb = 32
+    max_seq_len = 4096
+    layer_types = ["linear_attention"] * 30 + ["full_attention"] * 10
+
+    hybrid = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=layer_types,
+    )
+    uniform = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=["full_attention"] * 40,
+    )
+
+    assert hybrid._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
+
+
+@pytest.mark.parametrize(
+    ("sliding_window", "use_sliding_window"),
+    [
+        ([512, 1024], None),
+        (None, True),
+    ],
+    ids=["multiple_window_sizes", "missing_window"],
+)
+def test_v2_pool_estimation_falls_back_for_unsupported_window_metadata(
+    sliding_window,
+    use_sliding_window,
+):
+    tpb = 32
+    max_seq_len = 4096
+    hybrid = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=sliding_window,
+        use_sliding_window=use_sliding_window,
+    )
+    uniform = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=["full_attention", "full_attention"],
+    )
+
+    assert hybrid._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
 
 
 def test_vswa_max_attention_window_fallback_scales():
@@ -415,6 +505,9 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
     tpb = 32
     max_seq_len = 12288
     layer_types = ["sliding_attention"] * 28 + ["full_attention"] * 7
+    # Mixed sliding/full attention must include the model's actual window size;
+    # Gemma4-E2B uses a 512-token sliding window.
+    sliding_window = 512
 
     c = _make_creator(
         tpb,
@@ -424,6 +517,7 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         model_max_seq_len=max_seq_len,
         max_cuda_graph_batch_size=4,
         layer_types=layer_types,
+        sliding_window=sliding_window,
     )
 
     total_tokens = c._get_token_num_for_estimation()
@@ -852,7 +946,7 @@ def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
             return_value=Mock(),
         ) as create_manager,
     ):
-        creator._create_one_model_draft_kv_cache_manager()
+        creator._create_one_model_draft_kv_cache_manager(creator._max_seq_len)
 
     draft_config = create_manager.call_args.kwargs["kv_cache_config"]
     assert draft_config.pool_ratio == [1.0]
