@@ -511,6 +511,65 @@ def test_autotuner_preparation_try_block():
             f"{name}: expect the failure to be recorded."
 
 
+def test_autotuner_get_valid_tactics_skips_only_failed_runner():
+    # A get_valid_tactics failure takes out that runner only. The surviving
+    # runner still has to be timed: dropping the failed one leaves
+    # total_pairs at 1, and an ungated single-pair shortcut would cache the
+    # survivor at min_time=0.0 without ever profiling it.
+
+    class CrashedTacticsRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            raise Exception(
+                "For preparation try block test: get_valid_tactics crash happens."
+            )
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1) -> torch.Tensor:
+            return gemm_fallback(*inputs)
+
+    class SingleTacticRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1) -> torch.Tensor:
+            return gemm_fallback(*inputs)
+
+    x, w = torch.randn(M, 64), torch.randn(64, 128)
+    runners = [CrashedTacticsRunner(), SingleTacticRunner()]
+    tuner = AutoTuner.get()
+    name = "test_autotuner_get_valid_tactics_skips_only_failed_runner"
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        input_idx=0,
+        dim_idx=0,
+        gen_tuning_buckets=get_power_of_2_num_tokens_buckets,
+        map_to_tuning_buckets=next_positive_power_of_2), ), )
+    with autotune():
+        runner, tactic = tuner.choose_one(name, runners, tuning_config, [x, w])
+    assert runner is runners[1], \
+        f"Expect the surviving runner to be chosen, but got {runner}."
+    assert tactic == 0, \
+        f"Expect the surviving runner's only tactic, but got {tactic}."
+    assert tuner.stats.failed_profiling_count[name], \
+        "Expect the get_valid_tactics failure to be recorded."
+    cached = tuner.profiling_cache.get_specific_custom_op(name)
+    assert cached, "Expect the surviving runner to be cached."
+    assert all(min_time > 0.0 for _, _, min_time in cached.values()), \
+        f"Expect a real measurement, but got a shortcut entry: {cached}."
+
+
 @torch.library.custom_op("autotuner_test::recursive_get_best_gemm_tactic",
                          mutates_args=())
 def recursive_get_best_gemm_tactic(x: torch.Tensor, w1: torch.Tensor,
