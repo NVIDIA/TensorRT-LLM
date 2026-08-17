@@ -142,12 +142,10 @@ std::pair<std::string, std::uint64_t> splitKey(std::string const& key)
 // Launch the batched copy over plan arrays the CALLER already wrote into the exec context's pinned
 // host buffer (via planBufs()/appendSplitInto(): [srcs(n)|dsts(n)|sizes(n)]). Direction-agnostic
 // (gather or scatter); the data region (arena offset) is encoded into the srcs/dsts by the caller.
-// Two opt-in knobs (default off):
-//   - zeroCopy (default on): skip the H2D of the plan arrays — the kernel reads them straight from
-//     pinned host via ctx->hostPinnedDev, removing the H2D-then-kernel serialization.
-//   - cub: use cub::DeviceMemcpy::Batched (ctx->cubTemp workspace) instead of the custom kernel.
-// The two compose: arg source (scratch H2D vs pinned) x copy backend (custom vs cub).
-cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy, bool cub)
+// zeroCopy (default on) skips the H2D of the plan arrays — the kernel reads them straight from
+// pinned host via ctx->hostPinnedDev, removing the H2D-then-kernel serialization. Off stages them
+// in device scratch first (faster on machines where mapped-host reads are slow).
+cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy)
 {
     if (n == 0)
     {
@@ -182,20 +180,6 @@ cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy, bool cub)
     auto* ddsts = reinterpret_cast<std::uint64_t*>(base + b64);
     auto* dsizes = reinterpret_cast<std::uint32_t*>(base + 2 * b64);
     auto const n32 = static_cast<std::uint32_t>(n); // n <= scratchBytes/20, far below u32 max
-    if (cub && ctx->cubTemp != nullptr)
-    {
-        std::size_t need = 0;
-        cudaError_t const st = batchedCopyCubTempBytes(n32, need);
-        if (st != cudaSuccess)
-        {
-            return st;
-        }
-        if (need > ctx->cubTempBytes)
-        {
-            return cudaErrorMemoryAllocation; // shouldn't happen: n <= maxDescs the temp was sized for
-        }
-        return launchBatchedCopyCub(dsrcs, ddsts, dsizes, n32, ctx->stream, ctx->cubTemp, need);
-    }
     return launchBatchedCopy(dsrcs, ddsts, dsizes, n32, ctx->stream);
 }
 } // namespace
@@ -625,7 +609,7 @@ void BounceReceiver::scatterWorkerLoop()
                             splitBudget(idx, static_cast<std::size_t>(rawPieces - seen), maxEntries));
                     }
                 }
-                launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments, mCtx.cfg.useCubCopy);
+                launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);
             }
             else if (srcInBounds && nTotal == 0)
             {
@@ -687,7 +671,7 @@ std::shared_future<BounceResult> BounceSender::submit(
     {
         BounceNvtxScope planScope(kNvtxBuildPlan, "buildPlan nDesc=%zu", srcDescs.getDescs().size());
         plan = BounceTransferPlan::build(srcDescs, dstDescs, mCtx.cfg.maxChunkSizeBytes,
-            std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkSizeBytes / 256ULL), !mCtx.cfg.disableScatterRunMerging);
+            std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkSizeBytes / 256ULL));
     }
     catch (std::exception const& e)
     {
@@ -955,7 +939,7 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
                 splitBudget(idx, nDesc - 1 - i, maxEntries));
         }
         // gather into the region (cfg knobs select the H2D-vs-zero-copy arg path + custom-vs-cub copy)
-        cudaError_t const gatherErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments, mCtx.cfg.useCubCopy);
+        cudaError_t const gatherErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);
         // Record an event for gather completion and DEFER the write. The gather must finish before
         // NIXL reads the region, but on a shared GPU the gather can be delayed behind model kernels
         // — blocking the IO thread on cudaStreamSynchronize here would stall the whole reactor

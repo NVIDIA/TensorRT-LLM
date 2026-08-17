@@ -151,7 +151,7 @@ Backend makeBackend(b::BounceConfig& c, std::uint32_t regionCap)
     c.arenaSizeBytes = arenaSizeBytes;
     std::uint32_t const execCount = regionCap + c.scatterWorkerCount + 4;
     return Backend{std::make_unique<b::BounceArena>(arenaSizeBytes, 0, /*allowFabric=*/false),
-        std::make_unique<b::ExecPool>(execCount, 1024, 0, c.useZeroCopyArguments, c.useCubCopy)};
+        std::make_unique<b::ExecPool>(execCount, 1024, 0, c.useZeroCopyArguments)};
 }
 
 // Poll `ch` until `budget` elapses, invoking `onMsg(header, blob)` for each decoded message;

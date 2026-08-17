@@ -50,8 +50,6 @@ struct ExecCtx
     void* scratch{nullptr};       // device plan arrays; unused when zero-copy arguments are enabled
     void* hostPinned{nullptr};    // pinned staging for the plan arrays (H2D source, or read in-kernel)
     void* hostPinnedDev{nullptr}; // device alias of hostPinned when zero-copy arguments are enabled
-    void* cubTemp{nullptr};       // cub::DeviceMemcpy::Batched workspace when CUB copy is enabled
-    std::size_t cubTempBytes{0};  // capacity of cubTemp
     std::size_t scratchBytes{0};
 };
 
@@ -62,9 +60,7 @@ public:
     /// `maxDescsPerChunk` plan entries. Throws on CUDA allocation failure.
     /// @param useZeroCopyArguments Map hostPinned into the device address space so a kernel can read
     /// plan arrays directly.
-    /// @param useCubCopy Pre-allocate a CUB batched-memcpy workspace per context.
-    ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool useZeroCopyArguments = false,
-        bool useCubCopy = false);
+    ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int deviceId, bool useZeroCopyArguments = false);
     ~ExecPool();
 
     ExecPool(ExecPool const&) = delete;

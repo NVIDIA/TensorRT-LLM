@@ -206,8 +206,7 @@ void NixlTransferAgent::maybeInitBounce(std::optional<bool> agentBufferEnable)
                 mName.c_str());
             return;
         }
-        st->exec = std::make_unique<bounce::ExecPool>(
-            cfg.copyStreamCount, maxDescs, dev, cfg.useZeroCopyArguments, cfg.useCubCopy);
+        st->exec = std::make_unique<bounce::ExecPool>(cfg.copyStreamCount, maxDescs, dev, cfg.useZeroCopyArguments);
         st->transport = std::make_unique<bounce::BounceTransport>(
             mName, cfg, dev, st->channel.get(), st->engine.get(), st->arena.get(), st->exec.get());
         mBounce = std::move(st);
