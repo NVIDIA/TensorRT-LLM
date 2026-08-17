@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import os
 import pickle
@@ -584,7 +587,9 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
     kv_cache_configs = [
         KvCacheConfig(max_tokens=128,
                       enable_block_reuse=False,
-                      free_gpu_memory_fraction=0.4) for _ in range(2)
+                      free_gpu_memory_fraction=0.4,
+                      use_kv_cache_manager_v2=eagle3_one_model)
+        for _ in range(2)
     ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
@@ -1038,8 +1043,9 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
              cuda_graph_config=CudaGraphConfig()))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
-        for _ in range(2)
+        KvCacheConfig(max_tokens=2048 * 8,
+                      enable_block_reuse=True,
+                      use_kv_cache_manager_v2=False) for _ in range(2)
     ]
     # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [
@@ -1198,8 +1204,9 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
              cuda_graph_config=CudaGraphConfig()))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
-        for _ in range(2)
+        KvCacheConfig(max_tokens=2048 * 8,
+                      enable_block_reuse=True,
+                      use_kv_cache_manager_v2=False) for _ in range(2)
     ]
     # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [
