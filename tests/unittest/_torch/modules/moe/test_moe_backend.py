@@ -71,8 +71,6 @@ from tensorrt_llm._torch.modules.fused_moe.interface import (
     MoESchedulerKind,
     MoEWeightLoadingMode,
 )
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
@@ -85,8 +83,6 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import (
 )
 from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
 from tensorrt_llm._utils import get_sm_version, mpi_rank
-from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_gated_activation
-from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -205,6 +201,26 @@ def test_kimi_fused_route_quant_skips_prequantized_input(monkeypatch) -> None:
         backend.try_fused_kimi_route_quant(hidden_states, torch.empty(1, 896, dtype=torch.float32))
         is None
     )
+
+
+def test_kimi_mxfp8_quantized_tensor_handoff() -> None:
+    """The NVFP4 communication path preserves an upstream MXFP8 payload."""
+    fp8_tensor = torch.empty(2, 64, dtype=torch.float8_e4m3fn)
+    scaling_factor = torch.empty(2, 2, dtype=torch.uint8)
+    hidden_states = MxFp8QuantizedTensor(fp8_tensor, scaling_factor)
+    backend = TRTLLMGenFusedMoE.__new__(TRTLLMGenFusedMoE)
+    backend._weights_created = True
+    quant_mode = MagicMock()
+    quant_mode.has_any_quant.return_value = True
+    quant_mode.has_w4a8_mxfp4_fp8.return_value = False
+    quant_mode.has_nvfp4.return_value = True
+    backend.quant_config = SimpleNamespace(layer_quant_mode=quant_mode)
+
+    quantized, scales = backend.quantize_input(hidden_states)
+
+    assert quantized is fp8_tensor
+    assert scales.data_ptr() == scaling_factor.data_ptr()
+    assert torch.equal(scales, scaling_factor)
 
 
 def create_test_backend(
