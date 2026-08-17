@@ -40,4 +40,4 @@ def test_llm_api_single_gpu_with_mpirun(llmapi_example_root, llm_venv,
     ]
 
     venv_mpi_check_call(llm_venv, ["mpirun", "-n", "1", "--allow-run-as-root"],
-                        ["python3"] + summary_cmd)
+                        summary_cmd)
