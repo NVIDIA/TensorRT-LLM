@@ -610,6 +610,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                 hits={},
                 miss_indices=list(range(len(partition.keys))),
                 keys=partition.keys,
+                looked_up=partition.looked_up,
             )
         if (
             modality in ("image", "audio")
@@ -634,6 +635,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
                     hits={},
                     miss_indices=list(range(len(partition.keys))),
                     keys=partition.keys,
+                    looked_up=partition.looked_up,
                 )
         return partition
 
