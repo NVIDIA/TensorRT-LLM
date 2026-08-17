@@ -247,12 +247,12 @@ The response should contain a `choices[0].message.content` field completing the 
 The repository ships a ready-made multi-node GSM8K evaluation job built on `trtllm-eval` with the tested DEP16 settings:
 
 ```bash
-sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model /path/to/kimi-k3-checkpoint \
     --image /path/to/tensorrt-llm-container.sqsh
 ```
 
-The job writes progress and results to `kimi-k3-gsm8k-<job-id>.log` in the submission directory. If no local dataset path is configured, `trtllm-eval` downloads GSM8K from the Hugging Face Hub. The completed log contains a results table with the normalized GSM8K exact-match scores. With the tested checkpoint and the settings in this example, users should expect approximately:
+The job writes progress and results to `kimi-k3-eval-<job-id>.log` in the submission directory. If no local dataset path is configured, `trtllm-eval` downloads GSM8K from the Hugging Face Hub. The completed log contains a results table with the normalized GSM8K exact-match scores. With the tested checkpoint and the settings in this example, users should expect approximately:
 
 | Filter | Exact match |
 | :-- | --: |
