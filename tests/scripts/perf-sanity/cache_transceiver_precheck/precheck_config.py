@@ -447,7 +447,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         # True/False from the yaml wins; absent means "auto", which the
         # driver resolves against the model class's manager preference at
         # runtime, exactly like serving (_resolve_kv_cache_manager_v2_auto).
-        plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", "auto")
+        plan[f"{role}_use_kv_cache_manager_v2"] = kv_cfg.get("use_kv_cache_manager_v2", True)
     plan["fingerprint"] = plan_fingerprint(plan)
     return plan
 

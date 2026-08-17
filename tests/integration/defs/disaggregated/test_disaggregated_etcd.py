@@ -100,7 +100,7 @@ def start_context_server(config,
 
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    server_env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting CONTEXT server on GPU {gpu_id} (port {port})...")
@@ -127,7 +127,7 @@ def start_generation_server(config,
 
     server_env = env.copy() if env else os.environ.copy()
     server_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    server_env["TRTLLM_USE_UCX_KVCACHE"] = "1"
+    server_env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     server_env["UCX_TLS"] = get_ucx_tls()
 
     logger.info(f"Starting GENERATION server on GPU {gpu_id} (port {port})...")

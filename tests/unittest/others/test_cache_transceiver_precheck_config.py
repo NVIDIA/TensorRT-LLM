@@ -286,9 +286,9 @@ def test_use_kv_cache_manager_v2_flags():
     # Absent -> "auto" (the driver resolves it against the model's
     # get_preferred_kv_cache_manager_version at runtime, like serving).
     plan = pcfg.resolve_plan(_disagg_yaml())
-    assert plan["ctx_use_kv_cache_manager_v2"] == "auto"
-    assert plan["gen_use_kv_cache_manager_v2"] == "auto"
-    assert pcfg.side_plan(plan, "ctx")["use_kv_cache_manager_v2"] == "auto"
+    assert plan["ctx_use_kv_cache_manager_v2"] is True
+    assert plan["gen_use_kv_cache_manager_v2"] is True
+    assert pcfg.side_plan(plan, "ctx")["use_kv_cache_manager_v2"] is True
 
     # Explicit yaml values win, per side.
     plan = pcfg.resolve_plan(

@@ -72,7 +72,8 @@ worker_config:
         num_slots: 416
         layer_updates_per_iter: 1
     cache_transceiver_config:
-      backend: UCX
+      backend: NIXL
+      transceiver_runtime: PYTHON
       max_tokens_in_buffer: 8448
     stream_interval: 20
     num_postprocess_workers: 4
@@ -93,6 +94,7 @@ worker_config:
       free_gpu_memory_fraction: 0.75
       dtype: fp8
     cache_transceiver_config:
-      backend: UCX
+      backend: NIXL
+      transceiver_runtime: PYTHON
       max_tokens_in_buffer: 8448
     trust_remote_code: true

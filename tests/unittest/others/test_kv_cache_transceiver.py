@@ -414,6 +414,7 @@ def test_cancel_request_in_transmission(attention_type):
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      transceiver_runtime="CPP",
                                                       max_tokens_in_buffer=512)
 
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
@@ -485,6 +486,7 @@ def test_async_transfer_keeps_llm_request_alive():
     kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      transceiver_runtime="CPP",
                                                       max_tokens_in_buffer=512)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
@@ -611,7 +613,10 @@ def test_kv_transfer_timeout_warns_once_per_request(capfd):
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
 
     cache_transceiver_config = CacheTransceiverConfig(
-        backend="DEFAULT", max_tokens_in_buffer=512, kv_transfer_timeout_ms=100)
+        backend="DEFAULT",
+        transceiver_runtime="CPP",
+        max_tokens_in_buffer=512,
+        kv_transfer_timeout_ms=100)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
                                                   AttentionTypeCpp.DEFAULT,
@@ -660,6 +665,7 @@ def test_kv_transfer_timeout_silent_when_unset(capfd):
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      transceiver_runtime="CPP",
                                                       max_tokens_in_buffer=512)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
@@ -697,6 +703,7 @@ def test_context_transfer_bounded_poll_keeps_request_in_progress(capfd):
 
     cache_transceiver_config = CacheTransceiverConfig(
         backend="DEFAULT",
+        transceiver_runtime="CPP",
         max_tokens_in_buffer=512,
         kv_transfer_timeout_ms=100,
         kv_transfer_sender_future_timeout_ms=10)

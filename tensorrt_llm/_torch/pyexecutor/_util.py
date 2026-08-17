@@ -1031,6 +1031,9 @@ class KvCacheCreator:
             )
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
+            if (self._is_kv_cache_manager_v2
+                    and 'cp_type' not in self._mapping.cp_config):
+                self._skip_est = True
             estimating_kv_cache = False
             logger.info(
                 "KV cache size estimation is not supported for Vanilla attention backend, disable it."
