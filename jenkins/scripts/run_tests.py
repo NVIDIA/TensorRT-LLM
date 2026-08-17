@@ -505,7 +505,7 @@ def check_and_rerun(
             f"Too many {rerun_tag} tests to rerun ({valid_count} > max_rerun_tests={max_rerun_tests}). "
             "Skipping rerun."
         )
-        return False
+        return True, []
 
     # Step 3: Execute reruns
     is_rerun_failed = False
@@ -536,7 +536,6 @@ def check_and_rerun(
             print(f"The {rerun_tag} tests still failed after rerun attempt.")
             is_rerun_failed = True
 
-    print(f"is_rerun_failed for {rerun_tag}: {is_rerun_failed}")
     return is_rerun_failed, rerun_xml_files
 
 
