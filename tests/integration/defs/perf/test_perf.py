@@ -20,7 +20,7 @@ import os
 import re
 import shutil
 import sys
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Optional
 
 import pytest
 import yaml
@@ -920,6 +920,32 @@ class PerfTestConfig:
         """
         return self.get_benchmark_type() == "enc_dec"
 
+    def get_fixed_dataset_sequence_length(self) -> Optional[int]:
+        """Return the common total length when every dataset shape is fixed."""
+        if self.build_only or self.runtime not in ("bench", "serve"):
+            return None
+        if not self.output_lens or len(self.input_lens) != len(
+                self.output_lens):
+            return None
+
+        # LoRA data is generated with nonzero input/output length deviations.
+        if self.num_loras > 0:
+            return None
+
+        # These serve requests may terminate at EOS or include image tokens,
+        # so their configured text lengths are not fixed runtime lengths.
+        if self.runtime == "serve" and (self.model_name in SPEC_DEC_MODELS or
+                                        self.model_name in SERVE_IMAGE_MODELS):
+            return None
+
+        sequence_lengths = {
+            input_len + output_len
+            for input_len, output_len in zip(self.input_lens, self.output_lens)
+        }
+        if len(sequence_lengths) != 1:
+            return None
+        return sequence_lengths.pop()
+
 
 class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     """
@@ -985,6 +1011,17 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
     def get_trtllm_bench_model(self):
         return get_model_dir(self._config.model_name)
+
+    def _get_model_yaml_config(self) -> dict:
+        config = get_model_yaml_config(self._config.to_string(),
+                                       lora_dirs=self.lora_dirs)
+        uses_pytorch_backend = (self._config.runtime == "serve"
+                                or self._config.backend == "pytorch")
+        fixed_sequence_length = self._config.get_fixed_dataset_sequence_length()
+        if uses_pytorch_backend and fixed_sequence_length is not None:
+            kv_cache_config = config.setdefault('kv_cache_config', {})
+            kv_cache_config.setdefault('avg_seq_len', fixed_sequence_length)
+        return config
 
     def get_trtllm_bench_build_command(self, engine_dir) -> list:
         model_dir = self.get_trtllm_bench_model()
@@ -1161,8 +1198,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                                "extra-llm-api-config.yml")
             if not os.path.exists(pytorch_config_path):
                 os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
-            config = get_model_yaml_config(self._config.to_string(),
-                                           lora_dirs=self.lora_dirs)
+            config = self._get_model_yaml_config()
             if config:
                 print_info(f"pytorch/TRT model config: {config}")
                 with open(pytorch_config_path, 'w') as f:
@@ -1225,8 +1261,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             "pytorch",
         ]
 
-        config = get_model_yaml_config(self._config.to_string(),
-                                       lora_dirs=self.lora_dirs)
+        config = self._get_model_yaml_config()
         serve_config = config or {}
         serve_config.setdefault('max_batch_size', self._config.max_batch_size)
         serve_config.setdefault('max_num_tokens', self._config.max_num_tokens)
@@ -1875,6 +1910,107 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             raise ValueError(f"Unexpected metric_type: {metric_type}")
 
         return PERF_METRIC_THRESHOLD[metric_type][1]
+
+
+@pytest.mark.parametrize(
+    ("input_lens", "output_lens", "expected"),
+    [
+        ([500], [2000], 2500),
+        ([500, 1000], [2000, 1500], 2500),
+        ([500, 1000], [2000, 2000], None),
+    ],
+)
+def test_fixed_dataset_sequence_length(input_lens, output_lens, expected):
+    config = PerfTestConfig(
+        runtime="bench",
+        input_lens=input_lens,
+        output_lens=output_lens,
+    )
+
+    assert config.get_fixed_dataset_sequence_length() == expected
+
+
+@pytest.mark.parametrize(
+    ("runtime", "model_name", "num_loras", "build_only"),
+    [
+        ("bench", "", 0, True),
+        ("bench", "", 1, False),
+        ("serve", "qwen3_4b_eagle3", 0, False),
+        ("serve", "nemotron_3_nano_omni_nvfp4_image", 0, False),
+    ],
+)
+def test_non_fixed_dataset_does_not_infer_sequence_length(
+    runtime,
+    model_name,
+    num_loras,
+    build_only,
+):
+    config = PerfTestConfig(
+        model_name=model_name,
+        runtime=runtime,
+        input_lens=[500],
+        output_lens=[2000],
+        num_loras=num_loras,
+    )
+    config.build_only = build_only
+
+    assert config.get_fixed_dataset_sequence_length() is None
+
+
+@pytest.mark.parametrize(
+    ("runtime", "backend", "expected"),
+    [
+        ("bench", "pytorch", 2500),
+        ("serve", "", 2500),
+        ("bench", "", None),
+        ("bench", "_autodeploy", None),
+    ],
+)
+def test_model_yaml_infers_avg_seq_len_for_pytorch_only(
+    monkeypatch,
+    runtime,
+    backend,
+    expected,
+):
+    runner = object.__new__(MultiMetricPerfTest)
+    runner._config = PerfTestConfig(
+        runtime=runtime,
+        backend=backend,
+        input_lens=[500],
+        output_lens=[2000],
+    )
+    runner.lora_dirs = []
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "get_model_yaml_config",
+        lambda *args, **kwargs: {},
+    )
+
+    config = runner._get_model_yaml_config()
+
+    assert config.get("kv_cache_config", {}).get("avg_seq_len") == expected
+
+
+def test_model_yaml_preserves_explicit_avg_seq_len(monkeypatch):
+    runner = object.__new__(MultiMetricPerfTest)
+    runner._config = PerfTestConfig(
+        runtime="bench",
+        backend="pytorch",
+        input_lens=[500],
+        output_lens=[2000],
+    )
+    runner.lora_dirs = []
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "get_model_yaml_config",
+        lambda *args, **kwargs: {"kv_cache_config": {
+            "avg_seq_len": 1024
+        }},
+    )
+
+    config = runner._get_model_yaml_config()
+
+    assert config["kv_cache_config"]["avg_seq_len"] == 1024
 
 
 def run_perf_test(perf_case_name, trt_performance_cache_fpath,
