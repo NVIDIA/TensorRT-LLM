@@ -38,7 +38,7 @@ import torch
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 
 from ..llm_request import LlmRequest
-from .ops.vanilla import Fusions
+from .ops.vanilla import Fusions, occurrence_penalized_logits
 from .sampler_common import _get_max_beam_width, _unwrap_singleton
 
 __all__ = [
@@ -654,8 +654,9 @@ class PenaltyHandler:
 # per-beam bookkeeping that speculative decoding never needs (beam width is
 # always 1 there).
 #
-# The penalty formula itself is duplicated from Fusions._apply_occurrence_
-# penalties_impl; keep the two in sync until one can subsume the other.
+# The arithmetic itself is shared: both halves call
+# ``ops.vanilla.occurrence_penalized_logits``, so only the operand gathering
+# differs between them.
 # ---------------------------------------------------------------------------
 
 
@@ -811,17 +812,15 @@ def _apply_penalties_impl(
     # Storing them as a bitmask costs 1 bit instead of the 32 an int32 count would.
     seen_for_repetition = output_seen | _unpack_prompt_mask(prompt_mask, row_slots, logits.size(-1))
 
-    penalized = logits.float()
-    # Repetition is multiplicative and splits on sign: dividing a negative logit
-    # would raise it. Presence/frequency are plain subtractions.
-    repeated = torch.where(penalized < 0, penalized * rep, penalized / rep)
-    penalized = torch.where(seen_for_repetition, repeated, penalized)
-    penalized = penalized - torch.where(
-        output_seen, pre + freq * count.to(torch.float32), penalized.new_zeros(())
+    penalized = occurrence_penalized_logits(
+        logits,
+        count=count,
+        seen_for_repetition=seen_for_repetition,
+        seen_for_presence=output_seen,
+        repetition=rep,
+        presence=pre,
+        frequency=freq,
     )
-
-    limit = torch.finfo(logits.dtype).max
-    penalized = penalized.clamp(-limit, limit).to(logits.dtype)
     # Cast before the select so untouched rows stay bit-identical.
     row_active = active[row_slots].unsqueeze(1)
     logits.copy_(torch.where(row_active, penalized, logits))
