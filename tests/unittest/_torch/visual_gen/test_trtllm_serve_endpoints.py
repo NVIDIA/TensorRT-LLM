@@ -2208,6 +2208,8 @@ class TestVideoTensorResponse:
     def test_sync_tensor_path_returns_readable_output_path(self, video_audio_client, fmt):
         resp = self._post_sync(video_audio_client, fmt, "path")
         assert resp.status_code == 200
+        # path responses carry the Server-Timing metrics too.
+        _assert_visual_gen_server_timing(resp.headers)
         data = resp.json()
         assert set(data) >= {"id", "output_path"}
         # Co-located client reads the returned server-side path directly.
@@ -2276,6 +2278,8 @@ class TestVideoEncoderResponse:
             headers={"content-type": "application/json"},
         )
         assert resp.status_code == 200
+        # path responses carry the Server-Timing metrics too.
+        _assert_visual_gen_server_timing(resp.headers)
         body = resp.json()
         assert set(body) >= {"id", "output_path"}
         # The returned server-side path points at non-empty encoded bytes.
