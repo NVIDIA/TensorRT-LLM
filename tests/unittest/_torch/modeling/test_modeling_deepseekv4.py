@@ -37,6 +37,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     _resolve_enable_fused_hc,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
@@ -353,6 +354,65 @@ def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
     joint = joint_norm(hidden_states)
 
     assert not torch.allclose(per_head, joint, atol=0.1)
+
+
+def test_deepseek_v4_mla_builds_both_norms_at_the_v4_widths():
+    """The two tests above pin the norm maths; this pins how MLA wires them up.
+
+    `kv_a_layernorm` spans the WHOLE 512-wide latent, RoPE tail included -- unlike
+    V3/V3.2, where it is `kv_lora_rank` wide and the tail bypasses it. The fused KV
+    kernel applies the norm itself over that full row and
+    `_is_fused_kv_norm_enabled` gates on the weight width, so narrowing it would
+    silently disable the fusion rather than fail.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("MLA construction requires CUDA")
+
+    cfg = DeepseekV4Config(**deepcopy(DEEPSEEK_V4_TINY_CONFIG))
+    model_config = ModelConfig(
+        pretrained_config=cfg,
+        sparse_attention_config=DeepSeekV4SparseAttentionConfig(
+            index_n_heads=32, index_head_dim=128, index_topk=512
+        ),
+    )
+    mla = MLA(
+        hidden_size=cfg.hidden_size,
+        num_attention_heads=cfg.num_attention_heads,
+        num_key_value_heads=1,
+        qk_nope_head_dim=cfg.qk_nope_head_dim,
+        qk_rope_head_dim=cfg.qk_rope_head_dim,
+        v_head_dim=cfg.v_head_dim,
+        q_lora_rank=cfg.q_lora_rank,
+        kv_lora_rank=cfg.kv_lora_rank,
+        predicted_tokens_per_seq=1,
+        max_position_embeddings=cfg.max_position_embeddings,
+        bias=False,
+        pos_embd_params=_deepseek_v4_pos_embd_params(cfg, model_config, 0),
+        layer_idx=0,
+        dtype=torch.bfloat16,
+        config=model_config,
+        num_groups=cfg.o_groups,
+        o_lora_rank=cfg.o_lora_rank,
+    ).to("cuda")
+
+    latent_width = cfg.kv_lora_rank + cfg.qk_rope_head_dim
+    assert mla.kv_a_layernorm.weight.shape == (latent_width,)
+    assert mla.q_b_layernorm.weight.shape == (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim,)
+    assert list(mla.q_b_layernorm.named_parameters()) == []
+    # `kv_b_proj` is absent because DeepSeekV4Hooks.need_absorption is False, which
+    # is what proves the 512 above came from the V4 hook rather than from MLA's own
+    # `kv_lora_rank`-wide construction.
+    assert not hasattr(mla, "kv_b_proj")
+
+    # The RoPE tail is inside the norm: perturbing it moves the normalized nope
+    # segment, which a 448-wide V3-style norm would leave untouched.
+    latent = torch.randn(4, latent_width, dtype=torch.bfloat16, device="cuda")
+    perturbed = latent.clone()
+    perturbed[:, cfg.kv_lora_rank :] *= 4.0
+    assert not torch.allclose(
+        mla.kv_a_layernorm(latent)[:, : cfg.kv_lora_rank],
+        mla.kv_a_layernorm(perturbed)[:, : cfg.kv_lora_rank],
+    )
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
