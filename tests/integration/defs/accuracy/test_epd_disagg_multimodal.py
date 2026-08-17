@@ -324,6 +324,58 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
         dump_dir = crash_dir / f"hang_dumps_rep{_repeat:03d}"
         dump_dir.mkdir(parents=True, exist_ok=True)
 
+        # Detached reaper subprocess. When pytest itself dies from a native
+        # SIGSEGV/SIGABRT, its faulthandler + sitecustomize files are already
+        # on disk under dump_dir, but the CI SLURM node may be torn down
+        # (walltime, orchestrator kill) before Jenkins post-stage archival can
+        # rsync test-results to urm — which is what left the H100 tarball at
+        # 1 KB on PR_Github #66663 despite all our in-process capture.
+        #
+        # The reaper below is a bash `nohup`/`setsid`-detached child that
+        # every 5 s tars all hang_dumps + sitecustomize dirs and writes an
+        # atomic-replace snapshot at crash_dir/nvbug6327718_snapshot.tgz.
+        # It also does one final snapshot after detecting the parent's death
+        # via `kill -0`. Even if pytest SIGSEGVs, the snapshot on disk is at
+        # most 5 s stale and lives inside --output-dir so Jenkins archival
+        # will grab it if the SLURM node's filesystem survives long enough.
+        reaper_script = crash_dir / f"reaper_rep{_repeat:03d}.sh"
+        reaper_marker = crash_dir / f"reaper_rep{_repeat:03d}.status"
+        reaper_marker.write_text("spawning\n")
+        reaper_script.write_text(
+            textwrap.dedent(f"""\
+            #!/bin/bash
+            # Detached; survives parent SIGSEGV.
+            PARENT_PID={os.getpid()}
+            SNAP_TMP="{crash_dir}/nvbug6327718_snapshot.tgz.tmp"
+            SNAP="{crash_dir}/nvbug6327718_snapshot.tgz"
+            MARKER="{reaper_marker}"
+            echo "$$ started $(date -Is), watching pid=$PARENT_PID" > "$MARKER"
+            while kill -0 $PARENT_PID 2>/dev/null; do
+                sleep 5
+                # Atomic snapshot: tar to tmp, then mv over. Never leaves a
+                # half-written tarball on disk.
+                tar czf "$SNAP_TMP" -C "{crash_dir}" \\
+                    hang_dumps_rep{_repeat:03d} sitecustomize_rep{_repeat:03d} \\
+                    2>/dev/null && mv -f "$SNAP_TMP" "$SNAP"
+            done
+            # Parent died. One final snapshot in case /proc entries about the
+            # dying process are still around and produced last-second dumps.
+            sleep 2
+            tar czf "$SNAP_TMP" -C "{crash_dir}" \\
+                hang_dumps_rep{_repeat:03d} sitecustomize_rep{_repeat:03d} \\
+                2>/dev/null && mv -f "$SNAP_TMP" "$SNAP"
+            echo "final snapshot written $(date -Is)" >> "$MARKER"
+        """)
+        )
+        reaper_script.chmod(0o755)
+        subprocess.Popen(
+            ["setsid", "nohup", "bash", str(reaper_script)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
         # A sitecustomize.py runs at the top of every Python child process
         # that has this directory on PYTHONPATH — including the
         # mpi4py.futures.server workers spawned by MpiPoolSession. Prior
