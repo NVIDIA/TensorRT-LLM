@@ -19,7 +19,7 @@ from weakref import WeakSet
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._mnnvl_utils import MnnvlMemory, _checkpoint_allgather
 from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdog,
     AlltoAllWatchdogCoordinator,
@@ -46,7 +46,11 @@ def _collect_active_ranks(
     expected_size: int,
 ) -> list[int]:
     """Collectively return ranks whose local workspace clients are active."""
-    clients_idle_by_rank = comm.allgather(local_clients_idle)
+    clients_idle_by_rank = _checkpoint_allgather(
+        comm,
+        local_clients_idle,
+        operation="workspace idle readiness",
+    )
     if len(clients_idle_by_rank) != expected_size:
         raise RuntimeError(
             "MNNVL workspace communicator size does not match the MoE EP group: "
@@ -62,7 +66,11 @@ def _collect_unready_ranks(
     expected_size: int,
 ) -> list[int]:
     """Collectively return ranks that could not finish local restore work."""
-    ready_by_rank = comm.allgather(local_ready)
+    ready_by_rank = _checkpoint_allgather(
+        comm,
+        local_ready,
+        operation="frontend restore readiness",
+    )
     if len(ready_by_rank) != expected_size:
         raise RuntimeError(
             "MNNVL workspace communicator size does not match the MoE EP group: "
@@ -91,10 +99,12 @@ class _WatchdogConfig:
 class _MnnvlAlltoAllWorkspaceLifecycle:
     """Own checkpoint and watchdog transitions for one shared MoE workspace.
 
-    A top-level engine checkpoint coordinator must atomically stop admission and
-    drain or abort in-flight work before invoking this resource hook. The local
-    client and rank-wide idle checks are preflight validation only; they do not
-    prevent a new dispatch from starting after the idle vote.
+    ``PyExecutor`` invokes this resource hook from the engine sleep/wakeup
+    PREPARE/COMMIT/ABORT control path. That coordinator stops admission, drains
+    in-flight work, aggregates bounded per-rank results, and reopens admission
+    only after every rank has completed COMMIT. The local client and subgroup
+    idle checks here remain defense-in-depth validation while the executor is
+    parked.
     """
 
     def __init__(
@@ -228,11 +238,16 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
         comm = cast(_CollectiveCommunicator | None, self._memory.comm)
         if comm is None:
             raise RuntimeError("MNNVL workspace communicator is not initialized")
-        active_ranks = _collect_active_ranks(
-            comm,
-            local_clients_idle=local_clients_idle,
-            expected_size=self._ep_size,
-        )
+        try:
+            active_ranks = _collect_active_ranks(
+                comm,
+                local_clients_idle=local_clients_idle,
+                expected_size=self._ep_size,
+            )
+        except TimeoutError:
+            self._memory.checkpoint_fail_closed()
+            self._stop_watchdog()
+            raise
         if active_ranks:
             raise RuntimeError(
                 f"Cannot checkpoint during an active MoE All-to-All phase on ranks {active_ranks}"

@@ -56,6 +56,11 @@ class NVLinkTwoSided(Communication):
         alltoall_result_do_sum: bool = False,
     ):
         super().__init__(mapping)
+        if mapping.has_cp_helix():
+            raise ValueError(
+                "NVLinkTwoSided does not support Helix context parallelism because "
+                "its MNNVL communicator covers only the tensor-parallel group"
+            )
 
         # Store needed parameters
         self.num_experts = num_experts
@@ -120,18 +125,24 @@ class NVLinkTwoSided(Communication):
         comm = workspace.comm
         if comm is None:
             raise RuntimeError("MNNVL workspace communicator is not initialized")
-        active_ranks = _collect_active_ranks(
-            comm,
-            local_clients_idle=local_clients_idle,
-            expected_size=self.ep_size,
-        )
+        try:
+            active_ranks = _collect_active_ranks(
+                comm,
+                local_clients_idle=local_clients_idle,
+                expected_size=self.ep_size,
+            )
+        except TimeoutError:
+            for candidate in workspaces:
+                if candidate is not None:
+                    candidate.checkpoint_fail_closed()
+            raise
         if active_ranks:
             raise RuntimeError(
                 f"Cannot checkpoint during an active MoE All-to-All phase on ranks {active_ranks}"
             )
         MnnvlMoe.checkpoint_prepare()
 
-    def checkpoint_restore(self, comm) -> None:
+    def checkpoint_restore(self, comm=None) -> None:
         """Restore TRT-native two-sided workspaces and protocol state.
 
         Args:
@@ -141,6 +152,11 @@ class NVLinkTwoSided(Communication):
                 original allocations. Every rank must call this method
                 symmetrically.
         """
+        workspace = MnnvlMoe.moe_workspace or MnnvlMoe.moe_prepare_workspace
+        if comm is None and workspace is not None:
+            comm = workspace.comm
+        if comm is None:
+            raise RuntimeError("MNNVL workspace communicator is not initialized")
         restore_required = any(
             workspace is not None and not workspace.mapped
             for workspace in (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)

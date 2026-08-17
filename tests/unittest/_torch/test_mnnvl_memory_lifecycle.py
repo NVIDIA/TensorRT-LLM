@@ -41,11 +41,27 @@ class _FakeComm:
         self.barrier_count += 1
 
     def allgather(self, value):
-        return list(self.membership)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return list(self.membership)
+        return [value] * self.size
 
 
 class _TestMnnvlMemory(mnnvl.MnnvlMemory):
     pass
+
+
+def test_checkpoint_allgather_timeout_is_bounded(monkeypatch):
+    request = SimpleNamespace(test=lambda: (False, None))
+    comm = SimpleNamespace(iallgather=lambda value: request)
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S", 0.0)
+
+    with pytest.raises(TimeoutError, match="mapping readiness"):
+        mnnvl._checkpoint_allgather(
+            comm,
+            None,
+            operation="mapping readiness",
+        )
 
 
 @pytest.fixture
@@ -92,11 +108,11 @@ def test_checkpoint_prepare_preserves_va_and_is_idempotent(memory):
     assert record.rank_stride == 256
     assert record.address_offset == 32
     assert record.mem_handles == [None, None]
-    assert record.comm.barrier_count == 2
+    assert record.comm.barrier_count == 0
     assert [call.args[0] for call in mnnvl.cuda.cuMemUnmap.call_args_list] == [1032, 1288]
 
     obj.checkpoint_prepare()
-    assert record.comm.barrier_count == 2
+    assert record.comm.barrier_count == 0
 
 
 def test_checkpoint_restore_reuses_layout_with_fresh_handles(memory, monkeypatch):
@@ -161,6 +177,87 @@ def test_checkpoint_restore_failure_is_terminal_and_fails_closed(memory, monkeyp
     assert record.state is mnnvl._MnnvlAllocationState.BROKEN
     with pytest.raises(RuntimeError, match="broken state"):
         obj.checkpoint_restore(_FakeComm())
+
+
+def test_checkpoint_restore_membership_timeout_is_terminal(memory, monkeypatch):
+    obj, record = memory
+    obj.checkpoint_prepare()
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S", 0.0)
+
+    request = SimpleNamespace(test=lambda: (False, None))
+    comm = SimpleNamespace(
+        Get_rank=lambda: 0,
+        Get_size=lambda: 2,
+        iallgather=lambda value: request,
+    )
+    with pytest.raises(TimeoutError, match="communicator membership"):
+        obj.checkpoint_restore(comm)
+
+    assert record.state is mnnvl._MnnvlAllocationState.BROKEN
+    assert record.pending_comm is None
+    with pytest.raises(RuntimeError, match="broken state"):
+        obj.checkpoint_restore(comm)
+
+
+def test_checkpoint_restore_timeout_cleans_locally_mapped_handles(memory, monkeypatch):
+    obj, record = memory
+    obj.checkpoint_prepare()
+    monkeypatch.setattr(
+        _TestMnnvlMemory,
+        "_create_and_map_handles",
+        Mock(return_value=[33, 44]),
+    )
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S", 0.0)
+
+    class Request:
+        def __init__(self, result=None):
+            self.result = result
+
+        def test(self):
+            return (self.result is not None, self.result)
+
+    class TimeoutComm(_FakeComm):
+        def __init__(self):
+            super().__init__()
+            self.requests = [Request([0, 1]), Request()]
+
+        def iallgather(self, value):
+            return self.requests.pop(0)
+
+    with pytest.raises(TimeoutError, match="mapping readiness"):
+        obj.checkpoint_restore(TimeoutComm())
+
+    assert record.state is mnnvl._MnnvlAllocationState.BROKEN
+    assert record.mem_handles == [None, None]
+    assert [call.args[0] for call in mnnvl.cuda.cuMemUnmap.call_args_list[-2:]] == [1032, 1288]
+
+
+def test_handle_exchange_timeout_does_not_start_second_collective(memory, monkeypatch):
+    obj, record = memory
+    obj.checkpoint_prepare()
+    monkeypatch.setattr(
+        _TestMnnvlMemory,
+        "_create_and_map_handles",
+        Mock(side_effect=TimeoutError("handle exchange timed out")),
+    )
+
+    class CountingComm(_FakeComm):
+        def __init__(self):
+            super().__init__()
+            self.allgather_count = 0
+
+        def allgather(self, value):
+            self.allgather_count += 1
+            return super().allgather(value)
+
+    comm = CountingComm()
+    with pytest.raises(TimeoutError, match="handle exchange timed out"):
+        obj.checkpoint_restore(comm)
+
+    assert comm.allgather_count == 1
+    assert record.state is mnnvl._MnnvlAllocationState.BROKEN
 
 
 def test_failed_frontend_restore_releases_unpublished_handles(memory, monkeypatch):
@@ -243,9 +340,37 @@ def test_mnnvl_moe_restore_publishes_all_workspaces_after_frontend_ready(monkeyp
     second.checkpoint_restore.assert_called_once_with(comm)
     initialize_workspace.assert_called_once_with(workspace_tensor, 0, 2)
     synchronize.assert_called_once_with()
-    assert comm.barrier_count == 1
+    assert comm.barrier_count == 0
     first._checkpoint_restore_complete.assert_called_once_with()
     second._checkpoint_restore_complete.assert_called_once_with()
+
+
+def test_mnnvl_moe_restore_prepare_only_skips_main_workspace_initialization(monkeypatch):
+    main_workspace = Mock()
+    main_workspace.checkpoint_restore.return_value = False
+    prepare_workspace = Mock()
+    prepare_workspace.checkpoint_restore.return_value = True
+    workspace_tensor = Mock()
+    initialize_workspace = Mock()
+    synchronize = Mock()
+    comm = _FakeComm()
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", main_workspace)
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_prepare_workspace", prepare_workspace)
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace_tensor", workspace_tensor)
+    monkeypatch.setattr(
+        mnnvl.torch.ops.trtllm,
+        "moe_initialize_workspace",
+        initialize_workspace,
+    )
+    monkeypatch.setattr(mnnvl.torch.cuda, "synchronize", synchronize)
+
+    mnnvl.MnnvlMoe.checkpoint_restore(comm)
+
+    initialize_workspace.assert_not_called()
+    synchronize.assert_called_once_with()
+    assert comm.barrier_count == 0
+    main_workspace._checkpoint_restore_complete.assert_not_called()
+    prepare_workspace._checkpoint_restore_complete.assert_called_once_with()
 
 
 def test_mnnvl_moe_restore_failure_marks_earlier_workspace_broken(monkeypatch):
@@ -283,9 +408,18 @@ def test_close_detached_memory_only_frees_va(memory, monkeypatch):
 
 def test_create_and_map_handles_cleans_partial_allocation(monkeypatch):
     comm = Mock()
+    comm.iallgather = None
     comm.Get_rank.return_value = 0
     comm.Get_size.return_value = 2
-    comm.allgather.return_value = [b"local", b"remote"]
+    comm.allgather.side_effect = lambda value: [
+        value,
+        {
+            "error": None,
+            "handle": b"remote",
+            "is_fabric": True,
+            "pid": 1001,
+        },
+    ]
     allocation_prop = SimpleNamespace(
         requestedHandleTypes=mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
         location=object(),
@@ -325,8 +459,18 @@ def test_create_and_map_handles_cleans_partial_allocation(monkeypatch):
 
 def test_create_and_map_handles_releases_local_handle_on_export_failure(monkeypatch):
     comm = Mock()
+    comm.iallgather = None
     comm.Get_rank.return_value = 0
     comm.Get_size.return_value = 2
+    comm.allgather.side_effect = lambda value: [
+        value,
+        {
+            "error": None,
+            "handle": b"remote",
+            "is_fabric": True,
+            "pid": 1001,
+        },
+    ]
     allocation_prop = SimpleNamespace(
         requestedHandleTypes=mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
         location=object(),
@@ -361,9 +505,22 @@ def test_create_and_map_handles_releases_local_handle_on_export_failure(monkeypa
 )
 def test_create_and_map_handles_preserves_pidfd_error_hint(monkeypatch, errno_value, expected_hint):
     comm = Mock()
+    comm.iallgather = None
     comm.Get_rank.return_value = 0
     comm.Get_size.return_value = 2
-    comm.allgather.side_effect = [[100, 101], [1000, 1001]]
+    comm.allgather.side_effect = lambda value: (
+        [
+            value,
+            {
+                "error": None,
+                "handle": 101,
+                "is_fabric": False,
+                "pid": 1001,
+            },
+        ]
+        if isinstance(value, dict)
+        else [value, value]
+    )
     allocation_prop = SimpleNamespace(
         requestedHandleTypes=(
             mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
@@ -391,14 +548,28 @@ def test_create_and_map_handles_preserves_pidfd_error_hint(monkeypatch, errno_va
     with pytest.raises(RuntimeError, match=expected_hint):
         _TestMnnvlMemory._create_and_map_handles(comm, 64, 1000, 256, 32)
 
+    assert comm.allgather.call_count == 2
     assert [call.args[0] for call in close_fd.call_args_list] == [10, 11, 100]
 
 
 def test_create_and_map_handles_close_failure_does_not_mask_original_error(monkeypatch):
     comm = Mock()
+    comm.iallgather = None
     comm.Get_rank.return_value = 0
     comm.Get_size.return_value = 2
-    comm.allgather.side_effect = [[100, 101], [1000, 1001]]
+    comm.allgather.side_effect = lambda value: (
+        [
+            value,
+            {
+                "error": None,
+                "handle": 101,
+                "is_fabric": False,
+                "pid": 1001,
+            },
+        ]
+        if isinstance(value, dict)
+        else [value, value]
+    )
     allocation_prop = SimpleNamespace(
         requestedHandleTypes=(
             mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
@@ -428,6 +599,7 @@ def test_create_and_map_handles_close_failure_does_not_mask_original_error(monke
     with pytest.raises(RuntimeError, match="map failed"):
         _TestMnnvlMemory._create_and_map_handles(comm, 64, 1000, 256, 32)
 
+    assert comm.allgather.call_count == 2
     assert [call.args[0] for call in close_fd.call_args_list] == [10, 11, 20, 21, 100]
 
 

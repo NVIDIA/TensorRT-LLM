@@ -3115,6 +3115,7 @@ class PyExecutor:
                 op_id = msg.get("op_id")
                 error_msg = None
                 release_control_request = True
+                has_mnnvl_resources = False
                 try:
                     # Decode tags inside the try so KeyError / ValueError from
                     # a malformed message still results in an error ACK being
@@ -3166,8 +3167,12 @@ class PyExecutor:
                             if action == _SleepWakeupAction.PREPARE:
                                 # Prepared means this rank is quiesced and
                                 # ready to commit, but VMM state is unchanged.
+                                has_mnnvl_resources = (
+                                    self._has_mnnvl_checkpoint_resources(tags))
                                 release_control_request = False
                             elif target_action == _SleepWakeupAction.SLEEP:
+                                self._run_mnnvl_checkpoint_resources(
+                                    target_action, tags)
                                 release_with_tag(*tags)
                                 torch.cuda.synchronize()
                                 gc.collect()
@@ -3175,6 +3180,8 @@ class PyExecutor:
                             elif target_action == _SleepWakeupAction.WAKEUP:
                                 materialize_with_tag(*tags)
                                 torch.cuda.synchronize()
+                                self._run_mnnvl_checkpoint_resources(
+                                    target_action, tags)
                             else:
                                 error_msg = (
                                     f"unknown target action '{target_action}'")
@@ -3186,7 +3193,7 @@ class PyExecutor:
                         logger.warning("Sleep/wakeup listener: %s, ignoring.",
                                        error_msg)
                 except (KeyError, TypeError, ValueError, RuntimeError,
-                        torch.OutOfMemoryError) as exc:
+                        TimeoutError, torch.OutOfMemoryError) as exc:
                     error_msg = (f"rank {self.dist.rank} '{action}' failed: "
                                  f"{exc}\n{traceback.format_exc()}")
                     logger.error("Sleep/wakeup listener: error executing '%s':",
@@ -3230,12 +3237,65 @@ class PyExecutor:
                             "error": error_msg,
                             "op_id": op_id,
                             "phase": action,
+                            "has_mnnvl_resources": has_mnnvl_resources,
                         },
                         dest=0,
                         tag=_SleepWakeupTag.ACK,
                     )
         finally:
             set_thread_local_mpi_comm(None)
+
+    def _mnnvl_checkpoint_resources(self, tags) -> list:
+        """Return unique native MNNVL MoE resources selected by engine tags."""
+        from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import \
+            NVLinkOneSided
+        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import \
+            NVLinkTwoSided
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        selected_engines = []
+        if ExecutorMemoryType.MODEL_ENGINE_MAIN in tags:
+            selected_engines.append(self.model_engine)
+        if ExecutorMemoryType.MODEL_ENGINE_DRAFT in tags and self.draft_model_engine is not None:
+            selected_engines.append(self.draft_model_engine)
+
+        resource_types = (MoeAlltoAll, NVLinkOneSided, NVLinkTwoSided)
+        resources = []
+        seen = set()
+        for engine in selected_engines:
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                resource = getattr(module, "comm", None)
+                if not isinstance(resource, resource_types):
+                    continue
+                lifecycle = getattr(resource, "_workspace_lifecycle", None)
+                key = (("workspace",
+                        id(lifecycle)) if lifecycle is not None else
+                       ("resource_type", type(resource)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                resources.append(resource)
+        return resources
+
+    def _has_mnnvl_checkpoint_resources(self, tags) -> bool:
+        return bool(self._mnnvl_checkpoint_resources(tags))
+
+    def _run_mnnvl_checkpoint_resources(self, action, tags) -> None:
+        """Execute process-local native MNNVL hooks while the engine is parked."""
+        resources = self._mnnvl_checkpoint_resources(tags)
+        if action == _SleepWakeupAction.SLEEP:
+            for resource in resources:
+                resource.checkpoint_prepare()
+            return
+        if action == _SleepWakeupAction.WAKEUP:
+            for resource in resources:
+                resource.checkpoint_restore()
+            return
+        raise ValueError(f"unknown MNNVL checkpoint action '{action}'")
 
     def _ring_broadcast_sample_state(
         self,

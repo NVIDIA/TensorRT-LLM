@@ -194,6 +194,11 @@ class NVLinkOneSided(Communication):
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
         """
         super().__init__(mapping)
+        if mapping.has_cp_helix():
+            raise ValueError(
+                "NVLinkOneSided does not support Helix context parallelism because "
+                "its MNNVL communicator covers only the tensor-parallel group"
+            )
 
         if self.mapping.world_size != self.ep_size:
             raise RuntimeError("Currently NVLinkOneSided only supports pure EP for MoE.")
@@ -406,7 +411,7 @@ class NVLinkOneSided(Communication):
 
         self._destroyed = True
         lifecycle = getattr(self, "_workspace_lifecycle", None)
-        if lifecycle is not None:
+        if lifecycle is not None and getattr(self, "_workspace_registered", False):
             lifecycle.unregister(self)
         workspace_key = getattr(self, "_workspace_key", None)
         if workspace_key is None or not getattr(self, "_workspace_registered", False):
@@ -437,8 +442,10 @@ class NVLinkOneSided(Communication):
     def __del__(self) -> None:
         if sys.is_finalizing():
             return
+        # Finalizers cannot safely perform collective cache eviction because
+        # their order is nondeterministic across ranks.
         lifecycle = getattr(self, "_workspace_lifecycle", None)
-        if lifecycle is not None:
+        if lifecycle is not None and getattr(self, "_workspace_registered", False):
             lifecycle.unregister(self)
         workspace_key = getattr(self, "_workspace_key", None)
         if workspace_key is not None and getattr(self, "_workspace_registered", False):
@@ -471,7 +478,7 @@ class NVLinkOneSided(Communication):
         """
         self._require_workspace_lifecycle().checkpoint_prepare()
 
-    def checkpoint_restore(self, comm) -> None:
+    def checkpoint_restore(self, comm=None) -> None:
         """Collectively restore handles and all shared frontend state.
 
         Args:
@@ -481,6 +488,10 @@ class NVLinkOneSided(Communication):
                 original allocation. Every rank must call this method
                 symmetrically.
         """
+        if comm is None:
+            comm = self.mnnvl_mem.comm
+        if comm is None:
+            raise RuntimeError("MNNVL workspace communicator is not initialized")
         self._require_workspace_lifecycle().checkpoint_restore(
             comm,
             lambda: torch.ops.trtllm.moe_a2a_initialize(

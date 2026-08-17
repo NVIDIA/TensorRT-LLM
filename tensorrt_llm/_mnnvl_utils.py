@@ -18,6 +18,7 @@ import functools
 import os
 import platform
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, List, Optional, Union
@@ -34,6 +35,30 @@ from ._dlpack_utils import pack_strided_memory
 from ._utils import get_sm_version, mpi_comm
 from .logger import logger
 from .mapping import Mapping
+
+_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S = 20.0
+_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S = 0.01
+
+
+def _checkpoint_allgather(comm, value, *, operation: str):
+    """Run a bounded object allgather when the communicator supports it."""
+    iallgather = getattr(comm, "iallgather", None)
+    if iallgather is None:
+        return comm.allgather(value)
+
+    request = iallgather(value)
+    deadline = time.monotonic() + _MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S
+    while True:
+        test_result = request.test()
+        if isinstance(test_result, tuple):
+            ready, result = test_result
+            if ready:
+                return result
+        elif test_result:
+            return request.wait()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for MNNVL checkpoint {operation} allgather")
+        time.sleep(_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S)
 
 
 def _check_cu_result(cu_func_ret):
@@ -224,59 +249,117 @@ class MnnvlMemory:
         rank_stride: int,
         address_offset: int,
     ) -> List[Any]:
-        dev_id = int(_check_cu_result(cuda.cuCtxGetDevice()))
-        assert dev_id == MnnvlMemory.dev_id, (
-            f"Different dev_id found dev_id={dev_id} but MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
-        )
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
-        local_handle = _check_cu_result(cuda.cuMemCreate(aligned_size, allocation_prop, flags=0))
+        local_handle = None
         exported_handle = None
         pidfds = []
         remote_fds = []
         mem_handles = [None] * comm.Get_size()
         mapped_rank_ptrs = []
-        is_fabric = (
-            allocation_prop.requestedHandleTypes
-            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        )
+        is_fabric = False
         try:
-            exported_handle = _check_cu_result(
-                cuda.cuMemExportToShareableHandle(
-                    local_handle, allocation_prop.requestedHandleTypes, 0
+            local_error = None
+            local_handle_data = None
+            local_pid = None
+            try:
+                dev_id = int(_check_cu_result(cuda.cuCtxGetDevice()))
+                assert dev_id == MnnvlMemory.dev_id, (
+                    f"Different dev_id found dev_id={dev_id} but "
+                    f"MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
                 )
+                allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+                is_fabric = (
+                    allocation_prop.requestedHandleTypes
+                    == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+                )
+                local_handle = _check_cu_result(
+                    cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
+                )
+                exported_handle = _check_cu_result(
+                    cuda.cuMemExportToShareableHandle(
+                        local_handle, allocation_prop.requestedHandleTypes, 0
+                    )
+                )
+                local_handle_data = exported_handle.data if is_fabric else int(exported_handle)
+                local_pid = os.getpid()
+            except Exception as error:
+                local_error = f"{type(error).__name__}: {error}"
+
+            exported_by_rank = _checkpoint_allgather(
+                comm,
+                {
+                    "error": local_error,
+                    "handle": local_handle_data,
+                    "is_fabric": is_fabric,
+                    "pid": local_pid,
+                },
+                operation="handle export",
             )
+            export_errors = [
+                f"rank {rank}: {payload['error']}"
+                for rank, payload in enumerate(exported_by_rank)
+                if payload["error"] is not None
+            ]
+            if export_errors:
+                raise RuntimeError(
+                    "MNNVL handle export failed before mapping:\n" + "\n".join(export_errors)
+                )
+            fabric_modes = {payload["is_fabric"] for payload in exported_by_rank}
+            if len(fabric_modes) != 1:
+                raise RuntimeError("MNNVL ranks selected inconsistent shareable handle types")
+            is_fabric = fabric_modes.pop()
             if is_fabric:
-                all_handles_data = comm.allgather(exported_handle.data)
+                all_handles_data = [payload["handle"] for payload in exported_by_rank]
             else:
-                all_exported_fds = comm.allgather(int(exported_handle))
-                all_pids = comm.allgather(os.getpid())
+                all_exported_fds = [payload["handle"] for payload in exported_by_rank]
+                all_pids = [payload["pid"] for payload in exported_by_rank]
                 syscall = ctypes.CDLL(None, use_errno=True).syscall
-                for pid in all_pids:
-                    pidfd = syscall(434, pid, 0)
-                    if pidfd < 0:
-                        err = ctypes.get_errno()
-                        raise RuntimeError(
-                            f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
-                        )
-                    pidfds.append(pidfd)
-                for pidfd, fd in zip(pidfds, all_exported_fds):
-                    remote_fd = syscall(438, pidfd, fd, 0)
-                    if remote_fd < 0:
-                        err = ctypes.get_errno()
-                        error_msg = (
-                            f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno "
-                            f"{err}: {os.strerror(err)}."
-                        )
-                        if err == errno.EPERM:
-                            error_msg += (
-                                " Permission denied. If running in a container, try adding "
-                                "--cap-add=SYS_PTRACE to your docker run command."
+                fd_import_error = None
+                try:
+                    for pid in all_pids:
+                        pidfd = syscall(434, pid, 0)
+                        if pidfd < 0:
+                            err = ctypes.get_errno()
+                            raise RuntimeError(
+                                f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
                             )
-                        elif err == errno.ENOSYS:
-                            error_msg += " This may be due to kernel version (requires Linux 5.6+)."
-                        raise RuntimeError(error_msg)
-                    remote_fds.append(remote_fd)
-                comm.barrier()
+                        pidfds.append(pidfd)
+                    for pidfd, fd in zip(pidfds, all_exported_fds):
+                        remote_fd = syscall(438, pidfd, fd, 0)
+                        if remote_fd < 0:
+                            err = ctypes.get_errno()
+                            error_msg = (
+                                f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno "
+                                f"{err}: {os.strerror(err)}."
+                            )
+                            if err == errno.EPERM:
+                                error_msg += (
+                                    " Permission denied. If running in a container, try adding "
+                                    "--cap-add=SYS_PTRACE to your docker run command."
+                                )
+                            elif err == errno.ENOSYS:
+                                error_msg += (
+                                    " This may be due to kernel version (requires Linux 5.6+)."
+                                )
+                            raise RuntimeError(error_msg)
+                        remote_fds.append(remote_fd)
+                except Exception as error:
+                    fd_import_error = f"{type(error).__name__}: {error}"
+
+                fd_import_errors = _checkpoint_allgather(
+                    comm,
+                    fd_import_error,
+                    operation="POSIX file descriptor import readiness",
+                )
+                failed_ranks = [
+                    f"rank {rank}: {error}"
+                    for rank, error in enumerate(fd_import_errors)
+                    if error is not None
+                ]
+                if failed_ranks:
+                    raise RuntimeError(
+                        "MNNVL POSIX file descriptor import failed on one or more ranks:\n"
+                        + "\n".join(failed_ranks)
+                    )
                 all_handles_data = remote_fds
 
             access_desc = cuda.CUmemAccessDesc()
@@ -303,33 +386,33 @@ class MnnvlMemory:
                 try:
                     _check_cu_result(cuda.cuMemUnmap(rank_ptr, aligned_size))
                 except RuntimeError as error:
-                    logger.warning("Failed to unmap incomplete MNNVL allocation: %s", error)
+                    logger.warning(f"Failed to unmap incomplete MNNVL allocation: {error}")
 
             handles_to_release = [handle for handle in mem_handles if handle is not None]
-            if mem_handles[comm.Get_rank()] is None:
+            if local_handle is not None and mem_handles[comm.Get_rank()] is None:
                 handles_to_release.append(local_handle)
             for handle in handles_to_release:
                 try:
                     _check_cu_result(cuda.cuMemRelease(handle))
                 except RuntimeError as error:
-                    logger.warning("Failed to release incomplete MNNVL allocation: %s", error)
+                    logger.warning(f"Failed to release incomplete MNNVL allocation: {error}")
             raise
         finally:
             for pidfd in pidfds:
                 try:
                     os.close(pidfd)
                 except OSError as error:
-                    logger.warning("Failed to close MNNVL pidfd: %s", error)
+                    logger.warning(f"Failed to close MNNVL pidfd: {error}")
             for remote_fd in remote_fds:
                 try:
                     os.close(remote_fd)
                 except OSError as error:
-                    logger.warning("Failed to close imported MNNVL file descriptor: %s", error)
+                    logger.warning(f"Failed to close imported MNNVL file descriptor: {error}")
             if not is_fabric and exported_handle is not None:
                 try:
                     os.close(int(exported_handle))
                 except OSError as error:
-                    logger.warning("Failed to close exported MNNVL file descriptor: %s", error)
+                    logger.warning(f"Failed to close exported MNNVL file descriptor: {error}")
 
     @classmethod
     def open_mnnvl_memory(cls, mapping: Mapping, size: int):
@@ -385,7 +468,7 @@ class MnnvlMemory:
                         cuda.cuMemAddressFree(device_ptr, comm_size * cls.current_rank_stride)
                     )
                 except RuntimeError as error:
-                    logger.warning("cuMemAddressFree failed during error cleanup: %s", error)
+                    logger.warning(f"cuMemAddressFree failed during error cleanup: {error}")
                 else:
                     (
                         cls.current_start_address,
@@ -421,8 +504,7 @@ class MnnvlMemory:
             _MnnvlAllocationState.UNMAPPED,
         ):
             logger.warning(
-                "Skipping cleanup of MNNVL allocation in terminal state %s",
-                record.state.value,
+                f"Skipping cleanup of MNNVL allocation in terminal state {record.state.value}"
             )
             return
         cls.allocated_map.pop(ptr)
@@ -443,13 +525,32 @@ class MnnvlMemory:
 
     @classmethod
     def _unmap_and_release_handles(cls, record: _MnnvlAllocationRecord) -> None:
+        first_error = None
         for rank in range(record.comm_size):
             rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
-            _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
-            _check_cu_result(cuda.cuMemRelease(record.mem_handles[rank]))
+            try:
+                _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
+            except RuntimeError as error:
+                if first_error is None:
+                    first_error = error
+                continue
+            try:
+                _check_cu_result(cuda.cuMemRelease(record.mem_handles[rank]))
+            except RuntimeError as error:
+                if first_error is None:
+                    first_error = error
+            else:
+                record.mem_handles[rank] = None
+        if first_error is not None:
+            raise first_error
 
     def checkpoint_prepare(self) -> None:
-        """Collectively detach backing handles while retaining graph-visible VA."""
+        """Detach local backing handles while retaining graph-visible VA.
+
+        The engine checkpoint coordinator is responsible for quiescing and
+        invoking this operation on every rank. No collective follows the CUDA
+        mutation, so a local failure cannot strand peers in a trailing barrier.
+        """
         cls = type(self)
         record = cls.allocated_map[self.ptr]
         if record.state is _MnnvlAllocationState.UNMAPPED:
@@ -459,14 +560,23 @@ class MnnvlMemory:
         record.state = _MnnvlAllocationState.PREPARING
         try:
             torch.cuda.synchronize()
-            record.comm.barrier()
             cls._unmap_and_release_handles(record)
             record.mem_handles = [None] * record.comm_size
-            record.comm.barrier()
         except Exception:
             record.state = _MnnvlAllocationState.BROKEN
             raise
         record.state = _MnnvlAllocationState.UNMAPPED
+
+    def checkpoint_fail_closed(self) -> None:
+        """Make a timed-out checkpoint allocation terminal.
+
+        A timed-out nonblocking MPI collective may still be outstanding.  The
+        allocation must not be reused by a later checkpoint attempt because a
+        new collective could then be matched against the abandoned request.
+        """
+        record = type(self).allocated_map[self.ptr]
+        record.state = _MnnvlAllocationState.BROKEN
+        record.pending_comm = None
 
     def checkpoint_restore(self, comm) -> bool:
         """Remap fresh handles while keeping data-path access disabled."""
@@ -485,7 +595,18 @@ class MnnvlMemory:
                 f"rank/size {comm_rank}/{comm_size} != "
                 f"{record.comm_rank}/{record.comm_size}"
             )
-        comm_membership = tuple(int(rank) for rank in comm.allgather(self.mapping.rank))
+        try:
+            comm_membership = tuple(
+                int(rank)
+                for rank in _checkpoint_allgather(
+                    comm,
+                    self.mapping.rank,
+                    operation="communicator membership",
+                )
+            )
+        except Exception:
+            self.checkpoint_fail_closed()
+            raise
         if comm_membership != record.comm_membership:
             raise RuntimeError(
                 "Cannot restore MNNVL memory with a communicator whose ordered "
@@ -493,6 +614,7 @@ class MnnvlMemory:
                 f"{comm_membership} != {record.comm_membership}"
             )
         record.state = _MnnvlAllocationState.RESTORING
+        local_error = None
         try:
             torch.cuda.synchronize()
             record.mem_handles = cls._create_and_map_handles(
@@ -502,9 +624,31 @@ class MnnvlMemory:
                 record.rank_stride,
                 record.address_offset,
             )
-        except Exception:
+        except TimeoutError:
             record.state = _MnnvlAllocationState.BROKEN
             raise
+        except Exception as error:
+            local_error = f"{type(error).__name__}: {error}"
+
+        try:
+            restore_errors = _checkpoint_allgather(
+                comm,
+                local_error,
+                operation="mapping readiness",
+            )
+        except Exception:
+            self._checkpoint_restore_failed()
+            raise
+        failed_ranks = [
+            f"rank {rank}: {error}"
+            for rank, error in enumerate(restore_errors)
+            if error is not None
+        ]
+        if failed_ranks:
+            self._checkpoint_restore_failed()
+            raise RuntimeError(
+                "MNNVL checkpoint restore failed on one or more ranks:\n" + "\n".join(failed_ranks)
+            )
         record.pending_comm = comm
         return True
 
@@ -525,24 +669,21 @@ class MnnvlMemory:
         record = type(self).allocated_map[self.ptr]
         if record.state is _MnnvlAllocationState.RESTORING:
             for rank, handle in enumerate(record.mem_handles):
+                if handle is None:
+                    continue
                 rank_ptr = record.start_address + rank * record.rank_stride + record.address_offset
                 try:
                     _check_cu_result(cuda.cuMemUnmap(rank_ptr, record.aligned_size))
                 except RuntimeError as error:
                     logger.warning(
-                        "Failed to unmap unpublished MNNVL restore for rank %d: %s",
-                        rank,
-                        error,
+                        f"Failed to unmap unpublished MNNVL restore for rank {rank}: {error}"
                     )
-                if handle is None:
-                    continue
                 try:
                     _check_cu_result(cuda.cuMemRelease(handle))
                 except RuntimeError as error:
                     logger.warning(
-                        "Failed to release unpublished MNNVL restore handle for rank %d: %s",
-                        rank,
-                        error,
+                        "Failed to release unpublished MNNVL restore handle "
+                        f"for rank {rank}: {error}"
                     )
                 else:
                     record.mem_handles[rank] = None
@@ -756,15 +897,36 @@ class MnnvlMoe:
                     restored_workspaces.append(workspace)
             if not restored_workspaces:
                 return
-            if MnnvlMoe.moe_workspace_tensor is not None:
-                assert MnnvlMoe.moe_mapping is not None
-                torch.ops.trtllm.moe_initialize_workspace(
-                    MnnvlMoe.moe_workspace_tensor,
-                    MnnvlMoe.moe_mapping.moe_ep_rank,
-                    MnnvlMoe.moe_mapping.moe_ep_size,
+            restored_main_workspace = any(
+                workspace is MnnvlMoe.moe_workspace for workspace in restored_workspaces
+            )
+            local_error = None
+            try:
+                if restored_main_workspace and MnnvlMoe.moe_workspace_tensor is not None:
+                    assert MnnvlMoe.moe_mapping is not None
+                    torch.ops.trtllm.moe_initialize_workspace(
+                        MnnvlMoe.moe_workspace_tensor,
+                        MnnvlMoe.moe_mapping.moe_ep_rank,
+                        MnnvlMoe.moe_mapping.moe_ep_size,
+                    )
+                torch.cuda.synchronize()
+            except Exception as error:
+                local_error = f"{type(error).__name__}: {error}"
+            readiness_errors = _checkpoint_allgather(
+                comm,
+                local_error,
+                operation="two-sided frontend readiness",
+            )
+            failed_ranks = [
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(readiness_errors)
+                if error is not None
+            ]
+            if failed_ranks:
+                raise RuntimeError(
+                    "Native two-sided MoE restore failed on one or more ranks:\n"
+                    + "\n".join(failed_ranks)
                 )
-            torch.cuda.synchronize()
-            comm.barrier()
         except Exception:
             for workspace in restored_workspaces:
                 workspace._checkpoint_restore_failed()

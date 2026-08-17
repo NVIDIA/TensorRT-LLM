@@ -426,6 +426,109 @@ class TestMultiRankAckErrorPropagation:
         assert "rank 2 OOM" in msg
 
 
+class TestMnnvlSleepWakeupCoordination:
+    """Native MNNVL hooks enter COMMIT collectively and remain tag-scoped."""
+
+    def test_pyexecutor_discovers_shared_native_resource_once(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import (
+            NVLinkOneSided,
+        )
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        lifecycle = object()
+        resources = []
+        modules = []
+        for _ in range(2):
+            resource = NVLinkOneSided.__new__(NVLinkOneSided)
+            resource._workspace_lifecycle = lifecycle
+            resource._workspace_registered = False
+            resource.checkpoint_prepare = Mock()
+            resource.checkpoint_restore = Mock()
+            resources.append(resource)
+            modules.append(SimpleNamespace(comm=resource))
+
+        executor = object.__new__(PyExecutor)
+        executor.model_engine = SimpleNamespace(model=SimpleNamespace(modules=lambda: modules))
+        executor.draft_model_engine = None
+
+        tags = [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+        assert executor._mnnvl_checkpoint_resources(tags) == [resources[0]]
+        executor._run_mnnvl_checkpoint_resources(_SleepWakeupAction.SLEEP, tags)
+        resources[0].checkpoint_prepare.assert_called_once_with()
+        resources[1].checkpoint_prepare.assert_not_called()
+        assert not executor._has_mnnvl_checkpoint_resources([ExecutorMemoryType.KV_CACHE])
+
+    def test_mnnvl_commit_reaches_peer_before_rank_zero_hook(self):
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, _ = _make_proto_worker(
+            [
+                {"status": "ok", "has_mnnvl_resources": True},
+                {"status": "ok"},
+            ],
+            world_size=2,
+        )
+        events = []
+        original_send = worker.engine._sleep_wakeup_comm.send
+
+        def record_send(payload, *args, **kwargs):
+            events.append(("send", payload["action"]))
+            return original_send(payload, *args, **kwargs)
+
+        worker.engine._sleep_wakeup_comm.send = record_send
+        # Model partitions can differ: rank 0 may own no MoE layer while a
+        # peer does. The PREPARE ACK must still select peer-first COMMIT.
+        worker.engine._has_mnnvl_checkpoint_resources = lambda tags: False
+        worker.engine._run_mnnvl_checkpoint_resources = lambda action, tags: events.append(
+            ("local_mnnvl", action)
+        )
+
+        with (
+            patch(
+                "tensorrt_llm._torch.virtual_memory.release_with_tag",
+                side_effect=lambda *tags: events.append(("local_vmm", "sleep")),
+            ),
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.MODEL_ENGINE_MAIN])
+
+        commit_index = events.index(("send", _SleepWakeupAction.COMMIT))
+        hook_index = events.index(("local_mnnvl", _SleepWakeupAction.SLEEP))
+        vmm_index = events.index(("local_vmm", "sleep"))
+        assert commit_index < hook_index < vmm_index
+
+    def test_kv_only_sleep_does_not_run_mnnvl_hook(self):
+        from unittest.mock import Mock, patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, _ = _make_proto_worker([{"status": "ok"}, {"status": "ok"}], world_size=2)
+        run_mnnvl = Mock()
+        worker.engine._has_mnnvl_checkpoint_resources = lambda tags: False
+        worker.engine._run_mnnvl_checkpoint_resources = run_mnnvl
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag"),
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+        run_mnnvl.assert_not_called()
+
+
 class TestMultiRankSendFailureRecovery:
     """Partial rank-0 broadcast failures must not leave peer ACKs undrained."""
 
@@ -667,6 +770,75 @@ class TestMultiRankSendFailureRecovery:
             (1, _SleepWakeupTag.ACK),
         ]
 
+    def test_mnnvl_partial_commit_still_runs_rank_zero_bounded_phase(self):
+        """Once a peer sees MNNVL COMMIT, rank 0 must enter the local phase."""
+        import threading
+        from contextlib import contextmanager
+        from unittest.mock import Mock, patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
+        from tensorrt_llm.executor.base_worker import BaseWorker
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        class FakeComm:
+            def __init__(self):
+                self.op_id = None
+                self.ack_phases = {1: [], 2: []}
+
+            def send(self, payload, dest, tag):
+                self.op_id = payload.get("op_id", self.op_id)
+                if payload["action"] == _SleepWakeupAction.COMMIT and dest == 2:
+                    raise RuntimeError("injected MNNVL commit send failure")
+                self.ack_phases[dest].append(payload["action"])
+
+            def iprobe(self, source, tag):
+                return True
+
+            def recv(self, source, tag):
+                return {
+                    "status": "ok",
+                    "op_id": self.op_id,
+                    "phase": self.ack_phases[source].pop(0),
+                    "has_mnnvl_resources": True,
+                }
+
+        @contextmanager
+        def control_action(**kwargs):
+            yield None
+
+        worker = object.__new__(BaseWorker)
+        worker._backend = "pytorch"
+        worker.rank = 0
+        worker.llm_args = SimpleNamespace(
+            backend="pytorch",
+            parallel_config=SimpleNamespace(world_size=3),
+            sleep_config=object(),
+        )
+        run_mnnvl = Mock()
+        worker.engine = SimpleNamespace(
+            _sleep_wakeup_lock=threading.Lock(),
+            _sleep_wakeup_comm=FakeComm(),
+            control_action=control_action,
+            _has_mnnvl_checkpoint_resources=lambda tags: True,
+            _run_mnnvl_checkpoint_resources=run_mnnvl,
+        )
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            with pytest.raises(RuntimeError, match="commit send failure"):
+                worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.MODEL_ENGINE_MAIN])
+
+        run_mnnvl.assert_called_once_with(
+            _SleepWakeupAction.SLEEP,
+            [ExecutorMemoryType.MODEL_ENGINE_MAIN],
+        )
+        release.assert_called_once_with(ExecutorMemoryType.MODEL_ENGINE_MAIN)
+
 
 class TestListenerUncaughtExceptionSendsErrorAck:
     """An exception that bypasses the narrow except clause must still produce an error ACK.
@@ -803,6 +975,7 @@ class TestListenerAbortAndShutdown:
                 "error": None,
                 "op_id": op_id,
                 "phase": _SleepWakeupAction.PREPARE,
+                "has_mnnvl_resources": False,
             }
         ]
 

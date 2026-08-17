@@ -270,13 +270,15 @@ class MoeAlltoAll:
                 ep_size=self.ep_size,
                 health=self.ep_group_health,
             ))
+        self._destroyed = False
+        self._workspace_registered = False
         self._workspace_lifecycle.register(
             self,
             watchdog_timeout_s=alltoall_watchdog_timeout_s,
             watchdog_poll_interval_s=alltoall_watchdog_poll_interval_s,
             watchdog_on_timeout=alltoall_watchdog_on_timeout,
         )
-        self._destroyed = False
+        self._workspace_registered = True
 
     @property
     def metainfo(self) -> torch.Tensor:
@@ -296,8 +298,10 @@ class MoeAlltoAll:
             return
         self._destroyed = True
         lifecycle = getattr(self, "_workspace_lifecycle", None)
-        if lifecycle is not None:
+        if lifecycle is not None and getattr(self, "_workspace_registered",
+                                             False):
             lifecycle.unregister(self)
+            self._workspace_registered = False
 
     def __del__(self) -> None:
         if not sys.is_finalizing():
@@ -316,7 +320,7 @@ class MoeAlltoAll:
         """
         self._workspace_lifecycle.checkpoint_prepare()
 
-    def checkpoint_restore(self, comm) -> None:
+    def checkpoint_restore(self, comm=None) -> None:
         """Collectively restore handles and all shared frontend state.
 
         Args:
@@ -326,6 +330,11 @@ class MoeAlltoAll:
                 original allocation. Every rank must call this method
                 symmetrically.
         """
+        if comm is None:
+            comm = self.mnnvl_mem.comm
+        if comm is None:
+            raise RuntimeError(
+                "MNNVL workspace communicator is not initialized")
         self._workspace_lifecycle.checkpoint_restore(
             comm,
             lambda: torch.ops.trtllm.moe_a2a_initialize(

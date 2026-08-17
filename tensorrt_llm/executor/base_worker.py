@@ -662,11 +662,12 @@ class BaseWorker(GenerationExecutor):
         2. Send PREPARE to every non-rank-0 rank via the dedicated
            ``_sleep_wakeup_comm`` communicator.  Peers quiesce and ACK without
            changing VMM state.
-        3. Execute the VMM operation (``release_with_tag`` or
-           ``materialize_with_tag``) locally on rank-0.
-        4. Send COMMIT to prepared peers and collect ACKs after their local VMM
-           operations.  If PREPARE or rank-0 local execution fails, send ABORT
-           so peers leave the control barrier without changing VMM state.
+        3. When native MNNVL MoE resources are selected, send COMMIT to every
+           prepared peer before rank-0 enters the subgroup checkpoint
+           collectives. Otherwise execute the local VMM operation first.
+        4. Execute the selected VMM and MNNVL operations and collect bounded
+           COMMIT ACKs. If PREPARE or pre-commit local execution fails, send
+           ABORT so peers leave the control barrier without changing VMM state.
         5. Exit ``control_action()``, resuming rank-0's event loop.
 
         Args:
@@ -698,6 +699,9 @@ class BaseWorker(GenerationExecutor):
         tag_strings = [t.value for t in tags]
         op_id = uuid.uuid4().hex
         target_action = _SleepWakeupAction(action)
+        has_mnnvl_resources = getattr(self.engine,
+                                      "_has_mnnvl_checkpoint_resources",
+                                      lambda _tags: False)(tags)
         prepare_msg = {
             "action": _SleepWakeupAction.PREPARE,
             "target_action": target_action,
@@ -722,6 +726,8 @@ class BaseWorker(GenerationExecutor):
             errors = []
             local_error = None
             abort_sent = False
+            commit_ranks = []
+            commit_sent_early = False
 
             def send_abort(reason: str,
                            ranks: Optional[list[int]] = None) -> list[int]:
@@ -754,7 +760,9 @@ class BaseWorker(GenerationExecutor):
                         )
                 return abort_ranks
 
-            def drain_acks(ranks: list[int], phase: _SleepWakeupAction) -> None:
+            def drain_acks(ranks: list[int],
+                           phase: _SleepWakeupAction) -> list[dict]:
+                received_acks = []
                 ack_deadline = time.monotonic() + _SLEEP_WAKEUP_ACK_TIMEOUT_S
                 for src in ranks:
                     try:
@@ -775,10 +783,40 @@ class BaseWorker(GenerationExecutor):
                             exc_info=True,
                         )
                         continue
+                    received_acks.append(ack)
                     if ack.get("status") != "ok":
                         errors.append(
                             ack.get("error")
                             or f"rank {src} returned unknown {phase} ACK")
+                return received_acks
+
+            def send_commits() -> list[int]:
+                sent_ranks = []
+                failed_ranks = []
+                for dest in prepared_ranks:
+                    try:
+                        sleep_wakeup_comm.send(
+                            commit_msg,
+                            dest=dest,
+                            tag=_SleepWakeupTag.ACTION,
+                        )
+                        sent_ranks.append(dest)
+                    except Exception as exc:
+                        commit_error = (
+                            f"rank 0 failed to send '{action}' commit to "
+                            f"rank {dest}: {exc}")
+                        errors.append(commit_error)
+                        failed_ranks.append(dest)
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: %s",
+                            commit_error,
+                            exc_info=True,
+                        )
+                if failed_ranks:
+                    abort_ranks = send_abort("\n".join(errors),
+                                             ranks=failed_ranks)
+                    drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                return sent_ranks
 
             try:
                 # Phase 1: prepare peers.  A prepared peer has reached the
@@ -808,15 +846,27 @@ class BaseWorker(GenerationExecutor):
                         break
 
                 if not errors:
-                    drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+                    prepare_acks = drain_acks(prepared_ranks,
+                                              _SleepWakeupAction.PREPARE)
+                    has_mnnvl_resources = has_mnnvl_resources or any(
+                        ack.get("has_mnnvl_resources", False)
+                        for ack in prepare_acks)
 
                 if not errors:
-                    # Execute locally on rank-0.  Only CUDA/VMM errors are
-                    # captured as local_error. Peers are still prepared but
-                    # uncommitted, so local failure can abort them without
-                    # changing their VMM state.
+                    # MNNVL resource hooks contain subgroup handle exchange,
+                    # so peers must enter COMMIT before rank 0 executes them.
+                    if has_mnnvl_resources:
+                        commit_ranks = send_commits()
+                        commit_sent_early = True
+
+                if not errors or commit_sent_early:
                     torch.cuda.synchronize()
                     if action == _SleepWakeupAction.SLEEP:
+                        run_mnnvl = (getattr(
+                            self.engine, "_run_mnnvl_checkpoint_resources",
+                            None) if has_mnnvl_resources else None)
+                        if run_mnnvl is not None:
+                            run_mnnvl(target_action, tags)
                         release_with_tag(*tags)
                         torch.cuda.synchronize()
                         gc.collect()
@@ -824,7 +874,12 @@ class BaseWorker(GenerationExecutor):
                     else:
                         materialize_with_tag(*tags)
                         torch.cuda.synchronize()
-            except (RuntimeError, torch.OutOfMemoryError) as exc:
+                        run_mnnvl = (getattr(
+                            self.engine, "_run_mnnvl_checkpoint_resources",
+                            None) if has_mnnvl_resources else None)
+                        if run_mnnvl is not None:
+                            run_mnnvl(target_action, tags)
+            except (RuntimeError, TimeoutError, torch.OutOfMemoryError) as exc:
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
                 logger.error(
@@ -836,35 +891,15 @@ class BaseWorker(GenerationExecutor):
                 if local_error:
                     errors.append(local_error)
 
-                if errors and prepared_ranks and not abort_sent:
+                if commit_sent_early:
+                    drain_acks(commit_ranks, _SleepWakeupAction.COMMIT)
+
+                if (errors and prepared_ranks and not abort_sent
+                        and not commit_sent_early):
                     abort_ranks = send_abort("\n".join(errors))
                     drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
-                elif not errors:
-                    commit_ranks = []
-                    commit_failed_ranks = []
-                    for dest in prepared_ranks:
-                        try:
-                            sleep_wakeup_comm.send(
-                                commit_msg,
-                                dest=dest,
-                                tag=_SleepWakeupTag.ACTION,
-                            )
-                            commit_ranks.append(dest)
-                        except Exception as exc:
-                            commit_error = (
-                                f"rank 0 failed to send '{action}' commit to "
-                                f"rank {dest}: {exc}")
-                            errors.append(commit_error)
-                            commit_failed_ranks.append(dest)
-                            logger.error(
-                                "_multi_rank_sleep_wakeup: %s",
-                                commit_error,
-                                exc_info=True,
-                            )
-                    if commit_failed_ranks:
-                        abort_ranks = send_abort("\n".join(errors),
-                                                 ranks=commit_failed_ranks)
-                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                elif not errors and not commit_sent_early:
+                    commit_ranks = send_commits()
                     drain_acks(commit_ranks, _SleepWakeupAction.COMMIT)
 
                 if errors:

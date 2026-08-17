@@ -168,6 +168,20 @@ def test_checkpoint_prepare_rejects_communicator_size_mismatch() -> None:
     memory.checkpoint_prepare.assert_not_called()
 
 
+def test_checkpoint_prepare_timeout_fails_closed(monkeypatch) -> None:
+    lifecycle, memory, _ = _make_lifecycle()
+    request = SimpleNamespace(test=lambda: (False, None))
+    memory.comm = SimpleNamespace(iallgather=lambda value: request)
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S", 0.0)
+
+    with pytest.raises(TimeoutError, match="workspace idle readiness"):
+        lifecycle.checkpoint_prepare()
+
+    memory.checkpoint_fail_closed.assert_called_once_with()
+    memory.checkpoint_prepare.assert_not_called()
+
+
 def test_checkpoint_prepare_rejects_remote_active_client_before_watchdog_stop() -> None:
     lifecycle, memory, _ = _make_lifecycle()
     memory.comm = _FakeComm(clients_idle_by_rank=[True, False])
@@ -536,6 +550,35 @@ def test_two_sided_checkpoint_prepare_rejects_uninitialized_communicator(
     checkpoint_prepare.assert_not_called()
 
 
+def test_two_sided_checkpoint_prepare_timeout_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instances = WeakSet()
+    monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
+    request = SimpleNamespace(test=lambda: (False, None))
+    comm = SimpleNamespace(iallgather=lambda value: request)
+    main_workspace = Mock(mapped=True, comm=comm)
+    prepare_workspace = Mock(mapped=True)
+    monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", main_workspace)
+    monkeypatch.setattr(
+        mnnvl.MnnvlMoe,
+        "moe_prepare_workspace",
+        prepare_workspace,
+    )
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S", 0.0)
+    owner = NVLinkTwoSided.__new__(NVLinkTwoSided)
+    owner.ep_size = 2
+    owner._dispatch_state = {}
+    instances.add(owner)
+
+    with pytest.raises(TimeoutError, match="workspace idle readiness"):
+        owner.checkpoint_prepare()
+
+    main_workspace.checkpoint_fail_closed.assert_called_once_with()
+    prepare_workspace.checkpoint_fail_closed.assert_called_once_with()
+
+
 def test_two_sided_checkpoint_restore_resets_all_shared_owners(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -620,6 +663,7 @@ def test_frontend_destroy_unregisters_from_shared_lifecycle(
 ) -> None:
     wrapper = wrapper_type.__new__(wrapper_type)
     wrapper._destroyed = False
+    wrapper._workspace_registered = True
     lifecycle = Mock()
     wrapper._workspace_lifecycle = lifecycle
     if wrapper_type is NVLinkOneSided:
@@ -629,6 +673,53 @@ def test_frontend_destroy_unregisters_from_shared_lifecycle(
     wrapper.destroy()
 
     lifecycle.unregister.assert_called_once_with(wrapper)
+
+
+def test_moe_alltoall_aborted_registration_does_not_unregister(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycle = Mock()
+    lifecycle.register.side_effect = RuntimeError("registration failed")
+    monkeypatch.setattr(MoeAlltoAll, "_WORKSPACE", None)
+    monkeypatch.setattr(MoeAlltoAll, "_init_constants", Mock())
+    monkeypatch.setattr(
+        MoeAlltoAll,
+        "_METAINFO_INDEX",
+        {
+            "FLAG_VAL_OFFSET_INDEX": 0,
+            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 0,
+            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 0,
+        },
+    )
+    monkeypatch.setattr(mnnvl.MnnvlMemory, "initialize", Mock())
+    memory = Mock()
+    memory.as_torch_strided_tensor.return_value = torch.zeros(1, dtype=torch.uint8)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.distributed.moe_alltoall.MnnvlMemory",
+        Mock(return_value=memory),
+    )
+    monkeypatch.setattr(
+        _MnnvlAlltoAllWorkspaceLifecycle,
+        "get_or_create",
+        Mock(return_value=lifecycle),
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "moe_a2a_initialize",
+        Mock(return_value=torch.tensor([1])),
+    )
+    mapping = SimpleNamespace(moe_ep_size=2, moe_ep_rank=0)
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=1,
+            top_k=1,
+            num_slots=2,
+            workspace_size_per_rank=1,
+        )
+
+    lifecycle.unregister.assert_not_called()
 
 
 def test_one_sided_checkpoint_rejects_destroyed_workspace(
@@ -661,6 +752,7 @@ def test_one_sided_finalizer_unregisters_from_shared_lifecycle() -> None:
     wrapper._destroyed = False
     wrapper._workspace_lifecycle = lifecycle
     wrapper._workspace_key = None
+    wrapper._workspace_registered = True
 
     del wrapper
     gc.collect()
@@ -748,7 +840,12 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
         "moe_a2a_initialize",
         Mock(return_value=torch.tensor([1])),
     )
-    mapping = SimpleNamespace(world_size=2, moe_ep_size=2, moe_ep_rank=0)
+    mapping = SimpleNamespace(
+        world_size=2,
+        moe_ep_size=2,
+        moe_ep_rank=0,
+        has_cp_helix=Mock(return_value=False),
+    )
 
     with pytest.raises(RuntimeError, match="registration failed"):
         NVLinkOneSided(
@@ -761,3 +858,4 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     assert NVLinkOneSided._WORKSPACES == {}
     assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {}
     assert NVLinkOneSided._WORKSPACE is None
+    lifecycle.unregister.assert_not_called()
