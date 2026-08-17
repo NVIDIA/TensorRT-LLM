@@ -29,7 +29,12 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    LlmResponse,
+    SamplingConfig,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     DisaggTransferAdmissionController,
@@ -1866,6 +1871,44 @@ def test_pad_dummy_added_when_only_to_complete_requests_disagg():
     assert len(stub.active_requests) == 2
 
 
+def test_pad_dummy_tolerates_active_request_overshoot():
+    # A transient overshoot (len(active_requests) > expected_num_active_requests,
+    # when disagg transfer-error requests linger a tick before cleanup) used to
+    # trip a hard assert that crashed the gen loop on every ADP rank. It must now
+    # warn and continue instead of raising.
+    stub = _StubADPExecutor()
+    stub.active_requests = [
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS),
+        _make_adp_request(_STATE_GENERATION_IN_PROGRESS),
+    ]
+    stub.expected_num_active_requests = 1  # < len(active_requests) == 2
+
+    # Must not raise AssertionError (the pre-fix behavior on overshoot).
+    _run_pad(stub)
+
+    # Both requests are schedulable, so no dummy is added; pin it so the test
+    # cannot pass on an early return or a stray pad.
+    assert stub.add_dummy_calls == []
+    assert len(stub.active_requests) == 2
+
+
+def test_pad_dummy_added_when_overshoot_has_no_schedulable_requests():
+    # The branch that matters: overshoot AND nothing schedulable (all at
+    # GENERATION_TO_COMPLETE) must still pad, or can_queue goes False
+    # fleet-wide.
+    stub = _StubADPExecutor()
+    stub.active_requests = [
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=1),
+        _make_adp_request(_STATE_GENERATION_TO_COMPLETE, request_id=2),
+    ]
+    stub.expected_num_active_requests = 1  # < len(active_requests) == 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 3
+
+
 def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
     # Gen-first mode on the context server: DISAGG_CONTEXT_WAIT_SCHEDULER
     # sits BELOW the scheduler's window [CONTEXT_INIT, GENERATION_TO_COMPLETE)
@@ -2620,6 +2663,204 @@ class TestCheckCacheTransferErrorsAdpNoop:
         stub = _make_disagg_err_stub(world_size=1, active_requests=[err])
         stub._check_cache_transfer_errors("gen")
         assert len(stub.handle_errors_calls) == 1
+
+
+class TestPendingTransferResponseFlush:
+    def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
+        """A lone fatal rank must fail locally rather than desynchronize TP."""
+        executor = object.__new__(PyExecutor)
+        executor._error_budget = Mock()
+        executor._error_budget.consume.return_value = True
+        executor._error_budget.budget = 0.0
+        executor._fatal_error = None
+        executor.is_shutdown = False
+        executor.enable_attention_dp = True
+        executor.dist = Mock(world_size=2)
+        executor.waiting_queue = []
+        executor.executor_request_queue = Mock()
+        executor.executor_request_queue.get_request_queue.return_value.empty.return_value = True
+        executor.gather_all_responses = False
+        executor.active_requests = []
+        executor._pending_transfer_responses = []
+        executor._enqueue_responses = Mock()
+        executor._terminate_request = Mock()
+
+        with pytest.raises(RuntimeError, match="Fatal error: local failure"):
+            PyExecutor._handle_errors(executor, "local failure")
+
+        executor._enqueue_responses.assert_not_called()
+        executor.executor_request_queue.enqueue_shutdown_request.assert_called_once_with()
+
+    def test_adp_flush_participates_with_an_empty_response_list(self):
+        """Ranks without an error still join the synchronized response gather."""
+        executor = object.__new__(PyExecutor)
+        executor._pending_transfer_responses = []
+        executor._pending_response_terminations = []
+        executor.enable_attention_dp = True
+        executor._enqueue_responses = Mock()
+
+        PyExecutor._flush_pending_transfer_responses(executor)
+
+        executor._enqueue_responses.assert_called_once_with([])
+
+    def test_flush_delivers_and_clears_buffered_responses(self):
+        executor = object.__new__(PyExecutor)
+        responses = [(7, Mock())]
+        executor._pending_transfer_responses = responses
+        executor._pending_response_terminations = []
+        executor.enable_attention_dp = False
+        executor._enqueue_responses = Mock()
+
+        PyExecutor._flush_pending_transfer_responses(executor)
+
+        executor._enqueue_responses.assert_called_once_with(responses)
+        assert executor._pending_transfer_responses == []
+
+    def test_rank_zero_keeps_result_queue_until_buffered_error_flushes(self):
+        """A queued client receives a rank-0 ADP error before cleanup."""
+        executor = object.__new__(PyExecutor)
+        request_id = 7
+        response = LlmResponse(request_id=request_id)
+        response.request_id = request_id
+        response.client_id = 42
+        response.error_msg = "transfer failed"
+        result_queue = Mock()
+        executor._pending_transfer_responses = [(request_id, response)]
+        request = types.SimpleNamespace(py_request_id=request_id)
+        executor._pending_response_terminations = [request]
+        executor.enable_attention_dp = False
+        executor.gather_all_responses = False
+        executor.dist = Mock(rank=0)
+        executor.dist.mapping.tp_group = [0]
+        executor.responses = {}
+        executor.response_cv = threading.Condition()
+        executor.result_wait_queues = {request_id: result_queue}
+        executor._terminate_request = Mock(
+            side_effect=lambda _: executor.result_wait_queues.pop(request_id)
+        )
+
+        PyExecutor._flush_pending_transfer_responses(executor)
+
+        result_queue.put_response.remote.assert_called_once_with(42, response)
+        assert request_id not in executor.result_wait_queues
+        executor._terminate_request.assert_called_once_with(request)
+
+    @staticmethod
+    def _make_executor_loop_stub():
+        executor = object.__new__(PyExecutor)
+        executor.device_id = 0
+        profiler = MagicMock()
+        profiler.__enter__.return_value = Mock()
+        executor._profiler = Mock(return_value=profiler)
+        executor.hang_detector = MagicMock()
+        executor.enable_iter_perf_stats = False
+        executor._resource_governor_enabled = False
+        executor._is_kv_manager_v2 = False
+        executor._mm_encoder_item_scheduling_enabled = False
+        executor.is_benchmark_disagg = False
+        executor._handle_disagg_cache_errors_synced = Mock()
+        executor._flush_pending_transfer_responses = Mock()
+        return executor
+
+    @staticmethod
+    def _patch_executor_loop_cuda(monkeypatch):
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device",
+            Mock(),
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice",
+            Mock(),
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT",
+            Mock(),
+        )
+
+    def test_flushes_before_clean_scheduler_shutdown(self, monkeypatch):
+        """A response buffered before scheduling must survive a clean exit."""
+        executor = self._make_executor_loop_stub()
+        executor._prepare_and_schedule_batch = Mock(return_value=(None, None))
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop(executor)
+
+        executor._flush_pending_transfer_responses.assert_called_once_with()
+
+    def test_flushes_before_benchmark_retry(self, monkeypatch):
+        """The synchronized benchmark retry path must not strand a response."""
+        executor = self._make_executor_loop_stub()
+        scheduled_batch = types.SimpleNamespace(generation_requests=[])
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(False, True))
+        executor._finalize_adp_dummy_allocation = Mock()
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop(executor)
+
+        # Once for the retry pass and once for the following clean exit.
+        assert executor._flush_pending_transfer_responses.call_count == 2
+
+    def test_idle_pass_has_one_flush(self, monkeypatch):
+        """An idle pass must not pay an additional response gather."""
+        executor = self._make_executor_loop_stub()
+        scheduled_batch = types.SimpleNamespace(
+            encoder_requests=[], paused_requests=[], generation_requests=[]
+        )
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        executor._terminate_requests = Mock()
+        executor._pause_requests = Mock()
+        executor._can_queue = Mock(return_value=(False, None))
+        executor.kv_connector_manager = None
+        executor._revert_gen_alloc = Mock()
+        executor._finalize_adp_dummy_allocation = Mock()
+        executor._handle_kv_transfer_timeouts_synced = Mock()
+        executor.kv_cache_transceiver = None
+        executor._kv_connector_terminate_requests = Mock()
+        executor._flush_iter_stats_synced = Mock()
+        executor.iter_counter = 0
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop(executor)
+
+        # One completed idle pass plus the clean-exit drain, not two flushes
+        # during the idle pass itself.
+        assert executor._flush_pending_transfer_responses.call_count == 2
+
+    def test_overlap_flushes_before_clean_scheduler_shutdown(self, monkeypatch):
+        """The overlap loop must not drop a buffered response on clean exit."""
+        executor = self._make_executor_loop_stub()
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        executor._wait_for_model_engine_input_copy = Mock()
+        executor._prepare_and_schedule_batch = Mock(return_value=(None, None))
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        executor._flush_pending_transfer_responses.assert_called_once_with()
+
+    def test_overlap_flushes_before_benchmark_retry(self, monkeypatch):
+        """The overlap retry path must not strand a buffered response."""
+        executor = self._make_executor_loop_stub()
+        scheduled_batch = types.SimpleNamespace(generation_requests=[])
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        executor._wait_for_model_engine_input_copy = Mock()
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(False, True))
+        executor._finalize_adp_dummy_allocation = Mock()
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        # Once for the retry pass and once for the following clean exit.
+        assert executor._flush_pending_transfer_responses.call_count == 2
 
 
 class TestOneModelMTPDraftTokenScheduling:

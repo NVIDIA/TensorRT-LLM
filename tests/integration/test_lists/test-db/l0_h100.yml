@@ -41,6 +41,14 @@ l0_h100:
   # ------------- MoE: test_moe_backend (by backend) ---------------
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
+  # ------------- Kimi K3 MoE unit tests ---------------
+  # Any-CUDA (Triton trtllm::situ_and_mul op + torch reference, requires_cuda
+  # only; not SM100/SM103-gated), so they run on Hopper rather than consuming
+  # scarce Blackwell pre-merge capacity. The Blackwell-gated K3 suites live in
+  # l0_b200.yml / l0_gb300_multi_gpus.yml. (TRTLLM-15177)
+  - unittest/_torch/modules/moe/test_kimi_k3_mlp.py
+  - unittest/_torch/modules/moe/test_kimi_k3_moe_gate.py
+  - unittest/_torch/modules/moe/test_kimi_k3_situ_and_mul.py
   - unittest/_torch/multimodal -k "not nemotron_nano_v2_vl_fp8"
   # test_speculative_d2h_parity_real_predictor (both no_stop_token and
   # stop_token_15) is a HW-agnostic sampler D2H-parity invariant (plain CUDA
@@ -167,7 +175,6 @@ l0_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp[DeepSeek-V3-Lite-fp8]
-  - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_load_balance[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_tinyllama_multi_orchestrator[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-DeepSeek-V3-Lite-fp8/fp8]

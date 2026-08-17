@@ -12,31 +12,41 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for gRPC server components."""
+"""Unit tests for the SMG gRPC adapter."""
 
 import asyncio
 import io
 import os
 import sys
 
-import grpc
 import pytest
 import torch
 from PIL import Image
 
 from tensorrt_llm import LLM
-from tensorrt_llm.grpc import trtllm_service_pb2 as pb2
-from tensorrt_llm.grpc.grpc_request_manager import (
+from tensorrt_llm.llmapi import KvCacheConfig
+
+# The SMG adapter depends on the optional 'smg-grpc-proto' package
+# (pip install "tensorrt_llm[grpc-smg]"). Skip the whole module cleanly when it
+# is absent so collection does not fail in an environment without the dependency.
+pytest.importorskip(
+    "smg_grpc_proto",
+    reason='SMG gRPC adapter dependency not installed (pip install "tensorrt_llm[grpc-smg]")',
+)
+
+import grpc  # noqa: E402
+
+from tensorrt_llm.grpc.smg.bindings import trtllm_service_pb2 as pb2  # noqa: E402
+from tensorrt_llm.grpc.smg.request_manager import (  # noqa: E402
     GrpcRequestManager,
     create_disaggregated_params_from_proto,
     create_lora_request_from_proto,
     create_sampling_params_from_proto,
 )
-from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.grpc.smg.servicer import TrtllmServiceServicer  # noqa: E402
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../..")
 from utils.llm_data import llm_models_root
 
 # isort: on
@@ -642,12 +652,15 @@ def get_model_path(model_name):
     return str(llm_models_root() / model_name)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def grpc_service():
     """Create a real LLM, request manager, and servicer for e2e testing.
 
     Uses TinyLlama-1.1B for minimal GPU resource usage.
-    Shared across all tests in this module.
+    Shared across all tests in the class; class scope (not module) so the
+    LLM is shut down and its GPU memory released before the multimodal
+    class below creates its own LLM — with module scope both models are
+    alive at once and the second one OOMs on A10.
     """
     model_path = get_model_path(default_model_name)
     llm = LLM(
@@ -813,19 +826,20 @@ class TestGrpcServiceEndToEnd:
 # End-to-end multimodal gRPC service tests (with VLM model)
 # ============================================================================
 
-vlm_model_name = "Qwen3/Qwen3-VL-8B-Instruct"
+vlm_model_name = "Qwen3/Qwen3-VL-2B-Instruct"
 
 
 def get_test_image_path():
     return str(llm_models_root() / "multimodals" / "test_data" / "seashore.png")
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="class")
 def grpc_vlm_service():
     """Create a real VLM LLM, request manager, and servicer for multimodal e2e testing.
 
-    Uses Qwen3-VL-8B-Instruct for vision-language model testing.
-    Shared across all tests in this module.
+    Uses Qwen3-VL-2B-Instruct for vision-language model testing.
+    Shared across all tests in the class; class scope so this LLM does not
+    coexist with the one from grpc_service (see note there).
     """
     model_path = get_model_path(vlm_model_name)
     llm = LLM(
@@ -849,7 +863,7 @@ class TestGrpcMultimodalEndToEnd:
 
     Tests the full pipeline: gRPC request with image bytes -> servicer ->
     request manager -> VLM -> response.
-    Uses Qwen3-VL-8B-Instruct with test images from LLM_MODELS_ROOT.
+    Uses Qwen3-VL-2B-Instruct with test images from LLM_MODELS_ROOT.
     """
 
     def test_generate_with_image(self, grpc_vlm_service):

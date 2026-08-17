@@ -63,6 +63,12 @@ class ActivationType(IntEnum):
     Relu2 = 8
 
 
+# TRTLLM-Gen-local activation encoding, kept separate from the shared
+# ActivationType above ON PURPOSE: ActivationType mirrors the cutlass enum in
+# common.h and drives cutlass MoE kernels, whereas SiTu exists only in the
+# trtllm-gen batched-GEMM kernels. Adding SiTu to the shared ActivationType
+# would force a matching cutlass enum member that no cutlass kernel implements.
+# So SiTu stays here (TRTLLM-15177 item 1.2(a): decided keep-backend-local).
 # Keep this in sync with the ActType enum in
 # cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
 class ActType_TrtllmGen(IntEnum):
@@ -170,8 +176,8 @@ def make_weak_ref(x):
     elif isinstance(x, list):
         return [make_weak_ref(i) for i in x]
     elif isinstance(x, dict):
-        return {k: make_weak_ref(v) for k, v in x.items()}
-    elif isinstance(x, (int, float, bool)):
+        return {make_weak_ref(k): make_weak_ref(v) for k, v in x.items()}
+    elif x is None or isinstance(x, (int, float, str, bool)):
         return x
     else:
         raise TypeError(f"Invalid type {type(x)} to make weak ref")
@@ -397,12 +403,14 @@ def piecewise_cuda_graph(enable: bool):
         set_piecewise_cuda_graph_flag(prev_enable)
 
 
-def set_per_request_piecewise_cuda_graph_flag(enable: bool):
-    _global_attrs.per_request_piecewise_cuda_graph_flag = enable
+def set_per_request_prefill_cuda_graph_flag(enable: bool):
+    """Set whether the current batch can use its prefill CUDA graph backend."""
+    _global_attrs.per_request_prefill_cuda_graph_flag = enable
 
 
-def get_per_request_piecewise_cuda_graph_flag() -> bool:
-    return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
+def get_per_request_prefill_cuda_graph_flag() -> bool:
+    """Return whether the current batch can use its prefill CUDA graph backend."""
+    return getattr(_global_attrs, 'per_request_prefill_cuda_graph_flag', True)
 
 
 def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:

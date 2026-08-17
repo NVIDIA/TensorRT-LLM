@@ -41,6 +41,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
+from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -76,7 +77,9 @@ from .kv_cache_transceiver import (KvCacheTransceiver,
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length)
+                          MultimodalEncoderRequestError, get_draft_token_length,
+                          initialize_multimodal_encoder_request,
+                          is_multimodal_encoder_ready)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -246,7 +249,7 @@ def _load_iteration_indexes(env_var: str):
 
 
 def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
-    """Drop pinned encoder cache and raw pre-encoder tensors after prefill completes.
+    """Drop encoder outputs and raw inputs after prefill or early termination.
 
     Wraps `strip_mm_data_for_generation` and mutates the shared `request.py_multimodal_data`
     in-place so the `LlmRequest`'s multimodal tensors actually get freed (unlike
@@ -254,9 +257,15 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     and leaves the request's dict untouched).
     """
     mm_data = getattr(request, "py_multimodal_data", None)
-    if not mm_data:
-        return
-    strip_mm_data_for_generation(mm_data)
+    if mm_data:
+        strip_mm_data_for_generation(mm_data)
+    # Drop the per-item encoder state alongside the dict clear above. The
+    # state and the published `multimodal_embedding` are two references to
+    # one embedding buffer, so both have to go for the GPU memory to be
+    # freed -- and a request stripped mid-encode only has the state's.
+    # Clearing it is also the byte-budget release: the scheduler derives
+    # occupancy from live states, so this request stops counting next tick.
+    request.py_mm_encoder_state = None
 
 
 @dataclasses.dataclass
@@ -590,7 +599,6 @@ class PyExecutor:
 
         # related modules
         self.resource_manager = resource_manager
-        self.scheduler = scheduler
         self.model_engine = model_engine
         self._enable_adp_dummy_fixes = getattr(model_engine,
                                                "_enable_adp_dummy_fixes", False)
@@ -598,6 +606,12 @@ class PyExecutor:
             model_engine, "_enable_scheduler_aware_adp_dummy", False)
         self._enable_non_overlap_adp_forward_intent = getattr(
             model_engine, "_enable_non_overlap_adp_forward_intent", False)
+        # Compatibility checks and MultimodalScheduler wrapping live in
+        # `create_py_executor_instance`; the executor only keeps the flag
+        # its loop paths branch on.
+        self._mm_encoder_item_scheduling_enabled = getattr(
+            model_engine, "mm_encoder_item_scheduling_enabled", False)
+        self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
@@ -748,6 +762,11 @@ class PyExecutor:
         # responses and flushing them at a synchronised point in the executor
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+        # Requests with a buffered terminal response are terminated only after
+        # the synchronized flush has published that response.  This preserves
+        # queue-backed client delivery while retaining normal termination as
+        # the single owner of resource and result-queue cleanup.
+        self._pending_response_terminations: List[LlmRequest] = []
         # Same buffer-then-synced-flush pattern as _pending_transfer_responses
         # above: _handle_responses and _append_iter_stats are reached from
         # per-rank-divergent gates, so their tp_allgather collectives are
@@ -1177,7 +1196,10 @@ class PyExecutor:
                     (request.py_request_id, response))
             if self.async_transfer_manager.end_transfer(request):
                 self.active_requests.remove(request)
-                self._terminate_request(request)
+                if response:
+                    self._pending_response_terminations.append(request)
+                else:
+                    self._terminate_request(request)
             return
         if self.async_transfer_manager.end_transfer(request):
             if transfer_failed:
@@ -1188,18 +1210,22 @@ class PyExecutor:
                 self._terminate_request(request)
 
     def _flush_pending_transfer_responses(self):
-        """Enqueue buffered transfer-completion responses.
+        """Enqueue responses buffered by rank-divergent executor paths.
 
         Must be called at a point where ALL DP ranks execute in lockstep so
         that the tp_gather inside _enqueue_responses does not deadlock.
         """
         responses = self._pending_transfer_responses
         self._pending_transfer_responses = []
+        requests_to_terminate = self._pending_response_terminations
+        self._pending_response_terminations = []
         if responses or self.enable_attention_dp:
             # Even when this rank has no responses we must participate in the
             # collective when ADP is enabled so that the other rank's gather
             # can complete.
             self._enqueue_responses(responses)
+        for request in requests_to_terminate:
+            self._terminate_request(request)
 
     def _handle_kv_transfer_timeouts_synced(self):
         """ADP-safe drain of the KV-transfer-timeout consensus collective.
@@ -2716,6 +2742,10 @@ class PyExecutor:
                             local_disagg_candidates,
                             fitting_disagg_gen_init_requests)
 
+                if (self._mm_encoder_item_scheduling_enabled
+                        and scheduled_batch.scheduled_mm_encoder_items):
+                    self._forward_multimodal_encoder_step(scheduled_batch)
+
                 # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                 if self.kv_cache_transceiver:
                     self._prepare_disagg_gen_init(
@@ -4097,7 +4127,8 @@ class PyExecutor:
                 self.is_shutdown = True
                 self._handle_errors(error_msg,
                                     requests=None,
-                                    charge_budget=False)
+                                    charge_budget=False,
+                                    fatal_is_collective_aligned=True)
                 return
 
         if not (self.enable_attention_dp and self.dist.world_size != 1):
@@ -4192,6 +4223,13 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
+                    # _handle_disagg_cache_errors_synced() can buffer a
+                    # non-fatal response before scheduling observes shutdown.
+                    # Drain it before leaving the loop so the client does not
+                    # wait for its own timeout. Scheduling shutdown is
+                    # model-parallel synchronized, so every ADP rank reaches
+                    # this collective together.
+                    self._flush_pending_transfer_responses()
                     self._event_loop_completed = True
                     break
 
@@ -4203,7 +4241,16 @@ class PyExecutor:
                             self.kv_cache_manager.revert_allocate_generation(
                                 req)
                     self._finalize_adp_dummy_allocation(False)
+                    # _check_benchmark_disagg_gate() makes this retry decision
+                    # with a model-parallel all-gather. Flush before retrying so
+                    # a response buffered at the top of this pass is not held
+                    # until the benchmark fill gate opens.
+                    self._flush_pending_transfer_responses()
                     continue
+
+                if (self._mm_encoder_item_scheduling_enabled
+                        and scheduled_batch.scheduled_mm_encoder_items):
+                    self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
@@ -4352,7 +4399,6 @@ class PyExecutor:
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
                     self._send_kv_async(scheduled_batch.all_requests())
-                    self._flush_pending_transfer_responses()
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
@@ -4383,6 +4429,14 @@ class PyExecutor:
                     self._check_kv_transfer_timeout()
 
                 self._kv_connector_terminate_requests()
+
+                # This is the one ADP-synchronized response flush for a
+                # completed executor-loop pass. It is deliberately outside
+                # ``if can_queue``: non-fatal errors can be buffered on an
+                # idle pass, and every ADP rank must enter the tp_gather in
+                # the same order. Keep it after all per-pass error handling
+                # so a response is not needlessly delayed to the next pass.
+                self._flush_pending_transfer_responses()
 
                 if self.enable_iter_perf_stats and sample_state is not None:
                     self._process_iter_stats(
@@ -4728,6 +4782,7 @@ class PyExecutor:
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
                 if scheduled_batch is None:
+                    self._flush_pending_transfer_responses()
                     self._event_loop_completed = True
                     break
 
@@ -4739,7 +4794,12 @@ class PyExecutor:
                             self.kv_cache_manager.revert_allocate_generation(
                                 req)
                     self._finalize_adp_dummy_allocation(False)
+                    self._flush_pending_transfer_responses()
                     continue
+
+                if (self._mm_encoder_item_scheduling_enabled
+                        and scheduled_batch.scheduled_mm_encoder_items):
+                    self._forward_multimodal_encoder_step(scheduled_batch)
 
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
@@ -5292,6 +5352,79 @@ class PyExecutor:
                 f"{self.benchmark_req_queues_size} to prevent an unreachable "
                 f"benchmark disagg fill gate.")
 
+    def _apply_mm_encoder_admission(
+            self, waiting_queue: WaitingQueue,
+            new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
+        """Apply MM encoder item/token budgets to capacity-admitted requests.
+
+        Active requests consume this iteration's encoder budget first. New
+        requests then preserve waiting-queue FCFS order: once the head request
+        cannot make encoder progress, all later requests are deferred and
+        prepended to the waiting queue.
+        """
+        remaining_batch_slots = self.model_engine.encoder_batch_size
+        remaining_tokens = self.model_engine.encoder_max_num_tokens
+
+        def consume_pending(costs, pending_indices=None):
+            nonlocal remaining_batch_slots, remaining_tokens
+            if pending_indices is None:
+                pending_indices = range(len(costs))
+            progressed = False
+            for item_idx in pending_indices:
+                cost = costs[item_idx]
+                if remaining_batch_slots == 0 or cost > remaining_tokens:
+                    break
+                remaining_batch_slots -= 1
+                remaining_tokens -= cost
+                progressed = True
+            return progressed
+
+        for request in self.active_requests:
+            state = request.py_mm_encoder_state
+            if state is None or is_multimodal_encoder_ready(request):
+                continue
+            consume_pending(state.encoder_token_lengths,
+                            state.pending_item_indices())
+
+        admitted = []
+        deferred = []
+        blocked = False
+        for queue_item in new_requests:
+            if blocked:
+                deferred.append(queue_item)
+                continue
+            mm_data = getattr(queue_item.request, "py_multimodal_data", None)
+            try:
+                item_metadata = (get_multimodal_encoder_item_metadata(mm_data)
+                                 if isinstance(mm_data, dict) else None)
+            except (TypeError, ValueError):
+                # Admission only estimates capacity. Pass malformed requests
+                # through so the normal request-scoped validation path can
+                # report the error without terminating the executor loop or
+                # blocking later FCFS entries behind an invalid request.
+                admitted.append(queue_item)
+                continue
+            costs = (item_metadata.encoder_token_lengths
+                     if item_metadata is not None else None)
+            has_full_embedding = (isinstance(mm_data, dict)
+                                  and mm_data.get("multimodal_embedding")
+                                  is not None)
+            if costs and any(cost > self.model_engine.encoder_max_num_tokens
+                             for cost in costs):
+                # Admit the invalid request so normal request validation can
+                # return an error instead of leaving the FCFS queue blocked.
+                admitted.append(queue_item)
+                continue
+            if costs and not has_full_embedding and not consume_pending(costs):
+                blocked = True
+                deferred.append(queue_item)
+                continue
+            admitted.append(queue_item)
+
+        if deferred:
+            waiting_queue.prepend_requests(deferred)
+        return admitted
+
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
@@ -5313,12 +5446,17 @@ class PyExecutor:
                                            admission_capacity)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
-        return get_from_waiting_queue(
+        new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
+        if (not new_requests or
+                not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
+                or self.enable_attention_dp):
+            return new_requests
+        return self._apply_mm_encoder_admission(waiting_queue, new_requests)
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -5455,6 +5593,17 @@ class PyExecutor:
             """
             try:
                 self._validate_request(request)
+                if self._mm_encoder_item_scheduling_enabled:
+                    initialize_multimodal_encoder_request(
+                        request,
+                        max_num_tokens=self.model_engine.encoder_max_num_tokens,
+                        max_output_bytes=self.model_engine.
+                        mm_encoder_output_budget_bytes,
+                        bytes_per_encoder_embedding=getattr(
+                            self.model_engine,
+                            "bytes_per_mm_encoder_embedding",
+                            0,
+                        ))
                 return False
             except Exception as e:
                 self._handle_errors(str(e),
@@ -5803,8 +5952,44 @@ class PyExecutor:
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
+        scheduled_requests.scheduled_mm_encoder_items = (
+            scheduler_output.scheduled_mm_encoder_items)
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
+
+    def _forward_multimodal_encoder_step(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        """Run scheduler-selected MM encoder work before LLM resources."""
+        scheduled_items = scheduled_requests.scheduled_mm_encoder_items
+        if not scheduled_items:
+            return
+        try:
+            self.model_engine.forward_multimodal_encoder_items(
+                self.active_requests, scheduled_items)
+        except MultimodalEncoderRequestError as e:
+            error_msg = str(e)
+            logger.error(f"Encountered an error in multimodal encoder forward: "
+                         f"{error_msg}\n{traceback.format_exc()}")
+
+            failed_request_ids = set(scheduled_items)
+            failed_requests = [
+                request for request in self.active_requests
+                if request.request_id in failed_request_ids
+            ]
+
+            # Capacity scheduling may already have placed requests whose last
+            # pending item was selected into this iteration's context batch.
+            # Remove the failed owners before the LLM forward; unrelated
+            # context and generation work remains intact.
+            scheduled_requests.reset_context_requests([
+                request for request in scheduled_requests.context_requests
+                if request.request_id not in failed_request_ids
+            ])
+            scheduled_requests.scheduled_mm_encoder_items = None
+
+            self._handle_errors(error_msg,
+                                requests=failed_requests,
+                                charge_budget=False)
 
     # ---------------------------------------------------------------
     # Encoder-decoder support: encoder iteration in the executor loop.
@@ -7348,7 +7533,8 @@ class PyExecutor:
                        error_msg: Optional[str] = None,
                        *,
                        requests: Optional[List[LlmRequest]] = None,
-                       charge_budget: bool = True) -> None:
+                       charge_budget: bool = True,
+                       fatal_is_collective_aligned: bool = False) -> None:
         """Fail requests and optionally initiate shutdown on fatal errors.
 
         When ``charge_budget`` is True (the default), classifies the error
@@ -7384,6 +7570,14 @@ class PyExecutor:
         """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
+        multi_rank_adp = (self.enable_attention_dp
+                          and self.dist.world_size != 1)
+        # ``fatal_is_collective_aligned`` is set only by the synchronized caller
+        # (_handle_disagg_cache_errors_synced, after its world allreduce), which
+        # guarantees every ADP rank enters the fatal path in the same collective
+        # order. Do NOT infer it from ``self._fatal_error is not None``: a
+        # rank-local setter would then route into a tp_gather while peers are
+        # elsewhere, recreating the desync this path exists to prevent.
 
         budget_fatal = (self._error_budget.consume(error_msg)
                         if charge_budget else False)
@@ -7438,14 +7632,17 @@ class PyExecutor:
                                      client_id=getattr(item.request,
                                                        'client_id', None))))
 
-            adp_collective_required = (self.enable_attention_dp
-                                       and self.dist.world_size != 1)
-            if waiting_responses or adp_collective_required:
-                self._enqueue_responses(waiting_responses)
+            if not multi_rank_adp:
                 if waiting_responses:
+                    self._enqueue_responses(waiting_responses)
                     logger.info(
                         f"Drained {len(waiting_responses)} queued requests "
                         "on fatal error")
+            elif fatal_is_collective_aligned:
+                # Synchronized fatal: every ADP rank enters this drain gather
+                # together, so issue it even when this rank has no queued
+                # responses, to stay peer-aligned.
+                self._enqueue_responses(waiting_responses)
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
@@ -7463,12 +7660,65 @@ class PyExecutor:
                 request for request in self.active_requests
                 if request not in requests
             ]
-        self._enqueue_responses(list(error_responses.items()))
-        for request in failed_requests:
-            self._terminate_request(request)
+        defer_termination = False
+        publish_immediately = False
+        if is_fatal:
+            if multi_rank_adp:
+                if fatal_is_collective_aligned:
+                    # Synchronized fatal: all ranks agree and march through the
+                    # aligned publish/terminate collectives together, so publish
+                    # here instead of diverging.
+                    publish_immediately = True
+                else:
+                    # A novel rank-local fatal can be observed by one ADP rank
+                    # before its peers reach their next collective. Do not issue
+                    # tp_gather here: it would desynchronize the group exactly
+                    # like a rank-local non-fatal response. Skip the gather and
+                    # raise below; the distributed supervisor tears down peers.
+                    logger.error(
+                        "Skipping rank-local fatal response gather under ADP")
+            else:
+                publish_immediately = True
+        elif multi_rank_adp:
+            # Under attention DP, _enqueue_responses performs a tp_gather
+            # that every rank must enter in the same order. Non-fatal errors
+            # (e.g. a failed disagg KV transfer) are observed by a single
+            # rank, so enqueueing here would pair this rank's gather against
+            # a different collective on its peers — typically the per-step
+            # tp_allgather(batch_size) — corrupting both sides. Buffer the
+            # responses instead; every rank flushes the buffer together at
+            # _flush_pending_transfer_responses.
+            self._pending_transfer_responses.extend(error_responses.items())
+            self._pending_response_terminations.extend(failed_requests)
+            defer_termination = True
+        else:
+            # Without multi-rank ADP there is no rank-divergent collective, so
+            # publish the error immediately.
+            publish_immediately = True
+
+        if publish_immediately:
+            # A fatal executor exits before the next normal flush; a non-ADP
+            # executor has no rank-divergent collective. Both can publish the
+            # current errors plus any previously buffered terminal responses.
+            pending = self._pending_transfer_responses
+            self._pending_transfer_responses = []
+            pending_terminations = self._pending_response_terminations
+            self._pending_response_terminations = []
+            self._enqueue_responses(pending + list(error_responses.items()))
+            for request in pending_terminations:
+                self._terminate_request(request)
+
+        if not defer_termination:
+            for request in failed_requests:
+                self._terminate_request(request)
 
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
+            if multi_rank_adp and not fatal_is_collective_aligned:
+                # Only a novel rank-local fatal raises to force local teardown;
+                # a synchronized fatal has already published in lockstep and
+                # tears down every rank together via is_shutdown.
+                raise self._fatal_error
 
     def _terminate_request(self, request: LlmRequest):
         # Dummy requests don't participate in disagg KV cache transfers,
@@ -7483,6 +7733,9 @@ class PyExecutor:
 
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
+        # Cancellation and request-scoped failures can terminate before the
+        # normal post-prefill release point, including with a partial buffer.
+        _strip_py_multimodal_data_post_prefill(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
@@ -7568,8 +7821,27 @@ class PyExecutor:
                 gather_responses = []
                 if responses_list is not None:
                     for resp in responses_list:
-                        if resp is not None:
-                            gather_responses.extend(resp)
+                        if resp is None:
+                            continue
+                        if not isinstance(resp, (list, tuple)):
+                            # A non-list contribution means the TP collective
+                            # was matched against a *different* collective on
+                            # a peer rank (collectives pair by call order, not
+                            # by type). A common mismatch partner is the
+                            # per-step tp_allgather(batch_size), which makes
+                            # the stray payload an int. The gathered data is
+                            # corrupt on every rank, so fail fast instead of
+                            # raising an opaque TypeError below or silently
+                            # enqueueing garbage responses.
+                            raise RuntimeError(
+                                f"_enqueue_responses: TP collective desync — "
+                                f"gathered a {type(resp).__name__} "
+                                f"instead of a response list. A peer rank "
+                                f"entered a different collective (e.g. "
+                                f"tp_allgather(batch_size)); check for "
+                                f"per-rank-divergent callers of "
+                                f"_enqueue_responses.")
+                        gather_responses.extend(resp)
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
