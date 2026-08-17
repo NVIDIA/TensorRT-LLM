@@ -1889,19 +1889,8 @@ class Indexer(nn.Module):
                 last_mtp_topk = decode_topk[next_n - 1 :: next_n]
                 prev_topk_dst = metadata.heuristic_prev_topk[local_layer, :num_generations]
                 if do_multi_stream() and self.aux_stream is not None:
-                    # Fork the write-back onto the aux stream so the strided
-                    # gather copy overlaps with this layer's core sparse
-                    # attention instead of sitting on the critical path.
-                    # Nothing in this step reads it back — the next consumer
-                    # is the next decode step's pre_idx for this same layer.
-                    # Source and destination are persistent stable-address
-                    # buffers, so no record_stream bookkeeping is needed. The
-                    # fork MUST be joined within this layer's forward via
-                    # maybe_join_prev_topk_copy(): that both keeps CUDA graph
-                    # capture free of unjoined forks (cudaStreamEndCapture
-                    # rejects them) and restores ordering before the next
-                    # layer overwrites the shared topk_indices_buffer rows
-                    # this copy reads.
+                    # Fork the write-back onto the aux stream to overlap with this
+                    # layer's core sparse attention; joined by maybe_join_prev_topk_copy().
                     self.prev_topk_copy_events[0].record()
                     with torch.cuda.stream(self.aux_stream):
                         self.prev_topk_copy_events[0].wait()
@@ -1960,16 +1949,7 @@ class Indexer(nn.Module):
         return gen_topk[base + offset]
 
     def maybe_join_prev_topk_copy(self) -> None:
-        """Join the aux-stream heuristic prev_topk write-back, if forked.
-
-        Called by the owning MLA layer after this layer's core sparse
-        attention has been enqueued, so the copy forked in
-        sparse_attn_indexer overlaps with it. Joining within the same
-        layer's forward keeps every fork matched with a join inside a
-        single captured region (CUDA graph capture rejects unjoined
-        forks) and orders the copy's read of topk_indices_buffer before
-        the next layer's indexer overwrites those rows.
-        """
+        """Join the aux-stream heuristic prev_topk write-back, if forked."""
         if self._prev_topk_copy_pending:
             self.prev_topk_copy_events[1].wait()
             self._prev_topk_copy_pending = False
