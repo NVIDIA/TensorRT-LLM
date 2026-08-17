@@ -96,7 +96,6 @@ class MLP(nn.Module):
         self._use_fused_relu2_quant = False
         self._use_fused_gelu = False
         self._use_fused_gelu_fp4out = False
-        self._use_fused_linear_gelu = False
 
     def create_weights(self):
         self.up_proj.create_weights()
@@ -118,11 +117,6 @@ class MLP(nn.Module):
         # GatedMLP); the runtime quant_method check is deferred to first forward.
         self._use_fused_gelu, self._use_fused_gelu_fp4out = (
             self._gelu_fusion_eligibility())
-
-        # Static eligibility for the unquantized bf16 cublasLt GELU(tanh)
-        # epilogue (torch._addmm_activation); mutually exclusive with the
-        # NVFP4 route above by construction (unquantized vs NVFP4 up_proj).
-        self._use_fused_linear_gelu = self._linear_gelu_fusion_eligibility()
 
     # Minimum M for the fp4out CuTe DSL GELU kernel; below this its SFC epilogue
     # can write out-of-bounds (CTA tile height > output rows), so fall back to
@@ -155,91 +149,42 @@ class MLP(nn.Module):
                     self._fused_gelu(x, fp4_out=m >= MLP._FP4OUT_MIN_M))
             return self.down_proj(self._fused_gelu(x))
 
-        # Unquantized bf16: fold the eager GELU(tanh) into the up_proj GEMM
-        # via the cublasLt GELU epilogue (torch._addmm_activation, use_gelu=
-        # True — the tanh approximation on CUDA, matching gelu_tanh). Static
-        # eligibility can go stale: quant_method may be replaced after
-        # create_weights (weight loading), so re-check it at runtime (a
-        # torch.compile trace-time guard, not a per-step cost). Strict type
-        # check — the FP8 linear methods subclass UnquantizedLinearMethod.
-        # CUDA-only: the CPU _addmm_activation applies exact (erf) GELU.
-        if (self._use_fused_linear_gelu and isinstance(x, torch.Tensor)
-                and x.dim() >= 2 and x.is_cuda
-                and type(getattr(self.up_proj, "quant_method",
-                                 None)) is UnquantizedLinearMethod):
-            return self.down_proj(self._fused_linear_gelu(x))
-
-        x_up = self.up_proj(x)
-
-        # Weight loading may replace the quantization method after
-        # create_weights(), so do not rely on the cached eligibility alone.
-        if (self._use_fused_relu2_quant
-                and is_static_nvfp4_input_eligible(self.down_proj)):
-            x_act = self._fused_relu2_quant(x_up)
+        if self._can_fuse_up_proj_gelu(x):
+            x_act = self._fused_up_proj_gelu(x)
         else:
-            x_act = self.activation(x_up)
+            x_up = self.up_proj(x)
+            # Weight loading may replace the quantization method after
+            # create_weights(), so do not rely on the cached eligibility alone.
+            if (self._use_fused_relu2_quant
+                    and is_static_nvfp4_input_eligible(self.down_proj)):
+                x_act = self._fused_relu2_quant(x_up)
+            else:
+                x_act = self.activation(x_up)
 
         x_down = self.down_proj(x_act)
 
         return x_down
 
-    def _linear_gelu_fusion_eligibility(self) -> bool:
-        """Static (init-time) eligibility for folding the eager GELU(tanh)
-        into the unquantized bf16 up_proj GEMM via the cublasLt GELU epilogue
-        (``torch._addmm_activation(bias, x, w.t(), use_gelu=True)`` — the tanh
-        approximation on CUDA, matching ``gelu_tanh``). Counterpart of
-        ``_gelu_fusion_eligibility``, which owns the NVFP4 route; the two are
-        mutually exclusive by construction (unquantized vs NVFP4 up_proj).
+    def _can_fuse_up_proj_gelu(self, x: torch.Tensor) -> bool:
+        """Whether the unquantized up projection can use the cuBLASLt GELU epilogue."""
+        up_proj = self.up_proj
+        return (self.activation is gelu_tanh
+                and hasattr(torch, "_addmm_activation")
+                and isinstance(x, torch.Tensor) and x.dim() >= 2 and x.is_cuda
+                and x.dtype == torch.bfloat16 and not torch.is_grad_enabled()
+                and type(up_proj.quant_method) is UnquantizedLinearMethod
+                and up_proj.bias is not None
+                and up_proj.weight.dtype == torch.bfloat16
+                and not up_proj.use_custom_cublas_mm)
 
-        The runtime quant_method re-check lives in forward (quant_method can
-        be replaced after create_weights).
-        """
-        if not hasattr(torch, "_addmm_activation"):
-            return False
-        up = self.up_proj
-        weight = getattr(up, "weight", None)
-        return (
-            self.activation is gelu_tanh
-            # Unquantized only. Strict type check: FP8QDQ/FP8Rowwise/
-            # FP8BlockScales linear methods SUBCLASS UnquantizedLinearMethod,
-            # so isinstance() would wrongly engage on quantized paths.
-            and
-            type(getattr(up, "quant_method", None)) is UnquantizedLinearMethod
-            # cublasLt GELU_BIAS epilogue path needs the 1-D bias vector.
-            and getattr(up, "bias", None) is not None
-            # bf16 production dtype only; fp16/fp32 stay on the measured
-            # baseline path.
-            and up.dtype == torch.bfloat16 and weight is not None and
-            weight.dtype == torch.bfloat16
-            # Bypassing up_proj.forward must not silently skip an allgather
-            # or a non-default GEMM backend.
-            and not getattr(up, "gather_output", False)
-            and not getattr(up, "use_custom_cublas_mm", False)
-            and not getattr(up, "use_cute_dsl_bf16_gemm", False))
-
-    def _fused_linear_gelu(self, x: torch.Tensor) -> torch.Tensor:
-        """Fused up_proj GEMM + bias + GELU(tanh) via the cublasLt GELU
-        epilogue (``torch._addmm_activation``). Unquantized bf16 counterpart
-        of ``_fused_gelu`` for the eager ``F.linear`` + ``gelu_tanh`` pair.
-
-        TRT-LLM ``Linear`` stores ``weight`` as [out_features, in_features];
-        ``_addmm_activation`` needs mat2 as [in, out], so pass ``weight.t()``
-        (a view — cublasLt consumes the transposed operand natively, no
-        materialization). Rank-3 inputs are flattened to [M, in] for the GEMM
-        and unflattened after, preserving input rank.
-        """
-        module = self.up_proj
-        original_shape = None
-        if x.dim() > 2:
-            original_shape = x.shape
-            x = x.reshape(-1, x.shape[-1])
-        output = torch._addmm_activation(module.bias,
-                                         x,
-                                         module.weight.t(),
+    def _fused_up_proj_gelu(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the bf16 up projection with a fused GELU(tanh) epilogue."""
+        input_shape = x.shape
+        output = torch._addmm_activation(self.up_proj.bias,
+                                         x.reshape(-1, input_shape[-1]),
+                                         self.up_proj.weight.t(),
                                          use_gelu=True)
-        if original_shape is not None:
-            output = output.reshape(*original_shape[:-1], output.shape[-1])
-        return output
+        return output.reshape(*input_shape[:-1], output.shape[-1])
 
     def _gelu_fusion_eligibility(self) -> Tuple[bool, bool]:
         """Return (bf16_out_ok, fp4_out_ok) static eligibility for the fused

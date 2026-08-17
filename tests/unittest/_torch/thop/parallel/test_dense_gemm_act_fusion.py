@@ -21,6 +21,8 @@ floor); the small-M (m=64) bf16-out cases exercise the path the MLP/GatedMLP
 fall back to below that floor.
 """
 
+from unittest import mock
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -33,6 +35,39 @@ from tensorrt_llm.math_utils import pad_up
 FP4_E2M1_MAX = 6.0
 FP8_E4M3_MAX = 448.0
 SF_VEC = 16
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not hasattr(torch, "_addmm_activation"),
+    reason="requires CUDA torch._addmm_activation",
+)
+def test_mlp_gelu_tanh_backward_uses_unfused_path():
+    """Autograd keeps eager linear + GELU so bf16 backward remains valid."""
+    from tensorrt_llm._torch.modules.mlp import MLP
+    from tensorrt_llm._torch.utils import gelu_tanh
+
+    mlp = MLP(
+        hidden_size=64,
+        intermediate_size=128,
+        bias=True,
+        activation=gelu_tanh,
+        dtype=torch.bfloat16,
+        reduce_output=False,
+    ).cuda()
+    with torch.no_grad():
+        for parameter in mlp.parameters():
+            parameter.normal_(std=0.02)
+
+    x = torch.randn(2, 4, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    with mock.patch.object(
+        torch,
+        "_addmm_activation",
+        side_effect=AssertionError("inference-only fusion used with autograd"),
+    ):
+        mlp(x).float().sum().backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
 
 
 def _quantize_nvfp4(x_bf16: torch.Tensor):
