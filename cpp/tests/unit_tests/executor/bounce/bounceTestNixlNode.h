@@ -18,7 +18,7 @@
 #pragma once
 
 // Shared helpers for the bounce v2 tests that drive the FULL pipeline over REAL NIXL RDMA: a "node"
-// is a complete agent stack (NixlTransferAgent + NixlTransferEngine + arena + exec + zmq control
+// is a complete agent stack (NixlTransferAgent as the data plane + arena + exec + zmq control
 // channel + BounceTransport), plus seeded device buffers and a byte-exact verifier. Used by
 // bounceTransportTest, bounceTransportFailureTest, and bounceAgentE2ETest so they share one NIXL
 // setup (no per-file copy, and no LocalCopy loopback fake — the data plane is always real NIXL).
@@ -27,7 +27,6 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/NixlTransferEngine.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ZmqControlChannel.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 
@@ -37,6 +36,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -152,45 +152,56 @@ inline void freeXferBufs(XferBufs& x)
     }
 }
 
-// One bounce node = a full agent stack (agent + engine + arena + exec + control channel + transport).
+// One bounce node = a full agent stack (agent + arena + exec + control channel + transport). The
+// data plane is the agent itself (postXferRequest / registerRegionImpl); `agent` may be a test
+// subclass of NixlTransferAgent that overrides postXferRequest to inject transfer faults.
 struct Node
 {
     std::string name;
     std::unique_ptr<kvc::NixlTransferAgent> agent;
-    std::unique_ptr<b::NixlTransferEngine> eng;
     std::unique_ptr<b::BounceArena> arena;
     std::unique_ptr<b::ExecPool> exec;
     std::unique_ptr<b::ZmqControlChannel> ch;
     std::unique_ptr<b::BounceTransport> tx;
+
+    ~Node()
+    {
+        tx.reset(); // join the transport threads before the arena/agent go away
+        if (agent && arena)
+        {
+            agent->deregisterRegionImpl(arena->base(), arena->bytes(), /*deviceId=*/0);
+        }
+    }
 };
 
-// Build one full bounce node (agent+engine+arena+exec+channel+transport). Returns nullptr if the
-// NIXL agent/backend can't init or the arena can't be registered (caller GTEST_SKIPs). `cfg` supplies
+// Build one full bounce node (agent+arena+exec+channel+transport). Returns nullptr if the NIXL
+// agent/backend can't init or the arena can't be registered (caller GTEST_SKIPs). `cfg` supplies
 // arenaSizeBytes/arenaAllocationGranularityBytes/maxInflightChunksPerRequest etc., so callers
-// control the scheduler/arena sizing.
-inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig const& cfg, std::size_t maxDescs)
+// control the scheduler/arena sizing. `makeAgent` lets failure tests substitute a fault-injecting
+// NixlTransferAgent subclass.
+inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig const& cfg, std::size_t maxDescs,
+    std::function<std::unique_ptr<kvc::NixlTransferAgent>(kvc::BaseAgentConfig const&)> const& makeAgent = nullptr)
 {
     auto n = std::make_unique<Node>();
     n->name = name;
     try
     {
         kvc::BaseAgentConfig c{name, /*useProgThread=*/true, /*multiThread=*/false, /*useListenThread=*/true};
-        n->agent = std::make_unique<kvc::NixlTransferAgent>(c);
+        n->agent = makeAgent ? makeAgent(c) : std::make_unique<kvc::NixlTransferAgent>(c);
     }
     catch (std::exception const&)
     {
         return nullptr;
     }
-    n->eng = std::make_unique<b::NixlTransferEngine>(n->agent->getRawAgent(), 0);
     n->arena = std::make_unique<b::BounceArena>(cfg.arenaSizeBytes, 0, /*allowFabric=*/false);
     n->exec = std::make_unique<b::ExecPool>(cfg.maxInflightChunksPerRequest + 4, maxDescs, 0, cfg.useZeroCopyArguments);
-    if (!n->eng->registerRegion(n->arena->base(), n->arena->bytes()))
+    if (!n->agent->registerRegionImpl(n->arena->base(), n->arena->bytes(), /*deviceId=*/0))
     {
         return nullptr;
     }
     n->ch = std::make_unique<b::ZmqControlChannel>(name);
-    n->tx = std::make_unique<b::BounceTransport>(
-        n->name, cfg, 0, n->ch.get(), n->eng.get(), n->arena.get(), n->exec.get());
+    n->tx
+        = std::make_unique<b::BounceTransport>(n->name, cfg, 0, n->ch.get(), *n->agent, n->arena.get(), n->exec.get());
     return n;
 }
 

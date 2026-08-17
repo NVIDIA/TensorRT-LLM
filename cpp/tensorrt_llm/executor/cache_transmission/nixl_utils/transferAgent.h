@@ -65,7 +65,7 @@ public:
     [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
     [[nodiscard]] int getLastStatus() const noexcept;
-    [[nodiscard]] std::string getLastStatusStr() const;
+    [[nodiscard]] std::string getLastStatusStr() const override;
 
     [[nodiscard]] bool release() override;
 
@@ -80,7 +80,9 @@ private:
     mutable std::mutex mHandleMutex;
 };
 
-class NixlTransferAgent final : public BaseTransferAgent
+// Not `final`: the low-level virtuals below (postXferRequest / registerRegionImpl) are the
+// fault-injection seam — bounce failure tests subclass this agent and override them.
+class NixlTransferAgent : public BaseTransferAgent
 {
 public:
     NixlTransferAgent(BaseAgentConfig const& config);
@@ -101,10 +103,22 @@ public:
 
     [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;
 
-    [[nodiscard]] nixlAgent* getRawAgent() const noexcept
-    {
-        return mRawAgent.get();
-    }
+    // ---- Low-level transfer primitives (below the VMM splitter) -------------------------------
+    // submitTransferRequests() = bounce fork + VMM split/coalesce + postXferRequest(). The bounce
+    // transport calls these directly: its remote address comes from a credit (already final, no
+    // VMM resolution) and its per-chunk cadence cannot afford the full public path. Virtual so
+    // bounce failure tests can inject deterministic transfer faults.
+
+    /// Post one transfer whose descriptors are already FINAL device addresses (no VMM splitting,
+    /// no bounce fork). Returns nullptr on submission failure (logged) instead of aborting.
+    /// Takes no agent lock: safe from the bounce IO thread, which is joined before agent teardown.
+    [[nodiscard]] virtual std::unique_ptr<TransferStatus> postXferRequest(TransferOp op, TransferDescs const& srcDescs,
+        TransferDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage);
+
+    /// Register/deregister one raw device range with NIXL, WITHOUT the VMM split or the AgentDesc
+    /// VRAM-region bookkeeping (the bounce arena must not enter the splitter's region maps).
+    [[nodiscard]] virtual bool registerRegionImpl(void* base, std::size_t bytes, int deviceId);
+    virtual void deregisterRegionImpl(void* base, std::size_t bytes, int deviceId);
 
     nixl_opt_args_t* getExtraParams() noexcept
     {

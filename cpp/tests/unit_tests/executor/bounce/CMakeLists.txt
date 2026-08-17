@@ -85,8 +85,7 @@ if(NIXL_ROOT)
         ${BOUNCE_DIR}/BounceArena.cpp
         ${BOUNCE_DIR}/ExecPool.cpp
         ${BOUNCE_DIR}/GatherScatterKernel.cu
-        ${BOUNCE_DIR}/ZmqControlChannel.cpp
-        ${BOUNCE_DIR}/NixlTransferEngine.cpp)
+        ${BOUNCE_DIR}/ZmqControlChannel.cpp)
     set(BOUNCE_TEST_INCS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
                          ${ZMQ_INCLUDE_DIRS})
     set(BOUNCE_TEST_LIBS tensorrt_llm_nixl_wrapper NIXL::nixl

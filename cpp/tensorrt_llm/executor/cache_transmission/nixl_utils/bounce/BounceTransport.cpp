@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceNvtx.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/GatherScatterKernel.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -1072,8 +1073,16 @@ bool BounceSender::drainGatherReady()
             }
             p.nvtxWrite = bounceRangeStart(kNvtxNixlWrite, "nixlWrite rid=%llu chunk=%u bytes=%u",
                 static_cast<unsigned long long>(rid), p.chunkIdx, p.writeBytes);
-            p.xfer = mCtx.engine->postWrite(
-                req.peer, mCtx.arena->at(p.localOffset), p.remoteAddr, p.remoteDevId, p.writeBytes, nullptr);
+            {
+                // One already-final (src, dst) pair — the remote address came from the credit, so
+                // this goes through the agent's below-the-splitter primitive, not the public path.
+                // A nullptr result (submission failure, logged by the agent) polls as kFAILURE.
+                TransferDescs const src{MemoryType::kVRAM,
+                    {MemoryDesc{reinterpret_cast<std::uintptr_t>(mCtx.arena->at(p.localOffset)), p.writeBytes,
+                        static_cast<std::uint32_t>(mCtx.deviceId)}}};
+                TransferDescs const dst{MemoryType::kVRAM, {MemoryDesc{p.remoteAddr, p.writeBytes, p.remoteDevId}}};
+                p.xfer = mCtx.agent.postXferRequest(TransferOp::kWRITE, src, dst, req.peer, std::nullopt);
+            }
             p.state = PostState::Writing;
             didWork = true;
             req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk was posted
@@ -1104,8 +1113,10 @@ bool BounceSender::pollSenderHandles()
             {
                 continue; // still gathering (drainGatherReady handles it) or DATA already sent
             }
-            XferState const st = mCtx.engine->poll(p.xfer);
-            if (st == XferState::kDone)
+            // wait(0) is one non-blocking status query: IN_PROGRESS / SUCCESS / FAILURE.
+            // A failed post left p.xfer null -> report FAILURE.
+            TransferState const st = p.xfer != nullptr ? p.xfer->wait(0) : TransferState::kFAILURE;
+            if (st == TransferState::kSUCCESS)
             {
                 // End the write span BEFORE building the DATA message so nixlWrite measures only the
                 // RDMA in-flight time; the DATA build/encode/enqueue cost gets its own span (it used
@@ -1123,18 +1134,20 @@ bool BounceSender::pollSenderHandles()
                     mCtx.channel->sendTo(
                         req.peer, encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, chunk.scatterRuns));
                 }
-                if (!mCtx.engine->release(p.xfer))
+                if (!p.xfer->release())
                 {
-                    // The write is terminal, so progress is safe; the engine retains the handle for retry.
+                    // The write is terminal, so progress is safe; the status object keeps the
+                    // handle and its destructor retries the backend release.
                     TLLM_LOG_WARNING("BounceTransport(%s): terminal write handle release deferred rid=%llu chunk=%u",
                         mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), p.chunkIdx);
                 }
+                p.xfer.reset();
                 p.state = PostState::Sent;
                 p.nvtxAckWait = bounceRangeStart(
                     kNvtxAckWait, "ackWait rid=%llu chunk=%u", static_cast<unsigned long long>(rid), p.chunkIdx);
                 didWork = true;
             }
-            else if (st == XferState::kFailed)
+            else if (st == TransferState::kFAILURE)
             {
                 toFail.push_back(rid);
                 break;
@@ -1259,18 +1272,19 @@ bool BounceSender::drainOrphanLocal()
     bool didWork = false;
     std::vector<OrphanLocal> keep;
     keep.reserve(mOrphanLocal.size());
-    for (auto const& o : mOrphanLocal)
+    for (auto& o : mOrphanLocal)
     {
-        if (mCtx.engine->poll(o.xfer) == XferState::kInProgress)
+        if (o.xfer != nullptr && o.xfer->wait(0) == TransferState::kIN_PROGRESS)
         {
-            keep.push_back(o); // write still in flight -> the NIC may still read the region; wait
+            keep.push_back(std::move(o)); // write still in flight -> the NIC may still read the region; wait
             continue;
         }
         // Terminal (Done or Failed): the NIC is finished with the region (source AND the receiver's
         // destination) -> recycle the local source now.
-        if (!mCtx.engine->release(o.xfer))
+        if (o.xfer != nullptr && !o.xfer->release())
         {
-            // The write is terminal, so recycling is safe; only the backend handle remains retained.
+            // The write is terminal, so recycling is safe; only the backend handle remains retained
+            // (the status object's destructor retries the release).
             TLLM_LOG_WARNING("BounceTransport(%s): terminal orphan handle release deferred rid=%llu",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid));
         }
@@ -1328,7 +1342,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
         bounceRangeEnd(p.nvtxAckWait);
         if (p.state == PostState::Writing)
         {
-            mOrphanLocal.push_back(OrphanLocal{p.xfer, p.localOffset, req.peer, rid});
+            mOrphanLocal.push_back(OrphanLocal{std::move(p.xfer), p.localOffset, req.peer, rid});
             deferredWrite = true;
             continue; // do NOT release xfer or recycle the region yet
         }
@@ -1405,7 +1419,7 @@ void BounceSender::failAll()
     // active write was canceled/released; retain failures for retry instead of polling forever and
     // letting a failed peer/backend hang teardown.
     std::lock_guard<std::mutex> lk(mReqMu);
-    std::vector<std::uint64_t> releaseRetry;
+    std::vector<std::unique_ptr<TransferStatus>> releaseRetry;
     for (auto& [rid, req] : mRequests)
     {
         for (auto& p : req.posted)
@@ -1413,11 +1427,11 @@ void BounceSender::failAll()
             bounceRangeEnd(p.nvtxGather);
             bounceRangeEnd(p.nvtxWrite);
             bounceRangeEnd(p.nvtxAckWait);
-            if (p.state == PostState::Writing)
+            if (p.state == PostState::Writing && p.xfer != nullptr)
             {
-                if (!mCtx.engine->release(p.xfer))
+                if (!p.xfer->release())
                 {
-                    releaseRetry.push_back(p.xfer);
+                    releaseRetry.push_back(std::move(p.xfer));
                 }
             }
             if (p.ctx != nullptr)
@@ -1443,19 +1457,19 @@ void BounceSender::failAll()
     mRequests.clear();
     // Cancel/release deferred writes without recycling their regions or sending deferred control
     // messages: no producer remains, and shutdown must not grant work against an arena being torn down.
-    for (auto const& o : mOrphanLocal)
+    for (auto& o : mOrphanLocal)
     {
-        if (!mCtx.engine->release(o.xfer))
+        if (o.xfer != nullptr && !o.xfer->release())
         {
-            releaseRetry.push_back(o.xfer);
+            releaseRetry.push_back(std::move(o.xfer));
         }
     }
     mOrphanLocal.clear();
     // Retry failed cancellations once after all producers/futures have been stopped. A persistent
-    // backend failure remains owned by the engine for its final bounded teardown attempt.
-    for (auto const handle : releaseRetry)
+    // backend failure gets a final bounded attempt from the status object's destructor.
+    for (auto& status : releaseRetry)
     {
-        if (!mCtx.engine->release(handle))
+        if (!status->release())
         {
             TLLM_LOG_WARNING(
                 "BounceTransport(%s): NIXL handle still retained after shutdown retry", mCtx.selfName.c_str());
@@ -1472,8 +1486,8 @@ void BounceSender::failAll()
 // ============================================================================
 
 BounceTransport::BounceTransport(std::string selfName, BounceConfig cfg, int deviceId, ControlChannel* channel,
-    TransferEngine* engine, BounceArena* arena, ExecPool* exec)
-    : mCtx(std::move(selfName), cfg, deviceId, channel, engine, arena, exec)
+    NixlTransferAgent& agent, BounceArena* arena, ExecPool* exec)
+    : mCtx(std::move(selfName), cfg, deviceId, channel, agent, arena, exec)
     , mReceiver(mCtx)
     , mSender(mCtx)
 {
