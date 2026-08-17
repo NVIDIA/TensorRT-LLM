@@ -1578,16 +1578,14 @@ class PyTorchModelEngine(ModelEngine):
                                       flashinfer_mxfp8_autotune)
 
         enable_trtllm_autotuner = self.llm_args.enable_autotuner
+        if not enable_trtllm_autotuner:
+            return
+
         mxfp8_methods = []
         for module in self.model.modules():
             quant_method = getattr(module, "quant_method", None)
             if isinstance(quant_method, MXFP8LinearMethod):
                 mxfp8_methods.append(quant_method)
-        if not enable_trtllm_autotuner:
-            for method in mxfp8_methods:
-                method.disable_native_autotune()
-                method.disable_flashinfer_auto()
-            return
 
         # This engine owns startup warmup, so it explicitly opts its MXFP8
         # methods into native tuning. Standalone modules and engine paths that

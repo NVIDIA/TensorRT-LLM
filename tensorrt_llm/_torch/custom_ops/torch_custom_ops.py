@@ -553,17 +553,14 @@ def _(
     return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
 
 
-# The 8K-input workload produces one-, two-, and three/four-request context
-# batches in these bands; their endpoints are validated on SM100 and SM103.
-_MXFP8_LARGE_M_BUCKETS = (8192, 16384, 32768)
-_MXFP8_LARGE_M_BANDS = ((6553, 8192), (13106, 16384), (19659, 32768))
 _MXFP8_AUTOTUNED_OP = "trtllm::mxfp8_mxfp8_gemm_autotuned::gemm"
 
 
 def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
     """Map known large-M bands to stable native autotuning profiles."""
-    for (lower_bound, upper_bound), bucket in zip(_MXFP8_LARGE_M_BANDS,
-                                                  _MXFP8_LARGE_M_BUCKETS):
+    for (lower_bound,
+         upper_bound), bucket in zip(MXFP8GemmRunner._LARGE_M_BANDS,
+                                     MXFP8GemmRunner._LARGE_M_BUCKETS):
         if lower_bound <= num_tokens <= upper_bound:
             return bucket
     return num_tokens
@@ -572,7 +569,7 @@ def _map_to_mxfp8_large_m_bucket(num_tokens: int) -> int:
 def _get_mxfp8_large_m_tuning_buckets(max_num_tokens: int) -> tuple[int, ...]:
     """Return large-M profiles reachable by the configured token limit."""
     mapped_max = _map_to_mxfp8_large_m_bucket(max_num_tokens)
-    return tuple(bucket for bucket in _MXFP8_LARGE_M_BUCKETS
+    return tuple(bucket for bucket in MXFP8GemmRunner._LARGE_M_BUCKETS
                  if bucket <= mapped_max)
 
 
@@ -589,6 +586,12 @@ class MXFP8GemmRunner(TunableRunner):
         output_dtype: Output element type. Supported types are FP16, BF16, and
             FP32.
     """
+
+    # The 8K-input workload produces one-, two-, and three/four-request
+    # context batches in these bands; their endpoints are validated on SM100
+    # and SM103.
+    _LARGE_M_BUCKETS = (8192, 16384, 32768)
+    _LARGE_M_BANDS = ((6553, 8192), (13106, 16384), (19659, 32768))
 
     runner_dict = dict()
     synced_cache_keys: ClassVar[WeakKeyDictionary[AutoTunerProfilingCache, dict[
