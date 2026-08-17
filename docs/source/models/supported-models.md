@@ -176,8 +176,12 @@ The following optimizations are available to models that implement
   Set `multimodal_config.encoder_cache_max_bytes` to its capacity (for example, `"512MiB"`), or
   `0` to disable it. Entries are cached per multimodal item, but a request reuses cached embeddings
   only when all of its items hit the cache. At present, only single-modality requests are cacheable;
-  mixed-modality requests bypass the cache. When combined with side-stream prefetch, peak memory is
-  the cache capacity plus any in-flight prefetched encoder inputs and outputs.
+  mixed-modality requests bypass the cache. For models with item-level encoder scheduling, the
+  cache also composes with the item path: cached items skip encoder execution after selection but
+  still count against the per-iteration item and token budgets, partially cached requests re-compute
+  only the missing items, and items encoded through the item path populate the cache for later
+  requests. When combined with side-stream prefetch, peak memory is the cache capacity plus any
+  in-flight prefetched encoder inputs and outputs.
 
 # Visual Generation Models
 

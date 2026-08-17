@@ -541,6 +541,26 @@ def _parse_binary_byte_string(value: Any) -> Any:
     return amount * multiplier
 
 
+class MultimodalEncoderSchedulingPolicy(StrEnum):
+    """Selects how a model that supports item-level MM encoder scheduling runs its encoder.
+
+    Ignored for models that do not support it (they always use legacy inline
+    encode).
+    """
+
+    DISABLED = "DISABLED"
+    """Legacy inline encode: the encoder runs inside the model forward, not as
+    a separately scheduled step. Item scheduling and its byte budget are off."""
+
+    DEFAULT = "DEFAULT"
+    """Item scheduling (``MultimodalScheduler``): the executor encodes atomic
+    MM items as a separate, budgeted step before prefill."""
+
+    EAGER = "EAGER"
+    """Item scheduling that advances encoder work for active requests before
+    LLM capacity filtering (``MultimodalEagerEncoderScheduler``)."""
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -569,14 +589,23 @@ class MultimodalConfig(StrictBaseModel):
     encoder_cache_max_bytes: NonNegativeInt = Field(
         default=134_217_728,  # 128 MiB.
         description=
-        ("Maximum bytes for the per-model cross-request multimodal encoder embedding cache. "
-         "Set to 0 to disable. String values such as '512MB' and '1GiB' use binary units. "
-         "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
-         "every item in the request must hit the cache before cached embeddings are reused. "
-         "Only single-modality requests are cacheable for the time being. "
-         "Can be combined with encoder_side_stream_max_ahead. "
-         "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
-         ),
+        ("Maximum bytes for the opt-in multimodal encoder embedding cache; 0 "
+         "disables it. String values such as '512MB' and '1GiB' use binary "
+         "units. Inline encoding caches whole single-modality requests; item "
+         "scheduling caches individual items. Compatible with side-stream "
+         "prefetch; their memory limits are additive."),
+        status="prototype",
+    )
+
+    encoder_scheduling_policy: MultimodalEncoderSchedulingPolicy = Field(
+        default=MultimodalEncoderSchedulingPolicy.DEFAULT,
+        description=(
+            "MM encoder scheduling policy for models that support item-level "
+            "encoder scheduling. DISABLED: legacy inline encode (item "
+            "scheduling and its byte budget off). DEFAULT: item scheduling. "
+            "EAGER: item scheduling that advances encoder work for active "
+            "requests before LLM capacity filtering. Ignored for models that "
+            "do not support item scheduling."),
         status="prototype",
     )
 
@@ -5197,11 +5226,13 @@ class TorchLlmArgs(BaseLlmArgs):
     encoder_max_batch_size: Optional[int] = Field(
         default=None,
         description=
-        ("Maximum encoder batch size. For encoder-decoder models, this also "
-         "controls encoder microbatch admission and limits encoder CUDA graph "
-         "batch sizes. For multimodal models, this is the shared "
-         "AttentionMetadata budget across all encoded modalities. Falls back "
-         "to `max_batch_size` when unset."),
+        ("Maximum number of top-level encoder inputs processed in one "
+         "iteration. For encoder-decoder models, each encoder request counts "
+         "as one input. For multimodal models, each atomic image, video, or "
+         "other encoder item counts as one input, even if it expands into "
+         "multiple internal attention sequences. For encoder-decoder models, "
+         "it also limits encoder CUDA graph batch sizes. Falls back to "
+         "`max_batch_size` when unset."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[int] = Field(
@@ -5209,8 +5240,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description=(
             "Maximum number of encoder tokens. For encoder-decoder models, this "
             "limits encoder CUDA graph total-token buckets. For multimodal "
-            "models, this is the shared AttentionMetadata budget across all "
-            "encoded modalities. Falls back to `max_num_tokens` when unset."),
+            "models, it limits encoder attention tokens scheduled in one "
+            "iteration and is shared across all encoded modalities. It falls "
+            "back to `max_num_tokens` when unset. Because an atomic multimodal "
+            "item cannot be split, the effective budget is raised to the "
+            "model's largest atomic item when necessary."),
         status="prototype")
 
     @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
@@ -5240,6 +5274,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if missing:
             raise ValueError("encoder_cuda_graph_config requires "
                              f"{' and '.join(missing)}.")
+
         return self
 
     attn_backend: str = Field(
@@ -5565,20 +5600,6 @@ class TorchLlmArgs(BaseLlmArgs):
     @quant_config.setter
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
-
-    def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
-        """Return encoder runtime batch and token limits.
-
-        Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
-        back to the LLM-side `max_batch_size` / `max_num_tokens` when the
-        encoder-specific knobs are not set.
-        """
-        return (
-            self.encoder_max_batch_size
-            if self.encoder_max_batch_size is not None else self.max_batch_size,
-            self.encoder_max_num_tokens
-            if self.encoder_max_num_tokens is not None else self.max_num_tokens,
-        )
 
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(
