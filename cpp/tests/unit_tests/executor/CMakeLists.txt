@@ -53,7 +53,7 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
     target_compile_definitions(transferAgentTest PRIVATE TEST_NIXL_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_NIXL_BACKEND=1)
 
-    # NIXL bounce v2 tests (nixlTransferEngineTest / bounceNixlE2ETest /
+    # NIXL bounce v2 tests (bounceTransportTest / bounceTransportFailureTest /
     # bounceAgentE2ETest) live in bounce/CMakeLists.txt.
   endif()
 
