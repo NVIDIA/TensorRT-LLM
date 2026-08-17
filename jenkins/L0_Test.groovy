@@ -347,15 +347,32 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     pipeline.stage('Submit Test Result') {
         sh "ls -al ${stageName}/ || true"
 
+        if (suppressTestReporting) {
+            // This attempt is superseded by a planned retry. Rename its XMLs so
+            // Collect Test Result does not ingest them after extracting the tar.
+            // The progress snapshot still contains the old names, so it must not
+            // be promoted and the modified directory must be uploaded instead.
+            sh """
+                cd ${stageName} && for f in results*.xml; do
+                    [ -e "\$f" ] && mv "\$f" "superseded-\$f"
+                done || true
+            """
+        }
+
         // Promote progress tar to final path, or fall back to direct upload.
         // progress_upload_snapshot.sh writes the sentinel on each successful PUT.
-        if (!promoteProgressTar(stageName, postTag)) {
-            // Progress upload never succeeded (Artifactory unreachable, watcher not started, etc.).
-            // Fall back to original approach: tar local XML files and upload directly.
-            // Use --transform so tar contents carry the postTag filename without touching disk files.
-            echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
+        if (suppressTestReporting || !promoteProgressTar(stageName, postTag)) {
+            if (suppressTestReporting) {
+                echo "[PROGRESS-UPLOAD] ${stageName}: results*.xml changed on disk, re-uploading instead of promoting progress tar"
+            } else {
+                // Progress upload never succeeded (Artifactory unreachable, watcher not started, etc.).
+                echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
+            }
+            // Fall back to the original approach: tar the local stage directory
+            // and upload it directly. Use --transform so tar contents carry the
+            // postTag filename without touching on-disk results*.xml files.
             def xmlCount = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger()
-            if (xmlCount > 0) {
+            if (suppressTestReporting || xmlCount > 0) {
                 def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
                 sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
                 ensureStageResultNotUploaded("${stageName}${postTag}")
@@ -408,8 +425,9 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         }
     }
 
-    // Rename local results*.xml with postTag so junit() reports each attempt separately.
-    // This is the only place we touch disk files; snapshot.sh uses --transform instead.
+    // For a reportable attempt, rename local results*.xml with postTag so
+    // junit() reports each attempt separately. Superseded attempts were already
+    // renamed above and therefore do not match this loop.
     if (postTag) {
         sh """
             cd ${stageName}
@@ -3158,6 +3176,11 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                 freezeCbtsCoverage(stageName)
             }
             echo "Upload test results."
+            // promoteProgressTar is a server-side move of the already-uploaded
+            // progress snapshot. It is only valid when on-disk results*.xml are
+            // unchanged from that snapshot. After a rename (or any other local
+            // XML mutation) the snapshot is stale and must be re-tarred.
+            boolean xmlsMutated = false
             if (suppressTestReporting) {
                 // This attempt is superseded by a planned retry. Keep the tar for
                 // forensics, but move its result XMLs aside so the top-level Collect
@@ -3170,10 +3193,15 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                         [ -e "\$f" ] && mv "\$f" "superseded-\$f"
                     done || true
                 """
+                xmlsMutated = true
             }
 
-            if (!promoteProgressTar(stageName, postTag)) {
-                echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
+            if (xmlsMutated || !promoteProgressTar(stageName, postTag)) {
+                if (xmlsMutated) {
+                    echo "[PROGRESS-UPLOAD] ${stageName}: results*.xml changed on disk, re-uploading instead of promoting progress tar"
+                } else {
+                    echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
+                }
                 def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
                 sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
                 trtllm_utils.uploadArtifacts(
