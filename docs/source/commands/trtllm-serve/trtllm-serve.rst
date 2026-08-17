@@ -385,6 +385,8 @@ Example
 
 Open the trace files in `ui.perfetto.dev <https://ui.perfetto.dev/>`_ or ``chrome://tracing``. Each captured iteration is wrapped in a ``step[EXTEND bs=N toks=M]`` or ``step[DECODE bs=N]`` user-annotation scope.
 
+With the overlap scheduler enabled, sampling for an iteration runs after the previous batch is updated, so it cannot share the forward scope. That region is emitted as a separate ``step[...] sample`` scope. Only the bare ``step[...]`` labels mark iteration boundaries; ignore the ``sample``-suffixed ones when counting iterations.
+
 For a full benchmarking + profiling workflow (including multi-cycle capture under steady-state load), see :doc:`run-benchmark-with-trtllm-serve`.
 
 .. _configuring-with-yaml-files:

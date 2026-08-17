@@ -99,15 +99,83 @@ def test_stop_profile(server_with_mock_generator):
 def test_start_profile_backend_error_returns_500(server_with_mock_generator):
     server = server_with_mock_generator
     # A RuntimeError whose message contains neither "already in progress"
-    # nor "pending" is treated as a generic backend failure (500); the
-    # 409 path is covered by test_http_handler_rejects_double_start_with_409
-    # in test_profile_endpoints_bugs.py.
+    # nor "pending" is treated as a generic backend failure (500). The
+    # backend-side rejection that produces those messages is covered by
+    # tests/unittest/_torch/executor/test_profile_endpoints.py; the
+    # HTTP-side 409 mapping is covered below.
     server.generator.start_profile.side_effect = RuntimeError("boom")
     response = asyncio.run(server.start_profile(StartProfileRequest()))
 
     assert response.status_code == 500
     body = _extract_json(response)
+    assert body["success"] is False
     assert "boom" in body["message"]
+
+
+@pytest.mark.parametrize(
+    "backend_message",
+    [
+        "Profiling is already in progress (state: _profile_enabled=True)",
+        "a pending start has been scheduled; call stop_profile first",
+    ],
+    ids=["already-in-progress", "pending-start"],
+)
+def test_start_profile_double_start_returns_409(server_with_mock_generator, backend_message):
+    """A rejected overlapping profile window maps to 409, not 500.
+
+    ``PyExecutorProfileManager.start_profile`` raises ``RequestError``
+    (a ``RuntimeError`` subclass) when a window is already active or a
+    start is already pending. The handler distinguishes that from a
+    generic backend failure so callers can retry instead of treating it
+    as a server fault.
+    """
+    server = server_with_mock_generator
+    server.generator.start_profile.side_effect = RuntimeError(backend_message)
+    response = asyncio.run(server.start_profile(StartProfileRequest()))
+
+    assert response.status_code == 409
+    body = _extract_json(response)
+    assert body["success"] is False
+    assert body["message"] == backend_message
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        OSError("cannot create output_dir"),
+        ValueError("num_steps must be >= 1"),
+        TimeoutError("worker ack timed out"),
+    ],
+    ids=["oserror", "valueerror", "timeouterror"],
+)
+def test_start_profile_non_runtime_errors_return_500(server_with_mock_generator, exc):
+    """The non-``RuntimeError`` handler branch also answers 500.
+
+    ``OSError`` (output_dir creation), ``ValueError`` (schema rejection
+    that bypassed Pydantic) and ``TimeoutError`` (ack wait gave up) are
+    caught explicitly; anything else propagates to FastAPI.
+    """
+    server = server_with_mock_generator
+    server.generator.start_profile.side_effect = exc
+    response = asyncio.run(server.start_profile(StartProfileRequest()))
+
+    assert response.status_code == 500
+    body = _extract_json(response)
+    assert body["success"] is False
+    assert str(exc) in body["message"]
+
+
+def test_start_profile_unexpected_error_propagates(server_with_mock_generator):
+    """Unlisted exception types must not be swallowed as a generic 500.
+
+    They propagate to FastAPI's middleware so the server log keeps a
+    real stack trace.
+    """
+    server = server_with_mock_generator
+    server.generator.start_profile.side_effect = KeyError("unexpected")
+
+    with pytest.raises(KeyError):
+        asyncio.run(server.start_profile(StartProfileRequest()))
 
 
 def test_stop_profile_backend_error_returns_500(server_with_mock_generator):
@@ -118,6 +186,33 @@ def test_stop_profile_backend_error_returns_500(server_with_mock_generator):
     assert response.status_code == 500
     body = _extract_json(response)
     assert "nope" in body["error"]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        OSError("trace flush failed"),
+        TimeoutError("stop ack timed out"),
+    ],
+    ids=["oserror", "timeouterror"],
+)
+def test_stop_profile_non_runtime_errors_return_500(server_with_mock_generator, exc):
+    """``/stop_profile`` catches ``OSError`` and ``TimeoutError`` too."""
+    server = server_with_mock_generator
+    server.generator.stop_profile.side_effect = exc
+    response = asyncio.run(server.stop_profile())
+
+    assert response.status_code == 500
+    assert _extract_json(response) == {"error": str(exc)}
+
+
+def test_stop_profile_unexpected_error_propagates(server_with_mock_generator):
+    """Unlisted exception types propagate instead of becoming a 500."""
+    server = server_with_mock_generator
+    server.generator.stop_profile.side_effect = KeyError("unexpected")
+
+    with pytest.raises(KeyError):
+        asyncio.run(server.stop_profile())
 
 
 def _async_loop_block_test(handler_call, backend_block_s: float = 0.3) -> float:

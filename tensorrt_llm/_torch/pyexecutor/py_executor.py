@@ -577,6 +577,14 @@ class PyExecutor:
         # the iteration-scoped stop and (when triggered via an HTTP
         # handler) the server tickles the executor loop so the stop fires
         # even when the engine is otherwise idle.
+        #
+        # ``_profile_state_lock`` guards every read and write of
+        # ``_profile_enabled`` AND of the pending markers /
+        # ``_runtime_profile_*`` window fields above. Both the
+        # re-entrancy guard in ``start_profile()`` and the
+        # cancel-vs-schedule decision in ``apply_stop_config()`` depend
+        # on that combined state, and they race against the executor
+        # thread flipping the same fields inside ``profile_step``.
         self._profile_state_lock = threading.Lock()
         self._profile_enabled: bool = False
 
@@ -1802,10 +1810,14 @@ class PyExecutor:
         """
         return self._profile_manager.apply_start_config(config)
 
-    def _apply_profile_stop_config(self) -> None:
+    def _apply_profile_stop_config(self) -> bool:
         """Apply a broadcasted profile-stop on this rank.
 
         Forwards to ``PyExecutorProfileManager.apply_stop_config``.
+
+        Returns:
+            ``True`` when a pending start was cancelled before it
+            fired, ``False`` when a stop iteration was scheduled.
         """
         return self._profile_manager.apply_stop_config()
 
@@ -4067,7 +4079,8 @@ class PyExecutor:
         self._append_iter_stats(stats)
 
     def _build_step_scope_label(self,
-                                scheduled_batch: ScheduledRequests) -> str:
+                                scheduled_batch: ScheduledRequests,
+                                phase: Optional[str] = None) -> str:
         """Format a per-iteration scope label for ``torch.profiler``.
 
         The label uses a ``step[...]`` convention that exposes per-iteration
@@ -4083,15 +4096,32 @@ class PyExecutor:
             and ``toks`` is the total number of context tokens being
             processed this iteration (sum of each request's
             ``context_chunk_size``).
+
+        Exactly one bare ``step[...]`` scope is emitted per iteration, so a
+        trace consumer can derive iteration boundaries by counting them.
+        The overlap-scheduler loop cannot wrap the whole iteration in a
+        single scope -- ``_update_requests`` for the previous batch runs
+        between the forward and the sampling region -- so it emits its
+        second, non-nested scope with a ``phase`` suffix
+        (``step[...] sample``). Suffixed labels are distinct strings and
+        must not be counted as iteration boundaries.
+
+        Args:
+            scheduled_batch: The batch scheduled for this iteration.
+            phase: Optional sub-iteration phase name. When set, it is
+                appended after the bracketed body to keep the resulting
+                label distinguishable from the bare per-iteration label.
         """
         num_ctx = scheduled_batch.num_context_requests
         num_gen = scheduled_batch.num_generation_requests
         if num_ctx == 0:
-            return f"step[DECODE bs={num_gen}]"
-        total_toks = 0
-        for req in scheduled_batch.context_requests:
-            total_toks += int(getattr(req, "context_chunk_size", 0) or 0)
-        return f"step[EXTEND bs={num_ctx} toks={total_toks}]"
+            label = f"step[DECODE bs={num_gen}]"
+        else:
+            total_toks = 0
+            for req in scheduled_batch.context_requests:
+                total_toks += int(getattr(req, "context_chunk_size", 0) or 0)
+            label = f"step[EXTEND bs={num_ctx} toks={total_toks}]"
+        return f"{label} {phase}" if phase else label
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -4620,11 +4650,17 @@ class PyExecutor:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
-                # Per-iteration scope label for torch.profiler. Reused to
-                # wrap forward and sample calls below so the resulting
-                # chrome trace has ``step[...]`` user_annotation scopes
-                # marking each iteration.
+                # Per-iteration scope labels for torch.profiler. The
+                # overlap loop runs ``_update_requests`` for the previous
+                # batch between the forward and the sampling region, so the
+                # two cannot share one enclosing scope. Only the forward
+                # scope carries the bare ``step[...]`` label that marks an
+                # iteration boundary; the sampling scope gets a ``sample``
+                # phase suffix so trace consumers counting ``step[...]``
+                # annotations still see exactly one per iteration.
                 step_scope_label = self._build_step_scope_label(scheduled_batch)
+                sample_scope_label = self._build_step_scope_label(
+                    scheduled_batch, phase="sample")
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -4792,7 +4828,7 @@ class PyExecutor:
                     guided_decoder_failed_requests = None
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
-                        with torch.profiler.record_function(step_scope_label):
+                        with torch.profiler.record_function(sample_scope_label):
                             if self.guided_decoder is not None:
                                 # add_batch must be called again to have updated new tokens.
                                 self.guided_decoder.add_batch(scheduled_batch)

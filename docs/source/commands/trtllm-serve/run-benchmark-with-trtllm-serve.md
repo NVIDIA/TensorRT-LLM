@@ -242,6 +242,8 @@ For the full request body schema and response codes (including the `409` for dou
 
 5. **Open the traces** in [ui.perfetto.dev](https://ui.perfetto.dev/) or `chrome://tracing`. Each captured iteration is wrapped in a `step[EXTEND bs=N toks=M]` / `step[DECODE bs=N]` scope.
 
+   With the overlap scheduler enabled, sampling for an iteration runs after the previous batch is updated, so it cannot share the forward scope. That region is emitted as a separate `step[...] sample` scope. Only the bare `step[...]` labels mark iteration boundaries; ignore the `sample`-suffixed ones when counting iterations.
+
 ### Open-ended window (manual stop)
 
 Omit `num_steps` if you want to profile "from now until I say stop". You must call `/stop_profile` to flush the trace:

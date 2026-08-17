@@ -172,19 +172,43 @@ class PyExecutorProfileManager:
         (e.g. from the ``trtllm-serve /start_profile`` HTTP handler).
 
         Runs on the caller thread (FastAPI worker thread / user
-        thread). Marks ``_runtime_profile_pending_start_iter`` locally
-        so a concurrent second call is rejected immediately, then
-        broadcasts the config on rank 0 via the executor's request
-        queue so every rank sees the same start.
+        thread). Atomically claims
+        ``_runtime_profile_pending_start_iter`` under
+        ``_profile_state_lock`` so a concurrent second call is
+        rejected immediately, then broadcasts the config on rank 0 via
+        the executor's request queue so every rank sees the same start.
         """
         executor = self._executor
         # Reject overlapping profile windows. Check locally on the
         # caller thread so the HTTP handler gets a clean error instead
         # of the executor thread crashing on ``assert not enabled``
         # inside ``profile_step``.
+        #
+        # The check and the claim of the pending marker must happen in
+        # one critical section. Two ``POST /start_profile`` requests
+        # are dispatched through ``asyncio.to_thread`` onto different
+        # worker threads, and the in-process / Ray paths call
+        # ``PyExecutor.start_profile`` directly without the
+        # single-owner-thread serialization that
+        # ``GenerationExecutorProxy`` applies. A non-atomic
+        # check-then-set would let both callers pass the guard and
+        # broadcast a profile start, and the second
+        # ``apply_start_config`` would overwrite the trace path and
+        # activities of the first window.
         with executor._profile_state_lock:
             already_active = executor._profile_enabled
-        if already_active or executor._runtime_profile_pending_start_iter is not None:
+            pending_start = executor._runtime_profile_pending_start_iter
+            claimed = not already_active and pending_start is None
+            if claimed:
+                # Claim the window before releasing the lock. The
+                # sentinel (0) means "pending but not yet scheduled";
+                # the real ``profile_start_iters`` / trace_path state
+                # is only populated once the broadcast reaches
+                # ``_handle_special_queue_items``. Every failure path
+                # below rolls the claim back under the same lock.
+                executor._runtime_profile_pending_start_iter = 0
+
+        if not claimed:
             # Use ``RequestError`` (a ``RuntimeError`` subclass) so the
             # ``GenerationExecutor`` error monitor treats this as a
             # per-call rejection rather than a fatal engine error.
@@ -195,12 +219,54 @@ class PyExecutorProfileManager:
                 "been scheduled); call stop_profile first before starting "
                 "a new window. (state: _profile_enabled="
                 f"{already_active}, _runtime_profile_pending_start_iter="
-                f"{executor._runtime_profile_pending_start_iter}, "
+                f"{pending_start}, "
                 f"profile_start_iters="
                 f"{sorted(executor.profile_start_iters)[:5]}, "
                 f"profile_stop_iters="
                 f"{sorted(executor.profile_stop_iters)[:5]})"
             )
+
+        started = False
+        try:
+            self._prepare_and_broadcast_start(output_dir, num_steps, start_step, activities)
+            started = True
+        finally:
+            if not started:
+                # Validation error, ``output_dir`` creation failure or
+                # a failed broadcast: release the claim so a
+                # subsequent ``start_profile()`` is not rejected as
+                # "already pending", and so non-zero ranks (which
+                # never received the broadcast) do not drift out of
+                # sync with rank 0.
+                self._release_pending_start()
+
+    def _release_pending_start(self) -> None:
+        """Roll back the pending-start claim taken by ``start_profile``.
+
+        Mutates the shared markers under ``_profile_state_lock`` so the
+        rollback is atomic with respect to a concurrent
+        ``start_profile()`` / ``stop_profile()`` on another thread.
+        """
+        executor = self._executor
+        with executor._profile_state_lock:
+            executor._runtime_profile_pending_start_iter = None
+            executor._runtime_profile_activities = None
+
+    def _prepare_and_broadcast_start(
+        self,
+        output_dir: Optional[str],
+        num_steps: Optional[int],
+        start_step: int,
+        activities: Optional[List[str]],
+    ) -> None:
+        """Validate and broadcast a profile window already claimed.
+
+        Split out of ``start_profile`` so every failure path between
+        the pending-start claim and the successful broadcast rolls the
+        claim back through a single ``finally``. Must only be called
+        once ``_runtime_profile_pending_start_iter`` has been claimed.
+        """
+        executor = self._executor
 
         # Reject ``num_steps <= 0``. The HTTP layer already rejects
         # this via the ``StartProfileRequest`` Pydantic schema, but
@@ -270,14 +336,11 @@ class PyExecutorProfileManager:
             "num_steps": num_steps,
         }
 
-        # Mark pending on the caller thread too so a second
-        # concurrent ``start_profile()`` is rejected by the guard
-        # above. The actual ``profile_start_iters`` / trace_path
-        # state is only populated when the broadcast reaches
-        # ``_handle_special_queue_items``. Use a sentinel (0) to
-        # mean "pending but not yet scheduled".
-        executor._runtime_profile_pending_start_iter = 0
-        executor._runtime_profile_activities = list(activities)
+        # The pending marker was already claimed by ``start_profile``;
+        # publish the requested activities under the same lock so a
+        # concurrent reader never observes a half-written window.
+        with executor._profile_state_lock:
+            executor._runtime_profile_activities = list(activities)
 
         # Broadcast to every rank via the request queue so non-zero
         # ranks update their own ``profile_start_iters`` in
@@ -294,15 +357,12 @@ class PyExecutorProfileManager:
             try:
                 eq.enqueue_profile_start_request(profile_config)
             except (RuntimeError, OSError, ValueError, AttributeError) as e:
-                # Roll back the pending markers we just set so a
-                # subsequent ``start_profile()`` is not rejected as
-                # "already pending", and so non-zero ranks (which
-                # never received the broadcast) don't drift out of
-                # sync with rank 0. Then surface the failure to the
-                # HTTP layer rather than silently logging and
-                # continuing.
-                executor._runtime_profile_pending_start_iter = None
-                executor._runtime_profile_activities = None
+                # ``start_profile``'s ``finally`` rolls the pending
+                # markers back, so a subsequent ``start_profile()`` is
+                # not rejected as "already pending" and non-zero ranks
+                # (which never received the broadcast) don't drift out
+                # of sync with rank 0. Surface the failure to the HTTP
+                # layer rather than silently logging and continuing.
                 raise RuntimeError(
                     f"start_profile: failed to enqueue profile-start broadcast item: {e}"
                 ) from e
@@ -329,43 +389,21 @@ class PyExecutorProfileManager:
           ``OpenAIServer.stop_profile``).
         """
         executor = self._executor
-        with executor._profile_state_lock:
-            currently_enabled = executor._profile_enabled
-
-        if not currently_enabled and executor._runtime_profile_pending_start_iter is not None:
-            # Pending runtime start has not fired yet; cancel it
-            # cleanly on this rank.  Also broadcast the stop so
-            # non-zero ranks clear their own pending starts —
-            # otherwise a ``start_profile``-then-``stop_profile``
-            # cycle on an idle multi-rank deployment would leave
-            # stale pending starts on the subordinates.
-            self.apply_stop_config()
-            rank = getattr(getattr(executor, "dist", None), "rank", 0)
-            eq = getattr(executor, "executor_request_queue", None)
-            if rank == 0 and eq is not None:
-                try:
-                    eq.enqueue_profile_stop_request()
-                except (RuntimeError, OSError, ValueError, AttributeError) as e:
-                    # Local cancel already happened on this rank,
-                    # but subordinate ranks would still be carrying
-                    # the pending start. Surface the broadcast
-                    # failure so the caller can retry rather than
-                    # silently leaving the cluster out of sync.
-                    raise RuntimeError(
-                        f"stop_profile: failed to enqueue profile-stop broadcast item: {e}"
-                    ) from e
-            return
-
         # Apply locally so diagnostic state (profile_stop_iters,
         # pending_stop_iter) is visible on the caller thread
-        # immediately.
-        self.apply_stop_config()
+        # immediately. ``apply_stop_config`` decides atomically
+        # whether it cancelled a start that had not fired yet or
+        # scheduled a stop for an active window.
+        cancelled_pending_start = self.apply_stop_config()
 
         # Broadcast to every rank so non-zero ranks add the same
-        # stop_iter to their own profile_stop_iters. Also wakes the
-        # idle executor loop on rank 0; the broadcast then
-        # propagates the wake to all ranks inside
-        # ``_fetch_and_enqueue_requests``.
+        # stop_iter to their own profile_stop_iters (or, in the
+        # cancel case, clear their own pending starts — otherwise a
+        # ``start_profile``-then-``stop_profile`` cycle on an idle
+        # multi-rank deployment would leave stale pending starts on
+        # the subordinates). Also wakes the idle executor loop on
+        # rank 0; the broadcast then propagates the wake to all ranks
+        # inside ``_fetch_and_enqueue_requests``.
         rank = getattr(getattr(executor, "dist", None), "rank", 0)
         eq = getattr(executor, "executor_request_queue", None)
         if rank == 0 and eq is not None:
@@ -378,6 +416,11 @@ class PyExecutorProfileManager:
                 raise RuntimeError(
                     f"stop_profile: failed to enqueue profile-stop broadcast item: {e}"
                 ) from e
+
+        if cancelled_pending_start:
+            # Nothing was ever started on this rank, so there is no
+            # trace to flush and nothing to wait for.
+            return
 
         # Wait (with timeout) for the stop to actually fire so that
         # by the time stop_profile() returns the chrome trace has
@@ -437,35 +480,40 @@ class PyExecutorProfileManager:
         trace_filename = f"trtllm-trace-{profile_id}-rank-{executor.global_rank}.json"
         trace_path = os.path.join(output_dir, trace_filename)
 
-        # First apply on this rank? If the start_iter is already in
-        # profile_start_iters it means either rank 0's local apply
-        # ran (before the broadcast echo-back) or a prior broadcast
-        # already applied — in both cases the pending marker
-        # belongs to the original apply, and re-setting it here
-        # would overwrite a subsequent clear by ``profile_step()``
-        # and leak stale state.
-        is_first_apply = start_iter not in executor.profile_start_iters
+        # Publish the whole window under ``_profile_state_lock`` so a
+        # concurrent ``start_profile()`` / ``stop_profile()`` on a
+        # caller thread never observes a half-applied window (this
+        # method runs on the executor thread for the broadcast path).
+        with executor._profile_state_lock:
+            # First apply on this rank? If the start_iter is already in
+            # profile_start_iters it means either rank 0's local apply
+            # ran (before the broadcast echo-back) or a prior broadcast
+            # already applied — in both cases the pending marker
+            # belongs to the original apply, and re-setting it here
+            # would overwrite a subsequent clear by ``profile_step()``
+            # and leak stale state.
+            is_first_apply = start_iter not in executor.profile_start_iters
 
-        executor._runtime_profile_trace_path = trace_path
-        executor._runtime_profile_activities = list(activities)
-        executor._runtime_profile_cuda_only = (
-            len(activities) == 1 and activities[0].upper() == "CUDA_PROFILER"
-        )
+            executor._runtime_profile_trace_path = trace_path
+            executor._runtime_profile_activities = list(activities)
+            executor._runtime_profile_cuda_only = (
+                len(activities) == 1 and activities[0].upper() == "CUDA_PROFILER"
+            )
 
-        executor.profile_start_iters.add(start_iter)
-        if is_first_apply:
-            executor._runtime_profile_pending_start_iter = start_iter
-            if stop_iter is not None:
+            executor.profile_start_iters.add(start_iter)
+            if is_first_apply:
+                executor._runtime_profile_pending_start_iter = start_iter
+                if stop_iter is not None:
+                    executor.profile_stop_iters.add(int(stop_iter))
+                    executor._runtime_profile_pending_stop_iter = int(stop_iter)
+                # ``num_steps is None`` branch: leave pending_stop_iter
+                # alone — caller set it to None in start_profile.
+            elif stop_iter is not None:
+                # Broadcast echoes back to rank 0 after its local apply,
+                # or after the start has already fired. Only ensure the
+                # stop iter is in the set on this rank (idempotent);
+                # don't reset pending markers.
                 executor.profile_stop_iters.add(int(stop_iter))
-                executor._runtime_profile_pending_stop_iter = int(stop_iter)
-            # ``num_steps is None`` branch: leave pending_stop_iter
-            # alone — caller set it to None in start_profile.
-        elif stop_iter is not None:
-            # Broadcast echoes back to rank 0 after its local apply,
-            # or after the start has already fired. Only ensure the
-            # stop iter is in the set on this rank (idempotent);
-            # don't reset pending markers.
-            executor.profile_stop_iters.add(int(stop_iter))
 
         logger.info(
             f"_apply_profile_start_config[rank={executor.global_rank}]: "
@@ -474,32 +522,23 @@ class PyExecutorProfileManager:
             f"is_first_apply={is_first_apply}"
         )
 
-    def apply_stop_config(self) -> None:
+    def apply_stop_config(self) -> bool:
         """Apply a broadcasted profile-stop to this rank.
 
         Handles both the cancel-pending-start case and the
         schedule-a-stop case so the broadcast from rank 0 replays
-        correctly on every rank.
+        correctly on every rank. The whole decision runs under
+        ``_profile_state_lock`` so a concurrent ``start_profile()`` on
+        another thread cannot claim a pending start between the check
+        and the marker updates.
+
+        Returns:
+            ``True`` when a pending start was cancelled before it
+            fired (nothing was profiled, so there is no trace to
+            flush), ``False`` when a stop iteration was scheduled for
+            an active window.
         """
         executor = self._executor
-        with executor._profile_state_lock:
-            currently_enabled = executor._profile_enabled
-
-        if not currently_enabled and executor._runtime_profile_pending_start_iter is not None:
-            pending_start = executor._runtime_profile_pending_start_iter
-            pending_stop = executor._runtime_profile_pending_stop_iter
-            executor.profile_start_iters.discard(pending_start)
-            if pending_stop is not None:
-                executor.profile_stop_iters.discard(pending_stop)
-            executor._runtime_profile_pending_start_iter = None
-            executor._runtime_profile_pending_stop_iter = None
-            logger.info(
-                f"_apply_profile_stop_config[rank={executor.global_rank}]: "
-                f"cancelled pending start at iteration {pending_start} "
-                "before it fired"
-            )
-            return
-
         # Fire condition inside profile_step(): stop iter matches
         # ``self.iter_counter`` at the top of the NEXT executor loop
         # iteration. ``iter_counter`` is incremented at the END of
@@ -511,12 +550,34 @@ class PyExecutorProfileManager:
         # enough to flush.
         current_iter = getattr(executor, "iter_counter", 0)
         stop_iter = current_iter + 1
-        executor.profile_stop_iters.add(stop_iter)
-        executor._runtime_profile_pending_stop_iter = stop_iter
-        logger.info(
-            f"_apply_profile_stop_config[rank={executor.global_rank}]: "
-            f"scheduled stop at iteration {stop_iter}"
-        )
+
+        with executor._profile_state_lock:
+            currently_enabled = executor._profile_enabled
+            pending_start = executor._runtime_profile_pending_start_iter
+            cancelled_pending_start = not currently_enabled and pending_start is not None
+            if cancelled_pending_start:
+                pending_stop = executor._runtime_profile_pending_stop_iter
+                executor.profile_start_iters.discard(pending_start)
+                if pending_stop is not None:
+                    executor.profile_stop_iters.discard(pending_stop)
+                executor._runtime_profile_pending_start_iter = None
+                executor._runtime_profile_pending_stop_iter = None
+            else:
+                executor.profile_stop_iters.add(stop_iter)
+                executor._runtime_profile_pending_stop_iter = stop_iter
+
+        if cancelled_pending_start:
+            logger.info(
+                f"_apply_profile_stop_config[rank={executor.global_rank}]: "
+                f"cancelled pending start at iteration {pending_start} "
+                "before it fired"
+            )
+        else:
+            logger.info(
+                f"_apply_profile_stop_config[rank={executor.global_rank}]: "
+                f"scheduled stop at iteration {stop_iter}"
+            )
+        return cancelled_pending_start
 
     # ---- per-iteration driver (executor thread) --------------------
 
@@ -629,18 +690,21 @@ class PyExecutorProfileManager:
                     torch.cuda.cudart().cudaProfilerStop()
                     calibrator.stop()
                     enabled = False
-                    with executor._profile_state_lock:
-                        executor._profile_enabled = False
                     # Reset lazy state so a subsequent start/stop
                     # window can pick up a fresh runtime
                     # configuration.
                     torch_profiler = None
                     active_torch_trace_path = None
-                    # Clear the pending-stop marker so
-                    # ``start_profile()``'s guard no longer sees a
-                    # stale window.
-                    if executor._runtime_profile_pending_stop_iter == executor.iter_counter:
-                        executor._runtime_profile_pending_stop_iter = None
+                    with executor._profile_state_lock:
+                        executor._profile_enabled = False
+                        # Clear the pending-stop marker so
+                        # ``start_profile()``'s guard no longer sees a
+                        # stale window. Same critical section as
+                        # ``_profile_enabled`` so a caller thread
+                        # cannot observe "not enabled but still
+                        # pending" and reject a legitimate restart.
+                        if executor._runtime_profile_pending_stop_iter == executor.iter_counter:
+                            executor._runtime_profile_pending_stop_iter = None
                 active_enable_torch_trace = False
 
             # Capture per-loop timing whenever stats or the iter log
@@ -743,11 +807,14 @@ class PyExecutorProfileManager:
                 enabled = True
                 with executor._profile_state_lock:
                     executor._profile_enabled = True
-                # The scheduled start has arrived; clear the pending
-                # marker so the next ``start_profile()`` after this
-                # window ends is not rejected as "already pending".
-                if executor._runtime_profile_pending_start_iter == executor.iter_counter:
-                    executor._runtime_profile_pending_start_iter = None
+                    # The scheduled start has arrived; clear the
+                    # pending marker so the next ``start_profile()``
+                    # after this window ends is not rejected as
+                    # "already pending". Same critical section as
+                    # ``_profile_enabled`` so the two markers always
+                    # flip together from a caller thread's view.
+                    if executor._runtime_profile_pending_start_iter == executor.iter_counter:
+                        executor._runtime_profile_pending_start_iter = None
 
             # Notify host line profiler of iteration for
             # iteration-aware profiling.

@@ -252,3 +252,144 @@ def test_start_profile_rejects_num_steps_negative(tmp_path):
         executor.start_profile(output_dir=str(tmp_path), num_steps=-3)
 
     assert executor._runtime_profile_pending_start_iter is None
+
+
+def test_concurrent_start_profile_admits_exactly_one_caller(tmp_path):
+    """Only one of N concurrent ``start_profile()`` calls may win.
+
+    The re-entrancy guard reads ``_profile_enabled`` and
+    ``_runtime_profile_pending_start_iter`` and then claims the pending
+    marker. If that check-then-set is not atomic, two callers both pass
+    the guard and both broadcast a profile start, and the second
+    ``_apply_profile_start_config`` overwrites the trace path and
+    activities of the first window.
+
+    This is reachable in production: ``OpenAIServer.start_profile``
+    dispatches through ``asyncio.to_thread``, so two concurrent
+    ``POST /start_profile`` requests run on two different worker
+    threads, and the in-process / Ray paths call
+    ``PyExecutor.start_profile`` directly without the single-owner
+    thread that ``GenerationExecutorProxy`` interposes.
+    """
+    from tensorrt_llm.executor.utils import RequestError
+
+    class _RecordingQueue:
+        """Stand-in for ``executor_request_queue`` that counts broadcasts."""
+
+        def __init__(self):
+            self.start_configs = []
+            self._lock = threading.Lock()
+
+        def enqueue_profile_start_request(self, config):
+            with self._lock:
+                self.start_configs.append(config)
+
+    num_threads = 8
+    # The unguarded window is a couple of bytecodes wide, so repeat the
+    # race rather than relying on a single interleaving. The pre-fix
+    # code fails this within the first few trials.
+    for trial in range(50):
+        executor = _bare_executor()
+        executor.iter_counter = 7
+        queue = _RecordingQueue()
+        executor.executor_request_queue = queue
+
+        barrier = threading.Barrier(num_threads)
+        accepted = []
+        rejected = []
+        accepted_lock = threading.Lock()
+
+        def _worker():
+            # Release all threads into the guard at the same moment.
+            barrier.wait()
+            try:
+                executor.start_profile(output_dir=str(tmp_path), num_steps=100)
+            except RequestError as e:
+                with accepted_lock:
+                    rejected.append(e)
+            else:
+                with accepted_lock:
+                    accepted.append(True)
+
+        threads = [threading.Thread(target=_worker) for _ in range(num_threads)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        assert not any(t.is_alive() for t in threads), f"trial {trial}: start_profile deadlocked"
+        assert len(accepted) == 1, (
+            f"trial {trial}: {len(accepted)} callers were admitted into the "
+            f"profile window, expected exactly 1 "
+            f"({len(rejected)} rejected out of {num_threads})"
+        )
+        assert len(rejected) == num_threads - 1
+        assert len(queue.start_configs) == 1, (
+            f"trial {trial}: {len(queue.start_configs)} profile-start "
+            "broadcasts were enqueued, expected exactly 1"
+        )
+
+
+def test_start_profile_rolls_back_claim_when_broadcast_fails(tmp_path):
+    """A failed broadcast must not leave the window claimed.
+
+    Otherwise the engine is wedged: every later ``start_profile()`` is
+    rejected as "already pending" even though nothing is running and
+    there is nothing for ``stop_profile()`` to cancel on the ranks that
+    never saw a broadcast.
+    """
+    import pytest as _pytest
+
+    class _FailingQueue:
+        def enqueue_profile_start_request(self, config):
+            raise RuntimeError("zmq send failed")
+
+    executor = _bare_executor()
+    executor.iter_counter = 7
+    executor.executor_request_queue = _FailingQueue()
+
+    with _pytest.raises(RuntimeError, match="failed to enqueue profile-start"):
+        executor.start_profile(output_dir=str(tmp_path), num_steps=100)
+
+    assert executor._runtime_profile_pending_start_iter is None
+    assert executor._runtime_profile_activities is None
+
+    # The next attempt must be admitted rather than rejected as pending.
+    executor.executor_request_queue = None
+    executor.start_profile(output_dir=str(tmp_path), num_steps=100)
+    assert executor._runtime_profile_pending_start_iter is not None
+
+
+def test_apply_profile_stop_config_reports_cancel_vs_schedule(tmp_path):
+    """``_apply_profile_stop_config`` tells the caller which path it took.
+
+    ``stop_profile()`` uses the return value to decide whether to wait
+    for the executor loop to flush a trace. Cancelling a start that
+    never fired produces no trace, so waiting would just burn the
+    30s timeout.
+    """
+    # Cancel path: a pending start that has not fired yet.
+    executor = _bare_executor()
+    executor.iter_counter = 7
+    executor._apply_profile_start_config(
+        {
+            "output_dir": str(tmp_path),
+            "start_step": 0,
+            "num_steps": 100,
+        }
+    )
+    assert executor._runtime_profile_pending_start_iter == 8
+
+    assert executor._apply_profile_stop_config() is True
+    assert executor._runtime_profile_pending_start_iter is None
+    assert executor._runtime_profile_pending_stop_iter is None
+    assert 8 not in executor.profile_start_iters
+
+    # Schedule path: the window is already active on the executor loop.
+    executor = _bare_executor()
+    executor.iter_counter = 7
+    executor._profile_enabled = True
+
+    assert executor._apply_profile_stop_config() is False
+    assert executor._runtime_profile_pending_stop_iter == 8
+    assert 8 in executor.profile_stop_iters
