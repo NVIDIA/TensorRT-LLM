@@ -70,6 +70,9 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 COPY constraints.txt /tmp/constraints.txt
 # constraints.txt is also consumed as a pip constraint file, which forbids extras.
 RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ -n "$GITHUB_MIRROR" ]; then \
+      export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
+    fi && \
     pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
         nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 numpy wandb || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
