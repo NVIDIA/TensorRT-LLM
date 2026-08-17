@@ -298,10 +298,34 @@ def test_encoder_shutdown_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None
     executor = object.__new__(EncoderExecutor)
     executor.model_engine = engine
     executor._cleanup_done = False
+    executor._cleanup_error = None
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
 
     executor.shutdown()
     executor.shutdown()
+
+    engine._release_cuda_graphs.assert_called_once_with()
+    engine.shutdown_userbuffers.assert_called_once_with()
+    assert executor._cleanup_done
+    assert not hasattr(executor, "model_engine")
+
+
+def test_encoder_shutdown_preserves_failure_on_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    shutdown_error = RuntimeError("userbuffer shutdown failed")
+    engine = MagicMock()
+    engine.shutdown_userbuffers.side_effect = shutdown_error
+    executor = object.__new__(EncoderExecutor)
+    executor.model_engine = engine
+    executor._cleanup_done = False
+    executor._cleanup_error = None
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="userbuffer shutdown failed"):
+        executor.shutdown()
+    with pytest.raises(
+        RuntimeError, match=("previous EncoderExecutor shutdown failed.*userbuffer shutdown failed")
+    ):
+        executor.shutdown()
 
     engine._release_cuda_graphs.assert_called_once_with()
     engine.shutdown_userbuffers.assert_called_once_with()
