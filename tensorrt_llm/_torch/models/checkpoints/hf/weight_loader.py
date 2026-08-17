@@ -357,10 +357,9 @@ class HfWeightLoader(BaseWeightLoader):
         # skipped. Ranks that didn't prefetch reach the barrier immediately.
         local_mpi_barrier()
 
-        # Tracked here rather than inside `prefetch_files`, which returns
-        # early when this rank's stripe is empty (fewer files than local
-        # ranks): a flag set at the end of that function would leave such
-        # ranks marked unwarmed and re-warm files needlessly.
+        # Decided here rather than tracked inside `prefetch_files`, which
+        # returns early when this rank's stripe is empty (fewer files than
+        # local ranks) and would leave such ranks marked unwarmed.
         return self._load_weights_in_parallel(
             weight_files,
             self._load_safetensors_file,
@@ -389,8 +388,9 @@ class HfWeightLoader(BaseWeightLoader):
         """
         weights = {}
         pbar = tqdm.tqdm(total=len(weight_files), desc=description)
-        load_and_report = load_func
-        if not already_warmed:
+        if already_warmed:
+            load_and_report = load_func
+        else:
             # `load_func` reads a whole multi-GB file in one opaque blocking
             # call, and the only other output here is `pbar`, whose bare '\r'
             # never terminates a line, so on slow storage output-stall
@@ -399,8 +399,9 @@ class HfWeightLoader(BaseWeightLoader):
             # per window; it reads the same bytes `load_func` would, one file
             # at a time as that file is loaded, so neither total I/O nor peak
             # page-cache residency changes.
-            report_progress = self._make_progress_reporter(
-                "Weight load", weight_files)
+            report_progress = self._make_progress_reporter("Weight load",
+                                                           weight_files,
+                                                           scope="all files")
 
             def load_and_report(file_name: str):
                 self._prefetch_one_file(file_name, report_progress)
@@ -415,9 +416,16 @@ class HfWeightLoader(BaseWeightLoader):
         return ConsumableWeightsDict(weights)
 
     @staticmethod
-    def _make_progress_reporter(stage: str,
-                                file_names: List[str]) -> Callable[[int], None]:
+    def _make_progress_reporter(
+            stage: str,
+            file_names: List[str],
+            scope: str = "this rank's share") -> Callable[[int], None]:
         """Build a thread-safe, rate-limited progress reporter for `file_names`.
+
+        `scope` names what the reported total covers, since callers differ:
+        prefetch passes only this rank's stripe, while the load stage passes
+        every file. Reporting both as a rank share would misattribute the
+        denominator on the latter.
 
         Deliberately progress-gated rather than timer-driven: it proves
         liveness only while bytes are actually moving, so a fully hung mount
@@ -444,7 +452,7 @@ class HfWeightLoader(BaseWeightLoader):
                 last_log_time = now
                 current_size = done_size
             logger.info(f"{stage} progress: {current_size / (1024**3):.2f}GB / "
-                        f"{total_size / (1024**3):.2f}GB (this rank's share).")
+                        f"{total_size / (1024**3):.2f}GB ({scope}).")
 
         return report_progress
 

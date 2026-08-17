@@ -466,9 +466,9 @@ def test_prefetch_one_file_no_fallback_log_when_fully_populated(tmp_path, monkey
     assert not [c for c in info.call_args_list if "chunked reads" in str(c)]
 
 
-@pytest.mark.parametrize("already_warmed, expect_heartbeat", [(False, True), (True, False)])
+@pytest.mark.parametrize("already_warmed", [False, True])
 def test_load_stage_reports_progress_only_when_not_prefetched(
-    tmp_path, monkeypatch, already_warmed: bool, expect_heartbeat: bool
+    tmp_path, monkeypatch, already_warmed: bool
 ):
     # load_func reads a whole multi-GB file in one opaque blocking call, so
     # when prefetch was skipped the load stage would otherwise emit no
@@ -504,12 +504,16 @@ def test_load_stage_reports_progress_only_when_not_prefetched(
     assert len(weights) == len(files)
 
     heartbeats = [c for c in info.call_args_list if "Weight load progress" in str(c)]
-    if expect_heartbeat:
+    if already_warmed:
+        assert heartbeats == []
+    else:
         # One line per window with the interval forced to zero, so the silent
         # interval is bounded by window time rather than whole-file time.
         assert len(heartbeats) >= len(files) * windows_per_file
-    else:
-        assert heartbeats == []
+        # Every rank loads all of `files`, so this total must NOT be described
+        # as a per-rank share the way the striped prefetch stage's total is.
+        assert all("all files" in str(c) for c in heartbeats)
+        assert not [c for c in heartbeats if "this rank's share" in str(c)]
 
 
 def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
@@ -537,3 +541,6 @@ def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     # Every chunk logs when the interval is zero: 3 files x 4 KB at a 1 KB
     # chunk size means at least 12 heartbeats (short reads only add more).
     assert len(progress_logs) >= 12
+    # This stage really does prefetch only this rank's stripe, so its total
+    # keeps the rank-share wording that the load stage must not use.
+    assert all("this rank's share" in str(call) for call in progress_logs)
