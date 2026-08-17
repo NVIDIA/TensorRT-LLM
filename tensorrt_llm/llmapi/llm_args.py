@@ -1750,7 +1750,8 @@ class DecodingBaseConfig(StrictBaseModel):
         "Optional sub-path inside speculative_model that holds the draft, for drafts bundled beside their "
         "target model rather than published as a standalone repo. Works for both forms of speculative_model. "
         "The Hub has no single-string form for this: a repo id may contain at most one '/', so "
-        "'org/repo/subdir' is not a valid id and must be given as repo id + subfolder."
+        "'org/repo/subdir' is not a valid id and must be given as repo id + subfolder.",
+        status="prototype",
     )
 
     max_concurrency: Optional[PositiveInt] = Field(
