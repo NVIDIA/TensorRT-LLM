@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import contextlib
 import gc
 import importlib
 import inspect
@@ -93,6 +94,42 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
         else:
             raise ValueError(f"Invalid middleware {middleware}. "
                              "Must be a class or an async function.")
+
+
+@contextlib.contextmanager
+def _bound_server_socket(host: str, port: int, description: str):
+    """Bind (host, port) up front and yield the socket for uvicorn.
+
+    Binding before the model is built reserves the address across a
+    multi-minute initialization -- otherwise anything on the host could take
+    the port in that window -- and lets uvicorn listen() immediately, which is
+    what makes the startup phase answerable (503) instead of being
+    indistinguishable from a dead process.
+
+    launch_server binds by hand instead: it also has to handle SO_REUSEPORT
+    for attached frontends and a kernel-assigned port 0.
+    """
+    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
+                                   socket.SOCK_STREAM)
+    address_family = socket.AF_INET6 if all(
+        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    with socket.socket(address_family, socket.SOCK_STREAM) as s:
+        # uvicorn sets this on the sockets it binds itself. Since we bind
+        # first and hand it the result, we have to set it too, or TIME_WAIT
+        # tombstones from the connections this server accepted would refuse a
+        # restart for ~60s where they did not before.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            holder = _diagnose_port_in_use(port)
+            logger.error(
+                f"Failed to bind {description} socket to {host}:{port} "
+                f"(pid={os.getpid()}): {e}. "
+                f"Current port holder(s): {holder}")
+            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
+                               f"Port holder(s): {holder}")
+        yield s
 
 
 def _signal_handler_cleanup_child(signum, frame):
@@ -505,10 +542,12 @@ def _wait_attached_frontends_ready(children: list, ready_fds: list) -> None:
 def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
     """Report READY to the launcher over the inherited pipe.
 
-    Called once everything fallible in an attached frontend's startup
-    (port bind, executor attach, LLM and OpenAIServer construction,
-    middleware registration) has succeeded; the launcher blocks group
-    startup on this byte (see _wait_attached_frontends_ready).
+    Called once the frontend actually serves requests -- its engine built,
+    routes registered and readiness gate open -- not merely once it is
+    listening. The frontends share one port via SO_REUSEPORT, so a frontend
+    that reported READY early would take load-balanced traffic and 503 it.
+    The launcher blocks group startup on this byte (see
+    _wait_attached_frontends_ready).
     """
     ready_fd = os.environ.pop("TLLM_FRONTEND_READY_FD", None)
     if not (multi_frontend.is_attached_frontend and ready_fd):
@@ -585,32 +624,60 @@ def launch_server(
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
                                f"Port holder(s): {holder}")
 
-        if backend == 'pytorch':
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
-
         # The finally below is the cleanup boundary for the attached
         # frontends: it must cover everything from their spawn through
         # server construction, middleware registration, and runtime, or a
         # failure in between leaks the child processes.
         frontend_children = []
-        try:
-            if multi_frontend.is_launcher:
-                frontend_children = _spawn_attached_frontends(
-                    llm, multi_frontend.num_frontends)
 
+        def build_generator():
+            """Construct the engine; runs on a worker thread off the loop.
+
+            Called from the server's lifespan once uvicorn is listening, so
+            every endpoint answers 503 for the duration instead of the socket
+            being dark. Nothing here may touch the event loop.
+            """
+            if backend == 'pytorch':
+                llm_args.pop("build_config", None)
+                llm = PyTorchLLM(**llm_args)
+            elif backend == '_autodeploy':
+                from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+
+                # AutoDeploy does not support build_config
+                llm_args.pop("build_config", None)
+                llm = AutoDeployLLM(**llm_args)
+            else:
+                raise click.BadParameter(
+                    f"{backend} is not a known backend, check help for available options.",
+                    param_hint="backend")
+
+            if multi_frontend.is_launcher:
+                try:
+                    frontend_children.extend(
+                        _spawn_attached_frontends(llm,
+                                                  multi_frontend.num_frontends))
+                except BaseException:
+                    # BaseException, not Exception: a KeyboardInterrupt leaks
+                    # the engine just as surely as a TypeError would. No
+                    # reference has reached the server yet, so its teardown
+                    # would not cover this engine.
+                    try:
+                        llm.shutdown()
+                    except Exception as shutdown_error:
+                        # Never let cleanup become the headline.
+                        logger.error(
+                            "Engine shutdown after a failed frontend spawn "
+                            f"did not complete cleanly: {shutdown_error!r}")
+                    raise
+            return llm
+
+        try:
             server = OpenAIServer(
-                generator=llm,
+                generator=None,
+                generator_factory=build_generator,
+                # The attached frontends share this port via SO_REUSEPORT, so
+                # READY has to keep meaning "serves requests", not "listens".
+                on_ready=lambda: _signal_frontend_ready(multi_frontend),
                 model=model,
                 tool_parser=tool_parser,
                 server_role=server_role,
@@ -621,14 +688,17 @@ def launch_server(
                 allow_request_chat_template=allow_request_chat_template,
                 input_processor_workers=num_input_processor_workers,
                 media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key)
+                internal_disagg_auth_key=internal_disagg_auth_key,
+                # Read from llm_args because the middleware stack is frozen
+                # when the app starts, which is before the engine exists.
+                return_perf_metrics=bool(llm_args.get("return_perf_metrics")),
+                perf_metrics_output_dir=llm_args.get("perf_metrics_output_dir"))
             _apply_fastapi_middlewares(server.app, middleware)
 
             # Optionally disable GC (default: not disabled)
             if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
                 gc.disable()
 
-            _signal_frontend_ready(multi_frontend)
             uvloop.run(server(host, port, sockets=[s]))
         finally:
             if frontend_children:
@@ -644,16 +714,23 @@ def launch_mm_encoder_server(
 ):
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
-    mm_encoder = MultimodalEncoder(**encoder_args)
 
-    server = OpenAIServer(
-        generator=mm_encoder,
-        model=model,
-        server_role=ServerRole.MM_ENCODER,
-        metadata_server_cfg=metadata_server_cfg,
-        tool_parser=None,
-        allow_request_chat_template=allow_request_chat_template)
-    uvloop.run(server(host, port))
+    def build_encoder():
+        """Construct the encoder; runs on a worker thread off the loop."""
+        return MultimodalEncoder(**encoder_args)
+
+    with _bound_server_socket(host, port, "multimodal encoder server") as s:
+        server = OpenAIServer(
+            generator=None,
+            generator_factory=build_encoder,
+            model=model,
+            server_role=ServerRole.MM_ENCODER,
+            metadata_server_cfg=metadata_server_cfg,
+            tool_parser=None,
+            allow_request_chat_template=allow_request_chat_template,
+            return_perf_metrics=bool(encoder_args.get("return_perf_metrics")),
+            perf_metrics_output_dir=encoder_args.get("perf_metrics_output_dir"))
+        uvloop.run(server(host, port, sockets=[s]))
 
 
 # HF causal-LM architecture -> TRT-LLM text-embedding architecture. The embeddings
@@ -743,18 +820,28 @@ def launch_embedding_server(
             model_kwargs["architectures"] = override["architectures"]
         llm_args["model_kwargs"] = model_kwargs
 
-    # Encoder-only (embedding) serving uses the synchronous llm.encode() fast path
-    # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
-    llm = PyTorchLLM(encode_only=True, **llm_args)
+    def build_encoder():
+        """Construct the engine; runs on a worker thread off the loop.
 
-    server = OpenAIServer(generator=llm,
-                          model=model,
-                          server_role=ServerRole.EMBEDDING,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None,
-                          embedding_max_queue_delay=max_queue_delay,
-                          embedding_max_queue_size=max_queue_size)
-    asyncio.run(server(host, port))
+        Encoder-only (embedding) serving uses the synchronous llm.encode()
+        fast path (no KV cache / sampler / scheduler), coalesced behind the
+        dynamic batcher.
+        """
+        return PyTorchLLM(encode_only=True, **llm_args)
+
+    with _bound_server_socket(host, port, "embedding server") as s:
+        server = OpenAIServer(
+            generator=None,
+            generator_factory=build_encoder,
+            model=model,
+            server_role=ServerRole.EMBEDDING,
+            metadata_server_cfg=metadata_server_cfg,
+            tool_parser=None,
+            embedding_max_queue_delay=max_queue_delay,
+            embedding_max_queue_size=max_queue_size,
+            return_perf_metrics=bool(llm_args.get("return_perf_metrics")),
+            perf_metrics_output_dir=llm_args.get("perf_metrics_output_dir"))
+        asyncio.run(server(host, port, sockets=[s]))
 
 
 def launch_visual_gen_server(
@@ -785,28 +872,9 @@ def launch_visual_gen_server(
         VisualGen(model=model, args=visual_gen_args)
         return
 
-    # Reserve the listening (host, port) by binding the socket *before*
-    # constructing the VisualGen pipeline, then hand the bound socket to
-    # uvicorn. VisualGen initialization can take many minutes; if we deferred
-    # the bind until uvicorn started, anything else on the host could grab the
-    # port in that window and trtllm-serve would die at bind() time.
-    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                   socket.SOCK_STREAM)
-    address_family = socket.AF_INET6 if all(
-        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
-    with socket.socket(address_family, socket.SOCK_STREAM) as s:
-        try:
-            s.bind((host, port))
-        except OSError as e:
-            holder = _diagnose_port_in_use(port)
-            logger.error(
-                f"Failed to bind VisualGen server socket to {host}:{port} "
-                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
-                               f"Port holder(s): {holder}")
-
+    def build_visual_gen():
+        """Construct the pipeline; runs on a worker thread off the loop."""
         logger.info(f"Initializing VisualGen ({model})")
-
         visual_gen_model = VisualGen(model=model, args=visual_gen_args)
 
         n_workers = visual_gen_model.args.parallel_config.n_workers
@@ -816,8 +884,11 @@ def launch_visual_gen_server(
         logger.info(
             f"Ulysses size: {visual_gen_model.args.parallel_config.ulysses_size}"
         )
+        return visual_gen_model
 
-        server = OpenAIServer(generator=visual_gen_model,
+    with _bound_server_socket(host, port, "VisualGen server") as s:
+        server = OpenAIServer(generator=None,
+                              generator_factory=build_visual_gen,
                               model=model,
                               server_role=ServerRole.VISUAL_GEN,
                               metadata_server_cfg=metadata_server_cfg,
