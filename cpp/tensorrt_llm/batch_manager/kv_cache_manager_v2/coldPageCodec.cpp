@@ -1,0 +1,290 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "kv_cache_manager_v2/coldPageCodec.h"
+#include "kv_cache_manager_v2/utils/hostMem.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <limits>
+#include <memory>
+#include <new>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+{
+namespace
+{
+
+struct PoolCopyPlan
+{
+    std::byte* hotBase;
+    size_t hotPageBytes;
+    size_t coldPageOffset;
+};
+
+class ConcatKvCacheColdPageCodec final : public IKvCacheColdPageCodec
+{
+public:
+    // The concat layout depends only on hot-pool geometry. Therefore, all lifecycle variants in one hot pool group
+    // form one codec batching equivalence class. Codecs with lifecycle-specific algorithms or sizes need finer-grained
+    // configuration.
+    struct GroupConfig
+    {
+        size_t coldPageBytes;
+        LayerGroupId batchingLayerGroupId;
+        TypedVec<PoolIndex, PoolCopyPlan> copyPlans;
+    };
+
+    bool configure(PoolGroupDesc const* gpuDescs, PoolGroupIndex numGpuDescs) noexcept override
+    {
+        try
+        {
+            configureImpl(gpuDescs, numGpuDescs);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    [[nodiscard]] size_t queryColdPageBytes(LayerGroupId layerGroupId) const noexcept override
+    {
+        GroupConfig const* const group = findGroup(layerGroupId);
+        return group == nullptr ? 0 : group->coldPageBytes;
+    }
+
+    [[nodiscard]] LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept override
+    {
+        GroupConfig const* const group = findGroup(layerGroupId);
+        return group == nullptr ? LayerGroupId{-1} : group->batchingLayerGroupId;
+    }
+
+    [[nodiscard]] PageIndexLocation queryPageIndexLocation(LayerGroupId layerGroupId) const noexcept override
+    {
+        return findGroup(layerGroupId) == nullptr ? PageIndexLocation::kBadLocation : PageIndexLocation::kHost;
+    }
+
+    bool encode(LayerGroupId layerGroupId, void* dstBasePtr, PageIndexPair const* pageIndices, size_t numBasePages,
+        cudaStream_t stream) noexcept override
+    {
+        try
+        {
+            return dispatch<true>(findGroup(layerGroupId), dstBasePtr, nullptr, pageIndices, numBasePages, stream);
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool decode(LayerGroupId layerGroupId, void const* srcBasePtr, PageIndexPair const* pageIndices,
+        size_t numBasePages, cudaStream_t stream) noexcept override
+    {
+        try
+        {
+            return dispatch<false>(findGroup(layerGroupId), nullptr, srcBasePtr, pageIndices, numBasePages, stream);
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+private:
+    void configureImpl(PoolGroupDesc const* gpuDescs, PoolGroupIndex numGpuDescs)
+    {
+        TLLM_CHECK(gpuDescs != nullptr && numGpuDescs.value() > 0 && mGroups.empty() && mLifeCycleToGroup.empty());
+
+        LifeCycleId numLifeCycles{0};
+        for (PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < numGpuDescs; ++poolGroupIndex)
+        {
+            PoolGroupDesc const& gpuDesc = gpuDescs[toSizeT(poolGroupIndex)];
+            TLLM_CHECK(gpuDesc.poolGroupIndex == poolGroupIndex && !gpuDesc.pools.empty()
+                && !gpuDesc.slotDesc.variants.empty());
+            for (auto const& variant : gpuDesc.slotDesc.variants)
+            {
+                TLLM_CHECK(variant.lifeCycleId.value() >= 0
+                    && variant.lifeCycleId.value() < std::numeric_limits<LifeCycleId::ValueType>::max()
+                    && variant.coalescedBuffers.stdSize() == gpuDesc.pools.stdSize());
+                numLifeCycles = std::max(numLifeCycles, LifeCycleId{variant.lifeCycleId.value() + 1});
+            }
+        }
+
+        TypedVec<PoolGroupIndex, std::unique_ptr<GroupConfig>> groups(numGpuDescs);
+        TypedVec<LifeCycleId, PoolGroupIndex> lifeCycleToGroup(numLifeCycles, PoolGroupIndex{-1});
+        for (PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < numGpuDescs; ++poolGroupIndex)
+        {
+            PoolGroupDesc const& gpuDesc = gpuDescs[toSizeT(poolGroupIndex)];
+            TypedVec<PoolIndex, PoolCopyPlan> copyPlans;
+            copyPlans.reserve(gpuDesc.pools.size());
+
+            size_t coldOffset = 0;
+            for (PoolIndex poolIndex{0}; poolIndex < gpuDesc.pools.size(); ++poolIndex)
+            {
+                PoolDesc const& pool = gpuDesc.pools.at(poolIndex);
+                TLLM_CHECK(pool.poolIndex == poolIndex && pool.baseAddress != 0 && pool.slotBytes > 0
+                    && pool.slotBytes <= std::numeric_limits<size_t>::max() - coldOffset);
+                copyPlans.push_back(
+                    PoolCopyPlan{reinterpret_cast<std::byte*>(pool.baseAddress), pool.slotBytes, coldOffset});
+                coldOffset += pool.slotBytes;
+            }
+
+            LayerGroupId batchingLayerGroupId = gpuDesc.slotDesc.variants.front().lifeCycleId;
+            for (auto const& variant : gpuDesc.slotDesc.variants)
+            {
+                TLLM_CHECK(lifeCycleToGroup.at(variant.lifeCycleId).value() < 0);
+                for (PoolIndex poolIndex{0}; poolIndex < gpuDesc.pools.size(); ++poolIndex)
+                {
+                    TLLM_CHECK(variant.coalescedBuffers.at(poolIndex).size() == gpuDesc.pools.at(poolIndex).slotBytes);
+                }
+                lifeCycleToGroup.at(variant.lifeCycleId) = poolGroupIndex;
+                batchingLayerGroupId = std::min(batchingLayerGroupId, variant.lifeCycleId);
+            }
+
+            groups.at(poolGroupIndex)
+                = std::make_unique<GroupConfig>(GroupConfig{coldOffset, batchingLayerGroupId, std::move(copyPlans)});
+        }
+
+        mGroups = std::move(groups);
+        mLifeCycleToGroup = std::move(lifeCycleToGroup);
+    }
+
+    [[nodiscard]] GroupConfig const* findGroup(LayerGroupId layerGroupId) const
+    {
+        if (layerGroupId.value() < 0 || layerGroupId >= mLifeCycleToGroup.size())
+        {
+            return nullptr;
+        }
+        PoolGroupIndex const groupIndex = mLifeCycleToGroup.at(layerGroupId);
+        if (groupIndex.value() < 0 || groupIndex >= mGroups.size())
+        {
+            return nullptr;
+        }
+        return mGroups.at(groupIndex).get();
+    }
+
+    template <bool Encode>
+    bool dispatch(GroupConfig const* group, void* dstBasePtr, void const* srcBasePtr, PageIndexPair const* pageIndices,
+        size_t numBasePages, cudaStream_t stream) const
+    {
+        if (numBasePages == 0)
+        {
+            return group != nullptr;
+        }
+        if (group == nullptr || pageIndices == nullptr || (Encode ? dstBasePtr == nullptr : srcBasePtr == nullptr)
+            || stream == nullptr || numBasePages > std::numeric_limits<size_t>::max() / group->copyPlans.stdSize())
+        {
+            return false;
+        }
+
+        thread_local std::vector<CUdeviceptr> dsts;
+        thread_local std::vector<CUdeviceptr> srcs;
+        thread_local std::vector<size_t> sizes;
+        dsts.clear();
+        srcs.clear();
+        sizes.clear();
+        size_t const numCopies = group->copyPlans.stdSize() * numBasePages;
+        dsts.reserve(numCopies);
+        srcs.reserve(numCopies);
+        sizes.reserve(numCopies);
+
+        // Work around the interaction of two independent bugs. Linux kernels 6.11 through 6.13 cannot reliably pin
+        // more than 2 GiB in one call, so HostMem registers a large allocation as adjacent 2 GiB regions. Separately,
+        // cuMemcpyBatchAsync cannot handle one copy entry that spans two such registrations. Split only at those
+        // registration boundaries, and only on kernels for which HostMem enables chunked registration.
+        bool const splitRegistrationChunks = HostMem::shouldUseChunkedRegistration();
+        auto appendCopy = [&](std::byte* dst, std::byte const* src, size_t coldOffset, size_t numBytes)
+        {
+            do
+            {
+                size_t copyBytes = numBytes;
+                if (splitRegistrationChunks)
+                {
+                    size_t const bytesUntilBoundary = HostMem::kChunkSize - coldOffset % HostMem::kChunkSize;
+                    copyBytes = std::min(copyBytes, bytesUntilBoundary);
+                }
+                dsts.push_back(reinterpret_cast<CUdeviceptr>(dst));
+                srcs.push_back(reinterpret_cast<CUdeviceptr>(src));
+                sizes.push_back(copyBytes);
+                dst += copyBytes;
+                src += copyBytes;
+                coldOffset += copyBytes;
+                numBytes -= copyBytes;
+            } while (numBytes != 0);
+        };
+
+        auto* const coldDstBase = static_cast<std::byte*>(dstBasePtr);
+        auto const* const coldSrcBase = static_cast<std::byte const*>(srcBasePtr);
+        for (size_t page = 0; page < numBasePages; ++page)
+        {
+            PageIndexPair const pageIndex = pageIndices[page];
+            if (pageIndex.dst < 0 || pageIndex.src < 0)
+            {
+                return false;
+            }
+            for (PoolCopyPlan const& plan : group->copyPlans)
+            {
+                auto* const hotBase
+                    = plan.hotBase + static_cast<size_t>(Encode ? pageIndex.src : pageIndex.dst) * plan.hotPageBytes;
+                size_t const coldOffset
+                    = static_cast<size_t>(Encode ? pageIndex.dst : pageIndex.src) * group->coldPageBytes
+                    + plan.coldPageOffset;
+                if constexpr (Encode)
+                {
+                    appendCopy(coldDstBase + coldOffset, hotBase, coldOffset, plan.hotPageBytes);
+                }
+                else
+                {
+                    appendCopy(hotBase, coldSrcBase + coldOffset, coldOffset, plan.hotPageBytes);
+                }
+            }
+        }
+
+        CUmemcpyAttributes attributes{};
+        attributes.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
+        attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
+        size_t firstCopy = 0;
+        CUresult const error = cuMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attributes,
+            &firstCopy, 1, reinterpret_cast<CUstream>(stream));
+        return error == CUDA_SUCCESS;
+    }
+
+    TypedVec<PoolGroupIndex, std::unique_ptr<GroupConfig>> mGroups;
+    TypedVec<LifeCycleId, PoolGroupIndex> mLifeCycleToGroup;
+};
+
+} // namespace
+
+IKvCacheColdPageCodec::IKvCacheColdPageCodec() = default;
+IKvCacheColdPageCodec::~IKvCacheColdPageCodec() = default;
+
+LayerGroupId IKvCacheColdPageCodec::getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept
+{
+    return layerGroupId;
+}
+
+std::unique_ptr<IKvCacheColdPageCodec> createDefaultKvCacheColdPageCodec()
+{
+    return std::make_unique<ConcatKvCacheColdPageCodec>();
+}
+
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -102,7 +102,8 @@ std::vector<int> PageIndexConverter::operator()(int baseIndex) const
 // KvCacheManager
 // ---------------------------------------------------------------------------
 
-KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink)
+KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink,
+    std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec)
     : mConfig(config)
     , mLifeCycles(config)
     , mEventSink(std::move(eventSink))
@@ -115,12 +116,12 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock, mEventSink);
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
-    mStorage
-        = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock, mConfig.swaScratchReuse,
-            mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
+    mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
+        std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
+        mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
 
-    mTargetRatioListGpu = _currentGpuRatio();
-    mTargetRatioListOther = _currentOtherRatios();
+    mTargetRatioListHot = _currentHotRatio();
+    mTargetRatioListCold = _currentColdRatios();
     _resetIterationPeakNumBlocks();
 
     mLastAdjustmentTime = nowSeconds();
@@ -511,8 +512,8 @@ PeakBlockStatsByCacheLevel KvCacheManager::_currentBlockStatsByCacheLevel() cons
     for (CacheLevel cacheLevel{0}; cacheLevel < mStorage->numCacheLevels(); ++cacheLevel)
     {
         auto& levelStats = result[cacheLevel];
-        levelStats.resize(mStorage->numPoolGroups());
-        for (PoolGroupIndex poolGroup{0}; poolGroup < mStorage->numPoolGroups(); ++poolGroup)
+        levelStats.resize(mStorage->numPoolGroups(cacheLevel));
+        for (PoolGroupIndex poolGroup{0}; poolGroup < mStorage->numPoolGroups(cacheLevel); ++poolGroup)
         {
             auto const stats = mStorage->getStatistics(cacheLevel, poolGroup);
             levelStats[poolGroup] = {stats.available(), stats.unavailable(), stats.evictable};
@@ -529,8 +530,8 @@ void KvCacheManager::_resetIterationPeakNumBlocks(std::optional<CacheLevel> cach
         return;
     }
 
-    PeakBlockStatsByPoolGroup levelStats(mStorage->numPoolGroups());
-    for (PoolGroupIndex poolGroup{0}; poolGroup < mStorage->numPoolGroups(); ++poolGroup)
+    PeakBlockStatsByPoolGroup levelStats(mStorage->numPoolGroups(*cacheLevel));
+    for (PoolGroupIndex poolGroup{0}; poolGroup < mStorage->numPoolGroups(*cacheLevel); ++poolGroup)
     {
         auto const stats = mStorage->getStatistics(*cacheLevel, poolGroup);
         levelStats[poolGroup] = {stats.available(), stats.unavailable(), stats.evictable};
@@ -632,7 +633,7 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
     int tokPerBlock = tokensPerBlock();
     PoolGroupIndex numPg = mStorage->numPoolGroups();
     auto const& lcs = mLifeCycles;
-    auto const& lcGrouping = mStorage->mLifeCycleGrouping;
+    auto const& lcGrouping = mStorage->lifeCycleGrouping(kHotLevel);
 
     // Remaining slot counts per pool group.
     TypedVec<PoolGroupIndex, SlotCount> remainingSlots(numPg);
@@ -715,16 +716,16 @@ void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> persistentPages;
     if (mStorage->isLastLevel(level))
     {
-        persistentPages = _gatherPersistentPages();
+        persistentPages = _gatherLastLevelPersistentPages();
         persistent = &persistentPages;
     }
     mStorage->adjustCacheLevel(level, quota, ratioList, persistent);
 }
 
-TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherPersistentPages() const
+TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLastLevelPersistentPages() const
 {
     CacheLevel lastLevel = mStorage->numCacheLevels() - 1;
-    PoolGroupIndex numPg = mStorage->numPoolGroups();
+    PoolGroupIndex numPg = mStorage->numPoolGroups(lastLevel);
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> result(numPg);
 
     for (KvCache* kvc : mLivingKvCaches)
@@ -757,7 +758,7 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherPe
                     {
                         continue;
                     }
-                    PoolGroupIndex pgIdx = mStorage->getPoolGroupIndex(lc);
+                    PoolGroupIndex pgIdx = mStorage->getPoolGroupIndex(lastLevel, lc);
                     result[pgIdx].push_back(pg);
                 }
             }
@@ -790,25 +791,32 @@ void KvCacheManager::tryUpdateTargetRatios()
     int avgCapacity = static_cast<int>(std::round(std::sqrt(mAvgSqrCapacity.value())));
     int avgHistoryLength = static_cast<int>(std::round(std::sqrt(mAvgSqrHistoryLength.value())));
     if (avgCapacity > 0)
-        mTargetRatioListGpu
-            = mStorage->constrainRatio(mStorage->ratioFromLength(tokensPerBlock, avgHistoryLength, avgCapacity));
+    {
+        auto const lifeCycleRatio = mStorage->ratioFromLength(kHotLevel, tokensPerBlock, avgHistoryLength, avgCapacity);
+        mTargetRatioListHot = mStorage->constrainPoolGroupRatio(mStorage->toPoolGroupRatio(kHotLevel, lifeCycleRatio));
+    }
     if (avgReusedLength > 0)
-        mTargetRatioListOther = mStorage->ratioFromLength(tokensPerBlock, avgReusedLength, avgReusedLength);
+    {
+        CacheLevel const coldLevel = mStorage->numCacheLevels() > CacheLevel{1} ? CacheLevel{1} : kHotLevel;
+        auto const lifeCycleRatio
+            = mStorage->ratioFromLength(coldLevel, tokensPerBlock, avgReusedLength, avgReusedLength);
+        mTargetRatioListCold = mStorage->toPoolGroupRatio(coldLevel, lifeCycleRatio);
+    }
 }
 
-TypedVec<PoolGroupIndex, float> KvCacheManager::_currentGpuRatio() const
+TypedVec<PoolGroupIndex, float> KvCacheManager::_currentHotRatio() const
 {
     return mStorage->getRatioList(kHotLevel);
 }
 
-TypedVec<PoolGroupIndex, float> KvCacheManager::_currentOtherRatios() const
+TypedVec<PoolGroupIndex, float> KvCacheManager::_currentColdRatios() const
 {
     CacheLevel numLevels = mStorage->numCacheLevels();
     if (numLevels == CacheLevel{1})
     {
-        return _currentGpuRatio();
+        return _currentHotRatio();
     }
-    PoolGroupIndex numPg = mStorage->numPoolGroups();
+    PoolGroupIndex numPg = mStorage->numPoolGroups(CacheLevel{1});
     TypedVec<PoolGroupIndex, float> result(numPg, 0.f);
     for (CacheLevel lvl{1}; lvl < numLevels; ++lvl)
     {
@@ -830,13 +838,13 @@ TypedVec<PoolGroupIndex, float> KvCacheManager::_currentOtherRatios() const
 
 TypedVec<PoolGroupIndex, float> const& KvCacheManager::_getTargetRatioList(CacheLevel level) const
 {
-    return (level == kHotLevel) ? mTargetRatioListGpu : mTargetRatioListOther;
+    return (level == kHotLevel) ? mTargetRatioListHot : mTargetRatioListCold;
 }
 
 bool KvCacheManager::_needAdjustment(CacheLevel level) const
 {
     auto const& target = _getTargetRatioList(level);
-    auto current = (level == kHotLevel) ? _currentGpuRatio() : _currentOtherRatios();
+    auto current = (level == kHotLevel) ? _currentHotRatio() : _currentColdRatios();
     constexpr float kThreshold = 1.25f;
     for (PoolGroupIndex pgIdx{0}; pgIdx < target.size() && pgIdx < current.size(); ++pgIdx)
     {

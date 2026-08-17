@@ -330,4 +330,24 @@ TEST(KvCacheManagerV2TypedIndexTest, TypedVecSupportsVectorInterop)
     EXPECT_EQ(values[PoolGroupIndex{1}], 5);
 }
 
+TEST(KvCacheManagerV2TypedIndexTest, LifeCyclePoolGroupMappingProvidesForwardAndInverseLookup)
+{
+    LifeCyclePoolGroupMapping mapping(
+        TypedVec<LifeCycleId, PoolGroupIndex>{PoolGroupIndex{1}, PoolGroupIndex{0}, PoolGroupIndex{1}});
+
+    EXPECT_EQ(mapping.numPoolGroups(), PoolGroupIndex{2});
+    EXPECT_EQ(mapping.poolGroup(LifeCycleId{0}), PoolGroupIndex{1});
+    EXPECT_EQ(mapping.poolGroup(LifeCycleId{1}), PoolGroupIndex{0});
+    EXPECT_EQ(mapping.poolGroup(LifeCycleId{2}), PoolGroupIndex{1});
+
+    auto const firstPoolGroup = mapping.lifeCycles(PoolGroupIndex{0});
+    ASSERT_EQ(firstPoolGroup.size(), 1);
+    EXPECT_EQ(firstPoolGroup[0], LifeCycleId{1});
+
+    auto const secondPoolGroup = mapping.lifeCycles(PoolGroupIndex{1});
+    ASSERT_EQ(secondPoolGroup.size(), 2);
+    EXPECT_EQ(secondPoolGroup[0], LifeCycleId{0});
+    EXPECT_EQ(secondPoolGroup[1], LifeCycleId{2});
+}
+
 } // namespace

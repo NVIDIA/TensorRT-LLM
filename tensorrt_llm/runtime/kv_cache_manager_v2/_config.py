@@ -213,8 +213,10 @@ class KVCacheManagerConfig:
 
     initial_pool_ratio: list[float] | None = None
     """
-    User-provided initial memory partitioning between pool groups. When set, this
-    takes precedence over typical_step and constraints for initial sizing.
+    One positive, normalized cache-tier quota weight per layer group. KVCM projects these
+    weights onto each cache level's pool grouping. When set, this takes precedence
+    over typical_step and constraints for initial ratio selection; constraints remain
+    hot-level feasibility floors.
     """
 
     swa_scratch_reuse: SwaScratchReuseConfig | None = None

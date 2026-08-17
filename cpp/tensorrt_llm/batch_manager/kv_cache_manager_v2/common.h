@@ -22,14 +22,12 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/common/assert.h"
 
-#include <array>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
 #include <sys/types.h>
-#include <type_traits>
 #include <variant>
 #include <vector>
 
