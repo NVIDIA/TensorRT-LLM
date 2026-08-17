@@ -2213,9 +2213,6 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
         ],
     )
     def test_auto_dtype(self, mtp_nextn, block_reuse, use_py_transceiver):
-        if use_py_transceiver and block_reuse:
-            pytest.skip("Python transceiver does not support block reuse")
-
         ctx_cfg, gen_cfg, disagg_cfg = self._make_configs(use_py_transceiver)
         if mtp_nextn > 0:
             spec = {"decoding_type": "MTP", "max_draft_len": mtp_nextn}
