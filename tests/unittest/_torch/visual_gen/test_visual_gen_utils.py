@@ -859,3 +859,58 @@ class TestCleanupReferenceFiles:
 
     def test_missing_files_are_ignored(self, tmp_path):
         cleanup_reference_files(str(tmp_path), "video_absent")  # no raise
+
+
+class TestPrepareReferenceSlots:
+    """Engine-side reference choke point: passthrough local paths, materialize the rest."""
+
+    def test_local_path_passthrough_not_materialized_or_cleaned(self, tmp_path):
+        from tensorrt_llm.visual_gen import VisualGenParams
+        from tensorrt_llm.visual_gen.media_refs import prepare_reference_slots
+
+        src = tmp_path / "user.png"
+        Image.new("RGB", (4, 4)).save(src, format="PNG")
+        store = tmp_path / "store"
+        store.mkdir()
+        params = VisualGenParams(image_reference=str(src))  # bare local path -> passthrough
+        prepare_reference_slots(params, request_id="req1", media_storage_path=str(store))
+        assert params.image_reference[0].content == str(src)  # unchanged
+        assert list(store.iterdir()) == []  # nothing materialized
+        cleanup_reference_files(str(store), "req1")
+        assert src.exists()  # user file untouched by cleanup
+
+    def test_bytes_materialized_to_storage_and_cleaned(self, tmp_path):
+        from tensorrt_llm.visual_gen import VisualGenParams
+        from tensorrt_llm.visual_gen.media_refs import prepare_reference_slots
+
+        buf = BytesIO()
+        Image.new("RGB", (4, 4)).save(buf, format="PNG")
+        png = buf.getvalue()
+        store = tmp_path / "store"
+        store.mkdir()
+        params = VisualGenParams(image_reference=png)  # bytes -> materialize
+        prepare_reference_slots(params, request_id="req2", media_storage_path=str(store))
+        path = params.image_reference[0].content
+        assert path == str(store / "req2_image_ref_0")
+        assert Path(path).read_bytes() == png
+        cleanup_reference_files(str(store), "req2")
+        assert not Path(path).exists()
+
+    def test_is_local_path(self, tmp_path):
+        from tensorrt_llm.visual_gen.media_refs import _is_local_path
+
+        f = tmp_path / "x"
+        f.write_bytes(b"a")
+        assert _is_local_path(str(f)) is True
+        assert _is_local_path(f.as_uri()) is True  # file://
+        assert _is_local_path("iVBORw0KGgo=") is False  # base64-ish, no such file
+        assert _is_local_path("https://example.com/a.png") is False
+        assert _is_local_path(b"raw bytes") is False
+
+    def test_resolve_media_storage_path(self, tmp_path, monkeypatch):
+        from tensorrt_llm.visual_gen.media_refs import resolve_media_storage_path
+
+        target = tmp_path / "ms"
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(target))
+        resolved = resolve_media_storage_path()
+        assert resolved == target and target.is_dir()

@@ -25,7 +25,7 @@ from __future__ import annotations
 import base64
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from tensorrt_llm.inputs.media_io import (
@@ -147,3 +147,59 @@ def cleanup_reference_files(media_storage_path: Optional[str], request_id: str) 
             path.unlink()
         except OSError:
             pass
+
+
+def resolve_media_storage_path() -> Path:
+    """Resolve the media storage directory, creating it if needed.
+
+    Reads ``TRTLLM_MEDIA_STORAGE_PATH`` (default ``/tmp/trtllm_generated``),
+    shared by the serve boundary and the engine so both write materialized
+    references to the same place.
+    """
+    path = Path(os.getenv("TRTLLM_MEDIA_STORAGE_PATH", "/tmp/trtllm_generated"))  # nosec B108
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _is_local_path(content: Any) -> bool:
+    """True if ``content`` is a trusted local path to pass through untouched.
+
+    A ``file://`` URI, or a bare string naming an existing file. Everything else
+    (bytes, ``http(s)`` / ``data:`` URLs, base64) is materialized.
+    """
+    if not isinstance(content, str):
+        return False
+    scheme = urlparse(content).scheme
+    if scheme == "file":
+        return True
+    return scheme == "" and os.path.exists(content)
+
+
+def prepare_reference_slots(
+    params: Any, *, request_id: str, media_storage_path: Optional[str]
+) -> None:
+    """Resolve + materialize each reference to a local path, in place.
+
+    The single reference choke point, used by the engine (``generate_async``)
+    so serve and the standalone Python API share one path. A trusted local path
+    (``file://`` / existing bare path) passes through unchanged — not
+    materialized, not cleaned up (it is the caller's file). Everything else
+    (bytes / ``http(s)`` / ``data:`` / base64) resolves to bytes and materializes
+    to ``media_storage_path``; those files are reclaimed by
+    :func:`cleanup_reference_files` keyed on ``request_id``. Runs before the
+    coordinator broadcasts the request, so bad-media ``ValueError`` surfaces to
+    the caller synchronously (serve keeps its immediate 400).
+    """
+    for slot in ("image_reference", "video_reference", "audio_reference"):
+        modality = slot.split("_", 1)[0]
+        for i, ref in enumerate(getattr(params, slot, None) or []):
+            content = ref.content
+            if _is_local_path(content):
+                continue
+            data = content if isinstance(content, bytes) else _resolve_reference_string(content)
+            ref.content = _materialize_reference(
+                data,
+                modality=modality,
+                ref_id=f"{request_id}_{modality}_ref_{i}",
+                media_storage_path=media_storage_path,
+            )

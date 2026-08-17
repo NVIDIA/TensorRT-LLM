@@ -19,7 +19,7 @@ import secrets
 import sys
 import weakref
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Union
+from typing import Any, AsyncIterator, Callable, Dict, List, Literal, Optional, Union
 
 from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
 from tensorrt_llm._torch.visual_gen.executor import (
@@ -31,6 +31,11 @@ from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_vi
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 from tensorrt_llm.visual_gen.args import VisualGenArgs
+from tensorrt_llm.visual_gen.media_refs import (
+    cleanup_reference_files,
+    prepare_reference_slots,
+    resolve_media_storage_path,
+)
 from tensorrt_llm.visual_gen.output import VisualGenOutput
 from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
 
@@ -71,6 +76,7 @@ class VisualGenResult:
         request_id: int,
         executor: "DiffusionRemoteClient",
         batch_size: Optional[int] = None,
+        on_finish: Optional[Callable[[], None]] = None,
     ):
         self.request_id = request_id
         self.executor = executor
@@ -79,6 +85,10 @@ class VisualGenResult:
         self._batch_size = batch_size
         self._resolved = None
         self._finished = False
+        # Run once at terminal state (success/error/timeout) to reclaim the
+        # engine-materialized reference files for this request; None otherwise.
+        self._on_finish = on_finish
+        self._cleaned = False
 
     @property
     def done(self) -> bool:
@@ -128,10 +138,12 @@ class VisualGenResult:
                     for _ in range(self._batch_size)
                 ]
             self._finished = True
+            self._run_finish()
             return self._resolved_value()
 
         self._resolved = self._build_resolved(response)
         self._finished = True
+        self._run_finish()
         return self._resolved_value()
 
     def result(self, timeout: Optional[float] = None):
@@ -155,6 +167,16 @@ class VisualGenResult:
         raise NotImplementedError("Cancel request (not yet implemented).")
 
     # ----- internals -----
+
+    def _run_finish(self) -> None:
+        """Run the terminal cleanup callback once (idempotent, best-effort)."""
+        if self._cleaned or self._on_finish is None:
+            return
+        self._cleaned = True
+        try:
+            self._on_finish()
+        except Exception:
+            pass
 
     def _build_resolved(self, response: "DiffusionResponse"):
         # Failure class travels on the result object, not on the public
@@ -437,6 +459,16 @@ class VisualGen:
         if resolved_params.seed is None:
             resolved_params.seed = secrets.randbits(63)
 
+        # Resolve/materialize references to local paths here, on the coordinator,
+        # before the request is broadcast — the single choke point shared by serve
+        # and the standalone Python API. Runs synchronously so bad-media
+        # ``ValueError`` reaches the caller before dispatch (serve keeps its 400);
+        # a trusted local path passes through untouched (not materialized/cleaned).
+        media_storage_path = str(resolve_media_storage_path())
+        prepare_reference_slots(
+            resolved_params, request_id=str(req_id), media_storage_path=media_storage_path
+        )
+
         request = DiffusionRequest(
             request_id=req_id,
             prompt=prompt,
@@ -444,7 +476,12 @@ class VisualGen:
         )
 
         self.executor.enqueue_requests([request])
-        return VisualGenResult(req_id, self.executor, batch_size=batch_size)
+        return VisualGenResult(
+            req_id,
+            self.executor,
+            batch_size=batch_size,
+            on_finish=lambda: cleanup_reference_files(media_storage_path, str(req_id)),
+        )
 
     @staticmethod
     def _atexit_shutdown(self_ref):
