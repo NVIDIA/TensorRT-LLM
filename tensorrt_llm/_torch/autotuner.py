@@ -304,6 +304,10 @@ def autotune(tune_mode: bool = True,
     old_skip = autotuner.skip_dynamic_tuning_buckets
     autotuner.is_tuning_mode = tune_required
     autotuner.skip_dynamic_tuning_buckets = skip_dynamic_tuning_buckets
+    # Avoid making compiled AllReduce paths initialize or inspect AutoTuner.
+    from tensorrt_llm._torch.distributed.ops import \
+        set_allreduce_autotuner_tuning_mode
+    set_allreduce_autotuner_tuning_mode(tune_required)
     autotune_enabled = tune_required and not old_mode
 
     if autotune_enabled:
@@ -314,6 +318,7 @@ def autotune(tune_mode: bool = True,
     finally:
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
+        set_allreduce_autotuner_tuning_mode(old_mode)
         if autotune_enabled:
             logger.info("[Autotuner] Autotuning process ends")
 
@@ -1784,6 +1789,8 @@ class AutoTuner:
     def clear_cache(self) -> None:
         """Clear the profiling cache."""
         self.profiling_cache.clear()
+        if hasattr(torch.ops.trtllm, "clear_allreduce_tactic_cache"):
+            torch.ops.trtllm.clear_allreduce_tactic_cache()
 
     def reset_statistics(self) -> None:
         """Reset all statistics counters."""

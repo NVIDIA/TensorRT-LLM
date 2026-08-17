@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import importlib
 import time
 from enum import Enum
@@ -69,13 +84,30 @@ class NixlTransferStatus(TransferStatus):
 class NixlTransferAgent(BaseTransferAgent):
     """NixlTransferAgent using Python nixl library."""
 
-    def __init__(self, name: str, use_prog_thread: bool = True, num_threads: int = 1, **kwargs):
+    def __init__(
+        self,
+        name: str,
+        use_prog_thread: bool = True,
+        num_threads: int = 1,
+        rank: int | None = None,
+        world_size: int | None = None,
+        **kwargs,
+    ):
         """
         Initialize NixlTransferAgent.
         :param name: Name of the agent.
         :param use_prog_thread: Whether to enable the progress thread, if available.
         :param num_workers: Specify number of threads for the supported multi-threaded backends.
+        :param rank: Process rank, used only to keep the shared agent interface consistent.
+        :param world_size: Process count, used only to keep the shared agent interface consistent.
         """
+        if (rank is None) != (world_size is None):
+            raise ValueError("rank and world_size must be specified together")
+        if rank is not None:
+            assert world_size is not None
+            if world_size <= 0 or rank < 0 or rank >= world_size:
+                raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+
         self.name = name
         self.backends = ["UCX"]
         agent_config = nixl_agent_config(

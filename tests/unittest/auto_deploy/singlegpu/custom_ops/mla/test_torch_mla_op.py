@@ -738,6 +738,7 @@ class TestTorchBackendMLAWithCache:
         assert compression_ratio > 50, f"Expected >50x compression, got {compression_ratio:.1f}x"
 
 
+@pytest.mark.cpu_only
 class TestMLADescriptor:
     """Test MultiHeadLatentAttention descriptor configuration."""
 

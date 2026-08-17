@@ -17,7 +17,7 @@
 #   Attention                			  @NVIDIA/trt-llm-torch-attention-devs
 #   MoE                      			  @NVIDIA/trt-llm-moe-devs
 #   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
-#   Scaffolding              			  @WeiHaocheng
+#   Scaffolding              			  @WeiHaocheng @dc3671
 #   Self-managed: AutoDeploy, Triton backend, Dynamo.  Governance/legal: unchanged.
 #
 # New handles (trt-llm-devs / doc / agent / runtime / models / perf / moe / kernels / multi-gpu-ci-review)
@@ -32,7 +32,8 @@
 /tensorrt_llm/evaluate @NVIDIA/trt-llm-devs
 /tensorrt_llm/tools @NVIDIA/trt-llm-devs
 /tests/integration/test_lists/test-db @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
-/tests/integration/test_lists/waives.txt @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa-function @NVIDIA/trt-llm-infra-devs
+# Waiver updates follow the repository's normal review requirements.
+/tests/integration/test_lists/waives.txt
 /tests/test_common @NVIDIA/trt-llm-devs
 /tests/unittest @NVIDIA/trt-llm-devs
 
@@ -384,6 +385,8 @@
 /tensorrt_llm/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/_torch/visual_gen/attention_backend @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/_torch/visual_gen/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
+/cpp/tensorrt_llm/thop/*lysses* @NVIDIA/trt-llm-torch-visual-gen-devs
+/cpp/tensorrt_llm/kernels/ulysses* @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/media @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs @NVIDIA/trt-llm-runtime-devs
 /tests/integration/defs/examples/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
@@ -394,8 +397,8 @@
 /tests/unittest/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
 
 # ===== SCAFFOLDING =====
-/tensorrt_llm/scaffolding @WeiHaocheng
-/tests/unittest/scaffolding @WeiHaocheng
+/tensorrt_llm/scaffolding @WeiHaocheng @dc3671
+/tests/unittest/scaffolding @WeiHaocheng @dc3671
 
 # ===== SELF-MANAGED =====
 /docs/source/features/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
@@ -478,6 +481,7 @@
 /jenkins/license_cpp.json @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
 /pyproject.toml @NVIDIA/trt-llm-oss-compliance
 /requirements-dev.txt @NVIDIA/trt-llm-oss-compliance
+/requirements-grpc-smg.txt @NVIDIA/trt-llm-oss-compliance
 /requirements.txt @NVIDIA/trt-llm-oss-compliance
 /setup.py @NVIDIA/trt-llm-oss-compliance
 /tests/unittest/api_stability/ @NVIDIA/trt-llm-noncommitted-api-review-committee

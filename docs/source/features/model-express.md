@@ -74,6 +74,56 @@ Support for another model family requires a focused qualification change:
    Compare deterministic output token IDs with the standard Hugging Face load
    path before documenting the family as supported.
 
+### Qualification Test
+
+The reusable GPU harness is
+`tests/integration/defs/model_express/test_model_express.py`. It launches an HF
+baseline, a live MX donor, and an MX receiver on disjoint GPU sets. The receiver
+uses a metadata-only view of the donor's canonical snapshot and contains no
+weight shards. A positive result therefore requires direct transfer; disk
+fallback cannot accidentally satisfy the test.
+
+Run the TP=1 smoke test against an isolated ModelExpress 0.4.1 service with
+NIXL enabled:
+
+```bash
+TRTLLM_MX_E2E_REQUIRED=1 \
+MODEL_EXPRESS_URL=http://127.0.0.1:8001 \
+LLM_MODELS_ROOT=/path/to/llm-models \
+pytest -v tests/integration/defs/model_express/test_model_express.py \
+  -k llama-bf16-tp1
+```
+
+Run the TP=2 rank-mapping qualification on four GPUs by selecting
+`llama-bf16-tp2`. `TRTLLM_MX_LLAMA_MODEL` can override the default TinyLlama
+checkpoint path. `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model,
+or NIXL prerequisites from skips into failures and must be set by a CI
+qualification stage. That stage must also allocate the GPUs declared by the
+selected test row.
+
+The dedicated H100 CI stages own isolated Redis and ModelExpress 0.4.1
+sidecars. The two-GPU TP=1 stage is classified as multi-GPU: it runs
+automatically in post-merge pipelines or when a multi-GPU file changes, while
+direct pre-merge dispatch requires the `ci: full pre-merge approved` label.
+Trigger it directly with:
+
+```text
+/bot run --stage-list "DGX_H100-2_GPUs-PyTorch-ModelExpress-1"
+```
+
+TP=2 is the minimum evidence for adding or changing a parallel profile. Its
+four-GPU stage is intentionally on demand and does not join ordinary
+multi-GPU runs:
+
+```text
+/bot run --stage-list "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1"
+```
+
+Both stages set `TRTLLM_MX_E2E_REQUIRED=1`, so missing service, model, client,
+or NIXL prerequisites fail instead of skipping. Do not add every model profile
+to recurring coverage: use the harness for representative rows claimed by the
+support table and keep wider matrices in scheduled qualification.
+
 ### Transform-Layout ABI Rules
 
 An existing transform-layout ABI ID is immutable. Introduce a new ID when a

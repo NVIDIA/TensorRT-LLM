@@ -20,6 +20,7 @@ def torch_ref_rms_norm_rope(
     base,
     is_neox,
     position_ids,
+    use_gemma=False,
 ):
     """
     PyTorch reference implementation of RMSNorm+RoPE for verification.
@@ -40,6 +41,7 @@ def torch_ref_rms_norm_rope(
         base: Base value for RoPE calculations
         is_neox: Whether to use NeoX style RoPE
         position_ids: Position IDs for RoPE of shape [num_tokens]
+        use_gemma: Whether QK norm is Gemma-style RMSNorm (scale by (1 + weight))
 
     Returns:
         Combined tensor with Q and K parts normalized and RoPE applied
@@ -64,8 +66,12 @@ def torch_ref_rms_norm_rope(
     v = qkv[:, q_size + k_size :]
 
     # Create and apply RMSNorm modules with custom weights
-    q_norm = RMSNorm(hidden_size=head_dim, eps=eps).to(qkv.device).to(qkv.dtype)
-    k_norm = RMSNorm(hidden_size=head_dim, eps=eps).to(qkv.device).to(qkv.dtype)
+    q_norm = (
+        RMSNorm(hidden_size=head_dim, eps=eps, use_gemma=use_gemma).to(qkv.device).to(qkv.dtype)
+    )
+    k_norm = (
+        RMSNorm(hidden_size=head_dim, eps=eps, use_gemma=use_gemma).to(qkv.device).to(qkv.dtype)
+    )
 
     # Set the weights to the provided weights
     q_norm.weight.data.copy_(q_weight)
@@ -340,3 +346,110 @@ def test_fused_qk_norm_rope_gemma_mrope(
     )
 
     torch.testing.assert_close(output, ref_output, rtol=5e-2, atol=1e-1)
+
+
+_FP8_NUM_HEADS_GROUPS = (
+    (16, 8, 8),
+    (32, 8, 8),
+    (8, 1, 1),  # MiniMax-M3 sharded GQA (num_heads=8, num_kv_heads=1)
+)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("num_heads_group", _FP8_NUM_HEADS_GROUPS)
+@pytest.mark.parametrize("num_tokens", [1, 3, 8, 256])
+@pytest.mark.parametrize("is_neox", [False, True])
+@pytest.mark.parametrize("partial_rotary_factor", [1.0, 0.5])
+# MiniMax-M3 stores every RMSNorm as a Gemma norm, so use_gemma=True is what ships.
+@pytest.mark.parametrize("use_gemma", [False, True])
+def test_fused_qk_norm_rope_to_fp8(
+    head_dim, num_heads_group, num_tokens, partial_rotary_factor, is_neox, use_gemma
+):
+    """Test the FP8 out-variant of fused QK RMSNorm + RoPE.
+
+    Checks that the input is left untouched, the output is FP8 E4M3 of the same
+    shape, V is a bit-exact E4M3 cast of the input V, and Q/K match the BF16
+    reference after dequantization.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    num_heads_q, num_heads_k, num_heads_v = num_heads_group
+    hidden_size = (num_heads_q + num_heads_k + num_heads_v) * head_dim
+
+    torch.random.manual_seed(0)
+    qkv = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    qkv_ref = qkv.clone()
+
+    position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device) + 100
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device) * 5.0
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device) * 5.0
+
+    eps = 1e-5
+    base = 10000.0
+    factor, low, high, attention_factor = 1.0, 0, 0, 1.0
+    rotary_dim = int(head_dim * partial_rotary_factor)
+
+    out_fp8 = torch.ops.trtllm.fused_qk_norm_rope_to_fp8(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        True,  # is_qk_norm
+        use_gemma,
+        False,  # use_mrope (plain RoPE)
+        0,  # mrope_section1
+        0,  # mrope_section2
+    )
+
+    assert out_fp8.dtype == torch.float8_e4m3fn
+    assert tuple(out_fp8.shape) == (num_tokens, hidden_size)
+    # Out-of-place: the BF16 input must be left byte-for-byte unchanged.
+    torch.testing.assert_close(qkv, qkv_ref, rtol=0.0, atol=0.0)
+
+    # V is copy-cast only, so it pins down the kernel's FP8 rounding against
+    # torch's. The inputs stay well inside E4M3 range, so the two casts'
+    # clamp/NaN behaviors don't diverge.
+    v_start = (num_heads_q + num_heads_k) * head_dim
+    torch.testing.assert_close(
+        out_fp8[:, v_start:].float(),
+        qkv_ref[:, v_start:].to(torch.float8_e4m3fn).float(),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    ref_output = torch_ref_rms_norm_rope(
+        qkv_ref,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        rotary_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        use_gemma=use_gemma,
+    )
+
+    # Dominated by the single E4M3 rounding: 3 mantissa bits give a worst-case
+    # relative error of 2^-4 = 6.25%, plus the ~2^-9 the BF16 reference carries.
+    torch.testing.assert_close(
+        out_fp8.float(),
+        ref_output.float(),
+        rtol=0.07,
+        atol=0.1,
+    )

@@ -15,6 +15,7 @@
 """Unit tests for DSA C++ custom ops:
 
 - ``torch.ops.trtllm.indexer_k_cache_gather_op``
+- ``torch.ops.trtllm.indexer_k_cache_scatter_op``
 - ``torch.ops.trtllm.convert_req_index_to_global``
 - ``torch.ops.trtllm.fused_cat_fp4``
 - ``torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell``
