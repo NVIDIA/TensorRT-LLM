@@ -15,6 +15,11 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  # TEMPORARY (DO NOT MERGE): this test is normally post_merge only, so a PR
+  # pipeline never schedules it and --extra-stage cannot pull it in. Listed here
+  # so the Cosmos3 golden diagnostic actually runs pre-merge. Remove with the
+  # diagnostic.
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_t2i_lpips_against_golden TIMEOUT (15)
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
