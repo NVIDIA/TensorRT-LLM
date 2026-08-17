@@ -175,6 +175,14 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         self._prepare_sparse_forward_args(metadata, forward_args)
         return super().forward(q, k, v, metadata, forward_args=forward_args)
 
+    def _unit_scale(self, like: torch.Tensor) -> torch.Tensor:
+        """Cached [1.0], for scale pointers the Triton kernel cannot take as null."""
+        cached = getattr(self, "_unit_scale_tensor", None)
+        if cached is None or cached.device != like.device:
+            cached = torch.ones(1, dtype=torch.float32, device=like.device)
+            self._unit_scale_tensor = cached
+        return cached
+
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
@@ -262,10 +270,14 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 bmm2_scale=forward_args.mla_bmm2_scale,
                 # Mirrors attentionOp.cpp: quant_scale_o is the attention-output
                 # quant scale, and both dequant scales are the KV cache scale.
+                # The Triton kernel always dereferences quant_scale_o, so an absent
+                # out_scale needs an explicit 1.0 -- the value mlaKernels.cu:490
+                # substitutes for a null pointer. Falling back to the KV scale here
+                # would square it into bmm2.
                 quant_scale_o=(
                     forward_args.out_scale
                     if forward_args.out_scale is not None
-                    else self.kv_scale_quant_orig
+                    else self._unit_scale(self.kv_scale_quant_orig)
                 ),
                 dequant_scale_q=self.kv_scale_quant_orig,
                 dequant_scale_kv=self.kv_scale_quant_orig,

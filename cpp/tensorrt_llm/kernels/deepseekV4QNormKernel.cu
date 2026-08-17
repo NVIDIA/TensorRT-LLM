@@ -50,14 +50,6 @@ struct Fp8VecStore<16>
     using Type = uint4;
 };
 
-template <int NUM_ELTS>
-__device__ inline void storeFp8Vec(__nv_fp8_e4m3* dst, __nv_fp8x2_e4m3 const* packed)
-{
-    using StoreT = typename Fp8VecStore<NUM_ELTS>::Type;
-    static_assert(sizeof(StoreT) == NUM_ELTS, "FP8 store width mismatch.");
-    *reinterpret_cast<StoreT*>(dst) = *reinterpret_cast<StoreT const*>(packed);
-}
-
 constexpr int kWarpsPerBlock = 4;
 constexpr int kThreadsPerBlock = kWarpSize * kWarpsPerBlock;
 

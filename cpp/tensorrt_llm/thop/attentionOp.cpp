@@ -547,6 +547,15 @@ public:
                     TORCH_CHECK(latent_cache->dim() == 2, "latent_cache must be 2D for fused kv-norm, got ",
                         latent_cache->dim(), "D");
                     TORCH_CHECK(latent_cache->stride(1) == 1, "latent_cache must be unit-stride in its last dim");
+                    // The kernel walks rows with 16-byte vector loads, so a row start
+                    // that is not 16B-aligned faults with a bare misaligned-address
+                    // error far from here.
+                    auto const kEltsPer16B = 16 / latent_cache->element_size();
+                    TORCH_CHECK(latent_cache->stride(0) % kEltsPer16B == 0, "latent_cache row stride (",
+                        latent_cache->stride(0), ") must be a multiple of ", kEltsPer16B,
+                        " for the fused kv-norm 16B vector loads");
+                    TORCH_CHECK(reinterpret_cast<uintptr_t>(latent_cache->data_ptr()) % 16 == 0,
+                        "latent_cache must be 16B-aligned for the fused kv-norm vector loads");
                     mla_params.latent_row_stride = static_cast<int>(latent_cache->stride(0));
                     mla_params.kv_norm_weight = static_cast<void const*>(kv_norm_weight->data_ptr());
                     mla_params.kv_norm_eps = static_cast<float>(kv_norm_eps);

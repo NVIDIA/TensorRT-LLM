@@ -292,6 +292,13 @@ void MLARopeGeneration(std::optional<torch::Tensor> fused_q, // [tokens, num_hea
             "kv_norm_weight dtype must match latent_cache");
         TORCH_CHECK(kv_norm_weight->numel() == kv_lora_rank + qk_rope_head_dim,
             "kv_norm_weight must have kv_lora_rank + qk_rope_head_dim elements");
+        // The kernel walks rows with 16-byte vector loads, so a row start that is not
+        // 16B-aligned faults with a bare misaligned-address error far from here.
+        auto const kEltsPer16B = 16 / latent_cache.element_size();
+        TORCH_CHECK(latent_row_stride % kEltsPer16B == 0, "latent_cache row stride (", latent_row_stride,
+            ") must be a multiple of ", kEltsPer16B, " for the fused kv-norm 16B vector loads");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(latent_cache.data_ptr()) % 16 == 0,
+            "latent_cache must be 16B-aligned for the fused kv-norm vector loads");
         kv_norm_weight_ptr = kv_norm_weight->data_ptr();
     }
 
