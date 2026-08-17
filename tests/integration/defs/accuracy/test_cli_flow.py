@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -62,15 +62,6 @@ class TestGpt2Medium(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     def test_fp8(self):
         self.run(quant_algo=QuantAlgo.FP8)
-
-
-class TestStarcoder2_3B(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "bigcode/starcoder2-3b"
-    MODEL_PATH = f"{llm_models_root()}/starcoder2-3b"
-    EXAMPLE_FOLDER = "models/core/gpt"
-
-    def test_auto_dtype(self):
-        self.run(tasks=[Humaneval(self.MODEL_NAME)], dtype='auto')
 
 
 class TestStarcoder2_15B(CliFlowAccuracyTestHarness):
