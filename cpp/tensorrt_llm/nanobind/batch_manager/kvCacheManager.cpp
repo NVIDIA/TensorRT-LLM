@@ -264,7 +264,7 @@ public:
     }
 
     tbk::KvCacheTransferLease prepareBlocksForTransfer(
-        std::unordered_map<SizeType32, std::vector<tbk::KVCacheBlock::IdType>> const&, tb::LlmRequest::RequestIdType,
+        std::unordered_map<SizeType32, std::vector<tbk::KVCacheBlock::IdType>> const&,
         tensorrt_llm::executor::KvCacheTransferMode = tensorrt_llm::executor::KvCacheTransferMode::DRAM,
         std::string const& = "") override
     {

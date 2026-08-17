@@ -5008,131 +5008,113 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     EXPECT_EQ(freeAfterUnpin, totalBlocks);
 }
 
-TEST_F(KVCacheManagerTest, DisaggTransferBlockIndexLookupOnboardsOffloadedBlocks)
+namespace
+{
+struct DisaggTransferOffloadSetup
+{
+    std::unique_ptr<KVCacheManager> kvCacheManager;
+    std::shared_ptr<LlmRequest> llmRequest;
+    KVCacheBlock::IdType offloadedBlockId{};
+    BlockPtr offloadedBlock;
+    SizeType32 maxAttentionWindow{};
+};
+
+DisaggTransferOffloadSetup makeDisaggTransferOffloadSetup()
 {
     using namespace tensorrt_llm::batch_manager::kv_cache_manager;
-    auto constexpr numLayers = 2;
-    auto constexpr numKvHeads = 2;
-    auto constexpr sizePerHead = 16;
-    auto constexpr tokensPerBlock = 4;
-    auto constexpr blocksInPrimaryPool = 4;
-    auto constexpr blocksInSecondaryPool = 2;
-    auto constexpr maxNumSequences = 8;
+    auto constexpr kNumLayers = 2;
+    auto constexpr kNumKvHeads = 2;
+    auto constexpr kSizePerHead = 16;
+    auto constexpr kTokensPerBlock = 4;
+    auto constexpr kBlocksInPrimaryPool = 4;
+    auto constexpr kBlocksInSecondaryPool = 2;
+    auto constexpr kMaxNumSequences = 8;
     auto const stream = std::make_shared<tr::CudaStream>();
 
-    auto constexpr beamWidth = 1;
-    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+    auto constexpr kBeamWidth = 1;
+    auto const maxAttentionWindow = kTokensPerBlock * kBlocksInPrimaryPool;
 
-    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {kBlocksInPrimaryPool, kBlocksInSecondaryPool}}};
 
-    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
-        maxAttentionWindow, maxAttentionWindow, true);
-    kvCacheManager.allocatePools(false);
+    auto kvCacheManager = std::make_unique<KVCacheManager>(kNumLayers, kNumKvHeads, kSizePerHead, kTokensPerBlock,
+        blocksPerWindow, kMaxNumSequences, kBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
+        tensorrt_llm::DataType::kHALF, 0, stream, maxAttentionWindow, maxAttentionWindow, true);
+    kvCacheManager->allocatePools(false);
 
     LlmRequest::RequestIdType requestId{0};
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
-    tr::SamplingConfig const samplingConfig{beamWidth};
-    bool constexpr isStreaming{false};
-    auto llmRequest = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, isStreaming);
+    tr::SamplingConfig const samplingConfig{kBeamWidth};
+    bool constexpr kIsStreaming{false};
+    auto llmRequest = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, kIsStreaming);
 
-    kvCacheManager.addSequenceBatch(
-        {{{requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+    kvCacheManager->addSequenceBatch(
+        {{{requestId, static_cast<SizeType32>(inputTokens->size()), kBeamWidth}}}, {std::ref(*llmRequest)});
 
-    auto const& allBlockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
-    ASSERT_FALSE(allBlockIds.empty());
+    auto const& allBlockIds = kvCacheManager->getCacheBlockIds(requestId, maxAttentionWindow)[0];
+    TLLM_CHECK(!allBlockIds.empty());
     auto const offloadedBlockId = allBlockIds.front();
 
-    auto& blockManager = const_cast<BlockManager&>(kvCacheManager.getBlockManager());
+    auto& blockManager = tensorrt_llm::testing::KvCacheManagerTestUtil::mutableBlockManager(*kvCacheManager);
     auto block = blockManager.getBlockById(offloadedBlockId, maxAttentionWindow);
-    ASSERT_NE(block, nullptr);
-    ASSERT_TRUE(block->isPrimary());
+    TLLM_CHECK(block != nullptr);
+    TLLM_CHECK(block->isPrimary());
 
     blockManager.offloadBlock(block, maxAttentionWindow);
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    ASSERT_FALSE(block->isPrimary());
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+    TLLM_CHECK(!block->isPrimary());
 
-    auto const freeBlocksBeforeTransfer = blockManager.getNumFreeBlocksPerWindowSize().at(maxAttentionWindow);
+    return {std::move(kvCacheManager), std::move(llmRequest), offloadedBlockId, block, maxAttentionWindow};
+}
+} // namespace
+
+TEST_F(KVCacheManagerTest, DisaggTransferBlockIndexLookupOnboardsOffloadedBlocks)
+{
+    auto setup = makeDisaggTransferOffloadSetup();
+    auto& kvCacheManager = *setup.kvCacheManager;
+    auto& blockManager = tensorrt_llm::testing::KvCacheManagerTestUtil::mutableBlockManager(kvCacheManager);
+
+    auto const freeBlocksBeforeTransfer = blockManager.getNumFreeBlocksPerWindowSize().at(setup.maxAttentionWindow);
     ASSERT_GT(freeBlocksBeforeTransfer, 0);
     auto const allocTotalBeforeTransfer = kvCacheManager.getNumAllocTotalBlocks();
     auto const allocNewBeforeTransfer = kvCacheManager.getNumAllocNewBlocks();
     kvCacheManager.startScheduling();
-    ASSERT_TRUE(blockManager.schedulingHasFreeBlocks(freeBlocksBeforeTransfer, maxAttentionWindow));
+    ASSERT_TRUE(blockManager.schedulingHasFreeBlocks(freeBlocksBeforeTransfer, setup.maxAttentionWindow));
 
     {
         auto transferLease
-            = kvCacheManager.prepareBlocksForTransfer({{maxAttentionWindow, {offloadedBlockId}}}, requestId);
+            = kvCacheManager.prepareBlocksForTransfer({{setup.maxAttentionWindow, {setup.offloadedBlockId}}});
         EXPECT_TRUE(transferLease.issuedOnboardCopies());
-        transferLease.syncReadyForFormat(blockManager.getBufferManager(maxAttentionWindow));
-        ASSERT_TRUE(block->isPrimary());
+        transferLease.syncReadyForFormat(blockManager.getBufferManager(setup.maxAttentionWindow));
+        ASSERT_TRUE(setup.offloadedBlock->isPrimary());
         EXPECT_EQ(kvCacheManager.getNumAllocTotalBlocks(), allocTotalBeforeTransfer);
         EXPECT_EQ(kvCacheManager.getNumAllocNewBlocks(), allocNewBeforeTransfer);
-        EXPECT_TRUE(blockManager.schedulingHasFreeBlocks(freeBlocksBeforeTransfer - 1, maxAttentionWindow));
-        EXPECT_FALSE(blockManager.schedulingHasFreeBlocks(freeBlocksBeforeTransfer, maxAttentionWindow));
+        EXPECT_TRUE(blockManager.schedulingHasFreeBlocks(freeBlocksBeforeTransfer, setup.maxAttentionWindow));
 
         EXPECT_NO_THROW({
-            auto const indices
-                = kvCacheManager.getMemoryPoolBlockIndicesByBlockIds({offloadedBlockId}, maxAttentionWindow);
+            auto const indices = kvCacheManager.getMemoryPoolBlockIndicesByBlockIds(
+                {setup.offloadedBlockId}, setup.maxAttentionWindow);
             EXPECT_EQ(indices.size(), 1);
         });
     }
 
-    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
-    (void) kvCacheManager.removeSequence(requestId, llmRequest);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*setup.llmRequest);
+    (void) kvCacheManager.removeSequence(setup.llmRequest->mRequestId, setup.llmRequest);
 }
 
 TEST_F(KVCacheManagerTest, DisaggTransferBlockRangePreparationOnboardsOffloadedBlocks)
 {
-    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
-    auto constexpr numLayers = 2;
-    auto constexpr numKvHeads = 2;
-    auto constexpr sizePerHead = 16;
-    auto constexpr tokensPerBlock = 4;
-    auto constexpr blocksInPrimaryPool = 4;
-    auto constexpr blocksInSecondaryPool = 2;
-    auto constexpr maxNumSequences = 8;
-    auto const stream = std::make_shared<tr::CudaStream>();
+    auto setup = makeDisaggTransferOffloadSetup();
+    auto& kvCacheManager = *setup.kvCacheManager;
+    auto& blockManager = tensorrt_llm::testing::KvCacheManagerTestUtil::mutableBlockManager(kvCacheManager);
 
-    auto constexpr beamWidth = 1;
-    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
-
-    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
-
-    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, tensorrt_llm::DataType::kHALF, 0, stream,
-        maxAttentionWindow, maxAttentionWindow, true);
-    kvCacheManager.allocatePools(false);
-
-    LlmRequest::RequestIdType requestId{0};
-    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
-    tr::SamplingConfig const samplingConfig{beamWidth};
-    bool constexpr isStreaming{false};
-    auto llmRequest = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, isStreaming);
-
-    kvCacheManager.addSequenceBatch(
-        {{{requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
-
-    auto const& allBlockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
-    ASSERT_FALSE(allBlockIds.empty());
-    auto const offloadedBlockId = allBlockIds.front();
-
-    auto& blockManager = const_cast<BlockManager&>(kvCacheManager.getBlockManager());
-    auto block = blockManager.getBlockById(offloadedBlockId, maxAttentionWindow);
-    ASSERT_NE(block, nullptr);
-    ASSERT_TRUE(block->isPrimary());
-
-    blockManager.offloadBlock(block, maxAttentionWindow);
-    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    ASSERT_FALSE(block->isPrimary());
-
-    auto blockRange = BlockRange::fromAllBlockIds(kvCacheManager, requestId);
+    auto blockRange = BlockRange::fromAllBlockIds(kvCacheManager, setup.llmRequest->mRequestId);
     {
-        auto transferLease = prepareBlockRangeForTransfer(kvCacheManager, blockRange, {maxAttentionWindow}, requestId,
-            blockManager.getBufferManager(maxAttentionWindow), llmRequest.get());
+        auto transferLease = prepareBlockRangeForTransfer(kvCacheManager, blockRange, {setup.maxAttentionWindow},
+            blockManager.getBufferManager(setup.maxAttentionWindow), setup.llmRequest.get());
         EXPECT_TRUE(transferLease.issuedOnboardCopies());
-        ASSERT_TRUE(block->isPrimary());
+        ASSERT_TRUE(setup.offloadedBlock->isPrimary());
 
-        auto blockRangeForWindow = blockRange.getBlockRangeForWindow(maxAttentionWindow);
+        auto blockRangeForWindow = blockRange.getBlockRangeForWindow(setup.maxAttentionWindow);
         EXPECT_NO_THROW({
             auto it = blockRangeForWindow.begin();
             tr::ITensor::SharedPtr const blockTensor = it;
@@ -5140,8 +5122,8 @@ TEST_F(KVCacheManagerTest, DisaggTransferBlockRangePreparationOnboardsOffloadedB
         });
     }
 
-    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
-    (void) kvCacheManager.removeSequence(requestId, llmRequest);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*setup.llmRequest);
+    (void) kvCacheManager.removeSequence(setup.llmRequest->mRequestId, setup.llmRequest);
 }
 
 // Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block

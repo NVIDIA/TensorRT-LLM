@@ -426,6 +426,7 @@ void KVCacheTransferManager::syncOnboardToBufferManager(tr::BufferManager const&
     tr::CudaEvent onboardEvent;
     mOnboardManager.getStream().record(onboardEvent);
     bufferManager.getStream().wait(onboardEvent);
+    onboardEvent.synchronize();
 }
 
 KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()
