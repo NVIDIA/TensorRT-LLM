@@ -18,7 +18,6 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -463,7 +462,9 @@ class Runner:
             # To run the problem size of $B$ GPUs on $A$ GPUs, we need:
             # (1) Attention: If TP, reduce the number of attention heads; If DP, nothing to change.
             # (2) MoE: If EP, reduce the number of experts; If TP, reduce head size.
-            #     Maintain the result of AllToAll method selection because it is affected by EP size.
+            # MoE communication does not need a scaling hook: CommunicationFactory
+            # selects an alltoall strategy for any EP size under attention DP, so the
+            # scaled-down run already exercises the same communication path.
             def load_pretrained_config(*args, **kwargs):
                 pretrained_config = load_pretrained_config_orig(*args, **kwargs)
                 if not mapping.enable_attention_dp:
@@ -484,33 +485,13 @@ class Runner:
 
             return load_pretrained_config
 
-        def make_select_alltoall_method_type(select_alltoall_method_type_orig):
-            def select_alltoall_method_type(
-                cls: type, mapping: Mapping, top_k: int, *args, **kwargs
-            ):
-                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
-                # by replacing `top_k` with `fake_top_k`
-                if scaled_from <= top_k:
-                    fake_top_k = mapping.moe_ep_size + 1
-                else:
-                    fake_top_k = mapping.moe_ep_size - 1
-                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
-                return select_alltoall_method_type_orig(mapping, fake_top_k, *args, **kwargs)
-
-            return select_alltoall_method_type
-
-        select_alltoall_method_type_wide_ep = WideEPMoE.select_alltoall_method_type
         tensorrt_llm._torch.model_config.load_pretrained_config = make_load_pretrained_config(
             mapping, load_pretrained_config
-        )
-        WideEPMoE.select_alltoall_method_type = make_select_alltoall_method_type(
-            select_alltoall_method_type_wide_ep
         )
         try:
             yield
         finally:
             tensorrt_llm._torch.model_config.load_pretrained_config = load_pretrained_config
-            WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod
     @contextlib.contextmanager

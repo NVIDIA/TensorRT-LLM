@@ -256,13 +256,8 @@ tensorrt_llm/_torch/modules/fused_moe/fused_moe_deepgemm.py
 tensorrt_llm/_torch/modules/fused_moe/fused_moe_triton.py
 tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py
 tensorrt_llm/_torch/modules/fused_moe/fused_moe_vanilla.py
-tensorrt_llm/_torch/modules/fused_moe/fused_moe_wide_ep.py
 tensorrt_llm/_torch/modules/fused_moe/interface.py
 tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py
-tensorrt_llm/_torch/modules/fused_moe/ops/__init__.py
-tensorrt_llm/_torch/modules/fused_moe/ops/moe_op.py
-tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_cutlass.py
-tensorrt_llm/_torch/modules/fused_moe/ops/moe_op_deepgemm.py
 tensorrt_llm/_torch/modules/fused_moe/quantization.py
 tensorrt_llm/_torch/modules/fused_moe/routing.py
 tensorrt_llm/_torch/modules/gated_mlp.py
