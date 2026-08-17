@@ -12,11 +12,11 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
- * Adapted from vLLM (Apache-2.0):
- * https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/libtorch_stable/quantization/w8a8/fp8/common.cu
- * Extracted: dynamic_per_token_scaled_fp8_quant_kernel_strided only.
  */
+
+// Adapted from vLLM (Apache-2.0):
+// https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/libtorch_stable/quantization/w8a8/fp8/common.cu
+// Extracted: dynamic_per_token_scaled_fp8_quant_kernel_strided only.
 
 #pragma once
 

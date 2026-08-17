@@ -12,17 +12,17 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- *
- * Adapted from vLLM (Apache-2.0):
- *   https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/quantization/utils.cuh
- *   https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh
- *   https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/quantization/w8a8/fp8/common.cuh
- *
- * Slim compatibility header: provides the subset of FP8 quantization
- * utilities needed by dynamic_per_token_scaled_fp8_quant_kernel_strided.
- * Excludes the attention-dtype conversions from quant_utils.cuh that would
- * pull in vLLM's attention infrastructure.
  */
+
+// Adapted from vLLM (Apache-2.0):
+//   https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/quantization/utils.cuh
+//   https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/quantization/w8a8/fp8/nvidia/quant_utils.cuh
+//   https://github.com/vllm-project/vllm/blob/v0.25.0/csrc/quantization/w8a8/fp8/common.cuh
+//
+// Slim compatibility header: provides the subset of FP8 quantization
+// utilities needed by dynamic_per_token_scaled_fp8_quant_kernel_strided.
+// Excludes the attention-dtype conversions from quant_utils.cuh that would
+// pull in vLLM's attention infrastructure.
 
 #pragma once
 
