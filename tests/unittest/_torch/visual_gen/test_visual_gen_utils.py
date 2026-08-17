@@ -25,10 +25,10 @@ from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGene
 from tensorrt_llm.serve.visual_gen_utils import (
     _merge_extra_params,
     _warn_if_set_with_no_semantic,
-    cleanup_reference_files,
     parse_visual_gen_params,
 )
 from tensorrt_llm.visual_gen import VisualGenParams
+from tensorrt_llm.visual_gen.media_refs import cleanup_reference_files
 
 pytestmark = pytest.mark.cpu_only
 
@@ -558,7 +558,7 @@ class TestInputReferenceMaterialization:
                 self.content = content
 
         monkeypatch.setattr(
-            "tensorrt_llm.serve.visual_gen_utils._safe_request_get",
+            "tensorrt_llm.visual_gen.media_refs._safe_request_get",
             lambda url, **kwargs: _FakeResp(png),
         )
         request = VideoGenerationRequest(prompt="x", image_reference="https://example.com/a.png")
@@ -575,7 +575,7 @@ class TestInputReferenceMaterialization:
         def _blocked(url, **kwargs):
             raise RuntimeError("URL resolves to a non-public address (10.0.0.1)")
 
-        monkeypatch.setattr("tensorrt_llm.serve.visual_gen_utils._safe_request_get", _blocked)
+        monkeypatch.setattr("tensorrt_llm.visual_gen.media_refs._safe_request_get", _blocked)
         request = VideoGenerationRequest(prompt="x", image_reference="http://10.0.0.1/a.png")
         with pytest.raises(ValueError, match="reference URL could not be fetched"):
             parse_visual_gen_params(
