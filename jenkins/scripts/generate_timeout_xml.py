@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,9 +14,118 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
+import re
 import sys
 from html import escape
+
+# ---------------------------------------------------------------------------
+# XML sanitisation helpers
+# ---------------------------------------------------------------------------
+
+# ANSI escape sequences (e.g. colour codes from pytest output).
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+# Characters that are illegal in XML 1.0 (excluding the accepted whitespace
+# codepoints \t, \n, \r).
+_XML_ILLEGAL_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x84\x86-\x9f"
+    r"\ud800-\udfff￾￿]"
+)
+
+_RANK_TIMEOUT_DATA_FILE_RE = re.compile(r"timeout_data_step(\d+)_rank(\d+)\.jsonl$")
+
+
+def sanitize_for_xml(text):
+    """Remove ANSI escapes and XML-illegal characters, then XML-escape the result."""
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    text = _XML_ILLEGAL_RE.sub("", text)
+    return escape(text, quote=False)
+
+
+def format_timeout_system_out(nodeid, snippet):
+    """Return a human-readable timeout section for a JUnit ``system-out`` field."""
+    return (
+        "\n"
+        "==============================================================================\n"
+        "PYTEST TIMEOUT\n"
+        f"Test: {nodeid}\n"
+        "------------------------------------------------------------------------------\n"
+        "Captured pytest output:\n"
+        "------------------------------------------------------------------------------\n"
+        f"{snippet.rstrip()}\n"
+        "==============================================================================\n"
+        "END PYTEST TIMEOUT\n"
+        "==============================================================================\n"
+    )
+
+
+def timeout_data_sort_key(path):
+    """Return a deterministic numeric sort key for timeout-data files."""
+    path = os.fspath(path)
+    match = _RANK_TIMEOUT_DATA_FILE_RE.search(os.path.basename(path))
+    if match:
+        return (0, int(match.group(1)), int(match.group(2)), path)
+    return (1, 0, 0, path)
+
+
+def load_timeout_map(paths, expected_nodeids=None):
+    """Load NDJSON files and return a ``{nodeid: snippet}`` mapping.
+
+    Args:
+        paths: Paths to rank-specific or per-invocation timeout-data files.
+        expected_nodeids: Optional nodeids that remain unfinished. Records for
+            other tests are ignored before their snippets are retained.
+
+    Returns:
+        Timeout records keyed by nodeid. When duplicate rank records exist,
+        the first record by numeric step and rank order wins deterministically.
+        Unreadable files and corrupt lines are reported and skipped.
+    """
+    if not paths:
+        return {}
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    timeout_map = {}
+    for path in sorted(map(os.fspath, paths), key=timeout_data_sort_key):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for lineno, raw in enumerate(f, 1):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                        if (
+                            not isinstance(rec, dict)
+                            or not isinstance(rec.get("nodeid"), str)
+                            or not isinstance(rec.get("snippet"), str)
+                        ):
+                            raise ValueError(
+                                f'expected {{"nodeid": str, "snippet": str}}, '
+                                f"got {type(rec).__name__} with keys "
+                                f"{list(rec.keys()) if isinstance(rec, dict) else 'N/A'}"
+                            )
+                        nodeid = rec["nodeid"]
+                        if expected_nodeids is not None and nodeid not in expected_nodeids:
+                            continue
+                        timeout_map.setdefault(nodeid, rec["snippet"])
+                    except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                        print(
+                            f"WARNING: generate_timeout_xml: skipping corrupt line "
+                            f"{lineno} in {path}: {exc}",
+                            file=sys.stderr,
+                        )
+        except OSError as exc:
+            print(
+                f"WARNING: generate_timeout_xml: cannot read {path}: {exc}",
+                file=sys.stderr,
+            )
+    return timeout_map
+
+
+# ---------------------------------------------------------------------------
 
 
 def parse_xml_classname_name_file_from_testname(testname, stage_name):
@@ -70,14 +179,23 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
     return classname, name, file
 
 
-def generate_timeout_xml(stage_name, testList, outputFilePath):
+def generate_timeout_xml(stage_name, testList, outputFilePath, timeout_map=None):
     """Generate JUnit XML report for timed-out tests.
 
     Args:
-        stage_name: Name of the test stage
-        testList: List of test names that timed out
-        outputFilePath: Path where the XML report will be written
+        stage_name: Name of the test stage.
+        testList: List of test nodeids that did not complete (raw lines from
+            ``unfinished_test.txt``, including the stage prefix).
+        outputFilePath: Path where the XML report will be written.
+        timeout_map: Optional mapping of ``{nodeid: snippet}`` produced by
+            ``load_timeout_map()``.  A nodeid present in this map is classified
+            as ``pytest_timeout`` and its snippet is embedded in
+            ``<system-out>``.  All other nodeids are classified as ``unknown``.
+            When *None* or empty every test falls back to ``unknown``.
     """
+    if timeout_map is None:
+        timeout_map = {}
+
     num_tests = len(testList)
     # Escape stage_name for XML safety
     stage_name_escaped = escape(stage_name, quote=True)
@@ -93,13 +211,25 @@ def generate_timeout_xml(stage_name, testList, outputFilePath):
         classname_escaped = escape(classname, quote=True)
         name_escaped = escape(name, quote=True)
         file_escaped = escape(file, quote=True)
+
+        if test in timeout_map:
+            # Confirmed pytest-timeout kill: embed the captured log snippet.
+            system_out = format_timeout_system_out(test, timeout_map[test])
+            snippet_escaped = sanitize_for_xml(system_out)
+            error_block = (
+                f'        <error message="pytest_timeout">Pytest timeout.</error>\n'
+                f"        <system-out>{snippet_escaped}</system-out>\n"
+            )
+        else:
+            # Unexpected termination (OOM, node crash, etc.) or unknown cause.
+            error_block = '        <error message="unknown">Test terminated unexpectedly.</error>'
+
         xmlContent += (
             f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
             f'file="{file_escaped}" time="1.0">\n'
-            f'        <error message="Test terminated unexpectedly">'
-            f" Test terminated unexpectedly\n"
-            f"        </error></testcase>"
+            f"{error_block}</testcase>"
         )
+
     xmlContent += "</testsuite></testsuites>"
 
     with open(outputFilePath, "w", encoding="utf-8") as f:
@@ -117,6 +247,12 @@ def main():
     parser.add_argument("--stage-name", required=True, help="Stage name")
     parser.add_argument("--test-file-path", required=True, help="Test list file path")
     parser.add_argument("--output-file", required=True, help="Output file path")
+    parser.add_argument(
+        "--timeout-data-file",
+        action="append",
+        default=[],
+        help="Optional timeout-data file; may be passed once per Slurm rank",
+    )
     args = parser.parse_args(sys.argv[1:])
     stageName = args.stage_name
     testFilePath = args.test_file_path
@@ -138,7 +274,8 @@ def main():
         print(f"No timeout tests found in {full_path}, skipping timeout XML generation")
         return
 
-    generate_timeout_xml(stageName, timeoutTests, outputFilePath)
+    timeout_map = load_timeout_map(args.timeout_data_file, set(timeoutTests))
+    generate_timeout_xml(stageName, timeoutTests, outputFilePath, timeout_map)
 
 
 if __name__ == "__main__":
