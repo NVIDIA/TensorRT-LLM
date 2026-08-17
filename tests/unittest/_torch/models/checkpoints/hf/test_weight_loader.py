@@ -466,6 +466,52 @@ def test_prefetch_one_file_no_fallback_log_when_fully_populated(tmp_path, monkey
     assert not [c for c in info.call_args_list if "chunked reads" in str(c)]
 
 
+@pytest.mark.parametrize("already_warmed, expect_heartbeat", [(False, True), (True, False)])
+def test_load_stage_reports_progress_only_when_not_prefetched(
+    tmp_path, monkeypatch, already_warmed: bool, expect_heartbeat: bool
+):
+    # load_func reads a whole multi-GB file in one opaque blocking call, so
+    # when prefetch was skipped the load stage would otherwise emit no
+    # newline-terminated output for its entire duration and output-stall
+    # watchdogs kill a healthy load (the tqdm bar's bare '\r' is invisible to
+    # them). Warming as each file is loaded must report progress per window --
+    # and must NOT re-warm when prefetch already ran.
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    monkeypatch.setattr(wl, "_PREFETCH_CHUNK_SIZE_BYTES", mmap.PAGESIZE)
+    monkeypatch.setattr(wl, "_PREFETCH_LOG_INTERVAL_SEC", 0.0)
+
+    windows_per_file = 4
+    files = []
+    for i in range(3):
+        file = tmp_path / f"model-0000{i}-of-00003.safetensors"
+        file.write_bytes(os.urandom(windows_per_file * mmap.PAGESIZE))
+        files.append(str(file))
+
+    loaded: list[str] = []
+
+    def fake_load(file_name):
+        loaded.append(file_name)
+        return {file_name: object()}
+
+    with mock.patch.object(wl.logger, "info") as info:
+        weights = HfWeightLoader()._load_weights_in_parallel(
+            files, fake_load, "loading", already_warmed=already_warmed
+        )
+
+    # The weights must load either way -- warming only changes observability.
+    assert sorted(loaded) == sorted(files)
+    assert len(weights) == len(files)
+
+    heartbeats = [c for c in info.call_args_list if "Weight load progress" in str(c)]
+    if expect_heartbeat:
+        # One line per window with the interval forced to zero, so the silent
+        # interval is bounded by window time rather than whole-file time.
+        assert len(heartbeats) >= len(files) * windows_per_file
+    else:
+        assert heartbeats == []
+
+
 def test_prefetch_files_emits_progress_heartbeat(tmp_path, monkeypatch):
     # The heartbeat is what keeps a slow prefetch observable (and alive under
     # output-stall watchdogs); with the log interval forced to zero it must

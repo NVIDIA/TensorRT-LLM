@@ -357,12 +357,22 @@ class HfWeightLoader(BaseWeightLoader):
         # skipped. Ranks that didn't prefetch reach the barrier immediately.
         local_mpi_barrier()
 
+        # Tracked here rather than inside `prefetch_files`, which returns
+        # early when this rank's stripe is empty (fewer files than local
+        # ranks): a flag set at the end of that function would leave such
+        # ranks marked unwarmed and re-warm files needlessly.
         return self._load_weights_in_parallel(
-            weight_files, self._load_safetensors_file,
-            "Loading safetensors weights in parallel")
+            weight_files,
+            self._load_safetensors_file,
+            "Loading safetensors weights in parallel",
+            already_warmed=enable_prefetch)
 
-    def _load_weights_in_parallel(self, weight_files: List[str], load_func,
-                                  description: str) -> ConsumableWeightsDict:
+    def _load_weights_in_parallel(
+            self,
+            weight_files: List[str],
+            load_func,
+            description: str,
+            already_warmed: bool = False) -> ConsumableWeightsDict:
         """
         Load weight files in parallel using the specified loading function.
 
@@ -370,20 +380,73 @@ class HfWeightLoader(BaseWeightLoader):
             weight_files: List of weight file paths
             load_func: Function to load individual weight files
             description: Description for the progress bar
+            already_warmed: Whether the files were prefetched. When False, each
+                file is warmed in bounded windows as it is loaded so that the
+                load stage still reports progress.
 
         Returns:
             ConsumableWeightsDict containing all loaded weights
         """
         weights = {}
         pbar = tqdm.tqdm(total=len(weight_files), desc=description)
+        load_and_report = load_func
+        if not already_warmed:
+            # `load_func` reads a whole multi-GB file in one opaque blocking
+            # call, and the only other output here is `pbar`, whose bare '\r'
+            # never terminates a line, so on slow storage output-stall
+            # watchdogs see nothing for the whole stage and kill a healthy
+            # load. Warming through the windowed prefetch path reports progress
+            # per window; it reads the same bytes `load_func` would, one file
+            # at a time as that file is loaded, so neither total I/O nor peak
+            # page-cache residency changes.
+            report_progress = self._make_progress_reporter(
+                "Weight load", weight_files)
+
+            def load_and_report(file_name: str):
+                self._prefetch_one_file(file_name, report_progress)
+                return load_func(file_name)
 
         # Note that the function is called with a tuple of arguments, hence we need to wrap the arguments in a tuple via [(w,) for w in weight_files]
         # specifically the comma right after the w is important to make it a tuple.
-        run_concurrently(load_func, [(w, ) for w in weight_files],
+        run_concurrently(load_and_report, [(w, ) for w in weight_files],
                          reduce_func=weights.update,
                          pbar=pbar)
 
         return ConsumableWeightsDict(weights)
+
+    @staticmethod
+    def _make_progress_reporter(stage: str,
+                                file_names: List[str]) -> Callable[[int], None]:
+        """Build a thread-safe, rate-limited progress reporter for `file_names`.
+
+        Deliberately progress-gated rather than timer-driven: it proves
+        liveness only while bytes are actually moving, so a fully hung mount
+        still goes silent and output-stall watchdogs retain the ability to
+        kill it.
+        """
+        total_size = 0
+        for file_name in file_names:
+            try:
+                total_size += os.path.getsize(file_name)
+            except OSError:
+                pass  # Missing files are tolerated, as in _prefetch_one_file.
+        progress_lock = threading.Lock()
+        done_size = 0
+        last_log_time = time.monotonic()
+
+        def report_progress(num_bytes: int) -> None:
+            nonlocal done_size, last_log_time
+            with progress_lock:
+                done_size += num_bytes
+                now = time.monotonic()
+                if now - last_log_time < _PREFETCH_LOG_INTERVAL_SEC:
+                    return
+                last_log_time = now
+                current_size = done_size
+            logger.info(f"{stage} progress: {current_size / (1024**3):.2f}GB / "
+                        f"{total_size / (1024**3):.2f}GB (this rank's share).")
+
+        return report_progress
 
     @staticmethod
     def _load_safetensors_file(file):
@@ -487,34 +550,11 @@ class HfWeightLoader(BaseWeightLoader):
         if len(local_file_names) == 0:
             return
 
-        total_size = 0
-        for file_name in local_file_names:
-            try:
-                total_size += os.path.getsize(file_name)
-            except OSError:
-                pass  # Missing files are tolerated, as in _prefetch_one_file.
-        progress_lock = threading.Lock()
-        prefetched_size = 0
-        last_log_time = time.monotonic()
-
-        def report_progress(num_bytes: int) -> None:
-            # Periodic heartbeat: on slow storage, prefetching can run for
-            # tens of minutes without completing a single file, and log
-            # silence gets the process killed by output-stall watchdogs.
-            # Deliberately progress-gated: it proves liveness only while
-            # bytes are actually moving, so a fully hung mount still goes
-            # silent and such watchdogs retain the ability to kill it.
-            nonlocal prefetched_size, last_log_time
-            with progress_lock:
-                prefetched_size += num_bytes
-                now = time.monotonic()
-                if now - last_log_time < _PREFETCH_LOG_INTERVAL_SEC:
-                    return
-                last_log_time = now
-                current_size = prefetched_size
-            logger.info(
-                f"Prefetch progress: {current_size / (1024**3):.2f}GB / "
-                f"{total_size / (1024**3):.2f}GB (this rank's share).")
+        # Periodic heartbeat: on slow storage, prefetching can run for tens of
+        # minutes without completing a single file, and log silence gets the
+        # process killed by output-stall watchdogs.
+        report_progress = self._make_progress_reporter("Prefetch",
+                                                       local_file_names)
 
         max_workers = min(multiprocessing.cpu_count() * 2, 16,
                           len(local_file_names))
