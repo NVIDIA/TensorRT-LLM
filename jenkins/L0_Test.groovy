@@ -229,7 +229,7 @@ COMMON_SSH_OPTIONS = Utils.DEFAULT_CUSTOM_SSH_OPTIONS
 CBTS_EXCLUDE_STAGES = [] as Set
 
 def isCbtsStage(String stageName) {
-    // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
+    // Pipeline-level eligibility is decided in L0_MergeRequest.groovy and propagated via testFilter.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
