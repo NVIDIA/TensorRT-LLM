@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 @Library(['trtllm-jenkins-shared-lib@main']) _
 import groovy.json.JsonSlurper
 
@@ -8,6 +24,8 @@ def createKubernetesPodConfig()
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux"""
     def image = "urm.nvidia.com/docker/ubuntu:24.04"
+    // release mode requires a longer pod lifetime to survive the manual license review window
+    def scannerSleepSeconds = (params?.scanMode == 'release') ? '345600' : '7200'
     def podConfig = [
         cloud: targetCloud,
         namespace: "sw-tensorrt",
@@ -35,7 +53,7 @@ def createKubernetesPodConfig()
                     imagePullPolicy: Always
                   - name: pulse-container-scanner
                     image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:6.2.1
-                    command: ['sleep', '7200']
+                    command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
                       requests:
@@ -52,7 +70,7 @@ def createKubernetesPodConfig()
                       runAsGroup: 0
                   - name: pulse-oss-scanner
                     image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable
-                    command: ['sleep', '7200']
+                    command: ['sleep', '${scannerSleepSeconds}']
                     tty: true
                     resources:
                       requests:
@@ -200,8 +218,7 @@ def generateLockFiles(llmRepo, ref)
             echo "Running against a fork repo, skipping lock file push to branch"
         } else {
             sh "git status"
-            sh "git add -u security_scanning/"
-            sh "git add \$(find . -type f \\( -name 'poetry.lock' -o -name 'pyproject.toml' -o -name 'metadata.json' \\))"
+            sh "git add security_scanning/"
             sh "git commit -s -m \"[None][infra] Check in most recent lock file from nightly pipeline\""
             withCredentials([
                 string(credentialsId: 'svc_tensorrt_gitlab_api_token_no_username_as_string', variable: 'GITLAB_API_TOKEN'),
@@ -236,7 +253,7 @@ def sonarScan()
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
         withSonarQubeEnv() {
-          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.ref}"
+          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName} -Dsonar.exclusions=cpp/build/**,**/*.lock,**/*.cubin,**/*.zst,**/*.tar.zst,**/cubin/**,3rdparty/**,docs/**,**/*.png,**/*.jpg,**/*.jpeg,**/*.gif,**/*.ico,**/*.pdf,**/*.whl,**/*.egg-info/**"
         }
     }
 }
@@ -259,13 +276,20 @@ def pulseScanSourceCode(llmRepo, ref) {
             "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
             "PULSE_SCAN_OVERRIDE=false"
         ]) {
-            sh 'pulse scan --no-fail --exclude-detectors PIP --sbom .'
+            sh 'pulse scan --no-fail --exclude-detectors PIP,SETUPTOOLS --sbom .'
         }
     }
     container("cpu") {
         def outputDir = "scan_report/source_code"
         sh "mkdir -p ${outputDir}"
-        sh "unzip -p sbom.zip \"*.json\" > ${outputDir}/sbom.json"
+        sh """
+            sbom_zip=\$(find . -maxdepth 2 -name 'sbom*.zip' | head -1)
+            if [ -n "\$sbom_zip" ]; then
+                unzip -p "\$sbom_zip" "*.json" > ${outputDir}/sbom.json
+            else
+                echo "WARNING: sbom.zip not found; listing workspace for diagnostics:"
+            fi
+        """
         sh "mv nspect_scan_report.json ${outputDir}/vulns.json"
     }
 }
@@ -317,9 +341,9 @@ def pulseScanContainer(llmRepo, ref) {
 def processScanResults(ref) {
     container("cpu") {
         def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-scan/posting"
+        def ELASTICSEARCH_PREAPPROVED_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-pre-approve/posting"
         def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
         def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
-        def TRTLLM_ES_INDEX_PREAPPROVED_BASE = "df-swdl-tensorrt-infra-plc-container-pre-approve"
         def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
         def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
         def postMergeArgs = ""
@@ -332,9 +356,9 @@ def processScanResults(ref) {
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
             withEnv([
                 "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
+                "TRTLLM_ES_PREAPPROVED_POST_URL=${ELASTICSEARCH_PREAPPROVED_POST_URL}",
                 "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
                 "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
-                "TRTLLM_ES_INDEX_PREAPPROVED_BASE=${TRTLLM_ES_INDEX_PREAPPROVED_BASE}",
                 "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
             ]) {
                 sh """
@@ -342,7 +366,11 @@ def processScanResults(ref) {
                     venv/bin/pip install requests elasticsearch==7.13.4
                 """
                 def skipArgs = ""
-                if (!params.runSourceCodeScanning) {
+                def sbomExists = fileExists("${pwd()}/scan_report/source_code/sbom.json")
+                if (!params.runSourceCodeScanning || !sbomExists) {
+                    if (!sbomExists && params.runSourceCodeScanning) {
+                        echo "WARNING: Source code SBOM not found at scan_report/source_code/sbom.json; skipping SBOM analysis."
+                    }
                     skipArgs += " --skip-source-code"
                 }
                 if (!params.runContainerScanning) {
@@ -359,14 +387,39 @@ def processScanResults(ref) {
                             --scan-mode ${params.scanMode}${skipArgs}
                     """, returnStdout: true).trim()
                 }
-                echo "Scan result: ${output}"
                 def result = new JsonSlurper().parseText(output)
                 if (result.status == "unstable") {
                     echo "New risks detected: ${result.detail}"
+                    if (result.needs_manual_review) {
+                        needsManualReview = true
+                        manualReviewUrl = pipelineUrl
+                        def candidates = result.preapproved_candidates ?: []
+                        writeJSON file: "${pwd()}/preapproved_candidates.json",
+                                  json: candidates
+                    }
+                    if (result.detected_licenses) {
+                        def colWidths = [scan_type: 9, dependency_name: 15, license: 7, corrected_license: 17, is_nvidia_proprietary: 17]
+                        result.detected_licenses.each { entry ->
+                            colWidths.scan_type             = Math.max(colWidths.scan_type,             entry.scan_type.toString().length())
+                            colWidths.dependency_name       = Math.max(colWidths.dependency_name,       entry.dependency_name.toString().length())
+                            colWidths.license               = Math.max(colWidths.license,               entry.license.toString().length())
+                            colWidths.corrected_license     = Math.max(colWidths.corrected_license,     entry.corrected_license.toString().length())
+                            colWidths.is_nvidia_proprietary = Math.max(colWidths.is_nvidia_proprietary, entry.is_nvidia_proprietary.toString().length())
+                        }
+                        def sep  = "+-${'-' * colWidths.scan_type}-+-${'-' * colWidths.dependency_name}-+-${'-' * colWidths.license}-+-${'-' * colWidths.corrected_license}-+-${'-' * 11}-+-${'-' * colWidths.is_nvidia_proprietary}-+"
+                        def rows = [sep,
+                                    "| ${'SCAN TYPE'.padRight(colWidths.scan_type)} | ${'DEPENDENCY NAME'.padRight(colWidths.dependency_name)} | ${'LICENSE'.padRight(colWidths.license)} | ${'CORRECTED LICENSE'.padRight(colWidths.corrected_license)} | IS PERMISSIVE | ${'IS NV PROPRIETARY'.padRight(colWidths.is_nvidia_proprietary)} |",
+                                    sep]
+                        result.detected_licenses.each { entry ->
+                            rows << "| ${entry.scan_type.toString().padRight(colWidths.scan_type)} | ${entry.dependency_name.toString().padRight(colWidths.dependency_name)} | ${entry.license.toString().padRight(colWidths.license)} | ${entry.corrected_license.toString().padRight(colWidths.corrected_license)} | ${entry.is_permissive.toString().padRight(13)} | ${entry.is_nvidia_proprietary.toString().padRight(colWidths.is_nvidia_proprietary)} |"
+                        }
+                        rows << sep
+                        detectedLicensesTable = "Non-permissive licenses detected:\n${rows.join('\n')}"
+                    }
                     if (result.dashboard_url) {
                         echo "Dashboard: ${result.dashboard_url}"
                     }
-                    currentBuild.result = 'UNSTABLE'
+                    scanResultUnstable = true
                 } else {
                     echo "No new risks detected."
                 }
@@ -374,6 +427,12 @@ def processScanResults(ref) {
         }
     }
 }
+
+needsManualReview = false
+manualReviewUrl = ""
+detectedLicensesTable = ""
+scanResultUnstable = false
+manuallyApproved = false
 
 pipeline {
     agent {
@@ -393,7 +452,6 @@ pipeline {
     options {
         skipDefaultCheckout()
         timestamps()
-        timeout(time: 150, unit: 'MINUTES')
     }
     environment {
         LLM_REPO = getLLMRepo()
@@ -421,6 +479,7 @@ pipeline {
             }
         }
         stage('Run TRT-LLM PLC Jobs') {
+            options { timeout(time: 90, unit: 'MINUTES') }
             parallel {
                 stage("Source Code OSS Scanning") {
                     when {
@@ -428,7 +487,7 @@ pipeline {
                     }
                     steps {
                         script {
-                            generateLockFiles(env.LLM_REPO, env.REF)
+                             generateLockFiles(env.LLM_REPO, env.REF)
                             pulseScanSourceCode(env.LLM_REPO, env.REF)
                         }
                     }
@@ -456,11 +515,57 @@ pipeline {
             }
         }
         stage("Process In Pipeline Scan Result") {
+            options { timeout(time: 60, unit: 'MINUTES') }
             steps {
                 script {
                     processScanResults(env.REF)
                 }
             }
         }
+        stage("Manual License Review") {
+            when {
+                expression { return needsManualReview }
+            }
+            steps {
+                script {
+                    if (detectedLicensesTable) {
+                        echo detectedLicensesTable
+                    }
+                    withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+                        def slackReport = "New licenses detected in release mode (${params.ref} branch). Manual approval required before release."
+                        writeJSON file: '/tmp/slack_payload.json', json: [report: slackReport, dashboardUrl: manualReviewUrl]
+                        sh "curl -s -X POST -H 'Content-Type: application/json' -d @/tmp/slack_payload.json \$PLC_SLACK_WEBHOOK"
+                    }
+                    timeout(time: 96, unit: 'HOURS') {
+                        input(
+                            message: "New licenses detected in release mode. Please review the licenses listed above and confirm they are all approved for release.",
+                            ok: "Approve"
+                        )
+                    }
+                    manuallyApproved = true
+                    container("cpu") {
+                        def ELASTICSEARCH_PREAPPROVED_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-pre-approve/posting"
+                        def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
+                        def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc-scan"
+                        withEnv([
+                            "TRTLLM_ES_PREAPPROVED_POST_URL=${ELASTICSEARCH_PREAPPROVED_POST_URL}",
+                            "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
+                            "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
+                        ]) {
+                            sh "venv/bin/python /tmp/pulse_in_pipeline_scanning/submit_preapproved_candidates.py ${pwd()}/preapproved_candidates.json"
+                        }
+                    }
+                }
+            }
+        }
     } // stages
+    post {
+        always {
+            script {
+                if (scanResultUnstable && !manuallyApproved) {
+                    currentBuild.result = 'UNSTABLE'
+                }
+            }
+        }
+    }
 } // pipeline

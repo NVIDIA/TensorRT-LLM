@@ -30,9 +30,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecMetadata, SpecWorkerBase
-from .mtp import MTPSampler
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DraftTargetDecodingConfig
@@ -73,17 +71,6 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
         self.num_tokens -= self.num_generations * self.runtime_draft_len
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
-
-
-class DraftTargetOneModelSampler(MTPSampler):
-    """
-    Sampler for DraftTarget one-model speculative decoding.
-
-    Inherits from MTPSampler to reuse the speculative decoding sampling logic.
-    """
-
-    def __init__(self, args: TorchSampler.Args):
-        super().__init__(args, nextn=args.max_draft_len)
 
 
 class DraftTargetOneModelWorker(SpecWorkerBase):

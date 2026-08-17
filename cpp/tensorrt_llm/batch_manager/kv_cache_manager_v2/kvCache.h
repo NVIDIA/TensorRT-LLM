@@ -114,47 +114,6 @@ struct SeqBlock
 };
 
 // ---------------------------------------------------------------------------
-// Span<T> — non-owning view into a contiguous buffer.
-// Supports operator[] for uniform access with std::vector<int>.
-// ---------------------------------------------------------------------------
-template <typename T>
-struct Span
-{
-    T* ptr;
-    int32_t len;
-
-    T& operator[](int idx)
-    {
-        return ptr[idx];
-    }
-
-    T operator[](int idx) const
-    {
-        return ptr[idx];
-    }
-
-    int size() const noexcept
-    {
-        return len;
-    }
-
-    T* data() const noexcept
-    {
-        return ptr;
-    }
-
-    T* begin() const noexcept
-    {
-        return ptr;
-    }
-
-    T* end() const noexcept
-    {
-        return ptr + len;
-    }
-};
-
-// ---------------------------------------------------------------------------
 // PlannedDropHandle — tracks committed pages planned for dropping without
 // owning them. Mirrors Python's PlannedDropHandle in _core/_kv_cache.py.
 //
@@ -211,7 +170,8 @@ public:
     using PriorityCb = std::function<Priority(BlockOrdinal, LifeCycleId)>;
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
-        std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt);
+        std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
+        std::optional<bool> textOnly = std::nullopt);
 
     ~KvCache();
 
@@ -257,7 +217,7 @@ public:
     // This is a terminal-memory contract: callers must not perform later writes
     // to this KvCache's memory. The final live pages may be moved into the radix
     // tree instead of copied (SSM state and the last partial block).
-    void commit(std::vector<TokenIdExt> const& tokens, bool isEnd = false);
+    void commit(TokenSpan tokens, bool isEnd = false);
 
     // Stop committing (called by close() automatically).
     void stopCommitting();
@@ -319,6 +279,13 @@ public:
     int numCommittedTokens() const noexcept
     {
         return static_cast<int>(mCommittedTokens.size());
+    }
+
+    // Internal diagnostic: prefix supported by the attention pages alone,
+    // before recurrent-state (SSM) snapshot pruning shortened the reuse.
+    int numTokensBeforeHybridPruning() const noexcept
+    {
+        return mNumTokensBeforeHybridPruning;
     }
 
     std::vector<TokenIdExt> const& committedTokens() const noexcept
@@ -430,6 +397,16 @@ public:
 
     // Enable or disable SWA scratch reuse. Throws if the transition is invalid.
     void setEnableSwaScratchReuse(bool enable);
+
+    // Resolved text-only status: the per-sequence override, else the manager config
+    // default. When true, this sequence's tokens are known to be digest-free, letting
+    // block-key hashing skip the digest scan.
+    bool textOnly() const noexcept;
+
+    // Set the per-sequence text-only override. Throws if the transition is invalid:
+    // a text-only deployment (config.textOnly) forbids setting false, and setting true
+    // requires the already-committed tokens to be digest-free (verified by a scan).
+    void setTextOnly(bool textOnly);
 
     // Whether the given page index mode is supported (SHARED requires no scratch slots).
     bool supportsIndexMode(PageIndexMode mode) const;
@@ -609,6 +586,9 @@ private:
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
     std::vector<TokenIdExt> mCommittedTokens;
+    // Resolved per-sequence text-only state after applying the manager default.
+    bool mTextOnly = false;
+    int mNumTokensBeforeHybridPruning;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;
     int mTokensPerBlock;

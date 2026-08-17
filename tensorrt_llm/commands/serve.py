@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import contextlib
 import gc
 import importlib
 import inspect
@@ -11,10 +12,12 @@ import signal
 import socket
 import subprocess  # nosec B404
 import sys
+import tempfile
 import time
 import uuid
+from importlib.util import find_spec
 from pathlib import Path
-from typing import Any, Dict, NamedTuple, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Sequence, Set
 
 import click
 import torch
@@ -51,14 +54,14 @@ from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import config as _telemetry_config
-from tensorrt_llm.visual_gen import VisualGen
-from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+if TYPE_CHECKING:
+    # Type-only: the visual_gen tree is imported lazily inside the VisualGen
+    # code paths so plain LLM serving never pays its import cost.
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
-
-# Bound gRPC messages while leaving room for multimodal image payloads.
-_GRPC_MAX_MESSAGE_LENGTH_BYTES = 32 * 1024 * 1024
 
 
 def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
@@ -197,6 +200,7 @@ def get_llm_args(
         custom_tokenizer: Optional[str] = None,
         post_processor_hook: Optional[str] = None,
         backend: str = "pytorch",
+        generation_config: str = _LLM_ARGS_FIELDS["generation_config"].default,
         max_beam_width: int = _LLM_ARGS_FIELDS["max_beam_width"].default,
         max_batch_size: int = _LLM_ARGS_FIELDS["max_batch_size"].default,
         max_num_tokens: int = _LLM_ARGS_FIELDS["max_num_tokens"].default,
@@ -247,6 +251,8 @@ def get_llm_args(
         model,
         "backend":
         backend,
+        "generation_config":
+        generation_config,
         "tokenizer":
         tokenizer,
         "custom_tokenizer":
@@ -341,6 +347,54 @@ def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
     llm_args, llm_args_extra_dict = get_llm_args(
         **other_args, explicit_cli_keys=disagg_explicit_keys)
     return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
+
+
+def _publish_bound_address(report_addr: Optional[str], host: str,
+                           port: int) -> None:
+    """Write the address this server actually bound to ``report_addr``.
+
+    Lets a launcher pass ``--port 0`` and learn the kernel-assigned port
+    afterwards, instead of picking a port up front and racing whoever grabs it
+    before this process binds. The write is atomic (temp file in the same
+    directory, then rename) so a reader never observes a partial line, which
+    matters on the shared filesystems multi-node tests coordinate through.
+
+    The caller is responsible for making the path unique per run: a stale file
+    from an earlier run points at a dead server, which fails far less obviously
+    than a port conflict.
+
+    A wildcard bind host is replaced by this machine's hostname, since readers
+    use the published value as a URL authority and cannot dial 0.0.0.0 or ::.
+    """
+    if not report_addr:
+        return
+    if host in ("0.0.0.0", "::", ""):  # nosec B104 - reporting, not binding
+        resolved = socket.gethostname()
+        logger.info(f"Reporting hostname {resolved} instead of wildcard bind "
+                    f"address {host!r}, which a reader cannot dial")
+        host = resolved
+    report_addr = os.path.abspath(report_addr)
+    parent = os.path.dirname(report_addr)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent or None,
+                                    prefix=os.path.basename(report_addr) + ".",
+                                    suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            # Bracket IPv6 literals so the value is a usable URL authority:
+            # readers build "http://<reported>/..." from it verbatim.
+            reported_host = f"[{host}]" if ":" in host else host
+            f.write(f"{reported_host}:{port}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, report_addr)
+    finally:
+        # A successful replace already consumed tmp_path; this only cleans up
+        # after a failed write so a partial file is not left behind.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+    logger.info(f"Reported bound address {host}:{port} to {report_addr}")
 
 
 def _diagnose_port_in_use(port: int) -> str:
@@ -540,12 +594,23 @@ def launch_server(
         num_input_processor_workers: int = 8,
         num_media_load_workers: int = 8,
         multi_frontend_enabled: bool = True,
-        internal_disagg_auth_key: Optional[str] = None):
+        internal_disagg_auth_key: Optional[str] = None,
+        report_addr: Optional[str] = None):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
+    # re-execs this command line verbatim, so with port 0 every frontend binds
+    # its own kernel-assigned port instead of sharing one, and every frontend
+    # also re-runs _publish_bound_address, leaving the reader with whichever
+    # child wrote last.
+    if (port == 0 or report_addr) and multi_frontend.num_frontends > 1:
+        raise click.BadParameter(
+            "port 0 and --report_addr are only supported with a single serving "
+            f"frontend, but num_serve_frontends={multi_frontend.num_frontends}."
+        )
     if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
         # The Responses API store is per-process in-memory: with several
         # frontends behind one SO_REUSEPORT port, a follow-up request may
@@ -563,8 +628,17 @@ def launch_server(
     address_family = socket.AF_INET6 if all(
         [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
-        assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
+        # port == 0 lets the kernel pick the port; the caller then needs a way
+        # to learn it, either by service discovery or by report_addr.
+        assert port > 0 or disagg_cluster_config is not None or report_addr, (
+            "Port must be specified unless disagg cluster config or "
+            "--report_addr is provided")
+        # Without SO_REUSEADDR a restart is refused for the whole TIME_WAIT
+        # window (~60s) by the tombstones of connections this server accepted.
+        # The flag has to be set on the socket that owns the port first, since
+        # the TIME_WAIT entry inherits it -- setting it only on the later bind
+        # is not enough.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
             # Every frontend process binds its own listening socket on the
             # same port; the kernel load-balances accepts across them.
@@ -580,6 +654,10 @@ def launch_server(
                 f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
             raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
                                f"Port holder(s): {holder}")
+
+        # Only now is the address final, and the socket stays bound from here
+        # until uvicorn takes it over, so no one can steal the port in between.
+        _publish_bound_address(report_addr, host, port)
 
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
@@ -629,129 +707,6 @@ def launch_server(
         finally:
             if frontend_children:
                 _terminate_attached_frontends(frontend_children)
-
-
-def launch_grpc_server(host: str,
-                       port: int,
-                       llm_args: dict,
-                       served_model_name: Optional[str] = None):
-    """
-    Launch a gRPC server for TensorRT-LLM.
-
-    This provides a high-performance gRPC interface designed for external routers
-    (e.g., sgl-router) using pre-tokenized input and raw token ID output.
-
-    Args:
-        host: Host to bind to
-        port: Port to bind to
-        llm_args: Arguments for LLM initialization (from get_llm_args)
-        served_model_name: Custom model name for API responses (defaults to model path)
-    """
-    import grpc
-
-    try:
-        from grpc_reflection.v1alpha import reflection
-        REFLECTION_AVAILABLE = True
-    except ImportError:
-        REFLECTION_AVAILABLE = False
-
-    from tensorrt_llm.grpc import trtllm_service_pb2, trtllm_service_pb2_grpc
-    from tensorrt_llm.grpc.grpc_request_manager import GrpcRequestManager
-    from tensorrt_llm.grpc.grpc_servicer import TrtllmServiceServicer
-
-    async def serve_grpc_async():
-        logger.info("Initializing TensorRT-LLM gRPC server...")
-
-        backend = llm_args.get("backend")
-        model_path = served_model_name or llm_args.get("model", "")
-
-        if backend == "pytorch":
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        elif backend == "_autodeploy":
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
-
-        logger.info("Model loaded successfully")
-
-        # Create request manager
-        request_manager = GrpcRequestManager(llm)
-
-        # Create servicer
-        servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
-
-        # Create gRPC server
-        server = grpc.aio.server(
-            options=[
-                ("grpc.max_send_message_length",
-                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
-                ("grpc.max_receive_message_length",
-                 _GRPC_MAX_MESSAGE_LENGTH_BYTES),
-                ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
-                ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
-                ("grpc.keepalive_permit_without_calls", True),
-                ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
-            ], )
-
-        # Add servicer to server
-        trtllm_service_pb2_grpc.add_TrtllmServiceServicer_to_server(
-            servicer, server)
-
-        # Enable reflection for grpcurl and other tools
-        if REFLECTION_AVAILABLE:
-            service_names = (
-                trtllm_service_pb2.DESCRIPTOR.services_by_name["TrtllmService"].
-                full_name,
-                reflection.SERVICE_NAME,
-            )
-            reflection.enable_server_reflection(service_names, server)
-            logger.info("gRPC reflection enabled")
-
-        # Bind to address
-        address = f"{host}:{port}"
-        server.add_insecure_port(address)
-
-        # Start server
-        await server.start()
-        logger.info(f"TensorRT-LLM gRPC server started on {address}")
-        logger.info("Server is ready to accept requests")
-
-        # Handle shutdown signals
-        loop = asyncio.get_running_loop()
-        stop_event = asyncio.Event()
-
-        def signal_handler():
-            logger.info("Received shutdown signal")
-            stop_event.set()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, signal_handler)
-
-        # Serve until shutdown signal
-        try:
-            await stop_event.wait()
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-        finally:
-            logger.info("Shutting down TensorRT-LLM gRPC server...")
-
-            # Stop gRPC server
-            await server.stop(grace=5.0)
-            logger.info("gRPC server stopped")
-
-            # Shutdown LLM
-            if hasattr(llm, "shutdown"):
-                llm.shutdown()
-            logger.info("LLM engine stopped")
-
-            logger.info("Shutdown complete")
-
-    uvloop.run(serve_grpc_async())
 
 
 def launch_mm_encoder_server(
@@ -880,7 +835,7 @@ def launch_visual_gen_server(
         host: str,
         port: int,
         model: str,
-        visual_gen_args: Optional[VisualGenArgs] = None,
+        visual_gen_args: Optional["VisualGenArgs"] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         middleware: Sequence[str] = (),
 ):
@@ -898,6 +853,7 @@ def launch_visual_gen_server(
     # races the same port and all but one die EADDRINUSE. VisualGen() on a
     # worker rank never returns (sys.exit in __init__).
     from tensorrt_llm._torch.visual_gen.executor import _detect_external_launch
+    from tensorrt_llm.visual_gen import VisualGen
     ext = _detect_external_launch()
     if ext is not None and ext[0] != 0:
         VisualGen(model=model, args=visual_gen_args)
@@ -913,6 +869,9 @@ def launch_visual_gen_server(
     address_family = socket.AF_INET6 if all(
         [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
+        # See launch_server: without this, TIME_WAIT tombstones from the
+        # connections this server accepted refuse a restart for ~60s.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind((host, port))
         except OSError as e:
@@ -987,8 +946,17 @@ def launch_visual_gen_server(
     "--backend",
     type=click.Choice(["pytorch", "_autodeploy"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend.",
-    status="beta")
+    help="The backend to use to serve the model. Default is pytorch backend. "
+    "Note: the '_autodeploy' backend is deprecated and will be discontinued "
+    "in a future release; please use the 'pytorch' backend instead.",
+    status="deprecated")
+@stability_option(
+    "--generation-config",
+    type=click.Choice(["auto", "trtllm"]),
+    default=_LLM_ARGS_FIELDS["generation_config"].default,
+    help="Sampling defaults source. 'auto' loads supported values from the "
+    "model's generation_config.json; 'trtllm' uses TRT-LLM defaults.",
+    status="prototype")
 @stability_option("--custom_module_dirs",
                   type=click.Path(exists=True,
                                   readable=True,
@@ -1238,7 +1206,8 @@ def launch_visual_gen_server(
     is_flag=True,
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
-    "gRPC server accepts pre-tokenized requests and returns raw token IDs.",
+    "gRPC server accepts pre-tokenized requests and returns raw token IDs. "
+    "Requires the tensorrt_llm[grpc-smg] extra.",
     status="prototype")
 @stability_option(
     "--served_model_name",
@@ -1275,12 +1244,22 @@ def launch_visual_gen_server(
     help=
     "Types of agents to schedule. Now Only Support Open Deep Research agent.",
     status="prototype")
+@stability_option(
+    "--report_addr",
+    type=str,
+    default=None,
+    help="Write the host:port this server actually bound to this file, "
+    "atomically, once the socket is bound. Lets --port 0 be used and have the "
+    "launcher read the kernel-assigned port back instead of reserving one up "
+    "front.",
+    status="prototype")
 def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           post_processor_hook: Optional[str], host: str, port: int,
-          log_level: str, backend: str, max_beam_width: int,
-          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
-          tensor_parallel_size: int, pipeline_parallel_size: int,
-          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+          log_level: str, backend: str, generation_config: str,
+          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
+          max_seq_len: int, tensor_parallel_size: int,
+          pipeline_parallel_size: int, context_parallel_size: int,
+          moe_expert_parallel_size: Optional[int],
           moe_cluster_parallel_size: Optional[int],
           gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
           kv_cache_dtype: str, num_postprocess_workers: int,
@@ -1298,12 +1277,20 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
           telemetry: bool, custom_module_dirs: list[Path],
           chat_template: Optional[str], allow_request_chat_template: bool,
           middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
-          served_model_name: Optional[str], visual_gen_args: Optional[str]):
+          served_model_name: Optional[str], visual_gen_args: Optional[str],
+          report_addr: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    if backend == "_autodeploy":
+        logger.warning(
+            "The '_autodeploy' backend is deprecated and will be discontinued in a "
+            "future release. No new features or models will be added. Please migrate "
+            "to the 'pytorch' backend. See "
+            "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
 
     if moe_cluster_parallel_size is not None:
         logger.warning(
@@ -1367,6 +1354,7 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
             custom_tokenizer=custom_tokenizer,
             post_processor_hook=post_processor_hook,
             backend=backend,
+            generation_config=generation_config,
             max_beam_width=max_beam_width,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1478,10 +1466,18 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            launch_grpc_server(host,
-                               port,
-                               llm_args,
-                               served_model_name=served_model_name)
+            if find_spec("smg_grpc_proto") is None:
+                raise ValueError(
+                    "gRPC serving with the SMG protocol requires the optional "
+                    "'smg-grpc-proto' package. Install it with: "
+                    'pip install "tensorrt_llm[grpc-smg]"')
+
+            from tensorrt_llm.grpc.smg.server import launch_smg_server
+
+            launch_smg_server(host,
+                              port,
+                              llm_args,
+                              served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
@@ -1499,9 +1495,12 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
                 allow_request_chat_template=allow_request_chat_template,
                 num_input_processor_workers=num_input_processor_workers,
                 num_media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key)
+                internal_disagg_auth_key=internal_disagg_auth_key,
+                report_addr=report_addr)
 
     def _serve_visual_gen():
+        from tensorrt_llm.visual_gen.args import VisualGenArgs
+
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
                                   if visual_gen_args is not None else None)
 
@@ -1513,6 +1512,12 @@ def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
 
     is_visual_gen = (enable_visual_gen or visual_gen_args is not None
                      or get_is_diffusion_only_model(model))
+    # Only the OpenAI HTTP path publishes the bound address. Fail loudly rather
+    # than leaving a launcher waiting forever on a file nobody writes.
+    if report_addr and (grpc or is_visual_gen):
+        raise click.BadParameter(
+            "--report_addr is only supported for the OpenAI HTTP server, not "
+            f"the {'gRPC' if grpc else 'VisualGen'} server.")
     if is_visual_gen:
         _serve_visual_gen()
     else:
@@ -1839,6 +1844,15 @@ def serve_embedding(
     help="[Deprecated] The interval of logging metrics in seconds. "
     "This option is not connected to any functionality and will be removed in a future release.",
     status="deprecated")
+@stability_option(
+    "--report_addr",
+    type=str,
+    default=None,
+    help="Write the host:port this server actually bound to this file, "
+    "atomically, once the socket is bound. Lets the config set port 0 and "
+    "have the launcher read the kernel-assigned port back instead of "
+    "reserving one up front.",
+    status="prototype")
 def disaggregated(
     config_file: Optional[str],
     metadata_server_config_file: Optional[str],
@@ -1847,6 +1861,7 @@ def disaggregated(
     log_level: str,
     metrics_log_interval: int,
     schedule_style: str,
+    report_addr: Optional[str],
 ):
     """Running server in disaggregated mode"""
 
@@ -1881,6 +1896,17 @@ def disaggregated(
     num_workers = disagg_cfg.num_workers
     coordinator_url = disagg_cfg.disagg_coordinator_url
 
+    # Only topology (c) below binds the public socket in this process. The fleet
+    # paths hand the port to N SO_REUSEPORT workers, which with port 0 would each
+    # get a *different* kernel-assigned port instead of sharing one, so reject
+    # the combination rather than publishing an address that serves 1/N requests.
+    if (disagg_cfg.port == 0 or report_addr) and (coordinator_url
+                                                  or num_workers > 1):
+        raise click.BadParameter(
+            "port 0 and --report_addr are only supported for a single "
+            f"self-contained disaggregated server, but num_workers={num_workers} "
+            f"and disagg_coordinator_url={coordinator_url!r} select a fleet.")
+
     if coordinator_url:
         # (a) External coordinator: fork a fleet of delegating servers (or a
         # single one) pointed at it; never start a coordinator in this process.
@@ -1901,8 +1927,13 @@ def disaggregated(
     # (c) num_workers==1, no external coordinator: a single disagg server with an
     # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        # See launch_server: without this, TIME_WAIT tombstones from the
+        # connections this server accepted refuse a restart for ~60s.
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
+            if disagg_cfg.port == 0:
+                disagg_cfg.port = s.getsockname()[1]
         except OSError as e:
             holder = _diagnose_port_in_use(disagg_cfg.port)
             logger.error(
@@ -1912,6 +1943,9 @@ def disaggregated(
             raise RuntimeError(
                 f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
                 f"Port holder(s): {holder}")
+
+        _publish_bound_address(report_addr, disagg_cfg.hostname,
+                               disagg_cfg.port)
 
         server = OpenAIDisaggServer(
             config=disagg_cfg,

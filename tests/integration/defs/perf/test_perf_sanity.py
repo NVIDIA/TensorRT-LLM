@@ -32,8 +32,8 @@ from test_common.error_utils import report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
 from test_common.perf_sanity_matching import get_client_match_keys, get_server_match_keys
 
+from defs.common import wait_for_reported_addr
 from defs.trt_test_alternative import print_info
-from tensorrt_llm._utils import get_free_port
 
 from ..conftest import get_llm_root, llm_models_root
 from ._model_paths import MODEL_PATH_DICT as _MODEL_PATH_DICT_BASE
@@ -104,7 +104,11 @@ DEFAULT_TIMEOUT = 10800
 # per-test pytest kill both saves GPU-hours and leaves a classifiable failure
 # in the CI log. The disagg bound is larger because its /health only answers
 # once EVERY ctx/gen worker has finished model load + autotune + warmup.
-AGG_SERVER_READY_TIMEOUT = 1800
+# 1800 proved too tight for the largest agg cases: gb300 DeepSeek-V4-Pro
+# ctx_only (con4301) needs ~2000s of model load + autotune before /health
+# answers, so it failed readiness while the server was still coming up
+# (nvbugs/6517846). Raised to match the disagg bound.
+AGG_SERVER_READY_TIMEOUT = 3600
 DISAGG_SERVER_READY_TIMEOUT = 3600
 # GEN workers normally reap within seconds after benchmark_status is written.
 # Keep this well below the whole-test timeout so a stuck multi-node srun cannot
@@ -877,6 +881,11 @@ class ClientConfig:
         self.model_path = ""
         self.dataset_file = client_config_data.get("dataset_file", "")
         self.use_nv_sa_benchmark = client_config_data.get("use_nv_sa_benchmark", False)
+        # Derived from lane identity only (gen_only + concurrency == 1); do not
+        # set this from lane YAML. warmup is intentionally not a baseline match
+        # key, which is only sound while its value stays fully determined by
+        # benchmark_mode and concurrency.
+        self.warmup = client_config_data.get("warmup", False)
         self.env_vars = env_vars
         # spec_decoding flag is retained for DB matching (b_eos column). --ignore-eos
         # is now always passed; output-length stability with spec decoding comes from
@@ -955,11 +964,15 @@ class ClientConfig:
             str(self.concurrency * self.iterations),
             "--max-concurrency",
             str(self.concurrency),
-            "--no-test-input",
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
             "--ignore-eos",
         ]
+        # benchmark_serving's initial single-prompt test run (excluded from
+        # metrics) doubles as a warmup request; keep it disabled unless the
+        # lane requests one.
+        if not self.warmup:
+            benchmark_cmd.append("--no-test-input")
         if dataset_path:
             benchmark_cmd.append("--dataset-name")
             benchmark_cmd.append("trtllm_custom")
@@ -1017,6 +1030,7 @@ class ClientConfig:
             "b_trust_remote_code": self.trust_remote_code,
             "b_use_nv_sa_benchmark": self.use_nv_sa_benchmark,
             "b_eos": self.spec_decoding,
+            "b_warmup": self.warmup,
             "s_client_log_link": "",
             "s_client_env_vars": self.env_vars,
         }
@@ -1088,8 +1102,16 @@ class AggrTestCmds(NamedTuple):
 
         try:
             server_hostname = "localhost"
-            server_port = get_free_port()
-            server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, server_port)
+            # port 0 + --report_addr: let the server bind a kernel-assigned
+            # port and tell us which one, instead of reserving one here and
+            # racing whoever takes it before the server binds.
+            server_addr_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.addr")
+            if os.path.exists(server_addr_path):
+                os.remove(server_addr_path)
+            server_cmd_with_port = add_host_port_to_cmd(server_cmd, server_hostname, 0) + [
+                "--report_addr",
+                server_addr_path,
+            ]
 
             print_info(f"Starting server. cmd is {server_cmd_with_port}")
             server_file_path = os.path.join(self.test_output_dir, f"trtllm-serve.{server_idx}.log")
@@ -1103,6 +1125,7 @@ class AggrTestCmds(NamedTuple):
                     stdout=server_ctx,
                     stderr=subprocess.STDOUT,
                 )
+                _, server_port = wait_for_reported_addr(server_addr_path, self.timeout, server_proc)
 
                 wait_for_endpoint_ready(
                     f"http://{server_hostname}:{server_port}/health",
@@ -1193,19 +1216,28 @@ class DisaggTestCmds(NamedTuple):
     # receive env via SLURM env propagation set up by submit.py.
     server_configs: List[Tuple["ServerConfig", "ServerConfig", "DisaggConfig"]] = []
 
-    def _generate_hostname_file(self, server_idx: int, port: int):
-        """Create hostname file for coordination."""
-        hostnames_dir = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
-        if not os.path.exists(hostnames_dir):
-            os.makedirs(hostnames_dir, exist_ok=True)
-        hostname_file = os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
-        with open(hostname_file, "w") as f:
-            f.write(f"{self.hostname}:{port}")
+    def _hostnames_dir(self, server_idx: int) -> str:
+        """Directory the disagg tasks exchange bound addresses through.
+
+        Scoped by SLURM job id so a rerun never reads the previous run's files:
+        test_output_dir is derived from the test case name alone and is created
+        with exist_ok=True, so it is reused across runs. The step id is
+        deliberately excluded -- each role runs as a separate srun step within
+        one job, and they must all agree on this path.
+        """
+        run_id = os.environ.get("SLURM_JOB_ID", "local")
+        return os.path.join(self.test_output_dir, f"hostnames-{run_id}-{server_idx}")
+
+    def _hostname_file(self, server_idx: int) -> str:
+        """Path this task's server reports its bound address to."""
+        hostnames_dir = self._hostnames_dir(server_idx)
+        os.makedirs(hostnames_dir, exist_ok=True)
+        return os.path.join(hostnames_dir, f"{self.disagg_serving_type}.txt")
 
     def _generate_disagg_server_config(self, server_idx: int) -> str:
         """Generate disagg server config from hostname files."""
         print_info(f"Generating disagg server config for server index {server_idx}")
-        hostnames_folder = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
+        hostnames_folder = self._hostnames_dir(server_idx)
         expected_count = self.num_ctx_servers + self.num_gen_servers
         start_time = time.time()
         hostnames = []
@@ -1222,7 +1254,11 @@ class DisaggTestCmds(NamedTuple):
             time.sleep(10)
             if not os.path.exists(hostnames_folder):
                 continue
-            hostnames = os.listdir(hostnames_folder)
+            # Only completed files: trtllm-serve publishes its address by
+            # renaming a "<name>.<rand>.tmp" sibling into place, and counting
+            # those transient entries would both inflate the count and get
+            # parsed as a CTX/GEN url below.
+            hostnames = [f for f in os.listdir(hostnames_folder) if f.endswith(".txt")]
             if len(hostnames) >= expected_count:
                 break
 
@@ -1240,14 +1276,12 @@ class DisaggTestCmds(NamedTuple):
             elif hostname_file.startswith("GEN"):
                 gen_hostnames.append(hostname_port)
 
-        # Allocate port here (after waiting) to minimize the window between
-        # port allocation and actual use, avoiding TOCTOU race conditions
-        # where another process on the same node grabs the port.
-        disagg_server_port = get_free_port()
-
+        # port 0: the disagg server binds a kernel-assigned port and reports it
+        # back via --report_addr, so there is no window between choosing a port
+        # here and the server binding it.
         server_config = {
             "hostname": self.hostname,
-            "port": disagg_server_port,
+            "port": 0,
             "backend": "pytorch",
             "internal_request_auth_key": self.internal_request_auth_key,
             "context_servers": {
@@ -1265,25 +1299,19 @@ class DisaggTestCmds(NamedTuple):
         print_info(f"Server config file {config_path} generated")
         return config_path
 
-    def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
-        """Wait for and read disagg server config."""
-        config_path = os.path.join(self.test_output_dir, f"server_config.{server_idx}.yaml")
-        start_time = time.time()
-        while True:
-            if os.path.exists(config_path):
-                print_info(f"Server config file found: {config_path}")
-                break
-            elapsed_time = time.time() - start_time
-            if elapsed_time > self.timeout:
-                raise RuntimeError(
-                    f"Server config file {config_path} not found after {self.timeout}s"
-                )
-            print_info(f"Waiting for server config file, elapsed time: {elapsed_time}s")
-            time.sleep(10)
+    def _disagg_server_addr_file(self, server_idx: int) -> str:
+        """Path the disagg server reports its bound address to."""
+        return os.path.join(self._hostnames_dir(server_idx), f"DISAGG_SERVER.{server_idx}.addr")
 
-        with open(config_path, "r") as f:
-            server_config = yaml.safe_load(f)
-        return server_config["hostname"], server_config["port"]
+    def _get_disagg_server_hostname_and_port(self, server_idx: int) -> Tuple[str, int]:
+        """Wait for the disagg server to report the address it bound.
+
+        The config carries port 0, so the address is only known once the server
+        has bound; reading it from the config would yield 0.
+        """
+        addr_path = self._disagg_server_addr_file(server_idx)
+        print_info(f"Waiting for disagg server address file {addr_path}")
+        return wait_for_reported_addr(addr_path, self.timeout)
 
     def wait_for_benchmark_ready(
         self,
@@ -1437,8 +1465,11 @@ class DisaggTestCmds(NamedTuple):
             self.server_configs[server_idx] if server_idx < len(self.server_configs) else None
         )
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
-            port = get_free_port()
-            self._generate_hostname_file(server_idx, port)
+            # port 0 + --report_addr: the worker binds a kernel-assigned port
+            # and publishes host:port itself, so no port is reserved here and
+            # left unbound while anything on the node could take it. The disagg
+            # server reads these files to build its config, exactly as before.
+            hostname_file = self._hostname_file(server_idx)
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
 
@@ -1447,7 +1478,10 @@ class DisaggTestCmds(NamedTuple):
                 config_idx = server_cmd.index("--config") + 1
                 self._wait_for_config_file(server_cmd[config_idx])
 
-            server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, port)
+            server_cmd = add_host_port_to_cmd(server_cmd, self.hostname, 0) + [
+                "--report_addr",
+                hostname_file,
+            ]
             try:
                 print_info(
                     f"Starting server. disagg_serving_type: {self.disagg_serving_type} cmd is {server_cmd}"
@@ -1479,7 +1513,18 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
+                # _hostnames_dir is scoped by job, so a new job never sees an
+                # older one's files, but a retry within the same job and the
+                # same server_idx would. Drop the previous attempt's address
+                # first, or the BENCHMARK task connects to a dead port. This
+                # task owns the file exclusively, so removing it here is safe.
+                disagg_addr_path = self._disagg_server_addr_file(server_idx)
+                if os.path.exists(disagg_addr_path):
+                    os.remove(disagg_addr_path)
                 self._generate_disagg_server_config(server_idx)
+                # The config carries port 0; publish the resolved address so
+                # the BENCHMARK task can find the server.
+                disagg_cmd = disagg_cmd + ["--report_addr", disagg_addr_path]
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
                 disagg_server_file_path = os.path.join(
                     self.test_output_dir,
@@ -2011,6 +2056,15 @@ class PerfSanityTestConfig:
                 "use_nv_sa_benchmark": use_nv_sa_benchmark,
                 "accuracy_config": accuracy_data,
                 "only_run_accuracy": only_run_accuracy,
+                # gen_only measures a single round (iterations forced to 1
+                # above), so one-time costs like the cache transceiver's lazy
+                # connection setup would otherwise land entirely on the
+                # measured TTFT. Scoped to concurrency == 1: the gen executor's
+                # fill gate (TLLM_BENCHMARK_REQ_QUEUES_SIZE) only opens once
+                # `concurrency` requests are queued, so a lone warmup request
+                # would deadlock higher-concurrency lanes — which amortize the
+                # cold start anyway.
+                "warmup": benchmark_mode == "gen_only" and concurrency == 1,
             }
             client_config = ClientConfig(
                 client_config_data,
