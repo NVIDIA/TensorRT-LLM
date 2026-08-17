@@ -131,6 +131,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self._cached_block_table_gen = None
         self._cached_req_idx_ctx = None
         self._cached_req_idx_gen = None
+        self.num_ctx_mla_kv_tokens = 0
         self.nvfp4_mla_context_fp8_scratch = None
         super().__init__(*args, **kwargs)
         sparse_metadata_params = self.sparse_metadata_params
@@ -1270,6 +1271,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_for_mla_rope_append(self, cached_token_lens: torch.Tensor, kv_lens: torch.Tensor):
         if self.num_contexts > 0:
             self.num_ctx_cached_tokens = cached_token_lens[: self.num_contexts].sum().item()
+            self.num_ctx_mla_kv_tokens = kv_lens[: self.num_contexts].sum().item()
             self.max_ctx_kv_len = kv_lens[: self.num_contexts].max().item()
             self.max_ctx_seq_len = self.seq_lens[: self.num_contexts].max().item()
             # context cached token indptr
@@ -1294,6 +1296,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         else:
             self.num_ctx_cached_tokens = 0
+            self.num_ctx_mla_kv_tokens = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
 

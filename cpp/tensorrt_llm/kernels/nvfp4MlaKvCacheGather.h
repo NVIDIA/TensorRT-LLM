@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <cuda_fp8.h>
 
@@ -29,6 +30,15 @@ namespace kernels
 
 void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool, int32_t const* globalIndices,
     __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale, int32_t numRows, int32_t topK,
+    int32_t headDim, int64_t numPoolTokens, cudaStream_t stream = 0);
+
+size_t getNvFp4MlaContextKvCacheGatherWorkspaceSize(int32_t totalKvTokens, cudaStream_t stream = 0);
+
+void invokeNvFp4MlaContextKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool,
+    int32_t const* localTopKIndices, int32_t const* queryReqIndices, int32_t const* blockTable,
+    int64_t const* cuKvLengths, __nv_fp8_e4m3* output, int32_t* compactIndices, float const* globalDequantScale,
+    void* workspace, size_t workspaceSize, int32_t numQueryRows, int32_t topK, int32_t numRequests,
+    int32_t maxBlocksPerRequest, int32_t totalKvTokens, int32_t tokensPerBlock, int32_t pageStride, int32_t layerId,
     int32_t headDim, int64_t numPoolTokens, cudaStream_t stream = 0);
 
 } // namespace kernels

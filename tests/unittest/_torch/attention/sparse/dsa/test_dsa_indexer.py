@@ -214,21 +214,33 @@ def test_shared_topk_lifecycle():
     assert metadata.shared_topk_indices is buffer
 
 
-def test_nvfp4_context_topk_is_deduplicated_into_compact_pool():
+def test_nvfp4_context_topk_uses_device_compaction_path():
     topk_indices = torch.tensor(
-        [[5, 2, 5, -1], [2, 7, 9, 5]],
+        [[3, 2, -1], [1, 0, 5]],
         dtype=torch.int32,
+    )
+    cache_manager = SimpleNamespace(
+        dtype=DataType.NVFP4,
+        head_dim=16,
+        get_primary_pool_page_index_params=Mock(return_value=(2, 1)),
     )
     metadata = SimpleNamespace(
         num_ctx_tokens=2,
         num_tokens=2,
         num_generations=0,
+        num_contexts=2,
         shared_topk_indices=None,
         in_mtp_draft_loop=False,
-        kv_cache_manager=SimpleNamespace(dtype=DataType.NVFP4, head_dim=16),
+        kv_cache_manager=cache_manager,
         host_kv_cache_pool_pointers=torch.zeros((1, 2, 2), dtype=torch.int64),
         host_kv_cache_pool_mapping=torch.zeros((1, 2), dtype=torch.int32),
-        _cached_num_pool_tokens=8,
+        num_ctx_mla_kv_tokens=8,
+        _cached_num_pool_tokens=128,
+        _cached_tokens_per_block=64,
+        _cached_req_idx_ctx=torch.tensor([0, 1], dtype=torch.int32),
+        _cached_block_table_ctx=torch.tensor([[0], [1]], dtype=torch.int32),
+        ctx_kv_indptr=torch.tensor([0, 4, 8], dtype=torch.int64),
+        _ensure_pool_view_cached=Mock(),
         nvfp4_mla_context_fp8_scratch=None,
     )
     backend = SimpleNamespace(
@@ -243,14 +255,19 @@ def test_nvfp4_context_topk_is_deduplicated_into_compact_pool():
         sparse_backend_args=DSABackendForwardArgs(indexer_intermediates=[]),
     )
 
-    with (
-        patch(
-            "tensorrt_llm._torch.attention_backend.sparse.dsa.backend."
-            "transform_local_topk_and_prepare_pool_view",
-            return_value=(topk_indices, None),
-        ),
-        patch("torch.ops.trtllm.nvfp4_mla_kv_cache_gather", create=True) as gather,
-    ):
+    expected = torch.tensor(
+        [[3, 2, -1], [5, 4, -1]],
+        dtype=torch.int32,
+    )
+
+    def _gather(*args):
+        args[7].copy_(expected)
+
+    with patch(
+        "torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather",
+        side_effect=_gather,
+        create=True,
+    ) as gather:
         compact_indices, _ = DSATrtllmAttention.sparse_attn_predict(
             backend,
             torch.empty((2, 1)),
@@ -259,19 +276,15 @@ def test_nvfp4_context_topk_is_deduplicated_into_compact_pool():
             forward_args,
         )
 
-    expected = torch.tensor(
-        [[1, 0, 1, -1], [0, 2, -1, 1]],
-        dtype=torch.int32,
-    )
     torch.testing.assert_close(compact_indices, expected)
-    unique_indices = gather.call_args.args[2]
-    torch.testing.assert_close(
-        unique_indices,
-        torch.tensor([[2], [5], [7]], dtype=torch.int32),
-    )
-    scratch = gather.call_args.args[3]
-    assert scratch.shape == (3, 1, 16)
+    gather.assert_called_once()
+    assert gather.call_args.args[2] is topk_indices
+    scratch = gather.call_args.args[6]
+    assert scratch.shape == (8, 1, 16)
     assert scratch.dtype == torch.float8_e4m3fn
+    assert gather.call_args.args[11] == 64
+    assert gather.call_args.args[12] == 128
+    assert gather.call_args.args[13] == 1
     assert metadata.nvfp4_mla_context_fp8_scratch is scratch
     assert forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr == scratch.data_ptr()
 

@@ -18,6 +18,7 @@
 - ``torch.ops.trtllm.indexer_k_cache_scatter_op``
 - ``torch.ops.trtllm.convert_req_index_to_global``
 - ``torch.ops.trtllm.nvfp4_mla_kv_cache_gather``
+- ``torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather``
 - ``torch.ops.trtllm.fused_cat_fp4``
 - ``torch.ops.trtllm.cute_dsl_fp8_indexer_q_gemm_rope_fp4_blackwell``
 """
@@ -97,6 +98,69 @@ def test_nvfp4_mla_kv_cache_gather():
     expected_row = (e2m1[unpacked_codes] * 2.0 * 0.25).to(torch.float8_e4m3fn)
     valid = global_indices >= 0
     assert torch.equal(output[valid], expected_row.expand(output[valid].shape[0], -1))
+
+
+@skip_pre_blackwell
+def test_nvfp4_mla_context_kv_cache_gather():
+    """Compact selected context rows without host-side unique or synchronization."""
+    num_pool_tokens = 4
+    head_dim = 32
+    packed_head_dim = head_dim // 2
+    scales_per_token = head_dim // 16
+
+    row_codes = torch.arange(1, num_pool_tokens + 1, dtype=torch.uint8, device="cuda")
+    packed_codes = row_codes | (row_codes << 4)
+    data_pool = packed_codes[:, None].expand(-1, packed_head_dim).contiguous()
+    scale_pool = torch.full(
+        (num_pool_tokens, scales_per_token),
+        2.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    host_pool_pointers = torch.zeros((1, 2, 2), dtype=torch.int64)
+    host_pool_pointers[0, 0, 0] = data_pool.data_ptr()
+    host_pool_pointers[0, 0, 1] = scale_pool.data_ptr()
+    host_pool_mapping = torch.tensor([[0, 0]], dtype=torch.int32)
+
+    local_topk = torch.tensor([[0, 1, -1], [1, 0, 7]], dtype=torch.int32, device="cuda")
+    query_req_indices = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    block_table = torch.tensor([[0], [1]], dtype=torch.int32, device="cuda")
+    cu_kv_lengths = torch.tensor([0, 2, 4], dtype=torch.int64, device="cuda")
+    output = torch.empty(
+        (num_pool_tokens, 1, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    compact_indices = torch.empty_like(local_topk)
+    global_dequant_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+
+    torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather(
+        host_pool_pointers,
+        host_pool_mapping,
+        local_topk,
+        query_req_indices,
+        block_table,
+        cu_kv_lengths,
+        output,
+        compact_indices,
+        global_dequant_scale,
+        0,
+        num_pool_tokens,
+        2,
+        2,
+        0,
+        num_pool_tokens,
+    )
+
+    expected_indices = torch.tensor([[0, 1, -1], [3, 2, -1]], dtype=torch.int32, device="cuda")
+    assert torch.equal(compact_indices, expected_indices)
+    e2m1 = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device="cuda",
+    )
+    expected = (e2m1[row_codes.long()] * 2.0 * 0.25).to(torch.float8_e4m3fn)
+    for row in range(num_pool_tokens):
+        assert torch.equal(output[row, 0], expected[row].expand(head_dim))
 
 
 # ===================================================================

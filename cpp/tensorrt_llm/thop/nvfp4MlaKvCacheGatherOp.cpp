@@ -17,6 +17,8 @@
 #include "tensorrt_llm/kernels/nvfp4MlaKvCacheGather.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
+#include <limits>
+
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
 
@@ -74,6 +76,78 @@ void nvFp4MlaKvCacheGather(th::Tensor const& hostPoolPointers, th::Tensor const&
         static_cast<int32_t>(globalIndices.size(1)), static_cast<int32_t>(output.size(2)), numPoolTokens, stream);
 }
 
+void nvFp4MlaContextKvCacheGather(th::Tensor const& hostPoolPointers, th::Tensor const& hostPoolMapping,
+    th::Tensor const& localTopKIndices, th::Tensor const& queryReqIndices, th::Tensor const& blockTable,
+    th::Tensor const& cuKvLengths, th::Tensor& output, th::Tensor& compactIndices, th::Tensor const& globalDequantScale,
+    int64_t layerIdx, int64_t totalKvTokens, int64_t tokensPerBlock, int64_t pageStride, int64_t layerId,
+    int64_t numPoolTokens)
+{
+    TORCH_CHECK(hostPoolPointers.device().is_cpu(), "host_pool_pointers must be a CPU tensor");
+    TORCH_CHECK(hostPoolPointers.scalar_type() == th::kInt64, "host_pool_pointers must be int64");
+    TORCH_CHECK(hostPoolPointers.dim() == 3 && hostPoolPointers.size(2) == 2,
+        "host_pool_pointers must have shape [num_pools, 2, 2] for NVFP4 cache");
+    TORCH_CHECK(hostPoolMapping.device().is_cpu(), "host_pool_mapping must be a CPU tensor");
+    TORCH_CHECK(hostPoolMapping.scalar_type() == th::kInt32, "host_pool_mapping must be int32");
+    TORCH_CHECK(hostPoolMapping.dim() == 2 && hostPoolMapping.size(1) == 2,
+        "host_pool_mapping must have shape [num_layers, 2]");
+    TORCH_CHECK(layerIdx >= 0 && layerIdx < hostPoolMapping.size(0), "layer_idx is out of range");
+
+    TORCH_CHECK(localTopKIndices.is_cuda() && queryReqIndices.is_cuda() && blockTable.is_cuda() && cuKvLengths.is_cuda()
+            && output.is_cuda() && compactIndices.is_cuda() && globalDequantScale.is_cuda(),
+        "all non-host-pointer tensors must be CUDA tensors");
+    auto const device = localTopKIndices.device();
+    TORCH_CHECK(queryReqIndices.device() == device && blockTable.device() == device && cuKvLengths.device() == device
+            && output.device() == device && compactIndices.device() == device && globalDequantScale.device() == device,
+        "all CUDA tensors must be on the same device");
+    TORCH_CHECK(
+        localTopKIndices.scalar_type() == th::kInt32 && localTopKIndices.dim() == 2 && localTopKIndices.is_contiguous(),
+        "local_topk_indices must be contiguous int32 [num_query_rows, topk]");
+    TORCH_CHECK(queryReqIndices.scalar_type() == th::kInt32 && queryReqIndices.dim() == 1
+            && queryReqIndices.is_contiguous() && queryReqIndices.size(0) == localTopKIndices.size(0),
+        "query_req_indices must be contiguous int32 [num_query_rows]");
+    TORCH_CHECK(blockTable.scalar_type() == th::kInt32 && blockTable.dim() == 2 && blockTable.is_contiguous(),
+        "block_table must be a contiguous int32 2D tensor");
+    TORCH_CHECK(cuKvLengths.scalar_type() == th::kInt64 && cuKvLengths.dim() == 1 && cuKvLengths.is_contiguous(),
+        "cu_kv_lengths must be a contiguous int64 tensor");
+    int32_t const numRequests = static_cast<int32_t>(cuKvLengths.size(0) - 1);
+    TORCH_CHECK(numRequests > 0 && blockTable.size(0) >= numRequests,
+        "block_table and cu_kv_lengths request dimensions must agree");
+    TORCH_CHECK(totalKvTokens > 0 && totalKvTokens <= std::numeric_limits<int32_t>::max(),
+        "total_kv_tokens must be a positive int32 value");
+    TORCH_CHECK(output.scalar_type() == th::kFloat8_e4m3fn && output.dim() == 3 && output.is_contiguous()
+            && output.size(0) == totalKvTokens && output.size(1) == 1,
+        "output must be contiguous float8_e4m3fn [total_kv_tokens, 1, head_dim]");
+    TORCH_CHECK(compactIndices.scalar_type() == th::kInt32 && compactIndices.is_contiguous()
+            && compactIndices.sizes() == localTopKIndices.sizes(),
+        "compact_indices must be contiguous int32 with the local_topk_indices shape");
+    TORCH_CHECK(globalDequantScale.scalar_type() == th::kFloat32 && globalDequantScale.numel() >= 1
+            && globalDequantScale.is_contiguous(),
+        "global_dequant_scale must contain at least one contiguous float32 value");
+    TORCH_CHECK(tokensPerBlock > 0 && pageStride > 0 && layerId >= 0 && numPoolTokens > 0,
+        "invalid NVFP4 context gather geometry");
+
+    int32_t const poolIdx = hostPoolMapping.index({layerIdx, 0}).item<int32_t>();
+    TORCH_CHECK(poolIdx >= 0 && poolIdx < hostPoolPointers.size(0), "mapped pool index is out of range");
+    auto const dataPtr = hostPoolPointers.index({poolIdx, 0, 0}).item<int64_t>();
+    auto const scalePtr = hostPoolPointers.index({poolIdx, 0, 1}).item<int64_t>();
+    TORCH_CHECK(dataPtr != 0 && scalePtr != 0, "NVFP4 data and scale pool pointers must be non-null");
+
+    auto stream = at::cuda::getCurrentCUDAStream(localTopKIndices.get_device()).stream();
+    int32_t const totalKvTokens32 = static_cast<int32_t>(totalKvTokens);
+    size_t const workspaceSize = tk::getNvFp4MlaContextKvCacheGatherWorkspaceSize(totalKvTokens32, stream);
+    auto workspace = th::empty(
+        {static_cast<int64_t>(workspaceSize)}, th::TensorOptions().dtype(th::kUInt8).device(localTopKIndices.device()));
+    tk::invokeNvFp4MlaContextKvCacheGather(reinterpret_cast<uint8_t const*>(dataPtr),
+        reinterpret_cast<__nv_fp8_e4m3 const*>(scalePtr), localTopKIndices.data_ptr<int32_t>(),
+        queryReqIndices.data_ptr<int32_t>(), blockTable.data_ptr<int32_t>(), cuKvLengths.data_ptr<int64_t>(),
+        reinterpret_cast<__nv_fp8_e4m3*>(output.data_ptr()), compactIndices.data_ptr<int32_t>(),
+        globalDequantScale.data_ptr<float>(), workspace.data_ptr(), workspaceSize,
+        static_cast<int32_t>(localTopKIndices.size(0)), static_cast<int32_t>(localTopKIndices.size(1)), numRequests,
+        static_cast<int32_t>(blockTable.size(1)), totalKvTokens32, static_cast<int32_t>(tokensPerBlock),
+        static_cast<int32_t>(pageStride), static_cast<int32_t>(layerId), static_cast<int32_t>(output.size(2)),
+        numPoolTokens, stream);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -84,9 +158,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "nvfp4_mla_kv_cache_gather(Tensor host_pool_pointers, Tensor host_pool_mapping, Tensor global_indices, "
         "Tensor(a!) output, Tensor(b!) compact_indices, Tensor global_dequant_scale, int layer_idx, "
         "int num_pool_tokens) -> ()");
+    m.def(
+        "nvfp4_mla_context_kv_cache_gather(Tensor host_pool_pointers, Tensor host_pool_mapping, "
+        "Tensor local_topk_indices, Tensor query_req_indices, Tensor block_table, Tensor cu_kv_lengths, "
+        "Tensor(a!) output, Tensor(b!) compact_indices, Tensor global_dequant_scale, int layer_idx, "
+        "int total_kv_tokens, int tokens_per_block, int page_stride, int layer_id, int num_pool_tokens) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("nvfp4_mla_kv_cache_gather", &tensorrt_llm::torch_ext::nvFp4MlaKvCacheGather);
+    m.impl("nvfp4_mla_context_kv_cache_gather", &tensorrt_llm::torch_ext::nvFp4MlaContextKvCacheGather);
 }
