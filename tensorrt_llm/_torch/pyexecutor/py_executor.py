@@ -298,16 +298,16 @@ def _distributed_warmup_guard(dist, mapping):
     teardown signals the launcher is already acting on, and an MPI_Abort on
     top would turn a clean Ctrl-C into exit 137.
 
-    Peer count comes from ``global_mpi_size()``, not ``dist.world_size`` or
-    ``mpi_world_size()``: DWDP peers live in ``MPI.COMM_WORLD`` while each
-    DWDP worker is its own TP=1 instance, and ``mpi_comm()`` may have been
-    replaced with a sub-communicator by the serving layer.
+    Peer count uses both the model communicator and ``MPI.COMM_WORLD``. DWDP
+    peers live only in the latter, while a TorchDist launch can have multiple
+    model ranks even when the MPI world contains only this process.
     """
     try:
         yield
     except Exception:
         if dist.world_size > 1 or mapping.dwdp_enabled:
-            start_rank_crash_kill_watchdog(global_mpi_size(),
+            start_rank_crash_kill_watchdog(max(dist.world_size,
+                                               global_mpi_size()),
                                            error_delivered=None)
         raise
 
@@ -947,8 +947,9 @@ class PyExecutor:
             # CUDA graph capture inherits per-thread CUDA library state. Capture
             # on the same single worker that owns every runtime encoder replay.
             self.encoder_stream.wait_stream(self.execution_stream)
-            self.encoder_launch_executor.submit(
-                self._warmup_encoder_cuda_graphs_enc_dec).result()
+            with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                self.encoder_launch_executor.submit(
+                    self._warmup_encoder_cuda_graphs_enc_dec).result()
 
         self.is_warmup = False
 
