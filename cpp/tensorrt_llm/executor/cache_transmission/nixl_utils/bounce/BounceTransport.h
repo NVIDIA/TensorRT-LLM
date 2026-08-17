@@ -24,7 +24,6 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ControlChannel.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/CreditScheduler.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/TransferEngine.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 
 #include <atomic>
@@ -41,6 +40,14 @@
 #include <unordered_set>
 #include <vector>
 
+namespace tensorrt_llm::executor::kv_cache
+{
+// The data plane: bounce posts its per-chunk RDMA writes through the agent's low-level
+// postXferRequest / registerRegionImpl primitives (below the VMM splitter). Forward-declared so
+// bounce headers stay independent of the NIXL headers; BounceTransport.cpp includes the real one.
+class NixlTransferAgent;
+} // namespace tensorrt_llm::executor::kv_cache
+
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
@@ -52,7 +59,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // table, scheduler and shared resource pools provide their own synchronization.
 //
 //   BounceContext  — shared dependencies used by both roles: the injected
-//                    channel/engine/arena/exec, one CreditScheduler, and sendGrants().
+//                    channel/agent/arena/exec, one CreditScheduler, and sendGrants().
 //   BounceSender   — the [S] role: submit() -> WANT, GRANT -> gather+write, ACK
 //                    -> resolve. Owns the request table + sender-side orphan state.
 //   BounceReceiver — the [R] role: WANT -> grant regions, DATA -> scatter, ACK.
@@ -71,7 +78,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 //                                    all acked -> resolve the request's future SUCCESS.
 //        [R] WANT(rid, sizes[])   -> scheduler.onWant(peer:rid, sizes) -> send GRANT(s).
 //        [R] DATA(rid, chunk, h, plan) -> enqueue a scatter job over region `h`.
-//   2. poll TransferEngine on every in-flight write; on Done send DATA (data has
+//   2. poll every in-flight write (TransferStatus::wait(0)); on Done send DATA (data has
 //      landed at the remote) and mark on-wire. THIS is why no notifMsg is needed.
 //   3. drain scatter completions posted by workers: release receiver regions and re-GRANT.
 //
@@ -85,9 +92,9 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 // FAILURE on transfer error, peer invalidation, shutdown, or request timeout. Setting
 // requestTimeoutMs to 0 intentionally disables timeout-based failure.
 //
-// TransferEngine & ControlChannel are injected (not owned) so the same reactor runs
-// unchanged in tests and production (both over the real NIXL/zmq stack; tests may inject a
-// fault-injecting engine to exercise the failure path).
+// The agent (data plane) & ControlChannel are injected (not owned) so the same reactor runs
+// unchanged in tests and production (both over the real NIXL/zmq stack; failure tests subclass
+// NixlTransferAgent and override postXferRequest to inject deterministic transfer faults).
 // ============================================================================
 
 /// Why a bounce request resolved kFAILURE — carried inside the request's result future and
@@ -123,13 +130,13 @@ struct BounceResult
 class BounceContext
 {
 public:
-    BounceContext(std::string selfName, BounceConfig cfg, int deviceId, ControlChannel* channel, TransferEngine* engine,
-        BounceArena* arena, ExecPool* exec)
+    BounceContext(std::string selfName, BounceConfig cfg, int deviceId, ControlChannel* channel,
+        NixlTransferAgent& agent, BounceArena* arena, ExecPool* exec)
         : selfName(std::move(selfName))
         , cfg(cfg)
         , deviceId(deviceId)
         , channel(channel)
-        , engine(engine)
+        , agent(agent)
         , arena(arena)
         , exec(exec)
         , scheduler(arena->baseAddr(), cfg.arenaSizeBytes, cfg.arenaAllocationGranularityBytes,
@@ -149,7 +156,7 @@ public:
     BounceConfig cfg;
     int deviceId{};
     ControlChannel* channel{};
-    TransferEngine* engine{};
+    NixlTransferAgent& agent;  // data plane: postXferRequest (per-chunk RDMA writes)
     BounceArena* arena{};      // ONE shared data buffer: receiver grants + local gather both carve regions from it
     ExecPool* exec{};          // gather/scatter exec contexts (streams/scratch), borrowed per kernel
     CreditScheduler scheduler; // shared region allocator; internally synchronized
@@ -305,10 +312,11 @@ private:
     struct Posted
     {
         std::uint32_t chunkIdx{};
-        std::uint64_t localOffset{};  // shared-arena region held for gather/write until ACK (OUTGOING_HELD)
-        ExecCtx* ctx{nullptr};        // gather exec context, borrowed while the gather runs (until Gathered)
-        std::uint64_t xfer{};         // TransferEngine handle (valid once state == Writing)
-        std::uint64_t remoteHandle{}; // receiver's region handle (its arena offset); echoed in DATA
+        std::uint64_t localOffset{};          // shared-arena region held for gather/write until ACK (OUTGOING_HELD)
+        ExecCtx* ctx{nullptr};                // gather exec context, borrowed while the gather runs (until Gathered)
+        std::unique_ptr<TransferStatus> xfer; // in-flight RDMA write (set once state == Writing;
+                                              // nullptr after release, or if the post itself failed)
+        std::uint64_t remoteHandle{};         // receiver's region handle (its arena offset); echoed in DATA
         // Remote write target (from the GRANT), kept so postWrite can be issued LATER — after the
         // gather kernel completes — instead of blocking the IO thread on cudaStreamSynchronize.
         // The gather may be delayed behind unrelated GPU work (shared device), so we never sync;
@@ -366,7 +374,7 @@ private:
     // region. IO-thread-only (no lock). (xfer handle, arena offset).
     struct OrphanLocal
     {
-        std::uint64_t xfer{};
+        std::unique_ptr<TransferStatus> xfer;
         std::uint64_t offset{};
         std::string peer{};
         std::uint64_t rid{};
@@ -417,7 +425,7 @@ public:
     /// lifetime. (Most disagg agents are sender-only OR receiver-only, so a single arena avoids
     /// wasting a second one.)
     BounceTransport(std::string selfName, BounceConfig cfg, int deviceId, ControlChannel* channel,
-        TransferEngine* engine, BounceArena* arena, ExecPool* exec);
+        NixlTransferAgent& agent, BounceArena* arena, ExecPool* exec);
     ~BounceTransport();
 
     BounceTransport(BounceTransport const&) = delete;

@@ -20,16 +20,14 @@
 // fails, forgetPeer() drops a peer mid-transfer, or shutdown races in-flight requests. Plus a
 // multi-threaded concurrent-submit test.
 // The data plane is real NIXL (via bounceTestNixlNode helpers); the one exception is the
-// transfer-engine-failure path, which uses a tiny FailingTransferEngine fault injector because a
-// real NIXL engine cannot be made to deterministically fail a write.
+// transfer-failure path, which uses a FakeXferAgent (a NixlTransferAgent subclass overriding the
+// postXferRequest primitive) because real NIXL cannot be made to deterministically fail a write.
 //
 // The happy-path / concurrency / bidirectional / multi-agent coverage lives in bounceAgentE2ETest,
 // which drives the SAME pipeline through the production entry point (NixlTransferAgent::
 // submitTransferRequests) with one-directional AgentDesc bootstrap, so it is not duplicated here.
 
 #include "bounceTestNixlNode.h"
-
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/TransferEngine.h"
 
 #include <gtest/gtest.h>
 
@@ -44,78 +42,83 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 
 namespace
 {
-// Engine whose writes always report failure -> exercises the reactor's transfer-failure path. NIXL
-// can't be coerced into a deterministic write failure, so this stays a local fault injector (it is
-// NOT a loopback data mover — no data ever flows, so it needs no real agent / RDMA).
-class FailingTransferEngine : public b::TransferEngine
+// Test-controlled behavior for every write a FakeXferAgent posts. Shared by the agent and all the
+// statuses it hands out.
+struct XferControls
 {
-public:
-    bool registerRegion(void*, std::size_t) override
-    {
-        return true;
-    }
-
-    std::uint64_t postWrite(
-        std::string const&, void const*, std::uint64_t, std::uint32_t, std::uint32_t, cudaStream_t) override
-    {
-        return 1; // pretend a write was posted...
-    }
-
-    b::XferState poll(std::uint64_t) override
-    {
-        return b::XferState::kFailed; // ...but it never lands
-    }
-
-    bool release(std::uint64_t) override
-    {
-        return true;
-    }
+    std::atomic<bool> failWrites{false};     // every posted write polls as FAILURE
+    std::atomic<bool> allowTerminal{true};   // false -> posted writes stay IN_PROGRESS
+    std::atomic<bool> releaseSucceeds{true}; // false -> release() fails (handle retained)
+    std::atomic<std::uint64_t> postCount{0};
+    std::atomic<std::uint64_t> releaseCount{0};
 };
 
-// Deterministic engine for protocol and shutdown tests. It can leave a write active and reject its
-// first release, modeling a backend that cannot cancel immediately while preserving the handle for
-// a later retry.
-class ControllableTransferEngine : public b::TransferEngine
+// A TransferStatus driven by XferControls instead of a real backend handle. Unlike
+// NixlTransferStatus it does NOT release in its destructor, keeping releaseCount deterministic.
+class FakeXferStatus final : public kvc::TransferStatus
 {
 public:
-    bool registerRegion(void*, std::size_t) override
+    explicit FakeXferStatus(std::shared_ptr<XferControls> ctl)
+        : mCtl(std::move(ctl))
     {
-        return true;
     }
 
-    std::uint64_t postWrite(
-        std::string const&, void const*, std::uint64_t, std::uint32_t, std::uint32_t, cudaStream_t) override
+    [[nodiscard]] bool isCompleted() const override
     {
-        auto const handle = nextHandle.fetch_add(1, std::memory_order_relaxed);
-        outstandingHandle.store(handle, std::memory_order_release);
-        postCount.fetch_add(1, std::memory_order_relaxed);
-        return handle;
+        return wait(0) != kvc::TransferState::kIN_PROGRESS;
     }
 
-    b::XferState poll(std::uint64_t) override
+    [[nodiscard]] kvc::TransferState wait(int64_t) const override
     {
-        return allowTerminal.load(std::memory_order_acquire) ? b::XferState::kDone : b::XferState::kInProgress;
+        if (mCtl->failWrites.load(std::memory_order_acquire))
+        {
+            return kvc::TransferState::kFAILURE;
+        }
+        return mCtl->allowTerminal.load(std::memory_order_acquire) ? kvc::TransferState::kSUCCESS
+                                                                   : kvc::TransferState::kIN_PROGRESS;
     }
 
-    bool release(std::uint64_t handle) override
+    [[nodiscard]] bool release() override
     {
-        releaseCount.fetch_add(1, std::memory_order_relaxed);
-        if (!releaseSucceeds.load(std::memory_order_acquire))
+        if (mReleased)
+        {
+            return true;
+        }
+        mCtl->releaseCount.fetch_add(1, std::memory_order_relaxed);
+        if (!mCtl->releaseSucceeds.load(std::memory_order_acquire))
         {
             return false;
         }
-        std::uint64_t expected = handle;
-        return outstandingHandle.compare_exchange_strong(expected, 0, std::memory_order_acq_rel) || expected == 0;
+        mReleased = true;
+        return true;
     }
 
-    std::atomic<bool> allowTerminal{true};
-    std::atomic<bool> releaseSucceeds{true};
-    std::atomic<std::uint64_t> postCount{0};
-    std::atomic<std::uint64_t> releaseCount{0};
-    std::atomic<std::uint64_t> outstandingHandle{0};
+private:
+    std::shared_ptr<XferControls> mCtl;
+    bool mReleased{false};
+};
+
+// The fault-injection seam: a REAL NixlTransferAgent (control plane / metadata untouched) whose
+// low-level write primitive is overridden per XferControls — real NIXL cannot be coerced into a
+// deterministic write failure.
+class FakeXferAgent final : public kvc::NixlTransferAgent
+{
+public:
+    FakeXferAgent(kvc::BaseAgentConfig const& config, std::shared_ptr<XferControls> ctl)
+        : kvc::NixlTransferAgent(config)
+        , mCtl(std::move(ctl))
+    {
+    }
+
+    [[nodiscard]] std::unique_ptr<kvc::TransferStatus> postXferRequest(kvc::TransferOp, kvc::TransferDescs const&,
+        kvc::TransferDescs const&, std::string const&, std::optional<kvc::SyncMessage> const&) override
+    {
+        mCtl->postCount.fetch_add(1, std::memory_order_relaxed);
+        return std::make_unique<FakeXferStatus>(mCtl);
+    }
 
 private:
-    std::atomic<std::uint64_t> nextHandle{1};
+    std::shared_ptr<XferControls> mCtl;
 };
 
 b::BounceConfig cfg(int timeoutMs)
@@ -130,17 +133,9 @@ b::BounceConfig cfg(int timeoutMs)
     return c;
 }
 
-// The shared data arena + exec contexts for one manually-built transport (used only by the
-// FailingTransferEngine test, which doesn't use a NIXL node). Kept alive by the caller.
-struct Backend
-{
-    std::unique_ptr<b::BounceArena> arena;
-    std::unique_ptr<b::ExecPool> exec;
-};
-
-// Arena holds exactly `regionCap` max-size regions. Matching the allocation granularity to the
-// maximum chunk size makes every region one buddy block.
-Backend makeBackend(b::BounceConfig& c, std::uint32_t regionCap)
+// Shrink the arena to exactly `regionCap` max-size regions. Matching the allocation granularity to
+// the maximum chunk size makes every region one buddy block.
+void capRegions(b::BounceConfig& c, std::uint32_t regionCap)
 {
     c.arenaAllocationGranularityBytes = c.maxChunkSizeBytes;
     std::size_t arenaSizeBytes = c.arenaAllocationGranularityBytes;
@@ -149,9 +144,14 @@ Backend makeBackend(b::BounceConfig& c, std::uint32_t regionCap)
         arenaSizeBytes <<= 1;
     }
     c.arenaSizeBytes = arenaSizeBytes;
-    std::uint32_t const execCount = regionCap + c.scatterWorkerCount + 4;
-    return Backend{std::make_unique<b::BounceArena>(arenaSizeBytes, 0, /*allowFabric=*/false),
-        std::make_unique<b::ExecPool>(execCount, 1024, 0, c.useZeroCopyArguments)};
+}
+
+// makeNode with a FakeXferAgent wired to `ctl`.
+std::unique_ptr<bounce_test::Node> makeFakeNode(
+    std::string const& name, b::BounceConfig const& c, std::shared_ptr<XferControls> ctl)
+{
+    return bounce_test::makeNode(name, c, 1024,
+        [&ctl](kvc::BaseAgentConfig const& agentConfig) { return std::make_unique<FakeXferAgent>(agentConfig, ctl); });
 }
 
 // Poll `ch` until `budget` elapses, invoking `onMsg(header, blob)` for each decoded message;
@@ -233,32 +233,32 @@ TEST(BounceTransportFailure, NoGrantTimesOutNotHang)
     bounce_test::freeXferBufs(bufs);
 }
 
-// The transfer engine reports failure -> the request must FAIL (not hang, not falsely succeed).
-// Uses the FailingTransferEngine fault injector (no NIXL agent: no data ever lands).
-TEST(BounceTransportFailure, EngineFailureFailsRequest)
+// The posted write reports failure -> the request must FAIL (not hang, not falsely succeed).
+// The sender is a FakeXferAgent whose writes always poll as FAILURE.
+TEST(BounceTransportFailure, WriteFailureFailsRequest)
 {
     if (!bounce_test::hasCuda())
         GTEST_SKIP() << "no CUDA device";
     auto c = cfg(/*timeoutMs=*/5000);
-    b::ZmqControlChannel chA("feA");
-    b::ZmqControlChannel chB("feB");
-    FailingTransferEngine engA; // sender's writes fail
-    FailingTransferEngine engB; // receiver never writes; engine is unused on its side
-    auto beA = makeBackend(c, c.maxInflightChunksPerRequest);
-    auto beB = makeBackend(c, c.maxInflightChunksPerRequest);
-    auto A = std::make_unique<b::BounceTransport>("feA", c, 0, &chA, &engA, beA.arena.get(), beA.exec.get());
-    auto B = std::make_unique<b::BounceTransport>("feB", c, 0, &chB, &engB, beB.arena.get(), beB.exec.get());
-    A->addPeer("feB", chB.localEndpoint());
-    B->addPeer("feA", chA.localEndpoint());
+    capRegions(c, c.maxInflightChunksPerRequest);
+    auto ctl = std::make_shared<XferControls>();
+    ctl->failWrites.store(true, std::memory_order_release);
+    auto A = makeFakeNode("feA", c, ctl);
+    auto B = bounce_test::makeNode("feB", c, 1024);
+    if (!A || !B)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    A->tx->addPeer("feB", B->ch->localEndpoint());
+    B->tx->addPeer("feA", A->ch->localEndpoint());
 
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = A->submit(bufs.srcDescs, bufs.dstDescs, "feB");
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "engine failure hung";
+    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "feB");
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "write failure hung";
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kWriteFailed);
+    EXPECT_GE(ctl->postCount.load(std::memory_order_acquire), 1u);
 
-    A->shutdown();
-    B->shutdown();
+    A->tx->shutdown();
+    B->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
 }
 
@@ -270,21 +270,20 @@ TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
     if (!bounce_test::hasCuda())
         GTEST_SKIP() << "no CUDA device";
     auto c = cfg(/*timeoutMs=*/5000);
+    capRegions(c, c.maxInflightChunksPerRequest);
     b::ZmqControlChannel sender("dupDataSender");
-    b::ZmqControlChannel receiverChannel("dupDataReceiver");
-    FailingTransferEngine receiverEngine;
-    auto receiverBackend = makeBackend(c, c.maxInflightChunksPerRequest);
-    auto receiver = std::make_unique<b::BounceTransport>("dupDataReceiver", c, 0, &receiverChannel, &receiverEngine,
-        receiverBackend.arena.get(), receiverBackend.exec.get());
-    ASSERT_TRUE(sender.addPeer("dupDataReceiver", receiverChannel.localEndpoint()));
+    auto receiver = bounce_test::makeNode("dupDataReceiver", c, 1024); // receiver posts no writes
+    if (!receiver)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    ASSERT_TRUE(sender.addPeer("dupDataReceiver", receiver->ch->localEndpoint()));
 
     // Hold every context so both DATA messages reach the reactor before the first scatter can finish.
     std::vector<b::ExecCtx*> heldExecContexts;
-    while (auto* ctx = receiverBackend.exec->tryAcquire())
+    while (auto* ctx = receiver->exec->tryAcquire())
     {
         heldExecContexts.push_back(ctx);
     }
-    ASSERT_EQ(heldExecContexts.size(), receiverBackend.exec->size());
+    ASSERT_EQ(heldExecContexts.size(), receiver->exec->size());
 
     constexpr std::uint64_t rid = 17;
     sender.sendTo("dupDataReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
@@ -302,12 +301,12 @@ TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     for (auto* ctx : heldExecContexts)
     {
-        receiverBackend.exec->release(ctx);
+        receiver->exec->release(ctx);
     }
 
     EXPECT_EQ(countAcks(sender, std::chrono::seconds(2), rid), 1);
 
-    receiver->shutdown();
+    receiver->tx->shutdown();
     EXPECT_EQ(cudaFree(dst), cudaSuccess);
 }
 
@@ -323,13 +322,12 @@ TEST(BounceTransportFailure, GrantLeaseExpiryReclaimsSilentSendersRegion)
     auto c = cfg(/*timeoutMs=*/30000); // sender-side request timeout: irrelevant here
     c.receiverFlowTimeoutMs = 400;
     c.quarantineMs = 200;
+    capRegions(c, /*regionCap=*/1);                               // arena holds exactly ONE region
     b::ZmqControlChannel sender("glSender");
-    b::ZmqControlChannel receiverChannel("glReceiver");
-    FailingTransferEngine receiverEngine;                   // receiver never posts writes; engine unused on its side
-    auto receiverBackend = makeBackend(c, /*regionCap=*/1); // arena holds exactly ONE region
-    auto receiver = std::make_unique<b::BounceTransport>(
-        "glReceiver", c, 0, &receiverChannel, &receiverEngine, receiverBackend.arena.get(), receiverBackend.exec.get());
-    ASSERT_TRUE(sender.addPeer("glReceiver", receiverChannel.localEndpoint()));
+    auto receiver = bounce_test::makeNode("glReceiver", c, 1024); // receiver posts no writes
+    if (!receiver)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    ASSERT_TRUE(sender.addPeer("glReceiver", receiver->ch->localEndpoint()));
 
     // rid=1 takes the single region... and goes silent (models a dead/unreachable sender).
     sender.sendTo("glReceiver", b::encodeWant(/*rid=*/1, {256}, sender.localEndpoint()));
@@ -370,7 +368,7 @@ TEST(BounceTransportFailure, GrantLeaseExpiryReclaimsSilentSendersRegion)
     EXPECT_EQ(ackRid1, 0) << "late DATA for an expired grant was scattered/ACKed";
     EXPECT_EQ(ackRid2, 1);
 
-    receiver->shutdown();
+    receiver->tx->shutdown();
     EXPECT_EQ(cudaFree(dst), cudaSuccess);
 }
 
@@ -381,24 +379,24 @@ TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)
     if (!bounce_test::hasCuda())
         GTEST_SKIP() << "no CUDA device";
     auto c = cfg(/*timeoutMs=*/5000);
-    b::ZmqControlChannel senderChannel("validateSender");
+    capRegions(c, c.maxInflightChunksPerRequest);
     b::ZmqControlChannel legitimate("validateLegitimate");
     b::ZmqControlChannel attacker("validateAttacker");
-    ControllableTransferEngine senderEngine;
-    auto senderBackend = makeBackend(c, c.maxInflightChunksPerRequest);
-    auto sender = std::make_unique<b::BounceTransport>(
-        "validateSender", c, 0, &senderChannel, &senderEngine, senderBackend.arena.get(), senderBackend.exec.get());
-    ASSERT_TRUE(sender->addPeer("validateLegitimate", legitimate.localEndpoint()));
-    ASSERT_TRUE(legitimate.addPeer("validateSender", senderChannel.localEndpoint()));
-    ASSERT_TRUE(attacker.addPeer("validateSender", senderChannel.localEndpoint()));
+    auto ctl = std::make_shared<XferControls>(); // defaults: writes complete instantly
+    auto sender = makeFakeNode("validateSender", c, ctl);
+    if (!sender)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    ASSERT_TRUE(sender->tx->addPeer("validateLegitimate", legitimate.localEndpoint()));
+    ASSERT_TRUE(legitimate.addPeer("validateSender", sender->ch->localEndpoint()));
+    ASSERT_TRUE(attacker.addPeer("validateSender", sender->ch->localEndpoint()));
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/4);
-    auto fut = sender->submit(bufs.srcDescs, bufs.dstDescs, "validateLegitimate");
+    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "validateLegitimate");
     b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/77};
 
     attacker.sendTo("validateSender", b::encodeGrant(/*requestId=*/1, {credit}));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    EXPECT_EQ(senderEngine.postCount.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(ctl->postCount.load(std::memory_order_acquire), 0u);
 
     legitimate.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
     EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
@@ -408,7 +406,7 @@ TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)
     ASSERT_TRUE(pumpChannel(legitimate, std::chrono::seconds(5),
         [](b::BounceMsgHeader const& h, std::string const&)
         { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kDATA; }));
-    EXPECT_EQ(senderEngine.postCount.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(ctl->postCount.load(std::memory_order_acquire), 1u);
 
     attacker.sendTo("validateSender", b::encodeAck(/*requestId=*/1, /*chunkIdx=*/0, credit.regionHandle));
     EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
@@ -419,7 +417,7 @@ TEST(BounceTransportFailure, RejectsWrongPeerGrantAndInvalidAcks)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
 
-    sender->shutdown();
+    sender->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
 }
 
@@ -444,49 +442,45 @@ TEST(BounceTransportFailure, ShutdownFailsInflight)
     bounce_test::freeXferBufs(bufs);
 }
 
-// Shutdown uses the backend's bounded cancel/release operation instead of polling forever. If the
-// backend cannot abort, the future still fails promptly and the engine retains the handle for retry.
+// Shutdown uses the status object's bounded release instead of polling forever. If the backend
+// cannot abort, the future still fails promptly; the release is attempted once in failAll and once
+// in its retry pass (the production NixlTransferStatus destructor makes a final attempt).
 TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
 {
     if (!bounce_test::hasCuda())
         GTEST_SKIP() << "no CUDA device";
     auto c = cfg(/*timeoutMs=*/0);
-    b::ZmqControlChannel senderChannel("shutdownReleaseSender");
+    capRegions(c, c.maxInflightChunksPerRequest);
     b::ZmqControlChannel peer("shutdownReleasePeer");
-    ControllableTransferEngine senderEngine;
-    senderEngine.allowTerminal.store(false, std::memory_order_release);
-    senderEngine.releaseSucceeds.store(false, std::memory_order_release);
-    auto senderBackend = makeBackend(c, c.maxInflightChunksPerRequest);
-    auto sender = std::make_unique<b::BounceTransport>("shutdownReleaseSender", c, 0, &senderChannel, &senderEngine,
-        senderBackend.arena.get(), senderBackend.exec.get());
-    ASSERT_TRUE(sender->addPeer("shutdownReleasePeer", peer.localEndpoint()));
-    ASSERT_TRUE(peer.addPeer("shutdownReleaseSender", senderChannel.localEndpoint()));
+    auto ctl = std::make_shared<XferControls>();
+    ctl->allowTerminal.store(false, std::memory_order_release);
+    ctl->releaseSucceeds.store(false, std::memory_order_release);
+    auto sender = makeFakeNode("shutdownReleaseSender", c, ctl);
+    if (!sender)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    ASSERT_TRUE(sender->tx->addPeer("shutdownReleasePeer", peer.localEndpoint()));
+    ASSERT_TRUE(peer.addPeer("shutdownReleaseSender", sender->ch->localEndpoint()));
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/5);
-    auto fut = sender->submit(bufs.srcDescs, bufs.dstDescs, "shutdownReleasePeer");
+    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "shutdownReleasePeer");
     b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/91};
     peer.sendTo("shutdownReleaseSender", b::encodeGrant(/*requestId=*/1, {credit}));
 
     auto const postDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (
-        std::chrono::steady_clock::now() < postDeadline && senderEngine.postCount.load(std::memory_order_acquire) == 0)
+    while (std::chrono::steady_clock::now() < postDeadline && ctl->postCount.load(std::memory_order_acquire) == 0)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    ASSERT_EQ(senderEngine.postCount.load(std::memory_order_acquire), 1);
+    ASSERT_EQ(ctl->postCount.load(std::memory_order_acquire), 1u);
 
     auto const start = std::chrono::steady_clock::now();
-    sender->shutdown();
+    sender->tx->shutdown();
     EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(5));
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(1)), std::future_status::ready);
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
-    EXPECT_EQ(senderEngine.releaseCount.load(std::memory_order_acquire), 2);
-    EXPECT_EQ(senderEngine.outstandingHandle.load(std::memory_order_acquire), 1);
-
-    senderEngine.releaseSucceeds.store(true, std::memory_order_release);
-    EXPECT_TRUE(senderEngine.release(1));
-    EXPECT_EQ(senderEngine.outstandingHandle.load(std::memory_order_acquire), 0);
+    // failAll attempts the failed release exactly twice (initial + bounded retry), never spins.
+    EXPECT_EQ(ctl->releaseCount.load(std::memory_order_acquire), 2u);
     bounce_test::freeXferBufs(bufs);
 }
 

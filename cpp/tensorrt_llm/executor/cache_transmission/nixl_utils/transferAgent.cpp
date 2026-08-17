@@ -49,7 +49,6 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransport.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
-#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/NixlTransferEngine.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ZmqControlChannel.h"
 #include <cuda_runtime_api.h>
 #include <future>
@@ -69,16 +68,24 @@ struct NixlBounceState
 {
     BounceConfig cfg;
     int deviceId{};
+    NixlTransferAgent* owner{nullptr};       // the agent this state belongs to (owns this state)
+    bool arenaRegistered{false};             // arena was NIXL-registered -> dtor must deregister it
     std::unique_ptr<ControlChannel> channel; // ZmqControlChannel
     std::unique_ptr<BounceArena> arena;      // ONE shared buffer: receiver targets + local gather staging
     std::unique_ptr<ExecPool> exec;          // gather/scatter exec contexts (streams/scratch)
-    // Engine is declared AFTER the arena so it is destroyed BEFORE it: ~NixlTransferEngine
-    // deregisters the arena from the agent while the arena memory is still alive (the arena's
-    // cudaFree runs afterwards).
-    std::unique_ptr<NixlTransferEngine> engine;
     // Declared last -> destroyed first: BounceTransport::~ joins its threads (which use the
-    // engine/channel/arena/exec) before those are torn down.
+    // agent/channel/arena/exec) before those are torn down.
     std::unique_ptr<BounceTransport> transport;
+
+    ~NixlBounceState()
+    {
+        transport.reset(); // join the IO/worker threads before anything they use goes away
+        if (owner != nullptr && arenaRegistered && arena)
+        {
+            // Deregister the arena from NIXL while its memory is still alive (cudaFree follows).
+            owner->deregisterRegionImpl(arena->base(), arena->bytes(), deviceId);
+        }
+    }
 };
 } // namespace bounce
 
@@ -189,14 +196,14 @@ void NixlTransferAgent::maybeInitBounce(std::optional<bool> agentBufferEnable)
             = (localIp.find(':') != std::string::npos) ? "tcp://[" + localIp + "]:*" : "tcp://" + localIp + ":*";
         st->channel = std::make_unique<bounce::ZmqControlChannel>(mName, bindAddr);
         std::string const controlDesc = st->channel->localEndpoint();
-        st->engine = std::make_unique<bounce::NixlTransferEngine>(mRawAgent.get(), dev);
+        st->owner = this;
         std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
         // ONE shared arena for both roles (receiver RDMA-write targets + local gather staging),
         // carved into variable-size regions by the scheduler. Register it ONCE NOW (before any
         // metadata exchange) so peers' loaded MD includes it. Exec contexts (streams/scratch) are a
         // separate small pool borrowed per gather/scatter kernel.
         st->arena = std::make_unique<bounce::BounceArena>(cfg.arenaSizeBytes, dev, !cfg.disableFabricMemory);
-        if (!st->engine->registerRegion(st->arena->base(), st->arena->bytes()))
+        if (!registerRegionImpl(st->arena->base(), st->arena->bytes(), dev))
         {
             // Arena couldn't be NIXL-registered -> bounce can't move data. Leave mBounce null so the
             // agent falls back transparently to the standard per-desc NIXL path (no partial enable).
@@ -206,9 +213,10 @@ void NixlTransferAgent::maybeInitBounce(std::optional<bool> agentBufferEnable)
                 mName.c_str());
             return;
         }
+        st->arenaRegistered = true;
         st->exec = std::make_unique<bounce::ExecPool>(cfg.copyStreamCount, maxDescs, dev, cfg.useZeroCopyArguments);
         st->transport = std::make_unique<bounce::BounceTransport>(
-            mName, cfg, dev, st->channel.get(), st->engine.get(), st->arena.get(), st->exec.get());
+            mName, cfg, dev, st->channel.get(), *this, st->arena.get(), st->exec.get());
         mBounce = std::move(st);
         TLLM_LOG_INFO(
             "NixlTransferAgent(%s): bounce v2 enabled "
@@ -904,21 +912,6 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
 #endif
 
-    nixl_status_t status;
-    nixlXferReqH* handle;
-
-    // Local per-request copy: hasNotif / notifMsg vary per call; a shared mExtraParams
-    // would race between concurrent submits even under shared_lock.
-    nixl_opt_args_t reqParams = mExtraParams;
-    if (request.getSyncMessage().has_value())
-    {
-        reqParams.hasNotif = true;
-        reqParams.notifMsg = request.getSyncMessage().value();
-    }
-    else
-    {
-        reqParams.hasNotif = false;
-    }
     // Split transfer descriptors at VMM chunk boundaries to match registered memory, then coalesce
     // contiguous pieces. A coalesced descriptor never crosses a chunk boundary or a registered
     // region boundary on either side, so every descriptor still falls within a single registered
@@ -934,20 +927,93 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     auto [xferSrc, xferDst] = VmmDescSplitter::splitAndCoalesceTransferDescs(request.getSrcDescs(),
         request.getDstDescs(), mLocalVramRegionInfo, remoteRegionMap, !common::getEnvNixlDisableCoalesce());
 
+    auto status = postXferRequest(request.getOp(), xferSrc, xferDst, request.getRemoteName(), request.getSyncMessage());
+    TLLM_CHECK_WITH_INFO(status != nullptr,
+        " rank: %d createXferReq failed (see warning above) selfname: %s remoteAgent name: %s", mRank, mName.c_str(),
+        request.getRemoteName().c_str());
+    return status;
+}
+
+std::unique_ptr<TransferStatus> NixlTransferAgent::postXferRequest(TransferOp op, TransferDescs const& srcDescs,
+    TransferDescs const& dstDescs, std::string const& remoteName, std::optional<SyncMessage> const& syncMessage)
+{
+    // No mLock and no shutdown gate here: the public path already holds the shared lock, and the
+    // bounce IO thread (the other caller) is joined before agent teardown. mExtraParams is set once
+    // at construction and only read afterwards — its hasNotif is never set, so the no-notif case
+    // (every bounce chunk write, on the sub-ms pipeline) passes it directly without a copy. Only a
+    // notif-carrying call takes a local copy (hasNotif / notifMsg vary per call; mutating the shared
+    // mExtraParams would race between concurrent submits even under shared_lock).
+    nixl_opt_args_t notifParams;
+    nixl_opt_args_t const* reqParams = &mExtraParams;
+    if (syncMessage.has_value())
     {
-        NVTX3_SCOPED_RANGE(createXferReq);
-        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(xferSrc),
-            NixlHelper::convertXferDist(xferDst), request.getRemoteName(), handle, &reqParams);
+        notifParams = mExtraParams;
+        notifParams.hasNotif = true;
+        notifParams.notifMsg = syncMessage.value();
+        reqParams = &notifParams;
     }
 
-    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
-        " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s", mRank,
-        nixlEnumStrings::statusStr(status).c_str(), mName.c_str(), request.getRemoteName().c_str());
+    nixl_status_t status;
+    nixlXferReqH* handle = nullptr;
+    {
+        NVTX3_SCOPED_RANGE(createXferReq);
+        status = mRawAgent->createXferReq(NixlHelper::convert(op), NixlHelper::convertXferDist(srcDescs),
+            NixlHelper::convertXferDist(dstDescs), remoteName, handle, reqParams);
+    }
+    if (status != NIXL_SUCCESS)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): createXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
+            nixlEnumStrings::statusStr(status).c_str());
+        if (handle != nullptr)
+        {
+            (void) mRawAgent->releaseXferReq(handle);
+        }
+        return nullptr;
+    }
     {
         NVTX3_SCOPED_RANGE(postXferReq);
-        status = mRawAgent->postXferReq(handle, &reqParams);
+        status = mRawAgent->postXferReq(handle, reqParams);
+    }
+    if (status != NIXL_SUCCESS && status != NIXL_IN_PROG)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): postXferReq to %s failed: %s", mName.c_str(), remoteName.c_str(),
+            nixlEnumStrings::statusStr(status).c_str());
+        // The status object still owns the handle; its release()/dtor retries the backend release.
     }
     return std::make_unique<NixlTransferStatus>(std::weak_ptr<nixlAgent>(mRawAgent), handle);
+}
+
+bool NixlTransferAgent::registerRegionImpl(void* base, std::size_t bytes, int deviceId)
+{
+    nixl_reg_dlist_t list{VRAM_SEG};
+    list.addDesc(nixlBlobDesc{reinterpret_cast<uintptr_t>(base), bytes, static_cast<uint64_t>(deviceId)});
+    nixl_status_t const st = mRawAgent->registerMem(list);
+    if (st != NIXL_SUCCESS)
+    {
+        TLLM_LOG_WARNING(
+            "NixlTransferAgent(%s): registerMem failed: %s", mName.c_str(), nixlEnumStrings::statusStr(st).c_str());
+        return false;
+    }
+    return true;
+}
+
+void NixlTransferAgent::deregisterRegionImpl(void* base, std::size_t bytes, int deviceId)
+{
+    try
+    {
+        nixl_reg_dlist_t list{VRAM_SEG};
+        list.addDesc(nixlBlobDesc{reinterpret_cast<uintptr_t>(base), bytes, static_cast<uint64_t>(deviceId)});
+        nixl_status_t const st = mRawAgent->deregisterMem(list);
+        if (st != NIXL_SUCCESS)
+        {
+            TLLM_LOG_WARNING("NixlTransferAgent(%s): deregisterMem failed: %s", mName.c_str(),
+                nixlEnumStrings::statusStr(st).c_str());
+        }
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent(%s): deregisterMem threw: %s", mName.c_str(), e.what());
+    }
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)

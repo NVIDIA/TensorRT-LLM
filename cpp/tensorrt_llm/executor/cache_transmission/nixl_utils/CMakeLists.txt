@@ -66,7 +66,6 @@ if(NIXL_ROOT)
               bounce/ExecPool.cpp
               bounce/GatherScatterKernel.cu
               bounce/ZmqControlChannel.cpp
-              bounce/NixlTransferEngine.cpp
               bounce/BounceTransport.cpp)
     target_include_directories(
       ${NIXL_WRAPPER_TARGET} PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
