@@ -1811,7 +1811,7 @@ class _TorchLLM(BaseLLM):
         telemetry_config = kwargs.get("telemetry_config")
         usage_attempt_tracked = False
         _usage = None
-        # Start tracking before construction so initialization failures are observable.
+        # Telemetry: Track before construction so initialization failures are visible.
         try:
             import tensorrt_llm.usage as _usage
 
@@ -1819,7 +1819,6 @@ class _TorchLLM(BaseLLM):
                 telemetry_config,
                 default_usage_context=_usage.UsageContext.LLM_CLASS.value,
             )
-            _usage.set_lifecycle_phase("model_initialization")
         except Exception as exc:
             logger.debug("Usage telemetry initialization tracking failed: %s",
                          exc)
