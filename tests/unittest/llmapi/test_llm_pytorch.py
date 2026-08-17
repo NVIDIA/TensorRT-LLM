@@ -227,7 +227,9 @@ def test_llm_reward_model():
 @pytest.mark.part3
 def test_llm_perf_metrics():
     with LLM(model=llama_model_path,
-             kv_cache_config=global_kvcache_config) as llm:
+             kv_cache_config=global_kvcache_config.model_copy(
+                 update={"use_kv_cache_manager_v2": True}),
+             return_perf_metrics=False) as llm:
         sampling_params = SamplingParams(max_tokens=10,
                                          return_perf_metrics=True)
         outputs = llm.generate(prompts, sampling_params)
@@ -265,8 +267,10 @@ def test_llm_prefix_cache_reuse(attn_backend):
     with LLM(
             model=model_path,
             attn_backend=attn_backend,
-            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True,
+                                          use_kv_cache_manager_v2=True),
             cuda_graph_config=None,
+            return_perf_metrics=False,
     ) as llm:
         cold_output = llm.generate(prompt, sampling_params).outputs[0]
         warm_output = llm.generate(prompt, sampling_params).outputs[0]

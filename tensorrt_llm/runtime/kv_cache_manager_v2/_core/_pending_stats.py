@@ -28,6 +28,8 @@ class _PendingAllocationSegment:
     beam_width: int
     count_as_missed: bool
     count_as_generation: bool
+    record_manager_stats: bool
+    record_request_stats: bool
 
 
 @dataclass(slots=True)
@@ -108,19 +110,35 @@ class _PendingStats:
         block_end: BlockOrdinal,
     ) -> _PendingStatsDelta:
         num_blocks = max(0, int(block_end) - int(block_begin)) * segment.beam_width
-        stats = KVCacheStatsDelta(
-            alloc_total_blocks=num_blocks,
-            alloc_new_blocks=num_blocks,
-            missed_blocks=num_blocks if segment.count_as_missed else 0,
+        manager_stats = (
+            KVCacheStatsDelta(
+                alloc_total_blocks=num_blocks,
+                alloc_new_blocks=num_blocks,
+                missed_blocks=num_blocks if segment.count_as_missed else 0,
+            )
+            if segment.record_manager_stats
+            else KVCacheStatsDelta()
         )
-        request_stats = stats.copy()
-        iteration_stats = KVCacheIterationStatsDelta(
-            iter_alloc_total_blocks=num_blocks,
-            iter_alloc_new_blocks=num_blocks,
-            iter_missed_blocks=num_blocks if segment.count_as_missed else 0,
-            iter_gen_alloc_blocks=num_blocks if segment.count_as_generation else 0,
+        request_stats = (
+            KVCacheStatsDelta(
+                alloc_total_blocks=num_blocks,
+                alloc_new_blocks=num_blocks,
+                missed_blocks=num_blocks if segment.count_as_missed else 0,
+            )
+            if segment.record_request_stats
+            else KVCacheStatsDelta()
         )
-        return _PendingStatsDelta(stats, request_stats, iteration_stats, segment.life_cycle)
+        iteration_stats = (
+            KVCacheIterationStatsDelta(
+                iter_alloc_total_blocks=num_blocks,
+                iter_alloc_new_blocks=num_blocks,
+                iter_missed_blocks=num_blocks if segment.count_as_missed else 0,
+                iter_gen_alloc_blocks=num_blocks if segment.count_as_generation else 0,
+            )
+            if segment.record_manager_stats
+            else KVCacheIterationStatsDelta()
+        )
+        return _PendingStatsDelta(manager_stats, request_stats, iteration_stats, segment.life_cycle)
 
     def record_allocation_range(
         self,
@@ -131,8 +149,10 @@ class _PendingStats:
         beam_width: int,
         count_as_missed: bool,
         count_as_generation: bool = False,
+        record_manager_stats: bool,
+        record_request_stats: bool,
     ) -> bool:
-        if block_begin >= block_end:
+        if block_begin >= block_end or not (record_manager_stats or record_request_stats):
             return False
         segment = _PendingAllocationSegment(
             life_cycle=life_cycle,
@@ -141,6 +161,8 @@ class _PendingStats:
             beam_width=beam_width,
             count_as_missed=count_as_missed,
             count_as_generation=count_as_generation,
+            record_manager_stats=record_manager_stats,
+            record_request_stats=record_request_stats,
         )
         if not self.add(self._allocation_delta(segment, block_begin, block_end)):
             return False
@@ -153,18 +175,32 @@ class _PendingStats:
         *,
         full_reused_blocks: int,
         partial_reused_blocks: int,
+        record_manager_stats: bool,
+        record_request_stats: bool,
     ) -> bool:
         reused_blocks = full_reused_blocks + partial_reused_blocks
-        if reused_blocks == 0:
+        if reused_blocks == 0 or not (record_manager_stats or record_request_stats):
             return False
         return self.add(
             _PendingStatsDelta(
-                global_stats=KVCacheStatsDelta(reused_blocks=reused_blocks),
-                request_stats=KVCacheStatsDelta(reused_blocks=reused_blocks),
-                iteration_stats=KVCacheIterationStatsDelta(
-                    iter_reused_blocks=reused_blocks,
-                    iter_full_reused_blocks=full_reused_blocks,
-                    iter_partial_reused_blocks=partial_reused_blocks,
+                global_stats=(
+                    KVCacheStatsDelta(reused_blocks=reused_blocks)
+                    if record_manager_stats
+                    else KVCacheStatsDelta()
+                ),
+                request_stats=(
+                    KVCacheStatsDelta(reused_blocks=reused_blocks)
+                    if record_request_stats
+                    else KVCacheStatsDelta()
+                ),
+                iteration_stats=(
+                    KVCacheIterationStatsDelta(
+                        iter_reused_blocks=reused_blocks,
+                        iter_full_reused_blocks=full_reused_blocks,
+                        iter_partial_reused_blocks=partial_reused_blocks,
+                    )
+                    if record_manager_stats
+                    else KVCacheIterationStatsDelta()
                 ),
                 life_cycle=life_cycle,
             )

@@ -52,7 +52,7 @@ int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleI
 
 KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
     std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly)
+    std::optional<bool> textOnly, bool enableRequestStats)
     : id(mId)
     , mManager(manager.shared_from_this())
     , mReuseScope(std::move(reuseScope))
@@ -65,6 +65,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     , mExpectedPromptLength(
           expectedPromptLength.has_value() ? std::optional<int>{std::max(*expectedPromptLength, 0)} : std::nullopt)
     , mNumTokensBeforeHybridPruning(reuseMatch.has_value() ? reuseMatch->numTokensBeforeHybridPruning : 0)
+    , mEnableRequestStats(enableRequestStats)
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())
 {
@@ -371,6 +372,8 @@ bool KvCache::resume(std::optional<CUstream> stream)
         BeamIndex beamIdx = kDefaultBeamIndex;
         auto const lastOrdinal = BlockOrdinal{mBlocks.empty() ? 0 : (numCommittedTokens() - 1) / mTokensPerBlock};
         CUstream cudaStr = cudaStream();
+        bool const recordManagerStats = _shouldRecordManagerStats();
+        bool const recordRequestStats = _shouldRecordRequestStats();
 
         // Wait for all new slots to be ready (deduplicated).
         {
@@ -408,10 +411,11 @@ bool KvCache::resume(std::optional<CUstream> stream)
             srcLocks.push_back(lock);
 
             storageMgr.copySlotData(lcIdx, kHotLevel, kHotLevel, newSlot.slotId(), lock->page()->slotId(), cudaStr);
-            if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && _shouldRecordStats())
+            if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && (recordManagerStats || recordRequestStats))
             {
                 bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
-                    /*beamWidth=*/1, /*countAsMissed=*/!hasPartialReuseSource);
+                    /*beamWidth=*/1, /*countAsMissed=*/!hasPartialReuseSource, /*countAsGeneration=*/false,
+                    recordManagerStats, recordRequestStats);
                 if (changed)
                 {
                     mManager->markStatsDirty(id);
@@ -582,9 +586,13 @@ KVCacheStatsDelta KvCache::commitPendingStats()
         return {};
     }
 
-    mManager->commitStats(mPendingStats.globalStats(), mPendingStats.iterationStatsByLifeCycle());
-    mManager->commitSsmSnapshotIterationStats(mPendingStats.ssmSnapshotIterationStatsByLifeCycle());
-    KVCacheStatsDelta const requestStats = mPendingStats.requestStats().copy();
+    if (_shouldRecordManagerStats())
+    {
+        mManager->commitStats(mPendingStats.globalStats(), mPendingStats.iterationStatsByLifeCycle());
+        mManager->commitSsmSnapshotIterationStats(mPendingStats.ssmSnapshotIterationStatsByLifeCycle());
+    }
+    KVCacheStatsDelta const requestStats
+        = _shouldRecordRequestStats() ? mPendingStats.requestStats().copy() : KVCacheStatsDelta{};
     mPendingStats.clear();
     mManager->clearStatsDirty(id);
     return requestStats;
@@ -598,7 +606,20 @@ void KvCache::discardPendingStats()
 
 bool KvCache::_shouldRecordStats() const
 {
+    return _shouldRecordManagerStats() || _shouldRecordRequestStats();
+}
+
+bool KvCache::_shouldRecordManagerStats() const
+{
     return mManager->config().enableStats && !mManager->isStatsExcluded(id);
+}
+
+bool KvCache::_shouldRecordRequestStats() const
+{
+    // Manager stats historically also produced the request delta returned by
+    // commitPendingStats().  Preserve that contract while allowing callers to
+    // opt in to request-only accounting through mEnableRequestStats.
+    return (mManager->config().enableStats || mEnableRequestStats) && !mManager->isStatsExcluded(id);
 }
 
 void KvCache::_refreshStatsDirtyState()
@@ -618,7 +639,7 @@ void KvCache::_recordDirectIterationStats(LifeCycleId lifeCycle, KVCacheIteratio
     // Every lifecycle is reported, including SSM / recurrent ones: iteration
     // statistics are keyed by lifecycle, so recurrent page movement stays
     // distinguishable from attention movement downstream.
-    if (!_shouldRecordStats() || iterationStats.empty())
+    if (!_shouldRecordManagerStats() || iterationStats.empty())
     {
         return;
     }
@@ -630,7 +651,7 @@ void KvCache::_recordDirectIterationStats(LifeCycleId lifeCycle, KVCacheIteratio
 void KvCache::_recordMigratedSlots(
     std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel, CacheLevel dstLevel)
 {
-    if (!_shouldRecordStats())
+    if (!_shouldRecordManagerStats())
     {
         return;
     }
@@ -681,7 +702,7 @@ void KvCache::_recordMigratedSlots(
 
 void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
 {
-    if (!_shouldRecordStats())
+    if (!_shouldRecordManagerStats())
     {
         return;
     }
@@ -698,7 +719,9 @@ void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, Cac
 void KvCache::_recordResizePendingAllocations(BlockOrdinal blockBegin, BlockOrdinal blockEnd,
     TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration)
 {
-    if (!_shouldRecordStats() || blockBegin >= blockEnd)
+    bool const recordManagerStats = _shouldRecordManagerStats();
+    bool const recordRequestStats = _shouldRecordRequestStats();
+    if ((!recordManagerStats && !recordRequestStats) || blockBegin >= blockEnd)
     {
         return;
     }
@@ -711,14 +734,14 @@ void KvCache::_recordResizePendingAllocations(BlockOrdinal blockBegin, BlockOrdi
         BlockOrdinal const firstEnd = std::min(blockEnd, excluded.beg);
         if (blockBegin < firstEnd)
         {
-            changed |= mPendingStats.recordAllocationRange(
-                lifeCycle, blockBegin, firstEnd, mBeamWidth.value(), !countAsGeneration, countAsGeneration);
+            changed |= mPendingStats.recordAllocationRange(lifeCycle, blockBegin, firstEnd, mBeamWidth.value(),
+                !countAsGeneration, countAsGeneration, recordManagerStats, recordRequestStats);
         }
         BlockOrdinal const secondBegin = std::max(blockBegin, excluded.end);
         if (secondBegin < blockEnd)
         {
-            changed |= mPendingStats.recordAllocationRange(
-                lifeCycle, secondBegin, blockEnd, mBeamWidth.value(), !countAsGeneration, countAsGeneration);
+            changed |= mPendingStats.recordAllocationRange(lifeCycle, secondBegin, blockEnd, mBeamWidth.value(),
+                !countAsGeneration, countAsGeneration, recordManagerStats, recordRequestStats);
         }
     }
     if (changed)
@@ -1980,7 +2003,9 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
     auto ssmLcId = lifeCycles.ssmLifeCycleId();
     BlockOrdinal const fullReusedEnd{numTokens / mTokensPerBlock};
     bool const hasPartialMatch = numTokens % mTokensPerBlock != 0;
-    bool const shouldRecordStats = _shouldRecordStats();
+    bool const recordManagerStats = _shouldRecordManagerStats();
+    bool const recordRequestStats = _shouldRecordRequestStats();
+    bool const shouldRecordStats = recordManagerStats || recordRequestStats;
 
     // --- Build blocks with stale range handling ---
 
@@ -2038,7 +2063,9 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
         for (BlockOrdinal ord = staleEnd; ord < numMatchedBlocks; ++ord)
             processOrdinal(ord);
 
-        if (shouldRecordStats && isAttention && mPendingStats.recordReuse(lcId, fullReusedBlocks, partialReusedBlocks))
+        if (shouldRecordStats && isAttention
+            && mPendingStats.recordReuse(
+                lcId, fullReusedBlocks, partialReusedBlocks, recordManagerStats, recordRequestStats))
         {
             mManager->markStatsDirty(id);
         }
@@ -2054,7 +2081,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
     }
     // Record one SSM snapshot lookup for this reuse-match onboarding (a miss when
     // nothing matched). Mirrors Python's record_ssm_snapshot_lookup call.
-    if (shouldRecordStats && ssmLcId.has_value())
+    if (_shouldRecordManagerStats() && ssmLcId.has_value())
     {
         if (mPendingStats.recordSsmSnapshotLookup(*ssmLcId, match.numLookupTokens, numTokens, mTokensPerBlock))
         {
