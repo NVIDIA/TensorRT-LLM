@@ -11,20 +11,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# The specialized and generic paths are separate CUDA kernels. Compiler
-# specialization of the RoPE transcendental path may put a very small number
-# of values on opposite sides of an FP8 rounding boundary, but a one-bin-wide
-# numerical tolerance would hide precisely the regressions this test targets.
+# The specialized and generic paths are separate CUDA kernels. A one-bin-wide
+# numerical tolerance would hide precisely the regressions this test targets,
+# so small comparisons deliberately require exact bytes while larger tensors
+# permit strictly fewer than 0.1% mismatches.
 def _assert_fp8_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     """Require essentially byte-identical E4M3 results across CUDA kernels."""
     assert actual.shape == expected.shape
     assert actual.dtype == expected.dtype == torch.float8_e4m3fn
     byte_matches = actual.view(torch.uint8) == expected.view(torch.uint8)
-    match_fraction = byte_matches.float().mean().item()
-    assert match_fraction > 0.999, (
-        f"FP8 byte match rate {match_fraction:.6f} is not greater than 0.999 "
-        f"({byte_matches.numel() - int(byte_matches.sum().item())} mismatches "
-        f"out of {byte_matches.numel()})"
+    total = byte_matches.numel()
+    mismatches = total - int(byte_matches.sum().item())
+    mismatch_budget = (total - 1) // 1000
+    assert mismatches <= mismatch_budget, (
+        f"FP8 byte mismatches {mismatches} exceed the strict >99.9% budget "
+        f"of {mismatch_budget} out of {total} values"
     )
 
 

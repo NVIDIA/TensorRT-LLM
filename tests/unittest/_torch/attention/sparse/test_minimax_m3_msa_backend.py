@@ -57,16 +57,25 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered() -> None:
             indexer_kv_dtype="fp8",
             sparse_disable_index_value=False,
         )
+    for num_index_heads in (0, -1):
+        with pytest.raises(ValueError, match=r"greater than 0"):
+            MiniMaxM3SparseAttentionConfig(sparse_num_index_heads=num_index_heads)
 
 
 @pytest.mark.parametrize(
-    ("sparse_index_dim", "indexer_kv_dtype", "expected_dtype"),
-    [(96, "bf16", torch.bfloat16), (128, "fp8", torch.float8_e4m3fn)],
+    ("sparse_index_dim", "indexer_kv_dtype", "base_dtype", "expected_dtype"),
+    [
+        (96, "bf16", DataType.BF16, torch.bfloat16),
+        (96, "bf16", DataType.HALF, torch.bfloat16),
+        (96, "bf16", DataType.FLOAT, torch.bfloat16),
+        (128, "fp8", DataType.HALF, torch.float8_e4m3fn),
+    ],
 )
 def test_cache_manager_honors_executor_sparse_attention_config(
     monkeypatch: pytest.MonkeyPatch,
     sparse_index_dim: int,
     indexer_kv_dtype: str,
+    base_dtype: DataType,
     expected_dtype: torch.dtype,
 ) -> None:
     """The production keyword controls both index width and storage dtype."""
@@ -76,7 +85,7 @@ def test_cache_manager_honors_executor_sparse_attention_config(
     def fake_base_init(self, *args, **kwargs) -> None:
         del args, kwargs
         self.is_disagg = False
-        self.dtype = DataType.BF16
+        self.dtype = base_dtype
         self.layer_offsets = {}
 
     def fake_get_index_k_buffer(self, layer_idx, **kwargs):
@@ -393,6 +402,8 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
     # The default BF16 path keeps both live tensors and populates its cache.
     attention.indexer_kv_dtype = "bf16"
     bf16_metadata = FakeMetadata(torch.bfloat16)
+    with pytest.raises(ValueError, match=r"does not match indexer_kv_dtype"):
+        attention.run_indexer(idx_q, idx_k, fp8_metadata)
     with pytest.raises(ValueError, match=r"requires non-FP8 index-Q"):
         attention.run_indexer(fused_q, idx_k, bf16_metadata)
     with pytest.raises(ValueError, match=r"live index-K tensor"):

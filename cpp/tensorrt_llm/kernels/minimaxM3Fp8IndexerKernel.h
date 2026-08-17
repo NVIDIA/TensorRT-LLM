@@ -34,21 +34,21 @@ namespace kernels
 //! store removes the standalone cast/scatter launch from the decode graph.
 //!
 //! `qk` must be a contiguous BF16 `[num_tokens, (num_heads_q + 1) *
-//! head_dim]` tensor whose base address is 8-byte aligned. `q_out` is a
-//! contiguous E4M3 `[num_tokens, num_heads_q, head_dim]` output. `k_cache` is
+//! head_dim]` tensor whose base address is 8-byte aligned. `qOut` is a
+//! contiguous E4M3 `[num_tokens, num_heads_q, head_dim]` output. `kCache` is
 //! an E4M3 HND cache `[num_pages, 1, page_size, head_dim]`; its base address
-//! and every page start must be 4-byte aligned. `out_cache_loc` and
-//! `position_ids` contain one int32 value per token. The norm weights are BF16
+//! and every page start must be 4-byte aligned. `outCacheLoc` and
+//! `positionIds` contain one int32 value per token. The norm weights are BF16
 //! vectors of `head_dim` elements.
 //!
-//! \param page_stride Distance in E4M3 elements between cache pages.
-//! \param token_stride Distance in E4M3 elements between tokens in a page.
-//! \param page_size Number of token slots per cache page.
-//! \param num_pages Number of addressable pages in `k_cache`.
-void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* q_out, void* k_cache, int const* out_cache_loc,
-    int64_t page_stride, int64_t token_stride, int page_size, int64_t num_pages, int num_tokens, int num_heads_q,
-    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, float base,
-    int const* position_ids, cudaStream_t stream);
+//! \param pageStride Distance in E4M3 elements between cache pages.
+//! \param tokenStride Distance in E4M3 elements between tokens in a page.
+//! \param pageSize Number of token slots per cache page.
+//! \param numPages Number of addressable pages in `kCache`.
+void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* qOut, void* kCache, int const* outCacheLoc,
+    int64_t pageStride, int64_t tokenStride, int pageSize, int64_t numPages, int numTokens, int numHeadsQ, int headDim,
+    int rotaryDim, float eps, void const* qWeight, void const* kWeight, float base, int const* positionIds,
+    cudaStream_t stream);
 
 } // namespace kernels
 

@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <limits>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -162,23 +163,26 @@ __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __n
 
 } // namespace
 
-void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* q_out, void* k_cache, int const* out_cache_loc,
-    int64_t page_stride, int64_t token_stride, int page_size, int64_t num_pages, int num_tokens, int num_heads_q,
-    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, float base,
-    int const* position_ids, cudaStream_t stream)
+void launchMinimaxM3Fp8IndexerQKNormRope(void const* qk, void* qOut, void* kCache, int const* outCacheLoc,
+    int64_t pageStride, int64_t tokenStride, int pageSize, int64_t numPages, int numTokens, int numHeadsQ, int headDim,
+    int rotaryDim, float eps, void const* qWeight, void const* kWeight, float base, int const* positionIds,
+    cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(head_dim == kHeadDim, "MiniMax-M3 FP8 indexer requires head_dim=128");
-    TLLM_CHECK_WITH_INFO(rotary_dim == kRotaryDim, "MiniMax-M3 FP8 indexer requires rotary_dim=64");
-    TLLM_CHECK_WITH_INFO(num_heads_q > 0, "MiniMax-M3 FP8 indexer requires at least one query head");
+    TLLM_CHECK_WITH_INFO(headDim == kHeadDim, "MiniMax-M3 FP8 indexer requires head_dim=128");
+    TLLM_CHECK_WITH_INFO(rotaryDim == kRotaryDim, "MiniMax-M3 FP8 indexer requires rotary_dim=64");
+    TLLM_CHECK_WITH_INFO(numHeadsQ > 0, "MiniMax-M3 FP8 indexer requires at least one query head");
 
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
-    int const total_warps = num_tokens * (num_heads_q + 1);
-    int const grid_size = common::divUp(total_warps, kWarpsPerBlock);
-    minimaxM3Fp8IndexerQKNormRopeKernel<<<grid_size, kBlockSize, 0, stream>>>(static_cast<__nv_bfloat16 const*>(qk),
-        static_cast<__nv_fp8_e4m3*>(q_out), static_cast<__nv_fp8_e4m3*>(k_cache), out_cache_loc, page_stride,
-        token_stride, page_size, num_pages, num_tokens, num_heads_q, eps, static_cast<__nv_bfloat16 const*>(q_weight),
-        static_cast<__nv_bfloat16 const*>(k_weight), base, position_ids);
+    int64_t const totalWarps = static_cast<int64_t>(numTokens) * (static_cast<int64_t>(numHeadsQ) + 1);
+    int64_t const gridSize64 = common::divUp(totalWarps, static_cast<int64_t>(kWarpsPerBlock));
+    TLLM_CHECK_WITH_INFO(gridSize64 <= std::numeric_limits<int>::max(), "MiniMax-M3 FP8 indexer grid is too large");
+    int const gridSize = static_cast<int>(gridSize64);
+    minimaxM3Fp8IndexerQKNormRopeKernel<<<gridSize, kBlockSize, 0, stream>>>(static_cast<__nv_bfloat16 const*>(qk),
+        static_cast<__nv_fp8_e4m3*>(qOut), static_cast<__nv_fp8_e4m3*>(kCache), outCacheLoc, pageStride, tokenStride,
+        pageSize, numPages, numTokens, numHeadsQ, eps, static_cast<__nv_bfloat16 const*>(qWeight),
+        static_cast<__nv_bfloat16 const*>(kWeight), base, positionIds);
+    sync_check_cuda_error(stream);
 }
 
 } // namespace kernels

@@ -714,7 +714,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
-    sparse_num_index_heads: int = Field(
+    sparse_num_index_heads: PositiveInt = Field(
         default=4,
         description="Number of index-attention heads (per TP rank's view).",
     )
@@ -777,7 +777,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     )
 
     @model_validator(mode="after")
-    def _validate_msa_block_size(self):
+    def _validate_msa_configuration(self):
         if self.implementation == "msa" and self.sparse_block_size != 128:
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "

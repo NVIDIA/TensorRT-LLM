@@ -263,10 +263,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """Return the independently configured index-cache storage dtype."""
         if self.indexer_kv_dtype == "fp8":
             return torch.float8_e4m3fn
-        if self.dtype == DataType.HALF:
-            return torch.float16
-        if self.dtype == DataType.FLOAT:
-            return torch.float32
         return torch.bfloat16
 
     def get_index_k_buffer(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
