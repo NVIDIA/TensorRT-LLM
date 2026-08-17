@@ -17,7 +17,6 @@
 import importlib
 import itertools
 import logging
-import os
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock
@@ -138,13 +137,13 @@ def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int
         pytest.skip("CUDA required for MegaMoE tests")
     if dist.is_initialized():
         return
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29561")
-    os.environ.setdefault("RANK", "0")
-    os.environ.setdefault("WORLD_SIZE", "1")
-    os.environ.setdefault("LOCAL_RANK", str(rank))
     torch.cuda.set_device(rank)
-    dist.init_process_group(backend="nccl", rank=0, world_size=1)
+    dist.init_process_group(
+        backend="nccl",
+        store=dist.HashStore(),
+        rank=0,
+        world_size=1,
+    )
 
 
 def should_skip_gptoss(
