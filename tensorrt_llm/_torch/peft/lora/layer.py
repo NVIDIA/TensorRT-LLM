@@ -950,10 +950,11 @@ class _LoraGroupedGemmRunner(TunableRunner):
             cuda_graph_params = lora_params['cuda_graph_params']
             layer_params = cuda_graph_params.get_layer_params(self.layer_key)
             assert layer_params is not None
-            cuda_graph_params.slot_ranks_host = (
-                cuda_graph_params.slot_ranks_host.clone())
-            cuda_graph_params.slot_ranks_host.zero_()
-            cuda_graph_params.slot_ranks_host[0] = self.max_rank
+            if self.dtype == torch.float8_e4m3fn:
+                cuda_graph_params.slot_ranks_host = (
+                    cuda_graph_params.slot_ranks_host.clone())
+                cuda_graph_params.slot_ranks_host.zero_()
+                cuda_graph_params.slot_ranks_host[0] = self.max_rank
             (
                 x,
                 cuda_graph_params.slot_counts,
