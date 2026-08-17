@@ -3376,7 +3376,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # charging the recurrent pool for the original batch size.
         constraints = []
         for batch in config.constraints:
-            unique_kv_caches = dict.fromkeys(batch.kv_caches)
+            unique_kv_caches = {
+                (kv_cache.capacity, kv_cache.history_length): kv_cache
+                for kv_cache in batch.kv_caches
+            }.values()
             constraints.extend(
                 replace(
                     batch,
