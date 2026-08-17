@@ -1912,9 +1912,12 @@ class SpecWorkerBase(nn.Module, ABC):
         ``[ctx (1 row), gen (draft_len + 1 rows)]`` layout, i.e. after
         ``_reshape_logits_for_accept`` -- which is what makes PARD's wider raw
         layout fit the same mapping.
+
+        Returns the logits acceptance should read: a penalized copy when the
+        penalties apply, otherwise the caller's tensor unchanged.
         """
         if not getattr(spec_metadata, "enable_penalty", False):
-            return
+            return logits
         # NB: deliberately NOT gated on batch_uses_penalty. Decode steps replay a
         # captured CUDA graph, so a host-side skip decided at capture time would be
         # baked in permanently -- and capture happens during warmup, when no real
@@ -1926,14 +1929,19 @@ class SpecWorkerBase(nn.Module, ABC):
                                                 batch_size, draft_len,
                                                 draft_tokens, logits.device)
         if mapping is None:
-            return
+            return logits
         row_slots, intra_tokens, intra_valid = mapping
         if row_slots.numel() != logits.shape[0]:
             # The caller's row layout is not the one this mapping describes (tree
             # modes); penalizing against it would charge the wrong request.
-            return
-        penalty_ops.apply_penalties(logits, spec_metadata, row_slots,
+            return logits
+        # Copy first: apply_penalties rewrites in place, and the caller keeps this
+        # tensor as the step's reported logits. Penalizing it directly would feed
+        # the penalized scores back to logprobs and to the next step's consumers.
+        penalized = logits.clone()
+        penalty_ops.apply_penalties(penalized, spec_metadata, row_slots,
                                     intra_tokens, intra_valid)
+        return penalized
 
     def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
                              batch_size, spec_metadata):
@@ -1947,13 +1955,17 @@ class SpecWorkerBase(nn.Module, ABC):
 
         Occurrence penalties are applied to the target logits first, so both the
         strict and the rejection branch verify against the penalized distribution.
+        They are applied to a copy: the caller keeps a reference to this tensor and
+        returns it as the step's ``logits`` output (Eagle3's ``raw_logits``), which
+        feeds logprobs and other consumers that must see the model's own scores.
         The draft distribution is deliberately left unpenalized: rejection sampling
         stays unbiased either way (it only requires draft_probs to match how the
         draft tokens were actually drawn), so this costs acceptance rate rather
         than correctness.
         """
-        self._apply_occurrence_penalties(logits, draft_tokens, num_contexts,
-                                         batch_size, spec_metadata)
+        logits = self._apply_occurrence_penalties(logits, draft_tokens,
+                                                  num_contexts, batch_size,
+                                                  spec_metadata)
         num_gens = batch_size - num_contexts
         if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
             draft_len = draft_tokens.shape[1]
