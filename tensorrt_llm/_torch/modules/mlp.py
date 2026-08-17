@@ -8,7 +8,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
 from .linear import (Linear, TensorParallelMode, WeightMode,
                      WeightsLoadingConfig, is_static_nvfp4_input_eligible)

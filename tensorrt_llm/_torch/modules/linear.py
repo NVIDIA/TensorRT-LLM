@@ -14,7 +14,7 @@ from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
-from tensorrt_llm._torch.peft.lora.layer import LoraLayer, add_lora_result
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
