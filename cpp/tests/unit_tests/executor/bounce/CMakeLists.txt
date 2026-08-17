@@ -130,16 +130,13 @@ if(NIXL_ROOT)
       target_link_options(bounceTransportTsanTest PRIVATE -fsanitize=thread)
     endif()
 
-    # Real-NIXL end-to-end loopback: two real agents, real RDMA.
-    add_gtest(bounceNixlE2ETest bounceNixlE2ETest.cpp)
-    target_sources(bounceNixlE2ETest PRIVATE ${BOUNCE_REACTOR_SRCS})
-    target_include_directories(bounceNixlE2ETest PRIVATE ${BOUNCE_TEST_INCS})
-    target_link_libraries(bounceNixlE2ETest PRIVATE ${BOUNCE_TEST_LIBS})
-
     # Production-path e2e: bounce engaged via
     # NixlTransferAgent::submitTransferRequests. Bounce lives inside the
-    # wrapper; this test only uses the public agent API.
+    # wrapper; this test only uses the public agent API (the zmq include is
+    # needed only because the shared bounceTestNixlNode.h helpers pull in
+    # ZmqControlChannel.h at compile time).
     add_gtest(bounceAgentE2ETest bounceAgentE2ETest.cpp)
+    target_include_directories(bounceAgentE2ETest PRIVATE ${BOUNCE_TEST_INCS})
     target_link_libraries(
       bounceAgentE2ETest PRIVATE tensorrt_llm_nixl_wrapper NIXL::nixl
                                  ${NIXL_BUILD_LIBRARY})

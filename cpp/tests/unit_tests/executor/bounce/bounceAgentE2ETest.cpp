@@ -23,127 +23,94 @@
 // intentionally NOT NIXL-registered, so the standard path's createXferReq would fail on them --
 // a SUCCESS here proves the bounce fast path was taken (only the bounce arena is registered).
 
+#include "bounceTestNixlNode.h"
+
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 
 #include <gtest/gtest.h>
 
-#include <cuda_runtime_api.h>
-
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
+using bounce_test::freeXferBufs;
+using bounce_test::hasCuda;
+using bounce_test::makeXferBufs;
+using bounce_test::verifyXferBufs;
+using bounce_test::XferBufs;
+
 namespace
 {
-bool hasCuda()
+kvc::TransferRequest makeReq(XferBufs const& x, char const* dstPeer)
 {
-    int n = 0;
-    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
+    return kvc::TransferRequest{kvc::TransferOp::kWRITE, x.srcDescs, x.dstDescs, dstPeer, std::nullopt};
 }
 
-std::uint64_t alignUp(std::uint64_t v, std::uint64_t a)
+// Poll a transfer status to a terminal state (bounce futures resolve once all chunks are
+// scattered+ACKed); returns the last observed state (kIN_PROGRESS on deadline).
+template <typename StatusPtr>
+kvc::TransferState waitTerminal(StatusPtr& status, int seconds)
 {
-    return (v + a - 1) / a * a;
-}
-
-unsigned char pattern(std::size_t d, std::size_t i)
-{
-    return static_cast<unsigned char>((d * 211 + i * 17 + 3) & 0xFF);
-}
-
-unsigned char patSeed(std::uint32_t seed, std::size_t d, std::size_t i)
-{
-    return static_cast<unsigned char>((seed * 101 + d * 211 + i * 17 + 3) & 0xFF);
-}
-
-// One transfer's device buffers + descriptors (KV buffers, intentionally NOT NIXL-registered).
-struct AgentBufs
-{
-    void* src{nullptr};
-    void* dst{nullptr};
-    std::uint32_t nDescs{};
-    std::uint32_t descBytes{};
-    std::uint32_t seed{};
-    std::vector<std::uint64_t> off;
-    std::uint64_t total{};
-};
-
-AgentBufs makeAgentBufs(std::uint32_t nDescs, std::uint32_t descBytes, std::uint32_t seed)
-{
-    AgentBufs x;
-    x.nDescs = nDescs;
-    x.descBytes = descBytes;
-    x.seed = seed;
-    x.off.resize(nDescs);
-    std::uint64_t cur = 0;
-    for (std::uint32_t i = 0; i < nDescs; ++i)
+    auto st = kvc::TransferState::kIN_PROGRESS;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (std::chrono::steady_clock::now() < deadline)
     {
-        x.off[i] = cur;
-        cur = alignUp(cur + descBytes, 256);
-    }
-    x.total = cur;
-    EXPECT_EQ(cudaMalloc(&x.src, x.total), cudaSuccess);
-    EXPECT_EQ(cudaMalloc(&x.dst, x.total), cudaSuccess);
-    std::vector<unsigned char> h(x.total, 0);
-    for (std::uint32_t i = 0; i < nDescs; ++i)
-    {
-        for (std::uint32_t j = 0; j < descBytes; ++j)
+        st = status->wait(100);
+        if (st != kvc::TransferState::kIN_PROGRESS)
         {
-            h[x.off[i] + j] = patSeed(seed, i, j);
+            break;
         }
     }
-    EXPECT_EQ(cudaMemcpy(x.src, h.data(), x.total, cudaMemcpyHostToDevice), cudaSuccess);
-    EXPECT_EQ(cudaMemset(x.dst, 0, x.total), cudaSuccess);
-    return x;
+    return st;
 }
 
-kvc::TransferRequest makeReq(AgentBufs const& x, char const* dstPeer)
+// Fan out one transfer per (sender agent, dst peer) route, each on its own thread, and return how
+// many completed SUCCESS. bufs[i] backs routes[i].
+int runConcurrentFlows(
+    std::vector<std::pair<kvc::NixlTransferAgent*, char const*>> const& routes, std::vector<XferBufs> const& bufs)
 {
-    auto a2 = [](void* p, std::uint64_t o) { return reinterpret_cast<std::uintptr_t>(static_cast<char*>(p) + o); };
-    std::vector<kvc::MemoryDesc> sd;
-    std::vector<kvc::MemoryDesc> dd;
-    for (std::uint32_t i = 0; i < x.nDescs; ++i)
+    std::atomic<int> ok{0};
+    std::vector<std::thread> threads;
+    threads.reserve(routes.size());
+    for (std::size_t i = 0; i < routes.size(); ++i)
     {
-        sd.emplace_back(a2(x.src, x.off[i]), x.descBytes, 0);
-        dd.emplace_back(a2(x.dst, x.off[i]), x.descBytes, 0);
-    }
-    return kvc::TransferRequest{kvc::TransferOp::kWRITE, kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(sd)},
-        kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(dd)}, dstPeer, std::nullopt};
-}
-
-bool verifyAgentBufs(AgentBufs const& x)
-{
-    std::vector<unsigned char> got(x.total, 0xEE);
-    if (cudaMemcpy(got.data(), x.dst, x.total, cudaMemcpyDeviceToHost) != cudaSuccess)
-    {
-        return false;
-    }
-    for (std::uint32_t i = 0; i < x.nDescs; ++i)
-    {
-        for (std::uint32_t j = 0; j < x.descBytes; ++j)
-        {
-            if (got[x.off[i] + j] != patSeed(x.seed, i, j))
+        threads.emplace_back(
+            [&, i]
             {
-                return false;
-            }
-        }
+                auto req = makeReq(bufs[i], routes[i].second);
+                auto status = routes[i].first->submitTransferRequests(req);
+                if (status == nullptr)
+                {
+                    return;
+                }
+                if (waitTerminal(status, 60) == kvc::TransferState::kSUCCESS)
+                {
+                    ok.fetch_add(1);
+                }
+            });
     }
-    return true;
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+    return ok.load();
 }
 
-void setBounceEnv()
+// Enable bounce + tune thresholds so a modest transfer engages it (small regions -> recycling).
+void setBounceEnv(char const* arenaBytes = "2097152", char const* granularityBytes = "256")
 {
     setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "1", 1);
     setenv("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT", "4", 1);
     setenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES", "4096", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", "2097152", 1); // 2 MiB
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", "256", 1);
+    setenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", arenaBytes, 1);
+    setenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", granularityBytes, 1);
     setenv("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST", "2", 1);
 }
 
@@ -198,14 +165,7 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     {
         GTEST_SKIP() << "no CUDA device";
     }
-
-    // Enable bounce + tune thresholds so a modest transfer engages it (small regions -> recycling).
-    setenv("TRTLLM_NIXL_BOUNCE_ENABLE", "1", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MIN_DESCRIPTOR_COUNT", "4", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MAX_CHUNK_SIZE_BYTES", "4096", 1); // per-chunk byte cap
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_SIZE_BYTES", "1048576", 1);  // 1 MiB shared arena
-    setenv("TRTLLM_NIXL_BOUNCE_ARENA_ALLOCATION_GRANULARITY_BYTES", "4096", 1);
-    setenv("TRTLLM_NIXL_BOUNCE_MAX_INFLIGHT_CHUNKS_PER_REQUEST", "2", 1);
+    setBounceEnv(/*arenaBytes=*/"1048576", /*granularityBytes=*/"4096");
 
     std::unique_ptr<kvc::NixlTransferAgent> a;
     std::unique_ptr<kvc::NixlTransferAgent> b;
@@ -218,6 +178,7 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     }
     catch (std::exception const& e)
     {
+        clearBounceEnv();
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
 
@@ -229,72 +190,17 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     // here is the whole point. (We deliberately do NOT touch the connection-info path.)
     a->loadRemoteAgent("bAgentB", b->getLocalAgentDesc());
 
-    constexpr std::uint32_t kNDescs = 24;
-    constexpr std::uint32_t kDescBytes = 600;
-    std::vector<std::uint64_t> off(kNDescs);
-    std::uint64_t cur = 0;
-    for (std::uint32_t i = 0; i < kNDescs; ++i)
-    {
-        off[i] = cur;
-        cur = alignUp(cur + kDescBytes, 256);
-    }
-    std::uint64_t const total = cur;
-
-    void* dSrc = nullptr;
-    void* dDst = nullptr;
-    ASSERT_EQ(cudaMalloc(&dSrc, total), cudaSuccess);
-    ASSERT_EQ(cudaMalloc(&dDst, total), cudaSuccess);
-    std::vector<unsigned char> host(total, 0);
-    for (std::uint32_t i = 0; i < kNDescs; ++i)
-    {
-        for (std::uint32_t j = 0; j < kDescBytes; ++j)
-        {
-            host[off[i] + j] = pattern(i, j);
-        }
-    }
-    ASSERT_EQ(cudaMemcpy(dSrc, host.data(), total, cudaMemcpyHostToDevice), cudaSuccess);
-    ASSERT_EQ(cudaMemset(dDst, 0, total), cudaSuccess);
-
-    auto a2 = [](void* p, std::uint64_t o) { return reinterpret_cast<std::uintptr_t>(static_cast<char*>(p) + o); };
-    std::vector<kvc::MemoryDesc> sd;
-    std::vector<kvc::MemoryDesc> dd;
-    for (std::uint32_t i = 0; i < kNDescs; ++i)
-    {
-        sd.emplace_back(a2(dSrc, off[i]), kDescBytes, 0);
-        dd.emplace_back(a2(dDst, off[i]), kDescBytes, 0);
-    }
-    kvc::TransferRequest req{kvc::TransferOp::kWRITE, kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(sd)},
-        kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(dd)}, "bAgentB", std::nullopt};
-
+    auto bufs = makeXferBufs(/*nDescs=*/24, /*descBytes=*/600, /*seed=*/7);
+    auto req = makeReq(bufs, "bAgentB");
     auto status = a->submitTransferRequests(req);
     ASSERT_NE(status, nullptr);
-    // Poll to completion (bounce future resolves SUCCESS once all chunks are scattered+ACKed).
-    kvc::TransferState st = kvc::TransferState::kIN_PROGRESS;
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        st = status->wait(100);
-        if (st != kvc::TransferState::kIN_PROGRESS)
-        {
-            break;
-        }
-    }
-    EXPECT_EQ(st, kvc::TransferState::kSUCCESS) << "bounce transfer via submitTransferRequests did not succeed";
-
-    std::vector<unsigned char> got(total, 0xEE);
-    ASSERT_EQ(cudaMemcpy(got.data(), dDst, total, cudaMemcpyDeviceToHost), cudaSuccess);
-    for (std::uint32_t i = 0; i < kNDescs; ++i)
-    {
-        for (std::uint32_t j = 0; j < kDescBytes; ++j)
-        {
-            ASSERT_EQ(got[off[i] + j], pattern(i, j)) << "mismatch desc=" << i << " byte=" << j;
-        }
-    }
+    EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS)
+        << "bounce transfer via submitTransferRequests did not succeed";
+    EXPECT_TRUE(verifyXferBufs(bufs));
 
     a->shutdown();
     b->shutdown();
-    cudaFree(dSrc);
-    cudaFree(dDst);
+    freeXferBufs(bufs);
     clearBounceEnv();
 }
 
@@ -326,7 +232,7 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << e.what();
     }
 
-    auto bufs = makeAgentBufs(/*nDescs=*/1, /*descBytes=*/80 * 1024, /*seed=*/8);
+    auto bufs = makeXferBufs(/*nDescs=*/1, /*descBytes=*/80 * 1024, /*seed=*/8);
     auto req = makeReq(bufs, "capAgentB");
     a->registerMemory(req.getSrcDescs());
     b->registerMemory(req.getDstDescs());
@@ -334,19 +240,9 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
 
     auto status = a->submitTransferRequests(req);
     ASSERT_NE(status, nullptr);
-    kvc::TransferState state = kvc::TransferState::kIN_PROGRESS;
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        state = status->wait(100);
-        if (state != kvc::TransferState::kIN_PROGRESS)
-        {
-            break;
-        }
-    }
-    EXPECT_EQ(state, kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS);
     EXPECT_EQ(a->getBounceSubmitCount(), 0);
-    EXPECT_TRUE(verifyAgentBufs(bufs));
+    EXPECT_TRUE(verifyXferBufs(bufs));
     EXPECT_TRUE(status->release());
     status.reset();
 
@@ -354,8 +250,7 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
     b->deregisterMemory(req.getDstDescs());
     a->shutdown();
     b->shutdown();
-    cudaFree(bufs.src);
-    cudaFree(bufs.dst);
+    freeXferBufs(bufs);
     clearBounceEnv();
 }
 
@@ -392,59 +287,27 @@ TEST(BounceAgentE2E, ConcurrentSubmitUsesBounce)
     a->loadRemoteAgent("cAgentB", b->getLocalAgentDesc());
 
     constexpr int kThreads = 8;
-    std::vector<AgentBufs> bufs;
+    std::vector<XferBufs> bufs;
+    std::vector<std::pair<kvc::NixlTransferAgent*, char const*>> routes;
     bufs.reserve(kThreads);
+    routes.reserve(kThreads);
     for (int i = 0; i < kThreads; ++i)
     {
-        bufs.push_back(makeAgentBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(i + 1)));
+        bufs.push_back(makeXferBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(i + 1)));
+        routes.emplace_back(a.get(), "cAgentB");
     }
 
-    std::atomic<int> ok{0};
-    std::vector<std::thread> threads;
-    threads.reserve(kThreads);
-    for (int i = 0; i < kThreads; ++i)
-    {
-        threads.emplace_back(
-            [&, i]
-            {
-                auto req = makeReq(bufs[i], "cAgentB");
-                auto status = a->submitTransferRequests(req);
-                if (status == nullptr)
-                {
-                    return;
-                }
-                auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-                kvc::TransferState st = kvc::TransferState::kIN_PROGRESS;
-                while (std::chrono::steady_clock::now() < deadline)
-                {
-                    st = status->wait(100);
-                    if (st != kvc::TransferState::kIN_PROGRESS)
-                    {
-                        break;
-                    }
-                }
-                if (st == kvc::TransferState::kSUCCESS)
-                {
-                    ok.fetch_add(1);
-                }
-            });
-    }
-    for (auto& t : threads)
-    {
-        t.join();
-    }
-    EXPECT_EQ(ok.load(), kThreads) << "not all concurrent submitTransferRequests completed";
+    EXPECT_EQ(runConcurrentFlows(routes, bufs), kThreads) << "not all concurrent submitTransferRequests completed";
     for (auto const& x : bufs)
     {
-        EXPECT_TRUE(verifyAgentBufs(x)) << "byte mismatch / cross-talk for seed=" << x.seed;
+        EXPECT_TRUE(verifyXferBufs(x)) << "byte mismatch / cross-talk for seed=" << x.seed;
     }
 
     a->shutdown();
     b->shutdown();
     for (auto& x : bufs)
     {
-        cudaFree(x.src);
-        cudaFree(x.dst);
+        freeXferBufs(x);
     }
     clearBounceEnv();
 }
@@ -484,63 +347,29 @@ TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
     b->loadRemoteAgent("biAgentA", a->getLocalAgentDesc());
 
     constexpr int kThreads = 8; // 4 flows A->B + 4 flows B->A, all concurrent
-    std::vector<AgentBufs> bufs;
+    std::vector<XferBufs> bufs;
+    std::vector<std::pair<kvc::NixlTransferAgent*, char const*>> routes;
     bufs.reserve(kThreads);
+    routes.reserve(kThreads);
     for (int i = 0; i < kThreads; ++i)
     {
-        bufs.push_back(makeAgentBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(i + 1)));
+        bufs.push_back(makeXferBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(i + 1)));
+        // Even threads send A->B; odd threads send B->A (both arenas act as both roles).
+        bool const a2b = (i % 2 == 0);
+        routes.emplace_back(a2b ? a.get() : b.get(), a2b ? "biAgentB" : "biAgentA");
     }
 
-    std::atomic<int> ok{0};
-    std::vector<std::thread> threads;
-    threads.reserve(kThreads);
-    for (int i = 0; i < kThreads; ++i)
-    {
-        threads.emplace_back(
-            [&, i]
-            {
-                // Even threads send A->B; odd threads send B->A (both arenas act as both roles).
-                bool const a2b = (i % 2 == 0);
-                auto* tx = a2b ? a.get() : b.get();
-                char const* peer = a2b ? "biAgentB" : "biAgentA";
-                auto req = makeReq(bufs[i], peer);
-                auto status = tx->submitTransferRequests(req);
-                if (status == nullptr)
-                {
-                    return;
-                }
-                auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-                kvc::TransferState st = kvc::TransferState::kIN_PROGRESS;
-                while (std::chrono::steady_clock::now() < deadline)
-                {
-                    st = status->wait(100);
-                    if (st != kvc::TransferState::kIN_PROGRESS)
-                    {
-                        break;
-                    }
-                }
-                if (st == kvc::TransferState::kSUCCESS)
-                {
-                    ok.fetch_add(1);
-                }
-            });
-    }
-    for (auto& t : threads)
-    {
-        t.join();
-    }
-    EXPECT_EQ(ok.load(), kThreads) << "not all bidirectional submitTransferRequests completed";
+    EXPECT_EQ(runConcurrentFlows(routes, bufs), kThreads) << "not all bidirectional submitTransferRequests completed";
     for (auto const& x : bufs)
     {
-        EXPECT_TRUE(verifyAgentBufs(x)) << "byte mismatch / cross-talk for seed=" << x.seed;
+        EXPECT_TRUE(verifyXferBufs(x)) << "byte mismatch / cross-talk for seed=" << x.seed;
     }
 
     a->shutdown();
     b->shutdown();
     for (auto& x : bufs)
     {
-        cudaFree(x.src);
-        cudaFree(x.dst);
+        freeXferBufs(x);
     }
     clearBounceEnv();
 }
@@ -548,8 +377,8 @@ TEST(BounceAgentE2E, ConcurrentBidirectionalUsesBounce)
 // Production-path MULTI-AGENT (N>2): 1 receiver + S sender agents, every sender writing to the one
 // receiver concurrently (the disagg "many context workers -> one gen" shape). This is the REAL
 // one-directional bootstrap that transfer.py uses: each sender loads the receiver's AgentDesc; the
-// receiver loads NOBODY and self-bootstraps every sender from its WANT (BounceReceiver::onWant,
-// BounceReceiver::onWant) — so the reverse-control self-bootstrap is exercised across N distinct peers at once.
+// receiver loads NOBODY and self-bootstraps every sender from its WANT (BounceReceiver::onWant) —
+// so the reverse-control self-bootstrap is exercised across N distinct peers at once.
 // Seed-distinct patterns -> any cross-talk fails; all must complete SUCCESS + land byte-exact.
 TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
 {
@@ -586,51 +415,20 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
         s->loadRemoteAgent(recvName, recv->getLocalAgentDesc());
     }
 
-    std::vector<AgentBufs> bufs;
+    std::vector<XferBufs> bufs;
+    std::vector<std::pair<kvc::NixlTransferAgent*, char const*>> routes;
     bufs.reserve(kSenders);
+    routes.reserve(kSenders);
     for (int i = 0; i < kSenders; ++i)
     {
-        bufs.push_back(makeAgentBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(100 + i)));
+        bufs.push_back(makeXferBufs(/*nDescs=*/16, /*descBytes=*/500, /*seed=*/static_cast<std::uint32_t>(100 + i)));
+        routes.emplace_back(senders[i].get(), recvName.c_str());
     }
 
-    std::atomic<int> ok{0};
-    std::vector<std::thread> threads;
-    threads.reserve(kSenders);
-    for (int i = 0; i < kSenders; ++i)
-    {
-        threads.emplace_back(
-            [&, i]
-            {
-                auto req = makeReq(bufs[i], recvName.c_str());
-                auto status = senders[i]->submitTransferRequests(req);
-                if (status == nullptr)
-                {
-                    return;
-                }
-                auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-                kvc::TransferState st = kvc::TransferState::kIN_PROGRESS;
-                while (std::chrono::steady_clock::now() < deadline)
-                {
-                    st = status->wait(100);
-                    if (st != kvc::TransferState::kIN_PROGRESS)
-                    {
-                        break;
-                    }
-                }
-                if (st == kvc::TransferState::kSUCCESS)
-                {
-                    ok.fetch_add(1);
-                }
-            });
-    }
-    for (auto& t : threads)
-    {
-        t.join();
-    }
-    EXPECT_EQ(ok.load(), kSenders) << "not all senders completed to the shared receiver";
+    EXPECT_EQ(runConcurrentFlows(routes, bufs), kSenders) << "not all senders completed to the shared receiver";
     for (auto const& x : bufs)
     {
-        EXPECT_TRUE(verifyAgentBufs(x)) << "byte mismatch / cross-talk for seed=" << x.seed;
+        EXPECT_TRUE(verifyXferBufs(x)) << "byte mismatch / cross-talk for seed=" << x.seed;
     }
 
     for (auto& s : senders)
@@ -640,8 +438,7 @@ TEST(BounceAgentE2E, MultiAgentManySendersToOneReceiver)
     recv->shutdown();
     for (auto& x : bufs)
     {
-        cudaFree(x.src);
-        cudaFree(x.dst);
+        freeXferBufs(x);
     }
     clearBounceEnv();
 }

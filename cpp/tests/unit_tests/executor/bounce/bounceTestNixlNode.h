@@ -20,7 +20,7 @@
 // Shared helpers for the bounce v2 tests that drive the FULL pipeline over REAL NIXL RDMA: a "node"
 // is a complete agent stack (NixlTransferAgent + NixlTransferEngine + arena + exec + zmq control
 // channel + BounceTransport), plus seeded device buffers and a byte-exact verifier. Used by
-// bounceTransportTest, bounceTransportFailureTest, and bounceNixlE2ETest so they share one NIXL
+// bounceTransportTest, bounceTransportFailureTest, and bounceAgentE2ETest so they share one NIXL
 // setup (no per-file copy, and no LocalCopy loopback fake — the data plane is always real NIXL).
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceArena.h"

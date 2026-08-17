@@ -202,23 +202,35 @@ struct Mirror
 
 } // namespace
 
-TEST(CreditScheduler, SingleSenderRespectsInflightLimit)
+// One WANT against an (arena, per-request cap) pair grants exactly min(cap, nRegions): the
+// per-request limit binds even with arena room to spare, a large limit fills the arena exactly
+// once, and a want far beyond the arena neither over-grants nor loops.
+TEST(CreditScheduler, SingleWantGrantsMinOfCapAndArena)
 {
-    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/4);
-    auto g = s.onWant("A", want(100)); // wants a lot
-    EXPECT_EQ(g.size(), 4u);           // capped by the per-request limit
-    EXPECT_EQ(s.heldCount("A"), 4u);
-    EXPECT_EQ(freeRegions(s), 4u);
-    checkConservation(s, {"A"}, 8);
-}
+    struct Case
+    {
+        std::uint32_t nRegions;
+        std::uint32_t cap;
+        std::uint32_t wantChunks;
+        std::size_t expectGrants;
+    };
 
-TEST(CreditScheduler, SingleSenderFillsArenaWhenInflightLimitIsLarge)
-{
-    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/16);
-    auto g = s.onWant("A", want(100));
-    EXPECT_EQ(g.size(), 8u);
-    EXPECT_EQ(freeRegions(s), 0u);
-    checkConservation(s, {"A"}, 8);
+    for (auto const& tc : {
+             Case{8, 4, 100, 4},   // capped by the per-request limit
+             Case{8, 16, 100, 8},  // large limit -> fills the arena
+             Case{8, 16, 2000, 8}, // huge want -> exactly N, no more, no hang
+             Case{8, 2, 100, 2},   // limit binds even with arena room
+         })
+    {
+        auto s = makeSched(tc.nRegions, tc.cap);
+        auto g = s.onWant("A", want(tc.wantChunks));
+        std::string const ctx = " nRegions=" + std::to_string(tc.nRegions) + " cap=" + std::to_string(tc.cap)
+            + " want=" + std::to_string(tc.wantChunks);
+        EXPECT_EQ(g.size(), tc.expectGrants) << ctx;
+        EXPECT_EQ(s.heldCount("A"), tc.expectGrants) << ctx;
+        EXPECT_EQ(freeRegions(s), tc.nRegions - tc.expectGrants) << ctx;
+        checkConservation(s, {"A"}, tc.nRegions);
+    }
 }
 
 TEST(CreditScheduler, RecyclingOnScatterDone)
@@ -237,14 +249,6 @@ TEST(CreditScheduler, RecyclingOnScatterDone)
     checkConservation(s, {"A"}, 4);
 }
 
-TEST(CreditScheduler, HugeWantNeverOverGrantsOrLoops)
-{
-    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/16);
-    auto g = s.onWant("A", want(2000)); // far more than the arena can hold
-    EXPECT_EQ(g.size(), 8u);            // exactly N, no more, no hang
-    checkConservation(s, {"A"}, 8);
-}
-
 TEST(CreditScheduler, BoundedInflightLimitGivesFairSplit)
 {
     // With a per-request limit of four on an eight-region arena, two senders split it evenly.
@@ -256,17 +260,6 @@ TEST(CreditScheduler, BoundedInflightLimitGivesFairSplit)
     EXPECT_EQ(s.heldCount("B"), 4u);
     EXPECT_EQ(freeRegions(s), 0u);
     checkConservation(s, {"A", "B"}, 8);
-}
-
-TEST(CreditScheduler, InflightLimitCapsRequestEvenWithArenaRoom)
-{
-    // The per-request limit is independent of arena capacity.
-    auto s = makeSched(/*nRegions=*/8, /*maxInflightChunksPerRequest=*/2);
-    auto g = s.onWant("A", want(100));
-    EXPECT_EQ(g.size(), 2u);
-    EXPECT_EQ(s.heldCount("A"), 2u);
-    EXPECT_EQ(freeRegions(s), 6u);
-    checkConservation(s, {"A"}, 8);
 }
 
 TEST(CreditScheduler, MoreSendersThanRegionsNoStarvation)
