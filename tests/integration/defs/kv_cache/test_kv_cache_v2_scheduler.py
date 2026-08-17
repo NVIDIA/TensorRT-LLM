@@ -328,6 +328,7 @@ class TestKVCacheV2Llama:
         )
 
     # Chunked prefill + eviction + block reuse — V2 matches V1
+    @pytest.mark.private_mpi_session
     def test_chunked_prefill_eviction_block_reuse(self):
         _run_eviction_test(
             self.MODEL_PATH,

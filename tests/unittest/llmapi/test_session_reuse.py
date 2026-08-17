@@ -331,18 +331,6 @@ def test_autodeploy_nodeids_are_private():
     )
 
 
-def test_stateful_kv_cache_compare_nodeid_is_private() -> None:
-    from test_common.session_reuse_hooks import _is_private_nodeid
-
-    assert _is_private_nodeid(
-        "kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::"
-        "test_chunked_prefill_eviction_block_reuse"
-    )
-    assert not _is_private_nodeid(
-        "kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction_with_block_reuse"
-    )
-
-
 def test_failed_item_fences_cached_pools(reuse_cache, monkeypatch):
     """After a failed item the next acquire must NOT reuse the cached pool."""
     from test_common import session_reuse_hooks as hooks

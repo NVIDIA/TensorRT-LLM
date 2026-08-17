@@ -22,10 +22,6 @@ _PRIVATE_NODEID_PATTERNS = (
     "autodeploy",
     "auto_deploy",
     "/test_ad_",
-    # This V1/V2 comparison has hung after inheriting an older reused worker.
-    # Keep both executor legs isolated until their teardown resets all worker state.
-    "kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::"
-    "test_chunked_prefill_eviction_block_reuse",
 )
 
 
