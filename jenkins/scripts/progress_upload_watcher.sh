@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Background progress-upload watcher. Polls for results changes and calls
 # progress_upload_snapshot.sh on each update, until PROGRESS_DONE_FILE appears.
 #
@@ -28,7 +42,15 @@ set +e
 last=0
 _poll=0
 while [ ! -f "$PROGRESS_DONE_FILE" ]; do
-    sleep "$PROGRESS_INTERVAL"
+    # Poll the done sentinel frequently so stage teardown does not wait for a
+    # full progress-upload interval after the foreground process exits.
+    _remaining=$PROGRESS_INTERVAL
+    while [ "$_remaining" -gt 0 ] && [ ! -f "$PROGRESS_DONE_FILE" ]; do
+        _sleep=5
+        [ "$_remaining" -lt "$_sleep" ] && _sleep=$_remaining
+        sleep "$_sleep"
+        _remaining=$((_remaining - _sleep))
+    done
     [ -f "$PROGRESS_DONE_FILE" ] && break
     _poll=$((_poll + 1))
 
@@ -40,7 +62,6 @@ while [ ! -f "$PROGRESS_DONE_FILE" ]; do
         [ -z "$m" ] && m=0
         echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: poll #${_poll} mtime=${m} last=${last}"
         [ "$m" -le "$last" ] && continue
-        last=$m
         # Prime the login node's NFS cache before SCP: the stat above ran on the
         # compute node (via srun --overlap) so the login node may still have a
         # stale view of the directory.  Running ls on the login node here forces
@@ -59,6 +80,7 @@ while [ ! -f "$PROGRESS_DONE_FILE" ]; do
             echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: scp failed after 3 attempts; skipping this iteration"
             continue
         fi
+        last=$m
         # Fetch unfinished_test.txt for timeout XML generation (retry 3 times)
         if [ -n "$SLURM_SCP_UNFINISHED_CMD" ]; then
             _unfinished_ok=0
@@ -86,9 +108,13 @@ while [ ! -f "$PROGRESS_DONE_FILE" ]; do
         m=$(stat -c %Y "$XML_PATH" 2>/dev/null || echo 0)
         [ "$m" -le "$last" ] && continue
         last=$m
+    else
+        # Rerun mode has no mtime source, so invoke the snapshot every interval;
+        # progress_upload_snapshot.sh skips unchanged content by hash.
+        :
     fi
 
     LABEL="${LABEL_PREFIX}${m:+ (mtime=$m)}" \
-    bash "$(dirname "${BASH_SOURCE[0]}")/progress_upload_snapshot.sh" || continue
+    bash "$(dirname "${BASH_SOURCE[0]}")/progress_upload_snapshot.sh"
 done
 echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: watcher exiting"
