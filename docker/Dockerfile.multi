@@ -54,8 +54,10 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    --mount=type=secret,id=github_clone_token \
     echo "Using GitHub mirror: ${GITHUB_MIRROR}" && \
     echo "Using Python version: ${PYTHON_VERSION}" && \
+    . /opt/docker/common/github_auth.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
     CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
@@ -81,6 +83,8 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    --mount=type=secret,id=github_clone_token \
+    . /opt/docker/common/github_auth.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
     bash /opt/docker/common/install_etcd.sh && \
@@ -114,6 +118,8 @@ COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 
 # Install Triton deps, Mooncake, and CI tooling packages
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
+    --mount=type=secret,id=github_clone_token \
+    . /opt/docker/common/github_auth.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_triton.sh && \
     if [ -f /etc/redhat-release ]; then \
         echo "Rocky8 detected, skipping mooncake installation"; \
@@ -139,9 +145,13 @@ ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
+    --mount=type=secret,id=github_clone_token \
     if [ -n "$GITHUB_MIRROR" ]; then \
       export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
+    # Authenticates `git submodule update` and the CMake FetchContent clones
+    # (3rdparty/fetch_content.json) that this build pulls from github.com.
+    . docker/common/github_auth.sh && \
     TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}

@@ -1,6 +1,9 @@
 #!/bin/bash
 set -ex
 
+# Authenticate the github.com clone below; no-op when no token is available.
+source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+
 UCX_VERSION="v1.22.x"
 UCX_COMMIT="8a6b06fb880accbb933a79cda893883872c68d9d"
 UCX_INSTALL_PATH="/usr/local/ucx/"
