@@ -23,6 +23,7 @@ is native TRT-LLM (``modeling_gemma4_audio.py``). Both replace the previous
 import copy
 import dataclasses
 import math
+from collections.abc import Sequence
 from itertools import groupby
 from typing import Dict, List, Optional, Tuple
 
@@ -32,6 +33,7 @@ from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 
 from ..._utils import nvtx_range
 from ...inputs import (
@@ -52,7 +54,11 @@ from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
 from .modeling_gemma4_audio import Gemma4AudioModel
 from .modeling_gemma4_vision import Gemma4VisionModel
-from .modeling_multimodal_mixin import MultimodalModelMixin, PreparedLlmInputs
+from .modeling_multimodal_mixin import (
+    EncoderCachePartition,
+    MultimodalModelMixin,
+    PreparedLlmInputs,
+)
 from .modeling_multimodal_utils import _MULTIMODAL_ENV_NAME, _is_mm_disagg
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -576,6 +582,120 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             "audio.audio_features_mask",
         ]
 
+    # TODO(TRTLLM-14981): Implement finer-grained caching for videos.
+    @classmethod
+    def partition_encoder_cache(
+        cls,
+        param: MultimodalParams,
+        encoder_cache: TensorLRUCache,
+    ) -> Optional[EncoderCachePartition]:
+        """Treat unsupported partial Gemma4 cache hits as full misses."""
+        partition = super().partition_encoder_cache(param, encoder_cache)
+        modality = cls._encoder_cache_modality(param)
+        if (
+            modality == "video"
+            and partition is not None
+            and not partition.is_full_hit
+            and not partition.is_full_miss
+        ):
+            # Gemma4 flattens each video's frames into dim 0 before encoding, so the persistent
+            # cache cannot (yet) rebuild a partial-hit input by video item. Re-encode the complete
+            # video payload while retaining cache lookup and reuse for full hits.
+            logger.warning_once(
+                "Gemma4 video encoder cache has a partial hit, but frame slicing is not "
+                "supported; re-encoding the complete video payload.",
+                key="gemma4_video_encoder_cache_partial_hit_unsupported",
+            )
+            return EncoderCachePartition(
+                hits={},
+                miss_indices=list(range(len(partition.keys))),
+                keys=partition.keys,
+                looked_up=partition.looked_up,
+            )
+        if (
+            modality in ("image", "audio")
+            and partition is not None
+            and not partition.is_full_hit
+            and not partition.is_full_miss
+        ):
+            input_key = {"image": "pixel_values", "audio": "audio_features"}[modality]
+            modality_data = param.multimodal_data[modality]
+            input_tensor = modality_data.get(input_key) if isinstance(modality_data, dict) else None
+            if (
+                not isinstance(input_tensor, torch.Tensor)
+                or input_tensor.dim() == 0
+                or input_tensor.shape[0] != len(partition.keys)
+            ):
+                logger.warning_once(
+                    f"Gemma4 {modality} encoder cache has a partial hit, but {input_key} is not "
+                    "item-major; re-encoding the complete payload.",
+                    key=f"gemma4_{modality}_encoder_cache_partial_hit_unsupported",
+                )
+                return EncoderCachePartition(
+                    hits={},
+                    miss_indices=list(range(len(partition.keys))),
+                    keys=partition.keys,
+                    looked_up=partition.looked_up,
+                )
+        return partition
+
+    def build_multimodal_encoder_input(
+        self,
+        param: MultimodalParams,
+        item_indices: Sequence[int],
+    ) -> MultimodalParams:
+        """Build a Gemma4 image or audio input containing selected items.
+
+        The generic implementation recognizes item-major images through a parallel `image_sizes`
+        field and item-major audio through the `input_features` key. Gemma4 instead provides
+        fixed-size `pixel_values` without `image_sizes` and uses `audio_features`.
+
+        Partial encoder-cache hits therefore need this override to slice those tensors, together
+        with their per-item position, length, and mask fields.
+        """
+        modality = self._encoder_cache_modality(param)
+        # Partial video partitions are converted to full misses above, so they cannot call this
+        # hook. Delegate unexpected direct calls to the generic validation so they fail instead of
+        # returning an incorrectly unsliced input.
+        if modality not in ("image", "audio"):
+            return super().build_multimodal_encoder_input(param, item_indices)
+        input_key = {"image": "pixel_values", "audio": "audio_features"}[modality]
+
+        modality_data = param.multimodal_data[modality]
+        if not isinstance(modality_data, dict):
+            raise TypeError(
+                f"multimodal_data[{modality!r}] must be a dict, got {type(modality_data).__name__}"
+            )
+
+        item_count = len(param.multimodal_data.get("multimodal_embedding_lengths") or ())
+        input_tensor = modality_data.get(input_key)
+        # Only slice dim 0 after confirming it is the per-item axis declared by the cache metadata.
+        # Let the generic implementation handle any other recognized layout, or reject an
+        # inconsistent Gemma4 payload.
+        if (
+            not isinstance(input_tensor, torch.Tensor)
+            or input_tensor.dim() == 0
+            or input_tensor.shape[0] != item_count
+        ):
+            return super().build_multimodal_encoder_input(param, item_indices)
+
+        indices = list(item_indices)
+        sliced = {input_key: input_tensor[indices]}
+        sliced = {
+            **modality_data,
+            **sliced,
+            **self._slice_per_item_sibling_fields(
+                modality_data, item_count, indices, sliced.keys()
+            ),
+        }
+        residual_input = (
+            copy.copy(param.multimodal_input) if param.multimodal_input is not None else None
+        )
+        return MultimodalParams(
+            multimodal_data={**param.multimodal_data, modality: sliced},
+            multimodal_input=residual_input,
+        )
+
     def encode_multimodal_inputs(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         """Encode uncached Gemma4 image, video, and audio payloads."""
         modality_inputs = (
@@ -733,6 +853,17 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
 
     @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    def load_draft_weights(self, weights, weight_mapper=None):
+        self.llm.load_draft_weights(weights, weight_mapper)
+
+    @property
     def language_model(self) -> torch.nn.Module:
         return self.llm
 
@@ -743,6 +874,8 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         position_ids: Optional[torch.Tensor],
         mm_inputs: PreparedLlmInputs,
         lora_params=None,
+        spec_metadata=None,
+        resource_manager=None,
         **forward_kwargs,
     ) -> Dict:
         """Build Gemma4-specific language-model forward arguments."""
@@ -770,6 +903,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             "mm_token_type_ids": mm_token_type_ids,
             "ple_input_ids": ple_input_ids,
             "lora_params": lora_params,
+            "spec_metadata": spec_metadata,
+            "resource_manager": resource_manager,
+            "orig_input_ids": raw_input_ids,
         }
 
     @property

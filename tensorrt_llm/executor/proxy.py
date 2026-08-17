@@ -616,7 +616,12 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
-        from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
+        # With the lazily loaded model zoo this snapshot is intentionally
+        # partial: it carries only externally-registered (and already
+        # resolved) classes; workers resolve built-ins on demand. Do not
+        # "fix" it by importing the zoo eagerly before submit.
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
         torch.cuda.Stream()
 
         # Strip the tokenizer from worker_kwargs to avoid MPI pickle failures.
@@ -736,8 +741,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         Unlinking ipc socket paths does not disturb established zmq
         connections; it only prevents new connects.
         """
-        if self._multi_frontend_ipc_dir is not None:
-            shutil.rmtree(self._multi_frontend_ipc_dir, ignore_errors=True)
+        ipc_dir = getattr(self, "_multi_frontend_ipc_dir", None)
+        if ipc_dir is not None:
+            shutil.rmtree(ipc_dir, ignore_errors=True)
             self._multi_frontend_ipc_dir = None
 
     def shutdown(self):

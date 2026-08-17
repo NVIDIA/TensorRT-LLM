@@ -91,6 +91,11 @@ class _FakeNcclEP:
         self.top_k = top_k
 
 
+class _FakeDeepEP:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
 @pytest.mark.parametrize(
     ("act_dtype", "moe_max_num_tokens", "match"),
     [
@@ -119,10 +124,60 @@ def test_forced_nccl_ep_validates_preconditions(
         )
 
 
+def test_forced_nccl_ep_rejects_more_than_14_warp_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_config = _make_model_config()
+    assert (
+        communication_factory._get_nccl_ep_ll_combine_smem_requirement(
+            num_slots=15,
+            hidden_size=4096,
+            num_device_sms=1,
+        )
+        is None
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            multi_processor_count=1,
+            shared_memory_per_block_optin=102400,
+            shared_memory_per_block=102400,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="at most 14 expert warp groups"):
+        communication_factory.CommunicationFactory._create_forced_method(
+            "NCCL_EP",
+            model_config,
+            num_experts=16,
+            num_slots=15,
+            top_k=8,
+            expert_size_per_partition=8,
+            payload_in_workspace=False,
+            alltoall_result_do_sum=True,
+            use_flashinfer=False,
+            hidden_size=4096,
+        )
+
+
 def test_forced_nccl_ep_allows_missing_moe_max_num_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ):
     model_config = _make_model_config(torch.bfloat16, None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            multi_processor_count=72,
+            shared_memory_per_block_optin=232448,
+            shared_memory_per_block=102400,
+        ),
+    )
     monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
 
     strategy = communication_factory.CommunicationFactory._create_forced_method(
@@ -151,6 +206,17 @@ def test_auto_selection_uses_nccl_ep_with_missing_moe_max_num_tokens(
     monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
     monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
     monkeypatch.setenv("TRTLLM_CAN_USE_DEEP_EP", "0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            multi_processor_count=72,
+            shared_memory_per_block_optin=232448,
+            shared_memory_per_block=102400,
+        ),
+    )
     monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
 
     strategy = communication_factory.CommunicationFactory.create_strategy(
@@ -227,6 +293,94 @@ def test_auto_selection_skips_nccl_ep_for_quantized_moe(
     )
 
     assert isinstance(strategy, AllGatherReduceScatter)
+
+
+def test_nccl_ep_ll_combine_smem_requirement() -> None:
+    assert (
+        communication_factory._get_nccl_ep_ll_combine_smem_requirement(
+            num_slots=72,
+            hidden_size=2560,
+            num_device_sms=72,
+        )
+        == 200704
+    )
+
+
+@pytest.mark.parametrize(
+    "device_properties",
+    [
+        SimpleNamespace(
+            multi_processor_count=72,
+            shared_memory_per_block_optin=200704,
+            shared_memory_per_block=102400,
+        ),
+        SimpleNamespace(
+            multi_processor_count=72,
+            shared_memory_per_block=200704,
+        ),
+    ],
+    ids=["optin_shared_memory", "legacy_shared_memory"],
+)
+def test_forced_nccl_ep_accepts_supported_ll_combine_dynamic_smem(
+    monkeypatch: pytest.MonkeyPatch,
+    device_properties: SimpleNamespace,
+) -> None:
+    model_config = _make_model_config()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: device_properties)
+    monkeypatch.setattr(communication_factory, "NcclEP", _FakeNcclEP)
+
+    strategy = communication_factory.CommunicationFactory._create_forced_method(
+        "NCCL_EP",
+        model_config,
+        num_experts=72,
+        num_slots=72,
+        top_k=6,
+        expert_size_per_partition=18,
+        payload_in_workspace=False,
+        alltoall_result_do_sum=True,
+        use_flashinfer=False,
+        hidden_size=2560,
+    )
+
+    assert isinstance(strategy, _FakeNcclEP)
+
+
+def test_auto_selection_skips_nccl_ep_when_ll_combine_exceeds_dynamic_smem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_config = _make_model_config()
+    monkeypatch.setattr(communication_factory, "NVLinkOneSided", _strategy_unavailable)
+    monkeypatch.setattr(communication_factory, "NVLinkTwoSided", _strategy_unavailable)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(
+            multi_processor_count=72,
+            shared_memory_per_block_optin=102400,
+            shared_memory_per_block=102400,
+        ),
+    )
+    monkeypatch.setattr(
+        communication_factory,
+        "NcclEP",
+        lambda *args, **kwargs: pytest.fail("NcclEP should not be constructed"),
+    )
+    monkeypatch.setattr(communication_factory, "DeepEP", _FakeDeepEP)
+
+    strategy = communication_factory.CommunicationFactory.create_strategy(
+        model_config,
+        num_experts=72,
+        num_slots=72,
+        top_k=6,
+        expert_size_per_partition=18,
+        hidden_size=2560,
+    )
+
+    assert isinstance(strategy, _FakeDeepEP)
 
 
 def test_auto_selection_falls_back_when_nccl_probe_runtime_fails(

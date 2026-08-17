@@ -16,6 +16,8 @@ from tensorrt_llm.serve.chat_utils import (
     parse_chat_messages_coroutines,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def mock_mm_data_tracker():

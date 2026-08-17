@@ -26,6 +26,9 @@ from tensorrt_llm._torch.weight_sharing import (
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
+pytestmark = pytest.mark.cpu_only
+
+
 _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
     format_version=SOURCE_IDENTITY_FORMAT_VERSION,
     artifact_identity=ArtifactIdentity(
@@ -201,7 +204,7 @@ class _PostTransformMxLoader:
 
 def _spec_config_needing_draft_weights():
     return SimpleNamespace(
-        spec_dec_mode=SimpleNamespace(need_load_draft_weights=lambda: True),
+        needs_separate_draft_weights=True,
         speculative_model="/draft",
     )
 

@@ -52,6 +52,12 @@ class ExtraParamSchema(StrictBaseModel):
     range: Optional[tuple] = Field(
         default=None, description="Optional (min, max) range for numeric params."
     )
+    validator: Optional[Callable[[Any], Any]] = Field(
+        default=None,
+        description="Optional value validator; raises ValueError on invalid "
+        "values. Must be a module-level function (specs are pickled to the "
+        "coordinator in the READY handshake).",
+    )
 
 
 if TYPE_CHECKING:
@@ -339,6 +345,18 @@ class BasePipeline(nn.Module):
         parameters needed by :meth:`request_warmup_cache_key`. The default
         implementation is a no-op.
         """
+
+    def classify_request_failure(self, exc: BaseException) -> Optional[str]:
+        """Failure class for the response channel, or ``None`` if unknown.
+
+        Opt-in per pipeline: a pipeline that knows which of its failures are
+        caused by the request's own content returns ``"client"`` or
+        ``"capacity"`` for those. The default leaves every failure
+        unclassified, because the exception's built-in type alone does not say
+        whose fault it was -- a ``ValueError`` is just as likely to be an
+        internal invariant as a rejected input.
+        """
+        return None
 
     def infer(self, req: Any):
         raise NotImplementedError
@@ -1075,8 +1093,8 @@ class BasePipeline(nn.Module):
             guidance_interval: Optional ``(lo, hi)`` scheduler-timestep range in which CFG
                               is active. Outside the interval the effective scale is 1.0
                               (conditional prediction only); both branches still run.
-            post_step_fn: Optional callable applied to latents after each scheduler step.
-                         Signature: post_step_fn(latents) -> latents
+            post_step_fn: Optional callable applied after each scheduler step,
+                         invoked as ``post_step_fn(latents) -> latents``.
                          Use for constraints that must hold throughout denoising.
             scheduler_step_kwargs: Extra keyword arguments forwarded to every
                          scheduler's ``step()`` call.
@@ -1209,7 +1227,7 @@ class BasePipeline(nn.Module):
                 stats = self.cache_accelerator.get_stats()
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":
-                        logger.info("Cache-DiT stats: %s", stats)
+                        logger.info(f"Cache-DiT stats: {stats}")
                     elif self.pipeline_config.cache_backend == "teacache":
                         first_val = next(iter(stats.values()), None)
                         if isinstance(first_val, dict):

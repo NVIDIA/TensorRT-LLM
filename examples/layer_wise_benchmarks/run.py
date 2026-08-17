@@ -53,9 +53,7 @@ parser.add_argument(
 parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
 parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
-parser.add_argument(
-    "--moe-backend-for-prefill", type=str, choices=["CUTLASS", "DEEPGEMM", "WIDEEP"]
-)
+parser.add_argument("--moe-backend-for-prefill", type=str, choices=["CUTLASS", "DEEPGEMM"])
 parser.add_argument("--moe-max-num-tokens", type=int)
 group = parser.add_mutually_exclusive_group()
 group.add_argument(

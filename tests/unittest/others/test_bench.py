@@ -79,6 +79,9 @@ def test_int8_not_offered_as_bench_quant_choice() -> None:
     assert f"{QuantAlgo.INT8}" not in get_args(VALID_QUANT_ALGOS)
 
 
+pytestmark = pytest.mark.cpu_only
+
+
 @pytest.mark.parametrize(
     "values, weights, expected_average",
     [

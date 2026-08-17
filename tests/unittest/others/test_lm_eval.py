@@ -61,6 +61,9 @@ from tensorrt_llm.inputs.content_format import ContentFormat
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.sampling_params import SamplingParams
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ===========================================================================
 # AIME utils — last_boxed_only_string / remove_boxed / is_equiv / strip_string
 # ===========================================================================
@@ -983,20 +986,22 @@ def test_generate_until_invokes_partial_scorer():
 
 
 # ===========================================================================
-# TLLM_EVAL_SPEC_STATS — speculative-decoding AL stats
+# TLLM_EVAL_SPEC_STATS — speculative-decoding AL/AR stats
 # ===========================================================================
 #
-# Only AL (acceptance length) is reported for now; AR needs the
-# request_perf_metrics.speculative_decoding counters, which the TorchSampler
-# used by one-engine spec-dec does not populate (see _log_spec_stats).
-# AL is iteration-weighted (total decoded tokens / total decode iterations)
-# to agree with the repo's canonical definition in
-# ``bench/dataclasses/reporting.py``.
+# AL (acceptance length) is iteration-weighted (total decoded tokens / total
+# decode iterations) to agree with the repo's canonical definition in
+# ``bench/dataclasses/reporting.py``. AR (acceptance rate) is the corpus
+# ratio of accepted to drafted tokens summed over per-request
+# ``request_perf_metrics.speculative_decoding`` counters, which
+# ``_get_sampling_params`` requests via ``return_perf_metrics=True`` when
+# the stats are enabled.
 
 
 def _make_spec_output(
     tokens_per_iter: float | None = None,
     decoding_iter: int | None = 1,
+    accepted_drafted: tuple[int, int] | None = None,
 ) -> MagicMock:
     """Fake RequestOutput with an optional per-request AL sample.
 
@@ -1004,11 +1009,23 @@ def _make_spec_output(
     metrics (non-spec-dec run, or a response that never reported them).
     ``decoding_iter`` is the AL aggregation weight (decode iterations the
     request ran); None models a result that never populated it.
+    ``accepted_drafted`` populates the request_perf_metrics
+    speculative_decoding counters the AR line reads; None models a request
+    without perf metrics (return_perf_metrics off, or dropped).
     """
     output = MagicMock()
     output.avg_decoded_tokens_per_iter = tokens_per_iter
     output.decoding_iter = decoding_iter
-    output.outputs = [MagicMock()]
+    completion = MagicMock()
+    if accepted_drafted is not None:
+        accepted, drafted = accepted_drafted
+        spec_dec = MagicMock()
+        spec_dec.total_accepted_draft_tokens = accepted
+        spec_dec.total_draft_tokens = drafted
+        completion.request_perf_metrics.speculative_decoding = spec_dec
+    else:
+        completion.request_perf_metrics = None
+    output.outputs = [completion]
     return output
 
 
@@ -1115,6 +1132,67 @@ def test_log_spec_stats_silent_on_non_spec_run():
     with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
         wrapper._log_spec_stats(outputs)
     mock_logger.info.assert_not_called()
+
+
+def test_log_spec_stats_reports_corpus_ar():
+    """AR sums accepted/drafted over requests with populated counters."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [
+        _make_spec_output(tokens_per_iter=2.0, accepted_drafted=(30, 40)),
+        _make_spec_output(tokens_per_iter=2.0, accepted_drafted=(3, 4)),
+        _make_spec_output(tokens_per_iter=2.0),  # no perf metrics
+    ]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    assert mock_logger.info.call_count == 2  # AL line + AR line
+    ar_message = mock_logger.info.call_args_list[1][0][0]
+    assert "AR" in ar_message
+    assert "33/44" in ar_message
+    assert "75.0%" in ar_message
+
+
+def test_log_spec_stats_skips_ar_without_drafted_tokens():
+    """Zeroed counters (no drafting) produce no AR line, only AL."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [
+        _make_spec_output(tokens_per_iter=2.0, accepted_drafted=(0, 0)),
+    ]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    assert mock_logger.info.call_count == 1
+    assert "AL" in mock_logger.info.call_args[0][0]
+
+
+def test_log_spec_stats_ar_without_al_samples():
+    """AR still reports when no request exposed avg_decoded_tokens_per_iter."""
+    wrapper = _make_lm_eval_wrapper()
+    outputs = [_make_spec_output(accepted_drafted=(1, 2))]
+    with patch("tensorrt_llm.evaluate.lm_eval.logger") as mock_logger:
+        wrapper._log_spec_stats(outputs)
+    assert mock_logger.info.call_count == 1
+    ar_message = mock_logger.info.call_args[0][0]
+    assert "AR" in ar_message
+    assert "1/2" in ar_message
+
+
+def test_spec_stats_enables_return_perf_metrics(monkeypatch):
+    """TLLM_EVAL_SPEC_STATS=1 opts sampling params into perf metrics (AR)."""
+    from tensorrt_llm.evaluate.lm_eval import SPEC_STATS_ENV_VAR
+
+    monkeypatch.setenv(SPEC_STATS_ENV_VAR, "1")
+    wrapper = _make_lm_eval_wrapper()
+    out = wrapper._get_sampling_params({"max_gen_toks": 32})
+    assert out.return_perf_metrics is True
+
+
+def test_no_spec_stats_leaves_return_perf_metrics_off(monkeypatch):
+    """Without the env var, perf metrics stay off (zero overhead default)."""
+    from tensorrt_llm.evaluate.lm_eval import SPEC_STATS_ENV_VAR
+
+    monkeypatch.delenv(SPEC_STATS_ENV_VAR, raising=False)
+    wrapper = _make_lm_eval_wrapper()
+    out = wrapper._get_sampling_params({"max_gen_toks": 32})
+    assert out.return_perf_metrics is False
 
 
 def test_generate_until_logs_spec_stats_when_enabled(monkeypatch):
@@ -1542,3 +1620,155 @@ def test_e2e_windowed_matches_final_score(monkeypatch):
     )
     score = results["results"]["toy_arith"]["exact_match,strict-match"]
     assert score == pytest.approx(0.75)
+
+
+# ===========================================================================
+# post_processing — Kimi K3 channel-structured MMMU answer extraction
+# ===========================================================================
+#
+# Kimi K3 emits a channel-structured chat format whose reasoning ends with
+# ``<|close|>think<|sep|>`` (NOT ``</think>``) and whose final answer lives in a
+# ``<|open|>response<|sep|> X <|close|>response<|sep|>`` channel. The K2.5
+# strip_thinking() path keys on ``</think>`` and therefore cannot see the
+# answer, silently dropping ~6-7 MMMU points even when the model is correct
+# (observed on the real checkpoint: full mmmu_val 67.67 -> 74.11 by parsing the
+# channel alone). These tests pin the new extractor and guard that the K2.5
+# path is unchanged.
+
+from tensorrt_llm.evaluate.post_processing import (  # noqa: E402
+    extract_kimi_k3_mmmu_answer,
+    strip_thinking,
+    strip_thinking_and_extract_mmmu_answer,
+)
+
+
+def _k3_output(thinking: str, answer: str) -> str:
+    """Build a well-formed Kimi K3 channel-structured output string."""
+    return (
+        f"{thinking}<|close|>think<|sep|>"
+        f"<|open|>response<|sep|>{answer}<|close|>response<|sep|>"
+        f"<|close|>message<|sep|>"
+    )
+
+
+def test_k3_channel_bare_letter():
+    """Answer is a bare option letter inside the response channel."""
+    out = _k3_output("Reasoning about the options... I'll go with C.", "C")
+    assert extract_kimi_k3_mmmu_answer(out) == "C"
+
+
+def test_k3_channel_real_samples_recovered():
+    """Real committed mmmu_val samples the old parser scored wrong.
+
+    The channel holds the correct letter: accounting doc_id 7->C, 12->D, 21->A.
+    """
+    assert (
+        extract_kimi_k3_mmmu_answer(
+            _k3_output("...Total debits adjusted = 126,925. Final: C.", "C")
+        )
+        == "C"
+    )
+    assert (
+        extract_kimi_k3_mmmu_answer(_k3_output("...Ending = 0. Option D. Final just D.", "D"))
+        == "D"
+    )
+    assert (
+        extract_kimi_k3_mmmu_answer(
+            _k3_output("...commonly known by that name, so True. (A).", "A")
+        )
+        == "A"
+    )
+
+
+def test_k3_channel_parenthesized_answer():
+    """Channel content ``(C) Photos 2 & 3`` reduces to the option letter."""
+    out = _k3_output("Both use negative space.", "(C) Photos 2 & 3")
+    assert extract_kimi_k3_mmmu_answer(out) == "C"
+
+
+def test_k3_channel_answer_is_phrase():
+    """Channel content ``The answer is (D).`` reduces to the option letter."""
+    out = _k3_output("Long derivation here.", "The answer is (D).")
+    assert extract_kimi_k3_mmmu_answer(out) == "D"
+
+
+def test_k3_truncated_after_channel_open():
+    """Truncation right after the channel opened still yields the letter.
+
+    The regex boundary falls back to end-of-text for the unterminated span.
+    """
+    out = (
+        "Some reasoning.<|close|>think<|sep|>"
+        "<|open|>response<|sep|>B"
+    )  # cut off before <|close|>response
+    assert extract_kimi_k3_mmmu_answer(out) == "B"
+
+
+def test_k3_last_channel_wins():
+    """When multiple response channels are present, the final one is the answer."""
+    out = (
+        "r1<|close|>think<|sep|><|open|>response<|sep|>A<|close|>response<|sep|>"
+        "<|open|>response<|sep|>E<|close|>response<|sep|><|close|>message<|sep|>"
+    )
+    assert extract_kimi_k3_mmmu_answer(out) == "E"
+
+
+def test_k3_no_channel_bare_letter_falls_back():
+    """Short direct answers with no channel go through the K2.5 fallback."""
+    assert extract_kimi_k3_mmmu_answer("C") == "C"
+    assert extract_kimi_k3_mmmu_answer("Answer: (B)") == "B"
+
+
+def test_k3_no_channel_truncated_thinking_does_not_crash():
+    """Thinking truncated before the channel opened (finish=length).
+
+    No channel to parse -> fall back; must not raise and must not fabricate.
+    """
+    truncated = (
+        "Let me reason step by step about this very long problem "
+        "that never reaches a final answer channel " * 20
+    )
+    # Should not raise; returns whatever the fallback cascade yields (the model
+    # genuinely did not emit an answer, so the exact value is not asserted).
+    out = extract_kimi_k3_mmmu_answer(truncated)
+    assert isinstance(out, str)
+
+
+def test_k3_empty_input():
+    assert extract_kimi_k3_mmmu_answer("") == ""
+
+
+def test_k3_scrubs_residual_special_tokens():
+    """Residual ``<|...|>`` tokens inside a channel span are scrubbed.
+
+    They must not be returned as part of the answer.
+    """
+    out = (
+        "t<|close|>think<|sep|><|open|>response<|sep|>"
+        "<|reserved|>D<|close|>response<|sep|><|close|>message<|sep|>"
+    )
+    assert extract_kimi_k3_mmmu_answer(out) == "D"
+
+
+def test_k2_5_strip_thinking_path_unchanged():
+    """Guard: the new K3 extractor must not alter the K2.5 </think> behavior."""
+    k25 = "<think>chain of thought here</think>Answer: (C)"
+    # K2.5 path still extracts C directly.
+    assert strip_thinking_and_extract_mmmu_answer(k25) == "C"
+    # strip_thinking still returns content after the last </think>.
+    assert strip_thinking(k25) == "Answer: (C)"
+    # And the K3 extractor, given a </think> blob with no K3 response channel,
+    # defers to the K2.5 cascade and returns the same answer.
+    assert extract_kimi_k3_mmmu_answer(k25) == "C"
+
+
+def test_k3_channel_extracting_to_nothing_falls_back_to_cascade():
+    """A channel whose content extracts to nothing must not mask the fallback.
+
+    "** **" survives the special-token scrub as non-empty text, but the
+    cascade's markdown-bold stripping reduces it to "" — the extractor must
+    keep scanning and recover the letter from the reasoning text instead of
+    returning the empty string.
+    """
+    out = _k3_output("Elimination shows the answer is (B).", "** **")
+    assert extract_kimi_k3_mmmu_answer(out) == "B"

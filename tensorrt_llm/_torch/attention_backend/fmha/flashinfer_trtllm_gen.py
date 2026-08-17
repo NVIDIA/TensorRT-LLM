@@ -67,15 +67,155 @@ if TYPE_CHECKING:
     )
 
 
+def _install_flashinfer_mla_decode_tuning_config_cache() -> None:
+    """Work around an autotuner cache pathology on flashinfer 0.6.15's MLA decode path.
+
+    ``flashinfer.mla._core._build_mla_decode_tuning_config`` builds a fresh
+    ``TuningConfig`` — with fresh initializer closures — on every
+    ``trtllm_batch_decode_with_kv_cache_mla`` call. ``DynamicTensorSpec``'s
+    custom ``__hash__`` skips ``tensor_initializers``, but its
+    dataclass-generated ``__eq__`` compares them by value, so each call's
+    config is hash-equal but eq-unequal to all previous ones: the
+    ``lru_cache`` on ``AutoTuner._find_nearest_profile`` accumulates
+    colliding keys up to the cache cap, and every autotuner cache probe on
+    the MLA decode path then walks the entire collision chain in Python
+    ``__eq__`` (tens of milliseconds per attention call, per layer).
+
+    The workaround memoizes the config builder on the scalars that fully
+    determine its output (kv-cache paging geometry, workspace size, runner
+    set, head/rank dims, max_seq_len, device), so repeated calls reuse the
+    same ``TuningConfig`` object. Cache hits then resolve through
+    flashinfer's own unmodified hash/eq — no equality semantics change
+    anywhere, and the scope is exactly the MLA decode path that exhibits the
+    problem.
+
+    MLA decode is the only path that needs this: every other ``TuningConfig``
+    construction site in flashinfer 0.6.15 already reuses its config across
+    calls (module-level constants in ``gemm``, instance-level configs in the
+    cute-dsl MoE tuner, ``functools.cache``-wrapped builders in
+    ``mla/_sparse_mla_sm120.py``), so those specs hit the autotuner caches by
+    object identity and never accumulate collision chains. Memoizing the one
+    per-call builder therefore covers the whole pathology; extending it to
+    other ops would add nothing.
+
+    The bug is upstream in flashinfer; the patch is applied only when a
+    behavioral probe shows the hash/eq inconsistency and the builder still
+    has the expected signature, so a fixed or refactored flashinfer release
+    degrades this to a no-op.
+    """
+    try:
+        import inspect
+
+        from flashinfer.autotuner.autotuner import DynamicTensorSpec
+        from flashinfer.mla import _core as _flashinfer_mla_core
+
+        def _probe_spec() -> DynamicTensorSpec:
+            return DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(1,),
+                map_to_tuning_buckets=_probe_spec,  # any stable callable
+                tensor_initializers=[lambda shapes, dtype, device: None],
+            )
+
+        a, b = _probe_spec(), _probe_spec()
+        if not (hash(a) == hash(b) and a != b):
+            return  # flashinfer without the inconsistency; nothing to do
+
+        orig_build = _flashinfer_mla_core._build_mla_decode_tuning_config
+        if getattr(orig_build, "_trtllm_mla_tuning_config_cache", False):
+            return  # already installed
+
+        expected_params = (
+            "kv_cache",
+            "block_tables",
+            "workspace_buffer",
+            "runner_names",
+            "q_len",
+            "num_heads",
+            "kv_lora_rank",
+            "max_seq_len",
+            "device",
+        )
+        signature = inspect.signature(orig_build)
+        if tuple(signature.parameters) != expected_params:
+            return  # builder was refactored; memo key may no longer be complete
+        try:
+            signature.bind(**dict.fromkeys(expected_params))
+        except TypeError:
+            return  # parameters went positional-only; the keyword call below would fail
+
+        cache: dict = {}
+
+        def _cached_build(
+            kv_cache,
+            block_tables,
+            workspace_buffer,
+            runner_names,
+            q_len,
+            num_heads,
+            kv_lora_rank,
+            max_seq_len,
+            device,
+        ):
+            # Everything the builder (and _compute_mla_decode_buckets) reads
+            # from its tensor arguments reduces to these scalars.
+            key = (
+                kv_cache.shape[0],  # num_pages, captured by init_block_tables
+                kv_cache.shape[-2],  # page_size, feeds profile_seq_len
+                block_tables.shape[-1],  # pages per sequence, feeds profile_seq_len
+                workspace_buffer.numel() * workspace_buffer.element_size(),  # cute-dsl bucket cap
+                tuple(runner_names),
+                q_len,
+                num_heads,
+                kv_lora_rank,
+                max_seq_len,
+                device,
+            )
+            config = cache.get(key)
+            if config is None:
+                if len(cache) >= 256:  # backstop; a serving process sees a handful of keys
+                    cache.clear()
+                config = orig_build(
+                    kv_cache=kv_cache,
+                    block_tables=block_tables,
+                    workspace_buffer=workspace_buffer,
+                    runner_names=runner_names,
+                    q_len=q_len,
+                    num_heads=num_heads,
+                    kv_lora_rank=kv_lora_rank,
+                    max_seq_len=max_seq_len,
+                    device=device,
+                )
+                cache[key] = config
+            return config
+
+        _cached_build._trtllm_mla_tuning_config_cache = True
+        _flashinfer_mla_core._build_mla_decode_tuning_config = _cached_build
+        logger.debug(
+            "Memoized flashinfer _build_mla_decode_tuning_config "
+            "(autotuner cache collision-chain workaround)."
+        )
+    except (ImportError, AttributeError, TypeError, ValueError):
+        # A future flashinfer refactor (moved module, changed fields) must not
+        # break attention; it just loses the workaround.
+        # tensorrt_llm's logger.debug(*msg) takes no exc_info/kwargs.
+        logger.debug("Skipping flashinfer MLA decode tuning-config cache workaround.")
+
+
+if IS_FLASHINFER_AVAILABLE:
+    _install_flashinfer_mla_decode_tuning_config_cache()
+
+
 _MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
 
 
 def _get_multi_ctas_kv_counter_size(
     num_heads: int,
-    max_num_requests: int,
+    max_num_sequences: int,
     multi_processor_count: int,
 ) -> int:
-    num_counters = max(num_heads * max_num_requests, multi_processor_count)
+    num_counters = max(num_heads * max_num_sequences, multi_processor_count)
     aligned_num_counters = (
         (num_counters + _MULTI_CTAS_KV_COUNTER_ALIGNMENT - 1)
         // _MULTI_CTAS_KV_COUNTER_ALIGNMENT
@@ -88,142 +228,6 @@ def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     if bmm1_scale.numel() < 2:
         raise RuntimeError("trtllm-gen bmm1_scale workspace must contain raw and log2 scales.")
     return bmm1_scale.narrow(0, 1, 1)
-
-
-def _trtllm_gen_batch_decode_with_kv_cache(
-    query: torch.Tensor,
-    kv_pool: torch.Tensor,
-    workspace_buffer: torch.Tensor,
-    multi_ctas_kv_counter_buffer: torch.Tensor,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    max_seq_len: int,
-    bmm1_scale: float | torch.Tensor,
-    bmm2_scale: float | torch.Tensor,
-    window_left: int,
-    out: torch.Tensor,
-    sinks: Optional[torch.Tensor],
-    enable_pdl: bool,
-    q_len_per_req: Optional[int],
-    max_q_len: Optional[int],
-    cum_seq_lens_q: Optional[torch.Tensor],
-    kv_scale_pool: Optional[torch.Tensor],
-    uses_shared_paged_kv_idx: bool,
-) -> None:
-    if q_len_per_req is not None:
-        decode_max_q_len = q_len_per_req
-        batch_size = query.size(0) // q_len_per_req
-    else:
-        if max_q_len is None or cum_seq_lens_q is None:
-            raise RuntimeError(
-                "trtllm-gen multi-token generation requires max_q_len and cum_seq_lens_q."
-            )
-        decode_max_q_len = max_q_len
-        batch_size = cum_seq_lens_q.size(0) - 1
-
-    bmm1_scale_arg = (
-        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-    )
-
-    run_func = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
-    sm_count = flashinfer.decode.get_device_sm_count(query.device)
-    run_func(
-        out,
-        None,  # out_scale_factor
-        query,
-        kv_pool,
-        kv_pool,
-        workspace_buffer,
-        multi_ctas_kv_counter_buffer,
-        block_tables,
-        seq_lens,
-        decode_max_q_len,
-        max_seq_len,
-        bmm1_scale_arg,
-        bmm2_scale,
-        -1.0,  # o_sf_scale
-        -1,  # o_sf_vec_size
-        0,  # o_sf_start_index
-        batch_size,
-        window_left,
-        0,  # sparse_mla_top_k
-        sm_count,
-        enable_pdl,
-        workspace_buffer.numel() * workspace_buffer.element_size(),
-        sinks,
-        cum_seq_lens_q,
-        kv_scale_pool,  # k_block_scales
-        kv_scale_pool,  # v_block_scales
-        None,  # skip_softmax_threshold_scale_factor
-        uses_shared_paged_kv_idx,
-        None,  # lse
-        0,  # lse_stride_tokens
-        0,  # lse_stride_heads
-    )
-
-
-def _trtllm_gen_batch_context_with_kv_cache(
-    query: torch.Tensor,
-    kv_pool: torch.Tensor,
-    workspace_buffer: torch.Tensor,
-    multi_ctas_kv_counter_buffer: torch.Tensor,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    max_q_len: int,
-    max_kv_len: int,
-    bmm1_scale: float | torch.Tensor,
-    bmm2_scale: float | torch.Tensor,
-    batch_size: int,
-    cum_seq_lens_q: torch.Tensor,
-    cum_seq_lens_kv: torch.Tensor,
-    window_left: int,
-    out: torch.Tensor,
-    sinks: Optional[torch.Tensor],
-    enable_pdl: bool,
-    kv_scale_pool: Optional[torch.Tensor],
-    uses_shared_paged_kv_idx: bool,
-    causal: bool,
-) -> None:
-    bmm1_scale_arg = (
-        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale
-    )
-
-    run_func = flashinfer.prefill.get_trtllm_gen_fmha_module().trtllm_paged_attention_context
-    sm_count = flashinfer.prefill.get_device_sm_count(query.device)
-    run_func(
-        out,
-        None,  # out_scale_factor
-        query,
-        kv_pool,
-        kv_pool,
-        workspace_buffer,
-        multi_ctas_kv_counter_buffer,
-        block_tables,
-        seq_lens,
-        max_q_len,
-        max_kv_len,
-        bmm1_scale_arg,
-        bmm2_scale,
-        -1.0,  # o_sf_scale
-        -1,  # o_sf_vec_size
-        0,  # o_sf_start_index
-        batch_size,
-        window_left,
-        cum_seq_lens_q,
-        cum_seq_lens_kv,
-        sm_count,
-        enable_pdl,
-        workspace_buffer.numel() * workspace_buffer.element_size(),
-        sinks,
-        kv_scale_pool,  # key_block_scales
-        kv_scale_pool,  # value_block_scales
-        None,  # skip_softmax_threshold_scale_factor
-        uses_shared_paged_kv_idx,
-        causal,  # causal
-        None,  # lse
-        0,  # lse_stride_tokens
-        0,  # lse_stride_heads
-    )
 
 
 @lru_cache(maxsize=128)
@@ -407,9 +411,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
-    SLOWER_MLA_GENERATION_KERNELS = {
-        (576, 512, 32),
-    }
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
@@ -529,7 +530,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
-        tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
     ) -> Tuple[bool, str]:
@@ -565,14 +565,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 False,
                 f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
-            )
-
-        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
-            return (
-                False,
-                f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
-                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
-                f"tokens_per_block={tokens_per_block}.",
             )
 
         return True, ""
@@ -620,8 +612,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "sage attention."
         if meta.helix_position_offsets is not None:
             return False, "helix parallelism."
-        sparse_kv_indices = fwd.sparse_prediction.sparse_kv_indices
-        sparse_attn_indices = fwd.sparse_prediction.sparse_attn_indices
+        sparse_kv_indices = fwd.sparse_runtime_params.sparse_kv_indices
+        sparse_attn_indices = fwd.sparse_runtime_params.sparse_attn_indices
         if (
             (sparse_kv_indices is not None and sparse_kv_indices.numel() > 0)
             or (sparse_attn_indices is not None and sparse_attn_indices.numel() > 0)
@@ -741,7 +733,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
-                    tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
                 )
@@ -802,9 +793,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if self._multi_processor_count is None:
             self._multi_processor_count = self._get_multi_processor_count(q.device)
 
+        # One counter per head per decoder sequence; beam search expands each
+        # request into ``beam_width`` sequences.
         required_counter_size = _get_multi_ctas_kv_counter_size(
             attn.num_heads,
-            metadata.max_num_requests,
+            metadata.max_num_sequences or metadata.max_num_requests,
             self._multi_processor_count,
         )
         counter_buffer = self._multi_ctas_kv_counter_buffer
@@ -976,36 +969,37 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 .view(torch.float8_e4m3fn)
                 .view(params.num_tokens, attn.num_heads, attn.head_dim)
             )
-        ctx_bmm1_scale = (
-            bmm1_scale if params.fp8_context_fmha and bmm1_scale is not None else bmm1_scale_static
-        )
+        ctx_bmm1_scale = bmm1_scale_static
+        if params.fp8_context_fmha and bmm1_scale is not None:
+            ctx_bmm1_scale = bmm1_scale.narrow(0, 0, 1)
         ctx_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
         causal = (
             False
             if params.is_cross
             else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
         )
-        _trtllm_gen_batch_context_with_kv_cache(
-            q_processed,  # query
-            kv_pool,  # kv_pool
-            fmha_workspace,  # workspace_buffer
-            self._get_multi_ctas_kv_counter_buffer(),  # multi_ctas_kv_counter_buffer
-            block_tables,  # block_tables
-            params.sequence_lengths,  # seq_lens
-            max_q_len,  # max_q_len
-            max_kv_len,  # max_kv_len
-            ctx_bmm1_scale,  # bmm1_scale
-            ctx_bmm2_scale,  # bmm2_scale
-            params.batch_size,  # batch_size
-            cu_q_seqlens,  # cum_seq_lens_q
-            cu_kv_seqlens,  # cum_seq_lens_kv
-            window_left,  # window_left
-            params.context_buf,  # out
-            fwd.attention_sinks,  # sinks
-            self._enable_pdl,  # enable_pdl
-            kv_scale_pool,  # kv_scale_pool
-            self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
-            causal,  # causal
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            query=q_processed,
+            kv_cache=(kv_pool, kv_pool),
+            workspace_buffer=fmha_workspace,
+            block_tables=block_tables,
+            seq_lens=params.sequence_lengths,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=ctx_bmm1_scale,
+            bmm2_scale=ctx_bmm2_scale,
+            batch_size=params.batch_size,
+            cum_seq_lens_q=cu_q_seqlens,
+            cum_seq_lens_kv=cu_kv_seqlens,
+            window_left=window_left,
+            out=params.context_buf,
+            kv_layout=self._layout,
+            enable_pdl=self._enable_pdl,
+            sinks=fwd.attention_sinks,
+            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            causal=causal,
+            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
 
         if params.is_cross:
@@ -1140,25 +1134,32 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         gen_bmm2_scale = bmm2_scale if params.fp8_context_fmha and bmm2_scale is not None else 1.0
 
-        _trtllm_gen_batch_decode_with_kv_cache(
-            q_processed,  # query
-            kv_pool,  # kv_pool
-            fmha_workspace,  # workspace_buffer
-            self._get_multi_ctas_kv_counter_buffer(),  # multi_ctas_kv_counter_buffer
-            block_tables,  # block_tables
-            params.sequence_lengths,  # seq_lens
-            max_kv_len,  # max_seq_len
-            gen_bmm1_scale,  # bmm1_scale
-            gen_bmm2_scale,  # bmm2_scale
-            window_left,  # window_left
-            params.context_buf,  # out
-            fwd.attention_sinks,  # sinks
-            self._enable_pdl,  # enable_pdl
-            q_len_per_req,  # q_len_per_req
-            decode_max_q_len,  # max_q_len
-            decode_cu_seqlens,  # cum_seq_lens_q
-            kv_scale_pool,  # kv_scale_pool
-            self.USE_SHARED_PAGED_KV_IDX,  # uses_shared_paged_kv_idx
+        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+            query=q_processed,
+            kv_cache=(kv_pool, kv_pool),
+            workspace_buffer=fmha_workspace,
+            block_tables=block_tables,
+            seq_lens=params.sequence_lengths,
+            max_seq_len=max_kv_len,
+            bmm1_scale=gen_bmm1_scale,
+            bmm2_scale=gen_bmm2_scale,
+            window_left=window_left,
+            out=params.context_buf,
+            sinks=fwd.attention_sinks,
+            kv_layout=self._layout,
+            enable_pdl=self._enable_pdl,
+            backend="trtllm-gen",
+            q_len_per_req=q_len_per_req,
+            max_q_len=decode_max_q_len,
+            cum_seq_lens_q=decode_cu_seqlens,
+            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+            bmm1_scale_log2=(
+                _get_bmm1_scale_log2(gen_bmm1_scale)
+                if isinstance(gen_bmm1_scale, torch.Tensor)
+                else None
+            ),
+            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
 
     def run_mla_generation(
@@ -1194,14 +1195,6 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             batch_beam,  # batch_size
             params.attention_input.dtype,  # dtype
         )
-
-        pages_per_superblock = 128 // params.tokens_per_block
-        if pages_per_superblock > 1:
-            num_blocks = block_tables.size(-1)
-            remainder = num_blocks % pages_per_superblock
-            if remainder != 0:
-                pad = pages_per_superblock - remainder
-                block_tables = torch.nn.functional.pad(block_tables, (0, pad), value=0)
 
         kv_lora_rank = attn.kv_lora_rank or 0
         qk_nope_head_dim = attn.qk_nope_head_dim or 0
