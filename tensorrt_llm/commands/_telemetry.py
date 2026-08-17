@@ -83,7 +83,7 @@ def apply_raw_config_telemetry_opt_out(
             return
         telemetry_config = config.get("telemetry_config")
         if isinstance(telemetry_config, Mapping) and telemetry_config.get("disabled") is True:
-            usage.start_usage_session(
+            usage.apply_usage_session_config(
                 {"disabled": True},
                 default_usage_context=usage_context.value,
                 component=component,
@@ -128,7 +128,7 @@ def apply_disaggregated_telemetry_config(
         # This public opt-out is checked by every telemetry API and inherited
         # by fleet, MPI proxy, and model-worker descendants.
         os.environ[_TELEMETRY_OPT_OUT_ENV] = "1"
-        usage.start_usage_session(
+        usage.apply_usage_session_config(
             {"disabled": True},
             default_usage_context=UsageContext.DISAGGREGATED.value,
             component="server",
@@ -273,7 +273,7 @@ class TelemetryGroup(click.Group):
                 disabled=_telemetry_disabled_from_args(args),
                 usage_context=self._telemetry_usage_context,
             )
-            usage.start_usage_session(
+            usage.apply_usage_session_config(
                 self._telemetry_config,
                 component=self._telemetry_component,
                 lifecycle_phase="cli_parsing",

@@ -1126,18 +1126,17 @@ def _report_process_exit() -> None:
         pass
 
 
-def start_usage_session(
+def apply_usage_session_config(
     telemetry_config: Any = None,
     *,
     default_usage_context: str = "",
     component: Optional[schema.TerminationComponent] = None,
     lifecycle_phase: Optional[schema.LifecyclePhase] = None,
 ) -> bool:
-    """Create the process-local telemetry session without sending data.
+    """Apply configuration to the process-local session without sending data.
 
-    Returns whether telemetry is active for the process. Repeated calls reuse
-    the existing session and may promote an unknown ingress point to a known
-    one.
+    Returns whether telemetry is active for the process. An enabled config
+    creates or updates the session; an authoritative opt-out deactivates it.
     """
     global _PROCESS_EXIT_HOOK_REGISTERED
     global _SESSION
@@ -1202,7 +1201,7 @@ def record_llm_initialization_attempt(
     default_usage_context: str = "llm_class",
 ) -> bool:
     """Start local tracking and record entry into an LLM constructor."""
-    if not start_usage_session(
+    if not apply_usage_session_config(
         telemetry_config,
         default_usage_context=default_usage_context,
         component="llm",
@@ -1409,7 +1408,7 @@ def report_usage(
     global _REPORTER_STARTED
     try:
         _, usage_context = _telemetry_settings(telemetry_config)
-        if not start_usage_session(telemetry_config):
+        if not apply_usage_session_config(telemetry_config):
             return
         # See report_exit(): the authoritative communicator may not exist at
         # early session creation time, so rank gating belongs at emission.

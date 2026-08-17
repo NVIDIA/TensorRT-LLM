@@ -711,7 +711,7 @@ class TestProcessTelemetrySession:
         monkeypatch.setattr(usage_lib, "_PENDING_TERMINAL", None)
         usage_lib._NOTIFICATION_SHOWN.set()
 
-    def test_start_session_is_local_only(self, monkeypatch, enable_telemetry):
+    def test_apply_session_config_is_local_only(self, monkeypatch, enable_telemetry):
         """Session creation generates identity without threads or network I/O."""
         self._reset_session(monkeypatch)
         telemetry_config = SimpleNamespace(disabled=False, usage_context="cli_serve")
@@ -720,7 +720,7 @@ class TestProcessTelemetrySession:
             patch.object(usage_lib.threading, "Thread") as thread_cls,
             patch.object(usage_lib, "_send_to_gxt") as send,
         ):
-            assert usage_lib.start_usage_session(telemetry_config)
+            assert usage_lib.apply_usage_session_config(telemetry_config)
 
         assert usage_lib._SESSION is not None
         assert len(usage_lib._SESSION.session_id) == 32
@@ -728,7 +728,9 @@ class TestProcessTelemetrySession:
         thread_cls.assert_not_called()
         send.assert_not_called()
 
-    def test_start_session_does_not_publish_partial_session(self, monkeypatch, enable_telemetry):
+    def test_apply_session_config_does_not_publish_partial_session(
+        self, monkeypatch, enable_telemetry
+    ):
         """A failed exit-hook registration cannot expose a partial session."""
         monkeypatch.setattr(usage_lib, "_PROCESS_EXIT_HOOK_REGISTERED", False)
 
@@ -737,14 +739,14 @@ class TestProcessTelemetrySession:
             "register",
             side_effect=RuntimeError("registration failed"),
         ):
-            assert not usage_lib.start_usage_session()
+            assert not usage_lib.apply_usage_session_config()
 
         assert usage_lib._SESSION is None
         assert not usage_lib._PROCESS_EXIT_HOOK_REGISTERED
 
     def test_initial_report_slot_can_be_claimed_once(self, enable_telemetry):
         """Concurrent reporter starts cannot create two initial events."""
-        assert usage_lib.start_usage_session()
+        assert usage_lib.apply_usage_session_config()
 
         assert usage_lib._SESSION.claim_initial()
         assert not usage_lib._SESSION.claim_initial()
@@ -779,7 +781,7 @@ class TestProcessTelemetrySession:
 
     def test_monotonic_counters_saturate_at_uint32(self, enable_telemetry):
         """Cumulative counters never exceed the SMS PositiveInt bound."""
-        assert usage_lib.start_usage_session()
+        assert usage_lib.apply_usage_session_config()
         usage_lib._SESSION.llm_initialization_attempts = usage_lib.schema._UINT32_MAX
 
         assert usage_lib._SESSION.record_llm_initialization_attempt()
@@ -788,11 +790,11 @@ class TestProcessTelemetrySession:
 
     def test_session_resets_when_process_id_changes(self, enable_telemetry):
         """A forked child cannot reuse its parent's session identity or locks."""
-        assert usage_lib.start_usage_session()
+        assert usage_lib.apply_usage_session_config()
         parent_session_id = usage_lib._SESSION.session_id
         usage_lib._PROCESS_PID -= 1
 
-        assert usage_lib.start_usage_session()
+        assert usage_lib.apply_usage_session_config()
         assert usage_lib._SESSION.session_id != parent_session_id
         assert usage_lib._SESSION.owner_pid == os.getpid()
 
@@ -800,20 +802,20 @@ class TestProcessTelemetrySession:
         """An unvalidated opt-out value cannot accidentally enable telemetry."""
         self._reset_session(monkeypatch)
 
-        assert not usage_lib.start_usage_session({"disabled": "false"})
+        assert not usage_lib.apply_usage_session_config({"disabled": "false"})
         assert usage_lib._SESSION is None
 
     def test_unvalidated_enabled_dict_fails_closed(self, enable_telemetry):
         """Raw config dictionaries cannot opt in to early failure reporting."""
-        assert not usage_lib.start_usage_session({"disabled": False})
+        assert not usage_lib.apply_usage_session_config({"disabled": False})
         assert usage_lib._SESSION is None
 
     def test_late_config_opt_out_deactivates_early_session(self, enable_telemetry):
         """A parsed config opt-out overrides an earlier CLI-only decision."""
-        assert usage_lib.start_usage_session(default_usage_context="cli_serve")
+        assert usage_lib.apply_usage_session_config(default_usage_context="cli_serve")
         stale_session = usage_lib._SESSION
 
-        assert not usage_lib.start_usage_session({"disabled": True})
+        assert not usage_lib.apply_usage_session_config({"disabled": True})
         assert usage_lib._SESSION is None
         assert usage_lib._REPORTER_STOP.is_set()
         assert not stale_session.claim_initial()
@@ -824,23 +826,23 @@ class TestProcessTelemetrySession:
 
     def test_explicit_opt_out_remains_sticky_after_fork_reset(self, enable_telemetry):
         """Resetting inherited locks cannot discard an explicit user opt-out."""
-        assert usage_lib.start_usage_session()
-        assert not usage_lib.start_usage_session({"disabled": True})
+        assert usage_lib.apply_usage_session_config()
+        assert not usage_lib.apply_usage_session_config({"disabled": True})
         usage_lib._PROCESS_PID -= 1
 
-        assert not usage_lib.start_usage_session()
+        assert not usage_lib.apply_usage_session_config()
         assert usage_lib._SESSION is None
 
     def test_rank_transition_keeps_local_session_but_skips_emission(self, enable_telemetry):
         """Early global rank selection cannot suppress a later subgroup rank 0."""
         with patch.object(usage_lib, "_is_reporting_rank", return_value=True):
-            assert usage_lib.start_usage_session()
+            assert usage_lib.apply_usage_session_config()
 
         with (
             patch.object(usage_lib, "_is_reporting_rank", return_value=False),
             patch("tensorrt_llm.usage.usage_lib.threading.Thread") as thread_cls,
         ):
-            assert usage_lib.start_usage_session()
+            assert usage_lib.apply_usage_session_config()
             usage_lib.report_usage()
 
         assert usage_lib._SESSION is not None
@@ -849,7 +851,7 @@ class TestProcessTelemetrySession:
 
     def test_nonreporting_rank_does_not_claim_terminal_slot(self, enable_telemetry):
         """A later subgroup rank 0 can still emit the process terminal event."""
-        assert usage_lib.start_usage_session()
+        assert usage_lib.apply_usage_session_config()
 
         with patch.object(usage_lib, "_is_reporting_rank", return_value=False):
             assert not usage_lib.report_exit(
@@ -877,7 +879,7 @@ class TestProcessTelemetrySession:
 
     def test_first_termination_observation_is_preserved(self, enable_telemetry):
         """A later shutdown symptom cannot replace the original failure cause."""
-        assert usage_lib.start_usage_session()
+        assert usage_lib.apply_usage_session_config()
         usage_lib.record_termination_observation(
             usage_lib.TerminalOutcome(
                 termination_kind="worker_failure",
@@ -937,7 +939,7 @@ class TestProcessTelemetrySession:
         """Initial and terminal payloads can be joined by sessionId."""
         self._reset_session(monkeypatch)
         telemetry_config = SimpleNamespace(disabled=False, usage_context="cli_serve")
-        assert usage_lib.start_usage_session(telemetry_config)
+        assert usage_lib.apply_usage_session_config(telemetry_config)
         session_id = usage_lib._SESSION.session_id
         monkeypatch.setattr(usage_lib, "_TERMINAL_FLUSH_TIMEOUT", 0)
 
@@ -992,7 +994,7 @@ class TestProcessTelemetrySession:
 
     def test_unknown_exit_code_uses_zero_sentinel(self, enable_telemetry):
         """Unknown exit status cannot leak a guessed or stale numeric code."""
-        assert usage_lib.start_usage_session()
+        assert usage_lib.apply_usage_session_config()
         sent = []
 
         with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
@@ -1012,7 +1014,7 @@ class TestProcessTelemetrySession:
         """The first terminal caller wins and later calls are no-ops."""
         self._reset_session(monkeypatch)
         telemetry_config = SimpleNamespace(disabled=False, usage_context="llm_class")
-        assert usage_lib.start_usage_session(telemetry_config)
+        assert usage_lib.apply_usage_session_config(telemetry_config)
         sent = []
 
         with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
@@ -1042,7 +1044,7 @@ class TestProcessTelemetrySession:
 
     def test_terminal_claim_survives_sender_thread_failure(self, enable_telemetry):
         """Delivery setup failure cannot reopen the terminal-event slot."""
-        assert usage_lib.start_usage_session()
+        assert usage_lib.apply_usage_session_config()
 
         with patch.object(usage_lib.threading, "Thread", side_effect=RuntimeError("no threads")):
             assert usage_lib.report_exit(
@@ -1064,7 +1066,7 @@ class TestProcessTelemetrySession:
         """A blocked network send cannot hold shutdown past the configured bound."""
         self._reset_session(monkeypatch)
         monkeypatch.setattr(usage_lib, "_TERMINAL_FLUSH_TIMEOUT", 0.01)
-        assert usage_lib.start_usage_session(default_usage_context="llm_class")
+        assert usage_lib.apply_usage_session_config(default_usage_context="llm_class")
         release_send = threading.Event()
 
         def blocking_send(payload):
@@ -1092,7 +1094,7 @@ class TestProcessTelemetrySession:
         """Process-exit fallback need not create a thread during Python atexit."""
         self._reset_session(monkeypatch)
         monkeypatch.setattr(usage_lib, "_TERMINAL_FLUSH_TIMEOUT", 0)
-        assert usage_lib.start_usage_session()
+        assert usage_lib.apply_usage_session_config()
         usage_lib._REPORTER_ACTIVE = True
         sent = []
 
@@ -1117,7 +1119,7 @@ class TestProcessTelemetrySession:
     def test_concurrent_terminal_calls_send_once(self, monkeypatch, enable_telemetry):
         """Racing shutdown paths still produce one terminal event."""
         self._reset_session(monkeypatch)
-        assert usage_lib.start_usage_session(default_usage_context="cli_serve")
+        assert usage_lib.apply_usage_session_config(default_usage_context="cli_serve")
         sent = []
         sent_lock = threading.Lock()
         barrier = threading.Barrier(10)

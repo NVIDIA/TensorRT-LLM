@@ -35,7 +35,7 @@ UsageContext = _config.UsageContext
 TerminalOutcome = _usage_lib.TerminalOutcome
 report_usage = _usage_lib.report_usage
 report_exit = _usage_lib.report_exit
-start_usage_session = _usage_lib.start_usage_session
+apply_usage_session_config = _usage_lib.apply_usage_session_config
 record_llm_initialization_attempt = _usage_lib.record_llm_initialization_attempt
 record_llm_initialization_failure = _usage_lib.record_llm_initialization_failure
 record_llm_initialized = _usage_lib.record_llm_initialized
@@ -63,6 +63,6 @@ __all__ = [
     "report_usage",
     "set_lifecycle_phase",
     "set_usage_context",
-    "start_usage_session",
+    "apply_usage_session_config",
     "is_usage_stats_enabled",
 ]

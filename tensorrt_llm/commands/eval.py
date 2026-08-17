@@ -29,8 +29,8 @@ from ..llmapi import KvCacheConfig
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import update_llm_args_with_extra_dict
 from ..logger import logger, severity_map
+from ..usage import apply_usage_session_config
 from ..usage import config as _telemetry_config
-from ..usage import start_usage_session
 from ._telemetry import TelemetryGroup, apply_raw_config_telemetry_opt_out
 from .utils import collect_explicit_cli_keys
 
@@ -224,7 +224,7 @@ def main(ctx, model: str, tokenizer: Optional[str],
             explicit_cli_keys=explicit_cli_keys)
 
     # Update telemetry state or disable the early session.
-    start_usage_session(
+    apply_usage_session_config(
         llm_args.get("telemetry_config"),
         default_usage_context=_telemetry_config.UsageContext.CLI_EVAL.value,
         component="llm",

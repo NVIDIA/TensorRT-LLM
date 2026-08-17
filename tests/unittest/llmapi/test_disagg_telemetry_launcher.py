@@ -342,7 +342,7 @@ def test_launch_disaggregated_leader_propagates_deployment_id(monkeypatch) -> No
 def test_fleet_worker_uses_process_wide_telemetry_setting() -> None:
     """The direct fleet boundary does not construct an enabled override."""
     with (
-        mock.patch.object(serve, "start_usage_session") as start_session,
+        mock.patch.object(serve, "apply_usage_session_config") as apply_config,
         mock.patch.object(serve, "_run_fleet_worker_impl"),
         mock.patch.object(
             serve._command_telemetry.usage,
@@ -357,7 +357,7 @@ def test_fleet_worker_uses_process_wide_telemetry_setting() -> None:
     ):
         serve._run_fleet_worker()
 
-    assert start_session.call_args.args == ()
+    assert apply_config.call_args.args == ()
     assert report_exit.call_args.kwargs["telemetry_config"] is None
     assert report_exit.call_args.kwargs["default_usage_context"] == "disaggregated"
 
