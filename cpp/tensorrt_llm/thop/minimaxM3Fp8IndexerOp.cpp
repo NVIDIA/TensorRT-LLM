@@ -20,6 +20,9 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+#include <cstdint>
+#include <limits>
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
@@ -46,6 +49,15 @@ torch::Tensor minimaxM3Fp8IndexerQKNormRope(torch::Tensor const& qk, torch::Tens
         indexKCache.scalar_type() == at::ScalarType::Float8_e4m3fn, "Index-K cache must use torch.float8_e4m3fn");
 
     int64_t const numTokens = qk.size(0);
+    TORCH_CHECK(numHeadsQ > 0, "num_heads_q must be greater than zero");
+    TORCH_CHECK(headDim == 128, "MiniMax-M3 FP8 indexer requires head_dim=128");
+    TORCH_CHECK(rotaryDim == 64, "MiniMax-M3 FP8 indexer requires rotary_dim=64");
+    TORCH_CHECK(indexKCache.size(0) > 0, "Index-K cache must contain at least one page");
+    TORCH_CHECK(indexKCache.size(2) > 0, "Index-K cache page_size must be greater than zero");
+    TORCH_CHECK(numTokens <= std::numeric_limits<int>::max(), "num_tokens exceeds the CUDA kernel's int range");
+    TORCH_CHECK(numHeadsQ <= std::numeric_limits<int>::max(), "num_heads_q exceeds the CUDA kernel's int range");
+    TORCH_CHECK(indexKCache.size(2) <= std::numeric_limits<int>::max(),
+        "Index-K cache page_size exceeds the CUDA kernel's int range");
     TORCH_CHECK(qk.size(1) == (numHeadsQ + 1) * headDim, "Index QK width must equal (num_heads_q + 1) * head_dim");
     TORCH_CHECK(indexKCache.size(3) == headDim, "Index-K cache head dimension mismatch");
     TORCH_CHECK(indexKCache.stride(3) == 1 && indexKCache.stride(2) == headDim,
@@ -53,6 +65,14 @@ torch::Tensor minimaxM3Fp8IndexerQKNormRope(torch::Tensor const& qk, torch::Tens
     TORCH_CHECK(outCacheLoc.numel() >= numTokens, "out_cache_loc is shorter than num_tokens");
     TORCH_CHECK(positionIds.numel() == numTokens, "position_ids length must equal num_tokens");
     TORCH_CHECK(qWeight.numel() == headDim && kWeight.numel() == headDim, "Q/K norm weight width must equal head_dim");
+    constexpr uintptr_t kQkAlignment = 8;
+    constexpr uintptr_t kCacheAlignment = 4;
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(qk.data_ptr()) % kQkAlignment == 0,
+        "Index QK must start at an 8-byte-aligned address for vectorized BF16 loads");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(indexKCache.data_ptr()) % kCacheAlignment == 0,
+        "Index-K cache must start at a 4-byte-aligned address for packed E4M3 stores");
+    TORCH_CHECK(indexKCache.stride(0) % static_cast<int64_t>(kCacheAlignment) == 0,
+        "Index-K cache page stride must be a multiple of 4 E4M3 elements for packed stores");
     TORCH_CHECK(qk.get_device() == indexKCache.get_device() && qk.get_device() == outCacheLoc.get_device()
             && qk.get_device() == positionIds.get_device() && qk.get_device() == qWeight.get_device()
             && qk.get_device() == kWeight.get_device(),

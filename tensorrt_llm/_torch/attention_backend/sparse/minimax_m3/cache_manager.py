@@ -158,17 +158,19 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         sparse_index_dim: Optional[int] = None,
         **kwargs,
     ):
-        # Resolve M3 sparse-layer metadata from explicit kwargs first,
-        # then from ``sparse_attn_config``, then from the M3 checkpoint
-        # convention (layers 0..2 dense, 3..N-1 sparse,
-        # disable_index_value=True, sparse_index_dim=128).
-        sparse_attn_config = kwargs.get("sparse_attn_config") or kwargs.get(
-            "sparse_attention_config"
-        )
+        # Resolve M3 sparse-layer metadata from explicit kwargs first, then
+        # from the executor's ``sparse_attention_config`` keyword, then from
+        # the M3 checkpoint convention (layers 0..2 dense, 3..N-1 sparse,
+        # disable_index_value=True, sparse_index_dim=128). Honoring the
+        # executor keyword also makes non-default sparse_index_dim values
+        # authoritative for the cache layout instead of falling back to 128.
+        sparse_attention_config = kwargs.get("sparse_attention_config")
         num_layers = kwargs.get("num_layers")
 
         if sparse_index_dim is None:
-            sparse_index_dim = int(getattr(sparse_attn_config, "sparse_index_dim", 0) or 0) or 128
+            sparse_index_dim = (
+                int(getattr(sparse_attention_config, "sparse_index_dim", 0) or 0) or 128
+            )
         if sparse_layer_ids is None:
             if num_layers is not None:
                 sparse_layer_ids = list(range(3, int(num_layers)))
@@ -183,20 +185,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
         self.sparse_index_dim = int(sparse_index_dim)
-        self.indexer_kv_dtype = str(getattr(sparse_attn_config, "indexer_kv_dtype", "bf16"))
+        self.indexer_kv_dtype = str(getattr(sparse_attention_config, "indexer_kv_dtype", "bf16"))
         if self.indexer_kv_dtype not in ("bf16", "fp8"):
             raise ValueError(
                 "MiniMax M3 indexer_kv_dtype must be 'bf16' or 'fp8', got "
                 f"{self.indexer_kv_dtype!r}."
             )
-        if self.indexer_kv_dtype == "fp8" and (
-            set(self.sparse_layer_ids) - self.disable_index_value_layer_ids
-        ):
-            raise ValueError(
-                "MiniMax M3 FP8 index cache requires disable_index_value=True "
-                "for every sparse layer."
-            )
-
         super().__init__(*args, **kwargs)
 
         index_v_layer_ids = set(self.sparse_layer_ids) - self.disable_index_value_layer_ids

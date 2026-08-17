@@ -139,6 +139,11 @@ __global__ void minimaxM3Fp8IndexerQKNormRopeKernel(__nv_bfloat16 const* qk, __n
     else
     {
         int const slot = out_cache_loc[token_idx];
+        // Production msa_out_cache_loc contains only allocated live-token
+        // slots: KVCacheManagerV2 canonicalizes padded BAD_PAGE_INDEX entries
+        // before build_paged_kv_slot_mapping selects the live ranges. Keep
+        // these guards so direct custom-op callers cannot corrupt the cache
+        // when they supply a sentinel or stale out-of-range slot.
         if (slot < 0)
         {
             return;

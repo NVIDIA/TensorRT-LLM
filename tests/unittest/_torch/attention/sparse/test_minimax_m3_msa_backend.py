@@ -7,14 +7,19 @@ HND view contract passed to the packaged MSA kernel. Numerical parity against
 the Triton reference is covered by the SM100 integration accuracy test.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
+    MiniMaxM3KVCacheManagerV2,
+    MiniMaxM3MsaSparseAttention,
+)
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import msa_paged_kv
 from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minimax_m3_backend_cls
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
@@ -38,7 +43,8 @@ def test_msa_requires_block_size_128():
     assert cfg.sparse_block_size == 64
 
 
-def test_msa_fp8_indexer_config_is_explicit_and_lowered():
+def test_msa_fp8_indexer_config_is_explicit_and_lowered() -> None:
+    """FP8 is explicit, MSA-only, and incompatible with index values."""
     cfg = MiniMaxM3SparseAttentionConfig(implementation="msa", indexer_kv_dtype="fp8")
     assert cfg.to_sparse_params().indexer_kv_dtype == "fp8"
 
@@ -50,6 +56,41 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered():
             indexer_kv_dtype="fp8",
             sparse_disable_index_value=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("sparse_index_dim", "indexer_kv_dtype"),
+    [(96, "bf16"), (128, "fp8")],
+)
+def test_cache_manager_honors_executor_sparse_attention_config(
+    monkeypatch: pytest.MonkeyPatch, sparse_index_dim: int, indexer_kv_dtype: str
+) -> None:
+    """The production keyword controls both index width and storage dtype."""
+
+    def fake_base_init(self, *args, **kwargs) -> None:
+        del args, kwargs
+        self.is_disagg = False
+        self.layer_offsets = {}
+
+    monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
+    monkeypatch.setattr(
+        MiniMaxM3KVCacheManagerV2,
+        "_torch_dtype_for_index_cache",
+        lambda self: torch.float8_e4m3fn,
+    )
+    sparse_config = SimpleNamespace(
+        sparse_index_dim=sparse_index_dim,
+        indexer_kv_dtype=indexer_kv_dtype,
+    )
+
+    manager = MiniMaxM3KVCacheManagerV2(
+        num_layers=4,
+        sparse_attention_config=sparse_config,
+    )
+
+    assert manager.sparse_index_dim == sparse_index_dim
+    assert manager.indexer_kv_dtype == indexer_kv_dtype
 
 
 def test_msa_metadata_rejects_undersized_max_score_buffer():
@@ -258,7 +299,8 @@ def test_msa_indexer_preserves_strided_hnd_index_k(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_msa_fp8_cache_converts_live_index_query_before_scoring():
+def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
+    """Only producer states reachable from the FP8 and BF16 model paths pass."""
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
 
     config = MiniMaxM3SparseConfig(
@@ -273,12 +315,13 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
     attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
     attention.m3_config = config
     attention.layer_idx = 3
+    attention.indexer_kv_dtype = "fp8"
     captured = {}
 
     class FakeIndexer:
         def select_blocks(self, idx_q, idx_k_cache, **kwargs):
             captured["idx_q"] = idx_q
-            captured["idx_k_cache"] = idx_k_cache
+            captured["index_k_cache"] = idx_k_cache
             captured["kwargs"] = kwargs
             return torch.zeros(2, 4, 16, dtype=torch.int32, device="cuda")
 
@@ -294,36 +337,62 @@ def test_msa_fp8_cache_converts_live_index_query_before_scoring():
         msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
         msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
 
-        def __init__(self):
-            backing = torch.empty(2 * 7, 1, 128, 128, dtype=torch.float8_e4m3fn, device="cuda")
+        def __init__(self, dtype: torch.dtype) -> None:
+            backing = torch.empty(2 * 7, 1, 128, 128, dtype=dtype, device="cuda")
             self.cache = backing[::7]
+            self.msa_out_cache_loc = torch.tensor([0, 128], dtype=torch.int32, device="cuda")
 
-        def msa_write_idx_k(self, layer_idx, idx_k):
+        def msa_write_idx_k(self, layer_idx: int, idx_k: torch.Tensor) -> None:
+            from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import (
+                write_kv_slots,
+            )
+
             captured["write"] = (layer_idx, idx_k)
+            write_kv_slots(
+                self.cache,
+                self.msa_out_cache_loc,
+                idx_k,
+                layout="HND",
+            )
 
-        def msa_idx_k_cache(self, layer_idx):
+        def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
             captured["read_layer"] = layer_idx
             return self.cache
 
     idx_q = torch.randn(2, 4 * 128, dtype=torch.bfloat16, device="cuda")
     idx_k = torch.randn(2, 128, dtype=torch.bfloat16, device="cuda")
-    result = attention.run_indexer(idx_q, idx_k, FakeMetadata())
+    fp8_metadata = FakeMetadata(torch.float8_e4m3fn)
 
-    assert result.shape == (2, 4, 16)
-    assert captured["idx_q"].dtype == torch.float8_e4m3fn
-    assert captured["idx_k_cache"].dtype == torch.float8_e4m3fn
-    assert not captured["idx_k_cache"].is_contiguous()
-    assert captured["write"][0] == 3
-    assert captured["write"][1].data_ptr() == idx_k.data_ptr()
+    # The production FP8 path is fused. BF16 Q plus a live K is a test-only
+    # state and must not be silently converted or written into an FP8 cache.
+    with pytest.raises(ValueError, match=r"requires fused FP8 index-Q"):
+        attention.run_indexer(idx_q, idx_k, fp8_metadata)
 
-    # The production fused producer has already inserted K and passes no live
-    # K tensor; E4M3 Q must flow to the scorer without a duplicate cache write.
-    captured.pop("write")
+    # The fused producer has already inserted K and passes no live K tensor;
+    # E4M3 Q flows to the scorer without a duplicate cache write.
     fused_q = idx_q.to(torch.float8_e4m3fn)
-    result = attention.run_indexer(fused_q, None, FakeMetadata())
+    result = attention.run_indexer(fused_q, None, fp8_metadata)
     assert result.shape == (2, 4, 16)
     assert captured["idx_q"].data_ptr() == fused_q.data_ptr()
+    assert captured["index_k_cache"].dtype == torch.float8_e4m3fn
+    assert captured["index_k_cache"].stride(0) == 7 * 128 * 128
     assert "write" not in captured
+
+    # The default BF16 path keeps both live tensors and populates its cache.
+    attention.indexer_kv_dtype = "bf16"
+    bf16_metadata = FakeMetadata(torch.bfloat16)
+    with pytest.raises(ValueError, match=r"requires non-FP8 index-Q"):
+        attention.run_indexer(fused_q, idx_k, bf16_metadata)
+    with pytest.raises(ValueError, match=r"live index-K tensor"):
+        attention.run_indexer(idx_q, None, bf16_metadata)
+    result = attention.run_indexer(idx_q, idx_k, bf16_metadata)
+    assert result.shape == (2, 4, 16)
+    assert captured["idx_q"].data_ptr() == idx_q.data_ptr()
+    assert captured["index_k_cache"].dtype == torch.bfloat16
+    assert captured["write"][0] == 3
+    assert captured["write"][1].data_ptr() == idx_k.data_ptr()
+    torch.testing.assert_close(bf16_metadata.cache[0, 0, 0], idx_k[0])
+    torch.testing.assert_close(bf16_metadata.cache[1, 0, 0], idx_k[1])
 
 
 def test_msa_proxy_max_score_strided_index_k_matches_packed():

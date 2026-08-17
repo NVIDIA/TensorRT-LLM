@@ -995,6 +995,11 @@ class MiniMaxM3Attention(Attention):
             raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires NeoX RoPE.")
         if not self.use_gemma_norm:
             raise NotImplementedError("MiniMax-M3 fused FP8 indexer requires Gemma RMSNorm.")
+        if self.index_q_norm.variance_epsilon != self.index_k_norm.variance_epsilon:
+            raise ValueError(
+                "MiniMax-M3 fused FP8 indexer requires identical index Q/K "
+                "RMSNorm epsilon values because the kernel accepts one epsilon."
+            )
 
         rotary_dim = int(self.pos_embd_params.rope.dim)
         index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
