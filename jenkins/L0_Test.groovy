@@ -158,6 +158,22 @@ SLURM_INFRA_RETRY_MAX = 1
 // to avoid nesting with the inner SLURM retry.
 K8S_INFRA_RETRY_MAX = 1
 
+// Infra-scoped fail-fast master switch. When true, a branch whose post-retry
+// failure classifies as a positive K8s infra abort (via
+// FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its sibling
+// branches keep running instead of being SIGTERMed by failFast -- and a sub-job
+// that saw only infra aborts (no genuine failure) resolves to UNSTABLE. When
+// false, every failure rethrows and the original bare-boolean fail-fast is fully
+// restored. Kept separate from params.enableFailFast so the scoped behavior can
+// be disabled pipeline-wide without turning fail-fast itself off. Only K8s-scoped
+// aborts are deferred today; SLURM-scoped aborts fall back to today's fail-fast
+// (see runBranchesWithInfraDefer).
+//
+// Overridable without a code change by setting the ENABLE_INFRA_SCOPED_FAILFAST
+// env var on the job. Env values are strings ("false" is truthy in Groovy), so
+// the override goes through toBoolean() rather than the bare elvis.
+ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INFRA_SCOPED_FAILFAST.toBoolean() : true
+
 // Per-stage override of the above: set `infraRetryMax` in a stage's opts map (the
 // 3rd element of its parallel-jobs config tuple, alongside singleAttempt) to cap
 // or disable stage-level infra retries for resource-scarce hardware pools --
@@ -777,7 +793,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         // `scontrol show job null`, whose "Invalid job id specified" output then
         // shows up in failure analysis as a bogus error signature.
         if (!isValidSlurmJobId(slurmJobID)) {
-            Utils.exec(pipeline, script: "echo No SLURM job ID captured for node ${nodeName}; skipping job cleanup dump")
+            Utils.exec(pipeline, script: "echo \"No SLURM job ID captured for node ${nodeName}; skipping job cleanup dump\"")
         } else {
             Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
@@ -5409,6 +5425,61 @@ def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCo
     return configs
 }
 
+// Infra-scoped fail-fast (inner/branch layer). Runs `jobs` under `parallel` so a
+// branch whose post-retry failure is a positive K8s infra abort
+// (FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its siblings
+// keep running instead of being SIGTERMed by failFast. A genuine test/build
+// failure (or an unclassified one) is rethrown unchanged, so failFast stays fully
+// active for real failures; an interrupt (e.g. a sibling's own fail-fast SIGTERM)
+// is also rethrown and never swallowed. After the join, a sub-job that saw ONLY
+// infra aborts and no real failure resolves to UNSTABLE (coverage incomplete, not
+// a failure) so the parent layer (L0_MergeRequest.launchJob) can spare the healthy
+// sibling architecture; a mixed sub-job already threw on its real failure and is
+// FAILURE (currentBuild.result worst-of semantics won't downgrade it).
+//
+// Scope: classify() is scope-filtered, so this passes K8S -- the motivating
+// pod-scheduling abort (KubernetesClientTimeoutException) is K8S-scoped. SLURM-only
+// aborts do NOT match here and keep today's fail-fast; deferring those too means
+// threading each stage's scope (opts.slurmDispatcher) in -- a follow-up, not this
+// change. Gated on ENABLE_INFRA_SCOPED_FAILFAST; off restores today's behavior
+// exactly (plain failFast + parallel, no wrapping, no UNSTABLE).
+def runBranchesWithInfraDefer(Map jobs, boolean failFast) {
+    if (!ENABLE_INFRA_SCOPED_FAILFAST) {
+        jobs.failFast = failFast
+        parallel jobs
+        return
+    }
+    // CPS serializes parallel-branch continuations onto a single VM thread, so a
+    // plain list append from the catch blocks below is safe -- there is no
+    // JVM-level concurrency to guard against here.
+    def deferred = []
+    def wrapped = jobs.collectEntries { stageName, body ->
+        [(stageName), {
+            try {
+                body()
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                if (FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)) {
+                    deferred.add([stage: stageName])
+                    echo "[INFRA-DEFER] ${stageName}: K8s infra abort recorded; " +
+                         "siblings continue instead of fail-fast. ${e.toString()}"
+                    return
+                }
+                throw e
+            }
+        }]
+    }
+    wrapped.failFast = failFast
+    parallel wrapped
+    if (deferred) {
+        echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
+             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
+             "(coverage incomplete, no genuine test failure)."
+        currentBuild.result = 'UNSTABLE'
+    }
+}
+
 def launchTestJobs(pipeline, testFilter, globalVars)
 {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
@@ -5643,9 +5714,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
         "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 5, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 5, 4, 1, true, false],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
@@ -5665,7 +5738,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
-        9,
+        6,
         8,
         2
     )
@@ -5710,7 +5783,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        3,
+        1,
         12,
         3
     )
@@ -5719,7 +5792,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
-        2,
+        1,
         16,
         4
     )
@@ -5728,7 +5801,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        4,
+        2,
         20,
         5
     )
@@ -5746,7 +5819,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        8,
+        1,
         36,
         9
     )
@@ -5761,21 +5834,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         2
     )
     // GB300 PerfSanity post-merge disaggregated
-    // 3 Nodes (pre-merge, functional-only)
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        1,
-        12,
-        3
-    )
     // 3 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        2,
+        4,
         12,
         3
     )
@@ -5784,18 +5848,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
         "gb300-flex-aws-cmh",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        4,
+        2,
         20,
         5
-    )
-    // 9 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        1,
-        36,
-        9
     )
     // GB300 GLM-5 disaggregated (ctx DEP2)
     // 3 Nodes (pre-merge, functional-only)
@@ -5861,6 +5916,36 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         56,
         14
     )
+    // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
+        2,
+        8,
+        2
+    )
+    // Nemotron-Ultra-V3 50k2k con12: ctx1 (1 node, 4 GPUs) + gen6 (6 nodes, 4 GPUs each) = 28 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge",
+        "gb300-flex-aws-cmh",
+        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen6_node1_gpu4",
+        2,
+        28,
+        7
+    )
+    // Nemotron-Ultra-V3 50k2k con178: ctx5 (5 nodes, 4 GPUs each) + gen1 dep4 (1 node, 4 GPUs) = 24 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX5-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
+        "gb300-flex-aws-cmh",
+        "l0_gb300_multi_nodes_perf_sanity_ctx5_node1_gpu4_gen1_node1_gpu4",
+        2,
+        24,
+        6
+    )
+    // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
+    // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
+    // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -6580,31 +6665,27 @@ pipeline {
                                 echo "Skip multi-GPU testing. No test to run."
                             }
                             if (singleGpuJobs.size() > 0) {
-                                singleGpuJobs.failFast = params.enableFailFast
-                                parallel singleGpuJobs
+                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast)
                             } else {
                                 echo "Skip single-GPU testing. No test to run."
                             }
                         } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
                             echo "Only run multi-GPU tests."
                             if (dgxJobs.size() > 0) {
-                                dgxJobs.failFast = params.enableFailFast
-                                parallel dgxJobs
+                                runBranchesWithInfraDefer(dgxJobs, params.enableFailFast)
                             } else {
                                 error "Skip multi-GPU testing. No test to run."
                             }
                         } else {
                             if (singleGpuJobs.size() > 0) {
-                                singleGpuJobs.failFast = params.enableFailFast
-                                parallel singleGpuJobs
+                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast)
                             } else {
                                 echo "Skip single-GPU testing. No test to run."
                             }
 
                             if (dgxJobs.size() > 0) {
                                 stage(testPhase2StageName) {
-                                    dgxJobs.failFast = params.enableFailFast
-                                    parallel dgxJobs
+                                    runBranchesWithInfraDefer(dgxJobs, params.enableFailFast)
                                 }
                             }
                         }

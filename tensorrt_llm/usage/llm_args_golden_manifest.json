@@ -1122,6 +1122,17 @@
       "path": "multimodal_config.encoder_cache_max_bytes"
     },
     {
+      "allowed_values": [
+        "DISABLED",
+        "DEFAULT",
+        "EAGER"
+      ],
+      "annotation": "<enum 'MultimodalEncoderSchedulingPolicy'>",
+      "converter": "",
+      "kind": "categorical",
+      "path": "multimodal_config.encoder_scheduling_policy"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
@@ -1285,6 +1296,24 @@
       "converter": "",
       "kind": "value",
       "path": "pp_partition"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[int]]",
+      "converter": "",
+      "kind": "value",
+      "path": "prefill_capture_num_tokens"
+    },
+    {
+      "allowed_values": [
+        "disabled",
+        "piecewise",
+        "breakable"
+      ],
+      "annotation": "<enum 'PrefillCudaGraphBackend'>",
+      "converter": "allowlist",
+      "kind": "categorical",
+      "path": "prefill_cuda_graph_backend"
     },
     {
       "allowed_values": [],
