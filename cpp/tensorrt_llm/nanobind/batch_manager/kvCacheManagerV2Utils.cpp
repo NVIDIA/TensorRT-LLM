@@ -21,6 +21,8 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/torchView.h"
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime_api.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
@@ -33,6 +35,39 @@ using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+namespace
+{
+
+void checkTensorReadableByGpu(at::Tensor const& tensor, at::Device const& outputDevice, char const* name)
+{
+    void const* const inputPointer = tensor.const_data_ptr();
+    cudaPointerAttributes attributes{};
+    cudaError_t const status = cudaPointerGetAttributes(&attributes, inputPointer);
+    TLLM_CHECK_WITH_INFO(status == cudaSuccess, "%s pointer %p is not readable by output device %s: %s", name,
+        inputPointer, outputDevice.str().c_str(), cudaGetErrorString(status));
+    TLLM_CHECK_WITH_INFO(attributes.devicePointer != nullptr, "%s pointer %p is not readable by output device %s", name,
+        inputPointer, outputDevice.str().c_str());
+
+    bool originalPointerIsReadable = static_cast<void const*>(attributes.devicePointer) == inputPointer;
+    if (!originalPointerIsReadable && attributes.type == cudaMemoryTypeHost)
+    {
+        int canUseHostPointer = 0;
+        cudaError_t const attributeStatus = cudaDeviceGetAttribute(
+            &canUseHostPointer, cudaDevAttrCanUseHostPointerForRegisteredMem, outputDevice.index());
+        TLLM_CHECK_WITH_INFO(attributeStatus == cudaSuccess,
+            "Could not determine whether output device %s can read %s through its host pointer: %s",
+            outputDevice.str().c_str(), name, cudaGetErrorString(attributeStatus));
+        originalPointerIsReadable = canUseHostPointer != 0;
+    }
+
+    TLLM_CHECK_WITH_INFO(originalPointerIsReadable,
+        "%s pointer %p is readable only through device alias %p on output device %s, but the kernel receives the "
+        "original pointer",
+        name, inputPointer, attributes.devicePointer, outputDevice.str().c_str());
+}
+
+} // namespace
 
 std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optional<at::Tensor> torchPtr)
 {
@@ -79,7 +114,7 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         .def("remove_sequence", &IndexMapper::removeSequence)
         .def("get_copy_index", &IndexMapper::getCopyIndex)
         .def("gather_k_block_offsets", &IndexMapper::gatherKBlockOffsets, nb::arg("source"), nb::arg("destination"),
-            nb::arg("request_ids"), nb::arg("num_blocks"), nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("request_ids"), nb::arg("num_blocks"))
         .def("size", &IndexMapper::size)
         .def("num_free_slots", &IndexMapper::numFreeSlots);
 
@@ -173,13 +208,7 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
             checkInt32Contiguous(kvOffset, "kv_offset");
 
             TLLM_CHECK_WITH_INFO(output.device().is_cuda(), "output must be a CUDA tensor");
-            TLLM_CHECK_WITH_INFO(input.device().is_cpu() || input.device().is_cuda(),
-                "input and metadata must be either CPU or CUDA tensors");
-            TLLM_CHECK_WITH_INFO(copyIndex.device() == input.device() && indexScales.device() == input.device()
-                    && kvOffset.device() == input.device(),
-                "input, copy_index, index_scales, and kv_offset must be on the same device");
-            TLLM_CHECK_WITH_INFO(!input.device().is_cuda() || input.device() == output.device(),
-                "CUDA input and output tensors must be on the same device");
+            c10::cuda::CUDAGuard const deviceGuard(output.device());
 
             constexpr int64_t kKvFactor = 2;
             TLLM_CHECK_WITH_INFO(input.dim() == 4 && output.dim() == 4,
@@ -194,6 +223,14 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
                 output.size(1) >= copyIndex.size(0), "output must have at least one row per copy_index entry");
             TLLM_CHECK_WITH_INFO(indexScales.size(0) == input.size(0) && kvOffset.size(0) == input.size(0),
                 "index_scales and kv_offset must have one entry per pool");
+
+            if (copyIndex.numel() > 0)
+            {
+                checkTensorReadableByGpu(input, output.device(), "input");
+                checkTensorReadableByGpu(copyIndex, output.device(), "copy_index");
+                checkTensorReadableByGpu(indexScales, output.device(), "index_scales");
+                checkTensorReadableByGpu(kvOffset, output.device(), "kv_offset");
+            }
 
             auto _input = from_torch(input);
             auto _output = from_torch(output);
