@@ -23,6 +23,7 @@ same bytes as an ordinary H2D copy, and invokes the same expansion kernel from
 device-resident data instead.
 """
 
+from itertools import product
 from types import SimpleNamespace
 
 import pytest
@@ -343,20 +344,90 @@ def test_native_materializer_rejects_non_cuda_destination():
         )
 
 
-@requires_cuda
-def test_native_materializer_rejects_mixed_source_devices():
+@requires_native_page_table_kernel
+@pytest.mark.parametrize(
+    "cuda_sources",
+    list(product((False, True), repeat=4)),
+    ids=lambda values: "".join("d" if value else "h" for value in values),
+)
+def test_native_materializer_accepts_each_gpu_readable_source_independently(cuda_sources):
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
         copy_batch_block_offsets_to_device,
     )
 
-    with pytest.raises(RuntimeError, match="must be on the same device"):
+    host_table = _make_host_table(pin=True)
+    copy_idx = torch.tensor([3, 0, 1], dtype=torch.int32, pin_memory=True)
+    index_scales = torch.tensor([2, 3], dtype=torch.int32, pin_memory=True)
+    kv_offset = torch.tensor([100, 200], dtype=torch.int32, pin_memory=True)
+    host_sources = (host_table, copy_idx, index_scales, kv_offset)
+    sources = [
+        source.cuda() if on_cuda else source for source, on_cuda in zip(host_sources, cuda_sources)
+    ]
+    output = torch.empty(
+        (_NUM_POOLS, copy_idx.shape[0], 2, _MAX_BLOCKS_PER_SEQ),
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    copy_batch_block_offsets_to_device(
+        sources[0],
+        output,
+        sources[1],
+        sources[2],
+        sources[3],
+        torch.cuda.current_stream().cuda_stream,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        output.cpu(),
+        _reference_offsets(host_table, copy_idx, index_scales, kv_offset),
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("pageable_source", ("input", "copy_index", "index_scales", "kv_offset"))
+def test_native_materializer_validates_pageable_cpu_sources_before_launch(pageable_source):
+    """Pageable memory may be readable on coherent systems; otherwise fail before launch."""
+    from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
+        copy_batch_block_offsets_to_device,
+    )
+
+    host_table = _make_host_table()
+    copy_idx = torch.tensor([3, 0, 1], dtype=torch.int32)
+    index_scales = torch.tensor([2, 3], dtype=torch.int32)
+    kv_offset = torch.tensor([100, 200], dtype=torch.int32)
+    host_sources = {
+        "input": host_table,
+        "copy_index": copy_idx,
+        "index_scales": index_scales,
+        "kv_offset": kv_offset,
+    }
+    sources = {name: source.cuda() for name, source in host_sources.items()}
+    sources[pageable_source] = host_sources[pageable_source]
+    output = torch.empty(
+        (_NUM_POOLS, copy_idx.shape[0], 2, _MAX_BLOCKS_PER_SEQ),
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    try:
         copy_batch_block_offsets_to_device(
-            _make_host_table(),
-            torch.empty((_NUM_POOLS, 1, 2, _MAX_BLOCKS_PER_SEQ), dtype=torch.int32, device="cuda"),
-            torch.zeros(1, dtype=torch.int32, device="cuda"),
-            torch.ones(_NUM_POOLS, dtype=torch.int32),
-            torch.zeros(_NUM_POOLS, dtype=torch.int32),
+            sources["input"],
+            output,
+            sources["copy_index"],
+            sources["index_scales"],
+            sources["kv_offset"],
             torch.cuda.current_stream().cuda_stream,
+        )
+    except RuntimeError as error:
+        assert pageable_source in str(error)
+        assert "not readable by output device" in str(error)
+    else:
+        torch.cuda.synchronize()
+        assert torch.equal(
+            output.cpu(),
+            _reference_offsets(host_table, copy_idx, index_scales, kv_offset),
         )
 
 
