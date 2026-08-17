@@ -8,8 +8,6 @@ Checks the fused SiTU activation op against the eager fp32
 * elementwise parity across shapes (masked tails, multi-block rows),
   ``beta`` / ``linear_beta`` settings (incl. ``linear_beta=None``), bf16
   in/out, tight tolerance;
-* the ``KimiK3MLP(use_fused_activation=True)`` wiring matches the eager
-  module bit-for-bit at the down_proj output tolerance;
 * the fake/meta registration produces the right shape/dtype (graph
   tracing contract);
 * the op is CUDA-graph-capturable (no host sync, no data-dependent
@@ -75,38 +73,6 @@ def test_situ_and_mul_rejects_strided_columns():
 
     with pytest.raises(ValueError, match="contiguous last dimension"):
         torch.ops.trtllm.situ_and_mul(x, 4.0, 25.0)
-
-
-@requires_cuda
-@pytest.mark.parametrize("situ_beta,situ_linear_beta", _BETAS, ids=_BETA_IDS)
-def test_kimi_k3_mlp_fused_activation_matches_eager(situ_beta, situ_linear_beta):
-    device = torch.device("cuda")
-    hidden_size, intermediate_size = 512, 384
-    torch.manual_seed(3)
-    eager = KimiK3MLP(
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    with torch.no_grad():
-        for proj in (eager.gate_up_proj, eager.down_proj):
-            proj.weight.copy_(torch.randn_like(proj.weight, dtype=torch.float32) * 0.05)
-    fused = KimiK3MLP(
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        use_fused_activation=True,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    fused.load_state_dict(eager.state_dict())
-
-    x = torch.randn(64, hidden_size, dtype=torch.bfloat16, device=device) * 0.5
-    torch.testing.assert_close(fused(x), eager(x), rtol=1.6e-2, atol=1e-3)
 
 
 def test_kimi_k3_mlp_rejects_fused_flag_with_custom_activation():

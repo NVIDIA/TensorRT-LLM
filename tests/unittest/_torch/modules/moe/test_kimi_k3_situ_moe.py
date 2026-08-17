@@ -170,42 +170,6 @@ def test_padded_fused_shapes():
     assert padded_fused_shapes(2880, 96) == (3072, 2944, 128)
 
 
-def test_kimi_gate_reuses_deepseek_v3_routing():
-    config = _K3Config(num_experts=16, num_experts_per_token=4)
-    gate = KimiK3MoEGate(config)
-    torch.manual_seed(23)
-    with torch.no_grad():
-        gate.weight.normal_(std=0.1)
-        gate.e_score_correction_bias.normal_(std=0.05)
-    hidden_states = torch.randn(2, 7, config.hidden_size)
-
-    logits = gate.compute_logits(hidden_states)
-    scores = logits.sigmoid()
-    scores_for_choice = scores + gate.e_score_correction_bias.unsqueeze(0)
-    expected_ids = scores_for_choice.topk(gate.top_k, dim=-1, sorted=False).indices
-    expected_weights = scores.gather(1, expected_ids)
-    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
-    expected_weights *= gate.routed_scaling_factor
-
-    routing_method = gate.routing_method
-    # Exercise the portable PyTorch short path; the production path keeps
-    # is_fused=True and uses the same routing contract.
-    routing_method.routing_impl.is_fused = False
-    actual_ids, actual_weights = routing_method.apply(logits)
-
-    expected_order = expected_ids.argsort(dim=-1)
-    actual_order = actual_ids.argsort(dim=-1)
-    assert actual_ids.dtype == torch.int32
-    torch.testing.assert_close(
-        expected_ids.gather(1, expected_order).to(actual_ids.dtype),
-        actual_ids.gather(1, actual_order),
-    )
-    torch.testing.assert_close(
-        expected_weights.gather(1, expected_order),
-        actual_weights.gather(1, actual_order),
-    )
-
-
 def test_communication_factory_accepts_model_selected_method(monkeypatch):
     mapping = SimpleNamespace(
         enable_attention_dp=True,

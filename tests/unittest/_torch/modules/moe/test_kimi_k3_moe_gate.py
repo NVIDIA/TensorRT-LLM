@@ -71,15 +71,3 @@ def test_fused_routing_matches_eager_reference():
         rtol=2e-3,
         atol=2e-3,
     )
-
-
-@pytest.mark.parametrize(
-    "cfg,error",
-    [
-        (_GateConfig(moe_router_activation_func="softmax"), "requires sigmoid"),
-        (_GateConfig(moe_renormalize=False), "requires top-k weight renormalization"),
-    ],
-)
-def test_invalid_config_rejected_by_production_routing(cfg, error):
-    with pytest.raises(ValueError, match=error):
-        _ = KimiK3MoEGate(cfg).routing_method

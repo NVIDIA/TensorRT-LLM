@@ -186,24 +186,21 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
 
 
 @pytest.mark.parametrize(
-    "attention_dp,tp_size,rank,has_routed_comm,expected_shared_tp,expected_shared_rank,expected_reduce",
+    "attention_dp,tp_size,rank,expected_shared_tp,expected_shared_rank",
     [
-        (True, 8, 7, True, 1, 0, False),
-        (False, 1, 0, False, 1, 0, False),
-        (False, 8, 7, False, 8, 7, False),
-        (False, 8, 7, True, 8, 7, True),
+        (True, 8, 7, 1, 0),
+        (False, 1, 0, 1, 0),
+        (False, 8, 7, 8, 7),
     ],
-    ids=["attention_dp", "single_rank", "direct_tp", "routed_comm"],
+    ids=["attention_dp", "single_rank", "direct_tp"],
 )
 def test_kimi_k3_shared_expert_parallel_construction(
     monkeypatch,
     attention_dp,
     tp_size,
     rank,
-    has_routed_comm,
     expected_shared_tp,
     expected_shared_rank,
-    expected_reduce,
 ):
     """Shared experts are replicated or sharded for the selected parallel mode."""
     from tensorrt_llm._torch import distributed
@@ -221,7 +218,7 @@ def test_kimi_k3_shared_expert_parallel_construction(
         def __init__(self):
             nn.Module.__init__(self)
             self.backend = SimpleNamespace(initial_local_expert_ids=[0, 1, 2, 3])
-            self.comm = object() if has_routed_comm else None
+            self.comm = None
             self.layer_load_balancer = None
             self.all_reduce = _FakeAllReduce()
 
@@ -248,7 +245,7 @@ def test_kimi_k3_shared_expert_parallel_construction(
     assert shared.gate_up_proj.tp_rank == expected_shared_rank
     assert shared.down_proj.tp_size == expected_shared_tp
     assert shared.down_proj.tp_rank == expected_shared_rank
-    assert shared.down_proj.reduce_output is expected_reduce
+    assert shared.down_proj.reduce_output is False
     local_intermediate = (
         config.moe_intermediate_size * config.num_shared_experts // expected_shared_tp
     )

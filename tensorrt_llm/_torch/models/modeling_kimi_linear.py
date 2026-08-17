@@ -894,7 +894,6 @@ class KimiK3MoERuntime(nn.Module):
         self.experts_per_rank = len(local_expert_ids)
         self.expert_lo = local_expert_ids[0]
         self.expert_hi = self.expert_lo + self.experts_per_rank
-        routed_comm = self.routed_experts.comm
 
         shared_intermediate = cfg.moe_intermediate_size * cfg.num_shared_experts
         attention_dp = model_config.mapping.enable_attention_dp
@@ -903,17 +902,15 @@ class KimiK3MoERuntime(nn.Module):
         # Under attention DP each rank owns different tokens, so the shared
         # expert is replicated (TP size 1) and must not reduce across ranks.
         # Direct MoE-TP leaves both branches as partials for one concatenated
-        # all-reduce. Communication-backed MoE already returns a complete
-        # routed result, so GatedMLP must reduce only its shared partial.
+        # all-reduce.
         use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
-        needs_routed_all_reduce = use_shared_tp and routed_comm is None
         routed_all_reduce = self.routed_experts.all_reduce
-        if needs_routed_all_reduce and routed_all_reduce is None:
+        if use_shared_tp and routed_all_reduce is None:
             raise RuntimeError(
                 "Kimi K3 direct MoE tensor parallelism requires the "
                 "ConfigurableMoE all-reduce even when reduce_results=False."
             )
-        self._use_combined_all_reduce = needs_routed_all_reduce
+        self._use_combined_all_reduce = use_shared_tp
         self.shared_experts = GatedMLP(
             hidden_size=cfg.hidden_size,
             intermediate_size=shared_intermediate,
@@ -926,7 +923,7 @@ class KimiK3MoERuntime(nn.Module):
             dtype=dtype,
             config=shared_model_config,
             overridden_tp_size=1 if attention_dp else None,
-            reduce_output=use_shared_tp and not self._use_combined_all_reduce,
+            reduce_output=False,
             layer_idx=layer_idx,
             is_shared_expert=True,
         )
