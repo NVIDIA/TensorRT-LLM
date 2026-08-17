@@ -32,6 +32,7 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm.tools.layer_wise_benchmarks.runner import make_forward_impl_check
 
 from .builders import RoutingPlan
@@ -103,7 +104,9 @@ def _classify_native_projection(
     return "projected", f"{method_name}: unknown capability"
 
 
-def _grouped_routing_constraint(routing_method) -> Optional[Tuple[int, int]]:
+def _grouped_routing_constraint(
+    routing_method: BaseMoeRoutingMethod,
+) -> Optional[Tuple[int, int]]:
     """Return ``(n_group, topk_group)`` when the method enforces expert groups.
 
     Only methods classified ``projected_or_exact`` mask experts by group before

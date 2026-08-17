@@ -31,7 +31,7 @@ The materialiser:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -208,7 +208,7 @@ def _pack_slots_group_aware(
     return out
 
 
-def _take_loaded_expert(pool: Dict[int, int], exclude: set) -> Optional[int]:
+def _take_loaded_expert(pool: Dict[int, int], exclude: Set[int]) -> Optional[int]:
     """Take the expert with the most remaining slots, skipping ``exclude``.
 
     Draining the experts with the largest remaining slot count first keeps the
