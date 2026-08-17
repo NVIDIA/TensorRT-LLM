@@ -467,7 +467,10 @@ class PeerRegistrar:
         for pp in range(peer_start_pp, peer_end_pp):
             for cp in range(peer_start_cp, peer_end_cp):
                 for tp in range(peer_start_tp, peer_end_tp):
-                    ranks.append(pp * peer_ri.tp_size * peer_ri.cp_size + cp * peer_ri.tp_size + tp)
+                    # CP-minor flat rank (ppRank*(TP*CP) + tpRank*CP +
+                    # cpRank), matching Mapping and the C++ transceiver; a
+                    # TP-minor formula mis-routes when tp > 1 and cp > 1.
+                    ranks.append(pp * peer_ri.tp_size * peer_ri.cp_size + tp * peer_ri.cp_size + cp)
 
         dup_head, peer_dup_head = self._attention_policy.duplicate_head_factors(peer_ri)
 
