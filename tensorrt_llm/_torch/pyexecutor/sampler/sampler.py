@@ -2635,8 +2635,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         request: LlmRequest, max_seq_len: int, beam_idx: int = DEFAULT_BEAM_IDX
     ) -> bool:
         num_tokens = request.get_num_tokens(beam_idx)
-        return (num_tokens - request.py_orig_prompt_len >= request.py_max_new_tokens) or (
-            num_tokens >= max_seq_len
+        # Wrap in bool(): the operands come from C++ bindings (get_num_tokens,
+        # py_orig_prompt_len, py_max_new_tokens) and are Any-typed, so the
+        # comparison expression is inferred as Any rather than bool.
+        return bool(
+            (num_tokens - request.py_orig_prompt_len >= request.py_max_new_tokens)
+            or (num_tokens >= max_seq_len)
         )
 
     @staticmethod
@@ -4061,7 +4065,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._finish_reasons_handler.store.num_accepted_draft_tokens_host[
                     req.py_seq_slot
                 ] = req.py_num_accepted_draft_tokens
-            if req.state == LlmRequestState.GENERATION_COMPLETE:
+            # req.state can become GENERATION_COMPLETE within this loop iteration
+            # (e.g. process_draft_tokens -> _handle_stop_criteria -> finish_by),
+            # so the comparison is valid at runtime; mypy narrowed it away via the
+            # `continue` at the top of the loop and cannot see the mutating calls.
+            if req.state == LlmRequestState.GENERATION_COMPLETE:  # type: ignore[comparison-overlap]
                 self._retire_top_p_decay_slot(req)
 
     def _retire_top_p_decay_slot(self, req: LlmRequest) -> None:
