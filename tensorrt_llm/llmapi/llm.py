@@ -1811,6 +1811,7 @@ class _TorchLLM(BaseLLM):
         telemetry_config = kwargs.get("telemetry_config")
         usage_attempt_tracked = False
         _usage = None
+        # Start tracking before construction so initialization failures are observable.
         try:
             import tensorrt_llm.usage as _usage
 
