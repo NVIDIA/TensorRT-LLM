@@ -204,7 +204,7 @@ class _PostTransformMxLoader:
 
 def _spec_config_needing_draft_weights():
     return SimpleNamespace(
-        spec_dec_mode=SimpleNamespace(need_load_draft_weights=lambda: True),
+        needs_separate_draft_weights=True,
         speculative_model="/draft",
     )
 

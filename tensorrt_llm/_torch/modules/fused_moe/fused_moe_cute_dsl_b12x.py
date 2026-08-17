@@ -18,14 +18,23 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, Fp4QuantizedTensor
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
-from .impl_contract import MoERunContext, MoEStaticCapability, require_comm_plan
-from .interface import _warn_and_return
+from .impl_contract import (
+    MoEDeployment,
+    MoEEligibility,
+    MoEProblem,
+    MoERejectReason,
+    MoERunContext,
+    MoEStaticCapability,
+    require_comm_plan,
+)
+from .impl_environment import MoEDep
+from .interface import _reject
 
 # Shared MoE output buffer pool, keyed by (max_num_tokens, hidden_size, dtype,
 # device). ``B12xMoEWrapper.__init__`` allocates a private
@@ -48,43 +57,7 @@ _ACTIVATION_MAP = {
 class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     """B12x NVFP4 fused-MoE backend for SM120 / SM121.
 
-    Member of the cuteDSL backend family: the decode kernel
-    (``flashinfer.B12xMoEWrapper.run``) is JIT-compiled CuTe DSL, so the
-    backend slots in next to :class:`CuteDslFusedMoE` (which targets SM100 /
-    SM103). Plain NVFP4 prefill can route through the C++ CUTLASS NVFP4
-    GroupGEMM via explicit :class:`CutlassFusedMoE` method calls; the parent
-    class on the MRO does not change which kernels execute, only where the
-    b12x backend sits in the family.
-
-    Composition (see ``MOE_DEVELOPER_GUIDE.md`` for the full explainer):
-
-    - **NVFP4 prefill (``m >= _PREFILL_VIA_CUTLASS_THRESHOLD``)** explicitly
-      invokes :class:`CutlassFusedMoE` NVFP4 GroupGEMM. The b12x kernel's
-      12-CTA-per-token MMA pattern is suboptimal at large ``m``.
-    - **Decode (``m <  _PREFILL_VIA_CUTLASS_THRESHOLD``)** dispatches to
-      FlashInfer's ``B12xMoEWrapper.run`` — a kernel purpose-built for
-      ``m=1`` / small routed-row counts.
-    - **W4A16_NVFP4** stays on the b12x path for both prefill and decode.
-
-    NVFP4 weights are loaded via :class:`NVFP4CuteDslB12xFusedMoEMethod`
-    (an :class:`NVFP4CutlassFusedMoEMethod` subclass returned by
-    ``_get_quant_method``). The inherited CUTLASS NVFP4 layout is finalised
-    by the base class, and the b12x-shaped tensors (un-normalised FP8 SF,
-    ``convert_sf_to_mma_layout`` reshape, ``B12xMoEWrapper`` instance) are
-    materialised on top by the quant method's ``transform_weights``. Both
-    layouts coexist in memory and the dispatcher picks per call based on
-    ``x.shape[0]``.
-
-    CUDA graph capture only covers decode, so captured graphs always replay
-    the b12x path; eager prefill always runs CUTLASS — there is no graph
-    capture conflict.
-
-    The backend hard-rejects EP (b12x has no dispatch / combine kernel),
-    MoE alltoall, ``Fp4QuantizedTensor`` input, ``swiglu_gptoss_style``
-    biased SwiGLU, and activations outside ``{Relu2, Swiglu}``. It is
-    selected on the ``CUTEDSL`` MoE path when SM120 / SM121 + NVFP4 or
-    W4A16_NVFP4 + flashinfer-importable gates pass (see
-    ``create_moe.get_moe_cls``).
+    Large prefill chunks use CUTLASS; decode uses FlashInfer's b12x kernel.
     """
 
     # Restated rather than inherited: the LoRA gate this replaces compared the
@@ -104,29 +77,62 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     _PREFILL_VIA_CUTLASS_THRESHOLD = 64
 
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
-        sm_version = get_sm_version()
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        sm_version = d.env.sm
         if sm_version not in cls._SUPPORTED_SM_VERSIONS:
             sm_list = "/".join(f"SM{v}" for v in sorted(cls._SUPPORTED_SM_VERSIONS))
-            return _warn_and_return(f"CuteDslB12xFusedMoE requires {sm_list}, got SM{sm_version}")
-        if quant_algo not in {QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4}:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
+                f"CuteDslB12xFusedMoE requires {sm_list}, got SM{sm_version}",
+            )
+        if p.quant_algo not in {QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4}:
+            return _reject(
+                MoERejectReason.QUANT_UNSUPPORTED,
                 f"CuteDslB12xFusedMoE only supports NVFP4 or W4A16_NVFP4 quantization "
-                f"(got quant_algo={quant_algo})"
+                f"(got quant_algo={p.quant_algo})",
             )
-        if dtype_activation not in {torch.float16, torch.bfloat16}:
-            return _warn_and_return(
+        if p.dtype_act not in {torch.float16, torch.bfloat16}:
+            return _reject(
+                MoERejectReason.DTYPE_UNSUPPORTED,
                 f"CuteDslB12xFusedMoE NVFP4 requires float16 or bfloat16 "
-                f"activation dtype (got {dtype_activation})"
+                f"activation dtype (got {p.dtype_act})",
             )
-        if swiglu_gptoss_style:
-            return _warn_and_return("CuteDslB12xFusedMoE does not support swiglu_gptoss_style")
-        return True, None
+        if p.swiglu_gptoss_style:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "CuteDslB12xFusedMoE does not support swiglu_gptoss_style",
+            )
+        if p.activation_type not in _ACTIVATION_MAP:
+            supported = ", ".join(a.name for a in _ACTIVATION_MAP)
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                f"CuteDslB12xFusedMoE does not support activation "
+                f"{p.activation}; supported: {supported}",
+            )
+        # The decode kernel ships in the FlashInfer wheel.
+        if not d.env.has_dep(MoEDep.FLASHINFER):
+            return _reject(
+                MoERejectReason.DEP_MISSING,
+                "CuteDslB12xFusedMoE requires the flashinfer package",
+            )
+        # No expert-parallel dispatch/combine kernel: EP must stay at 1.
+        if d.ep_size != 1:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"CuteDslB12xFusedMoE requires ep_size == 1 (got {d.ep_size})",
+            )
+        # Attention-DP is a separate axis from EP: with moe_tp == tp the layer
+        # can have ep_size == 1 and still sit behind a DP allgather /
+        # reducescatter that the b12x wrapper has never been exercised under.
+        # ``use_dp and parallel_size > 1`` is exactly ``mapping.dp_size > 1``
+        # (``Mapping.dp_size`` is ``tp_size`` when attention-DP is on).
+        if d.use_dp and d.parallel_size > 1:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"CuteDslB12xFusedMoE does not support attention-DP "
+                f"(parallel_size={d.parallel_size})",
+            )
+        return MoEEligibility.ok()
 
     def __init__(self, *args, **kwargs):
         # ``ModelConfig`` is consumed by the inherited ``__init__`` for cache
@@ -138,22 +144,11 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
 
         super().__init__(*args, **kwargs)
 
-        # b12x has no expert-parallel dispatch/combine kernel, so EP must be
-        # disabled. dp_size > 1 implies the alltoall path which b12x can't run.
-        if self.ep_size != 1:
-            raise ValueError(
-                f"CuteDslB12xFusedMoE requires ep_size == 1 "
-                f"(got ep_size={self.ep_size}); use --moe_backend CUTLASS for EP."
-            )
+        # Eligibility (SM / quant / activation / EP) is owned by
+        # ``can_implement``. ``enable_alltoall`` is a run-time flag not yet on
+        # ``MoEDeployment``, so keep the construction guard here.
         if self.enable_alltoall:
             raise ValueError("CuteDslB12xFusedMoE does not support MoE alltoall communication.")
-        if self.activation_type not in _ACTIVATION_MAP:
-            supported = ", ".join(a.name for a in _ACTIVATION_MAP)
-            raise ValueError(
-                f"CuteDslB12xFusedMoE does not support activation "
-                f"{ActivationType(self.activation_type).name}; "
-                f"supported: {supported}."
-            )
 
         self._b12x_weights: Optional[dict] = None
         self.b12x_wrapper = None
