@@ -413,6 +413,8 @@ def _is_fused_q_fp8_quant_enabled(
     # The fused path leaves a placeholder bf16 q_buf, so consumers read the FP8
     # buffer and `_fused_q_pe`: context takes the prefix rows, generation the
     # suffix. A mixed batch launches once per phase over those disjoint ranges.
+    if os.environ.get("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0") == "1":
+        return False
     if self.qk_head_dim != 512 or self.kv_lora_rank != 448:
         return False
     return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
@@ -985,11 +987,16 @@ def forward_sparse_attn(
 
     # Use the CuTe BF16 Q projection only for ratio-4 CSA layers with unquantized,
     # bias-free weights. TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL disables this path.
+    # The fused FP8 Q branch owns q_b_proj's output, so the two are exclusive by
+    # construction rather than by assertion.
     _use_q_b_cute = (
         self.has_dsv4_indexer
         and os.environ.get("TRTLLM_MLA_Q_B_PROJ_USE_CUTE_DSL", "1") == "1"
         and self.q_b_proj.bias is None
         and self.q_b_proj.weight.dtype == torch.bfloat16
+        and not _is_fused_q_fp8_quant_enabled(
+            self, num_generations=num_generations, num_contexts=num_contexts
+        )
     )
 
     def _q_b_proj_cute_dsl_bf16(q: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -1043,11 +1050,7 @@ def forward_sparse_attn(
         )
 
     def _q_branch():
-        # CuTe BF16 projection is incompatible with fused FP8 Q quantization.
         if _use_q_b_cute:
-            assert not _fused_q_fp8_quant_enabled(), (
-                "CuTe DSL q_b_proj path is incompatible with the fused FP8 q-quant branch"
-            )
             q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
             # The context path detects fusion from these buffers, so clear stale state.
             self._fused_quant_q_buffer = None
@@ -1099,12 +1102,18 @@ def forward_sparse_attn(
             self.dsv4_compressor_event.wait()
             self.dsv4_indexer_event.wait()
 
-            # Keep cross-stream outputs alive on the consuming stream.
+            # Keep cross-stream outputs alive on the consuming stream. The fused-Q
+            # buffers count too: allocated on compressor_stream inside _q_branch, read
+            # by FMHA on this one.
             cur_stream = torch.cuda.current_stream()
-            if q is not None:
-                q.record_stream(cur_stream)
-            if topk_indices is not None:
-                topk_indices.record_stream(cur_stream)
+            for _crossed in (
+                q,
+                topk_indices,
+                self._fused_quant_q_buffer,
+                self._fused_q_pe,
+            ):
+                if _crossed is not None:
+                    _crossed.record_stream(cur_stream)
         elif _prelaunch_compressor:
             # Already in flight on compressor_stream since before kv_a_proj, so the
             # caller stream only runs the Q branch and joins. Running
