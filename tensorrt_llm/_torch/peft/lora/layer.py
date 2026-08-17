@@ -216,9 +216,9 @@ MOE_LORA_MODULE_TO_KERNEL_SLOT = {
 
 def add_lora_result(output: torch.Tensor,
                     lora_result: Optional[torch.Tensor]) -> torch.Tensor:
-    if lora_result is None:
-        return output
-    return output + lora_result.to(output.dtype)
+    if lora_result is not None:
+        output.add_(lora_result.to(output.dtype))
+    return output
 
 
 class LoraLayer(torch.nn.Module):
