@@ -300,7 +300,7 @@ class LoraLayer(torch.nn.Module):
                 continue
             if execute_in_parallel:
                 lora_output.record_stream(torch.cuda.current_stream())
-            base_output.add_(lora_output)
+            base_output = add_lora_result(base_output, lora_output)
 
         return base_output
 

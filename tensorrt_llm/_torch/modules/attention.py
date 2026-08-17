@@ -22,7 +22,7 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..pyexecutor.breakable_cuda_graph import (eager_on_graph,
                                                is_in_breakable_cuda_graph)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,

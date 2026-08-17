@@ -10,7 +10,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
 from .linear import (Linear, TensorParallelMode, WeightMode,
                      WeightsLoadingConfig, is_static_nvfp4_input_eligible)
