@@ -28,9 +28,9 @@ except ImportError:
 
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
-                                 is_trace_enabled, mpi_comm, mpi_disabled,
-                                 nvtx_range, set_thread_local_mpi_comm,
-                                 trace_func)
+                                 global_mpi_size, is_trace_enabled, mpi_comm,
+                                 mpi_disabled, nvtx_range,
+                                 set_thread_local_mpi_comm, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -274,6 +274,42 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     # Clearing it is also the byte-budget release: the scheduler derives
     # occupancy from live states, so this request stops counting next tick.
     request.py_mm_encoder_state = None
+
+
+@contextmanager
+def _distributed_warmup_guard(dist, mapping):
+    """Hard-kill the world when warmup fails on a subset of ranks.
+
+    Warmup runs from ``PyExecutor.__init__``, i.e. before the executor loop
+    and therefore before ``_event_loop_wrapper`` arms its rank-crash kill. A
+    rank that raises here leaves every peer blocked in the warmup collective
+    it will now never join, until that peer's own HangDetector fires 300s
+    later. Arming the same watchdog closes that window for the whole warmup,
+    whatever phase and whatever exception type it failed on.
+
+    The watchdog (not an immediate ``propagate_hard_kill``) is what lets the
+    ORIGINAL exception still reach the client: its grace gives the worker's
+    setup/RPC error path time to report before the abort tears the world
+    down, and it honours the ``TLLM_RANK_CRASH_HARD_KILL_GRACE`` escape
+    hatch.
+
+    ``SystemExit`` / ``KeyboardInterrupt`` are deliberately not covered, for
+    the same reason ``_event_loop_wrapper`` leaves them unarmed: they are
+    teardown signals the launcher is already acting on, and an MPI_Abort on
+    top would turn a clean Ctrl-C into exit 137.
+
+    Peer count comes from ``global_mpi_size()``, not ``dist.world_size`` or
+    ``mpi_world_size()``: DWDP peers live in ``MPI.COMM_WORLD`` while each
+    DWDP worker is its own TP=1 instance, and ``mpi_comm()`` may have been
+    replaced with a sub-communicator by the serving layer.
+    """
+    try:
+        yield
+    except Exception:
+        if dist.world_size > 1 or mapping.dwdp_enabled:
+            start_rank_crash_kill_watchdog(global_mpi_size(),
+                                           error_delivered=None)
+        raise
 
 
 @dataclasses.dataclass
@@ -894,7 +930,8 @@ class PyExecutor:
         self.is_warmup = True
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.execution_stream):
+        with torch.cuda.stream(self.execution_stream), \
+                _distributed_warmup_guard(self.dist, self.dist.mapping):
             self.model_engine.warmup(self.resource_manager)
             if self.draft_model_engine is not None:
                 self.draft_model_engine.warmup(self.resource_manager)
