@@ -2204,11 +2204,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # controller in standby mode" until it promotes, which takes up to
                     # SlurmctldTimeout (upstream default 120s) plus takeover time. The
                     # rejection is instant and burns no partition walltime, so retrying
-                    # it here -- every 30s, up to ~5min, inside this one stage attempt
-                    # -- rides out the window without touching the expensive
-                    # stage-level SLURM retry budget. Any other sbatch failure still
-                    # fails immediately.
-                    sbatch_max_attempts=11
+                    # it here -- every 30s, up to ~3min, inside this one stage attempt
+                    # -- rides out a failover without touching the expensive
+                    # stage-level SLURM retry budget. This window is sized to a
+                    # failover only, NOT to a cluster-wide controller outage or
+                    # maintenance: a standby condition that outlasts it falls through
+                    # to the failure classifier, whose PATTERN_CATALOG marks
+                    # "standby mode" PERSISTENT so the stage does not keep re-running
+                    # against a down controller. Any other sbatch failure still fails
+                    # immediately.
+                    sbatch_max_attempts=6
                     sbatch_attempt=1
                     while true; do
                         sbatch_rc=0
