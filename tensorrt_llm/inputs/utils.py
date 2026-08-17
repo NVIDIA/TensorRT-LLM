@@ -359,7 +359,7 @@ class ConversationMessage(TypedDict, total=False):
     content: str
     media: List[MultimodalData]
     content_parts: List[Union[str, dict]]
-    tools: List[dict]
+    tools: List[Dict[str, Any]]
 
 
 class MultimodalDataTracker:

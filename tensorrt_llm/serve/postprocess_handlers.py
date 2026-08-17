@@ -75,8 +75,10 @@ class ChatPostprocArgs(PostprocArgs):
     model: str
     num_choices: int = 1
     tools: Optional[List[ChatCompletionToolsParam]] = None
+    # None means "not specified": only an explicit client "none" (always set
+    # by from_request) suppresses parsed tool calls in apply_tool_parser.
     tool_choice: Optional[Union[Literal["none", "auto", "required"],
-                                ChatCompletionNamedToolChoiceParam]] = "none"
+                                ChatCompletionNamedToolChoiceParam]] = None
     return_logprobs: bool = False
     top_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None

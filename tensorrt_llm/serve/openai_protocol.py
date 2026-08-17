@@ -499,8 +499,8 @@ def _response_format_to_guided_decoding_params(
         # the prompt ends inside <|open|>response<|sep|>, the trigger would
         # never be generated, and the raw grammar applies from the first
         # generated token instead.
-        thinking = (chat_template_kwargs
-                    or {}).get("thinking", True) is not False
+        thinking = (chat_template_kwargs or {}).get("thinking",
+                                                    True) is not False
         if not thinking:
             return guided_decoding_params
         stag_format = {
@@ -923,13 +923,13 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
-
 class ChatCompletionThinkingParam(OpenAIBaseModel):
     """Kimi/Moonshot ``thinking`` extension controlling reasoning output.
 
     ``keep`` is fixed to ``"all"`` when thinking is enabled and ignored when
-    disabled; ``effort`` is only meaningful when enabled. A request-level
-    ``reasoning_effort`` overrides ``effort``.
+    disabled; ``effort`` is only meaningful when enabled. An explicit
+    ``effort`` wins over a request-level ``reasoning_effort``, which applies
+    only when ``effort`` is absent (and never for a disabled request).
     """
     type: Literal["enabled", "disabled"] = "enabled"
     keep: Optional[Literal["all"]] = None
@@ -1210,8 +1210,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if not isinstance(data, dict):
             return data
         for message in data.get("messages") or []:
-            if (isinstance(message, dict)
-                    and message.get("tools") is not None
+            if (isinstance(message, dict) and message.get("tools") is not None
                     and message.get("role") != "system"):
                 raise ValueError(
                     "Message-level `tools` are only allowed on system "
