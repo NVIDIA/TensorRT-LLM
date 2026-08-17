@@ -120,12 +120,9 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             conditional_properties,
             _top_level_workflow_properties(L0_TEST),
         )
-        self.assertIn(
-            'runLLMDocBuild(pipeline, VANILLA_CONFIG, "CPU-Build_Docs")', L0_TEST
-        )
-        self.assertNotIn(
-            'runLLMDocBuild(pipeline, VANILLA_CONFIG, "A10-Build_Docs")', L0_TEST
-        )
+        self.assertIn("def runLLMDocBuild(pipeline, config)", L0_TEST)
+        self.assertIn("runLLMDocBuild(pipeline, config=VANILLA_CONFIG)", L0_TEST)
+        self.assertIn('runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, "CPU-Build_Docs")', docs)
         upload_args = _groovy_list_values_after(prepared, "extraArgs += [")
         self.assertTrue(any(arg.startswith("--s3-upload-path=") for arg in upload_args))
         self.assertEqual(_pytest_capture_mode(upload_args, initial_mode="no"), "fd")
@@ -144,6 +141,14 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             body.index("runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)"),
         )
         self.assertLess(body.index("if (isInfraDryRun())"), body.index("pip3 install -e"))
+        dry_guard = body.index("if (isInfraDryRun())")
+        realpath = body.index("realpath ${LLM_ROOT}")
+        dry_runner = body.index("runInfraDryRunInPreparedWorkspace(pipeline, llmSrc, stageName)")
+        normal_root = body.index('def agentFlowRoot = "${LLM_ROOT}/agent-flow"')
+        self.assertLess(dry_guard, realpath)
+        self.assertLess(realpath, dry_runner)
+        self.assertLess(body.index("\n        return", dry_runner), normal_root)
+        self.assertIn('def agentFlowRoot = "${LLM_ROOT}/agent-flow"', body)
 
     def test_prepared_workspace_sets_dry_environment_before_collection(self):
         body = _function_body(L0_TEST, "runInfraDryRunInPreparedWorkspace", "runLLMDocBuild")
@@ -153,12 +158,8 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertLess(body.index(dry_environment), body.index("${pytestCommand.join"))
 
     def test_dry_run_limits_collection_to_rendered_nodeids(self):
-        targets = _function_body(
-            L0_TEST, "getInfraDryRunPytestTargets", "processShardTestList"
-        )
-        preprocessing = _function_body(
-            L0_TEST, "processShardTestList", "isValidSlurmJobId"
-        )
+        targets = _function_body(L0_TEST, "getInfraDryRunPytestTargets", "processShardTestList")
+        preprocessing = _function_body(L0_TEST, "processShardTestList", "isValidSlurmJobId")
         self.assertIn("if (!isInfraDryRun())", targets)
         self.assertIn('.findAll { it.contains("::") }', targets)
         self.assertIn(
@@ -189,6 +190,8 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             "pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)",
             body,
         )
+        self.assertIn('${infraDryRun ? "export infraDryRun=true" : ""}', body)
+        self.assertNotIn("export infraDryRun=$infraDryRun", body)
         self.assertIn('pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"', body)
         self.assertIn("if (!isInfraDryRun() && (disaggMultiNodeMode || aggMultiNodeMode))", body)
         self.assertNotIn("test_infra_dry_run_benchmark.py", body)
