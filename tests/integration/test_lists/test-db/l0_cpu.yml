@@ -62,6 +62,7 @@ l0_cpu:
   - unittest/disaggregated
   - unittest/dynamo
   - unittest/executor/test_base_worker.py ISOLATION
+  - unittest/executor/test_control_action_reentrancy.py
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_ipc.py
   - unittest/executor/test_rpc.py

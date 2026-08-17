@@ -167,6 +167,11 @@ _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
+# How often control_action() re-checks executor-loop liveness while waiting for
+# the control request barrier.  There is deliberately NO wall-clock deadline on
+# that wait -- see _wait_for_control_barrier() for why one would be unsafe.
+_CONTROL_BARRIER_POLL_INTERVAL_S = 0.5
+
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
     """Return whether an ACK is ready without blocking on recv."""
@@ -979,6 +984,12 @@ class PyExecutor:
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
+        # The two events above are a broadcast handshake, not a mutex: set()
+        # releases every waiter, so callers are serialised here instead.
+        self._control_action_lock = threading.Lock()
+        # Holder's thread ident, so a nested call can be rejected rather than
+        # deadlock on the non-reentrant lock above.
+        self._control_action_owner: Optional[int] = None
         self._active_control_id: Optional[str] = None
         self._sleep_wakeup_pending_aborts: Dict[str, str] = {}
         self._sleep_wakeup_pending_abort_lock = threading.Lock()
@@ -4729,19 +4740,86 @@ class PyExecutor:
                      In-flight requests keep their KV caches across the
                      action; same-batch requests fetched after the sentinel
                      are parked until the ``with`` block exits.
+
+        Mutually exclusive and not re-entrant: the two events are a broadcast
+        handshake rather than a mutex, so concurrent callers would both pass
+        the barrier and both clear it, releasing the executor loop while one
+        body still runs. Callers therefore serialise on
+        ``_control_action_lock``; a nested call from the holding thread is
+        rejected rather than blocked, which would deadlock.
+
+        The lock provides *local* mutual exclusion only.  It does not order
+        control actions across ranks: only rank 0 enqueues, and the order in
+        which callers on rank N acquire the lock is not tied to rank 0's
+        enqueue order, so concurrent control actions could still pair
+        different bodies with the same barrier cycle on different ranks.
+        Cross-rank correctness relies on rank 0 being the single enqueue
+        point - do not issue concurrent collective control actions.
         """
 
-        if self.dist.rank == 0:
-            self.executor_request_queue.enqueue_control_request(
-                drain=drain, control_id=control_id)
+        # Unsynchronised read is sound: only the owning thread writes its own
+        # ident, and clears it before releasing. So this can match only for a
+        # thread that really holds the lock; any other value falls through to
+        # the lock, which does the actual exclusion.
+        if self._control_action_owner == threading.get_ident():
+            raise RuntimeError(
+                "control_action() is not re-entrant: this thread already holds "
+                "one. A control action must not invoke another control action - "
+                "call the undecorated operation instead (e.g. self.engine.<op>() "
+                "rather than the @control_action_decorator wrapper).")
 
-        self.control_request_barrier.wait()
+        with self._control_action_lock:
+            self._control_action_owner = threading.get_ident()
+            try:
+                if self.dist.rank == 0:
+                    self.executor_request_queue.enqueue_control_request(
+                        drain=drain, control_id=control_id)
 
-        try:
-            yield self
-        finally:
-            self.control_action_done.set()
-            self.control_request_barrier.clear()
+                self._wait_for_control_barrier(control_id)
+
+                try:
+                    yield self
+                finally:
+                    self.control_action_done.set()
+                    self.control_request_barrier.clear()
+            finally:
+                self._control_action_owner = None
+
+    def _wait_for_control_barrier(self, control_id: Optional[str]) -> None:
+        """Wait for the executor loop to fire our control request.
+
+        Waits indefinitely, but polls so that a *dead* executor loop is
+        reported instead of hung on.
+
+        There is deliberately no wall-clock deadline.  Rank 0 has already
+        enqueued the sentinel by the time we get here, so bailing out while the
+        loop is still alive would strand it: the loop would later pop that
+        sentinel, ``set()`` the barrier and block in the untimed
+        ``control_action_done.wait()`` with no caller left to answer, hanging
+        the executor until the hang detector kills the job.  That is strictly
+        worse than the stall a deadline would have avoided.
+
+        The two conditions below are safe precisely because each one implies
+        there is no consumer left to strand: ``shutdown_event`` is set in
+        ``_executor_loop_cleanup()``, i.e. only once the loop has exited, and a
+        dead ``worker_thread`` cannot pop anything either.  So an orphaned
+        sentinel is inert in both cases.
+
+        Consequence: a lost barrier edge (``_handle_control_request`` pulses
+        ``set(); clear()`` on the aborted path without waiting for
+        ``control_action_done``) still blocks here while holding
+        ``_control_action_lock``.  That is pre-existing behaviour; fixing it
+        needs the abort to be routed back to this caller, not a timeout.
+        """
+        while not self.control_request_barrier.wait(
+                timeout=_CONTROL_BARRIER_POLL_INTERVAL_S):
+            worker = getattr(self, "worker_thread", None)
+            if self.shutdown_event.is_set() or (worker is not None
+                                                and not worker.is_alive()):
+                raise RuntimeError(
+                    "control_action() barrier never fired: the executor loop "
+                    f"is shut down (control_id={control_id}). The control "
+                    "request cannot be serviced.")
 
     def _wait_for_model_engine_input_copy(self):
         wait_for_input_copy = getattr(self.model_engine, "wait_for_input_copy",
