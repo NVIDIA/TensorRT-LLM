@@ -189,7 +189,11 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     // subclass type is not directly registered (e.g., agents created via factory).
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
         .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
-        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>());
+        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>())
+        // Failure detail for the last terminal state (empty if unavailable). Named to match the
+        // lookup in BindingsNixlTransferStatus.last_status_str (nixl/_agent_cpp.py), which is what
+        // the Python transceiver's error log reads.
+        .def("get_last_status_str", &kvc::TransferStatus::getLastStatusStr);
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")

@@ -88,7 +88,7 @@ namespace
 class BounceTransferStatus final : public TransferStatus
 {
 public:
-    explicit BounceTransferStatus(std::shared_future<TransferState> fut)
+    explicit BounceTransferStatus(std::shared_future<bounce::BounceResult> fut)
         : mFut(std::move(fut))
     {
     }
@@ -106,17 +106,28 @@ public:
         }
         if (timeoutMs < 0)
         {
-            return mFut.get();
+            return mFut.get().state;
         }
         if (mFut.wait_for(std::chrono::milliseconds(timeoutMs)) == std::future_status::ready)
         {
-            return mFut.get();
+            return mFut.get().state;
         }
         return TransferState::kIN_PROGRESS;
     }
 
+    /// Failure cause recorded by the bounce transport (empty while in flight / on success).
+    [[nodiscard]] std::string getLastStatusStr() const override
+    {
+        if (!mFut.valid() || mFut.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        {
+            return {};
+        }
+        auto const& result = mFut.get();
+        return result.reason == bounce::BounceFailReason::kNone ? std::string{} : bounce::toString(result.reason);
+    }
+
 private:
-    std::shared_future<TransferState> mFut;
+    std::shared_future<bounce::BounceResult> mFut;
 };
 } // namespace
 
