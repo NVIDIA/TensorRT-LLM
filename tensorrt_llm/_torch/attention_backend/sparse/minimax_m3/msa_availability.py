@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Availability checks for the MiniMax-M3 MSA sparse attention kernels.
 
-The MSA kernels are provided by the fmha_sm100 package from the MSA git
-submodule at 3rdparty/MSA and run only on the SM100 architecture family
-(SM100 and SM103). These helpers gate backend selection so a request for the
-MSA path fails early with a clear message on unsupported systems.
+The MSA kernels are provided by the fmha_sm100 package bundled with
+TensorRT-LLM and run only on the SM100 architecture family (SM100 and SM103).
+These helpers gate backend selection so a request for the MSA path fails early
+with a clear message on unsupported systems.
 """
 
 from __future__ import annotations
@@ -24,8 +24,7 @@ def ensure_msa_available() -> None:
     if not msa_package_available():
         raise RuntimeError(
             f"MiniMax-M3 MSA sparse attention requires the {MSA_PACKAGE} kernels "
-            "from the MSA git submodule at 3rdparty/MSA. Initialize it with "
-            "'git submodule update --init --recursive'."
+            "packaged with TensorRT-LLM. Reinstall TensorRT-LLM from a complete build."
         )
     if not is_sm_100f():
         sm_version = get_sm_version()

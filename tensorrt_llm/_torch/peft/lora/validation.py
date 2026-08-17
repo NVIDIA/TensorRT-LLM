@@ -3,11 +3,12 @@
 """Validation helpers for routed-expert (MoE) LoRA.
 
 MoE LoRA is supported only on the Cutlass backend with unquantized fp16/bf16 or
-per-tensor FP8 (qdq) base weights. This module provides a single helper,
-`check_moe_lora_supported`, that callers (typically the MoE factory in
-`create_moe.py`) can invoke at construction time so that unsupported
-combinations fail loudly instead of silently dropping the LoRA contribution at
-runtime.
+per-tensor FP8 (qdq) base weights. Resolution owns that contract at select time:
+``supports_moe_lora`` filters backends, and ``CutlassFusedMoE.can_implement``
+rejects unsupported base-weight quants when ``moe_lora_enabled`` is set.
+
+`check_moe_lora_supported` remains as a standalone assertion for unit tests and
+any caller that wants an explicit ValueError without going through resolution.
 
 Runtime-only rejections (min-latency mode, alltoall, CUDA-graph without slot
 pointers) are enforced in the C++ thop / runtime call paths and are NOT

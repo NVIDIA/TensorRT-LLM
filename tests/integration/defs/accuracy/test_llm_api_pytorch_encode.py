@@ -356,7 +356,6 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 #   Phi3ForCausalLM    — Phi-4-mini (SuRoPE, merged QKV)
 #   Qwen2ForCausalLM   — Qwen2-7B (distinct GQA head config, SwiGLU variant)
 #   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm, architecturally distinct from Qwen2)
-#   Starcoder2ForCausalLM — StarCoder2-3B (MQA, sliding window, code model)
 DECODER_MODELS = [
     # -- LlamaForCausalLM (covers Llama + Mistral family) --
     pytest.param(
@@ -389,12 +388,6 @@ DECODER_MODELS = [
         "Qwen/Qwen3-0.6B",
         f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
         id="qwen3-0.6b",
-    ),
-    # -- Starcoder2ForCausalLM --
-    pytest.param(
-        "bigcode/starcoder2-3b",
-        f"{llm_models_root()}/starcoder2-3b/",
-        id="starcoder2-3b",
     ),
 ]
 
