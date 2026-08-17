@@ -20,6 +20,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -28,6 +29,20 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
+//! Normalize and rotate MiniMax-M3 index Q/K, returning Q and caching K as E4M3.
+//!
+//! `qk` is contiguous CUDA BF16 `[num_tokens, (numHeadsQ + 1) * headDim]`.
+//! `indexKCache` is a mutable CUDA E4M3 HND cache
+//! `[num_pages, 1, page_size, headDim]`; valid `outCacheLoc` entries address
+//! `page * page_size + token`, while malformed negative or out-of-range entries
+//! are defensively skipped. `qWeight` and `kWeight` are contiguous CUDA BF16
+//! vectors of `headDim` elements, and `positionIds` is contiguous CUDA int32
+//! with one entry per token.
+//!
+//! `numHeadsQ` must be positive, `headDim` must be 128, `rotaryDim` must be 64,
+//! and both `eps` and `base` must be finite and positive. The function mutates
+//! `indexKCache` in place and returns contiguous E4M3
+//! `[num_tokens, numHeadsQ, headDim]` index Q.
 torch::Tensor minimaxM3Fp8IndexerQKNormRope(torch::Tensor const& qk, torch::Tensor& indexKCache,
     torch::Tensor const& outCacheLoc, int64_t numHeadsQ, int64_t headDim, int64_t rotaryDim, double eps,
     torch::Tensor const& qWeight, torch::Tensor const& kWeight, double base, torch::Tensor const& positionIds)
@@ -52,6 +67,8 @@ torch::Tensor minimaxM3Fp8IndexerQKNormRope(torch::Tensor const& qk, torch::Tens
     TORCH_CHECK(numHeadsQ > 0, "num_heads_q must be greater than zero");
     TORCH_CHECK(headDim == 128, "MiniMax-M3 FP8 indexer requires head_dim=128");
     TORCH_CHECK(rotaryDim == 64, "MiniMax-M3 FP8 indexer requires rotary_dim=64");
+    TORCH_CHECK(std::isfinite(eps) && eps > 0.0, "eps must be finite and greater than zero");
+    TORCH_CHECK(std::isfinite(base) && base > 0.0, "RoPE base must be finite and greater than zero");
     TORCH_CHECK(indexKCache.size(0) > 0, "Index-K cache must contain at least one page");
     TORCH_CHECK(indexKCache.size(2) > 0, "Index-K cache page_size must be greater than zero");
     TORCH_CHECK(numTokens <= std::numeric_limits<int>::max(), "num_tokens exceeds the CUDA kernel's int range");

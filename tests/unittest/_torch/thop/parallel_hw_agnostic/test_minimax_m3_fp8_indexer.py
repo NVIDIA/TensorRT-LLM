@@ -87,6 +87,8 @@ def _run(
     num_heads_q: int = 4,
     head_dim: int = 128,
     rotary_dim: int = 64,
+    eps: float = 1e-5,
+    base: float = 10000.0,
 ) -> torch.Tensor:
     """Invoke the specialized indexer operator with overridable geometry."""
     return torch.ops.trtllm.minimax_m3_fp8_indexer_qk_norm_rope(
@@ -96,10 +98,10 @@ def _run(
         num_heads_q,
         head_dim,
         rotary_dim,
-        1e-5,
+        eps,
         q_weight,
         k_weight,
-        10000.0,
+        base,
         position_ids,
     )
 
@@ -274,6 +276,36 @@ def test_minimax_m3_fp8_indexer_rejects_bad_cache_contracts() -> None:
             weights,
             weights,
             positions,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"eps": 0.0}, "eps must be finite and greater than zero"),
+        ({"eps": float("nan")}, "eps must be finite and greater than zero"),
+        ({"base": 0.0}, "RoPE base must be finite and greater than zero"),
+        ({"base": float("inf")}, "RoPE base must be finite and greater than zero"),
+    ],
+)
+def test_minimax_m3_fp8_indexer_rejects_invalid_scalars(
+    kwargs: dict[str, float], message: str
+) -> None:
+    """RMS epsilon and RoPE base must define finite, positive operations."""
+    qk = torch.empty(1, 5 * 128, dtype=torch.bfloat16, device="cuda")
+    slots = torch.zeros(1, dtype=torch.int32, device="cuda")
+    weights = torch.ones(128, dtype=torch.bfloat16, device="cuda")
+    positions = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    with pytest.raises(RuntimeError, match=message):
+        _run(
+            qk,
+            _strided_cache(1),
+            slots,
+            weights,
+            weights,
+            positions,
+            **kwargs,
         )
 
 
