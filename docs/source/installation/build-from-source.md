@@ -21,7 +21,6 @@ git lfs install
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
-git submodule update --init --recursive
 git lfs pull
 ```
 
@@ -118,6 +117,8 @@ Related knobs for shared-storage workflows:
 - `--use-3rdparty-cache`: cache FetchContent git clones as bare repos under `TRTLLM_FETCHCONTENT_CACHE` (defaults to `3rdparty/.cache_3rdparty`), avoiding repeated full clones after a clean.
 
 Plain local-disk builds are unaffected: without `--build_root`, all paths behave as before.
+
+Artifact copy-back into the checkout (`tensorrt_llm/include`, the `deep_gemm`/`deep_ep`/`flash_mla` Python trees) is incremental: directory trees are populated once via a streamed tar pipeline and then kept in sync by size/mtime comparison, so a rebuild rewrites only what changed instead of re-copying ~10k files onto the (possibly network) filesystem.
 
 #### Out-of-tree wheel builds (read-only checkout)
 
