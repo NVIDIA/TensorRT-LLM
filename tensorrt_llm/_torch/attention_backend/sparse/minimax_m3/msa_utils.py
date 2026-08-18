@@ -77,6 +77,20 @@ def msa_decode_span_bounds(metadata, num_tokens: int) -> Tuple[int, int, int, in
     return 0, 0, num_tokens // query_len, query_len
 
 
+def msa_ported_decode_owns_batch(metadata, num_tokens: int) -> bool:
+    """Whether the ported decode kernels produce every row of this step.
+
+    True on a pure-decode step, false on a mixed one, where fmha_sm100 keeps
+    the context prefix. Only the first case lets a producer epilogue speak for
+    the whole output tensor, which is what folding the o_proj quantize into the
+    sparse decode kernel needs.
+    """
+    if not msa_ported_decode_active(metadata):
+        return False
+    token_first, _, _, _ = msa_decode_span_bounds(metadata, num_tokens)
+    return token_first == 0
+
+
 @functools.lru_cache(maxsize=1)
 def _find_msa_python_dir() -> Optional[Path]:
     """Locate the fmha_sm100 package dir by walking up from this file.
@@ -305,6 +319,7 @@ __all__ = [
     "msa_package_available",
     "msa_paged_kv",
     "msa_ported_decode_active",
+    "msa_ported_decode_owns_batch",
     "per_token_valid_blocks",
     "require_msa_module",
     "select_blocks_from_maxscore",

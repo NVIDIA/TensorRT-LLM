@@ -917,6 +917,12 @@ class AttentionForwardArgs:
     output: Optional[torch.Tensor] = None
     output_sf: Optional[torch.Tensor] = None
 
+    # An MXFP8 copy of `output`, written alongside it by backends that can, so
+    # the consuming projection skips its own mxfp8_quantize. Unlike output_sf
+    # these do not replace `output`, which is still written in full.
+    output_mxfp8: Optional[torch.Tensor] = None
+    output_mxfp8_sf: Optional[torch.Tensor] = None
+
     out_scale: Optional[torch.Tensor] = None
     out_scale_sf: Optional[torch.Tensor] = None
     kv_scale_orig_quant: Optional[torch.Tensor] = None

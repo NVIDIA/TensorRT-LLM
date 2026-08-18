@@ -81,6 +81,10 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
     RMS_NORM = 9,
+    // Residual + RMSNorm emitting both the norm result and its MXFP8 form: E4M3 values
+    // with one E8M0 block scale per 32 elements, in the SWIZZLED layout the CUTLASS
+    // block-scaled GEMM reads. MXFP8 needs no global scale, so `scale` is unused.
+    RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8 = 10,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -99,6 +103,7 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
         os << "MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM";
         break;
     case AllReduceFusionOp::RMS_NORM: os << "RMS_NORM"; break;
+    case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8: os << "RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8"; break;
     default: os << "UNKNOWN"; break;
     }
     return os;

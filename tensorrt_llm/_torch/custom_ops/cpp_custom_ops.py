@@ -56,6 +56,14 @@ def _register_fake():
             norm_out = torch.empty_like(input)
             residual_out = torch.empty_like(input)
             return [norm_out, quant_fp4, scale_fp4, residual_out]
+        elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8):
+            norm_out = torch.empty_like(input)
+            quant_fp8 = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+            scale_fp8 = input.new_empty(fp4_utils.get_mxfp8_sf_size(
+                input.shape),
+                                        dtype=torch.uint8)
+            residual_out = torch.empty_like(input)
+            return [norm_out, quant_fp8, scale_fp8, residual_out]
         else:
             return [torch.empty_like(input)]
 

@@ -38,6 +38,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
+    MiniMaxM3DecoderLayer,
     MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
     _load_qkv_index_proj_weights,
@@ -55,7 +56,9 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
+from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
@@ -1399,3 +1402,150 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
     plain_ref = torch.nn.functional.silu(gate_c) * up_c
     plain = swiglu(gate_up, swiglu_limit=limit)
     torch.testing.assert_close(plain.float(), plain_ref.float(), atol=atol, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Boundary AllReduce folding the next layer's qkv MXFP8 quantize
+# ---------------------------------------------------------------------------
+#
+# The layer-boundary AllReduce+RMSNorm can emit the next layer's qkv activation
+# in MXFP8, saving that projection a standalone quantize launch. Which op the
+# boundary asks for has to depend only on things fixed at load time, or a
+# traced graph would carry one step's answer into every other step. These pin
+# the predicate and that the boundary passes the carrier along.
+
+
+def _mxfp8_quant_method(*, use_cutlass=True):
+    """An MXFP8LinearMethod without running __init__.
+
+    Constructing one probes for the compiled CUTLASS op and a Blackwell
+    device, neither of which this test has or needs: the predicate only reads
+    the type and use_cutlass.
+    """
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = use_cutlass
+    return method
+
+
+def _boundary_layer(**overrides):
+    layer = SimpleNamespace(
+        post_feed_forward_fusion=True,
+        next_layer_qkv_proj=SimpleNamespace(
+            quant_method=_mxfp8_quant_method(),
+            in_features=6144,
+            lora=None,
+            use_fused_gemm_allreduce=False,
+        ),
+    )
+    for key, value in overrides.items():
+        if key.startswith("proj_"):
+            setattr(layer.next_layer_qkv_proj, key[len("proj_") :], value)
+        else:
+            setattr(layer, key, value)
+    # The boundary norm consults the predicate through self, which a namespace
+    # does not resolve to the class the way an instance would.
+    layer._boundary_folds_qkv_mxfp8 = MiniMaxM3DecoderLayer._boundary_folds_qkv_mxfp8.__get__(layer)
+    return layer
+
+
+def _folds(**overrides):
+    return _boundary_layer(**overrides)._boundary_folds_qkv_mxfp8()
+
+
+def test_boundary_folds_qkv_mxfp8_when_the_next_projection_wants_it():
+    assert _folds() is True
+
+
+@pytest.mark.parametrize(
+    "overrides, why",
+    [
+        # setup_aliases leaves this None on the last layer, whose boundary norm
+        # feeds the LM head rather than a projection.
+        ({"next_layer_qkv_proj": None}, "no next layer"),
+        # Single GPU or attention-DP: there is no AllReduce to fold into.
+        ({"post_feed_forward_fusion": False}, "no POST fusion"),
+        ({"proj_quant_method": None}, "projection is not MXFP8"),
+        ({"proj_quant_method": _mxfp8_quant_method(use_cutlass=False)}, "dequant path"),
+        ({"proj_in_features": 6144 - 16}, "hidden not a multiple of 32"),
+        # 6112/32 = 191 scale columns, so the swizzled layout would pad columns
+        # the epilogue never writes.
+        ({"proj_in_features": 6144 - 32}, "hidden pads scale columns"),
+        ({"proj_lora": object()}, "LoRA reads the unquantized activation"),
+        ({"proj_use_fused_gemm_allreduce": True}, "fused GEMM+AllReduce"),
+    ],
+)
+def test_boundary_declines_the_qkv_fold(overrides, why):
+    assert _folds(**overrides) is False, why
+
+
+def test_boundary_qkv_fold_honors_the_kill_switch(monkeypatch):
+    monkeypatch.setattr("tensorrt_llm._torch.models.modeling_minimaxm3._FUSE_QKV_MXFP8", False)
+    assert _folds() is False
+
+
+def test_boundary_norm_returns_the_mxfp8_carrier_when_it_folds():
+    """The folding boundary must return the quantized activation alongside the
+    bf16 norm, not in place of it: the index projection, the spec-decoding
+    capture and the final norm all still read the bf16.
+    """
+    calls = []
+    fp8 = torch.empty((4, 6144), dtype=torch.float8_e4m3fn)
+    sf = torch.empty(128 * 192, dtype=torch.uint8)
+    norm, residual = torch.zeros(4, 6144), torch.ones(4, 6144)
+
+    def fake_allreduce(hidden_states, all_reduce_params):
+        calls.append(all_reduce_params.fusion_op)
+        return norm, fp8, sf, residual
+
+    layer = _boundary_layer(
+        allreduce=fake_allreduce,
+        next_layer_layernorm=SimpleNamespace(weight=torch.ones(6144), variance_epsilon=1e-5),
+    )
+    out_norm, out_mxfp8, out_residual = MiniMaxM3DecoderLayer._apply_next_layer_layernorm(
+        layer, torch.zeros(4, 6144), torch.zeros(4, 6144)
+    )
+
+    assert calls == [AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8]
+    assert out_norm is norm
+    assert out_residual is residual
+    assert out_mxfp8.fp8_tensor is fp8
+    assert out_mxfp8.scaling_factor is sf
+    # The GEMM reads swizzled block scales; the epilogue emits that layout.
+    assert out_mxfp8.is_sf_swizzled
+
+
+def test_boundary_norm_stays_on_the_plain_op_when_it_cannot_fold():
+    calls = []
+    norm, residual = torch.zeros(4, 6144), torch.ones(4, 6144)
+
+    def fake_allreduce(hidden_states, all_reduce_params):
+        calls.append(all_reduce_params.fusion_op)
+        return norm, residual
+
+    layer = _boundary_layer(
+        next_layer_qkv_proj=None,
+        allreduce=fake_allreduce,
+        next_layer_layernorm=SimpleNamespace(weight=torch.ones(6144), variance_epsilon=1e-5),
+    )
+    out_norm, out_mxfp8, out_residual = MiniMaxM3DecoderLayer._apply_next_layer_layernorm(
+        layer, torch.zeros(4, 6144), torch.zeros(4, 6144)
+    )
+
+    assert calls == [AllReduceFusionOp.RESIDUAL_RMS_NORM]
+    assert out_mxfp8 is None
+    assert out_norm is norm
+    assert out_residual is residual
+
+
+def test_boundary_norm_without_setup_aliases_passes_through():
+    """A standalone construction never runs setup_aliases, so the layer has no
+    boundary norm and the model applies the final norm itself.
+    """
+    hidden, residual = torch.zeros(4, 6144), torch.ones(4, 6144)
+    layer = _boundary_layer(next_layer_layernorm=None)
+    out_norm, out_mxfp8, out_residual = MiniMaxM3DecoderLayer._apply_next_layer_layernorm(
+        layer, hidden, residual
+    )
+    assert out_norm is hidden
+    assert out_mxfp8 is None
+    assert out_residual is residual

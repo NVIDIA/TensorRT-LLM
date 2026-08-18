@@ -1798,6 +1798,8 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
             output,
             kv_block_indexes=kv_block_indexes,
             plan=plan,
+            output_mxfp8=forward_args.output_mxfp8,
+            output_mxfp8_sf=forward_args.output_mxfp8_sf,
         )
 
 

@@ -998,6 +998,85 @@ def test_paged_gqa_raises_when_a_committed_dense_step_declines():
         )
 
 
+def _decode_span(token_first, row_first, row_last, query_len):
+    """The fields msa_decode_span_bounds reads off a resolved span."""
+    return SimpleNamespace(
+        token_first=token_first,
+        row_first=row_first,
+        row_last=row_last,
+        query_len=query_len,
+    )
+
+
+def _mxfp8_fold_metadata(**overrides):
+    """Metadata for a two-row pure-decode step, before any override."""
+    fields = dict(
+        kv_cache_manager=SimpleNamespace(
+            get_buffers=lambda layer_idx, kv_layout=None: torch.zeros(4, 2, 1, 16, 128)
+        ),
+        msa_decode_query_len=1,
+        msa_block_table=torch.zeros(2, 1, dtype=torch.int32),
+        msa_seq_lens_cuda=torch.zeros(2, dtype=torch.int32),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+@pytest.mark.parametrize(
+    "name,overrides,sparse",
+    [
+        # No span at all: a pure-prefill step, entirely fmha_sm100's.
+        ("no span", dict(msa_decode_query_len=None), True),
+        # A mixed batch, whose context prefix fmha_sm100 keeps.
+        ("mixed batch", dict(msa_decode_span=_decode_span(1, 1, 2, 1)), True),
+        # A dense layer, which has no sparse decode kernel to fold into.
+        ("dense layer", {}, False),
+    ],
+)
+def test_paged_gqa_refuses_an_mxfp8_output_it_cannot_fill(name, overrides, sparse):
+    """The o_proj GEMM cannot tell a partially quantized input from a whole one,
+    so a caller that asks for one on the wrong step has to be stopped rather
+    than served the rows this path does happen to write."""
+    from tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa import run_msa_paged_gqa
+
+    num_heads, head_dim = 8, 128
+    attention = MiniMaxM3MsaSparseAttention.__new__(MiniMaxM3MsaSparseAttention)
+    attention.layer_idx = 3
+    attention.head_dim = head_dim
+    attention.num_heads = num_heads
+    attention.q_scaling = 1.0
+
+    hidden = num_heads * head_dim
+    with pytest.raises(RuntimeError, match=r"does not own end to end"):
+        run_msa_paged_gqa(
+            attention,
+            torch.zeros(2, hidden),
+            None,
+            None,
+            _mxfp8_fold_metadata(**overrides),
+            torch.zeros(2, hidden),
+            kv_block_indexes=torch.zeros(2, 1, 4, dtype=torch.int32) if sparse else None,
+            plan=None,
+            output_mxfp8=torch.zeros(2, hidden, dtype=torch.float8_e4m3fn),
+            output_mxfp8_sf=torch.zeros(128 * hidden // 32, dtype=torch.uint8),
+        )
+
+
+def test_ported_decode_owns_batch_only_without_a_context_prefix():
+    """The predicate the o_proj fold turns on. A span starting at token 0 is the
+    whole step; anything later leaves rows to fmha_sm100."""
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_ported_decode_owns_batch,
+    )
+
+    assert msa_ported_decode_owns_batch(_mxfp8_fold_metadata(), 2)
+    assert not msa_ported_decode_owns_batch(
+        _mxfp8_fold_metadata(msa_decode_span=_decode_span(1, 1, 2, 1)), 2
+    )
+    # A step that never resolved a span has no ported kernels at all.
+    assert not msa_ported_decode_owns_batch(_mxfp8_fold_metadata(msa_decode_query_len=None), 2)
+
+
 def test_per_token_valid_blocks_multi_token_decode():
     """Spec-verify decode rows expose one entry per query TOKEN, walking the
     causal ladder within the verify window."""

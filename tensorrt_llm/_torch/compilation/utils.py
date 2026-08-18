@@ -192,7 +192,9 @@ def inplace_info():
             1: "output"
         },
         "minimax_m3_attn_custom_op_inplace": {
-            1: "output"
+            1: "output",
+            2: "output_mxfp8",
+            3: "output_mxfp8_sf"
         },
     }
     for op_name, mutates_args in optional_inplace_infos.items():
