@@ -40,7 +40,12 @@ from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.inputs.registry import (
     MultimodalEncoderItemMetadata,
     get_multimodal_encoder_item_metadata,
@@ -54,6 +59,7 @@ from .modeling_multimodal_utils import (
     fuse_input_embeds,
     get_multimodal_embeddings,
 )
+from .multimodal_encoder_data_parallel import EncoderDpItem, execute_encoder_dp_items
 
 
 class MultimodalEncoderContractError(ValueError):
@@ -365,18 +371,11 @@ def make_multimodal_encoder_model_config(model_config: ModelConfig) -> ModelConf
 
 
 @dataclass(frozen=True)
-class _EncoderDpWork:
+class _EncoderDpInput:
+    """Locate one DP work item in the caller's multimodal params."""
+
     param_index: int
     item_index: Optional[int]
-    global_row_start: int
-    row_count: int
-
-
-@dataclass(frozen=True)
-class _EncoderDpPlacement:
-    local_row_start: int
-    global_row_start: int
-    row_count: int
 
 
 def _build_request_multimodal_input(
@@ -510,6 +509,9 @@ class MultimodalModelMixin:
 
     supports_encoder_cache: ClassVar[bool] = False
     """Whether the model's production forward path uses the persistent encoder cache."""
+
+    supports_encoder_data_parallel: ClassVar[bool] = False
+    """Whether the model constructs a replicated encoder for encoder DP."""
 
     supports_mm_encoder_item_scheduling: ClassVar[bool] = False
     """Whether the model supports item-level MM encoder scheduling: it implements the item-encode
@@ -678,7 +680,7 @@ class MultimodalModelMixin:
         def flush_group() -> None:
             if not group_params:
                 return
-            embeddings = self.encode_multimodal_inputs(group_params)
+            embeddings = self._run_multimodal_encoder(group_params)
             expected_length = sum(group_lengths)
             if embeddings.shape[0] != expected_length:
                 raise MultimodalEncoderContractError(
@@ -733,7 +735,12 @@ class MultimodalModelMixin:
     def encoder_data_parallel_active(self) -> bool:
         """Whether encoder items are distributed over the model's TP group."""
         mapping = self.model_config.mapping
-        return not mapping.enable_attention_dp and self.encoder_data_parallel_size > 1
+        encoder_dp_size = self.encoder_data_parallel_size
+        if encoder_dp_size > 1 and not self.supports_encoder_data_parallel:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support multimodal encoder data parallelism."
+            )
+        return not mapping.enable_attention_dp and encoder_dp_size > 1
 
     def _get_encoder_dp_allreduce(self) -> AllReduce:
         allreduce = getattr(self, "_encoder_dp_allreduce", None)
@@ -782,19 +789,19 @@ class MultimodalModelMixin:
         features = modality_data.get(feature_key)
         return isinstance(features, torch.Tensor) and features.shape[0] == item_count
 
-    def _plan_encoder_dp_work(
+    def _build_encoder_dp_items(
         self,
         multimodal_params: Sequence[MultimodalParams],
-    ) -> Optional[tuple[list[MultimodalParams], list[_EncoderDpPlacement], int]]:
-        """Assign atomic encoder items to this TP rank.
+    ) -> Optional[tuple[list[EncoderDpItem], dict[int, _EncoderDpInput]]]:
+        """Adapt upstream/main ``MultimodalParams`` to the DP-core contract.
 
-        Returns ``None`` when row metadata is unavailable. That path is used by
-        encoder memory profiling and deliberately executes the full dummy input
-        on every rank.
+        Scheduler item metadata supplies physical encoder-token costs. Older
+        inputs without that metadata use output rows as a fallback cost. The
+        adapter falls back to one work descriptor per request when the common
+        raw-item slicer cannot safely partition that request.
         """
-        mapping = self.model_config.mapping
-        works: list[_EncoderDpWork] = []
-        global_row_start = 0
+        items: list[EncoderDpItem] = []
+        item_inputs: dict[int, _EncoderDpInput] = {}
 
         for param_index, param in enumerate(multimodal_params):
             raw_lengths = param.multimodal_data.get("multimodal_embedding_lengths")
@@ -803,69 +810,68 @@ class MultimodalModelMixin:
             lengths = [int(length) for length in raw_lengths]
             if any(length <= 0 for length in lengths):
                 raise ValueError("multimodal_embedding_lengths must contain positive values.")
+            item_metadata = get_multimodal_encoder_item_metadata(param.multimodal_data)
+            if item_metadata is None:
+                input_token_lengths = lengths
+            else:
+                if item_metadata.output_embedding_lengths != lengths:
+                    raise ValueError(
+                        "MM encoder item metadata output lengths must match "
+                        "multimodal_embedding_lengths."
+                    )
+                input_token_lengths = item_metadata.encoder_token_lengths
 
             if self._supports_encoder_item_partition(param):
                 for item_index, row_count in enumerate(lengths):
-                    works.append(
-                        _EncoderDpWork(
-                            param_index=param_index,
-                            item_index=item_index,
-                            global_row_start=global_row_start,
-                            row_count=row_count,
-                        )
+                    item = EncoderDpItem(
+                        ordinal=len(items),
+                        input_token_count=input_token_lengths[item_index],
+                        output_row_count=row_count,
                     )
-                    global_row_start += row_count
+                    items.append(item)
+                    item_inputs[item.ordinal] = _EncoderDpInput(
+                        param_index=param_index,
+                        item_index=item_index,
+                    )
             else:
                 row_count = sum(lengths)
-                works.append(
-                    _EncoderDpWork(
-                        param_index=param_index,
-                        item_index=None,
-                        global_row_start=global_row_start,
-                        row_count=row_count,
-                    )
+                item = EncoderDpItem(
+                    ordinal=len(items),
+                    input_token_count=sum(input_token_lengths),
+                    output_row_count=row_count,
                 )
-                global_row_start += row_count
+                items.append(item)
+                item_inputs[item.ordinal] = _EncoderDpInput(
+                    param_index=param_index,
+                    item_index=None,
+                )
 
-        rank_loads = [0] * mapping.tp_size
-        rank_works: list[list[_EncoderDpWork]] = [[] for _ in range(mapping.tp_size)]
-        for work in sorted(works, key=lambda item: (-item.row_count, item.global_row_start)):
-            target_rank = min(range(mapping.tp_size), key=lambda rank: (rank_loads[rank], rank))
-            rank_works[target_rank].append(work)
-            rank_loads[target_rank] += work.row_count
+        return items, item_inputs
 
-        selected = sorted(rank_works[mapping.tp_rank], key=lambda item: item.global_row_start)
-        selected_by_param: dict[int, list[_EncoderDpWork]] = {}
-        for work in selected:
-            selected_by_param.setdefault(work.param_index, []).append(work)
-
+    def _prepare_encoder_dp_inputs(
+        self,
+        local_items: Sequence[EncoderDpItem],
+        multimodal_params: Sequence[MultimodalParams],
+        item_inputs: dict[int, _EncoderDpInput],
+    ) -> list[MultimodalParams]:
+        """Slice raw inputs for DP work assigned to this rank."""
+        selected = [item_inputs[item.ordinal] for item in local_items]
         local_params: list[MultimodalParams] = []
-        placements: list[_EncoderDpPlacement] = []
-        local_row_start = 0
-        for param_index, param in enumerate(multimodal_params):
-            param_works = selected_by_param.get(param_index)
-            if not param_works:
+        for param_index, grouped_items_iter in itertools.groupby(
+            selected, key=lambda item_input: item_input.param_index
+        ):
+            grouped_items = list(grouped_items_iter)
+            param = multimodal_params[param_index]
+            if len(grouped_items) == 1 and grouped_items[0].item_index is None:
+                local_params.append(param)
                 continue
-
-            if param_works[0].item_index is None:
-                local_param = param
-            else:
-                item_indices = [work.item_index for work in param_works]
-                local_param = self.build_multimodal_encoder_input(param, item_indices)
-                self._apply_metadata_slice(local_param, param, item_indices)
+            if any(item.item_index is None for item in grouped_items):
+                raise ValueError("Encoder DP adapter cannot mix request-level and item-level work.")
+            item_indices = [int(item.item_index) for item in grouped_items]
+            local_param = self.build_multimodal_encoder_input(param, item_indices)
+            self._apply_metadata_slice(local_param, param, item_indices)
             local_params.append(local_param)
-
-            for work in param_works:
-                placements.append(
-                    _EncoderDpPlacement(
-                        local_row_start=local_row_start,
-                        global_row_start=work.global_row_start,
-                        row_count=work.row_count,
-                    )
-                )
-                local_row_start += work.row_count
-
-        return local_params, placements, global_row_start
+        return local_params
 
     def _run_multimodal_encoder(
         self,
@@ -874,7 +880,10 @@ class MultimodalModelMixin:
     ) -> torch.Tensor:
         """Run the model encoder with the configured multimodal DP behavior."""
         params = list(multimodal_params)
-        mapping = self.model_config.mapping
+        model_config = getattr(self, "model_config", None)
+        if model_config is None:
+            return self.encode_multimodal_inputs(params, **encoder_kwargs)
+        mapping = model_config.mapping
 
         # Attention DP has already routed different requests to each rank.
         # Its encoder weights are replicated, so no inner partition or gather
@@ -888,31 +897,43 @@ class MultimodalModelMixin:
                 f"parallel size ({mapping.tp_size}), got {self.encoder_data_parallel_size}."
             )
 
+        encoder_dp_inputs = self._build_encoder_dp_items(params)
+        if encoder_dp_inputs is not None:
+            items, item_inputs = encoder_dp_inputs
+
+            def prepare_local_inputs(
+                local_items: Sequence[EncoderDpItem],
+            ) -> list[MultimodalParams]:
+                return self._prepare_encoder_dp_inputs(
+                    local_items,
+                    params,
+                    item_inputs,
+                )
+
+            def encode_local_inputs(local_params: list[MultimodalParams]) -> torch.Tensor:
+                return self.encode_multimodal_inputs(local_params, **encoder_kwargs)
+
+            embedding_weight = self.text_embedding_layer.weight
+            return execute_encoder_dp_items(
+                items,
+                rank=mapping.tp_rank,
+                num_ranks=mapping.tp_size,
+                prepare_local_inputs=prepare_local_inputs,
+                encode_local_inputs=encode_local_inputs,
+                allreduce=self._allreduce_encoder_dp_tensor,
+                output_dim=self.embedding_dim,
+                output_dtype=self.embedding_dtype,
+                output_device=embedding_weight.device,
+            )
+
+        # Encoder memory profiling omits the row metadata needed for work
+        # partitioning, so every rank measures the full dummy encoder. Retain a
+        # status collective so a rank-local profiling failure is not observed as
+        # success by peer ranks.
         local_error: Optional[Exception] = None
         local_output: Optional[torch.Tensor] = None
-        plan: Optional[tuple[list[MultimodalParams], list[_EncoderDpPlacement], int]] = None
         try:
-            plan = self._plan_encoder_dp_work(params)
-            if plan is None:
-                # Memory profiling omits the row metadata needed for work
-                # partitioning, so every rank measures the full dummy encoder.
-                local_output = self.encode_multimodal_inputs(params, **encoder_kwargs)
-            else:
-                local_params, placements, _ = plan
-                if local_params:
-                    local_output = self.encode_multimodal_inputs(local_params, **encoder_kwargs)
-                    expected_local_rows = sum(placement.row_count for placement in placements)
-                    if local_output.shape[0] != expected_local_rows:
-                        raise ValueError(
-                            "Multimodal encoder returned an unexpected number of rows: "
-                            f"expected {expected_local_rows}, got {local_output.shape[0]}."
-                        )
-                    if local_output.ndim != 2 or local_output.shape[1] != self.embedding_dim:
-                        raise ValueError(
-                            "Multimodal encoder output shape does not match the model embedding "
-                            f"shape: expected (*, {self.embedding_dim}), "
-                            f"got {tuple(local_output.shape)}."
-                        )
+            local_output = self.encode_multimodal_inputs(params, **encoder_kwargs)
         except Exception as error:
             # Every rank must reach the status collective; otherwise a local
             # preprocessing/encoder failure would strand its peers in the data
@@ -931,28 +952,9 @@ class MultimodalModelMixin:
                 raise RuntimeError("Multimodal encoder data-parallel rank failed.") from local_error
             raise RuntimeError("Multimodal encoder data-parallel peer rank failed.")
 
-        if plan is None:
-            assert local_output is not None
-            return local_output
-        _, placements, total_rows = plan
-
-        output = torch.zeros(
-            (total_rows, self.embedding_dim),
-            dtype=self.embedding_dtype,
-            device=embedding_weight.device,
-        )
-        if local_output is not None:
-            for placement in placements:
-                local_slice = slice(
-                    placement.local_row_start,
-                    placement.local_row_start + placement.row_count,
-                )
-                global_slice = slice(
-                    placement.global_row_start,
-                    placement.global_row_start + placement.row_count,
-                )
-                output[global_slice].copy_(local_output[local_slice])
-        return self._allreduce_encoder_dp_tensor(output)
+        if local_output is None:
+            raise RuntimeError("Multimodal encoder profiling produced no output.")
+        return local_output
 
     @property
     def encoder_cache_active(self) -> bool:
@@ -1210,12 +1212,6 @@ class MultimodalModelMixin:
             # concat the requested subset in item-index order.
             grids = modality_data[grid_key]
             n_items = grids.shape[0]
-            embedding_lengths = param.multimodal_data.get("multimodal_embedding_lengths")
-            if isinstance(embedding_lengths, list) and n_items != len(embedding_lengths):
-                raise NotImplementedError(
-                    f"Default `build_multimodal_encoder_input` cannot map {n_items} "
-                    f"{modality} grids to {len(embedding_lengths)} items."
-                )
             patch_counts = [int(c) for c in torch.prod(grids, dim=1).tolist()]
             row_starts = list(itertools.accumulate(patch_counts, initial=0))
             if indices == list(range(indices[0], indices[0] + len(indices))):
@@ -1275,12 +1271,6 @@ class MultimodalModelMixin:
                 "input_features" if "input_features" in modality_data else "audio_features"
             )
             n_items = modality_data[feature_key].shape[0]
-            embedding_lengths = param.multimodal_data.get("multimodal_embedding_lengths")
-            if isinstance(embedding_lengths, list) and n_items != len(embedding_lengths):
-                raise NotImplementedError(
-                    f"Default `build_multimodal_encoder_input` cannot map {n_items} "
-                    f"{modality} input rows to {len(embedding_lengths)} items."
-                )
             sliced = {feature_key: modality_data[feature_key][indices]}
         else:
             raise NotImplementedError(
@@ -1734,6 +1724,19 @@ class MultimodalModelMixin:
         residual.multimodal_data["multimodal_embedding_lengths"] = [
             source_lengths[i] for i in item_indices
         ]
+        source_metadata = get_multimodal_encoder_item_metadata(source.multimodal_data)
+        if source_metadata is not None:
+            residual.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = (
+                MultimodalEncoderItemMetadata(
+                    item_refs=[source_metadata.item_refs[i] for i in item_indices],
+                    encoder_token_lengths=[
+                        source_metadata.encoder_token_lengths[i] for i in item_indices
+                    ],
+                    output_embedding_lengths=[
+                        source_metadata.output_embedding_lengths[i] for i in item_indices
+                    ],
+                )
+            )
         if residual.multimodal_input is not None and source.multimodal_input is not None:
             source_hashes = source.multimodal_input.multimodal_hashes
             residual.multimodal_input.multimodal_hashes = [source_hashes[i] for i in item_indices]
