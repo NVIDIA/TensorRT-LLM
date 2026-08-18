@@ -93,8 +93,8 @@ from safetensors import safe_open
 from torch import nn
 
 from ..._utils import is_sm_100f
+from ...distributed.mapping import Mapping
 from ...logger import logger
-from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention_backend import AttentionMetadata
 from ..distributed import AllReduce, AllReduceParams, AllReduceStrategy

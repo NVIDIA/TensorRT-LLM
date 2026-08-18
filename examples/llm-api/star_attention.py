@@ -7,8 +7,8 @@ from difflib import SequenceMatcher
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.distributed.mapping import CpType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.mapping import CpType
 
 
 def dump_jsonl(data, fname):

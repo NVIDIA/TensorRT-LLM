@@ -41,7 +41,7 @@ from mpi4py.futures import MPIPoolExecutor
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import allgather
 from tensorrt_llm._torch.distributed.symm_mem_allgather import SymmetricMemoryAllGather
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(

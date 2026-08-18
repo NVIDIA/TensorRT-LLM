@@ -1115,7 +1115,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/llmapi/mgmn_worker_node.py",
         "tensorrt_llm/llmapi/mpi_session.py",
         "tensorrt_llm/llmapi/trtllm-llmapi-launch",
-        "tensorrt_llm/mapping.py",
+        "tensorrt_llm/distributed/mapping.py",
         "tensorrt_llm/models/llama/",
         "tensorrt_llm/parameter.py",
         "tensorrt_llm/serve/cluster_storage.py",

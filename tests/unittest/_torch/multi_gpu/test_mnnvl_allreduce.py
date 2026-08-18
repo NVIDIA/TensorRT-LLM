@@ -27,8 +27,8 @@ import tensorrt_llm
 import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(

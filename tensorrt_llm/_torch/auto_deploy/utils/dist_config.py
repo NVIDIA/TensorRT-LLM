@@ -15,7 +15,7 @@
 
 """Self-contained distributed configuration for AutoDeploy sharding.
 
-``DistConfig`` replaces the dependency on ``tensorrt_llm.mapping.Mapping``
+``DistConfig`` replaces the dependency on ``tensorrt_llm.distributed.mapping.Mapping``
 within AutoDeploy.  It carries the minimal set of parallelism parameters
 needed by the sharding transforms and custom ops, plus serialization
 support for graph-level metadata (e.g., MoE all-to-all dispatch).
@@ -113,7 +113,7 @@ class DistConfig(BaseModel):
 
     @staticmethod
     def from_mapping(mapping: Any) -> "DistConfig":
-        """Construct from a ``tensorrt_llm.mapping.Mapping`` instance."""
+        """Construct from a ``tensorrt_llm.distributed.mapping.Mapping`` instance."""
         return DistConfig(
             world_size=mapping.world_size,
             rank=mapping.rank,
@@ -154,8 +154,8 @@ class DistConfig(BaseModel):
         )
 
     def to_mapping(self) -> Any:
-        """Convert back to a ``tensorrt_llm.mapping.Mapping`` for C++ op interop."""
-        from tensorrt_llm.mapping import Mapping  # will be deprecated by DistConfig
+        """Convert back to a ``tensorrt_llm.distributed.mapping.Mapping`` for C++ op interop."""
+        from tensorrt_llm.distributed.mapping import Mapping  # will be deprecated by DistConfig
 
         return Mapping(
             world_size=self.world_size,

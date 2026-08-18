@@ -281,7 +281,7 @@ def _worker_symm_mem_corruption(world_size, port):
     )
     from tensorrt_llm._torch.auto_deploy.utils.node_utils import all_reduce_ops, is_op
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
 
     if not is_trtllm_op_available():
         return "skip:no_trtllm_ops"

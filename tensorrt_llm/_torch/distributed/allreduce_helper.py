@@ -23,8 +23,8 @@ from tensorrt_llm.bindings.internal.runtime import (
     lamport_initialize,
     max_workspace_size_lowprecision,
 )
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 
 def force_all_reduce_deterministic():

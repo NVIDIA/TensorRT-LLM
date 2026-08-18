@@ -7,11 +7,11 @@ from typing import (Any, Callable, Dict, Iterator, List, NamedTuple, Optional,
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig,
                                           SeqLenAwareSparseAttentionConfig)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed

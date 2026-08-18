@@ -43,7 +43,7 @@ def run_single_rank(dtype, strategy, message_size):
 
     import tensorrt_llm
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
 
     torch.set_printoptions(threshold=10000)
 

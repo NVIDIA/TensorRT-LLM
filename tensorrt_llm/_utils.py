@@ -23,7 +23,6 @@ import socket
 import struct
 import sys
 import tempfile
-import threading
 import trace
 import traceback
 import weakref
@@ -35,8 +34,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 import nvtx
-from mpi4py import MPI
-from mpi4py.util import pkl5
 from typing_extensions import ParamSpec
 
 # isort: off
@@ -63,9 +60,39 @@ except ImportError:
     has_nvml = False
 # isort: on
 
+from tensorrt_llm.bindings import BuildInfo as _BuildInfo
 from tensorrt_llm.bindings import DataType, LayerType, steady_clock_now
-from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.distributed import mpi as _mpi
 from tensorrt_llm.logger import logger
+
+# Bound here for callers that still reach for these on this module.  Written
+# as assignments rather than imports because isort splits a re-export block
+# into single-name statements and autoflake then deletes the ones this file
+# does not itself call.  The mutable communicator globals are deliberately
+# absent: a copy taken here would not follow the one set_mpi_comm() rebinds.
+ENABLE_MULTI_DEVICE = _BuildInfo.ENABLE_MULTI_DEVICE
+OMPI_COMM_TYPE_HOST = _mpi.OMPI_COMM_TYPE_HOST
+global_mpi_rank = _mpi.global_mpi_rank
+global_mpi_size = _mpi.global_mpi_size
+local_mpi_barrier = _mpi.local_mpi_barrier
+local_mpi_comm = _mpi.local_mpi_comm
+local_mpi_rank = _mpi.local_mpi_rank
+local_mpi_size = _mpi.local_mpi_size
+mpi_allgather = _mpi.mpi_allgather
+mpi_barrier = _mpi.mpi_barrier
+mpi_broadcast = _mpi.mpi_broadcast
+mpi_comm = _mpi.mpi_comm
+mpi_disabled = _mpi.mpi_disabled
+mpi_isend = _mpi.mpi_isend
+mpi_isend_object = _mpi.mpi_isend_object
+mpi_rank = _mpi.mpi_rank
+mpi_recv = _mpi.mpi_recv
+mpi_recv_object = _mpi.mpi_recv_object
+mpi_send = _mpi.mpi_send
+mpi_send_object = _mpi.mpi_send_object
+mpi_world_size = _mpi.mpi_world_size
+set_mpi_comm = _mpi.set_mpi_comm
+set_thread_local_mpi_comm = _mpi.set_thread_local_mpi_comm
 
 # numpy doesn't know bfloat16, define abstract binary type instead
 np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
@@ -408,38 +435,6 @@ def get_free_ports(num=1) -> List[int]:
     return ports
 
 
-# mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
-OMPI_COMM_TYPE_HOST = 9
-
-comm = pkl5.Intracomm(MPI.COMM_WORLD)
-
-
-def set_mpi_comm(new_comm):
-    global comm
-    comm = new_comm
-
-
-thread_local_comm = threading.local()
-
-
-def set_thread_local_mpi_comm(new_comm):
-    thread_local_comm.value = new_comm
-
-
-def mpi_comm():
-    if hasattr(thread_local_comm,
-               "value") and thread_local_comm.value is not None:
-        return thread_local_comm.value
-    return comm
-
-
-local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
-
-
-def local_mpi_comm():
-    return local_comm
-
-
 # Global TorchDist instance for Ray orchestrator
 _torch_comm = None
 
@@ -458,53 +453,6 @@ def torch_comm():
     return _torch_comm
 
 
-def mpi_disabled() -> bool:
-    """True if TLLM_DISABLE_MPI is set to "1", False otherwise."""
-    return os.environ.get("TLLM_DISABLE_MPI") == "1"
-
-
-def mpi_rank():
-    if mpi_disabled():
-        try:
-            return torch.distributed.get_rank()
-        except ValueError:
-            # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
-            return 0
-    return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
-
-
-def global_mpi_rank():
-    if mpi_disabled():
-        # Fallback: return 0 when MPI is absent (Ray / Slurm PMIx)
-        return 0
-
-    return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
-
-
-def global_mpi_size():
-    return MPI.COMM_WORLD.Get_size() if ENABLE_MULTI_DEVICE else 1
-
-
-def mpi_world_size():
-    return mpi_comm().Get_size() if ENABLE_MULTI_DEVICE else 1
-
-
-def local_mpi_rank():
-    if mpi_disabled():
-        # For Ray/non-MPI: the device was already set during worker init
-        # torch.cuda.current_device() returns the correct local device ID
-        try:
-            return torch.cuda.current_device()
-        except ValueError:
-            return 0
-    return mpi_comm().Get_rank() % torch.cuda.device_count(
-    ) if ENABLE_MULTI_DEVICE else 0
-
-
-def local_mpi_size():
-    return local_comm.Get_size() if ENABLE_MULTI_DEVICE else 1
-
-
 def default_gpus_per_node():
     num_gpus = torch.cuda.device_count()
     num_ranks = local_mpi_size()
@@ -512,64 +460,6 @@ def default_gpus_per_node():
     if num_ranks > num_gpus:
         logger.warning(f"{num_ranks} MPI ranks will share {num_gpus} GPUs.")
     return min(num_ranks, num_gpus)
-
-
-def mpi_barrier():
-    if ENABLE_MULTI_DEVICE:
-        mpi_comm().Barrier()
-
-
-def local_mpi_barrier():
-    if ENABLE_MULTI_DEVICE:
-        local_comm.Barrier()
-
-
-def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if global_mpi_size() > 1 else obj
-
-
-def mpi_allgather(obj):
-    return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
-
-
-def mpi_isend(buf, dest, tag=0):
-    # isend in buf-like objects (e.g. numpy array)
-    # return request handle if ENABLE_MULTI_DEVICE
-    if ENABLE_MULTI_DEVICE:
-        return mpi_comm().Isend(buf, dest, tag=tag)
-    return None
-
-
-def mpi_send(buf, dest, tag=0):
-    # send in buf-like objects (e.g. numpy array)
-    # return request handle if ENABLE_MULTI_DEVICE
-    if ENABLE_MULTI_DEVICE:
-        mpi_comm().Send(buf, dest, tag=tag)
-    return None
-
-
-def mpi_recv(buf, source, tag):
-    # recv in buf-like object (e.g. numpy array)
-    if ENABLE_MULTI_DEVICE:
-        return mpi_comm().Recv(buf, source, tag=tag)
-    return None
-
-
-def mpi_send_object(obj, dest, tag=0):
-    if ENABLE_MULTI_DEVICE:
-        mpi_comm().send(obj, dest=dest, tag=tag)
-
-
-def mpi_isend_object(obj, dest, tag=0):
-    if ENABLE_MULTI_DEVICE:
-        return mpi_comm().isend(obj, dest=dest, tag=tag)
-    return None
-
-
-def mpi_recv_object(source, tag):
-    if ENABLE_MULTI_DEVICE:
-        return mpi_comm().recv(source=source, tag=tag)
-    return None
 
 
 def pad_vocab_size(vocab_size, tp_size):

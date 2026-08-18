@@ -20,8 +20,8 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.mapping import Mapping
 
 
 class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):

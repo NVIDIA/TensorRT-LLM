@@ -57,7 +57,7 @@ from transformers import PretrainedConfig
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 # The PerceptionEncoder head_dim is not in the FMHA cubin set, so the vision
 # attention is dispatched through TRT-LLM's ``Attention`` (TRTLLM backend) with

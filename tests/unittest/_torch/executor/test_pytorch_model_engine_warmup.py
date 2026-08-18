@@ -27,9 +27,9 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType,
 )
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-from tensorrt_llm.mapping import Mapping
 
 
 # Minimal fixtures mirroring sibling test_pytorch_model_engine.py — duplicated

@@ -18,12 +18,12 @@ import yaml
 from tensorrt_llm.bindings import internal as tb_internal
 
 from ._utils import release_gc, str_dtype_to_torch, torch_to_numpy
+from .distributed.mapping import Mapping
 from .lora_helper import (
     LoraConfig,
     get_default_trtllm_modules_to_hf_modules,
     get_missing_qkv_modules_from_lora_modules,
 )
-from .mapping import Mapping
 from .models.convert_utils import get_model_path, load_state_dict
 
 if TYPE_CHECKING:

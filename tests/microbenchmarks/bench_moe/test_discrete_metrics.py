@@ -132,7 +132,7 @@ def _current_sm() -> str:
 
 def _build_tiny_moe(backend: str, dtype: torch.dtype):
     """Build a small bf16 MoE via the existing bench_moe builder (single GPU)."""
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
 
     from .build import _build_moe_module
     from .specs import ConfigSpec, ModelSpec

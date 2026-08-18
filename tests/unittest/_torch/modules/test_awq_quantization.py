@@ -9,7 +9,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import DefaultMoeRoutingMethod, create_moe
 from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 

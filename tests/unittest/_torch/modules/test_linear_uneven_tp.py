@@ -25,7 +25,7 @@ from tensorrt_llm._torch.modules.linear import (
     WeightsLoadingConfig,
 )
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 

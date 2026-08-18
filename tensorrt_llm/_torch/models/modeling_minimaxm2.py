@@ -20,8 +20,8 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
-from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams

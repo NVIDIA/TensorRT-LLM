@@ -30,6 +30,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCac
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.inputs import (
     create_input_processor,
     create_input_processor_with_hash,
@@ -38,7 +39,6 @@ from tensorrt_llm.inputs import (
 )
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as PyKvCacheConfig
-from tensorrt_llm.mapping import Mapping
 
 
 @dataclass(repr=False)

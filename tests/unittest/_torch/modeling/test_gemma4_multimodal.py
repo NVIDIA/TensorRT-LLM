@@ -68,13 +68,13 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
     find_input_mm_embeds,
     get_multimodal_embeddings,
 )
+from tensorrt_llm.distributed.mapping import Mapping  # noqa: E402
 from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MultimodalInput,
     MultimodalParams,
     MultimodalRuntimeData,
 )
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig  # noqa: E402
-from tensorrt_llm.mapping import Mapping  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Small configs for unit-level tests

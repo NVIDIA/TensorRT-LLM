@@ -11,8 +11,8 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.runtime as _tbr
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 from ...distributed import AllReduce
 from ...mmap_utils import advise_tensor_pageout

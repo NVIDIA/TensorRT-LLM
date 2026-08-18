@@ -52,7 +52,7 @@ try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _visual_gen_dist_utils import spawn_with_retry
 
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
     from tensorrt_llm.visual_gen.args import AttentionConfig
 
     MODULES_AVAILABLE = True

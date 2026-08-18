@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, CUDAGraphRunnerConfig)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 
 def ceil_div(x: int, y: int) -> int:

@@ -62,8 +62,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
 
 # DSA (DeepSeek-V3.2 sparse attention) imports are done lazily inside the DSA
 # builders below: they pull in DeepGEMM (sm90/sm100/sm103 only) at import time,

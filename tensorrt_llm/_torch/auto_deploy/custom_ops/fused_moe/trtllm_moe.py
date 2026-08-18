@@ -20,7 +20,7 @@ import torch
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 from ..._compat import ActivationType, is_sm_100f
 from ...utils.cuda_graph import cuda_graph_state

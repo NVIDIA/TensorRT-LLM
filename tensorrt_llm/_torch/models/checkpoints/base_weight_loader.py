@@ -5,7 +5,7 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, Tuple, Union
 
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 
 class ConsumableWeightsDict:

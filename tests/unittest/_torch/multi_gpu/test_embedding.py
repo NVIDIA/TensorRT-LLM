@@ -11,7 +11,7 @@ from torch import nn
 import tensorrt_llm
 from tensorrt_llm._torch.modules.embedding import Embedding, LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(

@@ -31,7 +31,7 @@ if TRTLLM_AVAILABLE:
     )
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, PoolConfiguration
     from tensorrt_llm._utils import torch_dtype_to_binding
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
 
     CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
     DataType = tensorrt_llm.bindings.DataType

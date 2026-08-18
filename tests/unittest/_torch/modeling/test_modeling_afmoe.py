@@ -40,9 +40,9 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.llmapi import MoeConfig
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # AFMoE is a recent addition to HF transformers; older installed versions may
@@ -100,7 +100,7 @@ def _force_mpi_topology_mapping():
     # These tests inspect module TP attributes in one pytest process.  Force
     # the lightweight MPI-topology Mapping even when TLLM_DISABLE_MPI=1 would
     # otherwise require an initialized torch.distributed DeviceMesh.
-    return patch("tensorrt_llm.mapping.mpi_disabled", return_value=False)
+    return patch("tensorrt_llm.distributed.mapping.mpi_disabled", return_value=False)
 
 
 def _force_mpi_collectives():

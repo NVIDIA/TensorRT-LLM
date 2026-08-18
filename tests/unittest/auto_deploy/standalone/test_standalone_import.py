@@ -24,7 +24,7 @@ The stub provides:
   tensorrt_llm/_torch/__init__.py   (empty)
   tensorrt_llm/_torch/auto_deploy/  (symlink → real auto_deploy source)
 
-This means `from tensorrt_llm.mapping import Mapping` will fail with
+This means `from tensorrt_llm.distributed.mapping import Mapping` will fail with
 ModuleNotFoundError (no `mapping` module in the stub), causing _compat.py
 to set TRTLLM_AVAILABLE = False — exactly the standalone scenario.
 """

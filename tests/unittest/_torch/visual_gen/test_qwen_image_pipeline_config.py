@@ -42,7 +42,7 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image imp
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import (
     AttentionConfig,

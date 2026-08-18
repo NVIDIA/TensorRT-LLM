@@ -18,7 +18,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
 from tensorrt_llm._torch.models.modeling_qwen_moe import Qwen2MoeForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 QWEN2_57B_A14B_CONFIG = {

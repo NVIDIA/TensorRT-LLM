@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType, add_lora_result

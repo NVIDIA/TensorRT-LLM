@@ -53,13 +53,14 @@ if TYPE_CHECKING:
     import tensorrt_llm.tools as tools
 
     from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-    from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
-                         mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
-                         set_mpi_comm, str_dtype_to_torch)
+    from ._utils import default_gpus_per_node, str_dtype_to_torch
     from .disaggregated_params import DisaggregatedParams
+    from .distributed.mapping import Mapping
+    from .distributed.mpi import (local_mpi_rank, local_mpi_size, mpi_barrier,
+                                  mpi_comm, mpi_rank, mpi_world_size,
+                                  set_mpi_comm)
     from .llmapi import LLM, AsyncLLM, KvCacheConfig, MultimodalEncoder
     from .llmapi.llm_args import LlmArgs, TorchLlmArgs
-    from .mapping import Mapping
     from .models.automodel import AutoConfig, AutoModelForCausalLM
     from .sampling_params import SamplingParams
     from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
@@ -78,13 +79,13 @@ _LAZY_ATTRS = {
     'MnnvlMoe': ('tensorrt_llm._mnnvl_utils', 'MnnvlMoe'),
     'MoEAlltoallInfo': ('tensorrt_llm._mnnvl_utils', 'MoEAlltoallInfo'),
     'default_gpus_per_node': ('tensorrt_llm._utils', 'default_gpus_per_node'),
-    'local_mpi_rank': ('tensorrt_llm._utils', 'local_mpi_rank'),
-    'local_mpi_size': ('tensorrt_llm._utils', 'local_mpi_size'),
-    'mpi_barrier': ('tensorrt_llm._utils', 'mpi_barrier'),
-    'mpi_comm': ('tensorrt_llm._utils', 'mpi_comm'),
-    'mpi_rank': ('tensorrt_llm._utils', 'mpi_rank'),
-    'mpi_world_size': ('tensorrt_llm._utils', 'mpi_world_size'),
-    'set_mpi_comm': ('tensorrt_llm._utils', 'set_mpi_comm'),
+    'local_mpi_rank': ('tensorrt_llm.distributed.mpi', 'local_mpi_rank'),
+    'local_mpi_size': ('tensorrt_llm.distributed.mpi', 'local_mpi_size'),
+    'mpi_barrier': ('tensorrt_llm.distributed.mpi', 'mpi_barrier'),
+    'mpi_comm': ('tensorrt_llm.distributed.mpi', 'mpi_comm'),
+    'mpi_rank': ('tensorrt_llm.distributed.mpi', 'mpi_rank'),
+    'mpi_world_size': ('tensorrt_llm.distributed.mpi', 'mpi_world_size'),
+    'set_mpi_comm': ('tensorrt_llm.distributed.mpi', 'set_mpi_comm'),
     'str_dtype_to_torch': ('tensorrt_llm._utils', 'str_dtype_to_torch'),
     'DisaggregatedParams':
     ('tensorrt_llm.disaggregated_params', 'DisaggregatedParams'),
@@ -94,7 +95,7 @@ _LAZY_ATTRS = {
     'KvCacheConfig': ('tensorrt_llm.llmapi', 'KvCacheConfig'),
     'LlmArgs': ('tensorrt_llm.llmapi.llm_args', 'LlmArgs'),
     'TorchLlmArgs': ('tensorrt_llm.llmapi.llm_args', 'TorchLlmArgs'),
-    'Mapping': ('tensorrt_llm.mapping', 'Mapping'),
+    'Mapping': ('tensorrt_llm.distributed.mapping', 'Mapping'),
     'AutoConfig': ('tensorrt_llm.models.automodel', 'AutoConfig'),
     'AutoModelForCausalLM':
     ('tensorrt_llm.models.automodel', 'AutoModelForCausalLM'),

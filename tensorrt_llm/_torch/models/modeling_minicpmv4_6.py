@@ -31,8 +31,8 @@ import transformers
 from packaging.version import Version
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.mapping import Mapping
 
 from ..._utils import nvtx_range
 from ...inputs import (

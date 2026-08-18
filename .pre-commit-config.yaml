@@ -359,6 +359,8 @@ common-files: &common_files |
         tensorrt_llm/commands/bench.py |
         tensorrt_llm/commands/eval.py |
         tensorrt_llm/commands/serve.py |
+        tensorrt_llm/distributed/mapping.py |
+        tensorrt_llm/distributed/mpi.py |
         tensorrt_llm/evaluate/__init__.py |
         tensorrt_llm/evaluate/cnn_dailymail.py |
         tensorrt_llm/evaluate/interface.py |
@@ -412,7 +414,6 @@ common-files: &common_files |
         tensorrt_llm/llmapi/tracing.py |
         tensorrt_llm/llmapi/utils.py |
         tensorrt_llm/lora_helper.py |
-        tensorrt_llm/mapping.py |
         tensorrt_llm/math_utils.py |
         tensorrt_llm/metrics/__init__.py |
         tensorrt_llm/metrics/collector.py |
@@ -1133,6 +1134,8 @@ legacy-files: &legacy_files |
         tensorrt_llm/commands/bench.py |
         tensorrt_llm/commands/eval.py |
         tensorrt_llm/commands/serve.py |
+        tensorrt_llm/distributed/mapping.py |
+        tensorrt_llm/distributed/mpi.py |
         tensorrt_llm/evaluate/__init__.py |
         tensorrt_llm/evaluate/cnn_dailymail.py |
         tensorrt_llm/evaluate/interface.py |
@@ -1186,7 +1189,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/llmapi/tracing.py |
         tensorrt_llm/llmapi/utils.py |
         tensorrt_llm/lora_helper.py |
-        tensorrt_llm/mapping.py |
         tensorrt_llm/math_utils.py |
         tensorrt_llm/metrics/__init__.py |
         tensorrt_llm/metrics/collector.py |

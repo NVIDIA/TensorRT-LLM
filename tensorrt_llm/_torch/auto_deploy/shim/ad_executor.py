@@ -50,10 +50,10 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative.spec_sampler_base import SpecSampler
 from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
 from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy, MultimodalConfig, SamplerType
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
-from tensorrt_llm.mapping import Mapping
 
 from ..custom_ops.attention_interface import AttentionType
 from ..distributed.common import initialize_or_skip

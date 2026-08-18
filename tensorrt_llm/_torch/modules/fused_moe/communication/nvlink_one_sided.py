@@ -41,8 +41,8 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     reject_rank_mask_cuda_graph_capture,
 )
 from tensorrt_llm.bindings import internal as _tllm_internal
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger as tllm_logger
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 
 from .base import Communication

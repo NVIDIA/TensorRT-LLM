@@ -739,7 +739,7 @@ def report_usage(
         # test conftest stubs out tensorrt_llm. The try/except ensures
         # lightweight installs and test environments aren't broken.
         try:
-            from tensorrt_llm._utils import mpi_rank  # noqa: E402 — deferred by design
+            from tensorrt_llm.distributed.mpi import mpi_rank  # noqa: E402 — deferred by design
 
             if mpi_rank() != 0:
                 return

@@ -25,8 +25,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi import DFlashDecodingConfig
-from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="DFlash worker allocates CUDA context-cache buffers"

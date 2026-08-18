@@ -176,7 +176,7 @@ A validation rule in [`TorchLlmArgs`](https://github.com/NVIDIA/TensorRT-LLM/blo
 
 Helix in TensorRT-LLM supports all three major attention variants on Blackwell GPU architecture: Multi-Latent Attention (MLA), Grouped-Query Attention (GQA), and Multi-Head Attention (MHA).
 
-The integration in [`DeepseekV3ForCausalLM`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/models/modeling_deepseekv3.py) demonstrates the rank reprovisioning pattern, driven by helpers in [`tensorrt_llm/mapping.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/mapping.py):
+The integration in [`DeepseekV3ForCausalLM`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/models/modeling_deepseekv3.py) demonstrates the rank reprovisioning pattern, driven by helpers in [`tensorrt_llm/distributed/mapping.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/distributed/mapping.py):
 
 1. During model initialization, when `has_cp_helix()` is true, a deep copy of the original mapping (with CP) is saved as `mapping_with_cp`.
 2. The model config's mapping is repurposed via `repurpose_helix_cp_to_tp()`, which converts CP ranks to additional TP ranks (setting `tp_size = tp_size × cp_size`, `cp_size = 1`).

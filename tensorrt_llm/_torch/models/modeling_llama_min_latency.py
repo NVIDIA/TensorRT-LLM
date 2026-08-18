@@ -21,7 +21,7 @@ from torch.nn import functional as F
 from transformers import LlamaConfig
 
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a)
 

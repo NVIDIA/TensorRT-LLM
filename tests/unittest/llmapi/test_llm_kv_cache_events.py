@@ -17,13 +17,13 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.inputs.multimodal import (MultimodalInput,
                                             _find_mm_token_runs_from_mask,
                                             apply_mm_hashes)
 from tensorrt_llm.inputs.multimodal_data import (AudioData, VideoData,
                                                  serialize_item)
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams

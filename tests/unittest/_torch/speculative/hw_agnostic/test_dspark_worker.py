@@ -99,7 +99,7 @@ def _make_worker():
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
         confidence_threshold=0.5,
     )
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
 
     return DSparkWorker(cfg, Mapping())
 

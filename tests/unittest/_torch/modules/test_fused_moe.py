@@ -42,7 +42,7 @@ from tensorrt_llm._torch.modules.fused_moe.quantization import \
 # isort: on
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import get_sm_version, mpi_rank
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 # NOTE: Most tests in this file are deprecated and skipped. They are now covered by the

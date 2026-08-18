@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 if TYPE_CHECKING:
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
 
     from ..model_config import ModelConfig
     from ..speculative.interface import SpecMetadata

@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 import torch
 
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.mapping import CpType
+from tensorrt_llm.distributed.mapping import CpType
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector

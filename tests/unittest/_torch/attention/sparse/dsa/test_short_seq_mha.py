@@ -46,9 +46,9 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import get_sm_version, str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
-from tensorrt_llm.mapping import Mapping
 
 # DSACacheManager creates background ThreadPoolExecutor threads.
 pytestmark = pytest.mark.threadleak(enabled=False)

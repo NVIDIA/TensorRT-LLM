@@ -14,8 +14,8 @@ import torch
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
 import tensorrt_llm.bindings as _tb
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
-from tensorrt_llm.mapping import Mapping
 
 
 def test_quant_mode():

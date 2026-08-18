@@ -17,7 +17,6 @@ from PIL import Image
 from utils.util import getSMVersion
 
 import tensorrt_llm
-from tensorrt_llm import mapping as mapping_lib
 from tensorrt_llm._torch import metadata as metadata_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
@@ -26,6 +25,7 @@ from tensorrt_llm._torch.models.modeling_mistral import MistralHFInputProcessor
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm.bindings import executor as executor_lib
+from tensorrt_llm.distributed import mapping as mapping_lib
 from tensorrt_llm.models import modeling_utils
 
 _PATCH_SIZE = 14

@@ -23,8 +23,8 @@ try:
 except ImportError:
     from cuda import cuda, cudart
 
+from .distributed.mapping import Mapping
 from .logger import logger
-from .mapping import Mapping
 
 
 def _raise_if_error(error: cudart.cudaError_t | cuda.CUresult):

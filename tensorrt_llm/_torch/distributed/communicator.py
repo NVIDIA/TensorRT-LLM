@@ -24,8 +24,8 @@ from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
                                  torch_pybind11_abi)
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.bindings.internal.process_group import init_pg
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import Mapping
 
 try:
     import ray

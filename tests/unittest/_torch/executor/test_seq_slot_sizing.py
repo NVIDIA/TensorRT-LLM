@@ -25,8 +25,8 @@ from tensorrt_llm._torch.pyexecutor._util import (
     should_enable_non_overlap_adp_forward_intent,
     should_enable_scheduler_aware_adp_dummy,
 )
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
-from tensorrt_llm.mapping import Mapping
 
 SIZING_CASES = [
     # (pp_size, disable_overlap, enable_overlap_headroom, expected_factor)

@@ -315,7 +315,9 @@ class ShardingTransformConfig(TransformConfig):
 
     dist_mapping: dict[str, int] = Field(default_factory=dict)
 
-    mapping: Any = Field(default=None)  # Legacy: tensorrt_llm.mapping.Mapping (kept for compat)
+    mapping: Any = Field(
+        default=None
+    )  # Legacy: tensorrt_llm.distributed.mapping.Mapping (kept for compat)
     dist_config: DistConfig = Field(default_factory=DistConfig)
 
     def _init_mapping(self):

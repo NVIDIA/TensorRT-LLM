@@ -31,14 +31,14 @@ from unittest.mock import patch
 
 import pytest
 
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(autouse=True)
 def _force_mpi_topology_mapping():
-    with patch("tensorrt_llm.mapping.mpi_disabled", return_value=False):
+    with patch("tensorrt_llm.distributed.mapping.mpi_disabled", return_value=False):
         yield
 
 

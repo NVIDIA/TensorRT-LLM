@@ -10,7 +10,7 @@ from torch import nn
 
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.flashinfer import FlashInferAttentionMetadata

@@ -37,7 +37,7 @@ from tensorrt_llm._torch.distributed import (
     AllReduceStrategy,
     userbuffers_allreduce_finalize,
 )
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 cloudpickle.register_pickle_by_value(sys.modules[__name__])

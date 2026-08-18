@@ -28,7 +28,7 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.distributed import AllReduce, allgather
 from tensorrt_llm._torch.distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from tensorrt_llm._torch.modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 
 from ...distributed.common import ReduceOp, get_rank_world_size, get_world_size, is_ompi
 

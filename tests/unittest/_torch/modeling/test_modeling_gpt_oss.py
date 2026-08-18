@@ -21,11 +21,11 @@ from tensorrt_llm._torch.models.modeling_gpt_oss import GptOssForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import \
     KvCacheConfig as BindingsKvCacheConfig
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import _resolve_kv_cache_manager_v2_auto
-from tensorrt_llm.mapping import Mapping
 
 configs = """
 {

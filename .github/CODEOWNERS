@@ -116,6 +116,7 @@
 /tensorrt_llm/commands/__init__.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/commands/serve.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/commands/utils.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/distributed/mapping.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/grpc @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/inputs @NVIDIA/trt-llm-runtime-devs
@@ -123,7 +124,6 @@
 /tensorrt_llm/llmapi/mm_encoder.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/lora_helper.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/lora_manager.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/mapping.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/metrics @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/prompt_adapter_manager.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/sampling_params.py @NVIDIA/trt-llm-runtime-devs

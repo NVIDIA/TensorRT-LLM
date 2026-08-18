@@ -13,8 +13,8 @@ import tensorrt_llm
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
-from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 

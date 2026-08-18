@@ -22,7 +22,7 @@ from tensorrt_llm._torch.models.modeling_llama import \
     Llama4ForConditionalGeneration
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # This is Llama4 Maverick config but with only 2 layers.

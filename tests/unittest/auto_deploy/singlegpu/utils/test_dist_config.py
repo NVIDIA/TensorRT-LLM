@@ -23,7 +23,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 try:
-    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.distributed.mapping import Mapping
 
     _HAS_MAPPING = True
 except ImportError:
@@ -74,7 +74,9 @@ def test_from_dict_ignores_unknown_keys():
     assert cfg.rank == 0
 
 
-@pytest.mark.skipif(not _HAS_MAPPING, reason="Requires tensorrt_llm.mapping (not in standalone)")
+@pytest.mark.skipif(
+    not _HAS_MAPPING, reason="Requires tensorrt_llm.distributed.mapping (not in standalone)"
+)
 def test_from_mapping_to_mapping_roundtrip():
     m = Mapping(
         world_size=8,

@@ -85,7 +85,7 @@ def setup_dwdp(
 
     Args:
         model: The top-level causal-LM model (e.g. DeepseekV3ForCausalLM).
-        mapping: ``tensorrt_llm.mapping.Mapping`` instance with DWDP fields.
+        mapping: ``tensorrt_llm.distributed.mapping.Mapping`` instance with DWDP fields.
         device_id: CUDA device ordinal for this rank.
         comm: mpi4py communicator scoped to the DWDP group (owned by
             DwdpManager; lifetime exceeds setup_dwdp).

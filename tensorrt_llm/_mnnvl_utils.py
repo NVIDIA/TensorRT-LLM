@@ -30,8 +30,8 @@ except ImportError:
 
 from ._dlpack_utils import pack_strided_memory
 from ._utils import get_sm_version, mpi_comm
+from .distributed.mapping import Mapping
 from .logger import logger
-from .mapping import Mapping
 
 
 def _check_cu_result(cu_func_ret):

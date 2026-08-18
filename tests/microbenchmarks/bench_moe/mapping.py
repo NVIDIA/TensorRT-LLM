@@ -49,7 +49,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import (
     SigmoidRenormMoeRoutingMethod,
 )
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .backend import MoeModelConfig, resolve_deepseek_group_config

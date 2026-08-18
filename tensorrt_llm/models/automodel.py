@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Optional, Union
 
-from ..mapping import Mapping
+from ..distributed.mapping import Mapping
 from . import MODEL_MAP
 from .modeling_utils import QuantConfig
 

@@ -23,8 +23,8 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _is_mm_disagg,
     filter_mm_token_from_input_ids,
 )
+from tensorrt_llm.distributed.mapping import Mapping
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.mapping import Mapping
 
 from ..._utils import async_tensor_h2d
 from ...inputs import (
