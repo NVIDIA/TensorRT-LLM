@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import time
 from dataclasses import dataclass, field
 from operator import getitem
@@ -193,6 +207,17 @@ class MultiStreamDAG:
                     in_edges[arg] = latest_inplace_stat[arg]
                 elif isinstance(arg, torch.fx.Node) and arg.op != "placeholder":
                     in_edges[arg] = self.nodes[arg]
+
+            if node.op == "output":
+                # An in-place op can mutate a graph input without returning a
+                # value (for example, Eagle3 captures intermediate hidden
+                # states with inplace_slice_copy).  Such a side effect is not
+                # otherwise reachable from the FX output.  Make graph exit
+                # wait for the last mutation of every touched tensor so that
+                # an auxiliary stream cannot keep writing after the compiled
+                # callable returns.
+                for mutated_arg, mutator in latest_inplace_stat.items():
+                    in_edges[mutated_arg] = mutator
 
             # For node without in edge, connect it to the entry
             if len(in_edges) == 0:
