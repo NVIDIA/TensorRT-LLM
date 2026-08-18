@@ -314,7 +314,6 @@ unittest/_torch/attention/sparse/dsa/test_req_idx_per_token.py::test_on_update_k
 unittest/_torch/attention/sparse/rocketkv/test_rocketkv.py::test_model[TRTLLM-llama-3.1-model/Llama-3.1-8B-Instruct-pytorch] SKIP (https://nvbugs/6602094)
 unittest/_torch/attention/sparse/rocketkv/test_rocketkv.py::test_model[VANILLA-llama-3.1-model/Llama-3.1-8B-Instruct-pytorch] SKIP (https://nvbugs/6602094)
 unittest/_torch/attention/test_attention_backends.py::test_attention_backend[deepseekv3_mla-gen-bf16-HND-p32-v1] SKIP (https://nvbugs/6507109)
-unittest/_torch/executor/test_overlap_scheduler.py::test_overlap_scheduler_consistency[no_reuse-cpp_scheduler-TorchSampler] SKIP (https://nvbugs/6561559)
 unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy SKIP (https://nvbugs/6607482)
 unittest/_torch/modeling/test_modeling_qwen_moe.py::TestQwenMoe::test_qwen_moe_allclose_to_hf[backend:trtllm-use_cuda_graph:False] SKIP (https://nvbugs/6566765)
 unittest/_torch/modeling/test_modeling_qwen_moe.py::TestQwenMoe::test_qwen_moe_allclose_to_hf[backend:trtllm-use_cuda_graph:True] SKIP (https://nvbugs/6575012)
