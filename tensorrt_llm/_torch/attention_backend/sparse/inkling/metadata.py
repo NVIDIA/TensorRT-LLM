@@ -338,14 +338,11 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
                     # server log for the crosscheck's failure strings, so this
                     # message must not contain any of them.
                     logger.warning(
-                        "Inkling page-table crosscheck: layer %d request %s "
-                        "carries stale values %s past its %d blocks. Harmless -- "
-                        "the kernel masks every access by seq_len -- but the "
-                        "borrowed row is padded differently from the staged one.",
-                        layer,
-                        gen_ids[i],
-                        tail[:8],
-                        len(want),
+                        f"Inkling page-table crosscheck: layer {layer} request "
+                        f"{gen_ids[i]} carries stale values {tail[:8]} past its "
+                        f"{len(want)} blocks. Harmless -- the kernel masks every "
+                        "access by seq_len -- but the borrowed row is padded "
+                        "differently from the staged one."
                     )
                 checked += 1
         if not _INK_XCHK_ANNOUNCED:
