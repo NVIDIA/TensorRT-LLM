@@ -122,7 +122,9 @@ class PyStartTracker:
             path = os.path.join(
                 self.data_dir, f".cbtscov.{self.stage}.{self._suffix}.pid{os.getpid()}.sqlite"
             )
-            tmp = path + ".tmp"
+            # Keep in-progress files outside the .cbtscov.* input namespace. A report or archive
+            # running concurrently must only ever discover the atomically published final path.
+            tmp = os.path.join(self.data_dir, f".tmp-{os.path.basename(path)}")
             if os.path.exists(tmp):
                 os.remove(tmp)
             process_uid = f"{self.stage}/{self._suffix}.pid{os.getpid()}"

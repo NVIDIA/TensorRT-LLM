@@ -22,6 +22,7 @@ _ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_ROOT / "jenkins/scripts/cbts/coverage_utils"))
 
 from compact_db import merge_databases, validate_database, write_leaf_database  # noqa: E402
+from pystart_report import merge_to_sqlite  # noqa: E402
 
 
 def _rows(path: Path, query: str) -> list[tuple]:
@@ -39,6 +40,36 @@ def _merge(inputs: list[Path], output: Path) -> None:
 
 
 class CompactDatabaseTest(unittest.TestCase):
+    def test_report_glob_ignores_in_progress_database(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            leaf = root / ".cbtscov.stage.pid1.sqlite"
+            write_leaf_database(
+                leaf,
+                stage="stage",
+                process_uid="stage/process",
+                touches={
+                    "stage/test_a.py::test_one": {
+                        ("/workspace/tensorrt_llm/a.py", "run"),
+                    }
+                },
+                outcomes={"stage/test_a.py::test_one": "passed"},
+                expected_workers={"stage/test_a.py::test_one": 0},
+            )
+            in_progress = root / ".cbtscov.stage.pid2.sqlite.tmp"
+            sqlite3.connect(in_progress).close()
+
+            output = root / "merged.sqlite"
+            connection, input_count = merge_to_sqlite(str(root / ".cbtscov.stage*"), output)
+            connection.close()
+
+            self.assertEqual(input_count, 1)
+            validate_database(output)
+            self.assertEqual(
+                _rows(output, "SELECT test, file, qualname, stage FROM touch_rows"),
+                [("stage/test_a.py::test_one", "tensorrt_llm/a.py", "run", "stage")],
+            )
+
     def test_leaf_write_exposes_logical_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             leaf = Path(temp_dir) / "leaf.sqlite"

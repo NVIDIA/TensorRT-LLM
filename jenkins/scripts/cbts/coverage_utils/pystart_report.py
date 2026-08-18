@@ -34,7 +34,9 @@ def canon(path):
 
 def merge_to_sqlite(pattern, out_path):
     """Union every matching compact DB. Returns ``(connection, input_count)``."""
-    files = sorted(glob.glob(pattern))
+    # A broad caller glob may observe an atomic writer's in-progress `.sqlite.tmp` file.
+    # Only published SQLite paths are valid reducer inputs.
+    files = sorted(path for path in glob.glob(pattern) if path.endswith(".sqlite"))
     return merge_databases(files, out_path), len(files)
 
 
