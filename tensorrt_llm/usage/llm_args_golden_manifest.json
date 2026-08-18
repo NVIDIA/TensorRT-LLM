@@ -970,7 +970,7 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
-      "path": "lora_config.cudagraph_specialize_lora"
+      "path": "lora_config.cuda_graph_specialize_lora"
     },
     {
       "allowed_values": [

@@ -111,7 +111,7 @@ class LoraConfig(StrictBaseModel):
         "Whether to swap gate/up projection order in fused gate_up_proj LoRA B weights. "
         "Set to False for models like Phi-4-MM that use a different weight order."
     )
-    cudagraph_specialize_lora: bool = Field(
+    cuda_graph_specialize_lora: bool = Field(
         default=False,
         description=
         "Whether to capture separate CUDA graphs for batches with and without "

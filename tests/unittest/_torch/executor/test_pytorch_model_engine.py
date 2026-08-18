@@ -788,7 +788,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine = object.__new__(PyTorchModelEngine)
         engine.cuda_graph_lora_manager = object()
         engine._force_lora_graph_for_capture = None
-        lora_config = SimpleNamespace(cudagraph_specialize_lora=True)
+        lora_config = SimpleNamespace(cuda_graph_specialize_lora=True)
         engine.llm_args = SimpleNamespace(lora_config=lora_config)
         request = _make_request_stub(7)
         batch = ScheduledRequests()
@@ -800,7 +800,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertTrue(engine._use_lora_cuda_graph(batch))
 
         request.lora_task_id = None
-        lora_config.cudagraph_specialize_lora = False
+        lora_config.cuda_graph_specialize_lora = False
         self.assertTrue(engine._use_lora_cuda_graph(batch))
 
         engine._force_lora_graph_for_capture = False
@@ -1116,7 +1116,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
         engine.cuda_graph_lora_manager = object()
         engine.llm_args.lora_config = SimpleNamespace(
-            cudagraph_specialize_lora=True)
+            cuda_graph_specialize_lora=True)
         generation = _make_request_stub(2)
         generation.lora_task_id = 42
         batch = ScheduledRequests()
