@@ -2147,8 +2147,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    # Keep xtrace off around the token exports so they are not echoed into the Slurm job log.
+                    set +x
                     export HF_TOKEN=$HF_TOKEN
                     export GITHUB_CLONE_TOKEN=$GITHUB_CLONE_TOKEN
+                    set -x
                     if [ -f "${s3SecretKeyPathNode}" ]; then
                         set +x
                         export S3_SECRET_KEY="\$(cat "${s3SecretKeyPathNode}")"
