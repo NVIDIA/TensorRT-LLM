@@ -104,6 +104,7 @@ l0_b200:
   # GPU KDA disagg transfer + peer-validation (cpu_only cases skipped by the
   # stage's "not cpu_only" markexpr and run on the CPU-Generic stage instead).
   - unittest/disaggregated/test_kda_mamba_transfer.py
+  - unittest/_torch/modules/moe/test_kimi_k3_mlp.py
   - unittest/_torch/modules/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py TIMEOUT (15)
   # ------------- modules (non-MoE) ---------------
