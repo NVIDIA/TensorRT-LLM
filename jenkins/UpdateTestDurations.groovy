@@ -140,6 +140,12 @@ pipeline {
                         if (!(params.DAYS ==~ /^[1-9][0-9]*$/)) {
                             error("DAYS parameter must be a positive integer (got: '${params.DAYS}').")
                         }
+                        if (!(params.SOURCE_REPO ==~ /^[a-zA-Z0-9\/_.-]+$/)) {
+                            error("Invalid SOURCE_REPO: '${params.SOURCE_REPO}'. Must match [a-zA-Z0-9/_.-]+.")
+                        }
+                        if (!(params.TARGET_BRANCH ==~ /^[a-zA-Z0-9\/_.-]+$/)) {
+                            error("Invalid TARGET_BRANCH: '${params.TARGET_BRANCH}'. Must match [a-zA-Z0-9/_.-]+.")
+                        }
                     }
                     sh """
                         apt-get update -qq && \
@@ -209,16 +215,6 @@ pipeline {
             steps {
                 container('trt-llm') {
                     script {
-                        // Validate params before they reach any shell to prevent injection.
-                        // TARGET_BRANCH and DAYS are the only user-controlled values that end
-                        // up in shell commands inside withCredentials.
-                        if (!params.TARGET_BRANCH.matches('[a-zA-Z0-9/_.-]+')) {
-                            error("Invalid TARGET_BRANCH: '${params.TARGET_BRANCH}'")
-                        }
-                        if (!params.DAYS.matches('[0-9]+')) {
-                            error("DAYS must be a positive integer, got: '${params.DAYS}'")
-                        }
-
                         sh """
                             cd ${LLM_ROOT}
                             git config --global --add safe.directory \$(pwd)
@@ -264,14 +260,11 @@ pipeline {
                                     return
                                 }
 
-                                withEnv(["_TARGET_BRANCH=${params.TARGET_BRANCH}",
-                                         "_DAYS=${params.DAYS}"]) {
-                                    sh '''
-                                        cd ''' + LLM_ROOT + '''
-                                        git add ''' + DURATION_FILE_PATH + '''
-                                        git commit -s -m "[None][infra] Auto-update test durations from OpenSearch (last $_DAYS days)"
-                                    '''
-                                }
+                                sh """
+                                    cd ${LLM_ROOT}
+                                    git add ${DURATION_FILE_PATH}
+                                    git commit -s -m "[None][infra] Auto-update test durations from OpenSearch (last ${params.DAYS} days)"
+                                """
 
                                 try {
                                     sh """
