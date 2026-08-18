@@ -230,7 +230,7 @@ class TestQwen3VL(TestModelingMultimodal):
                 "attn_metadata"
             ].create_cuda_graph_metadata(1)
 
-            # Prepare metadata before capture (like in working Qwen2.5-VL test)
+            # Prepare metadata before capture.
             trtllm_inputs["attn_metadata"].prepare()
 
             key = (1, 0, False)
@@ -1000,7 +1000,7 @@ def test_rope_cos_sin_buffers_match_hf_rotary():
 # ---------------------------------------------------------------------------
 # argsort(window_index) equivalence with the prior scatter-assign inverse.
 #
-# Qwen2.5-VL's vision tower swaps
+# The vision tower swaps
 #   reverse_indices = torch.empty_like(window_index)
 #   reverse_indices[window_index] = torch.arange(N, device=..., dtype=...)
 # for

@@ -658,7 +658,6 @@ includes full requested and observed dispatch/expert matrices.
 
 | Model | Experts | `top_k` | Hidden | Intermediate | Default quant | Default routing |
 |---|---:|---:|---:|---:|---|---|
-| `qwen1.5_moe` | 60 | 4 | 2048 | 1408 | `FP8` | `RENORMALIZE` |
 | `deepseek_v2_lite` | 64 | 6 | 2048 | 1408 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `deepseek_v3` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `deepseek_r1` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |

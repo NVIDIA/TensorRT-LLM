@@ -252,18 +252,6 @@ google/gemma-2-9b-it:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 26.670
-Qwen/Qwen-7B-Chat:
-  - accuracy: 35.311
-  - quant_algo: W8A16
-    accuracy: 35.310
-  - quant_algo: W4A16_GPTQ
-    accuracy: 34.859
-Qwen/Qwen1.5-MoE-A2.7B-Chat:
-  - accuracy: 32.148
-  - quant_algo: W8A16
-    accuracy: 0
-Qwen/QwQ-32B:
-  - accuracy: 30.358
 nvidia/Nemotron-Mini-4B-Instruct:
   - quant_algo: FP8
     accuracy: 25.247

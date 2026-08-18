@@ -60,7 +60,6 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "google/gemma-3n-E2B-it": "gemma/gemma-3n-E2B-it",
     "google/gemma-4-E2B-it": "gemma/gemma-4-E2B-it",
     "nvidia/Qwen3.5-397B-A17B-NVFP4": "Qwen3.5-397B-A17B-NVFP4",
-    "Qwen/QwQ-32B": "QwQ-32B",
     "meta-llama/Llama-3.3-70B-Instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
     "mistralai/Codestral-22B-v0.1": "Codestral-22B-v0.1",
     "mistralai/Ministral-8B-Instruct-2410": "Ministral-8B-Instruct-2410",

@@ -314,9 +314,9 @@ QWEN3_5_VL_MOE_PARITY_CONFIG = {
 class TestQwen3_5MoeVL(TestModelingMultimodal):
     """Forward-parity test for Qwen3.5-MoE-VL against HuggingFace.
 
-    Tiny-synthetic-config parity test in the same shape as
-    `TestQwen3VLMoe` / `TestQwen2_5VL`: both stacks are constructed
-    from `QWEN3_5_VL_MOE_PARITY_CONFIG` (2 LM layers, 1 linear + 1 full
+    Tiny-synthetic-config parity test in the same shape as `TestQwen3VLMoe`.
+    Both stacks are constructed from `QWEN3_5_VL_MOE_PARITY_CONFIG`
+    (2 LM layers, 1 linear + 1 full
     attention, 128 experts, 2 vision layers), HF weights are copied
     into TRT-LLM via `Qwen3_5MoeHfWeightMapper`, then `test_all`
     sweeps the default `MultimodalScenario`s comparing last-position

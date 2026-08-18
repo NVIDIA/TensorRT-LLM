@@ -698,29 +698,3 @@ class TestGemma2_9BIt(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8,
                  kv_cache_quant_algo=QuantAlgo.FP8,
                  extra_convert_args=["--device_map=sequential"])
-
-
-class TestQwen7BChat(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "Qwen/Qwen-7B-Chat"
-    MODEL_PATH = f"{llm_models_root()}/Qwen-7B-Chat"
-    EXAMPLE_FOLDER = "models/core/qwen"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-    def test_weight_only(self):
-        self.run(quant_algo=QuantAlgo.W8A16)
-
-
-@pytest.mark.skip_less_device_memory(40000)
-class TestQwen1_5MoeA2_7BChat(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
-    MODEL_PATH = f"{llm_models_root()}/Qwen1.5-MoE-A2.7B-Chat"
-    EXAMPLE_FOLDER = "models/core/qwen"
-
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-    @pytest.mark.skip(reason="https://nvbugs/5100102")
-    def test_weight_only(self):
-        self.run(quant_algo=QuantAlgo.W8A16)

@@ -186,7 +186,7 @@ class TestQwen3VLMoe(TestModelingMultimodal):
 
     def init_kv_cache_manager(self, scenario: TestQwen3VLMoeScenario):
         # NOTE: Exactly the same as the parent class method,
-        # but with the mrope flag set to True for Qwen2.5-VL model.
+        # but with the mrope flag enabled.
         cache_config = self.get_kv_cache_config(scenario)
         tokens_per_block = cache_config["tokens_per_block"]
         max_seq_len = cache_config["max_seq_len"]
@@ -206,24 +206,24 @@ class TestQwen3VLMoe(TestModelingMultimodal):
         self.kv_cache_manager.add_dummy_requests(
             request_ids=[1],
             token_nums=[max_seq_len],
-            # NOTE: Qwen2.5-VL model uses mrope
+            # NOTE: Qwen3-VL uses mrope.
             use_mrope=True,
         )
 
     def run_trtllm_forward(self, trtllm_inputs, use_cuda_graph: bool = False):
         # NOTE: Exactly the same as the parent class method,
-        # but with the mrope flag set to True for Qwen2.5-VL model.
+        # but with the mrope flag enabled.
         if not use_cuda_graph:
             trtllm_inputs["attn_metadata"].prepare()
             return self.trtllm_model.forward(**trtllm_inputs)
         else:
-            # NOTE: Qwen2.5-VL model uses mrope
+            # NOTE: Qwen3-VL uses mrope.
             graph_runner = create_mock_cuda_graph_runner(1, True)
             trtllm_inputs["attn_metadata"] = trtllm_inputs[
                 "attn_metadata"
             ].create_cuda_graph_metadata(1)
 
-            # Prepare metadata before capture (like in working Qwen2.5-VL test)
+            # Prepare metadata before capture.
             trtllm_inputs["attn_metadata"].prepare()
 
             key = (1, 0, False)

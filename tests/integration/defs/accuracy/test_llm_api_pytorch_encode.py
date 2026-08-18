@@ -242,7 +242,7 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 #   LlamaForCausalLM   — TinyLlama (also covers Mistral, which aliases LlamaModel)
 #   Gemma3ForCausalLM  — Gemma-3-1B (sliding window + global alternation)
 #   Phi3ForCausalLM    — Phi-4-mini (SuRoPE, merged QKV)
-#   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm; covers Qwen2-family encode via shared decode path)
+#   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm)
 DECODER_MODELS = [
     # -- LlamaForCausalLM (covers Llama + Mistral family) --
     pytest.param(

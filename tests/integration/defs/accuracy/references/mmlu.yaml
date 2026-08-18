@@ -133,8 +133,6 @@ google/gemma-3n-E2B-it:
   - accuracy: 59.527
 google/gemma-4-E2B-it:
   - accuracy: 56.823
-Qwen/QwQ-32B:
-  - accuracy: 82.60
 deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 71.40
   - quant_algo: NVFP4
