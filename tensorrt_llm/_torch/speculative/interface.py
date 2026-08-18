@@ -32,6 +32,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+from ..pyexecutor.config_utils import is_deepseek_v4_sparse
 from ..pyexecutor.resource_manager import (BaseResourceManager,
                                            ResourceManagerType)
 
@@ -107,9 +108,13 @@ _FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
 _FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
 
 
-def should_use_separate_draft_kv_cache(spec_config) -> bool:
+def should_use_separate_draft_kv_cache(spec_config,
+                                       sparse_attention_config) -> bool:
     """
     Check if separate draft KV cache should be used for one-engine speculative decoding.
+
+    sparse_attention_config has no default so a new call site cannot silently
+    get the sparse-unaware answer; pass None when there is no sparse config.
     """
     if spec_config is None:
         return False
@@ -120,6 +125,14 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
     # DSpark owns a dedicated rolling-window cache in DSparkWorker. Its draft
     # model does not read the paged draft KV cache managed by attention metadata.
     if spec_config.spec_dec_mode.is_dspark():
+        return False
+    # DeepSeek-V4's cache manager already sizes the draft layers into the target
+    # manager: its __init__ appends (max_draft_len - 1) compress ratios and
+    # widens every window by max_draft_len. A second instance is redundant, and
+    # would never receive compute_sliding_block_tables, which is what
+    # initializes the _num_tables its block-offset copy reads. DSA inherits the
+    # base block-offset copy, so it keeps the separate draft manager.
+    if is_deepseek_v4_sparse(sparse_attention_config):
         return False
     return spec_config._allow_separate_draft_kv_cache
 

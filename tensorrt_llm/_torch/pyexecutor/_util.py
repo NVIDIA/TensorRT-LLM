@@ -1391,7 +1391,9 @@ class KvCacheCreator:
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
             return False
-        return should_use_separate_draft_kv_cache(self._speculative_config)
+        return should_use_separate_draft_kv_cache(
+            self._speculative_config,
+            sparse_attention_config=self._sparse_attention_config)
 
     def _get_effective_draft_config(self) -> ModelConfig:
         """
@@ -2066,11 +2068,12 @@ def _get_mamba_cache_layer_masks(
     mamba_params: MambaKVCacheParams,
     mapping: Mapping,
     spec_config: Optional[SpeculativeConfig],
+    sparse_attention_config: Optional[SparseAttentionConfig],
     is_draft: bool,
 ) -> tuple[List[bool], List[bool]]:
     use_separate_draft_kv_cache = (
-        not mapping.enable_attention_dp
-        and should_use_separate_draft_kv_cache(spec_config))
+        not mapping.enable_attention_dp and should_use_separate_draft_kv_cache(
+            spec_config, sparse_attention_config=sparse_attention_config))
     return mamba_params.get_layer_masks(
         is_draft=is_draft,
         use_separate_draft_kv_cache=use_separate_draft_kv_cache,
@@ -2283,6 +2286,7 @@ def _create_kv_cache_manager(
                 mamba_params,
                 mapping,
                 spec_config,
+                sparse_attention_config,
                 is_draft,
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
@@ -2388,6 +2392,7 @@ def _create_kv_cache_manager(
                 mamba_params,
                 mapping,
                 spec_config,
+                sparse_attention_config,
                 is_draft,
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
@@ -2503,6 +2508,7 @@ def _create_kv_cache_manager(
                 mamba_params,
                 mapping,
                 spec_config,
+                sparse_attention_config,
                 is_draft,
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
