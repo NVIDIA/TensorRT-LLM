@@ -5179,7 +5179,8 @@ class PyTorchModelEngine(ModelEngine):
         req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
         resource_manager: Optional[ResourceManager] = None,
         maybe_graph: bool = False,
-        promoted_context_request_ids: frozenset[int] = frozenset()
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+        use_lora_graph: bool = False,
     ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
         """
         Prepare inputs for Pytorch Model.
@@ -6322,7 +6323,11 @@ class PyTorchModelEngine(ModelEngine):
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
             ResourceManagerType.PEFT_CACHE_MANAGER)
         lora_params = self._get_lora_params_from_requests(
-            scheduled_requests, attn_metadata, peft_cache_manager, maybe_graph)
+            scheduled_requests,
+            attn_metadata,
+            peft_cache_manager,
+            maybe_graph,
+            use_lora_graph=use_lora_graph)
 
         attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
         (padded_num_tokens, can_run_prefill_cuda_graph,
@@ -6919,7 +6924,8 @@ class PyTorchModelEngine(ModelEngine):
             scheduled_requests: ScheduledRequests,
             attn_metadata: AttentionMetadata,
             peft_cache_manager: Optional[PeftCacheManager] = None,
-            maybe_graph: bool = False):
+            maybe_graph: bool = False,
+            use_lora_graph: bool = False):
         '''
         Get LoRA parameters from scheduled requests.
 
@@ -6931,7 +6937,7 @@ class PyTorchModelEngine(ModelEngine):
         use_cuda_graph_mode = self.cuda_graph_lora_manager is not None and maybe_graph
 
         if use_cuda_graph_mode:
-            if not self._use_lora_cuda_graph(scheduled_requests):
+            if not use_lora_graph:
                 self.cuda_graph_lora_manager.prepare_base_only_batch(
                     peft_cache_manager)
                 return None
@@ -7090,7 +7096,8 @@ class PyTorchModelEngine(ModelEngine):
         req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
         resource_manager: Optional[ResourceManager] = None,
         maybe_graph: bool = False,
-        promoted_context_request_ids: frozenset[int] = frozenset()
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+        use_lora_graph: bool = False,
     ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
         set_per_request_prefill_cuda_graph_flag(False)
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
@@ -7129,11 +7136,18 @@ class PyTorchModelEngine(ModelEngine):
                         sa_manager._initialized_requests.add(
                             request.py_request_id)
 
-        return self._prepare_tp_inputs(
-            scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
-            new_tensors_device, cache_indirection_buffer,
-            num_accepted_tokens_device, req_id_to_old_request, resource_manager,
-            maybe_graph, promoted_context_request_ids)
+        return self._prepare_tp_inputs(scheduled_requests,
+                                       kv_cache_manager,
+                                       attn_metadata,
+                                       spec_metadata,
+                                       new_tensors_device,
+                                       cache_indirection_buffer,
+                                       num_accepted_tokens_device,
+                                       req_id_to_old_request,
+                                       resource_manager,
+                                       maybe_graph,
+                                       promoted_context_request_ids,
+                                       use_lora_graph=use_lora_graph)
 
     def _prepare_encoder_inputs(
         self,
@@ -7662,6 +7676,7 @@ class PyTorchModelEngine(ModelEngine):
                     ResourceManagerType.PEFT_CACHE_MANAGER)
                 peft_cache_data_type = peft_cache_manager.data_type
 
+            use_lora_graph = self._use_lora_cuda_graph(padded_graph_requests)
             maybe_attn_metadata, maybe_spec_metadata, key = self.cuda_graph_runner.maybe_get_cuda_graph(
                 padded_graph_requests,
                 enable_spec_decode=self.enable_spec_decode,
@@ -7673,7 +7688,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_resource_manager=spec_resource_manager,
                 promoted_context_request_ids=promoted_context_request_ids,
                 peft_cache_data_type=peft_cache_data_type,
-                use_lora_graph=self._use_lora_cuda_graph(padded_graph_requests),
+                use_lora_graph=use_lora_graph,
             )
 
             can_run_graph = key is not None
@@ -7701,10 +7716,18 @@ class PyTorchModelEngine(ModelEngine):
                 )
 
             inputs, gather_ids = self._prepare_inputs(
-                execution_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, cache_indirection_buffer,
-                num_accepted_tokens_device, req_id_to_old_request,
-                resource_manager, can_run_graph, execution_promoted_context_ids)
+                execution_requests,
+                kv_cache_manager,
+                attn_metadata,
+                spec_metadata,
+                new_tensors_device,
+                cache_indirection_buffer,
+                num_accepted_tokens_device,
+                req_id_to_old_request,
+                resource_manager,
+                can_run_graph,
+                execution_promoted_context_ids,
+                use_lora_graph=use_lora_graph)
             if execution_promoted_context_ids:
                 self.iter_states[
                     'num_ctx_requests'] = scheduled_requests.num_context_requests

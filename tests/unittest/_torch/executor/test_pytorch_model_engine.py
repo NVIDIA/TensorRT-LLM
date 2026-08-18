@@ -1129,6 +1129,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         self.assertTrue(
             runner.maybe_get_cuda_graph.call_args.kwargs["use_lora_graph"])
+        self.assertTrue(
+            engine._prepare_inputs.call_args.kwargs["use_lora_graph"])
 
     def test_global_incompatibilities_bypass_candidate_selection(self) -> None:
         cases = (
