@@ -21,6 +21,9 @@ from pydantic import ValidationError
 
 from tensorrt_llm.usage import schema, schemas
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---------------------------------------------------------------------------
 # Features JSON payload structure tests
 # ---------------------------------------------------------------------------
