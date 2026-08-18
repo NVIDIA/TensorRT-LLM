@@ -13,6 +13,7 @@ class _FakePool:
         self.wait_shutdown = wait_shutdown
         self.env_overrides = dict(env_overrides or {})
         self.shut = False
+        self.exit_joins_released = False
         import os
 
         # What the workers freeze at spawn: TRTLLM* forwarded from the parent
@@ -23,6 +24,9 @@ class _FakePool:
 
     def shutdown(self):
         self.shut = True
+
+    def release_exit_joins(self):
+        self.exit_joins_released = True
 
     def shutdown_abort(self, *args, **kwargs):
         self.shut = True
@@ -35,7 +39,9 @@ def reuse_cache(monkeypatch):
     cache = SessionReuseCache()
     # No real MPI / NVML in pure-logic tests: record the calls instead.
     resets = []
-    monkeypatch.setattr(session_reuse, "submit_sync_per_worker", lambda s, fn: resets.append(s))
+    monkeypatch.setattr(
+        session_reuse, "submit_sync_per_worker", lambda s, fn: resets.append(s)
+    )
     cache.resets = resets
 
     # Hermetic: the REAL prefetcher singleton must not start background MPI
@@ -105,7 +111,9 @@ def test_cache_miss_takes_prefetched_shadow(reuse_cache):
     # A shadow armed at the PREVIOUS miss is consumed instantly on this one
     # (no synchronous spawn), and a replacement is restocked for the next
     # miss with the worker-side weight-cache overlay.
-    shadow = _FakePool(2, wait_shutdown=True, env_overrides={"TRTLLM_HF_WEIGHT_CACHE": "1"})
+    shadow = _FakePool(
+        2, wait_shutdown=True, env_overrides={"TRTLLM_HF_WEIGHT_CACHE": "1"}
+    )
     reuse_cache.prefetch.shadow = shadow
     s = reuse_cache.acquire(_FakePool, 2)
     assert s._real is shadow
@@ -323,10 +331,15 @@ def test_drain_kills_recorded_worker_when_shutdown_wedges(
 
     class _WedgedPool(_FakePool):
         def __init__(
-            self, n_workers: int, wait_shutdown: bool = False, env_overrides: dict | None = None
+            self,
+            n_workers: int,
+            wait_shutdown: bool = False,
+            env_overrides: dict | None = None,
         ) -> None:
             super().__init__(n_workers, wait_shutdown, env_overrides)
-            self.worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+            self.worker = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(300)"]
+            )
             self._worker_identities = ((self.worker.pid, b"owned"),)
 
         def shutdown(self) -> None:
@@ -346,6 +359,52 @@ def test_drain_kills_recorded_worker_when_shutdown_wedges(
         pool.worker.wait()
 
 
+def test_drain_releases_exit_joins_when_shutdown_remains_wedged(
+    reuse_cache: SessionReuseCache,
+) -> None:
+    import threading
+
+    class _ManagerWedgedPool(_FakePool):
+        def __init__(
+            self,
+            n_workers: int,
+            wait_shutdown: bool = False,
+            env_overrides: dict | None = None,
+        ) -> None:
+            super().__init__(n_workers, wait_shutdown, env_overrides)
+            self.shutdown_released = threading.Event()
+
+        def shutdown(self) -> None:
+            self.shutdown_released.wait()
+            self.shut = True
+
+        def release_exit_joins(self) -> None:
+            super().release_exit_joins()
+            self.shutdown_released.set()
+
+    session = reuse_cache.acquire(_ManagerWedgedPool, 1)
+    pool = session._real
+    session.shutdown()
+    reuse_cache.drain(timeout=0.01)
+    assert pool.exit_joins_released
+    assert pool.shutdown_released.wait(timeout=1.0)
+
+
+def test_kill_recorded_workers_skips_recycled_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _FakePool(1)
+    pool._reuse_worker_pids = ((123, b"owned"),)
+    kills = []
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"recycled")
+    monkeypatch.setattr(
+        session_reuse.os, "kill", lambda pid, sig: kills.append((pid, sig))
+    )
+
+    assert session_reuse._kill_recorded_workers(pool) == 0
+    assert kills == []
+
+
 def test_autodeploy_nodeids_are_private():
     from test_common.session_reuse_hooks import _is_private_nodeid
 
@@ -356,7 +415,9 @@ def test_autodeploy_nodeids_are_private():
     assert _is_private_nodeid(
         "examples/test_ad_guided_decoding.py::test_autodeploy_guided_decoding_main_json"
     )
-    assert _is_private_nodeid("unittest/_torch/auto_deploy/unit/singlegpu/test_x.py::test_y")
+    assert _is_private_nodeid(
+        "unittest/_torch/auto_deploy/unit/singlegpu/test_x.py::test_y"
+    )
     assert not _is_private_nodeid(
         "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[a]"
     )

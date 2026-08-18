@@ -46,7 +46,10 @@ from typing import Protocol
 # The spawn snapshot is shared with the session-prefetch layer (both hand a
 # live pool to a test that did not spawn it — same invariant).
 from test_common._session_utils import _isinstance_transparent_shim, _spawn_snapshot
-from test_common.grouped_test_utils import reset_worker_torch_compile_state, submit_sync_per_worker
+from test_common.grouped_test_utils import (
+    reset_worker_torch_compile_state,
+    submit_sync_per_worker,
+)
 
 # The only places in the library that construct MpiPoolSession for a bare
 # LLM(...); tests passing their own _mpi_session never reach these lines.
@@ -77,6 +80,8 @@ class _PoolSession(Protocol):
     _reuse_worker_pids: tuple[tuple[int, bytes | None], ...]
 
     def shutdown(self) -> None: ...
+
+    def release_exit_joins(self) -> None: ...
 
 
 def _reap_retires(timeout: float = 60.0) -> None:
@@ -146,7 +151,9 @@ def _describe_mismatch(spawn_snap, now_snap, uses, max_uses):
         return f"lifetime cap reached ({uses}/{max_uses} uses)"
     spawn_env, spawn_path = spawn_snap
     now_env, now_path = now_snap
-    changed = [k for k in set(spawn_env) | set(now_env) if spawn_env.get(k) != now_env.get(k)]
+    changed = [
+        k for k in set(spawn_env) | set(now_env) if spawn_env.get(k) != now_env.get(k)
+    ]
     if changed:
         return f"env changed since spawn: {sorted(changed)[:6]}"
     if spawn_path != now_path:
@@ -273,7 +280,9 @@ class SessionReuseCache:
             return  # fully installed: skip the env reads and module scan
         if not self.enabled:
             return
-        pending = [n for n in _ALL_PATCH_TARGETS if n in sys.modules and n not in self._patched]
+        pending = [
+            n for n in _ALL_PATCH_TARGETS if n in sys.modules and n not in self._patched
+        ]
         if not pending:
             return
         from tensorrt_llm.llmapi.mpi_session import MpiPoolSession as real_cls
@@ -331,7 +340,10 @@ class SessionReuseCache:
                 print(
                     "[session-reuse] retiring cached pool: "
                     + _describe_mismatch(
-                        real._reuse_spawn_snapshot, snap, real._reuse_uses, self.max_uses
+                        real._reuse_spawn_snapshot,
+                        snap,
+                        real._reuse_uses,
+                        self.max_uses,
                     ),
                     flush=True,
                 )
@@ -395,7 +407,9 @@ class SessionReuseCache:
             # collection still fails, unidentified workers may remain alive;
             # an immediate retry would overlap another MPI bootstrap with
             # them, so propagate the fail-closed error.
-            real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
+            real = real_cls(
+                n_workers=n_workers, wait_shutdown=True, env_overrides=overrides
+            )
         if prefetcher is not None:
             try:
                 # Restock only after the current pool is ready. On a shadow
@@ -459,7 +473,9 @@ class SessionReuseCache:
         for t in threads:
             t.join(timeout=max(0.0, deadline - time.monotonic()))
 
-        wedged = [(pool, thread) for pool, thread in zip(pools, threads) if thread.is_alive()]
+        wedged = [
+            (pool, thread) for pool, thread in zip(pools, threads) if thread.is_alive()
+        ]
         for pool, _ in wedged:
             killed = _kill_recorded_workers(pool)
             print(
@@ -471,14 +487,17 @@ class SessionReuseCache:
         # Killing a wedged worker should release its GPU allocation and let
         # the already-running shutdown return. Give that original thread a
         # short bounded reap window; never start a concurrent second shutdown.
-        reap_deadline = time.monotonic() + min(timeout, 5.0)
+        reap_deadline = time.monotonic() + min(max(timeout, 1.0), 5.0)
         for _, t in wedged:
             t.join(timeout=max(0.0, reap_deadline - time.monotonic()))
 
-        still_alive = sum(t.is_alive() for t in threads)
+        still_alive = [(pool, thread) for pool, thread in wedged if thread.is_alive()]
+        for pool, _ in still_alive:
+            pool.release_exit_joins()
+
         if still_alive:
             print(
-                f"[session-reuse] WARNING: {still_alive} pool shutdown thread(s) "
+                f"[session-reuse] WARNING: {len(still_alive)} pool shutdown thread(s) "
                 "remain after worker termination",
                 flush=True,
             )
