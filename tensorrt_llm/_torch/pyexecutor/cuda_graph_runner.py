@@ -684,6 +684,7 @@ class CUDAGraphRunner:
 
             graph = torch.cuda.CUDAGraph()
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            self.memory_pool = graph_pool
             with nccl_window_graph_capture(graph, graph_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
@@ -695,7 +696,6 @@ class CUDAGraphRunner:
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
-        self.memory_pool = graph_pool
         return graph_output
 
     def replay(self, key: KeyType,
@@ -1828,6 +1828,7 @@ class EncoderCUDAGraphRunner:
 
             graph = torch.cuda.CUDAGraph()
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            self.memory_pool = graph_pool
             with nccl_window_graph_capture(graph,
                                            graph_pool,
                                            capture_error_mode="thread_local"):
@@ -1852,7 +1853,6 @@ class EncoderCUDAGraphRunner:
         self.graphs[key] = graph
         graph_output = make_weak_ref(output)
         self.graph_outputs[key] = graph_output
-        self.memory_pool = graph_pool
         return graph_output
 
     def retire_staging(self) -> None:

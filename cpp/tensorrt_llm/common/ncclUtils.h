@@ -280,6 +280,11 @@ private:
 
     using CudaGetLastErrorFunc = cudaError_t (*)();
 
+    // Drain the sticky CUDA error when capture state cannot be queried because another
+    // thread owns a global capture. Returns true when the caller must use an unregistered buffer.
+    static bool clearCudaErrorIfCaptureStateUnknown(
+        cudaError_t captureError, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
+
     // Drain the sticky CUDA error left by a failed symmetric allocation.
     static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
         int localAllocOk, CudaGetLastErrorFunc getLastError = cudaGetLastError) noexcept;
@@ -395,9 +400,9 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
         return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
     }
 
-    // Expected resource failures and captures without a graph-pool owner return an invalid
-    // buffer so callers can use their existing unregistered fallback. Other programming errors
-    // must propagate instead of silently changing the collective implementation.
+    // Expected resource failures, unknown capture state, and captures without a graph-pool owner
+    // return an invalid buffer so callers can use their existing unregistered fallback. Other
+    // programming errors must propagate instead of silently changing the collective implementation.
     buffer = allocator.requestBuffer(*comm, buffer_size);
 
     // Defensive validation: ensure buffer is valid before proceeding

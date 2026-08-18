@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bind NCCL symmetric-window buffers to PyTorch CUDA graph memory pools."""
+"""Bind NCCL symmetric-window buffers to PyTorch CUDA graph memory pools.
+
+Every TRT-LLM CUDA graph capture that may use NCCL symmetric windows must use
+``nccl_window_graph_capture`` with its shared graph-pool handle. Bypassing this
+wrapper emits a warning and uses unregistered buffers to prevent unsafe reuse,
+which preserves correctness but loses symmetric-window performance.
+"""
 
 import contextlib
 import operator
@@ -15,6 +21,7 @@ _OWNER_BASE = 1 << 62
 _next_pool_owner = _OWNER_BASE
 _pool_owners: dict[tuple[int, int], int] = {}
 _pool_owners_lock = threading.Lock()
+_capture_owner = threading.local()
 
 
 def _pool_key(pool: Any) -> tuple[int, int]:
@@ -46,12 +53,15 @@ def nccl_window_graph_capture(
     **capture_kwargs: Any,
 ) -> Iterator[None]:
     owner = _shared_pool_owner(pool)
+    previous_owner = getattr(_capture_owner, "value", _EAGER_OWNER)
     torch.ops.trtllm.set_nccl_window_graph_owner(owner)
+    _capture_owner.value = owner
     try:
         with torch.cuda.graph(graph, pool=pool, **capture_kwargs):
             yield
     finally:
-        torch.ops.trtllm.set_nccl_window_graph_owner(_EAGER_OWNER)
+        torch.ops.trtllm.set_nccl_window_graph_owner(previous_owner)
+        _capture_owner.value = previous_owner
 
 
 def release_nccl_window_graph_owner(pool: Any) -> None:

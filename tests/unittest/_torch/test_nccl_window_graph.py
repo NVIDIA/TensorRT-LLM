@@ -126,3 +126,33 @@ def test_graph_capture_restores_owner_when_capture_fails(monkeypatch):
         ("capture", graph, pool, {}),
         ("owner", nccl_window_graph._EAGER_OWNER),
     ]
+
+
+def test_nested_graph_capture_restores_previous_owner(monkeypatch):
+    outer_pool = (67890, 2345)
+    inner_pool = (78901, 3456)
+    outer_owner = nccl_window_graph._shared_pool_owner(outer_pool)
+    inner_owner = nccl_window_graph._shared_pool_owner(inner_pool)
+    owners = []
+
+    monkeypatch.setattr(
+        nccl_window_graph.torch.ops.trtllm,
+        "set_nccl_window_graph_owner",
+        owners.append,
+    )
+    monkeypatch.setattr(
+        nccl_window_graph.torch.cuda,
+        "graph",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+
+    with nccl_window_graph.nccl_window_graph_capture(object(), outer_pool):
+        with nccl_window_graph.nccl_window_graph_capture(object(), inner_pool):
+            pass
+
+    assert owners == [
+        outer_owner,
+        inner_owner,
+        outer_owner,
+        nccl_window_graph._EAGER_OWNER,
+    ]

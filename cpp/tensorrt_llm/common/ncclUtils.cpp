@@ -451,7 +451,15 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     TLLM_CHECK_WITH_INFO(size > 0, "Buffer size must be greater than 0");
 
     cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
-    TLLM_CUDA_CHECK(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &captureStatus));
+    auto const captureError = cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &captureStatus);
+    if (clearCudaErrorIfCaptureStateUnknown(captureError))
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] CUDA graph capture state is unknown because another thread owns a global capture. "
+            "Falling back to an unregistered buffer.");
+        return NCCLWindowBuffer();
+    }
+    TLLM_CUDA_CHECK(captureError);
     bool const isCapturing = captureStatus != cudaStreamCaptureStatusNone;
     if (isCapturing && !gGraphPoolOwner.has_value())
     {
@@ -511,7 +519,10 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     }
 
     // Registration is not capture-safe. A capture without a suitable dedicated/eager buffer
-    // must use the existing unregistered fallback path.
+    // must use the existing unregistered fallback path. Safety relies on all ranks for this
+    // communicator executing window requests, releases, and graph-owner transitions in identical
+    // SPMD order. This keeps pool history and the registered/plain decision rank-symmetric; an NCCL
+    // symmetric collective must not mix window-backed and plain pointers across ranks.
     if (isCapturing)
     {
         TLLM_LOG_WARNING(
@@ -566,6 +577,17 @@ void NCCLWindowAllocator::recordSymmetricFailureLocked(ncclComm_t comm, size_t s
     {
         failureIt->second = size;
     }
+}
+
+bool NCCLWindowAllocator::clearCudaErrorIfCaptureStateUnknown(
+    cudaError_t captureError, CudaGetLastErrorFunc getLastError) noexcept
+{
+    if (captureError != cudaErrorStreamCaptureImplicit)
+    {
+        return false;
+    }
+    static_cast<void>(getLastError());
+    return true;
 }
 
 cudaError_t NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(

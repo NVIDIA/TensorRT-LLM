@@ -55,6 +55,12 @@ public:
     {
         return NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(localAllocOk, getLastError);
     }
+
+    static bool clearCudaErrorIfCaptureStateUnknown(
+        cudaError_t captureError, NCCLWindowAllocator::CudaGetLastErrorFunc getLastError = cudaGetLastError)
+    {
+        return NCCLWindowAllocator::clearCudaErrorIfCaptureStateUnknown(captureError, getLastError);
+    }
 };
 } // namespace tensorrt_llm::common::nccl_util
 
@@ -522,6 +528,23 @@ TEST_F(NCCLWindowAllocatorTest, ClearsCudaErrorAfterLocalAllocationFailure)
     EXPECT_EQ(gCudaGetLastErrorCallCount, 0);
 
     EXPECT_EQ(clearCudaErrorIfFailed(0), cudaErrorLaunchFailure);
+    EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
+}
+
+TEST_F(NCCLWindowAllocatorTest, CaptureStateUnknownUsesFallbackAndClearsCudaError)
+{
+    auto const clearCudaErrorIfUnknown = [](cudaError_t captureError)
+    {
+        return nccl_util::NCCLWindowAllocatorTestAccess::clearCudaErrorIfCaptureStateUnknown(
+            captureError, fakeCudaGetLastError);
+    };
+
+    gCudaGetLastErrorCallCount = 0;
+    EXPECT_TRUE(clearCudaErrorIfUnknown(cudaErrorStreamCaptureImplicit));
+    EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
+
+    EXPECT_FALSE(clearCudaErrorIfUnknown(cudaSuccess));
+    EXPECT_FALSE(clearCudaErrorIfUnknown(cudaErrorInvalidValue));
     EXPECT_EQ(gCudaGetLastErrorCallCount, 1);
 }
 
