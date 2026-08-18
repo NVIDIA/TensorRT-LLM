@@ -5,7 +5,7 @@ import copy
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -32,6 +32,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalParams)
+from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -69,8 +70,7 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_encoder import (_ENCODER_FALLBACK_MAX_NUM_REQUESTS,
-                                          MultimodalEncoderMixin)
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
     _install_processor_output_validation_filter, find_input_mm_embeds,
@@ -194,12 +194,6 @@ def _prepare_qwen_vl_mrope_config(
     return mrope_config
 
 
-# A token budget larger than any real ``encoder_max_num_tokens`` so that
-# ``get_size_for_max_tokens`` falls through to its ``max_pixels`` cap, yielding
-# the largest single-image size (used to report the per-item token demand).
-_MAX_PIXELS_TOKEN_PROBE = 1 << 31
-
-
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
@@ -252,6 +246,143 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
+    def get_mm_encoder_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+    ) -> Optional[MultimodalEncoderItemMetadata]:
+        """Return prompt-ordered Qwen vision items and pre-merger costs."""
+        grids_by_modality: Dict[str, torch.Tensor] = {}
+        for modality, grid_key in (("image", "image_grid_thw"),
+                                   ("video", "video_grid_thw")):
+            modality_data = multimodal_data.get(modality)
+            if isinstance(modality_data,
+                          dict) and modality_data.get(grid_key) is not None:
+                grids_by_modality[modality] = modality_data[grid_key]
+        if not grids_by_modality:
+            return None
+
+        # Qwen2.5's fixed attention metadata is sized from the live
+        # processor's startup geometry. Validate the processed grids against
+        # that same contract before the request reaches the scheduler. This
+        # also covers request-local processor overrides (for example,
+        # ``min_pixels`` or ``do_resize=False``) without trying to infer their
+        # effect from the raw kwargs.
+        if getattr(self.config.vision_config, "window_size", None) is not None:
+            self._validate_encoder_attention_geometry(grids_by_modality)
+
+        config = self.config
+        image_token_id = int(config.image_token_id)
+        video_token_id = int(config.video_token_id)
+        vision_start_token_id = int(config.vision_start_token_id)
+        vision_end_token_id = int(config.vision_end_token_id)
+
+        # Bounded `list.index` scans run at C speed, unlike a per-token
+        # Python loop over the full prompt.
+        modalities: List[str] = []
+        search_start = 0
+        prompt_length = len(prompt_token_ids)
+        while search_start < prompt_length:
+            try:
+                item_start = prompt_token_ids.index(vision_start_token_id,
+                                                    search_start)
+            except ValueError:
+                break
+            try:
+                item_end = prompt_token_ids.index(vision_end_token_id,
+                                                  item_start + 1)
+            except ValueError as error:
+                raise ValueError(
+                    "Unclosed Qwen vision span in prompt token IDs") from error
+
+            image_pos = None
+            video_pos = None
+            try:
+                image_pos = prompt_token_ids.index(image_token_id,
+                                                   item_start + 1, item_end)
+            except ValueError:
+                pass
+            try:
+                video_pos = prompt_token_ids.index(video_token_id,
+                                                   item_start + 1, item_end)
+            except ValueError:
+                pass
+
+            if image_pos is not None and video_pos is not None:
+                raise ValueError(
+                    "Qwen vision span contains both image and video tokens")
+            if image_pos is not None:
+                modalities.append("image")
+            elif video_pos is not None:
+                modalities.append("video")
+            else:
+                raise ValueError(
+                    "Qwen vision span contains no image or video token")
+
+            search_start = item_end + 1
+
+        video_grids = grids_by_modality.get("video")
+        num_video_spans = modalities.count("video")
+        video_spans_per_item: List[int] = []
+        if video_grids is not None:
+            if num_video_spans == len(video_grids):
+                video_spans_per_item = [1] * len(video_grids)
+            else:
+                temporal_spans = [int(grid[0]) for grid in video_grids]
+                if num_video_spans != sum(temporal_spans):
+                    raise ValueError(
+                        "Prompt video spans do not match processed video grids")
+                video_spans_per_item = temporal_spans
+
+        canonical_modalities: List[str] = []
+        span_idx = 0
+        video_idx = 0
+        while span_idx < len(modalities):
+            modality = modalities[span_idx]
+            canonical_modalities.append(modality)
+            if modality == "image":
+                span_idx += 1
+                continue
+            if video_idx >= len(video_spans_per_item):
+                raise ValueError(
+                    "Prompt contains more video items than encoder grids")
+            spans = video_spans_per_item[video_idx]
+            if modalities[span_idx:span_idx + spans] != ["video"] * spans:
+                raise ValueError(
+                    "One original video must occupy consecutive prompt spans")
+            span_idx += spans
+            video_idx += 1
+        if video_idx != len(video_spans_per_item):
+            raise ValueError(
+                "Processed video grids contain items absent from the prompt")
+
+        local_indices = {"image": 0, "video": 0}
+        item_refs: List[Tuple[str, int]] = []
+        encoder_token_lengths: List[int] = []
+        for modality in canonical_modalities:
+            local_idx = local_indices[modality]
+            grids = grids_by_modality.get(modality)
+            if grids is None or local_idx >= len(grids):
+                raise ValueError(
+                    f"Prompt contains more {modality} items than encoder grids")
+            item_refs.append((modality, local_idx))
+            encoder_token_lengths.append(
+                int(torch.prod(grids[local_idx]).item()))
+            local_indices[modality] += 1
+
+        expected_items = sum(len(grids) for grids in grids_by_modality.values())
+        if len(item_refs) != expected_items:
+            raise ValueError("Prompt multimodal item order does not match "
+                             "processed Qwen encoder grids")
+        output_embedding_lengths = [
+            token_length // self.spatial_merge_unit
+            for token_length in encoder_token_lengths
+        ]
+        return MultimodalEncoderItemMetadata(
+            item_refs=item_refs,
+            encoder_token_lengths=encoder_token_lengths,
+            output_embedding_lengths=output_embedding_lengths)
+
     # ------------------------------------------------------------------
     # Deterministic dummy-input sizing for multimodal profiling.
     #
@@ -270,24 +401,31 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         merge_size = self.config.vision_config.spatial_merge_size
         return merge_size * merge_size
 
-    def _vision_pixel_bounds(self) -> Tuple[int, int]:
-        """``(min_pixels, max_pixels)`` the HF image processor clamps to in
-        ``smart_resize``. Read from the live processor's ``size`` config
+    def _vision_pixel_bounds(self, modality: str = "image") -> Tuple[int, int]:
+        """Return the live processor's pixel bounds for one modality.
+
+        Read ``(min_pixels, max_pixels)`` from the selected HF processor's
+        ``size`` config
         (transformers 5.x ``SizeDict`` with ``shortest_edge`` / ``longest_edge``)
         so per-model overrides are honored; falls back to the HF ``smart_resize``
-        defaults when unavailable.
+        defaults for images when unavailable. A missing video processor is
+        reported separately because it means video profiling is unsupported.
         """
+        if modality not in ("image", "video"):
+            raise ValueError(f"Unsupported vision modality: {modality}")
         processor = getattr(self, "_processor", None)
-        image_processor = getattr(processor, "image_processor", None)
-        size = getattr(image_processor, "size", None)
+        vision_processor = getattr(processor, f"{modality}_processor", None)
+        size = getattr(vision_processor, "size", None)
         if size is not None:
             try:
                 min_pixels = size["shortest_edge"]
                 max_pixels = size["longest_edge"]
                 if min_pixels and max_pixels:
                     return int(min_pixels), int(max_pixels)
-            except (KeyError, TypeError):
+            except (KeyError, TypeError, ValueError):
                 pass
+        if modality == "video":
+            raise ValueError("The Qwen processor has no video pixel bounds")
         # HF `smart_resize` defaults.
         return 3136, 1003520
 
@@ -357,8 +495,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """``(grid_t, grid_h, grid_w)`` patch-grid dimensions the processor would
         produce for an image/video of the given pixel size, after HF
         ``smart_resize`` (so the ``[min_pixels, max_pixels]`` clamp is honored).
-        Shared by :meth:`_num_vision_tokens` (product) and
-        :meth:`get_dummy_mm_data_for_size` (tensor shapes)."""
+        Shared by :meth:`_num_vision_tokens` and the profiling dummy builder."""
         cfg = self.config.vision_config
         patch_size = cfg.patch_size
         merge_size = cfg.spatial_merge_size
@@ -392,24 +529,53 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         ``max_tokens`` is in the same unit as ``_num_vision_tokens`` /
         ``encoder_max_num_tokens`` (pre-merger).
 
-        Returns a single-image geometry (``num_frames=1``). This is a valid
-        worst case for the *whole* vision encoder regardless of the runtime
-        modality: the ViT cost is a function of the total pre-merger patch
-        count (the token unit), and ``_num_vision_tokens`` already folds video
-        frames into that same count — so an image saturating ``max_tokens``
-        hits the same attention workspace as any video with the same token
-        count. Non-visual modalities (e.g. audio) live on a different input
-        processor and size their own dummy.
+        Returns a single-image geometry (``num_frames=1``). Video profiling
+        uses the video processor's separate spatial and temporal constraints
+        instead of treating this image geometry as modality-independent.
         """
+        min_pixels, max_pixels = self._vision_pixel_bounds()
+        size = self._size_for_max_tokens(
+            max_tokens=max_tokens,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+        if size is None:
+            # Preserve the historical API: callers get a concrete minimum
+            # image geometry and can observe that it exceeds their budget.
+            cfg = self.config.vision_config
+            unit = cfg.patch_size * cfg.spatial_merge_size
+            min_area = max(1, math.ceil(min_pixels / (unit * unit)))
+            size = self._size_for_max_tokens(
+                max_tokens=min_area * self.spatial_merge_unit,
+                min_pixels=min_pixels,
+                max_pixels=max_pixels,
+            )
+            if size is None:
+                raise ValueError("Qwen vision processor pixel bounds do not "
+                                 "contain a valid patch grid")
+        return size
+
+    def _size_for_max_tokens(
+        self,
+        *,
+        max_tokens: int,
+        min_pixels: int,
+        max_pixels: int,
+    ) -> Optional[Dict[str, int]]:
+        """Largest processor-valid single-frame geometry within a budget."""
         if max_tokens <= 0:
             raise ValueError(f"max_tokens must be positive, got {max_tokens}")
 
-        def closest_factor_pair(n: int) -> Tuple[int, int]:
-            """Closest ``h*w=n`` to square; keeps dummy aspect ratio near 1:1."""
-            for d in range(math.isqrt(n), 0, -1):
-                if n % d == 0:
-                    return d, n // d
-            return 1, n
+        def factor_pair_with_bounded_aspect(
+                max_area: int, min_area: int) -> Optional[Tuple[int, int]]:
+            for area in range(max_area, min_area - 1, -1):
+                for divisor in range(math.isqrt(area), 0, -1):
+                    if area % divisor == 0:
+                        height, width = divisor, area // divisor
+                        if width / height <= 200:
+                            return height, width
+                        break
+            return None
 
         cfg = self.config.vision_config
         patch_size = cfg.patch_size
@@ -420,21 +586,22 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # dimension is ``merge_size`` × the post-merger factor. Searching in
         # post-merger units bounds the inner loop and lets us reuse the
         # familiar near-square factor pair for aspect ratio bounds.
-        post_merger_budget = max(max_tokens // (merge_size * merge_size), 1)
+        post_merger_budget = max_tokens // (merge_size * merge_size)
+        min_post_merger = max(1, math.ceil(min_pixels / (unit * unit)))
         # A single image can't exceed the processor's ``max_pixels`` -- past
         # that, ``smart_resize`` (in ``_num_vision_tokens``) clamps the image
         # back down, so an uncapped budget would produce a size whose real
         # token count falls short of ``max_tokens``. Cap so the chosen size
         # round-trips exactly (size the worst case by ``max_pixels``).
-        _, max_pixels = self._vision_pixel_bounds()
         max_post_merger = max(max_pixels // (unit * unit), 1)
         post_merger_budget = min(post_merger_budget, max_post_merger)
-        h_factor, w_factor = closest_factor_pair(post_merger_budget)
-        for seq_len in range(post_merger_budget, 0, -1):
-            h_f, w_f = closest_factor_pair(seq_len)
-            if w_f / max(h_f, 1) <= 200:
-                h_factor, w_factor = h_f, w_f
-                break
+        if post_merger_budget < min_post_merger:
+            return None
+        factors = factor_pair_with_bounded_aspect(post_merger_budget,
+                                                  min_post_merger)
+        if factors is None:
+            return None
+        h_factor, w_factor = factors
 
         return {
             "width": unit * w_factor,
@@ -442,49 +609,263 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             "num_frames": 1,
         }
 
-    def get_mm_max_tokens_per_item(self) -> Dict[str, int]:
-        """Qwen-VL runs image and video through one shared ViT, so the image
-        worst case already covers the vision encoder — only ``"image"`` is
-        declared. The value is the largest single image's encoder tokens (the
-        ``max_pixels``-capped size), used to weight the shared-budget split."""
-        size = self.get_size_for_max_tokens(max_tokens=_MAX_PIXELS_TOKEN_PROBE)
+    def _get_dummy_grid_for_modality(
+        self,
+        modality: str,
+        max_num_encoder_tokens: Optional[int],
+    ) -> Optional[Tuple[int, int, int]]:
+        """Return one processor-valid grid under the shared token budget."""
+        cfg = self.config.vision_config
+        token_budget = max_num_encoder_tokens
+        if token_budget is None:
+            _, image_max_pixels = self._vision_pixel_bounds()
+            token_budget = max(1, image_max_pixels // (cfg.patch_size**2))
+        if modality == "image":
+            image_size = self.get_size_for_max_tokens(max_tokens=token_budget)
+            image_grid = self._grid_thw_for_size(
+                width=image_size["width"],
+                height=image_size["height"],
+            )
+            return (image_grid
+                    if math.prod(image_grid) <= token_budget else None)
+        if modality == "video":
+            try:
+                min_pixels, max_pixels = self._vision_pixel_bounds("video")
+            except ValueError:
+                return None
+
+            merge_size = cfg.spatial_merge_size
+            unit = cfg.patch_size * merge_size
+            min_spatial_tokens = (max(1, math.ceil(min_pixels /
+                                                   (unit * unit))) *
+                                  merge_size * merge_size)
+            max_grid_t = token_budget // min_spatial_tokens
+            video_processor = getattr(self.processor, "video_processor", None)
+            processor_max_frames = getattr(video_processor, "max_frames", None)
+            temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
+            if processor_max_frames is not None:
+                max_grid_t = min(
+                    max_grid_t,
+                    int(processor_max_frames) // temporal_patch_size,
+                )
+
+            best_grid: Optional[Tuple[int, int, int]] = None
+            best_score = (0, 0)
+            for grid_t in range(1, max_grid_t + 1):
+                size = self._size_for_max_tokens(
+                    max_tokens=token_budget // grid_t,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
+                )
+                if size is None:
+                    continue
+                grid_h = size["height"] // cfg.patch_size
+                grid_w = size["width"] // cfg.patch_size
+                spatial_tokens = grid_h * grid_w
+                score = (grid_t * spatial_tokens, spatial_tokens)
+                if score > best_score:
+                    best_grid = (grid_t, grid_h, grid_w)
+                    best_score = score
+            return best_grid
+        raise ValueError(f"Unsupported vision modality: {modality}")
+
+    def get_mm_max_tokens_per_item(
+        self,
+        max_num_encoder_tokens: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Return processor-valid Qwen image/video encoder item sizes."""
+        max_tokens_per_item = {}
+        for modality in ("image", "video"):
+            grid = self._get_dummy_grid_for_modality(modality,
+                                                     max_num_encoder_tokens)
+            if grid is not None:
+                max_tokens_per_item[modality] = math.prod(grid)
+        return max_tokens_per_item
+
+    def get_max_mm_encoder_output_embeddings(
+            self, max_num_encoder_tokens: int) -> int:
+        """Bound post-merger embeddings from one Qwen encoder iteration.
+
+        Every scheduled image or video contributes one output embedding per
+        ``spatial_merge_unit`` physical encoder tokens. Item count cannot
+        increase the aggregate output beyond the shared encoder-token budget.
+        """
+        return max_num_encoder_tokens // self.spatial_merge_unit
+
+    def _post_merge_frame_area_bounds(self) -> Tuple[int, int]:
+        """Return startup frame-area bounds in merged-grid units.
+
+        Images and videos may use distinct HF processors. Qwen2/2.5 applies
+        the pixel clamp independently to every temporal frame, so use the
+        least restrictive minimum and greatest maximum across both.
+        """
+        cfg = self.config.vision_config
+        factor = cfg.patch_size * cfg.spatial_merge_size
+        pixel_bounds = []
+        for processor_name in ("image_processor", "video_processor"):
+            processor = getattr(self.processor, processor_name, None)
+            size = getattr(processor, "size", None)
+            if size is None:
+                continue
+            try:
+                min_pixels = int(size["shortest_edge"])
+                max_pixels = int(size["longest_edge"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if min_pixels > 0 and max_pixels >= min_pixels:
+                pixel_bounds.append((min_pixels, max_pixels))
+        if not pixel_bounds:
+            pixel_bounds.append(self._vision_pixel_bounds())
+
+        min_pixels = min(bounds[0] for bounds in pixel_bounds)
+        max_pixels = max(bounds[1] for bounds in pixel_bounds)
+        factor_area = factor * factor
+        min_area = max(1, math.ceil(min_pixels / factor_area))
+        max_area = max(min_area, max_pixels // factor_area)
+        return min_area, max_area
+
+    @staticmethod
+    def _windows_along(dimension: int, window_side: int) -> int:
+        """Windows the encoder produces along one merged-grid dimension.
+
+        This mirrors `Qwen2_5_VisionModel.get_window_index_by_thw` rather than
+        rounding up, because that padding is `window - dim % window`, which is
+        a whole extra window when `dim` is an exact multiple instead of none.
+        The extra window holds only padding, so its sequence length is zero --
+        but it is still emitted in `window_seq_lens` and still counted as a
+        context, so metadata sized with `ceil()` would come up short (a 4x4
+        merged grid produces 4 windows, not 1).
+        """
+        return dimension // window_side + 1
+
+    @staticmethod
+    @lru_cache(maxsize=32)
+    def _max_window_ratio(min_area: int, max_area: int,
+                          window_side: int) -> Tuple[int, int]:
+        """Return ``(windows, merged_tokens)`` with maximum ratio.
+
+        A resized Qwen frame has positive integer merged-grid dimensions
+        ``(h, w)`` and ``min_area <= h*w <= max_area``. Enumerating that
+        bounded domain gives a tight ratio upper bound for both images and
+        repeated video frames without assuming the runtime aspect ratio.
+        """
+        best_windows = 1
+        best_area = min_area
+        windows_along = Qwen2VLInputProcessorBase._windows_along
+        for grid_h in range(1, max_area + 1):
+            min_grid_w = max(1, math.ceil(min_area / grid_h))
+            max_grid_w = max_area // grid_h
+            for grid_w in range(min_grid_w, max_grid_w + 1):
+                area = grid_h * grid_w
+                windows = (windows_along(grid_h, window_side) *
+                           windows_along(grid_w, window_side))
+                if windows * best_area > best_windows * area:
+                    best_windows = windows
+                    best_area = area
+        return best_windows, best_area
+
+    def _validate_encoder_attention_geometry(
+            self, grids_by_modality: Dict[str, torch.Tensor]) -> None:
+        """Validate runtime grids against startup metadata-sizing bounds."""
+        cfg = self.config.vision_config
+        merge_size = cfg.spatial_merge_size
+        min_area, max_area = self._post_merge_frame_area_bounds()
+        window_side = max(1, cfg.window_size // merge_size // cfg.patch_size)
+        max_windows, ratio_area = self._max_window_ratio(
+            min_area, max_area, window_side)
+
+        for modality, grids in grids_by_modality.items():
+            for grid in grids:
+                _, grid_h, grid_w = (int(value) for value in grid)
+                if grid_h % merge_size or grid_w % merge_size:
+                    raise ValueError(
+                        f"Processed Qwen {modality} grid ({grid_h}, {grid_w}) "
+                        f"must be divisible by spatial_merge_size={merge_size}")
+                merged_h = grid_h // merge_size
+                merged_w = grid_w // merge_size
+                area = merged_h * merged_w
+                windows = (self._windows_along(merged_h, window_side) *
+                           self._windows_along(merged_w, window_side))
+                if (area < min_area
+                        or windows * ratio_area > max_windows * area):
+                    raise ValueError(
+                        f"Processed Qwen {modality} frame geometry "
+                        f"({grid_h}, {grid_w}) exceeds the encoder attention "
+                        "metadata capacity derived from the startup processor "
+                        "geometry. Configure the processor geometry at startup "
+                        "instead of lowering it per request.")
+
+    def get_mm_encoder_attention_metadata_capacity(
+            self, max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Bound Qwen2.5 full/window segments using processor geometry.
+
+        One atomic video item may contain enough temporal segments to consume
+        the whole token budget, so the bound is token-based.
+        """
+        cfg = self.config.vision_config
+        window_size = getattr(cfg, "window_size", None)
+        if window_size is None:
+            return None
+
+        merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size
+        min_area, max_area = self._post_merge_frame_area_bounds()
+        min_frame_tokens = merge_unit * min_area
+        full_capacity = max(1, max_num_tokens // min_frame_tokens)
+
+        window_side = max(
+            1, window_size // cfg.spatial_merge_size // cfg.patch_size)
+        windows, area = self._max_window_ratio(min_area, max_area, window_side)
+        window_capacity = max(1,
+                              max_num_tokens * windows // (merge_unit * area))
         return {
-            "image":
-            self._num_vision_tokens(width=size["width"], height=size["height"])
+            "full_attention": full_capacity,
+            "window_attention": window_capacity,
         }
 
-    def get_dummy_mm_data_for_tokens(
+    def get_dummy_mm_data(
         self,
         *,
-        max_tokens_per_modality: Dict[str, int],
+        max_num_encoder_tokens: int,
+        mm_counts: Mapping[str, int],
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
-        """Vision implementation of the modality-agnostic profiler entry: for the
-        ``"image"`` budget, pick the worst-case image size, fill it with identical
-        copies, and materialize the encoder tensors.
+        """Build processed Qwen tensors for the profiler-selected items."""
+        if max_num_encoder_tokens <= 0:
+            raise ValueError("max_num_encoder_tokens must be positive")
 
-        ``num_images`` is computed from the *realized* token count of the chosen
-        size (which the ``max_pixels`` cap may make smaller than the budget), so
-        the batch saturates the budget rather than assuming one image fills it.
-        """
-        max_tokens = max_tokens_per_modality.get("image")
-        if not max_tokens:
-            return {}
-        size = self.get_size_for_max_tokens(max_tokens=max_tokens)
-        tokens_per_image = max(
-            1,
-            self._num_vision_tokens(width=size["width"],
-                                    height=size["height"],
-                                    num_frames=size.get("num_frames", 1)))
-        num_images = max(1, max_tokens // tokens_per_image)
-        return self.get_dummy_mm_data_for_size(width=size["width"],
-                                               height=size["height"],
-                                               num_frames=size.get(
-                                                   "num_frames", 1),
-                                               num_images=num_images,
-                                               dtype=dtype)
+        mm_data: Dict[str, Any] = {}
+        total_tokens = 0
+        for modality, num_items in mm_counts.items():
+            if modality not in ("image", "video"):
+                raise ValueError(f"Unsupported vision modality: {modality}")
+            if num_items < 0:
+                raise ValueError(
+                    f"Multimodal item counts must be nonnegative; got "
+                    f"{num_items} for {modality}")
+            if num_items == 0:
+                continue
 
-    def get_dummy_mm_data_for_size(
+            grid = self._get_dummy_grid_for_modality(modality,
+                                                     max_num_encoder_tokens)
+            if grid is None:
+                raise ValueError(
+                    f"Qwen {modality} dummy does not fit within "
+                    f"max_num_encoder_tokens={max_num_encoder_tokens}")
+            total_tokens += num_items * math.prod(grid)
+            if total_tokens > max_num_encoder_tokens:
+                raise ValueError(
+                    "Requested multimodal dummy items exceed "
+                    f"max_num_encoder_tokens={max_num_encoder_tokens}")
+            mm_data.update(
+                self._dummy_vision_data_for_grid(
+                    modality=modality,
+                    grid=grid,
+                    num_items=num_items,
+                    dtype=dtype,
+                ))
+        return mm_data
+
+    def _dummy_mm_data_for_size(
         self,
         *,
         width: int,
@@ -493,38 +874,53 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         num_images: int = 1,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
-        """Build the *processed* multimodal tensors for ``num_images`` identical
-        ``(width, height)`` images directly, skipping PIL image creation and the
-        HF processor (the encoder profiler's worst-case dummy batch).
+        """Build processed Qwen vision tensors of the requested geometry."""
+        grid_t, grid_h, grid_w = self._grid_thw_for_size(
+            width=width,
+            height=height,
+            num_frames=num_frames,
+        )
+        return self._dummy_vision_data_for_grid(
+            modality="image",
+            grid=(grid_t, grid_h, grid_w),
+            num_items=max(num_images, 1),
+            dtype=dtype,
+        )
 
-        The vision encoder forward consumes only ``pixel_values`` (shape
-        ``[num_patches, in_dim]``) and ``image_grid_thw`` (shape
-        ``[num_images, 3]``); the pixel *content* is irrelevant for memory
-        profiling, so zero tensors of the exact shape the processor would emit
-        suffice. Returns the ``multimodal_data`` dict consumed by
-        :meth:`Qwen2VisionModelBase._parse_and_batch_multimodal_data`.
-        """
+    def _dummy_vision_data_for_grid(
+        self,
+        *,
+        modality: str,
+        grid: Tuple[int, int, int],
+        num_items: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Dict[str, Any]:
+        """Materialize processed Qwen tensors for one repeated grid."""
+        if num_items <= 0:
+            return {}
+        if modality not in ("image", "video"):
+            raise ValueError(f"Unsupported vision modality: {modality}")
+
         cfg = self.config.vision_config
-        grid_t, grid_h, grid_w = self._grid_thw_for_size(width=width,
-                                                         height=height,
-                                                         num_frames=num_frames)
-        num_images = max(num_images, 1)
-        patches_per_image = grid_t * grid_h * grid_w
         in_channels = getattr(cfg, "in_channels", None) or getattr(
             cfg, "in_chans", 3)
         temporal_patch_size = getattr(cfg, "temporal_patch_size", 1)
-        in_dim = in_channels * temporal_patch_size * cfg.patch_size * cfg.patch_size
-
+        in_dim = (in_channels * temporal_patch_size * cfg.patch_size *
+                  cfg.patch_size)
+        total_patches = num_items * math.prod(grid)
         pixel_values = torch.zeros(
-            (num_images * patches_per_image, in_dim),
+            (total_patches, in_dim),
             dtype=dtype or self.dtype,
         )
-        image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]] * num_images,
-                                      dtype=torch.long)
+        grid_thw = torch.tensor([grid] * num_items, dtype=torch.long)
+        pixel_key = ("pixel_values"
+                     if modality == "image" else "pixel_values_videos")
+        grid_key = ("image_grid_thw"
+                    if modality == "image" else "video_grid_thw")
         return {
-            "image": {
-                "pixel_values": pixel_values,
-                "image_grid_thw": image_grid_thw,
+            modality: {
+                pixel_key: pixel_values,
+                grid_key: grid_thw,
             }
         }
 
@@ -1433,25 +1829,23 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
                              None,
                              persistent=False)
 
-    def setup_attn_metadata(self, max_num_requests: int,
-                            max_num_tokens: int) -> None:
+    def setup_attn_metadata(
+        self,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
         # Override: Qwen2/2.5-VL uses two metadata objects (full + window
         # attention) instead of the mixin's single ``attn_metadata``.
         #
-        # Windowed attention splits each image into many attention sequences
-        # (one per window grid cell), so ``max_num_requests`` here is the
-        # **window** count, not the image count, and can far exceed the
-        # LLM-side ``max_batch_size`` that ``encoder_max_batch_size`` falls back
-        # to. Floor it at the same legacy fallback the mixin uses (see the TODO
-        # there: derive from ``encoder_max_num_tokens`` once the scheduler caps
-        # encoder forwards at it).
-        max_num_requests = max(max_num_requests,
-                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
-        kwargs = dict(max_num_requests=max_num_requests,
-                      max_num_tokens=max_num_tokens,
-                      kv_cache_manager=None)
-        self.full_attn_metadata = self.metadata_cls(**kwargs)
-        self.window_attn_metadata = self.metadata_cls(**kwargs)
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None else
+            self.get_encoder_attention_metadata_capacity(max_num_tokens))
+        kwargs = dict(max_num_tokens=max_num_tokens, kv_cache_manager=None)
+        self.full_attn_metadata = self.metadata_cls(
+            max_num_requests=capacities["full_attention"], **kwargs)
+        self.window_attn_metadata = self.metadata_cls(
+            max_num_requests=capacities["window_attention"], **kwargs)
         self.set_attn_max_seq_len(max_num_tokens)
         # Size the vision-block ``rope_position_ids`` scratch to the encoder
         # token budget; ``forward`` grows it on the rare miss above the budget.
@@ -1470,6 +1864,20 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self._window_attn_max_seq_len = min(
             self._full_attn_max_seq_len,
             vit_merger_window_size**2 * self.spatial_merge_unit)
+
+    def get_encoder_attention_metadata_capacity(
+            self, max_num_tokens: int) -> Dict[str, int]:
+        """Conservatively bound Qwen sequences without processor geometry.
+
+        One atomic video item can expand to multiple temporal and
+        window-attention sequences. The normal model-engine path injects the
+        tighter live-processor bound into :meth:`setup_attn_metadata` instead.
+        """
+        max_num_sequences = max(1, max_num_tokens // self.spatial_merge_unit)
+        return {
+            "full_attention": max_num_sequences,
+            "window_attention": max_num_sequences,
+        }
 
     def get_rotary_pos_emb_window_data(
         self, grid_rows: List[List[int]]
@@ -1723,6 +2131,7 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
+    supports_mm_encoder_item_scheduling = True
 
     def __init__(
         self,
