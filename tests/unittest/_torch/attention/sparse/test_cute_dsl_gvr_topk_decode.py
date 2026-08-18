@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 from typing import Optional
 
 import cutlass
@@ -212,21 +211,6 @@ def _make_inputs(
     return _inputs_cache[key]
 
 
-@contextlib.contextmanager
-def _runtime_cell(**axes):
-    """Name the runtime-axis combination in any assertion raised inside.
-
-    Runtime-only axes are looped rather than parametrized (see the design
-    note below), so this restores the failure locality a parametrize id
-    would have given: ``[varlen=True, batch_size=32, ...] <original>``.
-    """
-    try:
-        yield
-    except AssertionError as exc:
-        ids = ", ".join(f"{k}={v}" for k, v in axes.items())
-        raise AssertionError(f"[{ids}] {exc}") from exc
-
-
 # ---------------------------------------------------------------------------
 # Compile-cost-aware covering design for the op-level sweep.
 #
@@ -284,12 +268,16 @@ _DECODE_RUNTIME_CELLS = [
     "dtype,top_k,next_n,compress_ratio,N,cluster_size",
     _DECODE_COMPILE_CELLS,
 )
+@pytest.mark.parametrize("varlen,batch_size,preidx_hit_rate", _DECODE_RUNTIME_CELLS)
 def test_cute_dsl_gvr_topk_decode(
     dtype,
     top_k,
     N,
+    varlen,
     next_n,
+    batch_size,
     compress_ratio,
+    preidx_hit_rate,
     cluster_size,
     tie_aware_check,
 ):
@@ -303,48 +291,15 @@ def test_cute_dsl_gvr_topk_decode(
     ``varlen=False`` uses uniform seq_lens=N*cr across the batch;
     ``varlen=True`` draws per-row seq_lens uniformly in [N/2, N]*cr.
 
-    The runtime-only axes are a LOOP, not a parametrize dimension: they
-    reuse this cell's already-compiled kernel, so under pytest-xdist a
-    parametrize would scatter them across workers and make each worker
-    re-pay the cuTe DSL codegen for the same variant.
-
     The LJF host-side dispatch order (``order_row``) is covered by the
     dedicated ``test_cute_dsl_gvr_topk_decode_seqlen_sorted`` below on
     representative cells instead of doubling this whole sweep.
     """
     if N - next_n + 1 < top_k:
         pytest.skip(f"N_eff < top_k ({N - next_n + 1} < {top_k}) is a degenerate path")
+    if varlen and batch_size < 2:
+        pytest.skip("varlen with batch_size<2 collapses to fixed")
 
-    for varlen, batch_size, preidx_hit_rate in _DECODE_RUNTIME_CELLS:
-        if varlen and batch_size < 2:
-            continue
-        with _runtime_cell(varlen=varlen, batch_size=batch_size, hit_rate=preidx_hit_rate):
-            _decode_one(
-                dtype,
-                top_k,
-                N,
-                varlen,
-                next_n,
-                batch_size,
-                compress_ratio,
-                preidx_hit_rate,
-                cluster_size,
-                tie_aware_check,
-            )
-
-
-def _decode_one(
-    dtype,
-    top_k,
-    N,
-    varlen,
-    next_n,
-    batch_size,
-    compress_ratio,
-    preidx_hit_rate,
-    cluster_size,
-    tie_aware_check,
-):
     num_rows = batch_size * next_n
     logits, pre_idx, seq_lens = _make_inputs(
         num_rows,
@@ -373,13 +328,7 @@ def _decode_one(
     torch.cuda.synchronize()
 
     _gvr_check(
-        tie_aware_check,
-        out_indices,
-        logits,
-        seq_lens,
-        top_k,
-        next_n,
-        compress_ratio=compress_ratio,
+        tie_aware_check, out_indices, logits, seq_lens, top_k, next_n, compress_ratio=compress_ratio
     )
 
 
@@ -782,36 +731,8 @@ _LB_RUNTIME_CELLS = [
 
 @skip_not_sm100
 @pytest.mark.parametrize("dtype,top_k,N,next_n,compress_ratio", _LB_COMPILE_CELLS)
+@pytest.mark.parametrize("varlen,batch_size,preidx_hit_rate", _LB_RUNTIME_CELLS)
 def test_lb_vs_reference(
-    dtype,
-    top_k,
-    N,
-    next_n,
-    compress_ratio,
-    tie_aware_check,
-):
-    """LB kernel output matches torch.topk tie-aware reference across the
-    same param sweep used by the single-CTA UT."""
-    if N - next_n + 1 < top_k:
-        pytest.skip(f"N_eff < top_k ({N - next_n + 1} < {top_k}) is degenerate")
-    for varlen, batch_size, preidx_hit_rate in _LB_RUNTIME_CELLS:
-        if varlen and batch_size < 2:
-            continue
-        with _runtime_cell(varlen=varlen, batch_size=batch_size, hit_rate=preidx_hit_rate):
-            _lb_vs_reference_one(
-                dtype,
-                top_k,
-                N,
-                varlen,
-                next_n,
-                batch_size,
-                compress_ratio,
-                preidx_hit_rate,
-                tie_aware_check,
-            )
-
-
-def _lb_vs_reference_one(
     dtype,
     top_k,
     N,
@@ -822,6 +743,13 @@ def _lb_vs_reference_one(
     preidx_hit_rate,
     tie_aware_check,
 ):
+    """LB kernel output matches torch.topk tie-aware reference across the
+    same param sweep used by the single-CTA UT."""
+    if N - next_n + 1 < top_k:
+        pytest.skip(f"N_eff < top_k ({N - next_n + 1} < {top_k}) is degenerate")
+    if varlen and batch_size < 2:
+        pytest.skip("varlen with batch_size<2 collapses to fixed")
+
     num_rows = batch_size * next_n
     logits, pre_idx, seq_lens = _make_inputs(
         num_rows,
@@ -1024,14 +952,15 @@ _R0_EQ_CELLS = [
     # large-N only, and dtype-insensitive -> one cell.
     (torch.float32, 2048, 65536, 8),
 ]
-# Runtime-only axes for the sweep above: same compiled kernel, so they are a
-# LOOP (an xdist worker would otherwise re-codegen the pair per combination).
-_R0_EQ_RUNTIME_CELLS = [(1, "real"), (1, "rand"), (16, "real"), (16, "rand")]
 
 
 @skip_not_sm100
 @pytest.mark.parametrize("dtype,top_k,N,cluster_size", _R0_EQ_CELLS)
-def test_cute_dsl_gvr_topk_decode_r0_equivalence(dtype, top_k, N, cluster_size, tie_aware_check):
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("hint", ["real", "rand"])
+def test_cute_dsl_gvr_topk_decode_r0_equivalence(
+    dtype, top_k, N, batch_size, hint, cluster_size, tie_aware_check
+):
     """R0 admission (``enable_r0=True``, the new default) selects the same
     top-K as the secant baseline (``enable_r0=False``), by index set.
 
@@ -1047,12 +976,6 @@ def test_cute_dsl_gvr_topk_decode_r0_equivalence(dtype, top_k, N, cluster_size, 
     if cluster_size == 8 and N < 65536:
         pytest.skip("cs=8 is a large-N production config (runner picks it only at N >= 131072)")
 
-    for batch_size, hint in _R0_EQ_RUNTIME_CELLS:
-        with _runtime_cell(batch_size=batch_size, hint=hint):
-            _r0_equivalence_one(dtype, top_k, N, batch_size, hint, cluster_size, tie_aware_check)
-
-
-def _r0_equivalence_one(dtype, top_k, N, batch_size, hint, cluster_size, tie_aware_check):
     num_rows = batch_size  # next_n = 1
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
