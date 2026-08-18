@@ -60,11 +60,19 @@ def rgba_to_rgb(
     return converted
 
 
-def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
-    """Convert image to specified mode with proper handling of RGBA to RGB conversion."""
+def convert_image_mode(image: Image.Image, to_mode: str, drop_alpha: bool = False) -> Image.Image:
+    """Convert image to specified mode with proper handling of RGBA to RGB conversion.
+
+    ``drop_alpha`` selects how an RGBA source sheds its alpha channel on the way
+    to RGB: ``True`` discards the channel and keeps the stored RGB, which is what
+    PIL's own ``convert("RGB")`` and diffusers' ``load_image`` do; ``False``
+    composites onto a white background, which changes every pixel with
+    ``alpha < 255``. It only applies to that one direction, and defaults to
+    compositing so existing callers are unaffected.
+    """
     if image.mode == to_mode:
         return image
-    elif image.mode == "RGBA" and to_mode == "RGB":
+    elif image.mode == "RGBA" and to_mode == "RGB" and not drop_alpha:
         return rgba_to_rgb(image)
     else:
         return image.convert(to_mode)
@@ -242,10 +250,10 @@ async def _safe_aiohttp_get(
         return await _fetch(owned_session)
 
 
-def _load_and_convert_image(image):
+def _load_and_convert_image(image, mode: str = "RGB", drop_alpha: bool = False):
     image = Image.open(image)
     image.load()
-    return convert_image_mode(image, "RGB")
+    return convert_image_mode(image, mode, drop_alpha)
 
 
 def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
@@ -825,11 +833,22 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
     """I/O for the image modality."""
 
-    def __init__(self, format: str = "pt", device: str = "cpu") -> None:
+    def __init__(
+        self,
+        format: str = "pt",
+        device: str = "cpu",
+        mode: str = "RGB",
+        drop_alpha: bool = False,
+    ) -> None:
         if format not in _SUPPORTED_IMAGE_FORMATS:
             raise ValueError(f"format must be one of {_SUPPORTED_IMAGE_FORMATS}, got {format!r}")
         self._format = format
         self._device = device
+        # Target PIL mode, plus how RGBA sheds its alpha en route to RGB. A
+        # consumer that composites layers asks for mode="RGBA"; one that must
+        # match diffusers' preprocessing asks for drop_alpha=True.
+        self._mode = mode
+        self._drop_alpha = drop_alpha
 
     def _postprocess(self, image: Image.Image) -> Union[Image.Image, torch.Tensor, np.ndarray]:
         if self._format == "pt":
@@ -842,15 +861,21 @@ class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
         return image
 
     def load_bytes(self, data: bytes) -> Union[Image.Image, torch.Tensor, np.ndarray]:
-        return self._postprocess(_load_and_convert_image(BytesIO(data)))
+        return self._postprocess(
+            _load_and_convert_image(BytesIO(data), self._mode, self._drop_alpha)
+        )
 
     def load_base64(
         self, media_type: str, data: str
     ) -> Union[Image.Image, torch.Tensor, np.ndarray]:
-        return self._postprocess(_load_and_convert_image(BytesIO(base64.b64decode(data))))
+        return self._postprocess(
+            _load_and_convert_image(BytesIO(base64.b64decode(data)), self._mode, self._drop_alpha)
+        )
 
     def load_file(self, url: str) -> Union[Image.Image, torch.Tensor, np.ndarray]:
-        return self._postprocess(_load_and_convert_image(Path(_normalize_file_uri(url))))
+        return self._postprocess(
+            _load_and_convert_image(Path(_normalize_file_uri(url)), self._mode, self._drop_alpha)
+        )
 
 
 class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
