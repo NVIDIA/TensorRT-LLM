@@ -427,6 +427,8 @@ class TestKimiParamPolicy:
         req = self.enforce(top_p=0.8, temperature=2.0, n=2)
         # Fully unconstrained: no rejection and no coercion.
         assert req.top_p == 0.8
+        assert req.temperature == 2.0
+        assert req.n == 2
 
 
 class TestKimiResponseFormatGuidedDecoding:
