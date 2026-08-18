@@ -461,7 +461,7 @@ def _get_beam_width_in(request: LlmRequest) -> int:
 
 
 def _get_beam_width_out(request: LlmRequest) -> int:
-    return request.get_beam_width_by_iter(for_next_iteration=True)
+    return cast(int, request.get_beam_width_by_iter(for_next_iteration=True))
 
 
 def _get_max_beam_width(request: LlmRequest) -> int:
