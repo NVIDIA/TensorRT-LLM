@@ -1,0 +1,167 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""TransformerEngine FP8 attention backend for visual generation (diffusion) models.
+
+Uses TransformerEngine's ``DotProductAttention`` under ``fp8_autocast`` with
+``DelayedScaling(fp8_dpa=True, fp8_mha=True)``.  Operates in NHD layout
+([B, S, H, D]) which maps directly to TE's ``qkv_format="bshd"`` -- no
+transpose overhead.
+
+``forward`` and ``forward_with_lse`` are decorated with
+``@torch.compiler.disable`` because TE FP8 modules graph-break under
+torch.compile.
+"""
+
+import math
+from typing import Any, Optional, Tuple
+
+import torch
+
+from ...attention_backend.interface import PredefinedAttentionMask
+from .interface import AttentionBackend, AttentionTensorLayout
+
+try:
+    from transformer_engine.common.recipe import DelayedScaling
+    from transformer_engine.pytorch import DotProductAttention, fp8_autocast
+
+    _TE_AVAILABLE = True
+except ImportError:
+    _TE_AVAILABLE = False
+
+
+class TEAttention(AttentionBackend):
+    """FP8 attention via TransformerEngine ``DotProductAttention``.
+
+    FP8 is always enabled -- this backend exists to get FP8 attention.
+    No KV cache: diffusion models recompute attention each denoising step.
+    For BF16 attention use ``VANILLA``.
+
+    Supports ``forward_with_lse`` via ``return_softmax_stats=True``, enabling
+    use with Attention2DAttention for x72 context parallelism.
+    """
+
+    def __init__(
+        self,
+        layer_idx: int = 0,
+        num_heads: int = 8,
+        head_dim: int = 64,
+        num_kv_heads: Optional[int] = None,
+        dtype: Optional[torch.dtype] = None,
+        **kwargs,
+    ):
+        if not _TE_AVAILABLE:
+            raise ImportError(
+                "TransformerEngine is required for the TE attention backend. "
+                "Install transformer_engine before using backend='TE'."
+            )
+        self.layer_idx = layer_idx
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_kv_heads = num_kv_heads or num_heads
+        self.dtype = dtype
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self.recipe = DelayedScaling(fp8_dpa=True, fp8_mha=True)
+        # DotProductAttention is stateful (amax history). Rebuild only when
+        # (num_heads, head_dim, num_gqa_groups, attn_mask_type) changes.
+        self._attn_op: Optional[Any] = None
+        self._traits: Optional[tuple] = None
+
+    def _get_attn_op(self, num_gqa_groups: Optional[int], attn_mask_type: str) -> Any:
+        traits = (self.num_heads, self.head_dim, num_gqa_groups, attn_mask_type)
+        if traits != self._traits:
+            self._attn_op = DotProductAttention(
+                self.num_heads,
+                self.head_dim,
+                num_gqa_groups=num_gqa_groups,
+                attn_mask_type=attn_mask_type,
+                softmax_scale=self.scale,
+                qkv_format="bshd",
+            )
+            self._traits = traits
+        return self._attn_op
+
+    def _parse_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attention_mask: PredefinedAttentionMask,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> Tuple[Optional[int], str]:
+        if key_padding_mask is not None:
+            raise NotImplementedError("TE attention backend does not yet support key_padding_mask.")
+        is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
+        enable_gqa = self.num_heads != self.num_kv_heads
+        num_gqa_groups = k.shape[-2] if enable_gqa else None
+        attn_mask_type = "causal" if is_causal else "no_mask"
+        return num_gqa_groups, attn_mask_type
+
+    @torch.compiler.disable
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """FP8 self/cross attention. q/k/v shape: [B, S, H, D]. Returns [B, S, H, D]."""
+        num_gqa_groups, attn_mask_type = self._parse_inputs(q, k, attention_mask, key_padding_mask)
+        attn_op = self._get_attn_op(num_gqa_groups, attn_mask_type)
+        with fp8_autocast(enabled=True, fp8_recipe=self.recipe):
+            # TE returns [B, S, H*D]; restore to [B, S, H, D].
+            out = attn_op(q, k, v, attention_mask=None)
+        return out.unflatten(-1, (self.num_heads, self.head_dim))
+
+    @torch.compiler.disable
+    def forward_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """FP8 attention returning output and log-sum-exp. Required for Attention2D.
+
+        Returns:
+            output: [B, S, H, D]
+            lse:    [B, H, S] float32 -- log-sum-exp per query position
+        """
+        num_gqa_groups, attn_mask_type = self._parse_inputs(q, k, attention_mask, key_padding_mask)
+        attn_op = self._get_attn_op(num_gqa_groups, attn_mask_type)
+        B, S = q.shape[0], q.shape[1]
+        with fp8_autocast(enabled=True, fp8_recipe=self.recipe):
+            out, lse = attn_op(q, k, v, attention_mask=None, return_softmax_stats=True)
+        # out: [B, S, H*D] -> [B, S, H, D]
+        out = out.unflatten(-1, (self.num_heads, self.head_dim))
+        # lse: TE may return [B, H, S] or [B, H, S, 1] depending on version.
+        lse = lse.reshape(B, self.num_heads, S).float()
+        return out, lse
+
+    @property
+    def preferred_layout(self) -> AttentionTensorLayout:
+        return AttentionTensorLayout.NHD
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_lse(cls) -> bool:
+        return True
