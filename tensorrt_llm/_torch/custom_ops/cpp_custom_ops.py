@@ -59,6 +59,46 @@ def _register_fake():
         else:
             return [torch.empty_like(input)]
 
+    @torch.library.register_fake("trtllm::autotuned_allreduce")
+    def _(
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        group: List[int],
+        strategy: int,
+        op: int,
+        eps: float,
+        trigger_completion_at_end: bool,
+    ) -> List[torch.Tensor]:
+        return allreduce(input, residual, norm_weight, scale, bias, workspace,
+                         group, strategy, op, eps, trigger_completion_at_end)
+
+    @torch.library.register_fake("trtllm::register_allreduce_tactic")
+    def _(
+        input: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        norm_weight: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
+        group: List[int],
+        op: int,
+        bucket: int,
+        tactic: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::validate_allreduce_tuning_buckets")
+    def _(buckets: List[int]) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::clear_allreduce_tactic_cache")
+    def _() -> None:
+        return None
+
     @torch.library.register_fake("trtllm::allreduce_pg")
     def _(
         input: torch.Tensor,
@@ -1276,8 +1316,8 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::mla_rope_generation")
     def _(
-        fused_q: torch.Tensor,
-        q_pe: torch.Tensor,
+        fused_q: Optional[torch.Tensor],
+        q_pe: Optional[torch.Tensor],
         latent_cache: torch.Tensor,
         rotary_cos_sin: Optional[torch.Tensor],
         cu_q_seqlens: torch.Tensor,
@@ -1314,6 +1354,13 @@ def _register_fake():
         qk_rope_head_dim: int,
         v_head_dim: int,
         rope_append: bool,
+        kv_norm_weight: Optional[torch.Tensor] = None,
+        kv_norm_eps: float = 1e-6,
+        precomputed_cu_seqlens: bool = False,
+        precomputed_fmha_scheduler: bool = False,
+        kv_only: bool = False,
+        kv_done_elsewhere: bool = False,
+        quant_scale_qkv: Optional[torch.Tensor] = None,
     ) -> None:
         # This is a fake implementation for shape inference
         # The actual operation modifies fused_q and q_pe in-place

@@ -18,6 +18,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
@@ -49,6 +50,7 @@ from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
                        nvtx_range)
 from ...logger import logger
 from ...mapping import CpType, Mapping
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
@@ -208,6 +210,10 @@ def get_pp_layers(
 
 
 def request_context(is_draft: bool, scheduled_requests: ScheduledRequests):
+    # The non-draft scope has nothing to do, and this runs on the executor's
+    # per-iteration path, so return before executing the class statement below.
+    if not is_draft:
+        return nullcontext()
 
     class RequestContext:
 
@@ -347,6 +353,11 @@ class KVCacheManager(BaseResourceManager):
             self.indexer_k_cache_local_layer_mask = None
 
         self.kv_connector_manager = kv_connector_manager
+        # Dummy requests can reserve their V1 sequence before they enter the
+        # normal context prepare path. Track that ownership per manager so the
+        # same sequence is not registered twice, while a separate draft or
+        # cross-cache manager can still prepare its own copy.
+        self._preprepared_dummy_request_ids: set[int] = set()
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -456,8 +467,7 @@ class KVCacheManager(BaseResourceManager):
         # Determine if this is VSWA (Variable Sliding Window Attention).
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
         # values (negative) used by hybrid linear attention models.
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
-            w > 0 for w in self.max_attention_window_vec)
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
@@ -975,6 +985,8 @@ class KVCacheManager(BaseResourceManager):
     def _context_seq_len(self, req: LlmRequest, is_cross: bool,
                          is_star_cp: bool) -> Optional[int]:
         """Return the sequence length to pass to add_sequence_batch, or None to skip this request."""
+        if req.py_request_id in self._preprepared_dummy_request_ids:
+            return None
         if is_cross:
             if (getattr(req, "py_skip_cross_kv_projection", False)
                     or not req.is_first_context_chunk
@@ -1283,6 +1295,14 @@ class KVCacheManager(BaseResourceManager):
                 raise cleanup_error
             raise
 
+        if batch_request_infos:
+            self._preprepared_dummy_request_ids.update(
+                req_id for req_id, _, _ in batch_request_infos)
+        if (draft_batch_request_infos
+                and isinstance(draft_kv_cache_manager, KVCacheManager)):
+            draft_kv_cache_manager._preprepared_dummy_request_ids.update(
+                req_id for req_id, _, _ in draft_batch_request_infos)
+
         return requests
 
     def update_resources(self,
@@ -1333,8 +1353,10 @@ class KVCacheManager(BaseResourceManager):
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        return self.impl.remove_sequence(request.py_request_id, request,
-                                         pin_on_release)
+        result = self.impl.remove_sequence(request.py_request_id, request,
+                                           pin_on_release)
+        self._preprepared_dummy_request_ids.discard(request.py_request_id)
+        return result
 
     def store_blocks_for_reuse(self,
                                request: LlmRequest,

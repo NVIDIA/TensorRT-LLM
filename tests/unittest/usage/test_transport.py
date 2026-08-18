@@ -27,6 +27,7 @@ from tensorrt_llm.usage import schema, usage_lib
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 class TestSendToGxt:
     def test_send_fail_silent(self):
         """_send_to_gxt never raises on network error."""
@@ -105,6 +106,7 @@ class TestSendToGxt:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 class TestHttpsHandler:
     def test_opener_has_https_handler(self):
         """Opener includes HTTPSHandler for HTTPS endpoints."""
@@ -133,6 +135,7 @@ class TestHttpsHandler:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 class TestMalformedServerUrl:
     """Verify _send_to_gxt handles malformed server URLs without crashing."""
 
