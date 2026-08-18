@@ -236,32 +236,6 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
 // Static CftLeManager — lives for the process lifetime (like workspace).
 static std::unique_ptr<tensorrt_llm::kernels::moe_comm::CftLeManager> g_cft_manager;
 
-// Initialize CFT Logical Endpoints for handle-based counted writes.
-//
-// This op:
-//   1. Creates a CftLeManager that loads LE driver APIs
-//   2. Allocates fabric memory for the local rank's LE (recv buffer + counters)
-//   3. Exchanges LE handles with all ranks via MPI allgather
-//   4. Returns a tensor containing peer LE IDs, counter base, and backing pointer
-//
-// The LE memory layout:
-//   [0, payloadSize)                          — payload data (same layout as workspace recv buffers)
-//   [counterBase, counterBase + ep_size * 8)  — per-source-rank 8B counted write counters
-//
-// Args:
-//   workspace: the MNNVL workspace tensor (used for dimensions only)
-//   metainfo: the metainfo tensor from moe_a2a_initialize
-//   inputPayloads: representative payload tensors (for size calculation)
-//   runtimeMaxTokensPerRank: max tokens per rank
-//   epRank: current EP rank
-//   epSize: total EP size
-//
-// Returns:
-//   cft_info: 1D int64 tensor [ep_size + 3] containing:
-//     [0..ep_size-1] : peer LE IDs (uint32_t stored as int64)
-//     [ep_size]      : counter base offset within LE
-//     [ep_size+1]    : local LE backing pointer (CUdeviceptr stored as int64)
-//     [ep_size+2]    : total LE alloc size
 // Initialize CFT Logical Endpoints by binding the LE to the MNNVL workspace.
 // The workspace memory IS the LE backing store — fabric.try_put.counted writes land
 // directly in workspace recv_buffers, eliminating the duplicate allocation and the
@@ -574,6 +548,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         }
     }
     params.use_cft_counted_writes = useCftCountedWrites;
+    // Fused sanitization is a CFT dispatch optimisation; the fence path uses the standalone
+    // moe_a2a_sanitize_expert_ids op instead, so these options are ignored without CFT.
     params.sanitize_expert_ids = useCftCountedWrites && sanitizeExpertIds;
     params.expert_id_payload_index = expertIdPayloadIdx;
     params.invalid_expert_id = invalidExpertId;
@@ -805,8 +781,10 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     // ---- CFT combine wiring (counted writes). Sets up dedicated receive region C,
     // per-slot combine counters, and single-buffer baselines. Fence combine ignores these. ----
     params.use_cft_for_combine = useCftCountedWrites;
-    if (useCftCountedWrites && g_cft_manager && g_cft_manager->isInitialized())
+    if (useCftCountedWrites)
     {
+        TORCH_CHECK(g_cft_manager && g_cft_manager->isInitialized(),
+            "CFT counted writes requested but moe_a2a_cft_initialize has not been called");
         auto const* leIds = g_cft_manager->getAllLeIds();
         for (int i = 0; i < static_cast<int>(epSize); i++)
         {
@@ -988,7 +966,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "bool enable_rank_mask=False, "
         "Tensor? active_rank_mask=None) -> Tensor");
     module.def(
-        "moe_a2a_cft_initialize(Tensor workspace, int workspace_mem_handle, "
+        "moe_a2a_cft_initialize(Tensor(a!) workspace, int workspace_mem_handle, "
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
