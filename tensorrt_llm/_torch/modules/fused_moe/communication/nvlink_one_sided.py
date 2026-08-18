@@ -173,9 +173,10 @@ class NVLinkOneSided(Communication):
         ep_size: int,
         max_num_tokens: int,
         eplb_stats_num_experts: Optional[int] = None,
+        can_use_cft_counted_writes: bool = False,
     ) -> int:
         return torch.ops.trtllm.moe_a2a_get_aux_data_size(
-            ep_size, max_num_tokens, eplb_stats_num_experts
+            ep_size, max_num_tokens, eplb_stats_num_experts, can_use_cft_counted_writes
         )
 
     @staticmethod
@@ -187,12 +188,13 @@ class NVLinkOneSided(Communication):
         dtype: torch.dtype,
         eplb_stats_num_experts: Optional[int] = None,
         extra_payload_bytes_per_token: int = 0,
+        can_use_cft_counted_writes: bool = False,
     ) -> int:
         element_size = dtype.itemsize
 
         # Auxiliary data size
         workspace_size = NVLinkOneSided.get_aux_data_size(
-            ep_size, max_num_tokens, eplb_stats_num_experts
+            ep_size, max_num_tokens, eplb_stats_num_experts, can_use_cft_counted_writes
         )
 
         # Dispatch needs workspace for [ep_size, max_tokens] tokens,
@@ -212,8 +214,9 @@ class NVLinkOneSided(Communication):
         workspace_size = pad_up(workspace_size, 128)
         # CFT combine: dedicated combine RECEIVE region C (peer pushes land here;
         # prepareCombine never touches it -> no proxy aliasing). Same size as the combine region.
-        workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-        workspace_size = pad_up(workspace_size, 128)
+        if can_use_cft_counted_writes:
+            workspace_size += ep_size * max_num_tokens * hidden_size * element_size
+            workspace_size = pad_up(workspace_size, 128)
         # extra payload bytes per token
         workspace_size += ep_size * max_num_tokens * extra_payload_bytes_per_token
         workspace_size = pad_up(workspace_size, 128)
@@ -352,6 +355,7 @@ class NVLinkOneSided(Communication):
                 hidden_size,
                 dtype,
                 eplb_stats_num_experts=self.eplb_stats_num_experts,
+                can_use_cft_counted_writes=self.can_use_cft_counted_writes,
             )
         workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
         if workspace_mb_env:
@@ -406,6 +410,7 @@ class NVLinkOneSided(Communication):
                 self.ep_size,
                 self.max_num_tokens_per_rank,
                 self.eplb_stats_num_experts,
+                self.can_use_cft_counted_writes,
             )
             workspace_state = {
                 "workspace_size_per_rank": self.workspace_size_per_rank,

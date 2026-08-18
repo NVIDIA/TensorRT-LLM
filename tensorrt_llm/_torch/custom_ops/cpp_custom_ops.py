@@ -645,6 +645,7 @@ def _register_fake():
         ep_size: int,
         max_num_tokens_per_rank: int,
         eplb_stats_num_experts: Optional[int] = None,
+        can_use_cft_counted_writes: bool = False,
     ) -> torch.Tensor:
         return torch.empty((10, ), dtype=torch.int64, device="cpu")
 

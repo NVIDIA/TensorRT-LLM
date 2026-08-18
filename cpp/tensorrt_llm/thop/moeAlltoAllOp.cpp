@@ -88,13 +88,13 @@ inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTens
 }
 
 // Calculate auxiliary data offsets
-MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNumExperts)
+MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNumExperts, bool canUseCft)
 {
     // TODO: Use lambdas to encapsulate offset and alignment for each entry, which is less error prone and easier to
     // read.
     constexpr size_t SIZEOF_INT32 = 4;
 
-    MoeA2ADataOffsets offsets;
+    MoeA2ADataOffsets offsets{};
     size_t offset = 0;
 
     // flag_val
@@ -145,26 +145,30 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
     // concurrent counter updates do not contend for the same L2 port.
     using tensorrt_llm::kernels::moe_comm::kCftCounterStride;
 
-    // dispatch counted write counters: [ep_size] uint64_t, kCftCounterStride stride
-    offset = alignOffset(offset, kCftCounterStride);
-    offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] = offset;
-    offset += epSize * kCftCounterStride;
+    // CFT-only regions; unused offsets stay 0 to keep the field count fixed.
+    if (canUseCft)
+    {
+        // dispatch counted write counters: [ep_size] uint64_t, kCftCounterStride stride
+        offset = alignOffset(offset, kCftCounterStride);
+        offsets[DISPATCH_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] = offset;
+        offset += epSize * kCftCounterStride;
 
-    // combine counted write counters (CFT combine path): per receive-slot uint64
-    // counters, [ep_size * maxNumTokens], kCftCounterStride stride to avoid L2 XBAR camping.
-    offset = alignOffset(offset, kCftCounterStride);
-    offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] = offset;
-    offset += static_cast<size_t>(epSize) * static_cast<size_t>(maxNumTokens) * kCftCounterStride;
+        // combine counted write counters (CFT combine path): per receive-slot uint64
+        // counters, [ep_size * maxNumTokens], kCftCounterStride stride to avoid L2 XBAR camping.
+        offset = alignOffset(offset, kCftCounterStride);
+        offsets[COMBINE_COUNTED_WRITE_COUNTERS_OFFSET_INDEX] = offset;
+        offset += static_cast<size_t>(epSize) * static_cast<size_t>(maxNumTokens) * kCftCounterStride;
 
-    // dispatch counter baseline: [ep_size] uint64
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[DISPATCH_COUNTER_BASELINE_OFFSET_INDEX] = offset;
-    offset += static_cast<size_t>(epSize) * sizeof(uint64_t);
+        // dispatch counter baseline: [ep_size] uint64
+        offset = alignOffset(offset, CACHELINE_ALIGNMENT);
+        offsets[DISPATCH_COUNTER_BASELINE_OFFSET_INDEX] = offset;
+        offset += static_cast<size_t>(epSize) * sizeof(uint64_t);
 
-    // combine counter baseline: [ep_size * maxNumTokens] uint64
-    offset = alignOffset(offset, CACHELINE_ALIGNMENT);
-    offsets[COMBINE_COUNTER_BASELINE_OFFSET_INDEX] = offset;
-    offset += static_cast<size_t>(epSize) * static_cast<size_t>(maxNumTokens) * sizeof(uint64_t);
+        // combine counter baseline: [ep_size * maxNumTokens] uint64
+        offset = alignOffset(offset, CACHELINE_ALIGNMENT);
+        offsets[COMBINE_COUNTER_BASELINE_OFFSET_INDEX] = offset;
+        offset += static_cast<size_t>(epSize) * static_cast<size_t>(maxNumTokens) * sizeof(uint64_t);
+    }
 
     // payload data
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
@@ -189,7 +193,7 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 // Returns:
 //   - metainfo: Tensor containing offsets for auxiliary data
 torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize, int64_t maxNumTokens,
-    torch::optional<int64_t> eplbStatsNumExperts)
+    torch::optional<int64_t> eplbStatsNumExperts, bool canUseCftCountedWrites)
 {
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
 
@@ -205,7 +209,8 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
     TORCH_CHECK(eplbStatsNumExpertsValue >= 0, "eplbStatsNumExperts must be positive if not None.");
 
     // Calculate auxiliary data offsets
-    MoeA2ADataOffsets offsets = calculateOffsets(epSize, maxNumTokens, static_cast<int>(eplbStatsNumExpertsValue));
+    MoeA2ADataOffsets offsets
+        = calculateOffsets(epSize, maxNumTokens, static_cast<int>(eplbStatsNumExpertsValue), canUseCftCountedWrites);
 
     // Initialize workspace to zero, then mark both recv-counter parities empty.
     workspace[epRank].zero_();
@@ -925,12 +930,13 @@ torch::Tensor moeA2AGetCombinePayloadTensorOp(torch::Tensor const& workspace, in
 }
 
 // Return the size of auxiliary data in workspace
-int64_t moeA2AGetAuxDataSizeOp(int64_t epSize, int64_t maxNumTokens, torch::optional<int64_t> eplbStatsNumExperts)
+int64_t moeA2AGetAuxDataSizeOp(
+    int64_t epSize, int64_t maxNumTokens, torch::optional<int64_t> eplbStatsNumExperts, bool canUseCftCountedWrites)
 {
     int64_t eplbStatsNumExpertsValue = eplbStatsNumExperts.value_or(0);
     TORCH_CHECK(eplbStatsNumExpertsValue >= 0, "eplbStatsNumExperts must be positive if not None.");
-    MoeA2ADataOffsets offsets = calculateOffsets(
-        static_cast<int>(epSize), static_cast<int>(maxNumTokens), static_cast<int>(eplbStatsNumExpertsValue));
+    MoeA2ADataOffsets offsets = calculateOffsets(static_cast<int>(epSize), static_cast<int>(maxNumTokens),
+        static_cast<int>(eplbStatsNumExpertsValue), canUseCftCountedWrites);
     return static_cast<int64_t>(offsets[PAYLOAD_DATA_OFFSET_INDEX]);
 }
 
@@ -970,7 +976,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "int workspace_size_per_rank, int ep_rank, int ep_size) -> ()");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
-        "int? eplb_stats_num_experts=None) -> Tensor");
+        "int? eplb_stats_num_experts=None, bool can_use_cft_counted_writes=False) -> Tensor");
     module.def(
         "moe_a2a_sanitize_expert_ids(Tensor(a!) expert_ids, Tensor(a!) workspace, Tensor metainfo, int ep_rank, int "
         "invalid_expert_id) -> ()");
@@ -979,7 +985,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "runtime_max_tokens_per_rank, "
         "int combine_payload_offset, ScalarType out_dtype, int hidden_size) -> Tensor(a)");
     module.def("moe_a2a_set_warmup(bool in_warmup) -> ()", &tensorrt_llm::torch_ext::moe_comm::moeA2ASetWarmupOp);
-    module.def("moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens, int? eplb_stats_num_experts=None) -> int",
+    module.def(
+        "moe_a2a_get_aux_data_size(int ep_size, int max_num_tokens, int? eplb_stats_num_experts=None, "
+        "bool can_use_cft_counted_writes=False) -> int",
         &tensorrt_llm::torch_ext::moe_comm::moeA2AGetAuxDataSizeOp);
 }
 

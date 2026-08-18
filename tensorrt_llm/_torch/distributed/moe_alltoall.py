@@ -158,9 +158,11 @@ class MoeAlltoAll:
         ep_size: int,
         max_num_tokens: int,
         eplb_stats_num_experts: Optional[int] = None,
+        can_use_cft_counted_writes: bool = False,
     ) -> int:
         return torch.ops.trtllm.moe_a2a_get_aux_data_size(
-            ep_size, max_num_tokens, eplb_stats_num_experts)
+            ep_size, max_num_tokens, eplb_stats_num_experts,
+            can_use_cft_counted_writes)
 
     @staticmethod
     def calculate_required_workspace_size(
@@ -170,12 +172,14 @@ class MoeAlltoAll:
             hidden_size: int,
             dtype: torch.dtype,
             eplb_stats_num_experts: Optional[int] = None,
-            extra_payload_bytes_per_token: int = 0) -> int:
+            extra_payload_bytes_per_token: int = 0,
+            can_use_cft_counted_writes: bool = False) -> int:
         element_size = dtype.itemsize
 
         # Auxiliary data size
-        workspace_size = MoeAlltoAll.get_aux_data_size(ep_size, max_num_tokens,
-                                                       eplb_stats_num_experts)
+        workspace_size = MoeAlltoAll.get_aux_data_size(
+            ep_size, max_num_tokens, eplb_stats_num_experts,
+            can_use_cft_counted_writes)
 
         # Dispatch needs workspace for [ep_size, max_tokens] tokens,
         # but due to the variety of quantization recipes, we cannot know the exact size, so we conservatively estimate assuming no quantization.
@@ -199,8 +203,9 @@ class MoeAlltoAll:
 
         # CFT combine: dedicated combine RECEIVE region C (peer pushes land here;
         # prepareCombine never touches it -> no proxy aliasing). Same size as the combine region.
-        workspace_size += ep_size * max_num_tokens * hidden_size * element_size
-        workspace_size = pad_up(workspace_size, 128)
+        if can_use_cft_counted_writes:
+            workspace_size += ep_size * max_num_tokens * hidden_size * element_size
+            workspace_size = pad_up(workspace_size, 128)
 
         return workspace_size
 
@@ -336,7 +341,7 @@ class MoeAlltoAll:
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
             metainfo = torch.ops.trtllm.moe_a2a_initialize(
                 workspace, self.ep_rank, self.ep_size, self.max_num_tokens,
-                self.eplb_stats_num_experts)
+                self.eplb_stats_num_experts, self.can_use_cft_counted_writes)
             workspace_entry = {
                 "workspace_size_per_rank": workspace_size_per_rank,
                 "max_num_tokens": self.max_num_tokens,
