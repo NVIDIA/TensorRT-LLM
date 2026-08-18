@@ -799,6 +799,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     `tensorrt_llm/inputs/utils.py`).
     """
 
+    supports_encoder_data_parallel = True
     supports_encoder_cache = True
     supports_mm_encoder_item_scheduling = True
 

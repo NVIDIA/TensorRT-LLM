@@ -2308,6 +2308,7 @@ def _qwen_vision_input_partitions(
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
+    supports_encoder_data_parallel = True
     supports_mm_encoder_item_scheduling = True
 
     def get_multimodal_item_partitions(

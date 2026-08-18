@@ -919,6 +919,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     """Shared multimodal encoder flow for Gemma4 conditional generation models."""
 
+    supports_encoder_data_parallel = True
     supports_encoder_cache = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 

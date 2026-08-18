@@ -1426,6 +1426,7 @@ class Qwen3VisionModelBase(nn.Module):
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
+    supports_encoder_data_parallel = True
     supports_mm_encoder_item_scheduling = True
 
     def get_multimodal_item_partitions(
