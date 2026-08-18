@@ -187,12 +187,17 @@ def _benchmark_case(
     inputs = _make_inputs(num_candidates)
     expected_prefix, expected_output = _two_kernel(inputs)
     actual_prefix, actual_output = _fused(inputs)
+    _, three_kernel_output = _three_kernel(inputs)
     torch.cuda.synchronize()
     if not torch.equal(actual_prefix, expected_prefix):
         raise AssertionError(f"N={num_candidates}: fused updated prefix is not exact")
     cosine, relative_l2 = _similarity(actual_output, expected_output)
     if cosine <= 0.9999 or relative_l2 >= 5e-3:
         raise AssertionError(f"N={num_candidates}: cosine={cosine}, relative_l2={relative_l2}")
+    # attn_res_fwd + the production RMSNorm is what shipped before the trailing
+    # norm was folded into the kernel, so this -- not two_kernel, which is also
+    # a norm-fusing op -- is the baseline the fusion has to be judged against.
+    three_cosine, three_relative_l2 = _similarity(actual_output, three_kernel_output)
 
     add_us, add_min_us, add_max_us = _time_graph(
         lambda: inputs.prefix_sum + inputs.attention_output,
@@ -218,6 +223,8 @@ def _benchmark_case(
         "chain_length": chain_length,
         "cosine": cosine,
         "relative_l2": relative_l2,
+        "cosine_vs_three_kernel": three_cosine,
+        "relative_l2_vs_three_kernel": three_relative_l2,
         "add_us": add_us,
         "add_min_us": add_min_us,
         "add_max_us": add_max_us,

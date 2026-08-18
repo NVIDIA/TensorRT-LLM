@@ -534,3 +534,74 @@ def test_model_helper_keeps_multi_token_rmsnorm_split() -> None:
     cosine, relative_l2 = _similarity(actual, expected)
     assert cosine > 0.9999
     assert relative_l2 < 5e-3
+
+
+@torch.no_grad()
+def test_model_helper_norm_flag_keeps_unfused_norm_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KIMI_K3_FUSED_ATTN_RES_NORM=0 must keep attn_res_fwd + production RMSNorm.
+
+    KIMI_K3_FUSED_ATTN_RES=0 is the wrong A/B knob: it drops all the way to
+    the fp32 reference and skips the pre-port path.
+    """
+    (
+        layer_residual,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+    ) = _make_inputs(num_tokens=1, num_snapshots=3)
+    projection = nn.Linear(
+        HIDDEN_SIZE,
+        1,
+        bias=False,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    score_norm = KimiK3RMSNorm(
+        HIDDEN_SIZE,
+        eps=ATTN_RES_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    output_norm = RMSNorm(
+        hidden_size=HIDDEN_SIZE,
+        eps=OUTPUT_RMS_EPS,
+        dtype=torch.bfloat16,
+        device=torch.device("cuda"),
+    )
+    projection.weight.copy_(res_weight.reshape(1, -1))
+    score_norm.weight.copy_(score_rms_weight)
+    output_norm.weight.copy_(output_rms_weight)
+
+    prefix_sum = layer_residual[:, 0, :]
+    block_kernel_layout = block_residual[:, :, 0, :]
+    unexpected_fused = mock.Mock(
+        side_effect=AssertionError("norm flag off still reached the fused norm op")
+    )
+    monkeypatch.setattr(modeling_kimi_linear, "_FUSED_ATTN_RES_NORM_ENABLED", False)
+    monkeypatch.setattr(
+        modeling_kimi_linear,
+        "_apply_attn_res_rmsnorm_fused",
+        unexpected_fused,
+    )
+    expected = output_norm(
+        _apply_attn_res(
+            prefix_sum,
+            block_kernel_layout,
+            projection,
+            score_norm,
+        )
+    )
+    actual = _apply_attn_res_and_rmsnorm(
+        prefix_sum,
+        block_kernel_layout,
+        projection,
+        score_norm,
+        output_norm,
+    )
+    unexpected_fused.assert_not_called()
+    cosine, relative_l2 = _similarity(actual, expected)
+    assert cosine > 0.9999
+    assert relative_l2 < 5e-3
