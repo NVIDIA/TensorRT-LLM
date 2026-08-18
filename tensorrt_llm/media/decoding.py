@@ -215,12 +215,23 @@ def decode_video_reference_window(
     target_w: int,
     device: torch.device,
     resize: str = "cover",
+    frame_step: int = 1,
 ) -> torch.Tensor:
     """Decode frames ``[first_frame, last_frame]`` of a reference on device.
 
     Returns uint8 ``[T, target_h, target_w, 3]``. Indices are Python-style:
     non-negative counts from the start, negative from the end, so ``-1`` is
     the last frame and ``(-8, -1)`` the final eight. Both ends are inclusive.
+
+    ``frame_step`` retains every n-th frame of the range, so ``(0, 96)`` with
+    ``frame_step=6`` yields frames 0, 6, ... 96 — seventeen frames, not
+    ninety-seven. A caller whose model expects a frame spacing the source was
+    not shot at uses this to pick the right frames; the ratio of the two rates
+    is the caller's to compute, and no rate is named here. Skipped frames are
+    still decoded (inter-frame compression leaves no choice) but are neither
+    resized nor retained, so the cost is decode time, not memory. Only
+    non-negative ranges may step: the negative form wraps a ring whose length
+    is not known until EOS, and combining the two is not supported.
 
     ``resize`` selects how each frame reaches ``target_h x target_w``:
     ``"cover"`` scales to fill and center-crops (the default, and what video
@@ -246,6 +257,13 @@ def decode_video_reference_window(
     if first_frame > last_frame:
         raise ValueError(
             f"first_frame must not exceed last_frame, got ({first_frame}, {last_frame})."
+        )
+    if frame_step < 1:
+        raise ValueError(f"frame_step must be at least 1, got {frame_step}.")
+    if frame_step > 1 and first_frame < 0:
+        raise ValueError(
+            f"frame_step > 1 is only supported for non-negative ranges, got "
+            f"({first_frame}, {last_frame}) with frame_step={frame_step}."
         )
     resize_frames = _RESIZE_MODES.get(resize)
     if resize_frames is None:
@@ -306,7 +324,7 @@ def decode_video_reference_window(
         # Non-negative ranges retain exactly the requested slice, so the ring
         # is filled once; negative ranges cannot know the length up front, so
         # it wraps and holds the trailing `tail` frames until EOS.
-        tail = -first_frame if from_end else window
+        tail = -first_frame if from_end else (window + frame_step - 1) // frame_step
         ring = torch.empty(tail, target_h, target_w, 3, dtype=torch.uint8, device=device)
         count = 0  # frames decoded so far, i.e. the index of the next frame
         kept = 0  # frames written into the ring
@@ -317,7 +335,9 @@ def decode_video_reference_window(
                     if not from_end and count > last_frame:
                         done = True
                         break
-                    if from_end or count >= first_frame:
+                    if from_end or (
+                        count >= first_frame and (count - first_frame) % frame_step == 0
+                    ):
                         decoded = torch.from_dlpack(frame)
                         # Ownership copy off the NVDEC surface (recycled by
                         # the decoder) and resize-before-retain in one step.
@@ -331,7 +351,7 @@ def decode_video_reference_window(
         except torch.cuda.OutOfMemoryError as exc:
             raise MemoryError(
                 f"Out of device memory while decoding the video reference "
-                f"({window} frames @ {target_w}x{target_h} retained): {exc}"
+                f"({tail} frames @ {target_w}x{target_h} retained): {exc}"
             ) from exc
         except nvc.PyNvVCException as exc:
             raise ValueError(

@@ -247,6 +247,50 @@ class TestDecodeVideoReferenceWindow:
         window = self._decode(fixture.read_bytes(), keep="last")
         assert _frame_indices(window) == [4, 5, 6, 7, 8]
 
+    def test_frame_step_thins_the_window(self):
+        window = decode_video_reference_window(
+            _MP4.read_bytes(),
+            first_frame=0,
+            last_frame=8,
+            target_h=64,
+            target_w=64,
+            device=self._DEVICE,
+            frame_step=2,
+        )
+        assert window.shape[0] == 5
+        assert _frame_indices(window) == [0, 2, 4, 6, 8]
+
+    def test_frame_step_keeps_a_partial_tail(self):
+        # The range end is not a multiple of the step: 0, 3, 6 and stop.
+        window = decode_video_reference_window(
+            _MP4.read_bytes(),
+            first_frame=0,
+            last_frame=7,
+            target_h=64,
+            target_w=64,
+            device=self._DEVICE,
+            frame_step=3,
+        )
+        assert _frame_indices(window) == [0, 3, 6]
+
+    def test_frame_step_one_matches_the_default(self):
+        span = dict(
+            first_frame=0, last_frame=4, target_h=64, target_w=64, device=self._DEVICE
+        )
+        assert torch.equal(
+            decode_video_reference_window(_MP4.read_bytes(), **span),
+            decode_video_reference_window(_MP4.read_bytes(), frame_step=1, **span),
+        )
+
+    def test_frame_step_rejects_trailing_windows(self):
+        # The trailing form wraps a ring whose length is unknown until EOS.
+        with pytest.raises(ValueError, match="non-negative ranges"):
+            self._decode(_MP4.read_bytes(), keep="last", frame_step=2)
+
+    def test_frame_step_must_be_positive(self):
+        with pytest.raises(ValueError, match="at least 1"):
+            self._decode(_MP4.read_bytes(), frame_step=0)
+
     def test_rgb_channel_layout(self):
         # Frame i carries a green horizontal bar at rows [7i, 7i+7) and a
         # blue vertical bar at cols [7i, 7i+7): asserts the NVDEC output is

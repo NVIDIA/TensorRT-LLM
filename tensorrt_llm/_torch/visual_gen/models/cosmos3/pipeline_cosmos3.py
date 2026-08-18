@@ -51,6 +51,7 @@ from tensorrt_llm.media.decoding import decode_video_reference_window, video_str
 from .action import (
     ACTION_MODE_INVERSE_DYNAMICS,
     DEFAULT_ACTION_VIEW_POINT,
+    action_reference_frame_step,
     action_reference_size,
     action_start_frame_offset,
     build_action_json_prompt,
@@ -1809,22 +1810,43 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     )
                 prepare_error: Optional[Exception] = None
                 try:
+                    source_info = video_stream_info(video)
+                    source_frame_rate = source_info.frame_rate if source_info else None
+                    frame_step = action_reference_frame_step(source_frame_rate, frame_rate)
+                    if self.rank == 0:
+                        if frame_step > 1:
+                            logger.info(
+                                f"Cosmos3 action reference: {source_frame_rate} fps source "
+                                f"thinned to {frame_rate} fps, keeping every {frame_step} "
+                                f"frames of {(num_frames - 1) * frame_step + 1}"
+                            )
+                        elif source_frame_rate is not None and source_frame_rate < frame_rate:
+                            logger.warning(
+                                f"Cosmos3 action reference is {source_frame_rate} fps but "
+                                f"{normalized_action_mode} expects {frame_rate} fps: frames are "
+                                "further apart than the model was trained on and cannot be "
+                                "thinned to match. Re-encode the reference at the higher rate, "
+                                "or pass frame_rate explicitly to accept this spacing."
+                            )
                     # "fit" rather than the V2V default: an action reference is
                     # padded to the canvas, never cropped to it, because the
                     # gripper and target sit at the frame edge.
                     frames_u8 = decode_video_reference_window(
                         video,
                         first_frame=0,
-                        last_frame=num_frames - 1,
+                        last_frame=(num_frames - 1) * frame_step,
                         target_h=height,
                         target_w=width,
                         device=self.device,
                         resize="fit",
+                        frame_step=frame_step,
                     )
                     if frames_u8.shape[0] < num_frames:
                         raise ValueError(
-                            "Cosmos3 inverse_dynamics requires at least "
-                            f"{num_frames} frames, got {frames_u8.shape[0]}."
+                            f"Cosmos3 inverse_dynamics requires {num_frames} frames at "
+                            f"{frame_rate} fps; a {source_frame_rate} fps reference supplies "
+                            f"{frames_u8.shape[0]} once thinned by {frame_step} "
+                            f"({(num_frames - 1) * frame_step + 1} source frames needed)."
                         )
                     video_tensor = self._condition_frames_to_video_tensor(frames_u8)
                     del frames_u8

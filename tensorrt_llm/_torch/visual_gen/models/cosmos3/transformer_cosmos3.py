@@ -1587,7 +1587,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             else:
                 self.cached_kv = cached_kv_full
 
-        # --- Extra modality token injection (mutually exclusive: action OR audio) ---
+        # --- Extra modality token injection (mutually exclusive: action, audio or control) ---
         T_vid_tokens = hidden_gen.shape[1]  # T * Hp * Wp
         T_action = 0
         T_audio = 0

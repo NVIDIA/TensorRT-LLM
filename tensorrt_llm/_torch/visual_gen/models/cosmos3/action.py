@@ -457,6 +457,27 @@ def action_reference_size(
     return reference.height, reference.width
 
 
+def action_reference_frame_step(source_frame_rate: float | None, target_frame_rate: float) -> int:
+    """Source frames to advance per reference frame retained.
+
+    An embodiment's frame rate is a property of what it was trained on, not of
+    the clip a caller happens to send: bridge learned one command per frame at
+    5 Hz, so 200ms of gripper motion between frames. A 30 fps clip read
+    consecutively shows the model a sixth of that motion while the caption and
+    the mRoPE positions still claim 5 Hz, so the reference is thinned to match
+    -- every sixth frame here.
+
+    A clip slower than the embodiment returns 1: selection can drop frames,
+    never invent them, and closing that gap needs interpolation rather than a
+    step. The caller is expected to say so rather than let it pass silently.
+    """
+    if not source_frame_rate or not target_frame_rate:
+        return 1
+    if source_frame_rate <= 0 or target_frame_rate <= 0:
+        return 1
+    return max(1, round(source_frame_rate / target_frame_rate))
+
+
 def resize_and_pad_action_image(
     image: PIL.Image.Image, target_h: int, target_w: int
 ) -> PIL.Image.Image:

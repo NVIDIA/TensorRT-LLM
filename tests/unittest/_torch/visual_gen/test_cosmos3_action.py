@@ -22,6 +22,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     EMBODIMENT_TO_RAW_ACTION_DIM,
     VIDEO_RES_SIZE_INFO,
     action_aspect_ratio_label,
+    action_reference_frame_step,
     action_reference_size,
     build_action_json_prompt,
     find_closest_target_size,
@@ -296,6 +297,24 @@ class TestActionReferenceSize:
         monkeypatch.setattr(decoding, "video_stream_info", lambda data: None)
         with pytest.raises(ValueError, match="could not be demuxed"):
             action_reference_size(action_mode="inverse_dynamics", image=None, video=b"\x00bad")
+
+
+class TestActionReferenceFrameStep:
+    """The reference is thinned to the embodiment's rate, never invented."""
+
+    @pytest.mark.parametrize(
+        "source_frame_rate, target_frame_rate, expected",
+        [
+            (30.0, 5.0, 6),  # bridge: every sixth frame of a 30 fps clip
+            (5.0, 5.0, 1),  # already at the trained rate
+            (24.0, 5.0, 5),  # 4.8 rounds to 5
+            (10.0, 30.0, 1),  # slower than trained: cannot be thinned
+            (None, 5.0, 1),  # header unreadable
+            (0.0, 5.0, 1),  # header reported nothing usable
+        ],
+    )
+    def test_step_from_rates(self, source_frame_rate, target_frame_rate, expected):
+        assert action_reference_frame_step(source_frame_rate, target_frame_rate) == expected
 
 
 class TestActionJsonPrompt:
