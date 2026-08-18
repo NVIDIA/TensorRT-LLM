@@ -16,8 +16,8 @@
  */
 
 #include "kv_cache_manager_v2/coldPageCodec.h"
+#include "kv_cache_manager_v2/coldPageCopy.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -287,19 +287,9 @@ private:
             }
         }
 
-        CUmemcpyAttributes attributes{};
-        attributes.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
-        attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
-        size_t firstCopy = 0;
-#if CUDA_VERSION < 13000
-        size_t failIdx;
-        CUresult const error = cuMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attributes,
-            &firstCopy, 1, &failIdx, reinterpret_cast<CUstream>(stream));
-#else
-        CUresult const error = cuMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attributes,
-            &firstCopy, 1, reinterpret_cast<CUstream>(stream));
-#endif
-        return error == CUDA_SUCCESS;
+        detail::copyColdPageDataBatch(
+            dsts.data(), srcs.data(), sizes.data(), dsts.size(), reinterpret_cast<CUstream>(stream));
+        return true;
     }
 
     TypedVec<PoolGroupIndex, std::unique_ptr<GroupConfig>> mGroups;

@@ -16,6 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/coldPageCopy.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
@@ -23,7 +24,6 @@
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
-#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -207,22 +207,10 @@ bool StorageManager::submitColdPageCodec(
             std::min(remainingBytes, kMaxIndexBatchBytes), sizeof(PageIndexPair), alignof(PageIndexPair), stream);
         size_t const chunkPages = std::min(numPages - offset, device.size() / sizeof(PageIndexPair));
         TLLM_CHECK_DEBUG(chunkPages > 0);
-        size_t chunkBytes = chunkPages * sizeof(PageIndexPair);
-        // The index vector is ephemeral. CUDA consumes it before returning while the H2D transfer remains asynchronous.
-        CUdeviceptr dst = static_cast<CUdeviceptr>(device.address());
-        CUdeviceptr src = reinterpret_cast<CUdeviceptr>(pageIndices + offset);
-        CUmemcpyAttributes attributes{};
-        attributes.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_DURING_API_CALL;
-        attributes.srcLocHint.type = CU_MEM_LOCATION_TYPE_HOST;
-        attributes.dstLocHint.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
-        size_t firstCopy = 0;
-#if CUDA_VERSION < 13000
-        size_t failIdx;
-        TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &src, &chunkBytes, 1, &attributes, &firstCopy, 1, &failIdx, stream));
-#else
-        TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &src, &chunkBytes, 1, &attributes, &firstCopy, 1, stream));
-#endif
+        // The index vector is ephemeral. The helper captures it before returning while the device update remains
+        // asynchronous.
+        detail::copyPageIndicesToDevice(
+            static_cast<CUdeviceptr>(device.address()), pageIndices + offset, chunkPages, stream);
 
         if (!submit(reinterpret_cast<PageIndexPair const*>(device.address()), chunkPages, stream))
         {

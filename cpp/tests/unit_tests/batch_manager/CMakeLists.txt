@@ -34,6 +34,10 @@ target_include_directories(
   kvCacheManagerV2ColdPageTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager
           ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
+add_gtest(kvCacheManagerV2ColdPageCopyTest kvCacheManagerV2ColdPageCopyTest.cu)
+target_include_directories(
+  kvCacheManagerV2ColdPageCopyTest
+  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 add_gtest(kvCacheManagerV2TypedIndexTest kvCacheManagerV2TypedIndexTest.cpp)
 target_include_directories(
   kvCacheManagerV2TypedIndexTest

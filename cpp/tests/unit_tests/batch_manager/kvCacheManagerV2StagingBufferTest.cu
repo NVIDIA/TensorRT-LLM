@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCodec.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/coldPageCopy.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/stagingBuffer.h"
 #include "tensorrt_llm/common/tllmException.h"
 
@@ -225,16 +226,10 @@ TEST(KvCacheManagerV2StagingBufferTest, EphemeralHostIndicesUploadIntoDeviceRing
         auto device = deviceManager.acquire(sizeof(PageIndexPair), std::min(remainingBytes, kChunkBytes),
             sizeof(PageIndexPair), alignof(PageIndexPair), reinterpret_cast<CUstream>(stream));
         size_t const chunkPairs = std::min(input.size() - offset, device.size() / sizeof(PageIndexPair));
-        size_t const chunkBytes = chunkPairs * sizeof(PageIndexPair);
+        detail::copyPageIndicesToDevice(static_cast<CUdeviceptr>(device.address()), input.data() + offset, chunkPairs,
+            reinterpret_cast<CUstream>(stream));
 
-        void* dst = reinterpret_cast<void*>(device.address());
-        void const* src = input.data() + offset;
-        cudaMemcpyAttributes attributes{};
-        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderDuringApiCall;
-        size_t firstCopy = 0;
-        ASSERT_EQ(cudaMemcpyBatchAsync(&dst, &src, &chunkBytes, 1, &attributes, &firstCopy, 1, stream), cudaSuccess);
-
-        // DuringApiCall guarantees that the pageable host source is no longer accessed after the API returns.
+        // The helper captures the pageable host source before returning.
         std::fill_n(input.data() + offset, chunkPairs, PageIndexPair{-1, -1});
 
         constexpr uint32_t kThreads = 256;
