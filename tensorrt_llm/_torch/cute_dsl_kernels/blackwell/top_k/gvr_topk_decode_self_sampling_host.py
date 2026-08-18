@@ -31,8 +31,14 @@ module). Three sections, each a rename-only merge of the per-family source
 OPERATOR CONTRACT (standalone; not wired into the decode path): ``n_valid``
 is one host python int for the whole batch — every row shares the same
 valid prefix, in COMPRESSED index space (the caller applies any
-``compressRatio`` division and, for DSv3.2 (cr=1), the +1 temporal shift of
-``pre_idx``; see ``heuristicTopKDecode.cu``). The production decode engine
+``compressRatio`` division). ``pre_idx`` is consumed AS-IS — raw prev-step
+top-K indices, uniformly for DSv3.2 / DSv4 Flash / Pro. This deliberately
+drops the +1 temporal shift ``heuristicTopKDecode.cu`` applies for cr==1:
+hints only steer the sampling ladder (exactness never depends on them), and
+on real V3.2 decode captures raw prev-step hints land on MORE of the current
+top-K than +1-shifted ones (mean overlap 0.773 vs 0.536 across 15 cells x 14
+consecutive step-pairs, the gap widening with ISL), so one offset-free hint
+convention serves all three models. The production decode engine
 instead reads per-request ``seq_lens`` on-device with per-row MTP offsets
 (sync-free, CUDA-graph-replay safe with growing KV); adopting that per-row
 contract inside these kernels is tracked follow-up work. Until then this
