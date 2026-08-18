@@ -604,10 +604,11 @@ class MultimodalConfig(StrictBaseModel):
 
     encoder_data_parallel_size: PositiveInt = Field(
         default=1,
-        description=(
-            "Number of tensor-parallel ranks used to distribute multimodal "
-            "encoder items. The encoder weights are replicated on those ranks."
-        ),
+        description=
+        ("Number of ranks used to distribute multimodal encoder items. A value "
+         "greater than 1 currently uses the model's full tensor-parallel group, "
+         "replicates the encoder on those ranks, and requires pipeline- and "
+         "context-parallel sizes of 1."),
         status="prototype",
     )
 
@@ -5833,6 +5834,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 "disable_mm_encoder and mm_encoder_only are mutually "
                 "exclusive: one skips the multimodal encoder, the other runs "
                 "only the multimodal encoder.")
+        if (self.mm_encoder_only
+                and self.multimodal_config.encoder_data_parallel_size > 1):
+            raise ValueError(
+                "multimodal encoder data parallelism does not support "
+                "mm_encoder_only execution yet.")
         return self
 
     @model_validator(mode="after")

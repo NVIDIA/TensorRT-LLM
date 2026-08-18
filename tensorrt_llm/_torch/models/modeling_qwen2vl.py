@@ -2133,6 +2133,7 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
+    supports_encoder_data_parallel = True
     supports_mm_encoder_item_scheduling = True
 
     def __init__(

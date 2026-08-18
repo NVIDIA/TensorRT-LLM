@@ -2768,6 +2768,17 @@ class TestStrictBaseModelArbitraryArgs:
                 mm_encoder_only=True,
             )
 
+    def test_encoder_data_parallel_rejects_mm_encoder_only(self):
+        with pytest.raises(
+                ValueError,
+                match="does not support mm_encoder_only execution yet"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                mm_encoder_only=True,
+                multimodal_config=MultimodalConfig(
+                    encoder_data_parallel_size=2),
+            )
+
     def test_multimodal_encoder_rejects_encode_only(self):
         """Test that MultimodalEncoder owns mm_encoder_only mode internally."""
         encoder = object.__new__(MultimodalEncoder)
