@@ -376,7 +376,7 @@ void* HostAccessibleDeviceAllocator::allocate(size_t memorySize)
             mAllowManagedFallback, "HostAccessibleDeviceAllocator is not supported on the current system.");
         TLLM_CUDA_CHECK(cudaMallocManaged(&devPtr, memorySize));
         TLLM_CUDA_CHECK(cudaMemAdvise(
-            devPtr, memorySize, cudaMemAdviseSetPreferredLocation, {cudaMemLocationTypeDevice, currentDevId}));
+            devPtr, memorySize, cudaMemAdviseSetPreferredLocation, {cudaMemLocationTypeDevice, {currentDevId}}));
         hostPtr = devPtr;
     }
     recordAllocation(devPtr, memorySize, hostPtr, memDesc);

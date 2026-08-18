@@ -2,10 +2,16 @@
 set -ex
 
 GITHUB_URL="https://github.com"
+if [ -n "${GITHUB_MIRROR}" ]; then
+  GITHUB_URL=${GITHUB_MIRROR}
+  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+fi
+
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
 NIXL_VERSION="v1.3.1"
-NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
+NIXL_ARCHIVE="${GITHUB_URL}/ai-dynamo/nixl/archive/refs/tags/${NIXL_VERSION}.tar.gz"
+NIXL_SRC_DIR="nixl-${NIXL_VERSION#v}"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
 ARCH_NAME="x86_64-linux-gnu"
@@ -15,12 +21,10 @@ if [ "$(uname -m)" != "amd64" ] && [ "$(uname -m)" != "x86_64" ]; then
   GDS_PATH="$CUDA_PATH/targets/sbsa-linux"
 fi
 
-if [ -n "${GITHUB_MIRROR}" ]; then
-  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
-fi
 pip3 install meson ninja pybind11 setuptools
 
-git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
+curl -L ${NIXL_ARCHIVE} | tar -zx
+mv ${NIXL_SRC_DIR} nixl
 cd nixl
 
 CUDA_SO_PATH=$(find "/usr/local" -name "libcuda.so.1" 2>/dev/null | head -n1)

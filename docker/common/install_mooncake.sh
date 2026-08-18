@@ -1,9 +1,16 @@
 #!/bin/bash
 set -ex
 
+GITHUB_URL="https://github.com"
+if [ -n "${GITHUB_MIRROR}" ]; then
+  GITHUB_URL=${GITHUB_MIRROR}
+fi
+
 MOONCAKE_VERSION="v0.3.7.post2"
 MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 MOONCAKE_INSTALL_PATH="/usr/local/Mooncake"
+YALANTINGLIBS_COMMIT="c1cef74057b139944c982d840c09c9940f26e08e"
+YALANTINGLIBS_ARCHIVE="${GITHUB_URL}/alibaba/yalantinglibs/archive/${YALANTINGLIBS_COMMIT}.tar.gz"
 
 apt-get update
 
@@ -27,7 +34,8 @@ apt-get install -y --no-install-recommends \
 
 mkdir -p /third-party-source
 
-git clone --depth 1 https://github.com/alibaba/yalantinglibs.git
+curl -L ${YALANTINGLIBS_ARCHIVE} | tar -zx
+mv yalantinglibs-${YALANTINGLIBS_COMMIT} yalantinglibs
 tar -czf /third-party-source/yalantinglibs.tar.gz yalantinglibs
 cd yalantinglibs
 mkdir build && cd build

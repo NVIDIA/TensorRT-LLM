@@ -170,24 +170,30 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 // Explicit instantiations — 6 (dtype × K) combos. Launchers dispatch on
 // runtime topK via switch, so all 6 must be available at link time.
 // Trailing `int` is the compressRatio parameter (1 = V3.2, 4 = V4 indexer).
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 512>(
-    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 1024>(
-    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 2048>(
-    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__half, 512>(
-    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__half, 1024>(
-    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__half, 2048>(
-    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernel<512>(
-    float const*, int const*, int const*, float*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernel<1024>(
-    float const*, int const*, int const*, float*, int*, int, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernel<2048>(
-    float const*, int const*, int const*, float*, int*, int, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 512>(__nv_bfloat16 const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __nv_bfloat16* __restrict__, int* __restrict__, int, int, int,
+    int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 1024>(__nv_bfloat16 const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __nv_bfloat16* __restrict__, int* __restrict__, int, int, int,
+    int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 2048>(__nv_bfloat16 const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __nv_bfloat16* __restrict__, int* __restrict__, int, int, int,
+    int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__half, 512>(__half const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __half* __restrict__, int* __restrict__, int, int, int, int, int,
+    int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__half, 1024>(__half const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __half* __restrict__, int* __restrict__, int, int, int, int, int,
+    int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__half, 2048>(__half const* __restrict__,
+    int const* __restrict__, int const* __restrict__, __half* __restrict__, int* __restrict__, int, int, int, int, int,
+    int);
+template __global__ void heuristicTopKMultiRowKernel<512>(float const* __restrict__, int const* __restrict__,
+    int const* __restrict__, float* __restrict__, int* __restrict__, int, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernel<1024>(float const* __restrict__, int const* __restrict__,
+    int const* __restrict__, float* __restrict__, int* __restrict__, int, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernel<2048>(float const* __restrict__, int const* __restrict__,
+    int const* __restrict__, float* __restrict__, int* __restrict__, int, int, int, int, int, int);
 
 // Dispatch on topK at runtime — each TopK-instantiation gets its own smem
 // size (driven by GvrParams<InputT, TopK>::kC/kNumBins) and own kfn pointer

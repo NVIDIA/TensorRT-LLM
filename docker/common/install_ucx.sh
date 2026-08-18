@@ -1,19 +1,22 @@
 #!/bin/bash
 set -ex
 
+GITHUB_URL="https://github.com"
+if [ -n "${GITHUB_MIRROR}" ]; then
+  GITHUB_URL=${GITHUB_MIRROR}
+fi
+
 UCX_VERSION="v1.21.x"
 UCX_COMMIT="167a4c6a311d9a42e30a37dcc01b8a3e73ea2826"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-UCX_REPO="https://github.com/openucx/ucx.git"
+UCX_ARCHIVE="${GITHUB_URL}/openucx/ucx/archive/${UCX_COMMIT}.tar.gz"
 
 mkdir -p /third-party-source
 
 rm -rf ${UCX_INSTALL_PATH}
-git clone -b ${UCX_VERSION} ${UCX_REPO}
-cd ucx
-git checkout ${UCX_COMMIT}
-cd ..
+curl -L ${UCX_ARCHIVE} | tar -zx
+mv ucx-${UCX_COMMIT} ucx
 tar -czf /third-party-source/ucx-${UCX_VERSION}.tar.gz ucx
 cd ucx
 ./autogen.sh
