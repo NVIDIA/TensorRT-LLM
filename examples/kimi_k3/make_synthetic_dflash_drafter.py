@@ -148,7 +148,8 @@ def drafter_tensor_plan(
         "norm.weight": (hidden,),
     }
     if markov_rank:
-        assert vocab is not None, "markov head tensors need vocab_size"
+        if vocab is None:
+            raise ValueError("markov head tensors need vocab_size")
         plan["markov_w1.weight"] = (vocab, markov_rank)
         plan["markov_w2.weight"] = (vocab, markov_rank)
     if use_confidence_head:
