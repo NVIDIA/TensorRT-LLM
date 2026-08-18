@@ -68,6 +68,14 @@ _MAX_CUDA_THREADS_PER_BLOCK = 1024
 def _get_attention_layer_indices(kv_cache_manager: Any) -> list[int]:
     """Return layers that own key/value cache buffers."""
     layer_offsets = getattr(kv_cache_manager, 'layer_offsets', {})
+    is_attention_layer = getattr(kv_cache_manager, 'is_attention_layer', None)
+    if is_attention_layer is not None:
+        return [
+            layer_idx for layer_idx in layer_offsets
+            if is_attention_layer(layer_idx)
+        ]
+
+    # Compatibility fallback for managers without an explicit layer predicate.
     num_kv_heads = getattr(kv_cache_manager, 'num_kv_heads_per_layer', None)
     if num_kv_heads is None:
         return list(layer_offsets)
