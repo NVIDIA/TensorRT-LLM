@@ -56,6 +56,7 @@ class TelemetryUvicornServer(uvicorn.Server):
 
     async def _serve(self, sockets: list[socket.socket] | None = None) -> None:
         await super()._serve(sockets)
+        # No captured signal means Uvicorn exited cleanly; do not report a failure.
         if not self._captured_signals:
             return
 
