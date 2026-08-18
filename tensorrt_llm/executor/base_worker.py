@@ -53,7 +53,7 @@ from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
 
 if TYPE_CHECKING:
-    from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
+    from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
     from ..disaggregated_params import DisaggregatedParams
 
 __all__ = [

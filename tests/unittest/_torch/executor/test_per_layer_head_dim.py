@@ -20,7 +20,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     KVCacheManagerV2,
     Role,

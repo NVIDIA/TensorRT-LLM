@@ -4285,7 +4285,7 @@ class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
 
 # Legacy env-var selectors for the "DEFAULT" cache-transceiver backend,
 # ordered by priority. Single source of truth shared with
-# _torch/pyexecutor/kv_cache_transceiver.py.
+# _torch/disaggregation/kv_cache_transceiver.py.
 _CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
     ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
     ("TRTLLM_USE_UCX_KVCACHE", "UCX"),

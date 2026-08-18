@@ -30,7 +30,7 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
-from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from .interface import SpecMetadata, SpecWorkerBase
 from .suffix_automaton import SuffixAutomatonManager
 

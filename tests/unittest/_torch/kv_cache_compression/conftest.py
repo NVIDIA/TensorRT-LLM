@@ -257,7 +257,7 @@ def make_staging_manager(host_table, gather, manager_stream, *, num_slots=1):
 
 def make_fake_v2(enable_block_reuse=False, *, is_draft=False):
     """Build an unallocated V2 double with TriAttention's production contract."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
     fake_v2 = KVCacheManagerV2.__new__(KVCacheManagerV2)
     fake_v2.enable_block_reuse = enable_block_reuse

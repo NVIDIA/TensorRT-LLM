@@ -168,6 +168,7 @@ common-files: &common_files |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
         tensorrt_llm/_torch/device_mesh.py |
+        tensorrt_llm/_torch/disaggregation/kv_cache_transceiver.py |
         tensorrt_llm/_torch/distributed/__init__.py |
         tensorrt_llm/_torch/distributed/communicator.py |
         tensorrt_llm/_torch/distributed/moe_alltoall.py |
@@ -305,11 +306,10 @@ common-files: &common_files |
         tensorrt_llm/_torch/pyexecutor/guided_decoder.py |
         tensorrt_llm/_torch/pyexecutor/handle_additional_outputs.py |
         tensorrt_llm/_torch/pyexecutor/handle_logits.py |
-        tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py |
+        tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/layerwise_nvtx_marker.py |
         tensorrt_llm/_torch/pyexecutor/llm_request.py |
         tensorrt_llm/_torch/pyexecutor/make_decoding_batch_input_output.py |
-        tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/model_engine.py |
         tensorrt_llm/_torch/pyexecutor/model_loader.py |
         tensorrt_llm/_torch/pyexecutor/py_executor.py |
@@ -937,6 +937,7 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
         tensorrt_llm/_torch/device_mesh.py |
+        tensorrt_llm/_torch/disaggregation/kv_cache_transceiver.py |
         tensorrt_llm/_torch/distributed/__init__.py |
         tensorrt_llm/_torch/distributed/communicator.py |
         tensorrt_llm/_torch/distributed/moe_alltoall.py |
@@ -1074,11 +1075,10 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/pyexecutor/guided_decoder.py |
         tensorrt_llm/_torch/pyexecutor/handle_additional_outputs.py |
         tensorrt_llm/_torch/pyexecutor/handle_logits.py |
-        tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py |
+        tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/layerwise_nvtx_marker.py |
         tensorrt_llm/_torch/pyexecutor/llm_request.py |
         tensorrt_llm/_torch/pyexecutor/make_decoding_batch_input_output.py |
-        tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/model_engine.py |
         tensorrt_llm/_torch/pyexecutor/model_loader.py |
         tensorrt_llm/_torch/pyexecutor/py_executor.py |

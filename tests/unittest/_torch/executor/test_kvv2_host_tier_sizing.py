@@ -11,7 +11,7 @@ cross-rank ``allreduce(MIN)`` that reconciles them to the fleet minimum.
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _compute_auto_host_tier_quota,
     _sync_host_tier_quota,
 )
@@ -110,7 +110,7 @@ def _host_tier_sync_worker(per_rank_mem_gib):
     cross-rank sync. Returns this rank's pre- and post-sync quota so the parent
     process can assert on convergence.
     """
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
         _compute_auto_host_tier_quota,
         _sync_host_tier_quota,
     )

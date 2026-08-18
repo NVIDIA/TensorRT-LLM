@@ -90,13 +90,13 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
 from .guided_decoder import CapturableGuidedDecoder
-from .kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import (LlmRequest, LlmRequestState,
                           MultimodalEncoderRequestError, _Unset,
                           get_draft_token_length,
                           get_multimodal_embedding_lengths)
-from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,

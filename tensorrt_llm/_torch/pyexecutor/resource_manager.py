@@ -73,7 +73,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                               KvCacheCompressionConfig)
 
-    from .kv_cache_manager_v2 import KVCacheManagerV2
+    from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 BlocksPerWindow = Dict[int, Tuple[
     int,
@@ -1314,7 +1314,7 @@ class KVCacheManager(BaseResourceManager):
         # applies to it.
         if self.kv_cache_type != CacheTypeCpp.CROSS:
             if not self.is_draft:
-                from .kv_cache_manager_v2 import \
+                from .kv_cache.kv_cache_manager_v2 import \
                     _update_kv_cache_draft_token_location
 
                 _update_kv_cache_draft_token_location(self, scheduled_batch,
@@ -2739,7 +2739,7 @@ class KVCacheCompressionManager(BaseResourceManager):
         kv_cache_manager: "KVCacheManagerV2",
         draft_kv_cache_manager: Optional["KVCacheManagerV2"] = None,
     ):
-        from .kv_cache_manager_v2 import KVCacheManagerV2
+        from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         if not isinstance(kv_cache_manager, KVCacheManagerV2):
             raise TypeError("KV-cache compression requires KVCacheManagerV2")

@@ -24,7 +24,7 @@ import pytest
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionType
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import create_autodeploy_executor
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import AttentionTypeCpp
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import AttentionTypeCpp
 from tensorrt_llm.llmapi import CacheTransceiverConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -354,7 +354,7 @@ def test_create_executor_requires_attention_type():
 
 def test_create_executor_rejects_mamba_cache_manager_for_transceiver():
     """Test create_autodeploy_executor rejects Mamba/hybrid cache transfer."""
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import BaseMambaCacheManager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 
     mock_tokenizer = MockTokenizer()
 

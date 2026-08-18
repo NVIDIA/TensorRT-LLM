@@ -30,7 +30,7 @@ from transformers import PretrainedConfig
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping

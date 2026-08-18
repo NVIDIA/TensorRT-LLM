@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import GPU_LEVEL, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import GPU_LEVEL, KVCacheManagerV2
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,

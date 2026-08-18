@@ -30,14 +30,13 @@ from typing import List, Optional, Sequence
 import torch
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, PageIndexMode
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
-
-from ....pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 
 
 class MiniMaxM3SparseIndexCache:

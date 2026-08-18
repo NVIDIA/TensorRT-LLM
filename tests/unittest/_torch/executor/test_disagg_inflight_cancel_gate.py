@@ -19,14 +19,14 @@ from unittest.mock import Mock, call
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor import kv_cache_transceiver as transceiver_module
+from tensorrt_llm._torch.disaggregation import kv_cache_transceiver as transceiver_module
+from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import BindKvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import BindKvCacheTransceiver
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 
@@ -522,7 +522,9 @@ def test_flag_unset_preserves_python_transceiver(monkeypatch):
     expected = object()
     constructor = Mock(return_value=expected)
     fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
-    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
+    monkeypatch.setitem(
+        sys.modules, "tensorrt_llm._torch.disaggregation.transceiver_v2", fake_module
+    )
 
     result = transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
 
@@ -535,7 +537,9 @@ def test_python_nixl_transceiver_accepts_v2_mamba_manager(monkeypatch):
     expected = object()
     constructor = Mock(return_value=expected)
     fake_module = SimpleNamespace(KvCacheTransceiverV2=constructor)
-    monkeypatch.setitem(sys.modules, "tensorrt_llm._torch.disaggregation.transceiver", fake_module)
+    monkeypatch.setitem(
+        sys.modules, "tensorrt_llm._torch.disaggregation.transceiver_v2", fake_module
+    )
     manager = object.__new__(MambaHybridCacheManagerV2)
 
     result = transceiver_module.create_kv_cache_transceiver(
@@ -673,7 +677,7 @@ def test_cpp_capability_is_config_scoped(monkeypatch, backend, runtime, nixl_bac
 
 
 def test_python_transceiver_capability_defaults_to_unsupported():
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+    from tensorrt_llm._torch.disaggregation.transceiver_v2 import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
 

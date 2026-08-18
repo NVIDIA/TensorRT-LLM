@@ -25,7 +25,7 @@ from .._compat import TRTLLM_AVAILABLE, KvCacheConfig
 
 if TRTLLM_AVAILABLE:
     import tensorrt_llm.bindings
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
         MambaHybridCacheManager,
         MixedMambaHybridCacheManager,
     )
