@@ -317,7 +317,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | Unquantized (BF16/FP16) | Y (SM80+) | Y (SM100/103, BF16, needs FlashInfer `trtllm_bf16_moe`)§ | N | N | N | N | N | Y (SM90, BF16) | N | Y |
 | FP8 QDQ | Y (SM89+) | N | N | N | N | N | N | Y (SM90) | N | Y |
 | FP8 Block Scales | Y (SM90, SM120) | Y (SM100/103) | Y (SM100/103) | N | N‡ | N | N | N | N | Y |
-| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/120/121) | N | Y (SM100/103, cu13 cutlass-dsl + NVSHMEM provider; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
+| NVFP4 | Y (SM100/103/120/121) | Y (SM100/103) | N | Y (SM100/103) | Y (SM100/103/120/121) | N | Y (SM100/103/107, compatible cu13 cutlass-dsl; Rubin-capable build on SM107; per-expert alpha/norm_const + SwiGLU clamp) | N | Y (SM89-SM99) | Y |
 | W4A16 NVFP4 | Y (SM80+, dequant-on-the-fly) | N | N | N | Y (SM120/121 via `CuteDslB12xFusedMoE`, needs flashinfer) | N | N | N | Y (SM89-SM99, BF16) | Y |
 | W4A8 NVFP4 FP8 | N | Y (SM100/103) | N | N | N | N | N | N | N | N |
 | W4A16 MXFP4 | Y (SM90) | Y (SM100/103) | N | N | N | N | N | Y (SM90) | N | N |

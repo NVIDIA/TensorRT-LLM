@@ -12,7 +12,7 @@ NOTE: Top-level eager import of ``Sm100MegaMoEKernel`` would pull every
 CuteDSL kernel symbol the moment any caller does
 ``from tensorrt_llm._torch.cute_dsl_kernels.mega_moe_nvfp4 import ...``.
 The current tests only check capability (no kernel launch); keep the
-public surface lazy so unit tests on non-SM100 boxes do not trigger
+public surface lazy so unit tests on unsupported GPUs do not trigger
 CuteDSL import side effects.
 """
 
@@ -43,18 +43,23 @@ __all__ = [
 ]
 
 
-def import_kernel():
-    """Lazily import the CuteDSL kernel class.
+def import_kernel(sm_version: int = 100):
+    """Lazily import the CuteDSL kernel class for ``sm_version``.
 
-    Returns the ``Sm100MegaMoEKernel`` class. Raises ``ImportError`` with
+    Raises ``ImportError`` with
     an actionable message if the active CUDA 13 Cutlass DSL runtime does
     not expose every symbol the kernel needs. Callers must catch the
     error and report capability negatively (e.g. ``can_implement`` /
     backend skip), not crash the import of the wrapper module.
     """
-    from .megamoe_kernel import Sm100MegaMoEKernel
+    from .megamoe_kernel import Sm100MegaMoEKernel, Sm107MegaMoEKernel
 
-    return Sm100MegaMoEKernel
+    if sm_version in (100, 103):
+        return Sm100MegaMoEKernel
+    if sm_version == 107:
+        return Sm107MegaMoEKernel
+    raise ValueError(
+        f"MegaMoE NVFP4 supports SM100, SM103, or SM107; got SM{sm_version}.")
 
 
 def import_sym_buffer_host():
