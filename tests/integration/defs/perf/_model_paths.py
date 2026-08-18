@@ -100,6 +100,8 @@ MODEL_PATH_DICT = {
     "minimax_m3_fp4": "MiniMax-M3-NVFP4",
     # Kimi K2.5 NVFP4 (~1T MoE multimodal)
     "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
+    # Kimi K3 (KDA linear attention + MLA MoE, MXFP4 routed experts)
+    "kimi_k3": "Kimi-K3",
     # Keys below are sanity-side aliases; some point to the same weights as
     # entries above but are kept under sanity's historical naming.
     "deepseek_v32_fp4": "DeepSeek-V3.2-Exp-FP4-v2",
@@ -110,6 +112,10 @@ MODEL_PATH_DICT = {
     "super_bf16": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
     "qwen3_32b_fp8": "Qwen3/Qwen3-32B-FP8",
     "glm_5_nvfp4": "GLM-5-NVFP4",
+    # Nemotron-Ultra-V3 (550B-A55B) mixed NVFP4 weights + FP8 KV + fp16 Mamba
+    # cache. Synced locally under llm_models_root() (llm-models repo) -- distinct
+    # from the HF-download `nemotron_3_ultra_550b_nvfp4` entry in HF_MODEL_PATH.
+    "nemotron_ultra_v3_fp4": "Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k",
 }
 
 # Models loaded directly by HuggingFace repo id (downloaded at runtime, not synced locally).

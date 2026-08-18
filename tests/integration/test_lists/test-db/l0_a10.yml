@@ -37,6 +37,7 @@ l0_a10:
   # test list either).
   - unittest/_torch/models/checkpoints
   - unittest/_torch/models/test_qwen3_next_moe_quant.py
+  - unittest/_torch/models/test_qwen3_next_eager_fusion.py
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_multimodal_input_processor.py
   - unittest/others/test_cache_transceiver_precheck_config.py

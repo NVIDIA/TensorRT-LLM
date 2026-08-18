@@ -36,6 +36,7 @@ l0_cpu:
   - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
+  - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/thop/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
@@ -69,6 +70,7 @@ l0_cpu:
   - unittest/executor/test_rpc_worker_mixin.py
   - unittest/executor/test_stats_serializer.py
   - unittest/executor/test_spec_dec_perf_metrics.py
+  - unittest/executor/test_ray_stub.py
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/apps/test_chat_utils.py
@@ -90,6 +92,7 @@ l0_cpu:
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_utils.py
   - unittest/metrics/test_collector.py
   - unittest/models/test_quant_config_utils.py
