@@ -26,8 +26,6 @@ MODEL_PATH_DICT = {
     "llama_v4_scout_17b_16e_instruct": "llama4-models/Llama-4-Scout-17B-16E-Instruct",
     "llama_v4_scout_17b_16e_instruct_fp8": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
     "llama_v4_scout_17b_16e_instruct_fp4": "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
-    "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
-    "deepseek_r1_distill_llama_70b": "DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B/",
     "gemma_3_27b_it": "gemma/gemma-3-27b-it",
     "gemma_3_27b_it_fp8": "gemma/gemma-3-27b-it-fp8",
     "gemma_3_27b_it_fp4": "gemma/gemma-3-27b-it-FP4",
@@ -65,7 +63,6 @@ MODEL_PATH_DICT = {
     "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
     "phi_4_multimodal_instruct_fp4": "multimodals/Phi-4-multimodal-instruct-FP4",
     "phi_4_multimodal_instruct_fp8": "multimodals/Phi-4-multimodal-instruct-FP8",
-    "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
     "gpt_oss_120b_eagle3": "gpt_oss/gpt-oss-120b",
@@ -113,6 +110,10 @@ MODEL_PATH_DICT = {
     "super_bf16": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
     "qwen3_32b_fp8": "Qwen3/Qwen3-32B-FP8",
     "glm_5_nvfp4": "GLM-5-NVFP4",
+    # Nemotron-Ultra-V3 (550B-A55B) mixed NVFP4 weights + FP8 KV + fp16 Mamba
+    # cache. Synced locally under llm_models_root() (llm-models repo) -- distinct
+    # from the HF-download `nemotron_3_ultra_550b_nvfp4` entry in HF_MODEL_PATH.
+    "nemotron_ultra_v3_fp4": "Nemotron-Ultra-V3-rl3-050826-mixed_nvfp4-fp8_amax_1024x65k",
 }
 
 # Models loaded directly by HuggingFace repo id (downloaded at runtime, not synced locally).

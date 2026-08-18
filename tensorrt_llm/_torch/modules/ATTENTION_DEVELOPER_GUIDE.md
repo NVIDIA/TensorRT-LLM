@@ -134,14 +134,14 @@ both. The separate adapter types make the `Attention` and `MLA` signatures
 statically checkable without runtime signature inspection.
 
 Ordinary sparse variants use `attention_output_hidden_size` and the shared
-output allocation. DeepSeek-V4's fused epilogue is the exception: it requires
-two typed output buffers before the attention op runs, so it implements the
-optional output-preparation hook. `_create_outputs()` always returns a tensor
-list whose first entry is the standard attention output. The same list flows
-through forward, the registered custom op, and output projection; algorithms
-own the meaning of any additional entries. Context- and generation-phase
-helpers stay within each algorithm module and are not part of the generic hook
-facade.
+output allocation. DeepSeek-V4's fused epilogue instead uses the optional
+output-preparation hook to create one token-major O-LoRA output tensor. Its
+context- and generation-phase helpers allocate the private FP8 attention and
+scale buffers, then write the O-LoRA result into the corresponding token range.
+The shared MLA custom-op contract exposes exactly one mutable output tensor;
+`_create_outputs()` keeps that tensor in a single-entry list through forward
+and output projection. Phase-specific scratch buffers remain inside the
+DeepSeek-V4 algorithm module and do not widen the generic hook facade.
 
 Sparse prediction inputs stay out of shared MLA APIs. Algorithm modules wrap
 their module-to-backend inputs in a `SparseBackendForwardArgs` subclass and
@@ -204,6 +204,8 @@ The core contract is:
   - `support_fused_rope()`
   - `support_fused_qkv()`
   - `support_mla()`
+- `runtime_workspace_bytes_per_token(model_config, mapping)` — the memory-accounting
+  contract (default `0`); see below
 
 `**kwargs` is only a temporary compatibility path. It is merged into
 `AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
@@ -211,6 +213,18 @@ an explicit `forward_args`.
 
 Those capability hooks are coarse checks. They do not prove that every
 required operator or sparse path already exists.
+
+**Workspace memory-accounting contract.** The KV-cache estimator profiles peak
+memory against an empty cache and hands the rest to the KV pool, so a workspace
+sized by a runtime quantity the profiling forward never drives to its serving
+maximum is under-reserved and can OOM mid-forward. If a backend stages such a
+buffer, declare its per-token cost via
+`runtime_workspace_bytes_per_token(model_config, mapping)` (default `0`): the
+estimator reserves it from the KV budget and the scheduler caps the driving sum.
+Keep the declared cost identical to the runtime allocation's (single source of
+truth). The one instance today is the fp8 context-MLA K/V dequant workspace,
+sized by summed attended KV length (`total_kv_len`) — which KV-cache reuse
+decouples from `max_num_tokens` (`TrtllmAttention.runtime_workspace_bytes_per_token`).
 
 ### 2.4 Capability reference
 
@@ -323,6 +337,9 @@ agree on latent-cache layout, paged-KV read/write paths, and cached/chunked
 context behavior. Read `mla.py` and the relevant
 backend code for the current implementation details.
 
+fp8 context-MLA also stages a K/V dequant workspace sized by summed attended KV
+length; it is declared through the workspace memory-accounting contract (§2.3).
+
 #### 3.2.4 Sparse side-cache semantics
 
 Sparse backends may add side caches beyond the main KV cache. Some sparse
@@ -375,6 +392,11 @@ as the current blocker.
   How K/V are appended, what layout is assumed, how cached state is indexed and
   reused, whether chunked prefill or speculative decoding matters, and whether
   sparse side caches are required.
+
+- **Workspace memory accounting**
+  Whether the backend stages a workspace sized by a runtime quantity the KV-cache
+  profiler does not max out (e.g. `total_kv_len` under reuse) — if so, declare it
+  via `runtime_workspace_bytes_per_token` (§2.3).
 
 ### 4.3 Default bring-up order
 

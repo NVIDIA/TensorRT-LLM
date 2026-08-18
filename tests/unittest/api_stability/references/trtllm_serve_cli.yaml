@@ -58,7 +58,7 @@ commands:
       backend:
         type: Choice(['_autodeploy', 'pytorch'])
         default: pytorch
-        status: beta
+        status: deprecated
         required: false
         multiple: false
         is_flag: false
@@ -385,6 +385,15 @@ commands:
         is_flag: false
         flags:
         - "--reasoning_parser"
+      report_addr:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--report_addr"
       revision:
         type: str
         default: null
@@ -520,6 +529,15 @@ commands:
         is_flag: false
         flags:
         - "--metrics-log-interval"
+      report_addr:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--report_addr"
       request_timeout:
         type: int
         default: 180

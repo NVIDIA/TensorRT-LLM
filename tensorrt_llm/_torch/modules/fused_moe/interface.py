@@ -22,28 +22,27 @@ from typing import Dict, List, Optional, Tuple, Union, final
 import torch
 from torch import nn
 
-from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import QuantAlgo
-
 from ...distributed.ops import reducescatter
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
+                            MoEProblem, MoERejectReason, MoERunContext,
+                            MoEStaticCapability)
+
+# Route on the host (fused noaux_tc + post-topk pipeline) instead of inside
+# the trtllm-gen cubin. The in-cubin top-k tier for large expert counts
+# (896 experts / top-16) register-spills and costs ~33 us/layer at decode
+# batch 5..64 vs ~10 us for the post-topk pipeline; the separated path is
+# the same math the attention-DP deployments already run.
+#
+# Lives here rather than next to either reader because both need it: the
+# scheduler decides whether to precompute top-k at all, and TRTLLMGenFusedMoE
+# decides whether its kernel may route again.
+FORCE_SEPARATED_ROUTING = os.environ.get(
+    "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
 
-def _warn_and_return(reason: str) -> Tuple[bool, Optional[str]]:
-    """
-    Log a warning and return (False, reason) for can_implement() checks.
-
-    This is a common utility function used by all MoE backend implementations
-    to provide consistent logging and return values when a configuration
-    is not supported.
-
-    Args:
-        reason: The reason why the configuration is not supported.
-
-    Returns:
-        Tuple[bool, Optional[str]]: Always returns (False, reason)
-    """
-    logger.warning(reason)
-    return False, reason
+def _reject(reason: MoERejectReason, detail: str) -> MoEEligibility:
+    """Create a silent ``can_implement`` rejection."""
+    return MoEEligibility.no(reason, detail)
 
 
 from ...model_config import ModelConfig
@@ -227,6 +226,12 @@ class MoE(nn.Module):
     # override this to ``MoESchedulerKind.FUSED_COMM``.
     scheduler_kind: MoESchedulerKind = MoESchedulerKind.EXTERNAL_COMM
 
+    # Subclasses must restate capabilities to preserve exact-class behavior.
+    capabilities: MoEStaticCapability = MoEStaticCapability()
+
+    # Scheduler-provided inputs; inherited values remain valid for subclasses.
+    input_requirement: MoEInputRequirement = MoEInputRequirement()
+
     # Opt-in flag for non-divisible EP (num_experts % ep_size != 0). False by default
     # so backends whose dispatch/combine paths still assume uniform partitioning fail
     # fast with a clear error. Backends that fully exercise the ceil/floor partition
@@ -235,34 +240,10 @@ class MoE(nn.Module):
 
     @classmethod
     @abstractmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        Check if this MoE backend can implement the given quantization algorithm.
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Purely evaluate ``p`` and ``d`` without probing runtime state.
 
-        NOTE: This is a TRANSITIONAL interface. In the future, this method will be moved
-        to the MoEBackend interface as part of the backend abstraction layer. During this
-        transition period, it remains in the MoE base class to maintain compatibility.
-
-        This method checks both:
-        1. Whether the backend supports the specified quantization algorithm
-        2. Whether the current platform (SM version) supports the backend and quantization
-
-        Each backend MUST override this method to provide accurate capability information.
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation data type.
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-                - can_implement: True if the backend can implement this configuration
-                - skip_reason: None if can_implement is True, otherwise a string explaining why not
+        Abstain rather than reject when a required problem field is unknown.
         """
         raise NotImplementedError(
             f"{cls.__name__} must implement can_implement method")
@@ -927,32 +908,30 @@ class MoE(nn.Module):
     @abstractmethod
     def run_moe(
         self,
-        # ========== Common parameters (all backends use) ==========
-        x: torch.Tensor,
-        token_selected_experts: Optional[torch.Tensor],
-        token_final_scales: Optional[torch.Tensor],
-        x_sf: Optional[torch.Tensor] = None,
-        # ========== Backend-specific parameters (via kwargs) ==========
-        **kwargs
+        ctx: MoERunContext,
+        *,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         """
-        Unified MoE computation interface
+        Unified MoE computation interface.
 
-        NOTE: This is a TEMPORARY interface. In the future, this method should be moved
-        to the MoEBackend interface as part of the backend abstraction layer.
+        Every value the caller genuinely produces travels in ``ctx``; every
+        fact the comm layer decided for this forward travels in
+        ``ctx.comm_plan``. Backends read only the fields they need, so adding a
+        backend never requires touching the scheduler.
 
-        This method performs the core MoE computation. Different backends will implement
-        their specific computation logic while following this unified interface.
-
-        Common parameters (all backends use):
-            x: Input activations [num_tokens, hidden_size]
-            token_selected_experts: Expert IDs [num_tokens, top_k] (used by DeepGemm/TRTLLMGen).
-                                    If EPLB is enabled, this represents expert slots [num_tokens, top_k].
-            token_final_scales: Routing weights [num_tokens, top_k]
-            x_sf: Input scale factor (for quantization, if applicable)
-
-        Backend-specific parameters (passed via kwargs, obtained from _get_backend_kwargs()):
-            TODO: This is not finalized, will be updated later.
+        Args:
+            ctx: Inputs for this forward. ``token_selected_experts`` holds
+                expert slots rather than expert IDs when EPLB is enabled.
+            workspace: Scratch buffers owned by the scheduler because they are
+                allocated once per chunk and reused across the aux stream. Only
+                backends declaring ``requires_run_moe_workspace`` receive one.
+                ``MoEImplBase.run_moe`` deliberately omits this parameter: it
+                describes the state after impls allocate their own scratch
+                through ``get_workspaces``, which happens as each impl moves
+                onto that base (TRTLLM-14958, TRTLLM-14960..14969). Keyword-only
+                here so that removing it is a mechanical change to named call
+                sites rather than a silent re-binding of a positional argument.
 
         Returns:
             torch.Tensor: MoE computation result [num_tokens, hidden_size]
