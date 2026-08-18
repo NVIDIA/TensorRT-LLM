@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3 native TRTLLM-Gen SiTU MoE tests.
 
-Covers the acceptance criteria of the SiTU cubin integration plan
-(`tensorrt_llm/_torch/modules/kimi_k3_moe/SITU_CUBIN_INTEGRATION_PLAN.md`):
+Covers the SiTU cubin integration behavior:
 
 * runner-local ActType numeric stability (SwiGlu/Relu2/Silu unchanged,
   SiTu appended);
@@ -41,13 +40,13 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
     _K3_MOE_EP_ENV,
     _K3_MOE_TP_ENV,
+    KimiK3MoEGate,
     KimiK3MoERuntime,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
 from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
     _MEGA_MOE_SYMM_BUFFER_CACHE,
 )
-from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping
@@ -169,35 +168,6 @@ def test_padded_fused_shapes():
     assert padded_fused_shapes(512, 256) == (512, 512, 256)
     assert padded_fused_shapes(128, 256) == (512, 128, 256)
     assert padded_fused_shapes(2880, 96) == (3072, 2944, 128)
-
-
-def test_kimi_gate_reuses_deepseek_v3_routing():
-    config = _K3Config(num_experts=16, num_experts_per_token=4)
-    gate = KimiK3MoEGate(config)
-    torch.manual_seed(23)
-    with torch.no_grad():
-        gate.weight.normal_(std=0.1)
-        gate.e_score_correction_bias.normal_(std=0.05)
-    hidden_states = torch.randn(2, 7, config.hidden_size)
-
-    expected_ids, expected_weights = gate(hidden_states)
-    routing_method = gate.routing_method
-    # Exercise the portable PyTorch short path; the production path keeps
-    # is_fused=True and uses the same routing contract.
-    routing_method.routing_impl.is_fused = False
-    actual_ids, actual_weights = routing_method.apply(gate.compute_logits(hidden_states))
-
-    expected_order = expected_ids.argsort(dim=-1)
-    actual_order = actual_ids.argsort(dim=-1)
-    assert actual_ids.dtype == torch.int32
-    torch.testing.assert_close(
-        expected_ids.gather(1, expected_order).to(actual_ids.dtype),
-        actual_ids.gather(1, actual_order),
-    )
-    torch.testing.assert_close(
-        expected_weights.gather(1, expected_order),
-        actual_weights.gather(1, actual_order),
-    )
 
 
 def test_communication_factory_accepts_model_selected_method(monkeypatch):
