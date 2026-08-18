@@ -159,9 +159,6 @@ models:
 - name: nvidia/Llama-3.1-Minitron-4B-Width-Base
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
-- name: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Mistral-NeMo-Minitron-8B-Base
   config_id: default_ws_2
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -292,10 +289,6 @@ models:
 # - name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
 #   config_id: simple_shard_only
 #   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
-# ValueError: DeciLMForCausalLM does not support Flash Attention 2 yet. Please request to add support where the model is hosted, on its model hub page: https://huggingface.co//opt/huggingface/hub/models--nvidia--Llama-3...
-# - name: nvidia/Llama-3_3-Nemotron-Super-49B-v1
-#   config_id: nemotron_super_49b
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'nemotron_super_49b.yaml']
 - name: Qwen/Qwen3-30B-A3B
   config_id: simple_shard_only
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'simple_shard_only.yaml']

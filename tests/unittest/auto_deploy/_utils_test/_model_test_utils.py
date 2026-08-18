@@ -457,22 +457,13 @@ _SMALL_MODEL_CONFIGS = {
             "num_experts": 16,
         },
     },
-    "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
-        "model_factory": "AutoModelForImageTextToText",
+    "microsoft/Phi-3-mini-4k-instruct": {
         "model_kwargs": {
-            "text_config": {
-                "num_hidden_layers": 1,
-                "head_dim": 64,
-                "hidden_size": 32,
-                "intermediate_size": 64,
-                "intermediate_size_mlp": 64,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 1,
-                "num_local_experts": 2,
-            },
-            "vision_config": {
-                "num_hidden_layers": 1,
-            },
+            "num_hidden_layers": 2,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
         },
     },
     "deepseek-ai/DeepSeek-V3": {
