@@ -23,6 +23,12 @@ from tensorrt_llm.logger import logger
 
 from ...trtllm import TrtllmAttentionMetadata
 
+#: Per-process latch so the crosscheck announces itself exactly once. A check
+#: that is silent on success is indistinguishable from one that never ran -- the
+#: env var not reaching an MPI worker would look identical -- so the regression
+#: harness requires this line and fails if it is absent.
+_INK_XCHK_ANNOUNCED = False
+
 
 class InklingAttentionMetadata(TrtllmAttentionMetadata):
     """Per-step decode metadata for the Inkling Triton kernels.
@@ -295,9 +301,11 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
            hole is in the padded tail. Out-of-window SWA blocks are the obvious
            way that could stop being true.
         """
+        global _INK_XCHK_ANNOUNCED
         mgr = self.kv_cache_manager
         gen_ids = self.request_ids[self.num_contexts :]
         div = self.ink_page_div
+        checked = 0
         for layer in layers:
             borrowed = (self.ink_gen_page_table(layer) // div).tolist()
             for i, blocks in enumerate(mgr.get_batch_cache_indices(gen_ids, layer)):
@@ -339,6 +347,18 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
                         tail[:8],
                         len(want),
                     )
+                checked += 1
+        if not _INK_XCHK_ANNOUNCED:
+            _INK_XCHK_ANNOUNCED = True
+            logger.info(
+                "INKLING_PT_CROSSCHECK ACTIVE: %d layer/request pairs agreed "
+                "(borrowed kv_cache_block_offsets // %d == get_batch_cache_indices) "
+                "over %d layers and %d generation rows",
+                checked,
+                div,
+                len(layers),
+                len(gen_ids),
+            )
 
     def create_cuda_graph_metadata(
         self, max_batch_size: int, *args, **kwargs
