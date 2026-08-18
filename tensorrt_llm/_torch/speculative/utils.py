@@ -182,10 +182,10 @@ def skip_modules_for_separate_mtp_checkpoint(weights: dict) -> list[str]:
 
 
 def uses_mtp_head_checkpoint(spec_config) -> bool:
-    """True when `speculative_model` contains external MTP heads only."""
+    """True when `speculative_model` contains replacement MTP heads."""
     if spec_config is None:
         return False
-    return spec_config.uses_mtp_head_checkpoint
+    return spec_config.uses_replacement_heads
 
 
 def _refers_to_same_checkpoint(lhs, rhs) -> bool:
@@ -812,19 +812,20 @@ def update_spec_config_from_model_config(spec_config,
 
     # The target implementation owns the contract for its MTP drafter. Some one-model MTP
     # implementations construct `MTPForCausalLM` from the target config, and optionally load a
-    # heads-only checkpoint (e.g. NemotronH).
-    # Other implementations advertise a complete assistant architecture, which must be
+    # head replacement checkpoint (e.g. NemotronH).
+    # Other implementations advertise an external assistant architecture, which must be
     # constructed from the assistant's own config.
     checkpoint_type = spec_config._mtp_draft_checkpoint_type
     if spec_config.speculative_model is None:
         checkpoint_type = _MTPDraftCheckpointType.TARGET
     elif checkpoint_type != _MTPDraftCheckpointType.TARGET:
         if target_model_cls is not None:
-            checkpoint_type = (_MTPDraftCheckpointType.DRAFT_MODEL if getattr(
-                target_model_cls, "build_mtp_draft_model_from_config", False)
-                               else _MTPDraftCheckpointType.HEADS)
+            checkpoint_type = (
+                _MTPDraftCheckpointType.EXTERNAL_DRAFT_MODEL if getattr(
+                    target_model_cls, "build_mtp_draft_model_from_config",
+                    False) else _MTPDraftCheckpointType.HEAD_REPLACEMENT)
         elif checkpoint_type == _MTPDraftCheckpointType.UNRESOLVED:
-            checkpoint_type = _MTPDraftCheckpointType.HEADS
+            checkpoint_type = _MTPDraftCheckpointType.HEAD_REPLACEMENT
     spec_config._mtp_draft_checkpoint_type = checkpoint_type
 
     # When MTP heads live in a separate checkpoint, prefer that checkpoint's

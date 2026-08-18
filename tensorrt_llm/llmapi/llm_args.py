@@ -1755,8 +1755,8 @@ class _MTPDraftCheckpointType(StrEnum):
 
     UNRESOLVED = "unresolved"
     TARGET = "target"
-    HEADS = "heads"
-    DRAFT_MODEL = "draft_model"
+    HEAD_REPLACEMENT = "head_replacement"
+    EXTERNAL_DRAFT_MODEL = "external_draft_model"
 
 
 class DecodingBaseConfig(StrictBaseModel):
@@ -1778,9 +1778,9 @@ class DecodingBaseConfig(StrictBaseModel):
         description=
         "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'), "
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory. "
-        "For MTP, when set to a checkpoint other than the target model, loads MTP heads from it instead of any "
-        "embedded mtp.* weights in the target; pointing it at the target model keeps the embedded heads."
-    )
+        "For one-model MTP, a non-target checkpoint provides either replacement MTP heads or a complete external "
+        "draft model, depending on the target model implementation. Pointing it at the target checkpoint uses the "
+        "target's embedded mtp.* weights.")
 
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
@@ -1859,8 +1859,8 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
     # If set, the draft model attends directly over the target model KV cache.
     _use_shared_kv_cache: bool = PrivateAttr(False)
-    # Describes whether one-model MTP is embedded in the target, supplied as a heads-only
-    # checkpoint, or supplied as a complete draft model.
+    # Describes whether one-model MTP is embedded in the target, supplied as an MTP head replacement
+    # checkpoint, or supplied as an external draft model.
     _mtp_draft_checkpoint_type: _MTPDraftCheckpointType = PrivateAttr(
         default=_MTPDraftCheckpointType.UNRESOLVED)
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
@@ -1974,30 +1974,30 @@ class DecodingBaseConfig(StrictBaseModel):
         return True
 
     @property
-    def uses_mtp_head_checkpoint(self) -> bool:
-        """Whether `speculative_model` contains only external MTP heads."""
+    def uses_replacement_heads(self) -> bool:
+        """Whether `speculative_model` contains replacement MTP heads."""
         if (not self.spec_dec_mode.is_mtp_one_model()
                 or self.speculative_model is None):
             return False
-        return (
-            self._mtp_draft_checkpoint_type == _MTPDraftCheckpointType.HEADS)
+        return (self._mtp_draft_checkpoint_type ==
+                _MTPDraftCheckpointType.HEAD_REPLACEMENT)
 
     @property
-    def uses_full_draft_model_checkpoint(self) -> bool:
-        """Whether `speculative_model` contains a complete draft model."""
+    def uses_external_draft_model(self) -> bool:
+        """Whether `speculative_model` contains an external draft model."""
         return (self.spec_dec_mode.is_mtp_one_model()
                 and self._mtp_draft_checkpoint_type
-                == _MTPDraftCheckpointType.DRAFT_MODEL)
+                == _MTPDraftCheckpointType.EXTERNAL_DRAFT_MODEL)
 
     @property
     def needs_separate_draft_weights(self) -> bool:
         """Whether draft weights must be loaded from ``speculative_model``.
 
-        This includes complete draft models and heads-only MTP checkpoints.
+        This includes external draft models and MTP head replacement checkpoints.
         """
         return (self.spec_dec_mode.need_load_draft_weights()
-                or self.uses_full_draft_model_checkpoint
-                or self.uses_mtp_head_checkpoint)
+                or self.uses_external_draft_model
+                or self.uses_replacement_heads)
 
     @property
     def spec_dec_mode(self):

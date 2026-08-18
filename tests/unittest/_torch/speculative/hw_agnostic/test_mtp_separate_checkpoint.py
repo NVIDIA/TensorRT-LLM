@@ -24,17 +24,19 @@ from tensorrt_llm._torch.speculative.utils import (
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 
 
-class _FullDraftTarget:
+class _ExternalDraftModelTarget:
     build_mtp_draft_model_from_config = True
 
 
-class _EmbeddedOrHeadOnlyTarget:
+class _EmbeddedOrHeadReplacementTarget:
     pass
 
 
 def _resolve_as_head_checkpoint(spec_config):
     pretrained_config = PretrainedConfig(architectures=["TargetModel"], num_nextn_predict_layers=1)
-    update_spec_config_from_model_config(spec_config, pretrained_config, _EmbeddedOrHeadOnlyTarget)
+    update_spec_config_from_model_config(
+        spec_config, pretrained_config, _EmbeddedOrHeadReplacementTarget
+    )
 
 
 def test_needs_separate_draft_weights_for_mtp_with_speculative_model():
@@ -62,9 +64,9 @@ def test_uses_mtp_head_checkpoint_helper():
 @pytest.mark.parametrize(
     ("speculative_model", "target_model_cls", "expected_checkpoint_type"),
     [
-        (None, _EmbeddedOrHeadOnlyTarget, "embedded"),
-        ("/path/to/mtp", _EmbeddedOrHeadOnlyTarget, "heads"),
-        ("/path/to/assistant", _FullDraftTarget, "draft_model"),
+        (None, _EmbeddedOrHeadReplacementTarget, "embedded"),
+        ("/path/to/mtp", _EmbeddedOrHeadReplacementTarget, "head_replacement"),
+        ("/path/to/assistant", _ExternalDraftModelTarget, "external_draft_model"),
     ],
 )
 def test_mtp_checkpoint_type_selects_draft_model_constructor(
@@ -78,32 +80,34 @@ def test_mtp_checkpoint_type_selects_draft_model_constructor(
     )
     update_spec_config_from_model_config(spec_config, pretrained_config, target_model_cls)
 
-    full_draft_model = object()
-    mtp_heads = object()
+    external_draft_model = object()
+    replacement_mtp_heads = object()
     monkeypatch.setattr(
         modeling_speculative.AutoModelForCausalLM,
         "from_config",
-        lambda draft_config: full_draft_model,
+        lambda draft_config: external_draft_model,
     )
     monkeypatch.setattr(
         modeling_speculative,
         "MTPForCausalLM",
-        lambda *args: mtp_heads,
+        lambda *args: replacement_mtp_heads,
     )
 
-    draft_config = object() if expected_checkpoint_type == "draft_model" else None
+    draft_config = object() if expected_checkpoint_type == "external_draft_model" else None
     draft_model = modeling_speculative.get_draft_model(
         model_config, draft_config, object(), object()
     )
 
-    if expected_checkpoint_type == "draft_model":
-        assert spec_config.uses_full_draft_model_checkpoint
-        assert not spec_config.uses_mtp_head_checkpoint
-        assert draft_model is full_draft_model
+    if expected_checkpoint_type == "external_draft_model":
+        assert spec_config.uses_external_draft_model
+        assert not spec_config.uses_replacement_heads
+        assert draft_model is external_draft_model
     else:
-        assert not spec_config.uses_full_draft_model_checkpoint
-        assert spec_config.uses_mtp_head_checkpoint is (expected_checkpoint_type == "heads")
-        assert draft_model is mtp_heads
+        assert not spec_config.uses_external_draft_model
+        assert spec_config.uses_replacement_heads is (
+            expected_checkpoint_type == "head_replacement"
+        )
+        assert draft_model is replacement_mtp_heads
 
 
 def test_speculative_model_equal_to_target_keeps_embedded_mtp(tmp_path):

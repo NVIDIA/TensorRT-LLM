@@ -912,12 +912,14 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             model_nextn = self.config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
-            has_external_mtp = model_config.spec_config.uses_mtp_head_checkpoint
-            assert ckpt_nextn > 0 or has_external_mtp, (
+            has_mtp_head_replacement = (
+                model_config.spec_config.uses_replacement_heads)
+            assert ckpt_nextn > 0 or has_mtp_head_replacement, (
                 "There are not MTP modules in the checkpoint. "
                 "Set speculative_config.speculative_model to a separate MTP "
-                "heads checkpoint, or use a target checkpoint that embeds MTP.")
-            if ckpt_nextn == 0 and has_external_mtp:
+                "head replacement checkpoint, or use a target checkpoint that "
+                "embeds MTP.")
+            if ckpt_nextn == 0 and has_mtp_head_replacement:
                 # Neither checkpoint declares a head count: fall back to a
                 # single shared head, matching MTPForCausalLM's MTP-Eagle
                 # default.

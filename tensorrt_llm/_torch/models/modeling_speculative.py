@@ -2424,11 +2424,11 @@ def get_draft_model(model_config, draft_config, lm_head, model):
                 f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
             )
 
-    elif model_config.spec_config.uses_full_draft_model_checkpoint:
+    elif model_config.spec_config.uses_external_draft_model:
         if draft_config is None:
             raise ValueError(
-                "Full-model MTP speculative decoding requires an external draft "
-                "model config.")
+                "MTP speculative decoding with an external draft model requires "
+                "its model config.")
         return AutoModelForCausalLM.from_config(draft_config)
     elif spec_dec_mode.is_mtp_one_model():
         return MTPForCausalLM(model_config,
@@ -2540,7 +2540,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     model_config.quant_config.kv_cache_quant_algo
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
-                elif spec_config.uses_full_draft_model_checkpoint:
+                elif spec_config.uses_external_draft_model:
                     self.draft_config = ModelConfig.from_pretrained(
                         spec_config.speculative_model,
                         trust_remote_code=True,
