@@ -3,9 +3,11 @@ import hashlib
 import hmac
 import os
 import pickle  # nosec B403
+import tempfile
 import threading
 import time
 import traceback
+import uuid
 from queue import Queue
 from typing import Any, Optional
 
@@ -17,6 +19,35 @@ from tensorrt_llm.logger import logger
 from .._utils import nvtx_mark, nvtx_range_debug
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
                             print_colored)
+
+_IPC_SCHEME = "ipc://"
+
+# `sockaddr_un.sun_path` is 108 bytes including the NUL terminator.
+_AF_UNIX_PATH_MAX = 107
+
+
+def get_unique_ipc_addr() -> str:
+    """Return a process-unique AF_UNIX endpoint for same-host executor IPC.
+
+    The kernel recycles an ephemeral TCP port as soon as its socket closes.
+    A worker process that outlives its proxy keeps reconnecting to the old
+    endpoint every 100 ms, so a later executor that happens to draw the same
+    port can have its single ``zmq.PAIR`` slot claimed by that stale peer.
+    The live worker is then left without a pipe, its sends are silently
+    discarded (``HWM`` is 0 and ``ZMQ_IMMEDIATE`` is unset), and the proxy
+    blocks forever in ``recv()``. A uuid4 path is never reused, which removes
+    the collision outright.
+
+    Falls back to loopback TCP when the temporary directory is deep enough
+    that the socket path would exceed the AF_UNIX limit.
+    """
+    path = os.path.join(tempfile.gettempdir(), f"trtllm_ipc_{uuid.uuid4().hex}")
+    if len(path) > _AF_UNIX_PATH_MAX:
+        logger.warning(
+            f"IPC socket path {path} exceeds the AF_UNIX limit of "
+            f"{_AF_UNIX_PATH_MAX} bytes; falling back to loopback TCP.")
+        return "tcp://127.0.0.1:*"
+    return f"{_IPC_SCHEME}{path}"
 
 
 class ZeroMqQueue:
@@ -54,9 +85,12 @@ class ZeroMqQueue:
             )
 
         self.socket_type = socket_type
-        self.address_endpoint = address[
-            0] if address is not None else "tcp://127.0.0.1:*"
+        self.address_endpoint = (address[0] if address is not None else
+                                 get_unique_ipc_addr())
         self.is_server = is_server
+        # Set once this queue binds an AF_UNIX endpoint it owns; libzmq leaves
+        # the socket file behind on close, so close() has to remove it.
+        self._owned_ipc_path: Optional[str] = None
         self.context = zmq.Context() if not is_async else zmq.asyncio.Context()
         self.poller = None
         self.socket = None
@@ -94,6 +128,8 @@ class ZeroMqQueue:
             )  # Binds to the address and occupy a port immediately
             self.address_endpoint = self.socket.getsockopt(
                 zmq.LAST_ENDPOINT).decode()
+            if self.address_endpoint.startswith(_IPC_SCHEME):
+                self._owned_ipc_path = self.address_endpoint[len(_IPC_SCHEME):]
             logger_debug(
                 f"Server [{name}] bound to {self.address_endpoint} in {self.socket_type_str[socket_type]}\n",
                 "green")
@@ -353,6 +389,23 @@ class ZeroMqQueue:
         if self.context:
             self.context.term()
             self.context = None
+        self._unlink_owned_ipc_path()
+
+    def _unlink_owned_ipc_path(self) -> None:
+        """Remove the AF_UNIX socket file bound by this queue, if any.
+
+        libzmq does not unlink the file when the socket closes, so without
+        this every executor teardown would leave one behind.
+        """
+        path, self._owned_ipc_path = self._owned_ipc_path, None
+        if path is None:
+            return
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning(f"Failed to remove IPC socket file {path}: {e}")
 
     def _verify_hmac(self, data: bytes, actual_hmac: bytes) -> bool:
         """Verify the HMAC of received pickle data."""

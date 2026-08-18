@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from threading import Thread
 
@@ -289,6 +290,83 @@ class TestIpcBasics:
             assert received == test_data
         finally:
             client.close()
+            server.close()
+
+
+class TestIpcEndpointAllocation:
+    """Endpoints must never be recycled across queues.
+
+    An ephemeral TCP port returns to the kernel pool the moment its socket
+    closes. A worker process that outlives its proxy keeps reconnecting to
+    the old endpoint, so a later queue drawing the same port could have its
+    single PAIR slot claimed by that stale peer; the live worker's messages
+    were then dropped silently and the proxy blocked forever in recv().
+    """
+
+    def _server(self, name):
+        return ZeroMqQueue(
+            address=None,
+            socket_type=zmq.PAIR,
+            is_server=True,
+            is_async=False,
+            name=name,
+            use_hmac_encryption=True,
+        )
+
+    def test_default_endpoint_is_unique_ipc(self):
+        """Concurrent queues get distinct AF_UNIX endpoints, not shared ports."""
+        first = self._server("first")
+        second = self._server("second")
+        try:
+            assert first.address_endpoint.startswith("ipc://")
+            assert second.address_endpoint.startswith("ipc://")
+            assert first.address_endpoint != second.address_endpoint
+        finally:
+            second.close()
+            first.close()
+
+    def test_endpoint_never_reused_after_close(self):
+        """A closed queue's endpoint is never handed out again.
+
+        This is the invariant that makes the stale-peer hijack impossible.
+        """
+        seen = set()
+        for i in range(12):
+            queue = self._server(f"seq_{i}")
+            endpoint = queue.address_endpoint
+            queue.close()
+            assert endpoint not in seen, (
+                f"endpoint {endpoint} was recycled; a stale peer could hijack it"
+            )
+            seen.add(endpoint)
+
+    def test_socket_file_removed_on_close(self):
+        """close() unlinks the socket file -- libzmq leaves it behind."""
+        queue = self._server("cleanup")
+        path = queue.address_endpoint[len("ipc://") :]
+        assert os.path.exists(path)
+        queue.close()
+        assert not os.path.exists(path)
+
+    def test_explicit_address_is_honored(self):
+        """An explicitly supplied endpoint still wins over the default."""
+        server = self._server("explicit_server")
+        try:
+            client = ZeroMqQueue(
+                address=server.address,
+                socket_type=zmq.PAIR,
+                is_server=False,
+                is_async=False,
+                name="explicit_client",
+                use_hmac_encryption=True,
+            )
+            try:
+                assert client.address_endpoint == server.address_endpoint
+                client.put({"value": 7})
+                assert server.get() == {"value": 7}
+            finally:
+                client.close()
+        finally:
             server.close()
 
 
