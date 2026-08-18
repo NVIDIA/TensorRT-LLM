@@ -83,6 +83,10 @@ echo "[fat_build] Installing opencv-python-headless..."
 pip3 install --no-user --retries 10 opencv-python-headless
 echo "[fat_build] Installing ray (required for --run-ray test jobs)..."
 pip3 install --no-user --retries 10 "ray[default]==2.55.1"
+mambaArch=\$(uname -m)
+pip3 install --no-user --retries 10 --no-deps \
+    "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl" \
+    "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl"
 echo "[fat_build] Installed TensorRT-LLM version:"
 pip3 show tensorrt-llm || true
 echo "$LLM_TARFILE_URL" > /tmp/trtllm_installed.txt
