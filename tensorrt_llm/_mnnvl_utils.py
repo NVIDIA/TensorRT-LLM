@@ -79,8 +79,8 @@ def _cancel_checkpoint_requests(requests: list[Any]) -> None:
         # enclosing fail-closed path terminates the worker.
         _MNNVL_CHECKPOINT_ORPHANED_REQUESTS.extend(pending_requests)
         logger.error(
-            "Retaining %d active MNNVL checkpoint requests until worker termination",
-            len(pending_requests),
+            f"Retaining {len(pending_requests)} active MNNVL checkpoint requests "
+            "until worker termination"
         )
 
 
