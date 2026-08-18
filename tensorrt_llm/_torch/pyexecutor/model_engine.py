@@ -1672,7 +1672,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # Hold every rank here until the slowest has finished compiling, so the
         # first MoE all-to-all dispatch is entered without JIT skew.
-        if self.mapping.tp_size > 1:
+        if self.mapping.tp_size > 1 and self.dist is not None:
             self.dist.tp_allgather(1)
         logger.info("indexer-Q CuTe DSL prewarm complete")
 
@@ -1761,8 +1761,12 @@ class PyTorchModelEngine(ModelEngine):
         runtime, causing _create_warmup_request to return None on some ranks while
         others proceed into forward() with tp_comm collectives — deadlocking the
         job. This check prevents the deadlock by failing early with diagnostic info.
+
+        ``tp_size`` alone does not establish that peers are reachable: ``dist``
+        is optional, and without a communicator there is no tp_comm collective
+        to deadlock in.
         """
-        if self.mapping.tp_size <= 1:
+        if self.mapping.tp_size <= 1 or self.dist is None:
             return
         has_batch = int(batch is not None)
         all_flags = list(self.dist.tp_allgather(has_batch))

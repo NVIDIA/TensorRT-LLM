@@ -161,6 +161,18 @@ def test_warmup_batch_policy_without_communicator() -> None:
     assert engine._should_run_warmup_batch(None, 128, "general") is False
 
 
+def test_tp_agreement_needs_a_communicator_not_just_a_mapping() -> None:
+    """A mapping can claim TP peers that no communicator exists to reach.
+
+    The agreement check gates on `tp_size`, so it has to answer for that
+    state rather than walking into a collective on `None`.
+    """
+    engine = _engine(tp_size=2, with_dist=False)
+
+    assert engine._should_run_warmup_batch(object(), 128, "general") is True
+    assert engine._should_run_warmup_batch(None, 128, "general") is False
+
+
 def test_tp_disagreement_reports_the_ranks_that_lost_their_batch() -> None:
     """Asymmetric attention-DP capacity is the deadlock this check exists for.
 
