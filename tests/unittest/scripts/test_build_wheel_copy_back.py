@@ -42,11 +42,34 @@ SCRIPT_PATH = REPO_ROOT / "scripts" / "build_wheel.py"
 
 
 @pytest.fixture(scope="module")
-def sync_tree():
+def build_wheel_module():
     spec = importlib.util.spec_from_file_location("build_wheel", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.sync_tree
+    return module
+
+
+@pytest.fixture
+def sync_tree(build_wheel_module):
+    return build_wheel_module.sync_tree
+
+
+@pytest.fixture(params=["tar", "copytree"])
+def cold_backend(request, build_wheel_module, monkeypatch):
+    """Force sync_tree's cold populate down each backend in turn.
+
+    A missing destination is filled by _tar_pipe_copy when tar is on PATH and
+    by copytree otherwise. Both preserve mtimes, so the mtime-collision tests
+    that consume this fixture must hold on either; without pinning the backend
+    a run only covers whichever one the environment happens to select. The tar
+    case skips when tar is absent so it can never silently alias to copytree.
+    """
+    if request.param == "tar":
+        if shutil.which("tar") is None:
+            pytest.skip("tar unavailable; cannot exercise the tar cold path")
+    else:
+        monkeypatch.setattr(build_wheel_module, "_tar_pipe_copy", lambda src, dst: False)
+    return request.param
 
 
 def old_copy(src, dst, exclude=()):
@@ -184,13 +207,14 @@ def test_warm_noop_is_stable(sync_tree, tmp_path):
     assert_trees_equal(new_dir, old_dir)
 
 
-def test_rewrite_without_mtime_change_is_not_skipped(sync_tree, tmp_path):
+def test_rewrite_without_mtime_change_is_not_skipped(sync_tree, cold_backend, tmp_path):
     """A same-size rewrite that leaves the source mtime untouched must copy.
 
     Inode timestamps come from a coarse clock, so a file rewritten shortly
     after being copied can still report the mtime the copy recorded, and a
     size+mtime comparison would call it unchanged. utime pins the mtime to the
     copied value, making that collision deterministic instead of a race.
+    cold_backend runs this once per cold-populate path (tar and copytree).
     """
     src = tmp_path / "src"
     src.mkdir()
@@ -207,12 +231,13 @@ def test_rewrite_without_mtime_change_is_not_skipped(sync_tree, tmp_path):
     assert (new_dir / "mod.py").read_bytes() == b"def f():\n    return 99\n"
 
 
-def test_settled_file_is_not_recopied(sync_tree, tmp_path):
+def test_settled_file_is_not_recopied(sync_tree, cold_backend, tmp_path):
     """A file whose mtime has aged out of the race window is left alone.
 
     Pins the incremental behaviour itself: the destination is diverged behind
     sync_tree's back, so surviving the re-sync proves the file was skipped
-    rather than rewritten.
+    rather than rewritten. cold_backend runs this once per cold-populate path
+    (tar and copytree).
     """
     src = tmp_path / "src"
     src.mkdir()
