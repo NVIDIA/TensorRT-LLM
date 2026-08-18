@@ -46,7 +46,8 @@ BYTES_PER_TOKEN = HEAD_DIM + SCALE_BYTES
 
 
 @skip_pre_blackwell
-def test_nvfp4_mla_kv_cache_gather():
+@pytest.mark.parametrize("global_dequant_scale_value", [0.25, 1.0])
+def test_nvfp4_mla_kv_cache_gather(global_dequant_scale_value):
     """Gather physical NVFP4 rows and remap them into an FP8 scratch."""
     num_pool_tokens = 4
     head_dim = 32
@@ -74,7 +75,9 @@ def test_nvfp4_mla_kv_cache_gather():
         device="cuda",
     )
     compact_indices = torch.empty_like(global_indices)
-    global_dequant_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+    global_dequant_scale = torch.tensor(
+        [global_dequant_scale_value], dtype=torch.float32, device="cuda"
+    )
 
     torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
         host_pool_pointers,
@@ -95,16 +98,16 @@ def test_nvfp4_mla_kv_cache_gather():
         device="cuda",
     )
     unpacked_codes = torch.stack((packed_row & 0xF, packed_row >> 4), dim=-1).flatten().long()
-    expected_row = (e2m1[unpacked_codes] * 2.0 * 0.25).to(torch.float8_e4m3fn)
+    expected_row = (e2m1[unpacked_codes] * 2.0 * global_dequant_scale_value).to(torch.float8_e4m3fn)
     valid = global_indices >= 0
     assert torch.equal(output[valid], expected_row.expand(output[valid].shape[0], -1))
 
 
 @skip_pre_blackwell
-def test_nvfp4_mla_context_kv_cache_gather():
+@pytest.mark.parametrize("head_dim", [32, 576])
+def test_nvfp4_mla_context_kv_cache_gather(head_dim):
     """Compact selected context rows without host-side unique or synchronization."""
     num_pool_tokens = 4
-    head_dim = 32
     packed_head_dim = head_dim // 2
     scales_per_token = head_dim // 16
 
