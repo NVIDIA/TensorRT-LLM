@@ -155,6 +155,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.enable_gvr_topk = (
             sparse_metadata_params.enable_heuristic_topk and get_sm_version() >= 100
         )
+        self.kv_lens_row_reorder = None
         capture_graph = self.is_cuda_graph
         # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
         # metadata params carry the model-specific compression ratios.
@@ -451,7 +452,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True
                 )
+        self._compute_kv_lens_row_reorder()
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
+
+    def _compute_kv_lens_row_reorder(self) -> None:
+        """Prepare the longest-job-first GVR row order once per forward step."""
+        next_n = 1 + self.max_draft_tokens
+        if (
+            self.enable_gvr_topk
+            and self.use_cute_dsl_topk
+            and self.num_generations * next_n >= 2 * self.num_sms
+        ):
+            gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
+            order = torch.argsort(gen_kv_lens, descending=True).to(torch.int32)
+            self.kv_lens_row_reorder_buffer[: self.num_generations].copy_(order)
+            self.kv_lens_row_reorder = self.kv_lens_row_reorder_buffer[: self.num_generations]
+        else:
+            self.kv_lens_row_reorder = None
 
     def update_for_spec_dec(self):
         super().update_for_spec_dec()
@@ -727,6 +744,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
             self.gvr_prior_indices.zero_()
+            if self.use_cute_dsl_topk:
+                self.kv_lens_row_reorder_buffer = self.get_empty(
+                    self.cuda_graph_buffers,
+                    (self.max_num_sequences,),
+                    cache_name="kv_lens_row_reorder_buffer",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 

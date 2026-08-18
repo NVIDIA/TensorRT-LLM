@@ -30,7 +30,11 @@ _MAX_RADIX_BLOCKS_PER_ROW = 10
 
 
 class TopK(nn.Module):
-    """Select Top-K indices for sparse prefill and decode paths."""
+    """Select Top-K indices for sparse prefill and decode paths.
+
+    GVR decode state is owned by the caller so it can be shared with the
+    request metadata and retain a stable address across CUDA Graph replays.
+    """
 
     _memory_buffers = get_memory_buffers()
 
@@ -51,7 +55,6 @@ class TopK(nn.Module):
             decode_implementation or TopKImplementation.CUDA_RADIX
         )
         self.compress_ratio = compress_ratio
-        self._num_sms = 0
 
     def forward(
         self,
@@ -65,8 +68,30 @@ class TopK(nn.Module):
         scan_lengths: torch.Tensor | None = None,
         next_n: int = 1,
         gvr_prior_indices: torch.Tensor | None = None,
+        gvr_row_order: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Write prefill or decode Top-K indices into ``output_indices``."""
+        """Write prefill or decode Top-K indices into ``output_indices``.
+
+        Args:
+            scores: Top-K input scores with shape ``[num_rows, num_columns]``.
+            output_indices: Int32 output with shape ``[num_rows, top_k]``.
+            is_prefill: Whether to run the prefill implementation.
+            row_starts: Per-row inclusive starts for prefill.
+            row_ends: Per-row exclusive ends for prefill.
+            sequence_lengths: Per-request logical KV lengths for decode.
+            scan_lengths: Per-request score-column lengths for decode.
+            next_n: Number of decode rows per request.
+            gvr_prior_indices: Required for GVR decode. Int32 tensor with shape
+                ``[num_requests, top_k]`` on ``scores.device``. Each call reads
+                the previous selection and updates it in place with the last
+                decode row for every request.
+            gvr_row_order: Optional int32 tensor with shape ``[num_requests]``
+                on ``scores.device``. It contains a reusable request ordering
+                prepared once for the current forward step.
+
+        Returns:
+            ``output_indices`` after the selected implementation writes it.
+        """
         if is_prefill:
             assert row_starts is not None and row_ends is not None
             return self._forward_prefill(scores, row_starts, row_ends, output_indices)
@@ -79,6 +104,7 @@ class TopK(nn.Module):
             output_indices,
             next_n,
             gvr_prior_indices,
+            gvr_row_order,
         )
 
     def _forward_prefill(
@@ -116,6 +142,7 @@ class TopK(nn.Module):
         output_indices: torch.Tensor,
         next_n: int,
         gvr_prior_indices: torch.Tensor | None,
+        gvr_row_order: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.TORCH:
             return self._forward_decode_torch(scores, scan_lengths, output_indices, next_n)
@@ -127,6 +154,7 @@ class TopK(nn.Module):
                 output_indices,
                 next_n,
                 gvr_prior_indices,
+                gvr_row_order,
             )
 
         return self._forward_decode_radix(
@@ -173,6 +201,30 @@ class TopK(nn.Module):
         )
         return output_indices
 
+    def _get_workspace(
+        self,
+        scores: torch.Tensor,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        buffer_name: str,
+    ) -> torch.Tensor:
+        device_buffer_name = f"{buffer_name}_{scores.device}"
+        if scores.is_cuda:
+            with torch.cuda.device(scores.device):
+                capture_graph = torch.cuda.is_current_stream_capturing()
+                return self._memory_buffers.get_buffer(
+                    shape,
+                    dtype=dtype,
+                    buffer_name=device_buffer_name,
+                    reserve_buffer=capture_graph,
+                )
+        return self._memory_buffers.get_buffer(
+            shape,
+            dtype=dtype,
+            buffer_name=device_buffer_name,
+            reserve_buffer=False,
+        )
+
     def _get_radix_workspace(
         self, scores: torch.Tensor
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -180,18 +232,17 @@ class TopK(nn.Module):
             return None, None
 
         shape = (scores.shape[0], _MAX_RADIX_BLOCKS_PER_ROW, self.top_k)
-        capture_graph = scores.is_cuda and torch.cuda.is_current_stream_capturing()
-        radix_indices = self._memory_buffers.get_buffer(
+        radix_indices = self._get_workspace(
+            scores,
             shape,
-            dtype=torch.int32,
-            buffer_name="top_k_radix_indices_workspace",
-            reserve_buffer=capture_graph,
+            torch.int32,
+            "top_k_radix_indices_workspace",
         )
-        radix_values = self._memory_buffers.get_buffer(
+        radix_values = self._get_workspace(
+            scores,
             shape,
-            dtype=torch.float32,
-            buffer_name="top_k_radix_values_workspace",
-            reserve_buffer=capture_graph,
+            torch.float32,
+            "top_k_radix_values_workspace",
         )
         return radix_indices, radix_values
 
@@ -202,16 +253,15 @@ class TopK(nn.Module):
         output_indices: torch.Tensor,
         next_n: int,
         gvr_prior_indices: torch.Tensor | None,
+        gvr_row_order: torch.Tensor | None,
     ) -> torch.Tensor:
         assert gvr_prior_indices is not None
-        capture_graph = scores.is_cuda and torch.cuda.is_current_stream_capturing()
-        num_requests = sequence_lengths.shape[0]
         if self.decode_implementation == TopKImplementation.CUDA_GVR:
-            workspace = self._memory_buffers.get_buffer(
+            workspace = self._get_workspace(
+                scores,
                 (scores.shape[0], self.top_k),
-                dtype=scores.dtype,
-                buffer_name="top_k_cuda_gvr_workspace",
-                reserve_buffer=capture_graph,
+                scores.dtype,
+                "top_k_cuda_gvr_workspace",
             )
             radix_indices, radix_values = self._get_radix_workspace(scores)
             torch.ops.trtllm.indexer_topk_decode(
@@ -227,21 +277,6 @@ class TopK(nn.Module):
                 radix_aux_logits=radix_values,
             )
         else:
-            if self._num_sms == 0:
-                self._num_sms = (
-                    torch.cuda.get_device_properties(scores.device).multi_processor_count
-                    if scores.is_cuda
-                    else 1
-                )
-            row_order = None
-            if num_requests * next_n >= 2 * self._num_sms:
-                row_order = self._memory_buffers.get_buffer(
-                    (num_requests,),
-                    dtype=torch.int32,
-                    buffer_name="top_k_cute_dsl_gvr_row_order",
-                    reserve_buffer=capture_graph,
-                )
-                row_order.copy_(torch.argsort(sequence_lengths, descending=True).to(torch.int32))
             torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                 scores,
                 gvr_prior_indices,
@@ -251,7 +286,7 @@ class TopK(nn.Module):
                 next_n=next_n,
                 compress_ratio=self.compress_ratio,
                 max_seq_len=scores.shape[1],
-                order_row=row_order,
+                order_row=gvr_row_order,
             )
         gvr_prior_indices.copy_(output_indices[next_n - 1 :: next_n])
         return output_indices
@@ -264,7 +299,17 @@ class TopK(nn.Module):
         *,
         request_offset: int = 0,
     ) -> None:
-        """Update GVR prior indices from each prefill request's last selected row."""
+        """Update GVR prior indices from each prefill request's last row.
+
+        Args:
+            output_indices: Int32 prefill selections with shape
+                ``[num_prefill_rows, top_k]``.
+            request_lengths: Per-request prefill row counts.
+            gvr_prior_indices: Int32 caller-owned state on
+                ``output_indices.device`` with shape ``[capacity, top_k]``.
+                The slice starting at ``request_offset`` is updated in place.
+            request_offset: First request row to update in the prior state.
+        """
         if self.decode_implementation not in _GVR_IMPLEMENTATIONS:
             return
         assert gvr_prior_indices is not None

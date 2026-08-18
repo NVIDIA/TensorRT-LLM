@@ -176,6 +176,39 @@ def test_metadata_warmup_cute_dsl_radix_topk_dispatch(
         cute_dsl_radix.assert_not_called()
 
 
+def test_kv_lens_row_reorder_threshold():
+    """Prepare row order only when CuTe DSL GVR has enough decode rows."""
+    num_sms = 16
+    next_n = 2
+
+    def make_mock(num_generations, kv_lens_list):
+        kv_lens_cuda = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
+        row_order_buffer = torch.zeros(64, dtype=torch.int32, device="cuda")
+        return SimpleNamespace(
+            enable_gvr_topk=True,
+            use_cute_dsl_topk=True,
+            num_generations=num_generations,
+            num_sms=num_sms,
+            max_draft_tokens=next_n - 1,
+            num_contexts=0,
+            num_seqs=num_generations,
+            kv_lens_cuda=kv_lens_cuda,
+            kv_lens_row_reorder_buffer=row_order_buffer,
+            kv_lens_row_reorder=None,
+        )
+
+    kv_lens = [4, 1, 8, 2, 16, 3, 12, 6, 7, 9, 5, 11, 13, 10, 14, 15]
+
+    metadata_below = make_mock(1, [1000])
+    DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(metadata_below)
+    assert metadata_below.kv_lens_row_reorder is None
+
+    metadata_at = make_mock(num_sms, kv_lens)
+    DSAtrtllmAttentionMetadata._compute_kv_lens_row_reorder(metadata_at)
+    row_order = metadata_at.kv_lens_row_reorder.cpu().tolist()
+    assert [kv_lens[i] for i in row_order] == sorted(kv_lens, reverse=True)
+
+
 def test_shared_topk_lifecycle():
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=1,

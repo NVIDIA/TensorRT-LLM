@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the reusable sparse index-selection Top-K module."""
 
+from contextlib import nullcontext
 from unittest.mock import Mock, call
 
 import pytest
@@ -110,13 +111,13 @@ def test_cute_dsl_radix_preserves_compressed_mtp_fallback(monkeypatch) -> None:
         call(
             (2, 10, 2),
             dtype=torch.int32,
-            buffer_name="top_k_radix_indices_workspace",
+            buffer_name="top_k_radix_indices_workspace_cpu",
             reserve_buffer=False,
         ),
         call(
             (2, 10, 2),
             dtype=torch.float32,
-            buffer_name="top_k_radix_values_workspace",
+            buffer_name="top_k_radix_values_workspace_cpu",
             reserve_buffer=False,
         ),
     ]
@@ -174,16 +175,13 @@ def test_gvr_uses_prior_state_and_updates_it(monkeypatch) -> None:
     assert prior_indices.tolist() == [[5, 3]]
 
 
-def test_gvr_prepares_row_order_at_threshold(monkeypatch) -> None:
+def test_gvr_uses_caller_prepared_row_order(monkeypatch) -> None:
     gvr = Mock(side_effect=lambda *args, **kwargs: args[3].zero_())
     monkeypatch.setattr(torch.ops.trtllm, "cute_dsl_gvr_topk_decode", gvr)
     top_k = TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR)
     next_n = 2
     lengths = torch.tensor([4, 1, 8, 2], dtype=torch.int32)
-    workspace = torch.empty(lengths.shape[0], dtype=torch.int32)
-    buffers = Mock()
-    buffers.get_buffer.return_value = workspace
-    monkeypatch.setattr(TopK, "_memory_buffers", buffers)
+    row_order = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
 
     top_k(
         torch.randn(lengths.shape[0] * next_n, 8),
@@ -193,17 +191,10 @@ def test_gvr_prepares_row_order_at_threshold(monkeypatch) -> None:
         scan_lengths=lengths,
         next_n=next_n,
         gvr_prior_indices=torch.zeros(lengths.shape[0], 2, dtype=torch.int32),
+        gvr_row_order=row_order,
     )
 
-    buffers.get_buffer.assert_called_once_with(
-        (lengths.shape[0],),
-        dtype=torch.int32,
-        buffer_name="top_k_cute_dsl_gvr_row_order",
-        reserve_buffer=False,
-    )
-    row_order = gvr.call_args.kwargs["order_row"]
-    assert row_order is not None
-    assert row_order.tolist() == [2, 0, 3, 1]
+    assert gvr.call_args.kwargs["order_row"] is row_order
 
 
 def test_update_gvr_prior_from_prefill_uses_last_request_rows() -> None:
@@ -264,9 +255,16 @@ def test_cuda_gvr_reserves_workspace_during_capture_and_updates_prior(monkeypatc
     decode = Mock(side_effect=lambda *args, **kwargs: args[2].copy_(torch.tensor([[3, 1]])))
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", Mock(return_value=True))
+    device_context = Mock(side_effect=lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "device", device_context)
 
     top_k = TopK(2, decode_implementation=TopKImplementation.CUDA_GVR)
-    scores = Mock(shape=(1, 8), dtype=torch.float32, is_cuda=True)
+    scores = Mock(
+        shape=(1, 8),
+        dtype=torch.float32,
+        is_cuda=True,
+        device=torch.device("cuda", 3),
+    )
     lengths = torch.tensor([8], dtype=torch.int32)
     output = torch.empty(1, 2, dtype=torch.int32)
     radix_indices = torch.empty(1, 10, 2, dtype=torch.int32)
@@ -290,22 +288,23 @@ def test_cuda_gvr_reserves_workspace_during_capture_and_updates_prior(monkeypatc
         call(
             (scores.shape[0], 2),
             dtype=scores.dtype,
-            buffer_name="top_k_cuda_gvr_workspace",
+            buffer_name="top_k_cuda_gvr_workspace_cuda:3",
             reserve_buffer=True,
         ),
         call(
             (scores.shape[0], 10, 2),
             dtype=torch.int32,
-            buffer_name="top_k_radix_indices_workspace",
+            buffer_name="top_k_radix_indices_workspace_cuda:3",
             reserve_buffer=True,
         ),
         call(
             (scores.shape[0], 10, 2),
             dtype=torch.float32,
-            buffer_name="top_k_radix_values_workspace",
+            buffer_name="top_k_radix_values_workspace_cuda:3",
             reserve_buffer=True,
         ),
     ]
+    assert device_context.call_args_list == [call(scores.device)] * 3
     runtime_call = decode.call_args_list[-1]
     assert runtime_call.kwargs["pre_idx"] is prior_indices
     assert runtime_call.kwargs["heuristic_scratch"].data_ptr() == workspace.data_ptr()

@@ -1722,6 +1722,7 @@ class Indexer(nn.Module):
                 gvr_prior_indices=(
                     gvr_prior_indices[:num_generations] if gvr_prior_indices is not None else None
                 ),
+                gvr_row_order=metadata.kv_lens_row_reorder,
             )
 
         elif has_decode and metadata.skip_indexer_for_gen_reqs:
