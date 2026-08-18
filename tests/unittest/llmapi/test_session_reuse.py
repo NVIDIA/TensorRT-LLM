@@ -39,9 +39,7 @@ def reuse_cache(monkeypatch):
     cache = SessionReuseCache()
     # No real MPI / NVML in pure-logic tests: record the calls instead.
     resets = []
-    monkeypatch.setattr(
-        session_reuse, "submit_sync_per_worker", lambda s, fn: resets.append(s)
-    )
+    monkeypatch.setattr(session_reuse, "submit_sync_per_worker", lambda s, fn: resets.append(s))
     cache.resets = resets
 
     # Hermetic: the REAL prefetcher singleton must not start background MPI
@@ -111,9 +109,7 @@ def test_cache_miss_takes_prefetched_shadow(reuse_cache):
     # A shadow armed at the PREVIOUS miss is consumed instantly on this one
     # (no synchronous spawn), and a replacement is restocked for the next
     # miss with the worker-side weight-cache overlay.
-    shadow = _FakePool(
-        2, wait_shutdown=True, env_overrides={"TRTLLM_HF_WEIGHT_CACHE": "1"}
-    )
+    shadow = _FakePool(2, wait_shutdown=True, env_overrides={"TRTLLM_HF_WEIGHT_CACHE": "1"})
     reuse_cache.prefetch.shadow = shadow
     s = reuse_cache.acquire(_FakePool, 2)
     assert s._real is shadow
@@ -337,9 +333,7 @@ def test_drain_kills_recorded_worker_when_shutdown_wedges(
             env_overrides: dict | None = None,
         ) -> None:
             super().__init__(n_workers, wait_shutdown, env_overrides)
-            self.worker = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(300)"]
-            )
+            self.worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
             self._worker_identities = ((self.worker.pid, b"owned"),)
 
         def shutdown(self) -> None:
@@ -397,9 +391,7 @@ def test_kill_recorded_workers_skips_recycled_pid(
     pool._reuse_worker_pids = ((123, b"owned"),)
     kills = []
     monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"recycled")
-    monkeypatch.setattr(
-        session_reuse.os, "kill", lambda pid, sig: kills.append((pid, sig))
-    )
+    monkeypatch.setattr(session_reuse.os, "kill", lambda pid, sig: kills.append((pid, sig)))
 
     assert session_reuse._kill_recorded_workers(pool) == 0
     assert kills == []
@@ -415,9 +407,7 @@ def test_autodeploy_nodeids_are_private():
     assert _is_private_nodeid(
         "examples/test_ad_guided_decoding.py::test_autodeploy_guided_decoding_main_json"
     )
-    assert _is_private_nodeid(
-        "unittest/_torch/auto_deploy/unit/singlegpu/test_x.py::test_y"
-    )
+    assert _is_private_nodeid("unittest/_torch/auto_deploy/unit/singlegpu/test_x.py::test_y")
     assert not _is_private_nodeid(
         "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[a]"
     )
