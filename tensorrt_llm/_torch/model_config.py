@@ -32,7 +32,7 @@ from transformers.utils import HF_MODULES_CACHE
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid, load_pretrained_config)
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f, local_mpi_size,
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -103,24 +103,28 @@ def _release_lock_ignoring_infra_errors(lock: "filelock.BaseFileLock") -> None:
         logger.warning(f"HF remote-code lock release failed ({e}), continuing")
 
 
-def _remote_code_lock_timeout(seconds_per_rank: int = 2,
-                              floor: int = 20) -> int:
-    """Wait budget covering every rank that contends for the remote-code lock.
+def _try_take_lock(lock: "filelock.BaseFileLock") -> bool:
+    """Take ``lock`` without waiting; True if this process now holds it.
 
-    Ranks sharing one ``HF_MODULES_CACHE`` take the lock in turn, so the last
-    one waits for all the others. A fixed budget would therefore silently
-    degrade to running unlocked on a node wide enough to exhaust it, which is
-    the very race this lock exists to prevent. Scale with the node-local rank
-    count instead: the cache lives on node-local storage, so ranks on other
-    nodes do not contend for it.
+    Contention is reported as False rather than raised, so the caller can tell
+    "someone else is already filling the cache" apart from "the lock itself is
+    unusable", which surfaces as PermissionError/OSError.
     """
-    return max(floor, seconds_per_rank * local_mpi_size())
+    try:
+        # timeout=0 rather than blocking=False: same immediate semantics, but
+        # available in the older filelock releases huggingface-hub allows.
+        lock.acquire(timeout=0)
+    except filelock.Timeout:
+        # filelock signals "not acquired" with Timeout. Nothing was waited on
+        # here: another process simply holds the lock.
+        return False
+    return True
 
 
 @contextlib.contextmanager
-def hf_remote_code_lock(timeout: Optional[int] = None) -> Iterator[None]:
+def hf_remote_code_lock(timeout: int = 10) -> Iterator[None]:
     """
-    Serialize loads of HuggingFace ``trust_remote_code`` files across processes.
+    Serialize only the first load of HuggingFace ``trust_remote_code`` files.
 
     ``transformers.dynamic_module_utils.get_cached_module_file`` publishes a
     checkpoint's .py files into the shared ``HF_MODULES_CACHE`` with a plain
@@ -130,64 +134,75 @@ def hf_remote_code_lock(timeout: Optional[int] = None) -> Iterator[None]:
     file another rank is still writing and observe it as empty: the module
     loads, but the class it should define is missing.
 
+    Only writes are dangerous. Once the cache is complete, transformers
+    compares each file against the checkpoint and copies nothing, so the
+    remaining ranks can load concurrently. This is therefore a two-step gate
+    rather than a queue: the first arrival fills the cache while holding the
+    lock, and everyone else waits for it, steps aside, then loads in parallel.
+    Cost is one fill plus one concurrent load, independent of the rank count.
+
     Every caller must share this one lock instead of defining its own:
     ``AutoTokenizer`` and ``AutoProcessor`` internally call
     ``AutoConfig.from_pretrained``, so config and processor loads write
     overlapping sets of files into the same directory.
 
     Args:
-        timeout: Maximum time to wait for lock acquisition in seconds.
-            Defaults to a budget scaled by the node-local rank count.
+        timeout: Maximum time to wait for the filling rank, in seconds.
     """
-    if timeout is None:
-        timeout = _remote_code_lock_timeout()
     # One lock file inside the cache directory it guards, so that every rank
     # sharing that cache contends on the same file.
-    lock_path = Path(HF_MODULES_CACHE) / "hf_remote_code.lock"
-    lock = filelock.FileLock(str(lock_path), timeout=timeout)
-
-    # Guard only acquisition so caller-body exceptions propagate (single-yield).
+    lock = filelock.FileLock(str(
+        Path(HF_MODULES_CACHE) / "hf_remote_code.lock"))
     try:
-        lock.acquire(timeout=timeout)
-    except filelock.Timeout:
-        # Contention, not broken infra: a tempdir lock can't serialize against
-        # the holder, so degrade to no lock instead of crashing the process.
-        # The load then runs unserialized, so it can hit the very race this
-        # lock prevents: a rank may read a module file another rank is still
-        # copying, see it as empty, and raise AttributeError for the class it
-        # expected. Treat this warning as a failed run rather than a slow one.
-        logger.warning(
-            f"could not acquire HF remote-code lock within {timeout}s, "
-            "proceeding without lock; a concurrent rank may import a "
-            "partially written module and fail with AttributeError")
-        yield
+        is_filler = _try_take_lock(lock)
     except (PermissionError, OSError) as e:
         # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
         if not _is_lock_infra_error(e):
             raise
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        tmp_lock = filelock.FileLock(str(tmp_dir / "hf_remote_code.lock"),
-                                     timeout=timeout)
+        lock = filelock.FileLock(str(tmp_dir / "hf_remote_code.lock"))
         try:
-            tmp_lock.acquire(timeout=timeout)
-        except (PermissionError, OSError, filelock.Timeout):
-            # Unserialized as well; same failure mode as the timeout above.
+            is_filler = _try_take_lock(lock)
+        except (PermissionError, OSError) as tmp_error:
+            if not _is_lock_infra_error(tmp_error):
+                raise
             logger.warning(
-                "tempdir HF remote-code lock unavailable, proceeding without "
-                "lock; a concurrent rank may import a partially written "
-                "module and fail with AttributeError")
+                "no usable HF remote-code lock, loading unserialized; a "
+                "concurrent rank may import a partially written module and "
+                "fail with AttributeError")
             yield
-        else:
-            try:
-                yield
-            finally:
-                _release_lock_ignoring_infra_errors(tmp_lock)
-    else:
+            return
+
+    if is_filler:
+        # Guard only the body's exit so caller exceptions propagate.
         try:
             yield
         finally:
             _release_lock_ignoring_infra_errors(lock)
+        return
+
+    # Another rank is filling the cache. Wait for it to finish, then release at
+    # once: the cache is complete by then, so the waiting ranks load in
+    # parallel instead of queueing behind one another.
+    try:
+        lock.acquire(timeout=timeout)
+    except filelock.Timeout:
+        # Unlike the probe above, this wait genuinely expired: the filling rank
+        # is still holding the lock.
+        logger.warning(
+            f"HF remote-code cache still incomplete after {timeout}s, loading "
+            "unserialized; this rank may import a partially written module "
+            "and fail with AttributeError")
+    except (PermissionError, OSError) as e:
+        if not _is_lock_infra_error(e):
+            raise
+        logger.warning(
+            f"waiting on the HF remote-code lock failed ({e}), loading "
+            "unserialized")
+    else:
+        _release_lock_ignoring_infra_errors(lock)
+    yield
 
 
 @dataclass(kw_only=True)
