@@ -56,11 +56,18 @@ from .kernels import (
     write_kv_cache_hnd,
 )
 from .metadata import InklingAttentionMetadata
-from .params import InklingBackendForwardArgs, inkling_forward_args
+from .params import (
+    InklingBackendForwardArgs,
+    InklingSparseAttentionConfig,
+    InklingSparseParams,
+    inkling_forward_args,
+)
 
 __all__ = [
     "InklingAttentionMetadata",
     "InklingBackendForwardArgs",
+    "InklingSparseAttentionConfig",
+    "InklingSparseParams",
     "InklingConvRuntime",
     "InklingConvState",
     "InklingConvStateCache",

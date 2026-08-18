@@ -607,51 +607,90 @@ def test_metadata_clamps_a_row_to_max_pages():
     assert md.ink_gen_page_table(0)[:2].tolist() == [[1, 2], [5, 6]]
 
 
-def test_inkling_backend_and_metadata_resolve_from_the_backend_NAME():
-    """The name is Inkling's only identity outside the Attention module.
+def test_backend_and_cache_manager_both_resolve_from_the_sparse_registry():
+    """One selection path for every consumer.
 
-    PyTorchModelEngine, the KV-cache creator and a dozen vision encoders call
-    get_attention_backend(name) with no ModelConfig and read .Metadata off the
-    result. Routing selection through sparse/registry.py instead was tried and
-    reverted: SparseParams only exists at the module layer, so the engine fell
-    back to TrtllmAttentionMetadata, ink_conv_rt was never published, and warmup's
-    mixed batch died inside InklingTritonAttention.forward (job 6245984).
+    Inkling populates ``sparse_attention_config`` from the checkpoint
+    architecture, so the registry answers for the module layer AND for the
+    consumers that hold no ModelConfig. Both entries are required: without the
+    cache-manager one, ``get_kv_cache_manager_cls`` takes its sparse branch and
+    raises "Unsupported sparse attention algorithm" at engine startup.
     """
+    from tensorrt_llm._torch.attention_backend.sparse import (
+        get_sparse_attn_kv_cache_manager,
+        get_trtllm_sparse_attn_attention_backend,
+    )
     from tensorrt_llm._torch.attention_backend.sparse.inkling import (
         InklingAttentionMetadata,
+        InklingHybridCacheManager,
+        InklingSparseAttentionConfig,
+        InklingSparseParams,
         InklingTritonAttention,
     )
-    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 
-    assert get_attention_backend("INKLING") is InklingTritonAttention
-    assert get_attention_backend("inkling") is InklingTritonAttention
+    params = InklingSparseParams()
+    assert get_trtllm_sparse_attn_attention_backend(params) is InklingTritonAttention
     assert InklingTritonAttention.Metadata is InklingAttentionMetadata
-    # The degraded path the revert exists to prevent.
-    assert get_attention_backend("TRTLLM").Metadata is not InklingAttentionMetadata
+    assert (get_sparse_attn_kv_cache_manager(InklingSparseAttentionConfig())
+            is InklingHybridCacheManager)
 
 
 def test_the_family_selector_has_no_model_specific_branch():
-    """get_attention_backend chooses among the base backend *families*; a
-    model-specific name is resolved from a lazily-imported registry instead of a
-    branch in its body, so adding a model does not edit the selector.
-
-    The name is still what callers pass -- see the sibling test -- this only moves
-    where that name is looked up.
-    """
+    """get_attention_backend chooses among the base backend *families* only; a
+    model-specific backend is reached through sparse/registry.py."""
     import inspect
 
     from tensorrt_llm._torch.attention_backend import utils as backend_utils
 
-    body = inspect.getsource(backend_utils.get_attention_backend)
-    assert "INKLING" not in body.upper(), "model-specific branch back in the selector"
-    assert "INKLING" in backend_utils._MODEL_BACKEND_MODULES
+    src = inspect.getsource(backend_utils)
+    assert "INKLING" not in src.upper(), "model-specific name back in the family selector"
 
-    # Registration is the extension point, and it resolves lazily: importing
-    # utils must not drag in the model packages (they import trtllm /
-    # resource_manager and would cycle).
-    assert callable(backend_utils.register_attention_backend)
-    src = inspect.getsource(backend_utils._model_specific_backend)
-    assert "import_module" in src
+
+def test_the_fake_config_stays_out_of_the_user_facing_schema():
+    """The config exists to reach sparse/registry.py, not to give users a knob.
+
+    Adding it to the SparseAttentionConfig union in llmapi/llm_args.py would
+    change an API-stability snapshot, stale the golden manifest and need
+    telemetry sign-off -- for a field with one legal value. It is a standalone
+    BaseModel instead, and ModelConfig never validates against the union.
+
+    It must still be a BaseModel, because modules/attention.py calls
+    .model_dump() on whatever sits in that field.
+    """
+    import inspect
+
+    from pydantic import BaseModel
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import (
+        InklingSparseAttentionConfig,
+        InklingSparseParams,
+    )
+    from tensorrt_llm.llmapi import llm_args as la
+
+    cfg = InklingSparseAttentionConfig()
+    assert isinstance(cfg, BaseModel)
+    assert cfg.model_dump() == {"algorithm": "inkling"}
+    assert isinstance(cfg.to_sparse_params(), InklingSparseParams)
+
+    # Not a member of the user-facing union, and llm_args knows nothing of it.
+    assert not issubclass(InklingSparseAttentionConfig, la.BaseSparseAttentionConfig)
+    assert "inkling" not in inspect.getsource(la).lower()
+
+
+def test_the_config_is_injected_from_the_checkpoint_architecture():
+    """Never user-supplied: derived in from_pretrained, before the instance is
+    frozen (sparse_attention_config is not on __setattr__'s allow-list)."""
+    import inspect
+
+    from tensorrt_llm._torch import model_config as mc
+
+    assert "InklingForCausalLM" in mc._INKLING_ARCHITECTURES
+    assert "InklingForConditionalGeneration" in mc._INKLING_ARCHITECTURES
+    src = inspect.getsource(mc.ModelConfig.from_pretrained)
+    assert "_INKLING_ARCHITECTURES" in src
+    # Injected into kwargs before cls(...) -- assignment afterwards would hit the
+    # frozen guard.
+    assert src.index("_INKLING_ARCHITECTURES") < src.index("model_config._frozen = True")
 
 
 def test_rel_logits_rides_the_registered_backend_args_slot():
@@ -704,31 +743,32 @@ def test_llm_args_is_untouched_by_the_inkling_backend():
     from tensorrt_llm.llmapi import llm_args as la
 
     src = inspect.getsource(la)
-    assert "INKLING" not in src.upper()
+    assert "INKLING" not in src.upper()  # neither the backend name nor the config
 
 
-def test_model_defaults_pin_the_inkling_backend_name():
-    """The engine resolves attn_metadata from this name, so the default has to
-    carry it; a user override is caught by _assert_inkling_attn_backend."""
+def test_model_defaults_do_not_pin_an_attn_backend():
+    """Selection comes from the architecture-derived sparse_attention_config, so
+    the default carries no backend name; a family override is caught by
+    _assert_inkling_attn_backend."""
     from tensorrt_llm._torch.models.modeling_inkling import InklingForConditionalGeneration
 
     defaults = InklingForConditionalGeneration.get_model_defaults(None)
-    assert defaults["attn_backend"] == "INKLING"
+    assert "attn_backend" not in defaults
     assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
 
 
-def test_attn_backend_override_fails_loudly():
-    """Any other name degrades attn_metadata instead of failing, so catch it at
-    load rather than at the first mixed batch."""
+def test_attn_backend_family_override_fails_loudly():
+    """The VANILLA and FLASHINFER registries do not know the "inkling" algorithm
+    and would surface an error naming neither Inkling nor the setting."""
     from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
 
     check = InklingForCausalLM._assert_inkling_attn_backend
-    check(SimpleNamespace(attn_backend="INKLING"))
-    check(SimpleNamespace(attn_backend="inkling"))  # case-insensitive
-    check(SimpleNamespace(attn_backend=None))  # nothing to check
+    check(SimpleNamespace(attn_backend="TRTLLM"))  # the family Inkling runs under
+    check(SimpleNamespace(attn_backend="trtllm"))  # case-insensitive
+    check(SimpleNamespace(attn_backend=None))  # unset -> framework default
 
-    for bad in ("TRTLLM", "FLASHINFER", "VANILLA"):
-        with pytest.raises(ValueError, match="attn_backend='INKLING'"):
+    for bad in ("FLASHINFER", "VANILLA", "FLASHINFER_STAR_ATTENTION"):
+        with pytest.raises(ValueError, match="TRTLLM attention backend family"):
             check(SimpleNamespace(attn_backend=bad))
 
 
@@ -777,12 +817,47 @@ def test_conv_state_resource_type_is_gone():
 
 
 def test_inkling_selects_the_hybrid_cache_manager():
-    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingHybridCacheManager
+    """The manager comes from sparse/registry.py, not from a branch in
+    _non_hybrid_kv_cache_manager_cls.
+
+    get_kv_cache_manager_cls takes its sparse branch first (Inkling populates
+    sparse_attention_config), so a branch in the non-hybrid helper would be dead
+    code that disagrees with the registry the day one of them changes. What that
+    helper must still do is force V2: an explicit use_kv_cache_manager_v2=False
+    would otherwise mis-size the per-layer pool, and this runs before the model
+    (and therefore its get_model_defaults) exists.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.attention_backend.sparse import get_sparse_attn_kv_cache_manager
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import (
+        InklingHybridCacheManager,
+        InklingSparseAttentionConfig,
+    )
+    from tensorrt_llm._torch.pyexecutor import _util
     from tensorrt_llm._torch.pyexecutor._util import _non_hybrid_kv_cache_manager_cls
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
+    assert (get_sparse_attn_kv_cache_manager(InklingSparseAttentionConfig())
+            is InklingHybridCacheManager)
+
+    # The sparse branch runs before the non-hybrid helper is ever consulted.
+    outer = inspect.getsource(_util.get_kv_cache_manager_cls)
+    assert outer.index("get_sparse_attn_kv_cache_manager") < outer.index(
+        "_non_hybrid_kv_cache_manager_cls")
+
+    # V2 backstop survives: is_inkling still forces V2 even though the manager
+    # itself now comes from the registry.
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+
     cfg = SimpleNamespace(model_type="inkling_text")
-    assert _non_hybrid_kv_cache_manager_cls(cfg, KvCacheConfig()) is (InklingHybridCacheManager)
+    assert _non_hybrid_kv_cache_manager_cls(cfg, KvCacheConfig()) is KVCacheManagerV2
+
+    # And it returns no Inkling manager of its own. Comments are stripped: the
+    # helper *mentions* the class to explain where the routing went.
+    src = inspect.getsource(_non_hybrid_kv_cache_manager_cls)
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    assert "InklingHybridCacheManager" not in code
 
 
 def test_conv_pool_dtype_is_a_torch_dtype_not_the_kv_cache_dtype():

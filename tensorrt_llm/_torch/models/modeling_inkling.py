@@ -935,32 +935,32 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
 
     @staticmethod
     def _assert_inkling_attn_backend(model_config) -> None:
-        """Fail at load if the Inkling attention backend was overridden.
+        """Fail at load if the attention backend *family* was overridden.
 
-        ``get_model_defaults`` selects ``attn_backend='INKLING'`` because the
-        backend NAME is what every consumer outside the Attention module has to
-        go on: ``PyTorchModelEngine`` and the KV-cache creator call
-        ``get_attention_backend(name)`` and read ``.Metadata`` off it, with no
-        ModelConfig in hand. Model defaults are a deep-merge in which an explicit
-        user value wins, so an ``attn_backend: TRTLLM`` left in
-        ``--extra_llm_api_options`` -- a very easy thing to carry over from
-        another model's serve config -- silently degrades attn_metadata to
-        ``TrtllmAttentionMetadata``: the decode seq lens and page table are never
-        published and the short-conv runtime is never built. The run then dies
-        far from the setting responsible (a mixed-batch refusal out of
-        ``InklingTritonAttention.forward``, or "Cannot copy between CPU and CUDA
-        tensors" deep in CUDA-graph capture).
+        Inkling's backend is registered in ``sparse/registry.py`` under the
+        ``TRTLLM`` family only: ``get_attention_backend`` consults the registry
+        per family, and the ``VANILLA`` / ``FLASHINFER`` ones do not know the
+        ``"inkling"`` algorithm. Left to itself that surfaces as "Unsupported
+        sparse attention algorithm in vanilla attention backend", which names
+        neither Inkling nor the setting responsible.
+
+        A stray ``attn_backend`` in ``--extra_llm_api_options`` -- easy to carry
+        over from another model's serve config -- is the realistic way to get
+        here; model defaults are a deep-merge in which an explicit user value
+        wins. ``TRTLLM`` is accepted because that *is* the family Inkling runs
+        under and is also the framework default, so leaving ``attn_backend``
+        unset is the normal path.
         """
         backend = getattr(model_config, "attn_backend", None)
-        if backend is not None and str(backend).upper() != "INKLING":
+        if backend is not None and str(backend).upper() != "TRTLLM":
             raise ValueError(
-                f"Inkling requires attn_backend='INKLING' (got {backend!r}). "
-                "The Triton decode kernel reads its per-step seq_lens and page "
-                "table from InklingAttentionMetadata, which the model engine "
-                "resolves from the backend NAME -- so any other value degrades "
-                "the metadata rather than failing loudly here. Remove the "
-                "attn_backend override from --extra_llm_api_options / "
-                "LLM(attn_backend=...) so the model default applies."
+                f"Inkling requires the TRTLLM attention backend family (got "
+                f"{backend!r}). Its backend is registered in "
+                "attention_backend/sparse/registry.py under that family only, "
+                "and its Triton decode kernel reads per-step seq_lens and page "
+                "tables from InklingAttentionMetadata, which extends "
+                "TrtllmAttentionMetadata. Remove the attn_backend override from "
+                "--extra_llm_api_options / LLM(attn_backend=...)."
             )
 
     @staticmethod
@@ -1230,14 +1230,15 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         # a cache miss. ``MixedMambaHybridCacheManager`` has the same limitation.
         # An explicit user setting still wins the deep-merge.
         #
-        # ``attn_backend``: ``InklingAttentionMetadata`` publishes the decode
-        # seq_lens and page table into fixed-pointer GPU buffers before
-        # CUDA-graph capture, and the model engine resolves that metadata class
-        # from the backend NAME alone (get_attention_backend(name).Metadata),
-        # with no access to model-scoped state. The name is therefore the only
-        # way to make Inkling's backend identity visible engine-side.
+        # No ``attn_backend`` entry: Inkling runs under the framework-default
+        # TRTLLM family, and its backend and cache manager are both selected from
+        # ``sparse/registry.py`` keyed on the architecture-derived
+        # ``sparse_attention_config`` (see
+        # ``attention_backend/sparse/inkling/params.py``). Selecting from the
+        # model architecture rather than from a backend-name string is what makes
+        # every consumer -- including the ones holding no ModelConfig -- resolve
+        # the same backend and metadata.
         return {
-            "attn_backend": "INKLING",
             "kv_cache_config": {
                 "use_kv_cache_manager_v2": True,
                 "enable_block_reuse": False,

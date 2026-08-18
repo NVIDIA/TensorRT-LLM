@@ -97,13 +97,14 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     # would otherwise silently produce a mis-sized per-layer pool.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
                 or is_gemma4_hybrid(config) or is_inkling(config))
-    if is_inkling(config):
-        # Inkling's per-layer short convolutions hold per-request state with the
-        # KV cache's lifetime, so the cache manager owns that pool too (the
-        # CppMambaHybridCacheManager shape): it reaches the model through
-        # attn_metadata and is freed alongside the request's KV blocks.
-        from ..attention_backend.sparse.inkling import InklingHybridCacheManager
-        return InklingHybridCacheManager
+    # No Inkling branch here: it populates sparse_attention_config from the
+    # checkpoint architecture, so get_kv_cache_manager_cls takes its sparse
+    # branch and reaches InklingHybridCacheManager through sparse/registry.py
+    # before this function is called. A branch here would be dead code that
+    # disagrees with the registry the day one of them changes. The is_inkling
+    # test above stays: it is a needs_v2 backstop that runs even when the
+    # registry route is taken, because an explicit use_kv_cache_manager_v2=False
+    # must not silently produce a mis-sized per-layer pool.
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
