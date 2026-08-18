@@ -41,7 +41,7 @@ def enforce_single_worker(monkeypatch):
 # # test 1:  Generation correctness check
 # # ============================================================================
 @pytest.mark.high_cuda_memory
-def test_correctness_across_batch_sizes():
+def test_correctness_across_batch_sizes() -> None:
     schedule = {1: 3, 4: 2, 8: 1}
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     memory_required = 20
@@ -133,7 +133,7 @@ def test_correctness_across_batch_sizes():
 # # test 2:  Drafting side functionality check
 # # ============================================================================
 @pytest.mark.high_cuda_memory
-def test_draft_len_schedule_functionality(enforce_single_worker):
+def test_draft_len_schedule_functionality(enforce_single_worker) -> None:
     draft_schedule = {1: 5, 4: 4, 5: 3, 6: 2, 7: 1}
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")

@@ -132,8 +132,11 @@ def test_lora(client: openai.OpenAI, model_name: str, prompt: str,
         model=model_name,
         prompt=prompt,
         max_tokens=20,
+        temperature=0.0,
         extra_body=extra_body,
     )
-    # LoRA output is not deterministic, so retain the reference for diagnostics.
-    print(f"response: {response.choices[0].text}")
-    print(f"reference: {reference}")
+    output = response.choices[0].text
+    assert reference in output, (
+        f"Unexpected completion for LoRA adapter {lora_adapter_name!r}.\n"
+        f"Response: {output!r}\n"
+        f"Expected response to contain: {reference!r}")
