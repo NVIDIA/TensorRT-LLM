@@ -480,7 +480,7 @@ class GenerationExecutor(ABC):
         tp_size: int,
     ):
         logger.warning(f"Orchestrator is creating Ray executor")
-        from .ray_executor import RayExecutor
+        from .ray.executor import RayExecutor
 
         return RayExecutor(worker_kwargs,
                            model_world_size=model_world_size,

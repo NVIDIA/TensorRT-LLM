@@ -58,6 +58,13 @@ def sanity_check():
             'If you are attempting to use the pip development mode (editable installation), '
             'please execute `scripts/build_wheel.py` first, and then run `pip install -e .`.'
         )
+    if not (Path(__file__).resolve().parent / "3rdparty" /
+            "fmha_sm100").is_dir():
+        raise ImportError(
+            'The `fmha_sm100` package is missing. Please execute '
+            '`scripts/build_wheel.py` first (CMake FetchContent stages it under '
+            '3rdparty/fmha_sm100), or use TRTLLM_USE_PRECOMPILED to extract it '
+            'from a published wheel.')
 
 
 def get_version():
@@ -140,7 +147,14 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
-mx_deps = ["modelexpress==0.4.1"]
+mx_deps = ["modelexpress>=0.4.1,<0.6.0"]
+# Gateway protocol adapters are opt-in extras: the default installation must
+# not carry any gateway protobuf package. Each gateway owns a dedicated
+# requirements-<gateway>.txt as the single source of truth for its pins; CI
+# stages that exercise a gateway install that file explicitly, and the file
+# may carry gateway-specific options (such as an --extra-index-url) without
+# affecting the default dependency graph.
+grpc_smg_deps, _ = parse_requirements(Path("requirements-grpc-smg.txt"))
 constraints_file = Path("constraints.txt")
 if constraints_file.exists():
     constraints, _ = parse_requirements(constraints_file)
@@ -304,6 +318,21 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
                     os.makedirs(dst_dir, exist_ok=True)
                 print(f"Copying {rel_path} from local directory.")
                 shutil.copy2(src_file, dst_file)
+
+        source_fmha = os.path.join(precompiled_location, "3rdparty",
+                                   "fmha_sm100")
+        if not os.path.isdir(source_fmha):
+            raise SetupError(
+                f"Precompiled directory {precompiled_location} predates MSA "
+                "packaging and does not contain 3rdparty/fmha_sm100. Use a "
+                "precompiled source built with MSA packaging support.")
+        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+        print(f"Copying fmha_sm100 from local directory: {source_fmha}")
+        if os.path.islink(dst_fmha):
+            os.unlink(dst_fmha)
+        elif os.path.isdir(dst_fmha):
+            shutil.rmtree(dst_fmha)
+        shutil.copytree(source_fmha, dst_fmha)
         return
 
     # Handle local file or remote URL
@@ -339,6 +368,18 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
         wheel_path = precompiled_path
 
     with zipfile.ZipFile(wheel_path) as wheel:
+        dst_fmha = os.path.join("3rdparty", "fmha_sm100")
+        wheel_has_fmha = any(
+            file.filename.startswith("fmha_sm100/") for file in wheel.filelist)
+        if not wheel_has_fmha:
+            raise SetupError(
+                f"Precompiled wheel {wheel_path} predates MSA packaging and "
+                "does not contain fmha_sm100. Use a precompiled wheel built "
+                "with MSA packaging support.")
+        if os.path.islink(dst_fmha):
+            os.unlink(dst_fmha)
+        elif os.path.isdir(dst_fmha):
+            shutil.rmtree(dst_fmha)
         for file in wheel.filelist:
             # Skip yaml files
             if file.filename.endswith(".yaml"):
@@ -347,6 +388,15 @@ def extract_from_precompiled(precompiled_location: str, package_data: list[str],
             # Keep source-owned package data local so Python-only schema edits
             # layer over precompiled wheels.
             if should_skip_precompiled_package_data(file.filename):
+                continue
+
+            # Top-level MSA package in the wheel; stage under 3rdparty for
+            # setuptools package_dir, matching scripts/build_wheel.py.
+            if file.filename.startswith("fmha_sm100/"):
+                print(
+                    f"Extracting and including {file.filename} from precompiled wheel."
+                )
+                wheel.extract(file, path="3rdparty")
                 continue
 
             # Skip .py files EXCEPT for generated C++ extension wrappers
@@ -432,8 +482,35 @@ else:
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
-msa_package_dir = {"fmha_sm100": "3rdparty/MSA/python/fmha_sm100"}
+# fmha_sm100 is staged under 3rdparty/ by scripts/build_wheel.py from the
+# CMake FetchContent tree (same packaging role as tensorrt_llm/deep_ep).
+msa_package_dir = {"fmha_sm100": "3rdparty/fmha_sm100"}
 packages += ["fmha_sm100"]
+
+
+def get_build_state_options():
+    """Optionally redirect setuptools build state out of the source tree.
+
+    When TRTLLM_WHEEL_STAGING_DIR is set (e.g. by scripts/build_wheel.py
+    --build_root), the setuptools staging tree (build/) and *.egg-info are
+    written there instead of into the checkout. This keeps metadata-heavy
+    churn off slow network filesystems; behavior is unchanged when unset.
+    """
+    staging_dir = os.environ.get("TRTLLM_WHEEL_STAGING_DIR")
+    if not staging_dir:
+        return {}
+    staging = Path(staging_dir)
+    egg_base = staging / "egg-info"
+    egg_base.mkdir(parents=True, exist_ok=True)
+    return {
+        "build": {
+            "build_base": str(staging / "build")
+        },
+        "egg_info": {
+            "egg_base": str(egg_base)
+        },
+    }
+
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
@@ -459,6 +536,7 @@ setup(
         "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
+    options=get_build_state_options(),
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
@@ -484,8 +562,9 @@ setup(
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
-        "devel": devel_deps,
+        "devel": devel_deps + grpc_smg_deps,
         "mx": mx_deps,
+        "grpc-smg": grpc_smg_deps,
     },
     zip_safe=True,
     install_requires=required_deps,
