@@ -1814,6 +1814,48 @@ def test_deepseek_streaming_preserves_withheld_text(
                                          sample_tools).normal_text == expected
 
 
+@pytest.mark.parametrize(
+    "parser_cls, tool_call_text",
+    [
+        (
+            DeepSeekV3Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+             'get_weather\n```json\n{"location": "Tokyo"}\n```'
+             "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
+        ),
+        (
+            DeepSeekV31Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+             '{"location": "Tokyo"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'),
+        ),
+        (
+            DeepSeekV32Parser,
+            ('<｜DSML｜function_calls><｜DSML｜invoke name="get_weather">'
+             '<｜DSML｜parameter name="location" string="true">Tokyo'
+             "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>"),
+        ),
+        (
+            DeepSeekV4Parser,
+            ('<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+             '<｜DSML｜parameter name="location" string="true">Tokyo'
+             "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"),
+        ),
+    ],
+)
+def test_deepseek_streaming_emits_text_before_tool_call(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tool_call_text: str) -> None:
+    """Text that precedes a tool call in the same delta is content."""
+    text = "Normal text" + tool_call_text
+
+    result = parser_cls().parse_streaming_increment(text, sample_tools)
+
+    assert result.normal_text == "Normal text"
+    assert result.normal_text == parser_cls().detect_and_parse(
+        text, sample_tools).normal_text
+    assert "get_weather" in [call.name for call in result.calls if call.name]
+
+
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
