@@ -388,8 +388,7 @@ class OpenAIDisaggServer:
                                 port=port,
                                 log_level=logger.level,
                                 timeout_keep_alive=keep_alive_timeout)
-        server = create_uvicorn_server(config)
-        await server.serve(sockets=sockets)
+        await create_uvicorn_server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):
         """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
