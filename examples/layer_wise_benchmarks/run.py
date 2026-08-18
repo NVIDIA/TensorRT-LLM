@@ -49,6 +49,8 @@ parser.add_argument("--kv-cache-dtype", type=str, choices=["fp8", "nvfp4", "auto
 parser.add_argument(
     "--mamba-ssm-cache-dtype", type=str, choices=["auto", "float16", "bfloat16", "float32"]
 )
+parser.add_argument("--kv-pool-headroom", type=int, default=1)
+parser.add_argument("--enable-swa-scratch-reuse", action="store_true")
 # Model init args
 parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
 parser.add_argument("--max-num-tokens", type=int)
@@ -171,6 +173,8 @@ kv_cache_manager = Runner.create_kv_cache_manager(
     kv_cache_dtype=args.kv_cache_dtype,
     mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
     layer_indices=args.layer_indices,
+    kv_pool_headroom=args.kv_pool_headroom,
+    enable_swa_scratch_reuse=args.enable_swa_scratch_reuse,
 )
 attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
 logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")

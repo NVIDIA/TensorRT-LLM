@@ -32,20 +32,11 @@ def mark_ranges():
     GatedMLP.forward = nvtx.annotate("GatedMLP")(GatedMLP.forward)
     Mamba2Mixer.forward = nvtx.annotate("Mamba2Mixer")(Mamba2Mixer.forward)
 
-    # DeepSeek-V4. DeepseekV4Attention subclasses MLA without overriding forward, so
-    # it is already covered by the MLA line above. The gate and the MoE block are not:
-    # DeepseekV4Gate is a separate class from DeepseekV3Gate, and DeepseekV4MoE does
-    # not implement the MoE interface, so neither inherits an annotated forward.
+    # DeepseekV4Attention is covered by the MLA line above; these two are not.
     DeepseekV4Gate.forward = nvtx.annotate("DeepseekV4Gate")(DeepseekV4Gate.forward)
     DeepseekV4MoE.forward = nvtx.annotate("DeepseekV4MoE")(DeepseekV4MoE.forward)
 
-    # mHC has no forward: DeepseekV4DecoderLayer drives it through three entry points
-    # and deliberately fuses/defers them across the layer boundary (hc_attn.post_mapping
-    # + hc_ffn.pre_mapping collapse into one fused_hc, and post_mapping may resolve in
-    # the NEXT layer). There is therefore no single region to wrap -- annotating the
-    # three call sites is what makes mHC kernels attributable at all. Without these the
-    # only way to bucket them is by exclusion, which silently absorbs anything else the
-    # module map does not know about.
+    # mHC has no forward; DeepseekV4DecoderLayer calls these three directly.
     mHC.pre_mapping = nvtx.annotate("mHC pre_mapping")(mHC.pre_mapping)
     mHC.fused_hc = nvtx.annotate("mHC fused_hc")(mHC.fused_hc)
     mHC.post_mapping = nvtx.annotate("mHC post_mapping")(mHC.post_mapping)

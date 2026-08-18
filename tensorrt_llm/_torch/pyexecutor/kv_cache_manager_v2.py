@@ -3101,12 +3101,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # Materialize the blocks backing the declared history instead of treating it as
         # already committed. Only meaningful together with is_gen.
         #
-        # A generation request normally arrives with its history already written, so
-        # hinting the committed length lets the sliding-window pools keep just the last
-        # window_size blocks and leave the rest unbacked. A caller that is going to WRITE
-        # that history itself -- as the layer-wise benchmark does, prefilling every dummy
-        # request before it decodes any -- needs those blocks to exist, or the prefill
-        # writes land on block-table entries that were never assigned.
+        # Set when the caller writes the history itself and needs those blocks backed,
+        # instead of letting sliding-window pools keep only the last window_size.
         materialize_history: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,

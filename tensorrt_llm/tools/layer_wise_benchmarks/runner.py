@@ -773,6 +773,8 @@ class Runner:
         kv_cache_dtype,
         mamba_ssm_cache_dtype,
         layer_indices,
+        kv_pool_headroom=1,
+        enable_swa_scratch_reuse=False,
     ):
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
         model_config = ModelConfig.from_pretrained(pretrained_model_name_or_path)
@@ -784,37 +786,16 @@ class Runner:
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         config = model_config.pretrained_config
         # max_seq_len + 1 because the is_gen path in add_dummy_requests resizes each
-        # request a second time, to capacity + 1; without the extra token the last block
-        # rounds down and the resize fails.
-        #
-        # POOL_SPLIT_HEADROOM is empirical. A scalar max_tokens is divided across the
-        # manager's pools, and this workload does not look like the typical serving step
-        # the solver sizes them for -- it registers max_batch_size requests all at context
-        # length. Measured on DeepSeek-V4 (which reports num_pools=3): without headroom
-        # registration runs out at request 90 of 128; at 3x it completes. The factor is
-        # not derived, and a model whose pool layout differs may need a different one.
-        #
-        # Overridable by env because that sentence is a prediction, not a caveat: the 3
-        # was measured on V4-Flash at batch 128 / kv 1150, and V4-Pro runs batch 32 /
-        # kv 1675 through a different pool layout. Finding the right factor should not
-        # cost a wheel rebuild -- roughly an hour -- per attempt. The failure it guards
-        # is loud (the RuntimeError below names the shortfall and both knobs), so the
-        # loop is: read the number out of the error, re-run with the env set.
-        POOL_SPLIT_HEADROOM = int(os.environ.get("TLLM_LWB_POOL_SPLIT_HEADROOM", "3"))
+        # request to capacity + 1; without the extra token the last block rounds down.
+        # kv_pool_headroom oversizes max_tokens when the manager splits it across
+        # several pools. DeepSeek-V4 needs 3; the default 1 keeps every other model
+        # on its previous allocation.
         kv_cache_config = KvCacheConfig(
-            max_tokens=POOL_SPLIT_HEADROOM
+            max_tokens=kv_pool_headroom
             * max_batch_size
             * round_up(max_seq_len + 1, tokens_per_block),
             enable_block_reuse=False,
-            # Every dummy request below is registered at full max_seq_len and then
-            # actually written by the prefill pass, so on a sliding-window pool the
-            # benchmark needs the blocks its writes land on to exist. Without scratch
-            # reuse the solver sizes those pools for a typical serving step -- one
-            # context request plus max_batch_size-1 generation requests -- which this
-            # workload is not: it prefills every request before decoding any. On
-            # DeepSeek-V4, where params.py gives every layer a sliding-window pool,
-            # that shortfall is what makes create_kv_cache_manager fail.
-            enable_swa_scratch_reuse=True,
+            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         )
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
@@ -917,23 +898,24 @@ class Runner:
             )
         else:
             raise NotImplementedError("Unsupported config")
-        # is_gen because the replay measures a decode step, so the requests have to be in
-        # generation state with their history behind them. materialize_history because the
-        # benchmark then writes that history itself in the prefill pass below -- without it
-        # the sliding-window pools keep only the last window_size blocks and the prefill
-        # writes land on block-table entries that were never assigned.
-        #
-        # Checked rather than discarded: on failure add_dummy_requests returns None AFTER
-        # release_resources() has freed every request registered so far, so the next lookup
-        # fails as "Request ID not found in IndexMapper" from deep inside
-        # compute_sliding_block_tables -- pointing nowhere near the cause. NVBug 6567554 was
-        # filed on that symptom.
+        # The prefill pass below writes the history itself, so ask for materialized
+        # blocks where the manager takes the argument. Checked by signature, not by
+        # class: MambaHybridCacheManagerV2 subclasses KVCacheManagerV2 but overrides
+        # add_dummy_requests without this parameter.
+        add_dummy_kwargs = {}
+        if (
+            "materialize_history"
+            in inspect.signature(kv_cache_manager.add_dummy_requests).parameters
+        ):
+            add_dummy_kwargs["materialize_history"] = True
+        # add_dummy_requests returns None only after releasing every request it had
+        # registered, so a later lookup fails far from the cause (NVBug 6567554).
         if (
             kv_cache_manager.add_dummy_requests(
                 list(range(max_batch_size)),
                 token_nums=[max_seq_len] * max_batch_size,
                 is_gen=True,
-                materialize_history=True,
+                **add_dummy_kwargs,
             )
             is None
         ):
