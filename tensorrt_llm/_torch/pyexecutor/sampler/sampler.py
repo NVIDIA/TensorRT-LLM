@@ -457,7 +457,9 @@ def _get_beam_width_in(request: LlmRequest) -> int:
 
 
 def _get_beam_width_out(request: LlmRequest) -> int:
-    return request.get_beam_width_by_iter(for_next_iteration=True)
+    # Annotated: get_beam_width_by_iter is Any-typed without the generated bindings stubs.
+    beam_width_out: int = request.get_beam_width_by_iter(for_next_iteration=True)
+    return beam_width_out
 
 
 def _get_max_beam_width(request: LlmRequest) -> int:
@@ -2482,8 +2484,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         request: LlmRequest, max_seq_len: int, beam_idx: int = DEFAULT_BEAM_IDX
     ) -> bool:
         num_tokens = request.get_num_tokens(beam_idx)
-        return (num_tokens - request.py_orig_prompt_len >= request.py_max_new_tokens) or (
-            num_tokens >= max_seq_len
+        # Wrap in bool(): the operands come from C++ bindings (get_num_tokens,
+        # py_orig_prompt_len, py_max_new_tokens) and are Any-typed, so the
+        # comparison expression is inferred as Any rather than bool.
+        return bool(
+            (num_tokens - request.py_orig_prompt_len >= request.py_max_new_tokens)
+            or (num_tokens >= max_seq_len)
         )
 
     @staticmethod
