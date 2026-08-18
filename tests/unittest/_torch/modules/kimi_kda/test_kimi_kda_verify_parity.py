@@ -135,7 +135,7 @@ def test_kda_fused_prefill_matches_separate_projections():
     slot_indices = torch.tensor([2, 0], device=device, dtype=torch.long)
     cu_seqlens = torch.tensor([0, 3, 5], device=device, dtype=torch.long)
     hidden_states = torch.randn(5, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
-    conv_seed = torch.randn(slots, 3 * d, w, device=device, dtype=torch.bfloat16) * 0.02
+    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
     state_seed = (
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
@@ -182,7 +182,7 @@ def test_kda_qkvg_multistream_decode_matches_separate_projections():
     slots = batch + 2
     slot_indices = torch.tensor([2, 0, 4], device=device, dtype=torch.long)
     hidden_states = torch.randn(batch, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
-    conv_seed = torch.randn(slots, 3 * d, w, device=device, dtype=torch.bfloat16) * 0.02
+    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
     state_seed = (
         torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
     )
@@ -218,7 +218,7 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     # NaN/Inf bit pattern poisons both paths identically (nvbug 6599150).
     torch.nn.init.normal_(runtime.dt_bias, std=0.1)
     slots = batch + 2  # non-trivial slot mapping
-    cache = _LayerCache(slots, 3 * dim, w, h, lin["head_dim"], lin["head_dim"], t_steps, device)
+    cache = _LayerCache(slots, 3 * dim, w - 1, h, lin["head_dim"], lin["head_dim"], t_steps, device)
     slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)
 
     # Random-but-fixed starting state and inputs.

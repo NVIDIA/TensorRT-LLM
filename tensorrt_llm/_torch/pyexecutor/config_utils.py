@@ -422,12 +422,11 @@ def extract_mamba_kv_cache_params(
         #            = 3 * num_heads * head_dim  -> [q | k | v] short-conv
         #   ssm state shape = [num_heads, head_dim, state_size]
         #            = [H, V, K] fp32 delta-rule recurrent state.
-        # conv_kernel is set to short_conv_kernel_size + 1 so the pool's
-        # (conv_kernel - 1) columns hold the FULL FLA ShortConvolution cache
-        # window of `short_conv_kernel_size` columns.
+        # The pool stores the W - 1 raw inputs needed by the production
+        # causal-convolution kernels, where W is short_conv_kernel_size.
         lin = unwrap_kimi_text_config(config).linear_attn_config
         state_size = lin["head_dim"]
-        conv_kernel = lin["short_conv_kernel_size"] + 1
+        conv_kernel = lin["short_conv_kernel_size"]
         num_heads = lin["num_heads"]
         n_groups = lin["num_heads"]
         head_dim = lin["head_dim"]

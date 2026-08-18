@@ -43,6 +43,7 @@ from typing import Optional, Tuple
 import torch
 from einops import rearrange
 from fla.modules import FusedRMSNormGated, ShortConvolution
+from fla.modules.l2norm import l2norm_fwd
 from fla.ops.kda import fused_recurrent_kda
 from torch import nn
 
@@ -351,6 +352,8 @@ class KimiKDAReference(nn.Module):
         q = rearrange(q, "... (h d) -> ... h d", d=self.head_k_dim)
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
+        q, _ = l2norm_fwd(q)
+        k, _ = l2norm_fwd(k)
 
         lower_bound = (
             self.gate_lower_bound_override

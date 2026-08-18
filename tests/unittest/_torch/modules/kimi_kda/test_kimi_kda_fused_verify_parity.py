@@ -120,7 +120,7 @@ def _make_pools(B, seed):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     d = H * K
     conv_pool = (
-        torch.randn(B, 3 * d, W, generator=gen, device="cuda", dtype=torch.float32) * 0.5
+        torch.randn(B, 3 * d, W - 1, generator=gen, device="cuda", dtype=torch.float32) * 0.5
     ).to(torch.bfloat16)
     ssm_pool = torch.randn(B, H, K, K, generator=gen, device="cuda", dtype=torch.float32)
     ssm_pool *= torch.linspace(0.5, 1.5, K, device="cuda").view(1, 1, K, 1)
@@ -130,13 +130,13 @@ def _make_pools(B, seed):
 def _make_fused_layer_cache(B, conv_pool):
     """Replay caches shaped like PythonMambaCacheManager's KDA allocation,
     with the committed conv window seeded from the base pool (the prefill
-    seeding contract: FLA window columns [1, W) -> committed columns)."""
+    seeding contract: the base pool stores committed columns directly)."""
     d = H * K
     S = W - 1 + M
 
     def _conv_cache(section):
         cache = torch.zeros(B, S, d, device="cuda", dtype=torch.float32).transpose(-1, -2)
-        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d, 1:].float()
+        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d].float()
         return cache
 
     return SimpleNamespace(
@@ -157,7 +157,7 @@ def _make_seq_layer_cache(B):
     return SimpleNamespace(
         kda_qkg_cache=None,
         intermediate_conv_window=torch.zeros(
-            B, M + 1, 3 * d, W, device="cuda", dtype=torch.bfloat16
+            B, M + 1, 3 * d, W - 1, device="cuda", dtype=torch.bfloat16
         ),
         intermediate_ssm=torch.zeros(B, M + 1, H, K, K, device="cuda", dtype=torch.float32),
     )
@@ -177,6 +177,56 @@ def _rep(name, a, b):
     rel = ((a - b).norm() / (b.norm() + 1e-12)).item()
     print(f"  {name}: cos={cos:.6f} rel_l2={rel:.3e}")
     return cos > 0.999 and rel < 3e-2
+
+
+def test_plain_decode_direct_pool_matches_fallback():
+    """The production decode path updates packed live pools by slot."""
+    torch.manual_seed(4)
+    batch, slots = 4, 7
+    runtime = _make_runtime(seed=5)
+    runtime.finalize_decode_weights()
+    slot_indices = torch.tensor([6, 1, 4, 2], dtype=torch.long, device="cuda")
+    state_indices = slot_indices.to(torch.int32)
+    conv_direct, ssm_direct = _make_pools(slots, seed=6)
+    conv_fallback = conv_direct.clone()
+    ssm_fallback = ssm_direct.clone()
+    hidden = torch.randn(batch, HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    with torch.no_grad():
+        expected = runtime.forward_decode_fallback(
+            hidden,
+            conv_fallback,
+            ssm_fallback,
+            slot_indices,
+        )
+        actual = runtime.forward_decode(
+            hidden,
+            conv_direct,
+            ssm_direct,
+            slot_indices,
+            mamba_metadata=SimpleNamespace(
+                _arange_buffer=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+            ),
+            ssm_state_indices=state_indices,
+        )
+
+    assert _rep("plain decode output", actual, expected)
+    torch.testing.assert_close(
+        conv_direct.index_select(0, slot_indices),
+        conv_fallback.index_select(0, slot_indices),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        ssm_direct.index_select(0, slot_indices),
+        ssm_fallback.index_select(0, slot_indices),
+        rtol=2e-4,
+        atol=2e-4,
+    )
+    untouched = torch.ones(slots, dtype=torch.bool, device="cuda")
+    untouched[slot_indices] = False
+    assert torch.equal(conv_direct[untouched], conv_fallback[untouched])
+    assert torch.equal(ssm_direct[untouched], ssm_fallback[untouched])
 
 
 @torch.no_grad()

@@ -32,6 +32,8 @@ import torch
 
 pytest.importorskip("fla")
 
+from fla.modules.l2norm import l2norm_fwd  # noqa: E402
+
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch  # noqa: E402
 
 NUM_HEADS = 96
@@ -90,9 +92,11 @@ def _make_inputs(total_t: int, seed: int):
 def _run(dispatch, gate_params, q, k, v, g, beta, cu):
     """No .clone() on cu — these tests exercise object identity on purpose."""
     a_log, dt_bias = gate_params
+    q, _ = l2norm_fwd(q.clone())
+    k, _ = l2norm_fwd(k.clone())
     return dispatch.prefill_chunk_kda(
-        q=q.clone(),
-        k=k.clone(),
+        q=q,
+        k=k,
         v=v.clone(),
         g=g.clone(),
         beta=beta.clone(),

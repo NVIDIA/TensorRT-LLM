@@ -9,7 +9,14 @@ import torch
 
 pytest.importorskip("fla")
 
+from fla.modules import ShortConvolution  # noqa: E402
+
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
+    copy_kda_replay_conv_window,
+    fused_kda_post_conv,
+)
+from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn  # noqa: E402
 from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (  # noqa: E402
     KimiKDAReference,
     get_production_prefill_kernel_path,
@@ -88,7 +95,7 @@ def _run_production_prefill(
         conv_pool = torch.zeros(
             batch_size,
             3 * projection_size,
-            CONV_KERNEL_SIZE,
+            CONV_KERNEL_SIZE - 1,
             dtype=torch.bfloat16,
             device="cuda",
         )
@@ -109,6 +116,7 @@ def _run_production_prefill(
     metadata = SimpleNamespace(
         use_initial_states=use_initial_states,
         has_initial_states=has_initial_states,
+        state_indices=slot_indices.to(torch.int32),
     )
     output = attention.forward_prefill(
         hidden_states.reshape(-1, HIDDEN_SIZE),
@@ -131,6 +139,169 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     relative_l2 = ((actual_float - expected_float).norm() / (expected_float.norm() + 1e-12)).item()
     assert cosine > 0.999
     assert relative_l2 < 3e-2
+
+
+@pytest.mark.parametrize("sequence_length", [1, 127, 256])
+@torch.no_grad()
+def test_fused_kda_post_conv_matches_reference(sequence_length: int) -> None:
+    """Packed convolution output is normalized and transposed correctly."""
+    torch.manual_seed(1)
+    num_heads, head_dim = 8, 128
+    projection_size = num_heads * head_dim
+    packed = torch.randn(
+        3 * projection_size,
+        sequence_length,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    actual_q, actual_k, actual_v = fused_kda_post_conv(packed, num_heads, head_dim)
+    unpacked = packed.view(3, projection_size, sequence_length)
+    expected_q = unpacked[0].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
+    expected_k = unpacked[1].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
+    expected_v = unpacked[2].transpose(0, 1).reshape(1, sequence_length, num_heads, head_dim)
+    expected_q = expected_q.float()
+    expected_k = expected_k.float()
+    expected_q *= torch.rsqrt((expected_q * expected_q).sum(dim=-1, keepdim=True) + 1e-6)
+    expected_k *= torch.rsqrt((expected_k * expected_k).sum(dim=-1, keepdim=True) + 1e-6)
+
+    assert actual_q.is_contiguous()
+    assert actual_k.is_contiguous()
+    assert actual_v.is_contiguous()
+    torch.testing.assert_close(actual_q, expected_q.to(packed.dtype), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(actual_k, expected_k.to(packed.dtype), rtol=1e-2, atol=1e-2)
+    assert torch.equal(actual_v, expected_v)
+
+
+@torch.no_grad()
+def test_packed_gdn_convolution_matches_three_fla_convolutions() -> None:
+    """The reused GDN kernel preserves KDA convolution and cache semantics."""
+    torch.manual_seed(2)
+    dim, width, slots = 256, 4, 5
+    sequence_lengths = [7, 5]
+    num_tokens = sum(sequence_lengths)
+    state_indices = torch.tensor([4, 1], dtype=torch.int32, device="cuda")
+    state_indices_long = state_indices.long()
+    has_initial_state = torch.tensor([True, False], device="cuda")
+    cu_seqlens = torch.tensor(
+        [0, sequence_lengths[0], num_tokens], dtype=torch.int32, device="cuda"
+    )
+    cu_seqlens_long = cu_seqlens.long()
+
+    projected = [
+        torch.randn(1, num_tokens, dim, dtype=torch.bfloat16, device="cuda") for _ in range(3)
+    ]
+    convolutions = [
+        ShortConvolution(dim, width, activation="silu").to(device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    packed_weight = torch.cat(
+        [conv.weight.detach().squeeze(1) for conv in convolutions], dim=0
+    ).contiguous()
+    conv_pool = torch.randn(slots, 3 * dim, width - 1, dtype=torch.bfloat16, device="cuda")
+    conv_pool_before = conv_pool.clone()
+
+    packed = torch.cat(projected, dim=-1).squeeze(0).transpose(0, 1).contiguous()
+    causal_conv1d_fn(
+        packed,
+        packed_weight,
+        query_start_loc=cu_seqlens,
+        cache_indices=state_indices,
+        has_initial_state=has_initial_state,
+        conv_states=conv_pool,
+        activation="silu",
+    )
+
+    selected = conv_pool_before.index_select(0, state_indices_long)
+    selected[~has_initial_state] = 0
+    expected_outputs = []
+    expected_caches = []
+    for section, (projected_section, convolution) in enumerate(
+        zip(projected, convolutions, strict=True)
+    ):
+        cache = torch.nn.functional.pad(selected[:, section * dim : (section + 1) * dim], (1, 0))
+        output, final_cache = convolution(
+            projected_section,
+            cache=cache,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens_long,
+        )
+        expected_outputs.append(output)
+        expected_caches.append(final_cache[:, :, 1:])
+
+    actual_output = packed.transpose(0, 1).reshape(1, num_tokens, 3 * dim)
+    torch.testing.assert_close(
+        actual_output,
+        torch.cat(expected_outputs, dim=-1),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    torch.testing.assert_close(
+        conv_pool.index_select(0, state_indices_long),
+        torch.cat(expected_caches, dim=1),
+        rtol=0,
+        atol=0,
+    )
+    untouched = torch.ones(slots, dtype=torch.bool, device="cuda")
+    untouched[state_indices_long] = False
+    assert torch.equal(conv_pool[untouched], conv_pool_before[untouched])
+
+
+@torch.no_grad()
+def test_copy_kda_replay_conv_window_preserves_slot_padding() -> None:
+    """Committed Q/K/V rows copy across both strided production layouts."""
+    slots, dim, committed, num_spec = 6, 11, 3, 2
+    slot_stride = 3 * dim * committed + 17
+    storage = torch.arange(slots * slot_stride, dtype=torch.float32, device="cuda").to(
+        torch.bfloat16
+    )
+    conv_pool = torch.as_strided(
+        storage,
+        size=(slots, 3 * dim, committed),
+        stride=(slot_stride, committed, 1),
+    )
+
+    def replay_cache() -> torch.Tensor:
+        return torch.full(
+            (slots, committed + num_spec, dim),
+            -1,
+            dtype=torch.float32,
+            device="cuda",
+        ).transpose(-1, -2)
+
+    q_cache, k_cache, v_cache = replay_cache(), replay_cache(), replay_cache()
+    state_indices = torch.tensor([4, 1], dtype=torch.int32, device="cuda")
+    copy_kda_replay_conv_window(
+        conv_pool,
+        q_cache,
+        k_cache,
+        v_cache,
+        state_indices,
+    )
+
+    state_indices_long = state_indices.long()
+    for section, cache in enumerate((q_cache, k_cache, v_cache)):
+        expected = conv_pool.index_select(0, state_indices_long)[
+            :, section * dim : (section + 1) * dim
+        ].float()
+        torch.testing.assert_close(
+            cache.index_select(0, state_indices_long)[:, :, :committed],
+            expected,
+        )
+        assert torch.equal(
+            cache.index_select(0, state_indices_long)[:, :, committed:],
+            torch.full(
+                (state_indices.numel(), dim, num_spec),
+                -1,
+                dtype=cache.dtype,
+                device=cache.device,
+            ),
+        )
+    untouched = torch.ones(slots, dtype=torch.bool, device="cuda")
+    untouched[state_indices_long] = False
+    assert torch.equal(q_cache[untouched], replay_cache()[untouched])
+    assert torch.equal(k_cache[untouched], replay_cache()[untouched])
+    assert torch.equal(v_cache[untouched], replay_cache()[untouched])
 
 
 @torch.no_grad()
@@ -485,7 +656,7 @@ def test_kda_prefill_opt_out_fallback_preserves_mixed_initial_states(monkeypatch
         torch.randn(
             slots,
             3 * projection_size,
-            CONV_KERNEL_SIZE,
+            CONV_KERNEL_SIZE - 1,
             dtype=torch.bfloat16,
             device="cuda",
         )
