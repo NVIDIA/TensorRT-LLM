@@ -602,8 +602,12 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
     tactic space (split_kv and is_persistent tactic elements), and a
     subsequent serving-mode pass must reuse the tuned kernels without
     triggering any runtime ``cute.compile`` (a compile outside the tuning
-    window stalls the serving loop).
+    window stalls the serving loop). A final pass forces the ``choose_one``
+    -1 sentinel at a non-power-of-2 batch and checks that the
+    ``default_tactic`` fallback reuses a bucket-aligned compiled kernel.
     """
+    from unittest import mock
+
     from tensorrt_llm._torch.autotuner import AutoTuner, autotune
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
     from tensorrt_llm._utils import get_sm_version
@@ -622,7 +626,6 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
     scenario = Scenario(kv_cache_dtype=torch.float8_e4m3fn,
                         num_layers=1,
                         kv_cache_tokens_per_block=tokens_per_block)
-    ctx_lens = [10] * 64
     rope_config = RopeConfig(
         hidden_size=scenario.hidden_size,
         num_attention_heads=scenario.num_heads,
@@ -642,7 +645,7 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
         model_type=scenario.model_type,
     )
 
-    def run_once() -> None:
+    def run_once(batch_size: int = 64) -> None:
         # Numerics vs the reference implementation are asserted inside.
         _run_test_for_backend("TRTLLM", scenario.num_heads,
                               scenario.num_kv_heads, scenario.num_layers,
@@ -651,7 +654,7 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
                               scenario.qk_rope_head_dim, scenario.v_head_dim,
                               rope_config, scenario.kv_cache_tokens_per_block,
                               torch.device('cuda'), scenario.dtype,
-                              scenario.kv_cache_dtype, ctx_lens, 1, 2,
+                              scenario.kv_cache_dtype, [10] * batch_size, 1, 2,
                               v2_kv_cache)
 
     AutoTuner.get().clear_cache()
@@ -687,6 +690,60 @@ def test_attention_mla_cute_dsl_autotune(v2_kv_cache: bool) -> None:
         "serving-mode pass cute.compiled new kernel variants after tuning: "
         f"{set(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) - set(kernel_keys)}"
     )
+
+    # Fallback pass: serve a non-power-of-2 batch (65) with the AutoTuner
+    # cache cleared, so ``choose_one`` misses and returns its -1 sentinel and
+    # the op must take the ``default_tactic`` branch. The fallback rounds the
+    # batch down to its tuning bucket (64), so it must land on a kernel
+    # variant the tuning pass already compiled; deriving split_kv from the
+    # raw batch could cute.compile a fresh variant in the serving loop.
+    AutoTuner.get().clear_cache()
+    fallback_calls = []
+    orig_default_tactic = CuteDSLNVMlaDecodeBlackwellRunner.default_tactic
+
+    def spying_default_tactic(self, batch_size: int):
+        tactic = orig_default_tactic(self, batch_size)
+        fallback_calls.append((self, batch_size, tactic))
+        return tactic
+
+    with mock.patch.object(CuteDSLNVMlaDecodeBlackwellRunner, "default_tactic",
+                           spying_default_tactic):
+        run_once(batch_size=65)
+
+    assert fallback_calls, (
+        "batch-65 serving pass never reached default_tactic: with the "
+        "AutoTuner cache cleared, choose_one must miss and return its -1 "
+        "sentinel")
+    runner = fallback_calls[0][0]
+    for _, batch_size, tactic in fallback_calls:
+        assert batch_size == 65, (
+            f"default_tactic saw batch {batch_size}, expected 65")
+        assert tactic == runner.default_tactic(64), (
+            f"batch-65 fallback tactic {tactic} does not match batch-64's "
+            f"{runner.default_tactic(64)}")
+    assert len(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) == \
+        num_compiled, (
+        "batch-65 default_tactic fallback cute.compiled new kernel variants "
+        "instead of reusing a bucket-64 one from tuning: "
+        f"{set(CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache) - set(kernel_keys)}"
+    )
+
+    # The assertions above can hold even for an unbucketed fallback when this
+    # GPU's occupancy makes split_kv(65) == split_kv(64), so also check the
+    # bucketing itself with the occupancy ceiling pinned to a value where the
+    # raw batch and its bucket disagree: 256 // 65 // 2 == 1, while bucket 64
+    # gives 256 // 64 // 2 == 2.
+    with mock.patch.object(CuteDSLNVMlaDecodeBlackwellRunner,
+                           "_cute_dsl_max_active_blocks",
+                           256,
+                           create=True):
+        pinned_tactic = runner.default_tactic(65)
+        assert pinned_tactic == runner.default_tactic(64), (
+            f"default_tactic no longer buckets the batch: got {pinned_tactic} "
+            f"for batch 65 vs {runner.default_tactic(64)} for batch 64")
+        assert pinned_tactic[2] == 2, (
+            f"expected bucket-64 split_kv 2 with max_active_blocks pinned to "
+            f"256, got {pinned_tactic[2]}")
 
 
 def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
