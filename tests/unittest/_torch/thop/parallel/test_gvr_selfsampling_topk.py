@@ -113,6 +113,45 @@ def test_selfsampling_topk_exactness(batch_size, top_k, n_valid):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
+# n_valid <= top_k: every valid position is in the top-K. Production short
+# path (heuristicTopKDecode.cu:72-84): identity indices + -1 tail padding.
+_SHORT_CASES = [
+    (512, 256),
+    (512, 511),
+    (512, 512),
+    (1024, 64),
+    (1024, 1024),
+    (2048, 1000),
+    (2048, 2047),
+    (2048, 2048),
+]
+
+
+@pytest.mark.parametrize("batch_size", [1, 4], ids=lambda b: f"bs{b}")
+@pytest.mark.parametrize(
+    "top_k,n_valid", _SHORT_CASES, ids=[f"k{k}_n{n}" for k, n in _SHORT_CASES]
+)
+def test_selfsampling_topk_short_path(batch_size, top_k, n_valid):
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
+    npad = (n_valid + 63) // 64 * 64
+    logits = torch.randn((batch_size, npad), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, n_valid:] = 3e38  # poison pad: the short path must never read it
+    pre_idx = torch.randint(
+        0, n_valid, (batch_size, top_k), generator=gen, dtype=torch.int32, device=_DEV
+    )
+    indices = torch.full((batch_size, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run(logits, pre_idx, n_valid, indices)
+    torch.cuda.synchronize()
+    head = indices[:, :n_valid].to(torch.int64)
+    expect = torch.arange(n_valid, dtype=torch.int64, device=_DEV).expand(batch_size, n_valid)
+    assert torch.equal(torch.sort(head, dim=1).values, expect), "short-path head not {0..n-1}"
+    if n_valid < top_k:
+        assert torch.equal(
+            indices[:, n_valid:],
+            torch.full((batch_size, top_k - n_valid), -1, dtype=torch.int32, device=_DEV),
+        ), "short-path tail must be -1 padded"
+
+
 def test_selfsampling_topk_run_ws_explicit_workspace():
     """run_ws with a caller-owned workspace must agree with run()."""
     top_k, n_valid = 1024, 65536

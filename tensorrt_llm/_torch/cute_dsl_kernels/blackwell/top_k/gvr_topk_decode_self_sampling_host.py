@@ -766,6 +766,19 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws):
     if ish[1] != k:
         indices = indices.reshape(-1)[: b * k].view(b, k)
 
+    # ---- n <= k short path (heuristicTopKDecode.cu:72-84) -------------------
+    # Every valid position is in the top-K: emit identity indices and pad the
+    # tail with -1 (the production pad convention; downstream treats -1 as
+    # invalid). Order is contract-irrelevant — exactness is tie-interchangeable
+    # SET semantics. Torch-op path for now; the CUDA-graph-safe per-row rewrite
+    # moves this branch in-kernel (it cannot fall back per row inside a graph).
+    if n <= k:
+        if n > 0:
+            indices[:, :n] = torch.arange(n, dtype=_I32, device=indices.device)
+        if n < k:
+            indices[:, n:] = -1
+        return
+
     key = (b, n, npad, k)
     lc = _LAUNCH_CACHE.get(key)
     try:
