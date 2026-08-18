@@ -1622,9 +1622,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     return
                 }
 
-                // [M3 bringup] Skip all SBSA tests on this feat branch.
-                echo "Skipping SBSA tests (M3 bringup feat branch: no SBSA test coverage)"
-                return
+                if (testFilter[(TEST_STAGE_LIST)]?.contains("NGC-Container-Scaning")) {
+                    echo "Skipping SBSA tests (PLC container scanning)"
+                    return
+                }
 
                 testStageName = "[Test-SBSA-Single-GPU] Remote Run"
                 def singleGpuTestFailed = false
@@ -1662,8 +1663,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                def requireMultiGpuTesting = currentBuild.description?.contains("Require SBSA Multi-GPU Testing") ?: false
+                // [M3 bringup] Skip all SBSA multi-GPU tests on this feat branch.
+                def requireMultiGpuTesting = false
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                echo "Skipping SBSA multi-GPU test (M3 bringup feat branch: no SBSA multi-GPU test coverage)"
                 if (!requireMultiGpuTesting) {
                     if (singleGpuTestFailed) {
                         error "SBSA single-GPU test failed"
