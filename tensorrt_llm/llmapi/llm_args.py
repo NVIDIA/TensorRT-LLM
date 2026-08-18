@@ -764,6 +764,16 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "the fmha_sm100 package, and sparse_block_size == 128.",
         status="prototype",
     )
+    decode_backend: Literal["default", "msa", "adaptive"] = Field(
+        default="default",
+        description=
+        "Sparse GQA backend for pure-decode batches under the MSA implementation. "
+        "'default' retains the Triton decode route, 'msa' always uses the "
+        "preplanned fmha_sm100 route, and 'adaptive' uses Triton for rank-local "
+        "decode batch sizes 1-7 and MSA for batch sizes >= 8. Mixed batches keep "
+        "their existing Triton generation suffix.",
+        status="prototype",
+    )
 
     @model_validator(mode="after")
     def _validate_msa_block_size(self):
@@ -782,6 +792,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
                 "the 'msa' implementation.")
+        if self.decode_backend != "default" and self.implementation != "msa":
+            raise ValueError(
+                "MiniMax-M3 decode_backend='msa' or 'adaptive' requires the "
+                "'msa' implementation.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -804,6 +818,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             score_type=self.sparse_score_type,
             disable_index_value=self.sparse_disable_index_value,
             implementation=self.implementation,
+            decode_backend=self.decode_backend,
             indexer_kv_dtype=self.indexer_kv_dtype,
             fuse_qkv_index_projection=self.fuse_qkv_index_projection,
         )
@@ -836,6 +851,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             num_index_heads=self.sparse_num_index_heads,
             topk=self.sparse_topk_blocks,
             fuse_qkv_index_projection=self.fuse_qkv_index_projection,
+            decode_backend=self.decode_backend,
         )
 
 
