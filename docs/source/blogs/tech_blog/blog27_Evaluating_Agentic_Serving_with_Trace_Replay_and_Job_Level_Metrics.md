@@ -52,7 +52,7 @@ Industry practitioners have recently introduced a growing body of work in this d
 
 ## Implementation
 
-The methodology above translates into two concrete artifacts: a trace format that captures the structure of an agent run, and a pipeline that collects those traces, replays them against the system under evaluation, and turns the result into metrics. Both ship in TensorRT-LLM, so the last part of this section walks through running the pipeline end to end.
+The methodology above translates into two concrete artifacts: a trace format that captures the structure of an agent run, and a pipeline that collects those traces, replays them against the system under evaluation, and turns the result into metrics. This section takes each in turn, then closes with how to run the pipeline yourself.
 
 ### Trace Format
 
@@ -106,15 +106,15 @@ The pieces, one by one:
 
 ### Running the Pipeline
 
-The core tracing and replay code is in [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with an example trace, runnable replay scripts, and analysis tools in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay). Three commands cover the flow.
+All of these pieces ship in TensorRT-LLM: the tracing hooks and replay engine in [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), and an example trace, a runnable replay driver, and the offline analyzer in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay). Driving them takes three commands.
 
-Collecting a trace is one switch on a Scaffolding agent run: `--enable_tracing` writes a compact `*.trace.json` alongside a full one.
+The first collects a trace, which is one switch on a Scaffolding agent run: `--enable_tracing` writes a compact `*.trace.json` alongside a full one.
 
 ```bash
 python examples/scaffolding/contrib/Coder/run_coder.py ... --enable_tracing
 ```
 
-Replaying it requires the system under evaluation behind an OpenAI-compatible endpoint, typically `trtllm-serve`, whose config is where the knobs swept in the experiments below live: the batch size **B**, the parallel strategy, and the KV-cache settings. Nothing on the replay side changes when they move. The compact trace then goes straight to the replay driver, which re-issues its requests and writes a metrics report. The example trace shipped with the code is the same Coder trace quoted above, so this step runs without collecting anything first:
+The second replays that compact file against the system under evaluation, which only has to sit behind an OpenAI-compatible endpoint, typically `trtllm-serve`. Its config is where the knobs swept in the experiments below live: the batch size **B**, the parallel strategy, and the KV-cache settings. Nothing on the replay side changes when they move, so comparing two serving configurations means running the same command twice. The example trace is the Coder trace quoted earlier, so this step works before you have collected anything of your own:
 
 ```bash
 python examples/scaffolding/trace_replay/run_trace_replay.py \
@@ -122,14 +122,14 @@ python examples/scaffolding/trace_replay/run_trace_replay.py \
   --model Qwen/Qwen3-30B-A3B --openai-base-url http://127.0.0.1:8000/v1
 ```
 
-The offline analyzer runs on the same file and needs neither GPU nor server. It reports the `optimal_*` cache hit rates that Figure 6 compares the measured rates against:
+The third reads the same file offline, needing neither GPU nor server, and reports the `optimal_*` cache hit rates that Figure 6 compares the measured rates against:
 
 ```bash
 python examples/scaffolding/trace_replay/analysis/compute_cache_hit_trace.py \
   examples/scaffolding/trace_replay/trace_example/matplotlib__matplotlib-23412/
 ```
 
-See [`examples/scaffolding/trace_replay/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/scaffolding/trace_replay/README.md) for more details: the trace schema, how tracing attaches to an agent of your own, the replay flags and report fields, and the known boundaries of replay.
+Beyond these three commands, [`examples/scaffolding/trace_replay/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/scaffolding/trace_replay/README.md) documents the trace schema, how tracing attaches to an agent of your own, the replay flags and report fields, and the known boundaries of replay.
 
 ## Trace Dataset
 
