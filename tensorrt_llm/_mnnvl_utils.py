@@ -56,7 +56,6 @@ class MnnvlMemory:
 
     # Shared across all subclasses (global/device state).
     initialized: bool = False
-    allocation_granularity: int = 0
     fabric_page_size: int = 1 << 29  # 512 MB.
     dev_id: int = None
     force_fabric_handle: bool = False
@@ -70,6 +69,8 @@ class MnnvlMemory:
         "comm": None,  # MPI communicator.
         "allocated_map": dict,  # callable for fresh dict.
         "address_refcnt": dict,  # callable for fresh dict.
+        # Derived from get_allocation_prop(), whose handle type differs per class.
+        "allocation_granularity": 0,
     }
 
     # Initialize per-class state for the base class.
@@ -79,6 +80,7 @@ class MnnvlMemory:
     comm = None
     allocated_map = {}
     address_refcnt = {}
+    allocation_granularity: int = 0
 
     def __init_subclass__(cls, **kwargs):
         """Auto-initialize per-class attributes for each subclass to avoid sharing state with parent."""
