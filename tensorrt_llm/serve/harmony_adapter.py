@@ -1914,8 +1914,8 @@ def _create_usage_info(num_prompt_tokens,
 
 
 def maybe_transform_reasoning_effort(
-    reasoning_effort: ReasoningEffort | Literal["low", "medium", "high", "max",
-                                                "none"] | None
+    reasoning_effort: ReasoningEffort
+    | Literal["low", "medium", "high", "max", "none"] | None
 ) -> ReasoningEffort | None:
     str_to_effort = {
         "low": ReasoningEffort.LOW,

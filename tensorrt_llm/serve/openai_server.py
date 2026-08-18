@@ -74,10 +74,9 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionMessageParam, ChatCompletionRequest, ChatCompletionResponse,
     ChatCompletionResponseChoice, ChatCompletionToolsParam, ChatMessage,
-    CompletionRequest,
-    CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo,
-    ErrorResponse, ImageEditRequest, ImageGenerationRequest,
+    CompletionRequest, CompletionResponse, CompletionResponseChoice,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingResponseData,
+    EmbeddingUsageInfo, ErrorResponse, ImageEditRequest, ImageGenerationRequest,
     ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
     ModelList, PromptTokensDetails, ResponseFormat, ResponsesRequest,
     ResponsesResponse, StreamOptions, TokenizeRequest, TokenizeResponse,
@@ -247,18 +246,17 @@ _DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}\Z")
 
 
 def _dynamic_tool_dicts(
-    messages: Optional[List[ChatCompletionMessageParam]]) -> list[dict]:
+        messages: Optional[List[ChatCompletionMessageParam]]) -> list[dict]:
     """Collect message-level (dynamic) tool declarations from system messages."""
     tools: list[dict] = []
     for msg in messages or []:
-        if isinstance(msg, dict) and msg.get("role") == "system" and msg.get(
-                "tools"):
+        if isinstance(
+                msg, dict) and msg.get("role") == "system" and msg.get("tools"):
             tools.extend(msg["tools"])
     return tools
 
 
-def _validate_kimi_dynamic_tools(
-        request: ChatCompletionRequest) -> None:
+def _validate_kimi_dynamic_tools(request: ChatCompletionRequest) -> None:
     """Validate message-level (dynamic) tool declarations for kimi_k3.
 
     Kimi-style dynamic tools ride on system messages. Enforce the contract
@@ -297,8 +295,7 @@ def _validate_kimi_dynamic_tools(
             name = function.get("name")
             if not isinstance(name,
                               str) or not _DYNAMIC_TOOL_NAME_RE.match(name):
-                raise ValueError(
-                    f"Invalid message-level tool name: {name!r}.")
+                raise ValueError(f"Invalid message-level tool name: {name!r}.")
             if name in seen_names:
                 raise ValueError(f"Duplicate tool name: {name!r}.")
             seen_names.add(name)
@@ -312,13 +309,13 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
     thinking effort, tool_choice, and response_format, but only reads them
     from chat-template kwargs. Derive those kwargs from the request-level
     fields so the OpenAI-style API surface drives the template; explicit
-    client-supplied ``chat_template_kwargs`` win over derived values. The
+    client-supplied `chat_template_kwargs` win over derived values. The
     merged kwargs also steer the kimi_k3 reasoning parser's initial channel,
     the guided-decoding structural tag, and the thinking-budget logits
     processor downstream.
 
     Kimi's API also reports usage in the final streaming chunk without the
-    client opting in, so default ``stream_options`` for streaming requests.
+    client opting in, so default `stream_options` for streaming requests.
     """
     if model_type != "kimi_k3":
         return
@@ -335,9 +332,8 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
             derived["thinking_effort"] = request.thinking.effort
     if ("reasoning_effort" in request.model_fields_set
             and request.reasoning_effort is not None
-            and "thinking_effort" not in derived
-            and (request.thinking is None
-                 or request.thinking.type != "disabled")):
+            and "thinking_effort" not in derived and
+        (request.thinking is None or request.thinking.type != "disabled")):
         # Kimi semantics: an explicit thinking.effort wins, and an explicit
         # thinking object also wins the on/off axis — reasoning_effort only
         # supplies the effort when thinking.effort is absent, and
@@ -359,8 +355,8 @@ def _apply_kimi_chat_extensions(request: ChatCompletionRequest,
             and request.tool_choice in ("required", "none")):
         derived["tool_choice"] = request.tool_choice
     response_format = request.response_format
-    if response_format is not None and response_format.type in (
-            "json_object", "json_schema"):
+    if response_format is not None and response_format.type in ("json_object",
+                                                                "json_schema"):
         derived["response_format"] = response_format.type
         if response_format.type == "json_schema":
             # Kimi requires the OpenAI wrapper shape: {name, schema[, strict]}.
