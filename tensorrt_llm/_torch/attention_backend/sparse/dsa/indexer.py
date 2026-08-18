@@ -691,6 +691,28 @@ class Indexer(nn.Module):
         self._enable_heuristic_topk = (
             sparse_params.enable_heuristic_topk and get_sm_version() >= 100
         )
+        # Opt-in self-sampling GVR top-K decode (standalone CuTeDSL modules,
+        # env-gated experimental path: TRTLLM_GVR_SELF_SAMPLING=1). Same
+        # operator contract as the tiered heuristic path (per-request device
+        # kv_lens, request-level raw prev-top-K hints, per-row MTP window,
+        # in-kernel n <= topK short path); tuning is frozen from
+        # indexer_max_seq_len at capture time, so the launch is
+        # CUDA-graph-replay safe. Contract violations raise loudly rather
+        # than silently falling back — this flag is an explicit experiment.
+        self._use_self_sampling_topk = (
+            os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") == "1"
+            and IS_CUTLASS_DSL_AVAILABLE
+            and get_sm_version() >= 100
+            and sparse_params.index_topk in (512, 1024, 2048)
+            and compress_ratio in (1, 4)
+        )
+        self._selfsampling_run_varlen = None
+        if self._use_self_sampling_topk:
+            from ....cute_dsl_kernels.blackwell.top_k import (
+                selfsampling_topk_run_varlen,
+            )
+
+            self._selfsampling_run_varlen = selfsampling_topk_run_varlen
         self.mtp_index_share = sparse_params.mtp_index_share
 
         if self._enable_heuristic_topk and layer_idx == 0:
@@ -1813,7 +1835,26 @@ class Indexer(nn.Module):
                     if not metadata.use_cute_dsl_topk:
                         heuristic_scratch = metadata.heuristic_scratch_values[:num_gen_tokens]
 
-                if self.use_cute_dsl_topk and self._enable_heuristic_topk:
+                if (
+                    self._use_self_sampling_topk
+                    and self._enable_heuristic_topk
+                    and pre_idx is not None
+                ):
+                    # Self-sampling GVR varlen engine (TRTLLM_GVR_SELF_SAMPLING=1):
+                    # one launch for the batch; per-row n from device kv_lens,
+                    # capture-stable tuning from indexer_max_seq_len (no host
+                    # reads — CUDA-graph safe). Hints are consumed raw for all
+                    # of DSv3.2 / Flash / Pro (offset-free hint contract).
+                    self._selfsampling_run_varlen(
+                        logits_decode,
+                        pre_idx,
+                        gen_kv_lens_cuda,
+                        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
+                        next_n=next_n,
+                        compress_ratio=self.compress_ratio,
+                        max_seq_len=indexer_max_seq_len,
+                    )
+                elif self.use_cute_dsl_topk and self._enable_heuristic_topk:
                     torch.ops.trtllm.cute_dsl_gvr_topk_decode(
                         logits_decode,
                         pre_idx,
