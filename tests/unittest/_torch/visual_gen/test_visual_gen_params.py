@@ -194,6 +194,37 @@ class TestMediaRefValidation:
         with pytest.raises(ValidationError, match=r"format\s+Field required"):
             MediaRef(content="a.png")
 
+    @pytest.mark.parametrize(
+        "content,content_format",
+        [("not-bytes", "bytes"), (b"\x89PNG", "base64"), (b"\x89PNG", "path"), (b"x", "url")],
+    )
+    def test_content_type_must_match_format(self, content, content_format):
+        """The pairing is enforced at construction, not deep in the engine."""
+        from pydantic import ValidationError
+
+        from tensorrt_llm.visual_gen import MediaRef
+
+        with pytest.raises(ValidationError, match="requires (bytes|string) content"):
+            MediaRef(content=content, format=content_format)
+
+    def test_content_type_matching_format_accepted(self):
+        from tensorrt_llm.visual_gen import MediaRef
+
+        assert MediaRef(content=b"raw", format="bytes").content == b"raw"
+        for fmt in ("path", "url", "base64"):
+            assert MediaRef(content="x", format=fmt).format == fmt
+
+    def test_engine_rewrite_is_not_blocked_by_the_pairing_check(self):
+        """``prepare_reference_slots`` rewrites content then format, so the
+        intermediate state contradicts the pairing; assignment must not
+        re-validate or that rewrite would be impossible."""
+        from tensorrt_llm.visual_gen import MediaRef
+
+        ref = MediaRef(content="aGk=", format="base64")
+        ref.content = "/tmp/materialized"  # contradicts format for one statement
+        ref.format = "path"
+        assert (ref.content, ref.format) == ("/tmp/materialized", "path")
+
     def test_unknown_format_rejected(self):
         from pydantic import ValidationError
 

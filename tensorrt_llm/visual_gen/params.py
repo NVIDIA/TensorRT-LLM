@@ -15,7 +15,7 @@
 import ast
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 
@@ -52,6 +52,27 @@ class MediaRef(StrictBaseModel):
     role: Optional[Role] = Field(
         default=None, description="``reference`` | ``first_frame`` | ``last_frame``."
     )
+
+    @model_validator(mode="after")
+    def _check_content_matches_format(self):
+        """Reject a ``content`` whose Python type contradicts ``format``.
+
+        ``bytes`` is the only format carrying a binary payload; the other three
+        name a location or an encoding and are therefore strings. Checking the
+        pairing here fails at construction — an HTTP 422 or an immediate
+        ``ValueError`` — instead of deep in the engine's resolve step.
+        """
+        if self.format == "bytes":
+            if not isinstance(self.content, bytes):
+                raise ValueError(
+                    f"format='bytes' requires bytes content, got {type(self.content).__name__}."
+                )
+        elif not isinstance(self.content, str):
+            raise ValueError(
+                f"format={self.format!r} requires string content, got "
+                f"{type(self.content).__name__}."
+            )
+        return self
 
 
 def _reject_bare_refs(value: Any) -> Any:
