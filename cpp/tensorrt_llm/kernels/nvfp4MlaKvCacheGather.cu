@@ -34,11 +34,72 @@ constexpr int32_t kWarpSize = 32;
 constexpr int32_t kWarpsPerBlock = 8;
 constexpr int32_t kThreadsPerBlock = kWarpSize * kWarpsPerBlock;
 constexpr int32_t kBlocksPerSm = 6;
+constexpr int32_t kGenerationBlocksPerSm = 8;
+constexpr int32_t kAsyncCopyBytes = 16;
+constexpr int32_t kScaleCopyBytes = 4;
+constexpr int32_t kMlaHeadDim = 576;
+constexpr int32_t kMlaPackedHeadDim = kMlaHeadDim / 2;
+constexpr int32_t kMlaScalesPerToken = kMlaHeadDim / 16;
+constexpr int32_t kMlaStagingRowBytes
+    = (kMlaPackedHeadDim + kMlaScalesPerToken + kAsyncCopyBytes - 1) / kAsyncCopyBytes * kAsyncCopyBytes;
+constexpr int32_t kMlaStagingBuffers = 3;
 constexpr size_t kWorkspaceAlignment = 256;
 
 constexpr size_t alignUp(size_t value, size_t alignment)
 {
     return (value + alignment - 1) / alignment * alignment;
+}
+
+__device__ __forceinline__ void copyAsync16(void* destination, void const* source, uint32_t sourceBytes)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    uint32_t const sharedAddress = static_cast<uint32_t>(__cvta_generic_to_shared(destination));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :
+                 : "r"(sharedAddress), "l"(source), "r"(sourceBytes));
+#else
+    if (sourceBytes == kAsyncCopyBytes)
+    {
+        *static_cast<uint4*>(destination) = *static_cast<uint4 const*>(source);
+    }
+    else
+    {
+        *static_cast<uint4*>(destination) = make_uint4(0, 0, 0, 0);
+    }
+#endif
+}
+
+__device__ __forceinline__ void copyAsync4(void* destination, void const* source, uint32_t sourceBytes)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    uint32_t const sharedAddress = static_cast<uint32_t>(__cvta_generic_to_shared(destination));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n"
+                 :
+                 : "r"(sharedAddress), "l"(source), "r"(sourceBytes));
+#else
+    *static_cast<uint32_t*>(destination) = sourceBytes == kScaleCopyBytes ? *static_cast<uint32_t const*>(source) : 0;
+#endif
+}
+
+__device__ __forceinline__ void commitAsyncCopies()
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.commit_group;\n");
+#endif
+}
+
+__device__ __forceinline__ void waitAsyncCopies()
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group 0;\n");
+#endif
+}
+
+__device__ __forceinline__ void waitAsyncCopiesKeepOne()
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group 1;\n");
+#endif
 }
 
 __device__ __forceinline__ uint2 convertE2m1x4ToFp16x4(uint16_t packed)
@@ -109,6 +170,57 @@ __device__ __forceinline__ uint32_t convertUnitScaledE2m1x4ToE4m3(uint16_t packe
 #endif
 }
 
+__device__ __forceinline__ uint2 convertUnitScaledE2m1x8ToE4m3(uint32_t packed, __nv_fp8_e4m3 scale)
+{
+    uint32_t const low = convertUnitScaledE2m1x4ToE4m3(static_cast<uint16_t>(packed), scale);
+    uint32_t const high = convertUnitScaledE2m1x4ToE4m3(static_cast<uint16_t>(packed >> 16), scale);
+    return make_uint2(low, high);
+}
+
+__device__ __forceinline__ uint4 convertUnitScaledE2m1x16ToE4m3(uint2 packed, __nv_fp8_e4m3 scale)
+{
+    uint2 const low = convertUnitScaledE2m1x8ToE4m3(packed.x, scale);
+    uint2 const high = convertUnitScaledE2m1x8ToE4m3(packed.y, scale);
+    return make_uint4(low.x, low.y, high.x, high.y);
+}
+
+__device__ __forceinline__ void prefetchMlaRow(
+    uint8_t* stagingRow, uint8_t const* dataPool, __nv_fp8_e4m3 const* scalePool, int32_t globalIdx, int32_t lane)
+{
+    bool const valid = globalIdx >= 0;
+    auto const* packedRow = valid ? dataPool + static_cast<int64_t>(globalIdx) * kMlaPackedHeadDim : dataPool;
+    auto const* scaleRow = valid ? scalePool + static_cast<int64_t>(globalIdx) * kMlaScalesPerToken : scalePool;
+    uint32_t const dataBytes = valid ? kAsyncCopyBytes : 0U;
+    uint32_t const scaleBytes = valid ? kScaleCopyBytes : 0U;
+    constexpr int32_t kDataCopyLanes = kMlaPackedHeadDim / kAsyncCopyBytes;
+    constexpr int32_t kScaleCopyLanes = kMlaScalesPerToken / kScaleCopyBytes;
+    if (lane < kDataCopyLanes)
+    {
+        copyAsync16(stagingRow + lane * kAsyncCopyBytes, packedRow + lane * kAsyncCopyBytes, dataBytes);
+    }
+    else if (lane < kDataCopyLanes + kScaleCopyLanes)
+    {
+        int32_t const scaleLane = lane - kDataCopyLanes;
+        copyAsync4(stagingRow + kMlaPackedHeadDim + scaleLane * kScaleCopyBytes, scaleRow + scaleLane * kScaleCopyBytes,
+            scaleBytes);
+    }
+    commitAsyncCopies();
+}
+
+__device__ __forceinline__ int32_t fetchGlobalIndex(
+    int32_t const* globalIndices, int32_t* compactIndices, int64_t pair, int64_t numPoolTokens, int32_t lane)
+{
+    int32_t globalIdx = -1;
+    if (lane == 0)
+    {
+        globalIdx = globalIndices[pair];
+        bool const valid = globalIdx >= 0 && static_cast<int64_t>(globalIdx) < numPoolTokens;
+        compactIndices[pair] = valid ? static_cast<int32_t>(pair) : -1;
+        globalIdx = valid ? globalIdx : -1;
+    }
+    return __shfl_sync(0xFFFFFFFFU, globalIdx, 0);
+}
+
 template <bool kUnitGlobalScale>
 __device__ __forceinline__ void dequantizeRow(uint8_t const* __restrict__ dataPool,
     __nv_fp8_e4m3 const* __restrict__ scalePool, __nv_fp8_e4m3* __restrict__ output, int32_t globalIdx,
@@ -120,29 +232,37 @@ __device__ __forceinline__ void dequantizeRow(uint8_t const* __restrict__ dataPo
     auto const* scaleRow = scalePool + static_cast<int64_t>(globalIdx) * scalesPerToken;
     auto* outputRow = output + static_cast<int64_t>(outputIdx) * headDim;
 
-    // Four neighboring lanes cooperatively convert one 16-value scaling group.
-    // Each lane handles four packed values and emits one 4-byte FP8 store. For
-    // a unit global scale, E2M1 times E4M3 is exactly representable in FP16, so
-    // the half2 path preserves the FP8 result. Other scales retain FP32 math.
-    int32_t const groupLane = lane % 4;
-    for (int32_t groupBase = 0; groupBase < scalesPerToken; groupBase += kWarpSize / 4)
+    if constexpr (kUnitGlobalScale)
     {
-        int32_t const group = groupBase + lane / 4;
-        bool const active = group < scalesPerToken;
-        uint32_t const activeMask = __ballot_sync(0xFFFFFFFFU, active);
-        if (!active)
+        // E2M1 times E4M3 is exactly representable in FP16, so each lane can
+        // convert a complete 16-value scaling group and emit one 16-byte store.
+        for (int32_t groupBase = 0; groupBase < scalesPerToken; groupBase += kWarpSize)
         {
-            continue;
+            int32_t const group = groupBase + lane;
+            if (group < scalesPerToken)
+            {
+                uint2 const packed = *reinterpret_cast<uint2 const*>(packedRow + static_cast<int64_t>(group) * 8);
+                *reinterpret_cast<uint4*>(outputRow + static_cast<int64_t>(group) * 16)
+                    = convertUnitScaledE2m1x16ToE4m3(packed, scaleRow[group]);
+            }
         }
-        uint16_t const packed
-            = *reinterpret_cast<uint16_t const*>(packedRow + static_cast<int64_t>(group) * 8 + groupLane * 2);
-        uint32_t converted;
-        if constexpr (kUnitGlobalScale)
+    }
+    else
+    {
+        // Four neighboring lanes cooperatively convert one scaling group. FP32
+        // math preserves the result for arbitrary global dequantization scales.
+        int32_t const groupLane = lane % 4;
+        for (int32_t groupBase = 0; groupBase < scalesPerToken; groupBase += kWarpSize / 4)
         {
-            converted = convertUnitScaledE2m1x4ToE4m3(packed, scaleRow[group]);
-        }
-        else
-        {
+            int32_t const group = groupBase + lane / 4;
+            bool const active = group < scalesPerToken;
+            uint32_t const activeMask = __ballot_sync(0xFFFFFFFFU, active);
+            if (!active)
+            {
+                continue;
+            }
+            uint16_t const packed
+                = *reinterpret_cast<uint16_t const*>(packedRow + static_cast<int64_t>(group) * 8 + groupLane * 2);
             float scale = groupLane == 0 ? static_cast<float>(scaleRow[group]) * dequantScale : 0.F;
             scale = __shfl_sync(activeMask, scale, lane - groupLane);
             float4 values = convertE2m1x4ToFloat4(packed);
@@ -150,22 +270,85 @@ __device__ __forceinline__ void dequantizeRow(uint8_t const* __restrict__ dataPo
             values.y *= scale;
             values.z *= scale;
             values.w *= scale;
-            converted = convertFloat4ToE4m3(values);
+            *reinterpret_cast<uint32_t*>(outputRow + static_cast<int64_t>(group) * 16 + groupLane * 4)
+                = convertFloat4ToE4m3(values);
         }
-        *reinterpret_cast<uint32_t*>(outputRow + static_cast<int64_t>(group) * 16 + groupLane * 4) = converted;
     }
 }
 
-__global__ void nvFp4MlaKvCacheGatherKernel(uint8_t const* __restrict__ dataPool,
-    __nv_fp8_e4m3 const* __restrict__ scalePool, int32_t const* __restrict__ globalIndices,
-    __nv_fp8_e4m3* __restrict__ output, int32_t* __restrict__ compactIndices,
+__global__ __launch_bounds__(kThreadsPerBlock, kGenerationBlocksPerSm) void nvFp4MlaKvCacheGatherKernel(
+    uint8_t const* __restrict__ dataPool, __nv_fp8_e4m3 const* __restrict__ scalePool,
+    int32_t const* __restrict__ globalIndices, __nv_fp8_e4m3* __restrict__ output, int32_t* __restrict__ compactIndices,
     float const* __restrict__ globalDequantScale, int64_t numPairs, int32_t headDim, int64_t numPoolTokens)
 {
     int32_t const warp = threadIdx.x / kWarpSize;
     int32_t const lane = threadIdx.x % kWarpSize;
     float const dequantScale = globalDequantScale == nullptr ? 1.F : globalDequantScale[0];
+    __shared__ __align__(16) uint8_t staging[kMlaStagingBuffers][kWarpsPerBlock][kMlaStagingRowBytes];
     int64_t pair = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
     int64_t const pairStride = static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
+    if (dequantScale == 1.F && headDim == kMlaHeadDim)
+    {
+        if (pair >= numPairs)
+        {
+            return;
+        }
+
+        int32_t globalIdx = fetchGlobalIndex(globalIndices, compactIndices, pair, numPoolTokens, lane);
+        int32_t stage = 0;
+        prefetchMlaRow(staging[stage][warp], dataPool, scalePool, globalIdx, lane);
+        int64_t nextPair = pair + pairStride;
+        bool hasNext = nextPair < numPairs;
+        int32_t nextGlobalIdx = -1;
+        if (hasNext)
+        {
+            nextGlobalIdx = fetchGlobalIndex(globalIndices, compactIndices, nextPair, numPoolTokens, lane);
+            prefetchMlaRow(staging[1][warp], dataPool, scalePool, nextGlobalIdx, lane);
+        }
+        while (true)
+        {
+            if (hasNext)
+            {
+                waitAsyncCopiesKeepOne();
+            }
+            else
+            {
+                waitAsyncCopies();
+            }
+            __syncwarp();
+
+            int64_t const followingPair = nextPair + pairStride;
+            bool const hasFollowing = hasNext && followingPair < numPairs;
+            int32_t followingGlobalIdx = -1;
+            if (hasFollowing)
+            {
+                followingGlobalIdx
+                    = fetchGlobalIndex(globalIndices, compactIndices, followingPair, numPoolTokens, lane);
+                int32_t const prefetchStage = stage == 0 ? 2 : stage - 1;
+                prefetchMlaRow(staging[prefetchStage][warp], dataPool, scalePool, followingGlobalIdx, lane);
+            }
+
+            if (globalIdx >= 0)
+            {
+                auto const* stagedScales
+                    = reinterpret_cast<__nv_fp8_e4m3 const*>(staging[stage][warp] + kMlaPackedHeadDim);
+                dequantizeRow<true>(
+                    staging[stage][warp], stagedScales, output, 0, static_cast<int32_t>(pair), kMlaHeadDim, 1.F, lane);
+            }
+            if (!hasNext)
+            {
+                break;
+            }
+            pair = nextPair;
+            globalIdx = nextGlobalIdx;
+            nextPair = followingPair;
+            nextGlobalIdx = followingGlobalIdx;
+            hasNext = hasFollowing;
+            stage = stage == kMlaStagingBuffers - 1 ? 0 : stage + 1;
+        }
+        return;
+    }
+
     for (; pair < numPairs; pair += pairStride)
     {
         int32_t globalIdx = 0;
@@ -309,11 +492,11 @@ __global__ void remapContextTopKKernel(int32_t const* __restrict__ localTopKIndi
     }
 }
 
-int32_t getPersistentBlockCount(int64_t workItems)
+int32_t getPersistentBlockCount(int64_t workItems, int32_t blocksPerSm = kBlocksPerSm)
 {
     int32_t const workBlocks = static_cast<int32_t>((workItems + kWarpsPerBlock - 1) / kWarpsPerBlock);
     static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    return std::max(1, std::min(workBlocks, smCount * kBlocksPerSm));
+    return std::max(1, std::min(workBlocks, smCount * blocksPerSm));
 }
 
 } // namespace
@@ -332,7 +515,7 @@ void invokeNvFp4MlaKvCacheGather(uint8_t const* dataPool, __nv_fp8_e4m3 const* s
     int64_t const numPairs = static_cast<int64_t>(numRows) * topK;
     TLLM_CHECK_WITH_INFO(
         numPairs <= std::numeric_limits<int32_t>::max(), "NVFP4 MLA gather compact indices exceed int32 capacity");
-    int32_t const blocks = getPersistentBlockCount(numPairs);
+    int32_t const blocks = getPersistentBlockCount(numPairs, kGenerationBlocksPerSm);
     nvFp4MlaKvCacheGatherKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(dataPool, scalePool, globalIndices, output,
         compactIndices, globalDequantScale, numPairs, headDim, numPoolTokens);
     TLLM_CUDA_CHECK(cudaGetLastError());
