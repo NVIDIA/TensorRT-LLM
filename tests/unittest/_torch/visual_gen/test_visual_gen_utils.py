@@ -28,7 +28,19 @@ from tensorrt_llm.serve.visual_gen_utils import (
     parse_visual_gen_params,
 )
 from tensorrt_llm.visual_gen import VisualGenParams
-from tensorrt_llm.visual_gen.media_refs import cleanup_reference_files
+from tensorrt_llm.visual_gen.media_refs import cleanup_reference_files, prepare_reference_slots
+
+
+def _parse_and_prepare(request, generator, request_id, media_storage_path):
+    """Run the production reference flow: serve transport, then engine materialize.
+
+    ``parse_visual_gen_params`` only normalizes transport (upload -> bytes,
+    strings pass through); resolution + materialization happen at the engine
+    choke point, so tests that assert on stored paths drive both stages.
+    """
+    params = parse_visual_gen_params(request, generator)
+    prepare_reference_slots(params, request_id=request_id, media_storage_path=media_storage_path)
+    return params
 
 pytestmark = pytest.mark.cpu_only
 
@@ -83,7 +95,7 @@ class TestDefaultOverlay:
         generator = _StubVisualGen(
             defaults={"width": 1024, "height": 1024, "num_inference_steps": 30},
         )
-        params = parse_visual_gen_params(image_request_defaults, "id-1", generator)
+        params = parse_visual_gen_params(image_request_defaults, generator)
         assert params.width == 1024
         assert params.height == 1024
         assert params.num_inference_steps == 30
@@ -103,7 +115,7 @@ class TestDefaultOverlay:
             n=4,
             negative_prompt="blurry",
         )
-        params = parse_visual_gen_params(request, "id-2", generator)
+        params = parse_visual_gen_params(request, generator)
         assert (params.width, params.height) == (512, 512)
         assert params.num_inference_steps == 10
         assert params.guidance_scale == 4.0
@@ -115,19 +127,19 @@ class TestDefaultOverlay:
     def test_size_string_used_when_width_height_absent(self):
         generator = _StubVisualGen()
         request = ImageGenerationRequest(prompt="cat", size="768x256")
-        params = parse_visual_gen_params(request, "id-3", generator)
+        params = parse_visual_gen_params(request, generator)
         assert (params.width, params.height) == (768, 256)
 
     def test_width_height_pair_wins_over_size(self):
         generator = _StubVisualGen()
         request = ImageGenerationRequest(prompt="cat", size="768x256", width=128, height=64)
-        params = parse_visual_gen_params(request, "id-4", generator)
+        params = parse_visual_gen_params(request, generator)
         assert (params.width, params.height) == (128, 64)
 
     def test_image_seed_propagates(self):
         generator = _StubVisualGen()
         request = ImageGenerationRequest(prompt="cat", seed=12345)
-        params = parse_visual_gen_params(request, "id-seed", generator)
+        params = parse_visual_gen_params(request, generator)
         assert params.seed == 12345
 
 
@@ -194,7 +206,7 @@ class TestWarnOnSet:
     def test_quality_hd_does_not_override_steps(self):
         generator = _StubVisualGen(defaults={"num_inference_steps": 25})
         request = ImageGenerationRequest(prompt="cat", quality="hd")
-        params = parse_visual_gen_params(request, "id-q", generator)
+        params = parse_visual_gen_params(request, generator)
         # ``quality`` is an OpenAI-shape no-semantic field. The pipeline
         # default for ``num_inference_steps`` must reach the engine
         # unchanged.
@@ -234,21 +246,21 @@ class TestVideoFrameBudget:
     def test_num_frames_wins_over_seconds_times_frame_rate(self):
         generator = _StubVisualGen(defaults={"frame_rate": 24.0})
         request = VideoGenerationRequest(prompt="x", num_frames=33, seconds=10.0)
-        params = parse_visual_gen_params(request, "id-v1", generator)
+        params = parse_visual_gen_params(request, generator)
         assert params.num_frames == 33
 
     def test_seconds_and_frame_rate_derive_num_frames(self):
         generator = _StubVisualGen(defaults={"frame_rate": 12.0})
         # fps alias resolves to frame_rate via populate_by_name=True
         request = VideoGenerationRequest(prompt="x", seconds=2.5, fps=24)
-        params = parse_visual_gen_params(request, "id-v2", generator)
+        params = parse_visual_gen_params(request, generator)
         assert params.frame_rate == 24.0
         assert params.num_frames == int(2.5 * 24.0)
 
     def test_seconds_alone_uses_pipeline_frame_rate(self):
         generator = _StubVisualGen(defaults={"frame_rate": 16.0})
         request = VideoGenerationRequest(prompt="x", seconds=4.0)
-        params = parse_visual_gen_params(request, "id-v3", generator)
+        params = parse_visual_gen_params(request, generator)
         assert params.frame_rate == 16.0
         assert params.num_frames == int(4.0 * 16.0)
 
@@ -259,7 +271,7 @@ class TestVideoFrameBudget:
         # leave ``num_images_per_prompt`` unchanged from the pipeline
         # default.
         request = VideoGenerationRequest(prompt="x")
-        params = parse_visual_gen_params(request, "id-v4", generator)
+        params = parse_visual_gen_params(request, generator)
         assert params.num_images_per_prompt == 1
 
 
@@ -276,9 +288,7 @@ class TestInputReferenceMaterialization:
         img.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
         request = VideoGenerationRequest(prompt="x", image_reference=b64)
-        params = parse_visual_gen_params(
-            request, "vid-1", generator, media_storage_path=str(tmp_path)
-        )
+        params = _parse_and_prepare(request, generator, "vid-1", str(tmp_path))
         assert len(params.image_reference) == 1
         ref_path = params.image_reference[0].content
         assert str(ref_path).endswith("vid-1_image_ref_0")
@@ -295,9 +305,7 @@ class TestInputReferenceMaterialization:
         request = VideoGenerationRequest(
             prompt="x", image_reference=[b64, {"content": b64, "role": "last_frame"}]
         )
-        params = parse_visual_gen_params(
-            request, "vid-r", generator, media_storage_path=str(tmp_path)
-        )
+        params = _parse_and_prepare(request, generator, "vid-r", str(tmp_path))
         assert [r.role for r in params.image_reference] == [None, "last_frame"]
         paths = [r.content for r in params.image_reference]
         assert len(set(paths)) == 2  # unique file per index
@@ -310,7 +318,7 @@ class TestInputReferenceMaterialization:
         b64 = base64.b64encode(buf.getvalue()).decode()
         request = VideoGenerationRequest(prompt="x", image_reference=b64)
         with pytest.raises(ValueError, match="media_storage_path"):
-            parse_visual_gen_params(request, "vid-2", generator, media_storage_path=None)
+            _parse_and_prepare(request, generator, "vid-2", None)
 
     _TEST_DATA = Path(__file__).parent / "test_data"
 
@@ -335,9 +343,7 @@ class TestInputReferenceMaterialization:
         payload = self._avi_bytes()
         upload = UploadFile(file=BytesIO(payload), filename="clip.avi")
         request = VideoGenerationRequest(prompt="x", video_reference=upload)
-        params = parse_visual_gen_params(
-            request, "vid-avi", generator, media_storage_path=str(tmp_path)
-        )
+        params = _parse_and_prepare(request, generator, "vid-avi", str(tmp_path))
         assert params.image_reference is None
         assert Path(params.video_reference[0].content).read_bytes() == payload
 
@@ -346,9 +352,7 @@ class TestInputReferenceMaterialization:
         payload = self._mp4_bytes()
         upload = UploadFile(file=BytesIO(payload), filename="clip.mp4")
         request = VideoGenerationRequest(prompt="x", video_reference=upload)
-        params = parse_visual_gen_params(
-            request, "vid-3", generator, media_storage_path=str(tmp_path)
-        )
+        params = _parse_and_prepare(request, generator, "vid-3", str(tmp_path))
         # Encoded payload is persisted byte-identical — the boundary never
         # decodes video; the worker demuxes/NVDEC-decodes the conditioning
         # window from the stored file.
@@ -364,7 +368,7 @@ class TestInputReferenceMaterialization:
         b64 = base64.b64encode(self._mp4_bytes()).decode()
         request = VideoGenerationRequest(prompt="x", video_reference=b64)
         with pytest.raises(ValueError, match="media_storage_path"):
-            parse_visual_gen_params(request, "vid-9", generator, media_storage_path=None)
+            _parse_and_prepare(request, generator, "vid-9", None)
 
     def test_deprecated_input_reference_routes_by_sniff(self, tmp_path):
         # The deprecated single input_reference is sniff-routed to the typed slot.
@@ -374,19 +378,19 @@ class TestInputReferenceMaterialization:
         img_b64 = base64.b64encode(buf.getvalue()).decode()
         vid_b64 = base64.b64encode(self._mp4_bytes()).decode()
 
-        p = parse_visual_gen_params(
+        p = _parse_and_prepare(
             VideoGenerationRequest(prompt="x", input_reference=img_b64),
-            "vid-i",
             generator,
-            media_storage_path=str(tmp_path),
+            "vid-i",
+            str(tmp_path),
         )
         assert len(p.image_reference) == 1 and p.video_reference is None
 
-        p = parse_visual_gen_params(
+        p = _parse_and_prepare(
             VideoGenerationRequest(prompt="x", input_reference=vid_b64),
-            "vid-v",
             generator,
-            media_storage_path=str(tmp_path),
+            "vid-v",
+            str(tmp_path),
         )
         assert len(p.video_reference) == 1 and p.image_reference is None
 
@@ -397,11 +401,11 @@ class TestInputReferenceMaterialization:
         Image.new("RGB", (4, 4)).save(buf, format="PNG")
         img_b64 = base64.b64encode(buf.getvalue()).decode()
         vid_b64 = base64.b64encode(self._mp4_bytes()).decode()
-        p = parse_visual_gen_params(
+        p = _parse_and_prepare(
             VideoGenerationRequest(prompt="x", image_reference=img_b64, input_reference=vid_b64),
-            "vid-x",
             generator,
-            media_storage_path=str(tmp_path),
+            "vid-x",
+            str(tmp_path),
         )
         assert len(p.image_reference) == 1
         assert p.video_reference is None  # input_reference video dropped
@@ -413,9 +417,7 @@ class TestInputReferenceMaterialization:
         payload = self._mp4_bytes()
         b64 = base64.b64encode(payload).decode()
         request = VideoGenerationRequest(prompt="x", video_reference=b64)
-        params = parse_visual_gen_params(
-            request, "vid-4", generator, media_storage_path=str(tmp_path)
-        )
+        params = _parse_and_prepare(request, generator, "vid-4", str(tmp_path))
         assert params.image_reference is None
         assert Path(params.video_reference[0].content).read_bytes() == payload
 
@@ -429,9 +431,7 @@ class TestInputReferenceMaterialization:
         payload = self._mp4_bytes()
         b64 = base64.b64encode(payload).decode()
         request = VideoGenerationRequest(prompt="x", video_reference=b64)
-        params = parse_visual_gen_params(
-            request, "vid-10", generator, media_storage_path=str(tmp_path)
-        )
+        params = _parse_and_prepare(request, generator, "vid-10", str(tmp_path))
         assert Path(params.video_reference[0].content).read_bytes() == payload
 
     def test_multipart_image_reference_written_to_disk(self, tmp_path):
@@ -444,9 +444,7 @@ class TestInputReferenceMaterialization:
         buf.seek(0)
         upload = UploadFile(file=buf, filename="ref.jpg")
         request = VideoGenerationRequest(prompt="x", image_reference=upload)
-        params = parse_visual_gen_params(
-            request, "vid-5", generator, media_storage_path=str(tmp_path)
-        )
+        params = _parse_and_prepare(request, generator, "vid-5", str(tmp_path))
         assert params.extra_params is None
         assert str(params.image_reference[0].content).endswith("vid-5_image_ref_0")
 
@@ -458,18 +456,18 @@ class TestInputReferenceMaterialization:
         img_b64 = base64.b64encode(buf.getvalue()).decode()
         vid_b64 = base64.b64encode(self._mp4_bytes()).decode()
         with pytest.raises(ValueError, match="video_reference is not a recognized"):
-            parse_visual_gen_params(
+            _parse_and_prepare(
                 VideoGenerationRequest(prompt="x", video_reference=img_b64),
-                "vid-m1",
                 generator,
-                media_storage_path=str(tmp_path),
+                "vid-m1",
+                str(tmp_path),
             )
         with pytest.raises(ValueError, match="image_reference is not a recognized image"):
-            parse_visual_gen_params(
+            _parse_and_prepare(
                 VideoGenerationRequest(prompt="x", image_reference=vid_b64),
-                "vid-m2",
                 generator,
-                media_storage_path=str(tmp_path),
+                "vid-m2",
+                str(tmp_path),
             )
         assert list(tmp_path.iterdir()) == []
 
@@ -478,7 +476,7 @@ class TestInputReferenceMaterialization:
         b64 = base64.b64encode(b"neither an image nor a video").decode()
         request = VideoGenerationRequest(prompt="x", image_reference=b64)
         with pytest.raises(ValueError, match="not a recognized image"):
-            parse_visual_gen_params(request, "vid-6", generator, media_storage_path=str(tmp_path))
+            _parse_and_prepare(request, generator, "vid-6", str(tmp_path))
         # Classification runs on the bytes; rejected content never touches disk.
         assert list(tmp_path.iterdir()) == []
 
@@ -488,7 +486,7 @@ class TestInputReferenceMaterialization:
         # length, so b64decode raises.
         request = VideoGenerationRequest(prompt="x", image_reference="ABC")
         with pytest.raises(ValueError, match="not valid base64"):
-            parse_visual_gen_params(request, "vid-7", generator, media_storage_path=str(tmp_path))
+            _parse_and_prepare(request, generator, "vid-7", str(tmp_path))
         assert list(tmp_path.iterdir()) == []
 
     def test_upload_stream_failure_cleans_up_tmp(self, tmp_path):
@@ -502,7 +500,7 @@ class TestInputReferenceMaterialization:
         request = VideoGenerationRequest(prompt="x", video_reference=upload)
         # I/O failures keep their server-error semantics (no 400 masking) …
         with pytest.raises(OSError, match="client went away"):
-            parse_visual_gen_params(request, "vid-8", generator, media_storage_path=str(tmp_path))
+            _parse_and_prepare(request, generator, "vid-8", str(tmp_path))
         # … and the payload read fails before any file is written, so nothing leaks.
         assert list(tmp_path.iterdir()) == []
 
@@ -516,35 +514,33 @@ class TestInputReferenceMaterialization:
         bad = base64.b64encode(b"neither an image nor a video").decode()
         request = VideoGenerationRequest(prompt="x", image_reference=[good, bad])
         with pytest.raises(ValueError, match="not a recognized image"):
-            parse_visual_gen_params(request, "vid-11", generator, media_storage_path=str(tmp_path))
+            _parse_and_prepare(request, generator, "vid-11", str(tmp_path))
         assert list(tmp_path.iterdir()) == []
 
-    def test_file_uri_image_reference_read_and_materialized(self, tmp_path):
-        # A file:// reference is read from local disk and persisted like any other.
+    def test_file_uri_image_reference_passthrough(self, tmp_path):
+        # A file:// reference is a trusted local path: normalized to a plain path
+        # and passed through untouched — not copied into media storage.
         generator = _StubVisualGen()
         src = tmp_path / "ref.png"
         Image.new("RGB", (4, 4), (7, 8, 9)).save(src, format="PNG")
         store = tmp_path / "store"
         store.mkdir()
         request = VideoGenerationRequest(prompt="x", image_reference=src.as_uri())
-        params = parse_visual_gen_params(
-            request, "vid-file", generator, media_storage_path=str(store)
-        )
-        assert Path(params.image_reference[0].content).read_bytes() == src.read_bytes()
+        params = _parse_and_prepare(request, generator, "vid-file", str(store))
+        assert params.image_reference[0].content == str(src)
+        assert list(store.iterdir()) == []
 
-    def test_bare_path_image_reference_read_and_materialized(self, tmp_path):
-        # A bare local path (no file:// scheme) is read from disk after the
-        # base64 decode attempt fails.
+    def test_bare_path_image_reference_passthrough(self, tmp_path):
+        # A bare local path is passed through unchanged — not materialized.
         generator = _StubVisualGen()
         src = tmp_path / "ref.png"
         Image.new("RGB", (4, 4), (11, 22, 33)).save(src, format="PNG")
         store = tmp_path / "store"
         store.mkdir()
         request = VideoGenerationRequest(prompt="x", image_reference=str(src))
-        params = parse_visual_gen_params(
-            request, "vid-bare", generator, media_storage_path=str(store)
-        )
-        assert Path(params.image_reference[0].content).read_bytes() == src.read_bytes()
+        params = _parse_and_prepare(request, generator, "vid-bare", str(store))
+        assert params.image_reference[0].content == str(src)
+        assert list(store.iterdir()) == []
 
     def test_http_url_image_reference_fetched_and_materialized(self, tmp_path, monkeypatch):
         # An http(s) reference is fetched through the guarded loader, then stored.
@@ -562,9 +558,7 @@ class TestInputReferenceMaterialization:
             lambda url, **kwargs: _FakeResp(png),
         )
         request = VideoGenerationRequest(prompt="x", image_reference="https://example.com/a.png")
-        params = parse_visual_gen_params(
-            request, "vid-url", generator, media_storage_path=str(tmp_path)
-        )
+        params = _parse_and_prepare(request, generator, "vid-url", str(tmp_path))
         assert Path(params.image_reference[0].content).read_bytes() == png
 
     def test_http_url_fetch_failure_is_client_error(self, tmp_path, monkeypatch):
@@ -578,9 +572,7 @@ class TestInputReferenceMaterialization:
         monkeypatch.setattr("tensorrt_llm.visual_gen.media_refs._safe_request_get", _blocked)
         request = VideoGenerationRequest(prompt="x", image_reference="http://10.0.0.1/a.png")
         with pytest.raises(ValueError, match="reference URL could not be fetched"):
-            parse_visual_gen_params(
-                request, "vid-ssrf", generator, media_storage_path=str(tmp_path)
-            )
+            _parse_and_prepare(request, generator, "vid-ssrf", str(tmp_path))
         assert list(tmp_path.iterdir()) == []
 
     def test_missing_file_uri_is_client_error(self, tmp_path):
@@ -589,7 +581,7 @@ class TestInputReferenceMaterialization:
         missing = (tmp_path / "does_not_exist.png").as_uri()
         request = VideoGenerationRequest(prompt="x", image_reference=missing)
         with pytest.raises(ValueError, match="reference file could not be read"):
-            parse_visual_gen_params(request, "vid-nf", generator, media_storage_path=str(tmp_path))
+            _parse_and_prepare(request, generator, "vid-nf", str(tmp_path))
         assert list(tmp_path.iterdir()) == []
 
 
@@ -704,7 +696,7 @@ class TestMediaBytesProbes:
             prompt="x", image_reference=base64.b64encode(heic).decode()
         )
         with pytest.raises(ValueError, match="HEIF/AVIF"):
-            parse_visual_gen_params(request, "vid-heic", generator, media_storage_path=None)
+            _parse_and_prepare(request, generator, "vid-heic", None)
 
     def test_truncated_image_reference_is_routed_not_decoded(self, tmp_path):
         """The boundary routes on signature and never decodes.
@@ -726,9 +718,7 @@ class TestMediaBytesProbes:
         request = VideoGenerationRequest(
             prompt="x", image_reference=base64.b64encode(truncated).decode()
         )
-        params = parse_visual_gen_params(
-            request, "vid-12", generator, media_storage_path=str(tmp_path)
-        )
+        params = _parse_and_prepare(request, generator, "vid-12", str(tmp_path))
         assert Path(params.image_reference[0].content).read_bytes() == truncated
 
 

@@ -36,12 +36,12 @@ from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_timing_headers,
 )
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
-from tensorrt_llm.visual_gen.media_refs import cleanup_reference_files
 
 if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen.params import VisualGenParams
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
 
 def _video_content_type(suffix: str) -> str:
@@ -145,27 +145,22 @@ class _VideoRoutesMixin:
         - Multipart: Send form fields + optional image_reference / video_reference file
         """
         request_received = raw_request.state.server_arrival_time
-        # Assigned before the try so the ``finally`` can always clean up any
-        # reference inputs materialized for this request id.
+        # Names this request's output files (``{video_id}_{i}``) and the b64
+        # response id; references are keyed and reclaimed by the engine instead.
         video_id = f"video_{uuid.uuid4().hex}"
         try:
             # Client-side ValueErrors from content-type parsing, request
             # translation, encoder-format preflight, parameter validation,
-            # and the synchronous engine call return 400. Serialization /
-            # encoder failures further down (server-side) fall through to
-            # the outer ``except Exception`` → 500.
+            # and the engine call return 400. Serialization / encoder failures
+            # further down (server-side) fall through to the outer
+            # ``except Exception`` → 500.
             try:
                 # Parse request based on content-type
                 request = await self._parse_video_generation_request(raw_request)
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(
-                    request,
-                    video_id,
-                    self.generator,
-                    media_storage_path=str(self.media_storage_path),
-                )
+                params = parse_visual_gen_params(request, self.generator)
                 request_format = _resolve_tensor_only_format(
                     request.format, request.extra_params, self.generator.extra_param_specs
                 )
@@ -174,7 +169,13 @@ class _VideoRoutesMixin:
                     f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
                 )
                 sync_video_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt, params=params)
+                # Offload the blocking resolve/materialize/enqueue off the event
+                # loop but await it, so bad media / bad params still surface as
+                # 400 here; then await generation on the executor's loop.
+                handle = await asyncio.to_thread(
+                    self.generator.generate_async, request.prompt, params
+                )
+                output = await handle.aresult()
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:
@@ -281,11 +282,6 @@ class _VideoRoutesMixin:
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-        finally:
-            # References are input-only; the pipeline has consumed them by now,
-            # so remove them (success or failure) — conditioned requests must not
-            # accumulate materialized inputs in media storage.
-            cleanup_reference_files(str(self.media_storage_path), video_id)
 
     async def _parse_video_generation_request(
         self,
@@ -384,10 +380,9 @@ class _VideoRoutesMixin:
         - Multipart: Send form fields + optional image_reference / video_reference file
         """
         request_received = raw_request.state.server_arrival_time
-        # Assigned before the try so the ``finally`` can clean up references
-        # materialized for this request if no background task takes ownership.
+        # Names this request's output files and VIDEO_STORE entry; references
+        # are keyed and reclaimed by the engine when the task awaits the handle.
         video_id = f"video_{uuid.uuid4().hex}"
-        task_started = False
         try:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
@@ -395,9 +390,7 @@ class _VideoRoutesMixin:
             if path_error is not None:
                 return path_error
 
-            params = parse_visual_gen_params(
-                request, video_id, self.generator, media_storage_path=str(self.media_storage_path)
-            )
+            params = parse_visual_gen_params(request, self.generator)
             # Synchronously validate the resolved params against the
             # loaded pipeline's extra-param specs / declared defaults
             # so unknown ``extra_params`` keys and similar engine-side
@@ -419,6 +412,13 @@ class _VideoRoutesMixin:
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
 
+            # Resolve/materialize references, validate params, and enqueue in the
+            # foreground (offloaded but awaited) so bad media / unknown
+            # extra_params surface as 400 here, before the 202 — not as a queued
+            # job that later fails. The engine reclaims the references via its
+            # terminal hook once the background task awaits the handle.
+            handle = await asyncio.to_thread(self.generator.generate_async, request.prompt, params)
+
             # Persist the queued job before scheduling the background task so
             # that a fast-completing task can always look it up in VIDEO_STORE.
             video_job = VideoJob(
@@ -435,18 +435,17 @@ class _VideoRoutesMixin:
             )
             await VIDEO_STORE.upsert(video_id, video_job)
 
-            # Start background generation task
+            # Start background task to await generation and save the result.
             task = asyncio.create_task(
                 self._generate_video_background(
                     video_id=video_id,
                     request=request,
                     params=params,
                     request_format=request_format,
+                    handle=handle,
                 )
             )
             self.video_gen_tasks[video_id] = task
-            # The background task now owns reference cleanup (its ``finally``).
-            task_started = True
             task.add_done_callback(lambda t, vid=video_id: self._on_video_task_done(vid, t))
 
             return JSONResponse(content=video_job.model_dump(), status_code=202)
@@ -463,11 +462,6 @@ class _VideoRoutesMixin:
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-        finally:
-            if not task_started:
-                # Failed before the background task was scheduled — nothing else
-                # will clean these up.
-                cleanup_reference_files(str(self.media_storage_path), video_id)
 
     async def _generate_video_background(
         self,
@@ -475,8 +469,9 @@ class _VideoRoutesMixin:
         request: VideoGenerationRequest,
         params: VisualGenParams,
         request_format: str,
+        handle: "VisualGenResult",
     ):
-        """Background task to generate video and save to storage.
+        """Background task to await generation and save to storage.
 
         ``request_format`` is the format already resolved by the route (see
         :func:`_resolve_tensor_only_format`), not ``request.format``: the
@@ -489,8 +484,7 @@ class _VideoRoutesMixin:
             if job:
                 job.status = "generating"
                 await VIDEO_STORE.upsert(video_id, job)
-            future = self.generator.generate_async(inputs=request.prompt, params=params)
-            output = await future
+            output = await handle
 
             if output.video is None:
                 # Update job status to failed since we're in a background task
@@ -572,11 +566,6 @@ class _VideoRoutesMixin:
                 job.completed_at = int(time.time())
                 job.error = str(e)
                 await VIDEO_STORE.upsert(video_id, job)
-        finally:
-            # References are input-only; remove them once generation has run,
-            # failed, or been cancelled. Runs on CancelledError too, so a delete
-            # that cancels an in-flight job still reclaims the inputs.
-            cleanup_reference_files(str(self.media_storage_path), video_id)
 
     async def list_videos(self, raw_request: Request) -> Response:
         """List all generated videos.

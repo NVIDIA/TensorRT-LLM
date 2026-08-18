@@ -35,7 +35,13 @@ from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
+from tensorrt_llm.visual_gen.media_refs import (
+    cleanup_reference_files,
+    prepare_reference_slots,
+    resolve_media_storage_path,
+)
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
+from tensorrt_llm.visual_gen.params import validate_visual_gen_params
 
 pytestmark = pytest.mark.cpu_only
 
@@ -265,37 +271,40 @@ class MockVisualGen:
                         self.last_ref_bytes[path] = fh.read()
 
     def generate(self, inputs=None, params=None) -> VisualGenOutput:
-        self.last_inputs = inputs
-        self.last_params = params
-        self._snapshot_refs(params)
-        if self._validation_error is not None:
-            raise self._validation_error
-        if self._generate_error is not None:
-            raise self._generate_error
-        if self._should_fail:
-            raise RuntimeError("Generation intentionally failed")
-        n = getattr(params, "num_images_per_prompt", 1) if params else 1
-        return VisualGenOutput(
-            request_id=self._next_request_id(),
-            image=self._maybe_batch(self._image, n),
-            video=self._maybe_batch(self._video, n),
-            audio=self._audio,
-            metrics=_make_dummy_metrics(),
-        )
+        return self.generate_async(inputs=inputs, params=params).result()
 
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
         self.last_inputs = inputs
         self.last_params = params
-        self._snapshot_refs(params)
         if self._validation_error is not None:
             raise self._validation_error
+        # Mirror the real engine entry: validate against the pipeline metadata
+        # (unknown extra_params / undeclared fields / ref arity) before doing any
+        # work, so the route's synchronous 400 path is exercised end-to-end.
+        if params is not None:
+            validate_visual_gen_params(
+                params,
+                declared_defaults=self.executor.default_generation_params,
+                extra_param_specs=self.executor.extra_param_specs,
+                ref_slot_specs=self.executor.ref_slot_specs,
+            )
+        # Materialize references at the coordinator, then hand the result a
+        # terminal cleanup keyed on the same request id.
+        req_id = self._next_request_id()
+        media_storage_path = str(resolve_media_storage_path())
+        prepare_reference_slots(
+            params, request_id=str(req_id), media_storage_path=media_storage_path
+        )
+        self._snapshot_refs(params)
         n = getattr(params, "num_images_per_prompt", 1) if params else 1
         return MockVisualGenResult(
-            request_id=self._next_request_id(),
+            request_id=req_id,
             image=self._maybe_batch(self._image, n),
             video=self._maybe_batch(self._video, n),
             audio=self._audio,
             should_fail=self._should_fail,
+            generate_error=self._generate_error,
+            on_finish=lambda: cleanup_reference_files(media_storage_path, str(req_id)),
         )
 
     def _next_request_id(self) -> int:
@@ -349,37 +358,58 @@ class MockVisualGenResult:
         video: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         should_fail: bool = False,
+        generate_error: Optional[BaseException] = None,
+        on_finish=None,
     ):
         self.request_id = request_id
         self._image = image
         self._video = video
         self._audio = audio
         self._should_fail = should_fail
+        # Engine-side failure surfaced through the result (capacity/client),
+        # distinct from a coordinator preflight rejection.
+        self._generate_error = generate_error
+        self._on_finish = on_finish
+        self._cleaned = False
+
+    def _run_finish(self):
+        # Terminal reference cleanup, run once (idempotent), mirroring the real
+        # VisualGenResult so it fires on success and failure alike.
+        if self._cleaned or self._on_finish is None:
+            return
+        self._cleaned = True
+        try:
+            self._on_finish()
+        except Exception:
+            pass
+
+    def _resolve(self) -> VisualGenOutput:
+        if self._generate_error is not None:
+            raise self._generate_error
+        if self._should_fail:
+            raise RuntimeError("Async generation intentionally failed")
+        return VisualGenOutput(
+            request_id=self.request_id,
+            image=self._image,
+            video=self._video,
+            audio=self._audio,
+            metrics=_make_dummy_metrics(),
+        )
 
     def __await__(self):
         return self.aresult().__await__()
 
     async def aresult(self, timeout=None):
-        if self._should_fail:
-            raise RuntimeError("Async generation intentionally failed")
-        return VisualGenOutput(
-            request_id=self.request_id,
-            image=self._image,
-            video=self._video,
-            audio=self._audio,
-            metrics=_make_dummy_metrics(),
-        )
+        try:
+            return self._resolve()
+        finally:
+            self._run_finish()
 
     def result(self, timeout=None):
-        if self._should_fail:
-            raise RuntimeError("Async generation intentionally failed")
-        return VisualGenOutput(
-            request_id=self.request_id,
-            image=self._image,
-            video=self._video,
-            audio=self._audio,
-            metrics=_make_dummy_metrics(),
-        )
+        try:
+            return self._resolve()
+        finally:
+            self._run_finish()
 
 
 # ---------------------------------------------------------------------------

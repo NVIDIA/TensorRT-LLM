@@ -18,7 +18,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ImageGenerationRequest,
     VideoGenerationRequest,
 )
-from tensorrt_llm.visual_gen.media_refs import _materialize_reference, _resolve_reference_string
+from tensorrt_llm.visual_gen.media_refs import _resolve_reference_string
 
 if TYPE_CHECKING:
     from fastapi import UploadFile
@@ -110,33 +110,34 @@ def _merge_extra_params(
         params.extra_params = None
 
 
-def _reference_payload_and_role(ref: Any) -> tuple[bytes, Optional[str]]:
-    """Extract ``(payload_bytes, role)`` from one raw HTTP reference.
+def _reference_payload_and_role(ref: Any) -> tuple[Any, Optional[str]]:
+    """Extract ``(content, role)`` from one raw HTTP reference for transport.
 
     ``ref`` is a string (base64/``data:`` URI, ``http(s)`` URL, or a local file
     path), a multipart ``UploadFile`` (has ``.file``), or a ``MediaReferenceItem``
-    exposing ``content`` and an optional ``role``.
+    exposing ``content`` and an optional ``role``. An upload is read to ``bytes``
+    here — the only decode the boundary owns; strings pass through untouched for
+    the engine to resolve and materialize.
     """
     role = getattr(ref, "role", None)
     if isinstance(ref, str):
-        return _resolve_reference_string(ref), role
+        return ref, role
     if hasattr(ref, "file"):  # multipart UploadFile
         return ref.file.read(), role
     data = getattr(ref, "content", None)
     if not isinstance(data, str):
         raise ValueError("reference item must carry a 'content' string.")
-    return _resolve_reference_string(data), role
+    return data, role
 
 
-def _build_reference_list(
-    value: Any, *, modality: str, id: str, media_storage_path: Optional[str]
-) -> Optional[list]:
-    """Materialize an HTTP reference field into a list of ``MediaRef`` objects.
+def _build_reference_list(value: Any) -> Optional[list]:
+    """Normalize one HTTP reference field into a list of ``MediaRef`` objects.
 
-    ``value`` is None, a base64/data-URI string, a multipart ``UploadFile``, a
-    ``MediaReferenceItem``, or a list of any of those. Each entry is decoded,
-    content-validated for ``modality``, persisted to a per-index path, and
-    wrapped as ``MediaRef`` (carrying ``role`` when present).
+    ``value`` is None, a base64/data-URI/URL/path string, a multipart
+    ``UploadFile``, a ``MediaReferenceItem``, or a list of any of those. Each
+    entry becomes a ``MediaRef`` carrying its transport content — ``bytes`` for
+    an upload, the string otherwise — plus its ``role``. Resolution and
+    materialization happen later at the engine choke point.
     """
     if value is None:
         return None
@@ -146,27 +147,9 @@ def _build_reference_list(
 
     raw_items = value if isinstance(value, list) else [value]
     refs = []
-    created_paths: list[str] = []
-    try:
-        for i, item in enumerate(raw_items):
-            payload, role = _reference_payload_and_role(item)
-            ref_path = _materialize_reference(
-                payload,
-                modality=modality,
-                ref_id=f"{id}_{modality}_ref_{i}",
-                media_storage_path=media_storage_path,
-            )
-            created_paths.append(ref_path)
-            refs.append(MediaRef(content=ref_path, role=role))
-    except Exception:
-        # A later item failed; remove the files earlier items already wrote so
-        # a rejected multi-reference request leaves nothing on disk.
-        for path in created_paths:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        raise
+    for item in raw_items:
+        content, role = _reference_payload_and_role(item)
+        refs.append(MediaRef(content=content, role=role))
     return refs
 
 
@@ -386,15 +369,14 @@ def cleanup_materialized_conditioning_inputs(value: Any) -> None:
 def _apply_deprecated_input_reference(
     input_reference: str | UploadFile | None,
     params: VisualGenParams,
-    *,
-    id: str,
-    media_storage_path: str | None,
 ) -> None:
     """Back-compat for the deprecated single ``input_reference``.
 
     Sniff-routes the payload to ``image_reference`` (image) or ``video_reference``
     (video), preserving the pre-typed-fields behavior. Ignored when a typed
     image/video reference is already set — the typed fields take precedence.
+    Routing needs the bytes, so a string payload is resolved here; the engine
+    materializes the resulting ``MediaRef`` like any other reference.
     """
     if input_reference is None:
         return
@@ -404,23 +386,13 @@ def _apply_deprecated_input_reference(
     from tensorrt_llm.visual_gen.params import MediaRef
 
     payload, _ = _reference_payload_and_role(input_reference)
+    if isinstance(payload, str):
+        payload = _resolve_reference_string(payload)
     kind = sniff_media_kind(payload)
     if kind == "image":
-        path = _materialize_reference(
-            payload,
-            modality="image",
-            ref_id=f"{id}_input_ref",
-            media_storage_path=media_storage_path,
-        )
-        params.image_reference = [MediaRef(content=path)]
+        params.image_reference = [MediaRef(content=payload)]
     elif kind == "video":
-        path = _materialize_reference(
-            payload,
-            modality="video",
-            ref_id=f"{id}_input_ref",
-            media_storage_path=media_storage_path,
-        )
-        params.video_reference = [MediaRef(content=path)]
+        params.video_reference = [MediaRef(content=payload)]
     else:
         raise ValueError(
             "input_reference is not a recognized media container; supported "
@@ -430,9 +402,7 @@ def _apply_deprecated_input_reference(
 
 def parse_visual_gen_params(
     request: ImageGenerationRequest | ImageEditRequest | VideoGenerationRequest,
-    id: str,
     generator: VisualGen,
-    media_storage_path: Optional[str] = None,
 ) -> VisualGenParams:
     """Translate an HTTP request into :class:`VisualGenParams`.
 
@@ -481,15 +451,8 @@ def parse_visual_gen_params(
             raise ValueError("Image edit mask input is not supported yet.")
         if request.n is not None:
             params.num_images_per_prompt = request.n
-        if media_storage_path is None:
-            raise ValueError("media_storage_path is required when image edit inputs are provided")
         _validate_image_edit_request_limits(request, generator)
-        params.image = _materialize_conditioning_inputs(
-            request.image,
-            id=id,
-            field_name="image",
-            media_storage_path=media_storage_path,
-        )
+        params.image_reference = _build_reference_list(request.image)
 
     elif isinstance(request, VideoGenerationRequest):
         if request.frame_rate is not None:
@@ -516,27 +479,19 @@ def parse_visual_gen_params(
                     "directly."
                 )
             params.num_frames = derived
-        # Reference inputs: materialize each transport (base64/data-URI/upload)
-        # to a stored file and hand the pipeline a ``MediaRef`` carrying the
-        # local path. Decode stays model-specific in the worker.
-        image_refs = _build_reference_list(
-            request.image_reference, modality="image", id=id, media_storage_path=media_storage_path
-        )
+        # Reference inputs: hand the pipeline a ``MediaRef`` carrying the
+        # transport content (``bytes`` for an upload, the string otherwise).
+        # The engine resolves and materializes; the boundary never touches disk.
+        image_refs = _build_reference_list(request.image_reference)
         if image_refs:
             params.image_reference = image_refs
-        video_refs = _build_reference_list(
-            request.video_reference, modality="video", id=id, media_storage_path=media_storage_path
-        )
+        video_refs = _build_reference_list(request.video_reference)
         if video_refs:
             params.video_reference = video_refs
-        audio_refs = _build_reference_list(
-            request.audio_reference, modality="audio", id=id, media_storage_path=media_storage_path
-        )
+        audio_refs = _build_reference_list(request.audio_reference)
         if audio_refs:
             params.audio_reference = audio_refs
-        _apply_deprecated_input_reference(
-            request.input_reference, params, id=id, media_storage_path=media_storage_path
-        )
+        _apply_deprecated_input_reference(request.input_reference, params)
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _decode_inline_media(request.extra_params, generator.extra_param_specs)

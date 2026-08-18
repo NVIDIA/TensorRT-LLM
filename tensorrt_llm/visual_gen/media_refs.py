@@ -164,14 +164,16 @@ def resolve_media_storage_path() -> Path:
 def _is_local_path(content: Any) -> bool:
     """True if ``content`` is a trusted local path to pass through untouched.
 
-    A ``file://`` URI, or a bare string naming an existing file. Everything else
-    (bytes, ``http(s)`` / ``data:`` URLs, base64) is materialized.
+    A ``file://`` URI or bare string naming an *existing* file. A missing path
+    (either form) returns False so it falls through to the resolve step, whose
+    read raises ``ValueError`` — a client 400, not a silent passthrough.
+    Everything else (bytes, ``http(s)`` / ``data:`` URLs, base64) materializes.
     """
     if not isinstance(content, str):
         return False
     scheme = urlparse(content).scheme
     if scheme == "file":
-        return True
+        return os.path.exists(_normalize_file_uri(content))
     return scheme == "" and os.path.exists(content)
 
 
@@ -182,24 +184,35 @@ def prepare_reference_slots(
 
     The single reference choke point, used by the engine (``generate_async``)
     so serve and the standalone Python API share one path. A trusted local path
-    (``file://`` / existing bare path) passes through unchanged — not
-    materialized, not cleaned up (it is the caller's file). Everything else
+    (``file://`` / existing bare path) passes through — not materialized, not
+    cleaned up (it is the caller's file); a ``file://`` URI is normalized to a
+    plain path so the pipeline, which opens paths, can read it. Everything else
     (bytes / ``http(s)`` / ``data:`` / base64) resolves to bytes and materializes
     to ``media_storage_path``; those files are reclaimed by
     :func:`cleanup_reference_files` keyed on ``request_id``. Runs before the
     coordinator broadcasts the request, so bad-media ``ValueError`` surfaces to
-    the caller synchronously (serve keeps its immediate 400).
+    the caller synchronously (serve keeps its immediate 400). If a later slot
+    fails mid-materialize, the files earlier slots wrote are reclaimed here so a
+    rejected request leaves nothing on disk.
     """
-    for slot in ("image_reference", "video_reference", "audio_reference"):
-        modality = slot.split("_", 1)[0]
-        for i, ref in enumerate(getattr(params, slot, None) or []):
-            content = ref.content
-            if _is_local_path(content):
-                continue
-            data = content if isinstance(content, bytes) else _resolve_reference_string(content)
-            ref.content = _materialize_reference(
-                data,
-                modality=modality,
-                ref_id=f"{request_id}_{modality}_ref_{i}",
-                media_storage_path=media_storage_path,
-            )
+    try:
+        for slot in ("image_reference", "video_reference", "audio_reference"):
+            modality = slot.split("_", 1)[0]
+            for i, ref in enumerate(getattr(params, slot, None) or []):
+                content = ref.content
+                if _is_local_path(content):
+                    if urlparse(content).scheme == "file":
+                        ref.content = _normalize_file_uri(content)
+                    continue
+                data = content if isinstance(content, bytes) else _resolve_reference_string(content)
+                ref.content = _materialize_reference(
+                    data,
+                    modality=modality,
+                    ref_id=f"{request_id}_{modality}_ref_{i}",
+                    media_storage_path=media_storage_path,
+                )
+    except Exception:
+        # The terminal on_finish hook is not wired yet (the request is never
+        # enqueued on failure), so reclaim any files earlier slots wrote here.
+        cleanup_reference_files(media_storage_path, request_id)
+        raise
