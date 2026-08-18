@@ -50,8 +50,9 @@ from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
 from ..utils import is_gdn_replay_enabled
 from .config_utils import (MambaKVCacheParams, extract_mamba_kv_cache_params,
                            get_layer_attention_window, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
+                           is_hybrid_linear, is_inkling, is_kimi_linear, is_mla,
                            is_nemotron_hybrid, is_qwen3_hybrid,
+                           reject_unsupported_inkling_kv_cache_features,
                            uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -88,10 +89,22 @@ def ceil_div(a: int, b: int) -> int:
 
 
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
-    # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
-    # require KVCacheManagerV2 for per-layer buffer sizes.
+    # Models with per-layer head_dim / num_kv_heads (Gemma4 hybrid attention,
+    # Inkling's local/global KV-head split) require KVCacheManagerV2 for
+    # per-layer buffer sizes. The identity tests are a backstop: both models
+    # declare use_kv_cache_manager_v2 in get_model_defaults, but this runs before
+    # the model is instantiated, so an explicit use_kv_cache_manager_v2=False
+    # would otherwise silently produce a mis-sized per-layer pool.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
-                or is_gemma4_hybrid(config))
+                or is_gemma4_hybrid(config) or is_inkling(config))
+    # No Inkling branch here: it populates sparse_attention_config from the
+    # checkpoint architecture, so get_kv_cache_manager_cls takes its sparse
+    # branch and reaches InklingHybridCacheManager through sparse/registry.py
+    # before this function is called. A branch here would be dead code that
+    # disagrees with the registry the day one of them changes. The is_inkling
+    # test above stays: it is a needs_v2 backstop that runs even when the
+    # registry route is taken, because an explicit use_kv_cache_manager_v2=False
+    # must not silently produce a mis-sized per-layer pool.
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
@@ -620,6 +633,19 @@ class KvCacheCreator:
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         model_config = model_engine.model.model_config
+        # Inkling's short-conv window is per-request state outside the KV cache;
+        # block reuse and chunked prefill would both silently drop it. Checked
+        # here because this is the one place that sees the *resolved*
+        # kv_cache_config (model defaults already deep-merged with the user's
+        # settings) alongside llm_args.
+        reject_unsupported_inkling_kv_cache_features(
+            model_config.pretrained_config,
+            enable_block_reuse=kv_cache_config.enable_block_reuse,
+            enable_chunked_prefill=bool(
+                getattr(self._llm_args, "enable_chunked_prefill", False)),
+            enable_cache_transceiver=(self._cache_transceiver_config is not None
+                                      and self._cache_transceiver_config.backend
+                                      is not None))
         cls = get_kv_cache_manager_cls(
             model_config,
             kv_cache_config,
@@ -658,6 +684,23 @@ class KvCacheCreator:
                 incompat.append("kv_connector_manager")
             if self._max_beam_width is not None and self._max_beam_width > 1:
                 incompat.append("max_beam_width > 1")
+            # The C++ CacheTransceiver expects the nanobind KVCacheManagerCpp,
+            # but V2's ``.impl`` is the Python manager, so disagg would die in a
+            # nanobind constructor with an unrelated TypeError. Catch it here,
+            # where the message can name the unsupported combination.
+            #
+            # Scoped to the C++ runtime (KvCacheTransceiverV2 takes the manager
+            # object instead). ``transceiver_runtime`` may still be the
+            # unresolved "auto" sentinel, which maps to C++, so treat anything
+            # that is not an explicit "PYTHON" as C++.
+            if (self._cache_transceiver_config is not None
+                    and self._cache_transceiver_config.backend is not None
+                    and self._cache_transceiver_config.transceiver_runtime
+                    != "PYTHON"):
+                incompat.append(
+                    "disaggregated serving with the C++ cache transceiver "
+                    "(try cache_transceiver_config.transceiver_runtime="
+                    "'PYTHON' with backend='NIXL')")
             sparse_attn_config = model_config.sparse_attention_config
             if (sparse_attn_config is not None
                     and sparse_attn_config.algorithm == "dsa"
@@ -683,6 +726,15 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
+                if is_inkling(config):
+                    # Same structural V2 requirement as Gemma4's per-layer
+                    # head_dim: V1's unified pool would coerce the per-layer
+                    # KV-head split to one value and mis-size the pool. Fail
+                    # loudly rather than produce wrong outputs.
+                    raise NotImplementedError(
+                        f"Inkling hybrid attention requires KVCacheManagerV2, "
+                        f"which is not yet supported with {incompat_str}. "
+                        f"Disable these features to run Inkling.")
                 if is_hybrid_linear(config):
                     raise NotImplementedError(
                         "Hybrid Mamba cache managers do not support "
@@ -812,6 +864,15 @@ class KvCacheCreator:
         # The MM encoder is profiled independently at its own token budget.
         requests = []
         vocab_size = self._model_engine.model.model_config.pretrained_config.vocab_size
+        # Dummy warmup requests must pass the same token-range check real
+        # requests do. When the input-embedding vocab is padded above the output
+        # head vocab (as in Inkling), sampling ids up to the padded vocab_size
+        # lands in the gap and fails capacity estimation, so bound the dummy
+        # range to the head.
+        lm_head = getattr(self._model_engine.model, "lm_head", None)
+        head_vocab = getattr(lm_head, "num_embeddings", None)
+        if head_vocab:
+            vocab_size = min(vocab_size, head_vocab)
         max_num_tokens = self._max_num_tokens
         max_beam_width = self._max_beam_width
 
@@ -2162,10 +2223,22 @@ def _create_kv_cache_manager(
     if kv_cache_type is None:
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
 
+    # Inkling: the KV cache is sized from the text tower, whose geometry lives in
+    # the top-level config's ``text_config``.
+    _is_inkling = is_inkling(config)
+    if _is_inkling:
+        config = getattr(config, "text_config", config)
+
     hidden_size = config.hidden_size
     num_attention_heads = config.num_attention_heads
     num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
         config, 'num_key_value_heads', num_attention_heads)
+    if _is_inkling:
+        # Hybrid per-layer geometry: local (sliding-window) layers use 16 KV
+        # heads, global layers 8; head_dim is uniform (128). V2 divides each by
+        # tp_size and allocates the paged pool per layer accordingly (the generic
+        # V2 branch below consumes this list directly).
+        num_key_value_heads = config.num_kv_heads_per_layer()
     if not isinstance(head_dim, int):
         head_dim = getattr(config, "head_dim", None)
     if not isinstance(head_dim, int):

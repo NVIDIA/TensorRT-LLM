@@ -71,6 +71,19 @@ _MINIMAX_M3_ARCHITECTURES = {
     "MiniMaxM3SparseForConditionalGeneration",
 }
 
+# Inkling is NOT a sparse-attention model. Its architectures are listed here
+# because `from_pretrained` populates `sparse_attention_config` for them, which
+# is what makes `sparse/registry.py` the single selection path for its backend
+# and cache manager -- consumers that hold no ModelConfig (PyTorchModelEngine,
+# the KV-cache creator, the vision encoders) go through the registry too, and
+# with the field left None they resolved the base family instead. The config is
+# a standalone BaseModel outside the user-facing union; see
+# `attention_backend/sparse/inkling/params.py` for the full rationale and cost.
+_INKLING_ARCHITECTURES = {
+    "InklingForCausalLM",
+    "InklingForConditionalGeneration",
+}
+
 
 def _is_lock_infra_error(exc: BaseException) -> bool:
     """Whether exc indicates broken lock infrastructure (not mere contention)."""
@@ -454,12 +467,19 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        quant_config.quant_algo = (QuantAlgo(json_quant_configs['quant_algo'])
-                                   if json_quant_configs.get('quant_algo')
-                                   is not None else None)
-        quant_config.kv_cache_quant_algo = (
-            QuantAlgo(json_quant_configs['kv_cache_quant_algo']) if
-            json_quant_configs.get('kv_cache_quant_algo') is not None else None)
+        def _algo_or_none(value):
+            # modelopt hf_quant_config.json may spell "no quantization" as JSON
+            # null or as the string "none"/"null"; both must map to None rather
+            # than QuantAlgo("none"), which is not a member.
+            if value is None or (isinstance(value, str) and
+                                 value.strip().lower() in ("none", "null", "")):
+                return None
+            return QuantAlgo(value)
+
+        quant_config.quant_algo = _algo_or_none(
+            json_quant_configs.get('quant_algo'))
+        quant_config.kv_cache_quant_algo = _algo_or_none(
+            json_quant_configs.get('kv_cache_quant_algo'))
         quant_config.group_size = json_quant_configs.get('group_size', None)
         quant_config.exclude_modules = json_quant_configs.get(
             'exclude_modules', None)
@@ -483,10 +503,8 @@ class ModelConfig(Generic[TConfig]):
                 )
             json_quant_configs.update(json_extended_quant_configs)
             # kv_cache_quant_algo is global regardless of MIXED_PRECISION
-            kv_cache_quant_algo = (QuantAlgo(
-                json_quant_configs['kv_cache_quant_algo']) if
-                                   json_quant_configs.get('kv_cache_quant_algo')
-                                   is not None else None)
+            kv_cache_quant_algo = _algo_or_none(
+                json_quant_configs.get('kv_cache_quant_algo'))
             mixed_quant_configs = json_quant_configs.get(
                 'quantized_layers', None)
             if (kv_quant_lhs := json_extended_quant_configs.get(
@@ -1263,6 +1281,17 @@ class ModelConfig(Generic[TConfig]):
         if architecture in _MINIMAX_M3_ARCHITECTURES:
             layer_quant_config = cls._set_minimax_m3_layer_quant_config(
                 pretrained_config, layer_quant_config)
+
+        if (architecture in _INKLING_ARCHITECTURES
+                and kwargs.get('sparse_attention_config') is None):
+            # Derived from the architecture, never user-supplied: Inkling has one
+            # correct backend and no alternative to choose between. Injected here
+            # rather than assigned afterwards because the instance is frozen on
+            # the next line and `sparse_attention_config` is not on
+            # `__setattr__`'s allow-list; this is the same seam DeepSeek-V4 uses
+            # to derive its own config from the checkpoint.
+            from .attention_backend.sparse.inkling import InklingSparseAttentionConfig
+            kwargs['sparse_attention_config'] = InklingSparseAttentionConfig()
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

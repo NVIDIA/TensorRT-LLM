@@ -166,6 +166,39 @@ def _parse_partial_scores_env() -> Optional[int]:
     return value if value > 0 else None
 
 
+def _resolve_post_process_fn(
+    post_process_fn: Optional[Callable[[str], str] | str]
+) -> tuple[Optional[Callable[[str], str]], bool]:
+    """Resolve a CLI post-processor key and whether it needs raw special tokens."""
+    keep_special_tokens = False
+    if not isinstance(post_process_fn, str):
+        return post_process_fn, keep_special_tokens
+
+    if post_process_fn == "strip_thinking_mmmu":
+        from .post_processing import strip_thinking_and_extract_mmmu_answer
+        post_process_fn = strip_thinking_and_extract_mmmu_answer
+    elif post_process_fn == "inkling":
+        # Inkling emits typed content blocks delimited by special tokens. Route
+        # <|content_thinking|> out and score only the visible <|content_text|>
+        # channel -- the offline analog of SGLang's --reasoning-parser inkling.
+        from .post_processing import extract_inkling_content
+        post_process_fn = extract_inkling_content
+        keep_special_tokens = True
+    elif post_process_fn == "inkling_mmmu":
+        from .post_processing import strip_inkling_and_extract_mmmu_answer
+        post_process_fn = strip_inkling_and_extract_mmmu_answer
+        keep_special_tokens = True
+    elif post_process_fn == "kimi_k3_mmmu":
+        from .post_processing import extract_kimi_k3_mmmu_answer
+        post_process_fn = extract_kimi_k3_mmmu_answer
+    else:
+        raise click.BadParameter(
+            f"Unknown --post_process_fn={post_process_fn!r}; expected "
+            "'strip_thinking_mmmu', 'inkling', 'inkling_mmmu', or "
+            "'kimi_k3_mmmu'.")
+    return post_process_fn, keep_special_tokens
+
+
 class LmEvalWrapper(TemplateLM):
 
     def __init__(self,
@@ -178,6 +211,8 @@ class LmEvalWrapper(TemplateLM):
                  output_dir: Optional[str] = None,
                  sampling_override: bool = False,
                  preserve_caller_max_tokens: bool = False,
+                 post_process_fn: Optional[Callable[[str], str]] = None,
+                 keep_special_tokens: bool = False,
                  partial_scores_every: Optional[int] = None,
                  partial_scoring_task_dict: Optional[dict] = None):
         super().__init__()
@@ -194,6 +229,13 @@ class LmEvalWrapper(TemplateLM):
         # task yaml's max_gen_toks. Opt-in for thinking models (e.g. Kimi K2.5)
         # whose chain-of-thought output exceeds lm-eval's default (~512).
         self.preserve_caller_max_tokens = preserve_caller_max_tokens
+        # Optional per-sample text post-processor applied to each generation
+        # before scoring (e.g. Inkling content-text channel extraction). None
+        # for the historical text path, so non-opted-in models are unchanged.
+        self.post_process_fn = post_process_fn
+        # When True, detokenize with skip_special_tokens=False so channel markers
+        # (e.g. Inkling <|content_text|>) survive for post_process_fn to parse.
+        self.keep_special_tokens = keep_special_tokens
         # When set (with the task_dict), log running metric estimates every
         # N completed responses during generate_until — a liveness/quality
         # signal for long evals. See _RunningScoreTracker.
@@ -295,6 +337,10 @@ class LmEvalWrapper(TemplateLM):
                     if current is not None and current > value:
                         continue
                 setattr(sampling_params, trtllm_key, value)
+        # Preserve channel markers (e.g. Inkling <|content_text|>) so the
+        # post-processor can route reasoning vs visible content before scoring.
+        if self.keep_special_tokens:
+            sampling_params.skip_special_tokens = False
         if self.spec_stats:
             # The AR line in _log_spec_stats reads per-request
             # request_perf_metrics.speculative_decoding, which is only
@@ -499,7 +545,13 @@ class LmEvalWrapper(TemplateLM):
         logger.info(f"TRTLLM execution time: {elapsed_time:.3f} seconds.")
         profiler.reset("trtllm exec")
 
-        return [output.outputs[0].text for output in outputs]
+        texts = [output.outputs[0].text for output in outputs]
+        # Opt-in per-sample post-processing (e.g. Inkling content-text channel
+        # extraction). Identity when not configured, so other models/benchmarks
+        # score exactly as before.
+        if self.post_process_fn is not None:
+            texts = [self.post_process_fn(t) for t in texts]
+        return texts
 
 
 class MultimodalLmEvalWrapper(LmEvalWrapper):
@@ -522,6 +574,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                  sampling_override: bool = False,
                  preserve_caller_max_tokens: bool = False,
                  post_process_fn: Optional[Callable[[str], str]] = None,
+                 keep_special_tokens: bool = False,
                  partial_scores_every: Optional[int] = None,
                  partial_scoring_task_dict: Optional[dict] = None):
         """
@@ -542,6 +595,8 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                 to model outputs before scoring. Used by Kimi K2.5 to strip
                 ``<think>...</think>`` and extract the final answer (see
                 ``tensorrt_llm.evaluate.post_processing``).
+            keep_special_tokens: If True, preserve special tokens in generated
+                text so channel-based post-processors can parse them.
             partial_scores_every: Same as LmEvalWrapper — log running
                 metric estimates every N completed responses. The multimodal
                 path scores the post-processed text (the same string lm-eval
@@ -558,6 +613,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             output_dir=output_dir,
             sampling_override=sampling_override,
             preserve_caller_max_tokens=preserve_caller_max_tokens,
+            keep_special_tokens=keep_special_tokens,
             partial_scores_every=partial_scores_every,
             partial_scoring_task_dict=partial_scoring_task_dict,
         )
@@ -806,7 +862,8 @@ class LmEvalEvaluator(Evaluator):
                  output_path: Optional[str] = None,
                  output_dir: Optional[str] = None,
                  post_process_fn: Optional[Callable[[str], str]] = None,
-                 preserve_caller_max_tokens: bool = False):
+                 preserve_caller_max_tokens: bool = False,
+                 keep_special_tokens: bool = False):
         try:
             import lm_eval
         except ImportError as e:
@@ -832,10 +889,13 @@ class LmEvalEvaluator(Evaluator):
         self.num_samples = num_samples
         self.log_samples = log_samples
         self.output_path = output_path
-        # Optional per-sample text post-processor — only forwarded to
-        # MultimodalLmEvalWrapper; the text-only LmEvalWrapper does not
-        # accept it.
+        # Optional per-sample text post-processor, forwarded to both the
+        # text-only LmEvalWrapper and MultimodalLmEvalWrapper.
         self.post_process_fn = post_process_fn
+        # When True, generations are detokenized with skip_special_tokens=False
+        # so channel markers (e.g. Inkling <|content_text|>) survive for the
+        # post-processor to route reasoning vs visible content.
+        self.keep_special_tokens = keep_special_tokens
         # Opt-in: when True, the wrapper keeps caller-set max_tokens if it is
         # larger than the lm-eval task's max_gen_toks. Used by thinking
         # models (e.g. Kimi K2.5) whose CoT output exceeds the task default.
@@ -956,15 +1016,16 @@ class LmEvalEvaluator(Evaluator):
             is_force_single_image=is_force_single_image,
             output_dir=self.output_dir,
             sampling_override=sampling_override,
+            post_process_fn=self.post_process_fn,
+            preserve_caller_max_tokens=self.preserve_caller_max_tokens,
             partial_scores_every=partial_scores_every,
             partial_scoring_task_dict=self.task_dict
             if partial_scores_every else None,
         )
-        # post_process_fn / preserve_caller_max_tokens only consumed by multimodal.
-        if self.MULTIMODAL:
-            lm_kwargs["post_process_fn"] = self.post_process_fn
-            lm_kwargs[
-                "preserve_caller_max_tokens"] = self.preserve_caller_max_tokens
+        # Channel-based post-processors such as Inkling content extraction need
+        # raw special tokens regardless of whether the task is text-only or
+        # multimodal.
+        lm_kwargs["keep_special_tokens"] = self.keep_special_tokens
 
         results = lm_eval.evaluate(
             lm=lm_cls(llm, **lm_kwargs),
@@ -1004,21 +1065,8 @@ class LmEvalEvaluator(Evaluator):
     def command_harness(cls, ctx, **kwargs):
         llm: PyTorchLLM = ctx.obj
 
-        # Resolve the post-processor: accept a callable (already-bound) or a
-        # string key coming from CLI flags.
-        post_process_fn = kwargs.pop("post_process_fn", None)
-        if isinstance(post_process_fn, str):
-            if post_process_fn == "strip_thinking_mmmu":
-                from .post_processing import \
-                    strip_thinking_and_extract_mmmu_answer
-                post_process_fn = strip_thinking_and_extract_mmmu_answer
-            elif post_process_fn == "kimi_k3_mmmu":
-                from .post_processing import extract_kimi_k3_mmmu_answer
-                post_process_fn = extract_kimi_k3_mmmu_answer
-            else:
-                raise click.BadParameter(
-                    f"Unknown --post_process_fn={post_process_fn!r}; expected "
-                    "'strip_thinking_mmmu' or 'kimi_k3_mmmu'.")
+        post_process_fn, keep_special_tokens = _resolve_post_process_fn(
+            kwargs.pop("post_process_fn", None))
 
         evaluator = cls(
             dataset_path=kwargs.pop("dataset_path", None),
@@ -1033,6 +1081,7 @@ class LmEvalEvaluator(Evaluator):
             output_path=kwargs.pop("output_path", None),
             output_dir=kwargs.pop("output_dir", None),
             post_process_fn=post_process_fn,
+            keep_special_tokens=keep_special_tokens,
             preserve_caller_max_tokens=kwargs.pop("preserve_caller_max_tokens",
                                                   False))
         # Optional sampling overrides (default: greedy, as before).
@@ -1097,6 +1146,14 @@ class GSM8K(LmEvalEvaluator):
         callback=lambda ctx, param, value: json.loads(value) if value else None,
         help=
         'Chat template kwargs as JSON string, e.g., \'{"thinking_budget": 0}\'')
+    @click.option(
+        "--post_process_fn",
+        type=str,
+        default=None,
+        help="Per-sample output post-processor before scoring. 'inkling' keeps "
+        "special tokens and scores only the visible <|content_text|> channel "
+        "(drops <|content_thinking|>), matching SGLang's --reasoning-parser "
+        "inkling. 'strip_thinking_mmmu' strips <think>...</think> for MMMU.")
     @click.option("--fewshot_as_multiturn",
                   is_flag=True,
                   default=False,
@@ -1617,12 +1674,15 @@ class MMMU(LmEvalEvaluator):
         "produce chain-of-thought before the answer).")
     @click.option(
         "--post_process_fn",
-        type=click.Choice(["strip_thinking_mmmu", "kimi_k3_mmmu"]),
+        type=click.Choice(
+            ["strip_thinking_mmmu", "inkling_mmmu", "kimi_k3_mmmu"]),
         default=None,
         help="Per-sample post-processor. 'strip_thinking_mmmu' strips "
         "<think>...</think> and then runs the MMMU answer extractor — needed "
         "for thinking models (Kimi K2.5, Step3p7) whose CoT output the "
-        "default lm-eval regex cannot parse. 'kimi_k3_mmmu' reads the answer "
+        "default lm-eval regex cannot parse. 'inkling_mmmu' extracts Inkling's "
+        "visible <|content_text|> channel before the MMMU answer extractor. "
+        "'kimi_k3_mmmu' reads the answer "
         "from Kimi K3's <|open|>response<|sep|>...<|close|>response channel "
         "(its reasoning ends with <|close|>think<|sep|>, not </think>, so the "
         "strip_thinking path cannot see the answer) and falls back to the "

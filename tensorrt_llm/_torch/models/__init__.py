@@ -48,6 +48,8 @@ __all__ = [
     "HCXVisionForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
+    "InklingForCausalLM",
+    "InklingForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
     "KimiLinearForCausalLM",

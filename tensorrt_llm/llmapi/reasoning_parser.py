@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import re
 from abc import ABC, abstractmethod
 from collections.abc import KeysView
 from dataclasses import dataclass
@@ -775,6 +776,169 @@ class Gemma4ReasoningParser(BaseReasoningParser):
         if self.in_reasoning:
             return ReasoningParserResult(reasoning_content=remaining)
         return ReasoningParserResult(content=remaining)
+
+
+# --- Inkling typed-content channel parser ------------------------------------
+# Inkling frames model output as special-token-delimited typed blocks, e.g.:
+#     <|content_thinking|>reasoning<|end_message|>
+#     <|message_model|><|content_text|>visible answer<|end_message|>
+#     <|content_model_end_sampling|>
+# Only ``<|content_text|>`` runs are visible content; ``<|content_thinking|>``
+# runs are reasoning; message headers and end tokens are framing. Mirrors
+# SGLang's ``InklingDetector`` (``--reasoning-parser inkling``) so trtllm-serve
+# returns the same thinking-stripped ``message.content``. The control-token
+# alphabet is copied verbatim from SGLang's ``INKLING_CONTROL_TOKENS``.
+_INKLING_MESSAGE_MODEL = "<|message_model|>"
+_INKLING_CONTENT_TEXT = "<|content_text|>"
+_INKLING_CONTENT_THINKING = "<|content_thinking|>"
+_INKLING_INVOKE_TOOL_JSON = "<|content_invoke_tool_json|>"
+_INKLING_INVOKE_TOOL_TEXT = "<|content_invoke_tool_text|>"
+_INKLING_INVOKE_TOOL = "<|content_invoke_tool|>"
+_INKLING_CONTENT_KINDS = {
+    _INKLING_CONTENT_THINKING: "reasoning",
+    _INKLING_CONTENT_TEXT: "content",
+}
+_INKLING_TOOL_CONTENT_TOKENS = frozenset({
+    _INKLING_INVOKE_TOOL_JSON,
+    _INKLING_INVOKE_TOOL_TEXT,
+    _INKLING_INVOKE_TOOL,
+})
+_INKLING_CONTROL_TOKENS = frozenset({
+    "<|endoftext|>",
+    "<|message_user|>",
+    _INKLING_MESSAGE_MODEL,
+    "<|message_system|>",
+    "<|message_tool|>",
+    _INKLING_CONTENT_TEXT,
+    "<|content_image|>",
+    "<|content_model_end_sampling|>",
+    _INKLING_CONTENT_THINKING,
+    "<|content_audio_input|>",
+    "<|content_tool_error|>",
+    "<|content_xml|>",
+    "<|end_message|>",
+    "<|audio_end|>",
+    _INKLING_INVOKE_TOOL_JSON,
+    _INKLING_INVOKE_TOOL_TEXT,
+    _INKLING_INVOKE_TOOL,
+    "<|model_trigger_generation|>",
+})
+_INKLING_CONTROL_RE = re.compile("|".join(
+    re.escape(t)
+    for t in sorted(_INKLING_CONTROL_TOKENS, key=len, reverse=True)))
+_INKLING_MAX_CONTROL_LEN = max(len(t) for t in _INKLING_CONTROL_TOKENS)
+
+
+@register_reasoning_parser("inkling")
+class InklingReasoningParser(BaseReasoningParser):
+    """Reasoning parser for Inkling typed-content blocks.
+
+    Faithful to SGLang's ``InklingDetector``: ``<|content_text|>`` runs are
+    visible content, ``<|content_thinking|>`` runs are reasoning, message
+    headers are framing (dropped), and end tokens close the current block.
+    Tool-invocation blocks route to content, matching SGLang. Text before any
+    control token (or when no markers are present at all) is treated as visible
+    content, so non-Inkling / already-stripped output passes through unchanged.
+
+    ``needs_raw_special_tokens = True`` makes the OpenAI server disable
+    ``skip_special_tokens`` for requests using this parser; otherwise the
+    ``<|content_*|>`` delimiters are stripped from the decoded text before this
+    parser runs and reasoning cannot be separated from the visible answer.
+    """
+
+    needs_raw_special_tokens = True
+
+    def __init__(self,
+                 *,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        self._kind: Optional[str] = None
+        self._buffer = ""
+
+    def _emit(self, segment: str, content: list[str],
+              reasoning: list[str]) -> None:
+        if not segment:
+            return
+        # content / tool / None(between blocks or no marker) -> visible content;
+        # reasoning -> reasoning; header -> framing (dropped).
+        if self._kind in ("content", "tool", None):
+            content.append(segment)
+        elif self._kind == "reasoning":
+            reasoning.append(segment)
+
+    def _consume(self, text: str, content: list[str],
+                 reasoning: list[str]) -> None:
+        pos = 0
+        for m in _INKLING_CONTROL_RE.finditer(text):
+            self._emit(text[pos:m.start()], content, reasoning)
+            token = m.group(0)
+            pos = m.end()
+            if token == _INKLING_MESSAGE_MODEL:
+                self._kind = "header"
+            elif token in _INKLING_TOOL_CONTENT_TOKENS:
+                self._kind = "tool"
+            elif token in _INKLING_CONTENT_KINDS:
+                self._kind = _INKLING_CONTENT_KINDS[token]
+            else:
+                # End tokens, message headers, and non-text content markers are
+                # framing. They close the previous block and drop any text until a
+                # visible content or tool-content marker opens a new block.
+                self._kind = "header"
+        self._emit(text[pos:], content, reasoning)
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        self._kind = None
+        self._buffer = ""
+        content: list[str] = []
+        reasoning: list[str] = []
+        self._consume(text, content, reasoning)
+        return ReasoningParserResult(content="".join(content),
+                                     reasoning_content="".join(reasoning))
+
+    @staticmethod
+    def _partial_control_length(text: str) -> int:
+        """Longest suffix of ``text`` that is a strict prefix of a control token.
+
+        Held back during streaming so a control token split across deltas is not
+        misclassified as visible content.
+        """
+        max_len = min(len(text), _INKLING_MAX_CONTROL_LEN - 1)
+        for length in range(max_len, 0, -1):
+            suffix = text[-length:]
+            if any(
+                    len(suffix) < len(tok) and tok.startswith(suffix)
+                    for tok in _INKLING_CONTROL_TOKENS):
+                return length
+        return 0
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        text = self._buffer + delta_text
+        hold = self._partial_control_length(text)
+        if hold:
+            self._buffer = text[-hold:]
+            text = text[:-hold]
+        else:
+            self._buffer = ""
+        content: list[str] = []
+        reasoning: list[str] = []
+        self._consume(text, content, reasoning)
+        return ReasoningParserResult(content="".join(content),
+                                     reasoning_content="".join(reasoning))
+
+    def finish(self) -> ReasoningParserResult:
+        remaining = self._buffer
+        self._buffer = ""
+        if not remaining:
+            self._kind = None
+            return ReasoningParserResult()
+        content: list[str] = []
+        reasoning: list[str] = []
+        self._consume(remaining, content, reasoning)
+        # Reset the block kind too, so reusing this instance for a second stream
+        # does not route its first segment by the previous stream's channel.
+        self._kind = None
+        return ReasoningParserResult(content="".join(content),
+                                     reasoning_content="".join(reasoning))
 
 
 @register_reasoning_parser("kimi_k2")
