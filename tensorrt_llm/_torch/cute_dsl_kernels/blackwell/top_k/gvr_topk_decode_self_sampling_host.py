@@ -462,6 +462,157 @@ if __name__ == "__main__":
     for shp in smoke:
         print(shp, "->", route(*shp))
 
+
+# ---------------------------------------------------------------------------
+# two-time-scale dispatch split (per-row varlen / CUDA-graph groundwork)
+# ---------------------------------------------------------------------------
+# route(b, n, npad, k) factored into
+#   route_static(b, n, npad, k)  — everything that must be frozen per launch:
+#       family, compile tuple, grid, cluster, block, and the rt scalars that
+#       change only at discrete n-thresholds;
+#   route_dynamic(static, n)     — the n-continuous scalars a per-row kernel
+#       recomputes from its own row length (the device code will mirror these
+#       formulas): n, CMP (reg families), the sampling ladder
+#       SMP/TGT/SS2/TGT2/Q (streaming families), and the reg-family smem
+#       footprint.
+# INVARIANT (fuzz-verified): merging route_dynamic back into route_static
+# reproduces route() EXACTLY for every n. The capture-time policy of which n
+# to freeze the static half at (e.g. max_seq_len) is a later, perf-only
+# choice — this split only proves the factorization is lossless.
+
+_DYN_RT = {
+    "reg": ("n", "CMP"),
+    "regimg": ("n", "CMP"),
+    "reg_clus": ("n",),
+    "clus": ("n", "SMP", "TGT", "Q", "SS2", "TGT2"),
+    "main": ("n", "SMP", "TGT", "Q", "SS2", "TGT2"),
+}
+_DYN_SMEM = ("reg", "regimg")  # smem depends on CMP/IMGW -> recomputed per n
+
+
+def route_static(b, n, npad, k):
+    """route() with the n-continuous fields redacted (see _DYN_RT/_DYN_SMEM).
+    Constant on maximal n-intervals ("bands"); every redacted field is
+    reconstructible from (static, n) by route_dynamic."""
+    plan = route(b, n, npad, k)
+    st = {key: (dict(val) if isinstance(val, dict) else val) for key, val in plan.items()}
+    for f in _DYN_RT[st["kernel"]]:
+        st["rt"].pop(f)
+    if st["kernel"] in _DYN_SMEM:
+        st.pop("smem")
+    return st
+
+
+def route_dynamic(static, n):
+    """Recompute the redacted n-continuous scalars from (static, n).
+    Returns (rt_updates, smem). Transcribed independently from route() —
+    the factorization fuzz is the equivalence proof, and the device-side
+    per-row engine mirrors exactly these formulas."""
+    fam = static["kernel"]
+    k = static["rt"]["k"]
+    if fam in ("reg", "regimg"):
+        dege = static["tpl"][5]
+        cmp_ = n if dege else (n if n < 2560 else 2560)
+        nbsel = static["rt"]["IMGOFF"]
+        if fam == "regimg":
+            imgw = (n + 3) & ~3
+            smem = (nbsel + (2 * cmp_ if 2 * cmp_ > imgw else imgw)) * 4
+        else:
+            smem = (nbsel + 2 * cmp_) * 4
+        return {"n": n, "CMP": cmp_}, smem
+    if fam == "reg_clus":
+        return {"n": n}, static["smem"]
+
+    # streaming families (main / clus): the sampling-ladder scalars
+    b = static["grid"][1]
+    if fam == "clus":
+        R = static["cluster"]
+        scap = static["rt"]["SCAP"]
+    else:
+        R = static["rt"]["R"]
+        scap = static["rt"]["SCAP_"]
+    big = b * R <= 148
+    aim = (
+        ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
+        if big
+        else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
+    )
+    r_ = int(0.5 + math.sqrt(float(6 * n)))
+    if r_ > aim:
+        aim = r_
+    sfac = (32 if R == 2 else (48 if k > 1024 else 16)) if R > 1 else (64 if k >= 1024 else 32)
+    amin = 3 * k if R == 2 else (7 * k) // 2
+    if R > 1 and aim < amin:
+        aim = amin
+    if aim > (scap >> 1):
+        aim = scap >> 1
+    if aim < k:
+        aim = k
+
+    n4s = n >> 2
+    smp, ss2, tgt, tgt2 = 0, 1, 0, 0
+    small_dense = (k > 1024) and (not big) and n <= scap and n > 2 * k
+    if (n > scap or small_dense) and n4s >= 4:
+        sel = sfac * n // aim
+        sel = 256 if sel < 256 else sel
+        sel = n // 2 if sel > n // 2 else sel
+        pairs = max(sel >> 3, 1)
+        half = max(n4s >> 1, 1)
+        pairs = half if pairs > half else pairs
+        ss2 = max(half // pairs, 1)
+        smp = max(half // ss2, 1)
+        tgt = max((aim * (smp * 8)) // n, 1)
+        tgt2 = max((k * (smp * 8)) // n, 1)
+    q_ = (n4s + R - 1) // R
+    if fam == "clus" and n > scap and n4s >= 4:
+        sel = sfac * n // aim
+        sel = 256 if sel < 256 else sel
+        sel = n // 2 if sel > n // 2 else sel
+        quads = max(sel >> 4, 1)
+        quarter = max(n4s >> 2, 1)
+        quads = quarter if quads > quarter else quads
+        ss2 = max(quarter // quads, 1)
+        smp = max(quarter // ss2, 1)
+        tgt = max((aim * (smp * 16)) // n, 1)
+        tgt2 = max((k * (smp * 16)) // n, 1)
+    return (
+        {"n": n, "SMP": smp, "TGT": tgt, "Q": q_, "SS2": ss2, "TGT2": tgt2},
+        static["smem"],
+    )
+
+
+def route_split(b, n, npad, k):
+    """route_static + route_dynamic recombined — must equal route() exactly
+    (the factorization fuzz in the unit tests asserts this)."""
+    st = route_static(b, n, npad, k)
+    dyn, smem = route_dynamic(st, n)
+    plan = {key: (dict(val) if isinstance(val, dict) else val) for key, val in st.items()}
+    plan["rt"].update(dyn)
+    plan["smem"] = smem
+    return plan
+
+
+def route_bands(b, npad, k, n_lo=None, n_hi=None):
+    """Enumerate maximal n-intervals on which route_static is constant.
+    Dense O(n_hi - n_lo) scan of the pure host dispatch — an offline /
+    engine-init tool (seconds for the 262144-token envelope), NOT a hot
+    path. Returns [(n_lo, n_hi, static_plan), ...]."""
+    lo = k + 1 if n_lo is None else max(n_lo, k + 1)
+    hi = npad if n_hi is None else min(n_hi, npad)
+    bands = []
+    cur_key, cur_lo, cur_plan = None, lo, None
+    for n in range(lo, hi + 1):
+        st = route_static(b, n, npad, k)
+        key = repr(st)
+        if key != cur_key:
+            if cur_key is not None:
+                bands.append((cur_lo, n - 1, cur_plan))
+            cur_key, cur_lo, cur_plan = key, n, st
+    if cur_key is not None:
+        bands.append((cur_lo, hi, cur_plan))
+    return bands
+
+
 # ===========================================================================
 # ==== workspace (ct_workspace.py) ==========================================
 # ===========================================================================
@@ -923,6 +1074,10 @@ def run_varlen(logits, pre_idx, kv_lens, indices, next_n=1, compress_ratio=1, va
 
 __all__ = [
     "route",
+    "route_static",
+    "route_dynamic",
+    "route_split",
+    "route_bands",
     "run",
     "run_ws",
     "run_varlen",

@@ -312,6 +312,45 @@ def test_selfsampling_topk_guards():
         ss_host.run(logits, pre_idx[:0], 8192, indices)
 
 
+def test_selfsampling_route_factorization():
+    """Two-time-scale dispatch groundwork: route() must factor losslessly
+    into route_static (constant on n-bands, freezable at capture time) and
+    route_dynamic (the n-continuous scalars the per-row device engine will
+    recompute) — recombining them reproduces route() exactly. CPU-only."""
+    npad = 1 << 20
+    checked = 0
+    for b in (1, 8, 16, 64, 148, 296, 1024):
+        for k in (512, 1024, 2048):
+            ns = set()
+            for c in (
+                2 * k, 3 * k, 4 * k + 64, 2560, 4096, 8192, 16384,
+                4 * 1024, 4 * 4096, 4 * 32768, 65536, 131072, 262144,
+            ):
+                ns.update(v for v in range(c - 4, c + 5) if k < v <= npad)
+            ns.update(range(k + 1, npad + 1, 4999))
+            s = 12345
+            for _ in range(400):
+                s = (s * 1103515245 + 12345) % (1 << 31)
+                ns.add(k + 1 + s % (npad - k - 1))
+            for n in sorted(ns):
+                assert ss_host.route_split(b, n, npad, k) == ss_host.route(b, n, npad, k), (
+                    b, n, k,
+                )
+                checked += 1
+    assert checked > 10_000
+
+
+def test_selfsampling_route_bands_contiguous():
+    """route_bands must tile the envelope contiguously with n-free statics."""
+    bands = ss_host.route_bands(8, 262144, 1024)
+    assert bands[0][0] == 1025 and bands[-1][1] == 262144
+    for (_, h1, _), (l2, _, _) in zip(bands, bands[1:]):
+        assert l2 == h1 + 1
+    for _, _, st in bands:
+        for f in ss_host._DYN_RT[st["kernel"]]:
+            assert f not in st["rt"]
+
+
 def test_selfsampling_dispatch_is_pure_and_total():
     """route(b, n, npad, k) must return a plan for every in-envelope shape."""
     for k in (512, 1024, 2048):
