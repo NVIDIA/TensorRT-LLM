@@ -93,6 +93,10 @@ class TestQwenMoe(unittest.TestCase):
     def test_qwen_moe_sanity(self, quant_algo):
         qwen_moe = None
         kv_cache_manager = None
+        attn_metadata = None
+        input_ids = None
+        position_ids = None
+        logits = None
         try:
             config_dict = deepcopy(QWEN2_57B_A14B_CONFIG)
             # Run a single layer
@@ -206,6 +210,9 @@ class TestQwenMoe(unittest.TestCase):
             if kv_cache_manager is not None:
                 kv_cache_manager.shutdown()
             del kv_cache_manager, qwen_moe
+            # A failing assertion keeps this frame alive through pytest's
+            # traceback, so drop every GPU-owning local before releasing.
+            del attn_metadata, input_ids, position_ids, logits
             self._release_cuda_memory()
 
     @parameterized.expand([
@@ -225,6 +232,15 @@ class TestQwenMoe(unittest.TestCase):
         qwen_moe = None
         kv_cache_manager = None
         graph_runner = None
+        weight_mapper = None
+        attn_metadata = None
+        input_ids = None
+        position_ids = None
+        gen_input_ids = None
+        gen_position_ids = None
+        inputs = None
+        logits = None
+        ref = None
         try:
             backend = scenario.backend
             metadata_cls = get_attention_backend(backend).Metadata
@@ -394,4 +410,8 @@ class TestQwenMoe(unittest.TestCase):
             if kv_cache_manager is not None:
                 kv_cache_manager.shutdown()
             del graph_runner, kv_cache_manager, qwen_moe, hf_qwen_moe
+            # A failing assertion keeps this frame alive through pytest's
+            # traceback, so drop every GPU-owning local before releasing.
+            del weight_mapper, attn_metadata, inputs, logits, ref
+            del input_ids, position_ids, gen_input_ids, gen_position_ids
             self._release_cuda_memory()
