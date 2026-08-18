@@ -21,22 +21,19 @@ deliberate structural choice rather than a claim about the math:
 
 ``sparse/`` is where every *model-specific* attention backend already lives
 (``dsa``, ``deepseek_v4``, ``minimax_m3``, ``rocket``). The package name is
-historical -- what actually unifies its members is that each needs its own
+historical -- what unifies its members is that each needs its own
 ``AttentionBackend`` + metadata + cache manager, which is exactly Inkling's
-shape. Keeping it beside them means one place to look for "models with a
-private attention stack" instead of one such package plus a lone top-level
-exception.
+shape. Keeping it beside them means one place to look for "models with a private
+attention stack" rather than that package plus a lone top-level exception.
 
-Inkling differs from its neighbours in how the backend is *selected*: they are
-dispatched from ``sparse/registry.py`` on ``SparseParams``, Inkling from its
-backend name in ``attention_backend/utils.py``. That is not an oversight; see
-``params.py`` for why the registry route was tried and reverted. The one sparse
-interface Inkling does reuse is ``SparseBackendForwardArgs``, as the carrier for
-``rel_logits`` -- also documented there.
+Selection goes through ``sparse/registry.py`` on ``SparseParams``, like its
+neighbours, so ``attention_backend/utils.py`` needs no model-specific branch;
+``params.py`` explains the config that makes that reachable and what it costs.
+The other sparse interface reused there is ``SparseBackendForwardArgs``, as the
+carrier for ``rel_logits``.
 
-If these mechanisms are ever renamed to something algorithm-neutral (say
-``AttentionModuleHooks`` / ``model_backend_args``), Inkling should follow the
-rename; nothing here depends on sparsity semantics.
+If these mechanisms are ever renamed to something algorithm-neutral, Inkling
+should follow: nothing here depends on sparsity semantics.
 """
 
 from .backend import InklingTritonAttention

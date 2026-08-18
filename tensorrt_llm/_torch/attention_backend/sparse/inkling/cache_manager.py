@@ -16,44 +16,36 @@
 
 The short-conv state is **registered with V2 as SSM layers** rather than
 allocated on the side. ``SsmLayerConfig`` is the framework's container for
-per-request fixed-size state -- ``MambaHybridCacheManagerV2`` already carries
-Mamba's conv/SSM state through it -- and it fits here for the same reason: a
-short-conv window is ``[channels, kernel-1]`` per request and does not grow with
-the sequence, so it cannot be an attention buffer (there ``BufferConfig.size``
-means bytes *per block*, i.e. per ``tokens_per_block`` tokens).
+per-request fixed-size state (``MambaHybridCacheManagerV2`` carries Mamba's
+through it), and a short-conv window is ``[channels, kernel-1]`` per request:
+it does not grow with the sequence, so it cannot be an attention buffer, where
+``BufferConfig.size`` means bytes *per block*. V2 also sizes SSM layers with a
+dedicated rule -- one dedicated block per request, never shared
+(``_storage_manager._compute_slots_for_batch``) -- which is exactly the
+semantics, and which the attention branch's capacity-driven, cross-request-shared
+accounting would get wrong by two orders of magnitude.
 
-What that buys, in order of importance:
+What that buys: the pool's bytes enter V2's quota (they used to be a side
+``torch`` allocation, counted only because the throwaway manager built during
+size estimation also held one -- correct only while the two pools matched, which
+nothing enforced); stable device addresses from the pool allocator; and
+automatic coalescing of equal-sized buffers, so the k/v pair and the attn/mlp
+pair do not each need their own allocation.
 
-1. **The pool's bytes enter V2's quota.** They used to be a plain ``torch``
-   allocation no byte quota knew about, accounted for only because the throwaway
-   manager built during KV-cache size estimation also held one, so
-   ``configure_kv_cache_capacity``'s peak-memory reading happened to include it.
-   That was correct only while the estimation pool and the serving pool were
-   exactly the same size -- an invariant nothing enforced and any future
-   runtime-dependent sizing would have broken silently.
-2. Stable device addresses come from the pool allocator, so a captured CUDA
-   graph keeps working without this file having to argue for it.
-3. Equal-sized buffers are coalesced into shared pool slots automatically, so
-   the k/v pair (kv-head width) and the attn/mlp pair (hidden width) do not each
-   need a separate allocation.
+What it does not buy: slot allocation. V2 owns the memory, not the
+request-to-slot mapping, so :class:`InklingConvStateCache` still assigns rows --
+as Mamba's manager also does.
 
-What it does **not** buy: slot allocation. V2 owns the memory, not the
-request-to-slot mapping; ``MambaHybridCacheManagerV2`` likewise keeps its own
-allocator. :class:`InklingConvStateCache` still assigns rows.
+The SSM layers are **appended** after the attention layers, not interleaved.
+DeepSeek-V4 must interleave because there one model layer's KV is split across
+several cache layers; Inkling's is not, so appending leaves every attention
+``layer_id`` in place and ``get_buffers`` / ``get_batch_cache_indices`` / the
+metadata's row mapping all stay untouched.
 
-The SSM layers are **appended** after the attention layers
-``_build_base_config`` already produced, not interleaved with them. Interleaving
-is what DeepSeek-V4 does, and it has to, because there one model layer's KV is
-itself split across several cache layers; Inkling's KV stays one buffer per
-layer, so appending leaves every attention ``layer_id`` where it was and no
-mapping table is needed anywhere -- ``get_buffers`` / ``get_batch_cache_indices``
-/ the metadata's page tables are all untouched.
-
-There is deliberately no shared conv-state protocol. ``BaseMambaCacheManager``
-is the closest existing one, but it mandates SSM state and replay metadata
-Inkling cannot back, and its one-tensor-per-layer accessor cannot express
-Inkling's four convs per layer at two different widths. If a second short-conv
-model appears, widen that hook rather than adding another beside it.
+There is deliberately no shared conv-state protocol: ``BaseMambaCacheManager``
+mandates SSM state Inkling cannot back, and its one-tensor-per-layer accessor
+cannot express four convs at two widths. Widen that hook if a second short-conv
+model appears.
 """
 
 from dataclasses import replace
@@ -80,16 +72,14 @@ from .conv_state import CONV_ROLES, InklingConvState, InklingConvStateCache
 def _resolve_conv_dtype(pretrained_config) -> torch.dtype:
     """The compute dtype the short-conv pool holds.
 
-    Not the manager's ``dtype`` argument -- that is the KV cache dtype, a C++
-    binding type ``torch.zeros`` rejects, and it is ``nvfp4``/``fp8`` on
-    quantized releases while the conv pool holds unquantized pre-conv
-    activations.
+    Not the manager's ``dtype`` argument: that is the KV cache dtype, a C++
+    binding type ``torch.zeros`` rejects, and it is nvfp4/fp8 on quantized
+    releases while this pool holds unquantized pre-conv activations.
 
-    HuggingFace configs carry ``torch_dtype`` as either a ``torch.dtype`` or its
-    name (``"bfloat16"``), so both are accepted. An unresolvable value raises:
-    the previous silent fall back to bfloat16 turned an fp16 checkpoint into a
-    pool of the wrong dtype, which reaches the conv kernels as a dtype mismatch
-    far from its cause.
+    ``torch_dtype`` may be a ``torch.dtype`` or its name, so both are accepted.
+    An unresolvable value raises rather than defaulting: silently falling back
+    to bfloat16 turned an fp16 checkpoint into a wrong-dtype pool, surfacing far
+    from its cause.
     """
     config = getattr(pretrained_config, "text_config", pretrained_config)
     dtype = getattr(config, "torch_dtype", None)
@@ -155,16 +145,11 @@ class _InklingConvGeometry:
 class InklingHybridCacheManager(KVCacheManagerV2):
     """Paged KV (V2, per-layer geometry) + the short-conv state pool.
 
-    Folding the pool into the cache manager -- the shape
-    ``CppMambaHybridCacheManager`` uses for mamba conv/SSM state -- lets it reach
-    the model through the standard ``attn_metadata.kv_cache_manager`` field and
-    be released by the manager's own ``free_resources``. The conv rows are then
-    freed by the same call that frees the request's KV blocks, so the two views
-    cannot drift apart.
-
-    The pool's bytes are declared to V2 through :meth:`_build_cache_config`, so
-    they are inside the same quota as the paged KV rather than riding on a
-    peak-memory coincidence during capacity estimation. See the module docstring.
+    Folding the pool into the manager -- ``CppMambaHybridCacheManager``'s shape
+    -- lets it reach the model through ``attn_metadata.kv_cache_manager`` and be
+    released by the manager's own ``free_resources``, so conv rows and KV blocks
+    cannot drift apart. Its bytes are declared to V2 in
+    :meth:`_build_cache_config`; see the module docstring.
     """
 
     def __init__(self, *args, pretrained_config, mapping, max_batch_size, **kwargs):
@@ -213,10 +198,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     def _conv_layer_id(self, local_layer_idx: int) -> LayerId:
         """Cache-layer id holding ``local_layer_idx``'s four conv states.
 
-        The SSM layers are appended after the attention ones, so this is plain
-        arithmetic and no mapping table is needed. Keeping the attention ids at
-        ``0..N-1`` is the point: everything that addresses the paged KV keeps
-        working untouched.
+        Appended after the attention layers, so this is plain arithmetic with no
+        mapping table -- and every attention id stays at ``0..N-1``, which is
+        what keeps the paged-KV addressing untouched.
         """
         return LayerId(self.num_local_layers + local_layer_idx)
 
@@ -290,16 +274,13 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     def _get_pool_roles(self, pool_id: int):
         """Name a role that actually exists in ``pool_id``.
 
-        The base returns ``Role.KEY`` unconditionally, and
-        ``_build_pool_mapping_tensors`` then looks up
-        ``_pool_layer_ids_by_role[(pool_id, role)]`` -- a dict keyed only by the
-        pairs that exist. Appending conv layers creates pools holding no KEY at
-        all, so the base's answer is a ``KeyError`` for them.
+        The base returns ``Role.KEY`` unconditionally, but conv pools hold no
+        KEY, so ``_build_pool_mapping_tensors`` would ``KeyError`` on them.
         ``MambaHybridCacheManagerV2`` overrides this for the same reason.
 
-        Unlike Mamba's version this resolves the role rather than naming one:
-        the four conv states come in two widths, V2 coalesces by size, and which
-        role represents a given pool is its packing decision, not ours.
+        Unlike Mamba's it *resolves* the role rather than naming one: the four
+        states come in two widths and V2 coalesces by size, so which role
+        represents a pool is its packing decision, not ours.
         """
         first_layer = int(self.impl.layer_grouping[pool_id][0])
         if first_layer < self.num_local_layers:
@@ -345,11 +326,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     def get_conv_states(self, layer_idx: int) -> InklingConvState:
         """The four short-conv state buffers of ``layer_idx``.
 
-        Named after ``BaseMambaCacheManager.get_conv_states`` on purpose: this
-        is the same question asked of the same kind of manager. It cannot
-        *implement* that hook, which returns one tensor per layer and cannot
-        express Inkling's four convs at two widths -- widening the shared hook
-        is the move if a second short-conv model appears.
+        Named after ``BaseMambaCacheManager.get_conv_states`` deliberately, but
+        it cannot *implement* that hook: one tensor per layer cannot express four
+        convs at two widths. Widen the shared hook if a second model needs it.
         """
         return self._conv_cache.layer_state(layer_idx)
 
@@ -364,11 +343,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     def free_resources(self, request, *args, **kwargs):
         """Release the conv row with the request's KV blocks.
 
-        This is what lets the model engine's warmup/estimation dummy-batch
-        cleanup drop its Inkling-specific branch: it already calls
-        ``kv_cache_manager.free_resources(req)`` for every dummy request, and a
-        leaked conv row would later be reused, with stale state, by a real
-        request whose id collides with a dummy id.
+        Lets the engine's dummy-batch cleanup stay generic -- it already calls
+        ``free_resources`` per request -- and a leaked row would later be reused
+        with stale state by a real request whose id collides with a dummy's.
         """
         rid = getattr(request, "py_request_id", None)
         if rid is not None:

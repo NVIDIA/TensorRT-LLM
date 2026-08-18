@@ -226,36 +226,26 @@ class InklingTritonAttention(TrtllmAttention):
     ):
         device = q.device
         # --- Runtime CUDA-graph-safe path. ---------------------------------
-        # ``InklingAttentionMetadata.prepare()`` validated that this batch's
-        # decode inputs are live in stable GPU buffers, so the captured forward
-        # does zero host->device copy: it slices the base metadata's
-        # ``kv_lens_cuda`` and ``kv_cache_block_offsets`` and persists the new
-        # K/V with an in-graph scatter whose (page, offset) indices are derived
-        # on-GPU. Padding rows carry their own dummy request slots, so the
-        # scatter never corrupts a real request's page.
+        # Zero host->device copy: slice the base metadata's graph-stable
+        # ``kv_lens_cuda`` and ``kv_cache_block_offsets``, then persist the new
+        # K/V with an in-graph scatter whose indices are derived on-GPU. Padding
+        # rows carry dummy request slots, so the scatter never touches a real
+        # request's page.
         num_req = q.shape[0]
-        # Guard on the metadata *type*, explicitly. The previous version read a
-        # per-step counter through ``getattr(..., 0)``, so a foreign metadata
-        # object fell through on the default rather than on a stated check --
-        # the counter's real job, since with both buffers borrowed its value was
-        # always the base's ``num_generations``.
+        # Guard on the metadata *type*, explicitly: the previous version relied
+        # on a ``getattr(..., 0)`` default to route a foreign metadata object
+        # here, which is not a stated check.
         if (
             isinstance(attn_metadata, InklingAttentionMetadata)
             and attn_metadata.num_generations == num_req
         ):
-            # Both come from the base metadata. The page table's leading axis is
-            # per-pool, so every layer of the same KV geometry gets the same
-            # rows for free.
             sl = attn_metadata.ink_gen_seq_lens(num_req)
             pt = attn_metadata.ink_gen_page_table(cache_layer)[:num_req]
             page_div = attn_metadata.ink_page_div
             pos = (sl - 1).long()  # write slot = total_kv_len - 1 = num_cached
             page_row = torch.div(pos, page_size, rounding_mode="floor")
             offs = pos - page_row * page_size
-            # ``pt`` entries count pages (K and V separately); ``k_cache`` /
-            # ``v_cache`` are the two planes of a [blocks, kv_factor, ...] buffer
-            # and count blocks. Divide after the gather -- [num_req] elements
-            # rather than [num_req, max_blocks].
+            # Divide after the gather: [num_req] elements, not [num_req, blocks].
             pages = pt.gather(1, page_row.unsqueeze(1)).squeeze(1).long()
             if page_div > 1:
                 pages = torch.div(pages, page_div, rounding_mode="floor")

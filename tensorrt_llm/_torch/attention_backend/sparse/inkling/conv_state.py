@@ -42,15 +42,12 @@ InklingConvState = namedtuple("InklingConvState", ["k", "v", "attn", "mlp"])
 class InklingRole:
     """V2 pool roles for the four short convolutions of a decoder layer.
 
-    Four roles rather than two despite only two distinct widths: a role is the
-    identity a buffer is addressed by, and k/v/attn/mlp are separate states that
-    merely happen to pair up in size. V2 coalesces same-sized buffers into shared
-    pool slots on its own, so naming them apart costs nothing -- and the pairing
-    is a property of today's config (``kv_dim`` vs ``hidden_size``), not
-    something worth baking into the role space.
+    Four roles despite only two widths: a role is a buffer's identity, and
+    k/v/attn/mlp merely happen to pair up in size today. V2 coalesces same-sized
+    buffers on its own, so naming them apart is free.
 
-    Lives here rather than in ``cache_manager`` so the pool and its roles are
-    declared together, and so the two modules do not import each other.
+    Lives here so the pool and its roles are declared together, and so this
+    module and ``cache_manager`` do not import each other.
     """
 
     CONV_K = DataRole("inkling_conv_k")
@@ -73,38 +70,23 @@ class InklingConvStateCache:
     ``[num_slots, channels, kernel_size - 1]``. The k/v conv channels follow the
     fused-qkv k/v split (TP-sharded); the residual-stream convs are replicated.
 
-    The buffers themselves come from the ``allocate`` callback, which
-    :class:`InklingHybridCacheManager` wires to V2 SSM-layer pool memory -- this
-    class owns the request-to-row mapping, V2 owns the bytes. That split matches
-    ``MambaHybridCacheManagerV2``, which likewise keeps its own slot allocator
-    over V2-provided state buffers.
+    The buffers come from the ``allocate`` callback, which
+    :class:`InklingHybridCacheManager` wires to V2 SSM-layer pool memory: this
+    class owns the request-to-row mapping, V2 owns the bytes -- the same split
+    ``MambaHybridCacheManagerV2`` uses.
 
-    The row count is fixed at construction and never changes:
-
-      ``num_request_slots`` real rows, one per resident sequence, plus one
-      permanently reserved row shared by every CUDA-graph padding sentinel, plus
-      one reserved row for the attention-DP idle dummy when that is enabled.
-
-    This is the ``MambaCacheManager`` slot layout (``_padding_slot`` /
-    ``_attention_dp_dummy_slot``), and it is a fixed size for the same two
-    reasons. First, padding rows must not consume real-request capacity: the
-    CUDA-graph runner keeps one sentinel id per runtime draft length, so
-    charging each of them a real row silently shrinks the servable batch.
-    Second, all buffers -- including the int32 ``state_indices`` -- keep stable
-    device addresses and are mutated in place, so a captured CUDA graph replays
-    cleanly (the Mamba2Metadata stable-pointer pattern). A pool that
-    reallocated to grow would strand every pointer a previously captured graph
-    holds, and a graph replaying against a freed buffer does not raise -- it
-    reads whatever the allocator handed out next.
-
-    Fixing the size is no longer what keeps KV-cache capacity estimation honest
-    -- the rows are declared to V2 as SSM-layer buffers and a min-slots
-    constraint, so their bytes sit inside the same quota as the paged KV (see
-    ``cache_manager``). Before that they were a side allocation counted only
-    because the throwaway estimation manager happened to hold one while
-    ``configure_kv_cache_capacity`` read peak memory, which was correct only
-    while the two pools were exactly the same size. The two reasons above still
-    stand on their own.
+    The row count is fixed at construction: ``num_request_slots`` real rows,
+    plus one row shared by every CUDA-graph padding sentinel, plus one for the
+    attention-DP idle dummy when enabled. This is the ``MambaCacheManager``
+    layout (``_padding_slot`` / ``_attention_dp_dummy_slot``), fixed for two
+    reasons. Padding rows must not consume real-request capacity -- the
+    CUDA-graph runner keeps one sentinel per runtime draft length, so charging
+    each a real row silently shrinks the servable batch. And every buffer,
+    including the int32 ``state_indices``, keeps a stable device address and is
+    mutated in place, so a captured graph replays cleanly; a pool that
+    reallocated to grow would strand captured pointers, and replaying against a
+    freed buffer does not raise -- it reads whatever the allocator handed out
+    next.
     """
 
     @staticmethod
@@ -112,17 +94,13 @@ class InklingConvStateCache:
         """Rows sitting above the per-request ones.
 
         One row shared by every CUDA-graph padding sentinel, plus one for the
-        attention-DP idle dummy when that is enabled. Neither may consume real
-        request capacity -- the graph runner keeps one sentinel id per runtime
-        draft length, so charging each a real row silently shrinks the servable
-        batch.
+        attention-DP idle dummy when enabled.
 
-        Exposed as a static method because the count is needed twice: here, to
-        size the pool, and in ``_InklingConvGeometry``, to declare the min-slots
-        floor to KVCacheManagerV2. Those two must agree exactly -- a V2 buffer
-        sized from a smaller count is indexed out of bounds by ``slots_for`` --
-        and the slot layout is this class's to define, so the geometry asks
-        rather than re-deriving.
+        Static because the count is needed twice -- here to size the pool, and in
+        ``_InklingConvGeometry`` to declare V2's min-slots floor. They must agree
+        exactly (a buffer sized from a smaller count is indexed out of bounds by
+        :meth:`slots_for`), and the layout is this class's to define, so the
+        geometry asks rather than re-deriving.
         """
         return 1 + int(reserve_attention_dp_slot)
 
@@ -234,16 +212,14 @@ class InklingConvStateCache:
     def slots_for(self, request_ids: List[int]) -> List[int]:
         """Map request ids to their (stable) pool rows, allocating new ones.
 
-        Fresh requests get a zero-initialised row; existing requests keep theirs
-        so their carried short-conv windows persist across decode steps. Padding
-        sentinels and the attention-DP idle dummy alias their reserved rows and
-        never consume real capacity.
+        Fresh requests get a zero-initialised row; existing ones keep theirs so
+        their conv windows persist across decode steps. Padding sentinels and the
+        attention-DP dummy alias their reserved rows.
 
-        Raises when the real rows are exhausted. The pool is sized to every
-        sequence that can be resident at once, so exhaustion means a request
-        held a row past its ``free_resources`` -- and the alternative to raising
-        is handing that request a row another request is still carrying state
-        in, which produces wrong tokens silently.
+        Raises on exhaustion. The pool covers every sequence that can be resident
+        at once, so running out means a request held a row past its
+        ``free_resources``; the alternative to raising is handing it a row
+        another request is still carrying state in, which corrupts silently.
         """
         slots = []
         for r in request_ids:

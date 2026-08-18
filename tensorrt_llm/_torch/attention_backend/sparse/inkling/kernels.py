@@ -234,14 +234,8 @@ def _inkling_decode_kernel(
             page_table + cur_batch * stride_ptb + page_local, mask=mask_n, other=0
         ).to(tl.int64)
         if PAGE_DIV > 1:
-            # ``page_table`` is the base metadata's ``kv_cache_block_offsets``
-            # K plane, whose entries the C++ copy encodes as
-            # ``base_page_index * index_scale`` (kvCacheManagerV2Utils.cu). The
-            # K/V views handed in here are ``kv[:, 0]`` / ``kv[:, 1]`` of a
-            # ``[blocks, kv_factor, ...]`` buffer, so their first axis counts
-            # *blocks* rather than pages -- hence one integer division by
-            # ``kv_factor`` per KV tile. ``PAGE_DIV`` is a constexpr power of
-            # two, so this lowers to a shift.
+            # Entries count pages; the K/V views count blocks. One integer
+            # division per KV tile, and PAGE_DIV is a constexpr power of two.
             page_id = page_id // PAGE_DIV
 
         k_ptrs = (
@@ -409,10 +403,8 @@ def inkling_decode_attention(
             views (K/V selected from the ``[num_pages, 2, ...]`` pool).
         seq_lens: ``[batch]`` int32 GPU total-KV length per request.
         page_table: ``[batch, max_pages]`` int32 GPU page ids, indexed by
-            absolute block ordinal (``k_pos // page_size``). Entries are divided
-            by ``page_div`` before use, which lets the base metadata's
-            ``kv_cache_block_offsets`` be passed straight through instead of
-            staging a private table -- see ``page_div``.
+            absolute block ordinal (``k_pos // page_size``), scaled by
+            ``page_div``.
         page_size: tokens per page.
         sm_scale: softmax scale (``1 / head_dim``).
         rel_logits: ``[batch, num_heads, rel_extent]`` fp32 aux bias, or None.
@@ -420,12 +412,10 @@ def inkling_decode_attention(
         window_left: sliding-window radius (inclusive), -1 to disable.
         out: optional pre-allocated ``[batch, num_heads, head_dim]`` output (for
             CUDA-graph static buffers).
-        page_div: divisor applied to every ``page_table`` entry. 1 when the
-            table already holds indices into the ``[blocks, ...]`` K/V views;
-            ``kv_factor`` when it holds the C++-encoded
-            ``base_page_index * index_scale`` of ``kv_cache_block_offsets``,
-            whose unit is pages and therefore counts K and V separately. Must be
-            a power of two so the division lowers to a shift.
+        page_div: divisor on every ``page_table`` entry. 1 when the table already
+            holds indices into the ``[blocks, ...]`` K/V views; ``kv_factor``
+            when it is a slice of ``kv_cache_block_offsets``, whose unit is
+            pages. Power of two, so the division lowers to a shift.
 
     Returns ``[batch, num_heads, head_dim]`` in q's dtype.
     """
