@@ -346,7 +346,8 @@ public:
     virtual ~RunnerBase() = default;
     virtual void prepare(AttentionOp& op) const = 0;
     virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0) const
+        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
+        int const maxCrossKvLength = 0) const
         = 0;
     // typically, we use single qkv input, but for context MLA, we use separate qkv inputs
     virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
@@ -411,10 +412,11 @@ public:
     }
 
     int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0) const override
+        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
+        int const maxCrossKvLength = 0) const override
     {
         size_t const context_workspace_size = op.getWorkspaceSizeForContext(
-            op.mType, max_num_requests, op.mMaxContextLength, 0, num_tokens, ctx_total_kv_len);
+            op.mType, max_num_requests, op.mMaxContextLength, maxCrossKvLength, num_tokens, ctx_total_kv_len);
         size_t const generation_workspace_size = op.getWorkspaceSizeForGeneration(
             op.mType, max_num_sequences, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
 
@@ -896,6 +898,7 @@ public:
                 auto const& cross_kv_tensor = cross_kv.value();
                 enqueue_params.cross_kv = static_cast<T const*>(cross_kv_tensor.data_ptr());
                 enqueue_params.num_encoder_tokens = static_cast<int32_t>(cross_kv_tensor.size(0));
+                // Kept in step with maxCrossKvLength in attention(), which sizes the workspace carved here.
                 enqueue_params.cross_kv_length
                     = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
             }
@@ -1361,8 +1364,18 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
     int32_t const max_blocks_per_sequence
         = use_kv_cache && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
-    int64_t const workspace_size = runner->getWorkspaceSize(
-        *op, num_tokens, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, ctx_total_kv_len);
+    // For cross-attention, several unfused-path context buffers scale with the encoder KV length.
+    // Mirror the context-stage enqueue, which uses the max past-KV length over the context sequences
+    // as cross_kv_length; sizing with 0 here under-allocates the workspace and the carved views in
+    // enqueueContext land past the end of the allocation. The enqueue also gates on cross_kv.has_value(),
+    //  so this can over-allocate relative to the carve; that is safe.
+    int32_t maxCrossKvLength = 0;
+    if (op->isCrossAttention() && num_contexts > 0)
+    {
+        maxCrossKvLength = host_past_key_value_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
+    }
+    int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens,
+        max_blocks_per_sequence, ctx_total_kv_len, maxCrossKvLength);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     torch::Tensor workspace;
