@@ -22,7 +22,7 @@ Usage:
 
 import argparse
 
-from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm import MediaRef, VisualGen, VisualGenArgs
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,7 +62,7 @@ def main() -> None:
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     params = visual_gen.default_params
-    params.image_reference = args.image
+    params.image_reference = [MediaRef(content=args.image, format="path")]
 
     output = visual_gen.generate(inputs=args.prompt, params=params)
     saved = output.save(args.output_path)

@@ -54,6 +54,9 @@ def _video_content_type(suffix: str) -> str:
 # /v1/videos/{id} routes try when the stored output_path is missing.
 _KNOWN_VIDEO_OUTPUT_SUFFIXES = (".mp4", ".avi", ".safetensors", ".pt")
 
+# Reference fields whose multipart text form is a JSON object, not a scalar.
+_REFERENCE_FIELDS = ("image_reference", "video_reference", "audio_reference")
+
 
 def _preflight_encoder_format(fmt):
     """Pre-flight an encoder format string before any GPU work.
@@ -272,6 +275,19 @@ class _VideoRoutesMixin:
                     except json.JSONDecodeError as exc:
                         raise ValueError(
                             f"'extra_params' must be a JSON object string; {exc}"
+                        ) from exc
+                    continue
+                if key in _REFERENCE_FIELDS:
+                    # A reference sent as a text part is the object form; a file
+                    # part was already routed above and carries its own format.
+                    if value == "":
+                        continue
+                    try:
+                        data[key] = json.loads(value)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"'{key}' must be an uploaded file or a JSON object string "
+                            f'like {{"content": ..., "format": "url"}}; {exc}'
                         ) from exc
                     continue
                 if value == "":
