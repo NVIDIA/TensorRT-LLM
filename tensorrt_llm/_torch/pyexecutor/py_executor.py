@@ -3114,6 +3114,7 @@ class PyExecutor:
                 action = msg.get("action", "<unknown>")
                 op_id = msg.get("op_id")
                 error_msg = None
+                abort_acknowledged = False
                 release_control_request = True
                 has_mnnvl_resources = False
                 try:
@@ -3143,10 +3144,13 @@ class PyExecutor:
                                                     None)
                         if op_id is None:
                             release_control_request = False
-                        elif (not self.control_request_barrier.is_set()
-                              or active_control_id != op_id):
-                            self._record_sleep_wakeup_abort(op_id, error_msg)
-                            release_control_request = False
+                        else:
+                            if (not self.control_request_barrier.is_set()
+                                    or active_control_id != op_id):
+                                self._record_sleep_wakeup_abort(
+                                    op_id, error_msg)
+                                release_control_request = False
+                            abort_acknowledged = True
                         logger.warning("Sleep/wakeup listener: %s", error_msg)
                     elif action in (_SleepWakeupAction.PREPARE,
                                     _SleepWakeupAction.COMMIT,
@@ -3231,14 +3235,18 @@ class PyExecutor:
                     # exiting control_action() and broadcasting new requests
                     # before our executor loop has cleared its control barrier
                     # and is ready to participate in the next collective.
+                    ack_error = None if abort_acknowledged else error_msg
+                    ack = {
+                        "status": "ok" if ack_error is None else "error",
+                        "error": ack_error,
+                        "op_id": op_id,
+                        "phase": action,
+                        "has_mnnvl_resources": has_mnnvl_resources,
+                    }
+                    if abort_acknowledged:
+                        ack["reason"] = error_msg
                     self._sleep_wakeup_comm.send(
-                        {
-                            "status": "ok" if error_msg is None else "error",
-                            "error": error_msg,
-                            "op_id": op_id,
-                            "phase": action,
-                            "has_mnnvl_resources": has_mnnvl_resources,
-                        },
+                        ack,
                         dest=0,
                         tag=_SleepWakeupTag.ACK,
                     )

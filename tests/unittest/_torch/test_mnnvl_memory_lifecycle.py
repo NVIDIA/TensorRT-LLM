@@ -51,8 +51,24 @@ class _TestMnnvlMemory(mnnvl.MnnvlMemory):
 
 
 def test_checkpoint_allgather_timeout_is_bounded(monkeypatch):
-    request = SimpleNamespace(test=lambda: (False, None))
-    comm = SimpleNamespace(iallgather=lambda value: request)
+    orphaned_requests = []
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_ORPHANED_REQUESTS", orphaned_requests)
+    receive_request = SimpleNamespace(
+        test=lambda: (False, None),
+        Cancel=Mock(),
+        Free=Mock(),
+    )
+    send_request = SimpleNamespace(
+        test=lambda: (False, None),
+        Cancel=Mock(),
+        Free=Mock(),
+    )
+    comm = SimpleNamespace(
+        Get_rank=lambda: 0,
+        Get_size=lambda: 2,
+        irecv=lambda **kwargs: receive_request,
+        isend=lambda value, **kwargs: send_request,
+    )
     monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
     monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S", 0.0)
 
@@ -62,6 +78,82 @@ def test_checkpoint_allgather_timeout_is_bounded(monkeypatch):
             None,
             operation="mapping readiness",
         )
+    receive_request.Cancel.assert_called_once_with()
+    receive_request.Free.assert_not_called()
+    send_request.Cancel.assert_called_once_with()
+    send_request.Free.assert_not_called()
+    assert orphaned_requests == [receive_request, send_request]
+
+
+def test_checkpoint_request_cleanup_retains_request_when_cancel_fails(monkeypatch):
+    orphaned_requests = []
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_ORPHANED_REQUESTS", orphaned_requests)
+    request = SimpleNamespace(
+        test=Mock(return_value=(False, None)),
+        Cancel=Mock(side_effect=RuntimeError("cancel failed")),
+        Free=Mock(),
+    )
+    monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
+
+    mnnvl._cancel_checkpoint_requests([request])
+
+    request.Cancel.assert_called_once_with()
+    request.test.assert_called_once_with()
+    request.Free.assert_not_called()
+    assert orphaned_requests == [request]
+
+
+def test_checkpoint_allgather_uses_bounded_object_requests():
+    class _ReceiveRequest:
+        def __init__(self, value):
+            self.value = value
+
+        def test(self):
+            return True, self.value
+
+    comm = SimpleNamespace(
+        Get_rank=lambda: 1,
+        Get_size=lambda: 3,
+        irecv=lambda source, tag: _ReceiveRequest(f"rank-{source}"),
+        isend=lambda value, dest, tag: SimpleNamespace(test=lambda: (True, None)),
+        allgather=Mock(side_effect=AssertionError("blocking fallback used")),
+    )
+
+    result = mnnvl._checkpoint_allgather(comm, "rank-1", operation="test")
+
+    assert result == ["rank-0", "rank-1", "rank-2"]
+    comm.allgather.assert_not_called()
+
+
+def test_checkpoint_allgather_post_failure_retires_partial_requests():
+    requests = [
+        SimpleNamespace(test=Mock(return_value=(True, None)), Cancel=Mock(), Free=Mock()),
+        SimpleNamespace(test=Mock(return_value=(True, None)), Cancel=Mock(), Free=Mock()),
+        SimpleNamespace(test=Mock(return_value=(True, None)), Cancel=Mock(), Free=Mock()),
+    ]
+    receive_requests = iter(requests[:2])
+    send_requests = iter([requests[2], RuntimeError("post failed")])
+
+    def isend(value, dest, tag):
+        result = next(send_requests)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    comm = SimpleNamespace(
+        Get_rank=lambda: 0,
+        Get_size=lambda: 3,
+        irecv=lambda source, tag: next(receive_requests),
+        isend=isend,
+    )
+
+    with pytest.raises(RuntimeError, match="post failed"):
+        mnnvl._checkpoint_allgather(comm, None, operation="test")
+
+    for request in requests:
+        request.Cancel.assert_called_once_with()
+        request.test.assert_called_once_with()
+        request.Free.assert_not_called()
 
 
 @pytest.fixture
@@ -185,11 +277,16 @@ def test_checkpoint_restore_membership_timeout_is_terminal(memory, monkeypatch):
     monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
     monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S", 0.0)
 
-    request = SimpleNamespace(test=lambda: (False, None))
+    receive_request = SimpleNamespace(
+        test=lambda: (False, None),
+        Cancel=Mock(),
+        Free=Mock(),
+    )
     comm = SimpleNamespace(
         Get_rank=lambda: 0,
         Get_size=lambda: 2,
-        iallgather=lambda value: request,
+        irecv=lambda source, tag: receive_request,
+        isend=lambda value, dest, tag: SimpleNamespace(test=lambda: (True, None)),
     )
     with pytest.raises(TimeoutError, match="communicator membership"):
         obj.checkpoint_restore(comm)
@@ -211,20 +308,31 @@ def test_checkpoint_restore_timeout_cleans_locally_mapped_handles(memory, monkey
     monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
     monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S", 0.0)
 
+    pending = object()
+
     class Request:
-        def __init__(self, result=None):
+        def __init__(self, result=pending):
             self.result = result
 
         def test(self):
-            return (self.result is not None, self.result)
+            return (self.result is not pending, None if self.result is pending else self.result)
+
+        def Cancel(self):
+            pass
+
+        def Free(self):
+            pass
 
     class TimeoutComm(_FakeComm):
         def __init__(self):
             super().__init__()
-            self.requests = [Request([0, 1]), Request()]
+            self.receive_requests = iter([Request(1), Request()])
 
-        def iallgather(self, value):
-            return self.requests.pop(0)
+        def irecv(self, source, tag):
+            return next(self.receive_requests)
+
+        def isend(self, value, dest, tag):
+            return Request(None)
 
     with pytest.raises(TimeoutError, match="mapping readiness"):
         obj.checkpoint_restore(TimeoutComm())
@@ -408,7 +516,8 @@ def test_close_detached_memory_only_frees_va(memory, monkeypatch):
 
 def test_create_and_map_handles_cleans_partial_allocation(monkeypatch):
     comm = Mock()
-    comm.iallgather = None
+    comm.isend = None
+    comm.irecv = None
     comm.Get_rank.return_value = 0
     comm.Get_size.return_value = 2
     comm.allgather.side_effect = lambda value: [
@@ -459,7 +568,8 @@ def test_create_and_map_handles_cleans_partial_allocation(monkeypatch):
 
 def test_create_and_map_handles_releases_local_handle_on_export_failure(monkeypatch):
     comm = Mock()
-    comm.iallgather = None
+    comm.isend = None
+    comm.irecv = None
     comm.Get_rank.return_value = 0
     comm.Get_size.return_value = 2
     comm.allgather.side_effect = lambda value: [
@@ -505,7 +615,8 @@ def test_create_and_map_handles_releases_local_handle_on_export_failure(monkeypa
 )
 def test_create_and_map_handles_preserves_pidfd_error_hint(monkeypatch, errno_value, expected_hint):
     comm = Mock()
-    comm.iallgather = None
+    comm.isend = None
+    comm.irecv = None
     comm.Get_rank.return_value = 0
     comm.Get_size.return_value = 2
     comm.allgather.side_effect = lambda value: (
@@ -554,7 +665,8 @@ def test_create_and_map_handles_preserves_pidfd_error_hint(monkeypatch, errno_va
 
 def test_create_and_map_handles_close_failure_does_not_mask_original_error(monkeypatch):
     comm = Mock()
-    comm.iallgather = None
+    comm.isend = None
+    comm.irecv = None
     comm.Get_rank.return_value = 0
     comm.Get_size.return_value = 2
     comm.allgather.side_effect = lambda value: (

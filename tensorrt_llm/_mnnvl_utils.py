@@ -38,27 +38,104 @@ from .mapping import Mapping
 
 _MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S = 20.0
 _MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S = 0.01
+_MNNVL_CHECKPOINT_REQUEST_CLEANUP_TIMEOUT_S = 0.1
+_MNNVL_CHECKPOINT_ALLGATHER_TAG = 31415
+_MNNVL_CHECKPOINT_ORPHANED_REQUESTS: list[Any] = []
 
 
-def _checkpoint_allgather(comm, value, *, operation: str):
-    """Run a bounded object allgather when the communicator supports it."""
-    iallgather = getattr(comm, "iallgather", None)
-    if iallgather is None:
+def _cancel_checkpoint_requests(requests: list[Any]) -> None:
+    """Bound cancellation cleanup so timeout handling cannot hang in MPI."""
+    for request in requests:
+        try:
+            request.Cancel()
+        except Exception as error:
+            logger.warning(f"Failed to cancel MNNVL checkpoint request: {error}")
+
+    pending_requests = list(requests)
+    cleanup_timeout_s = min(
+        _MNNVL_CHECKPOINT_REQUEST_CLEANUP_TIMEOUT_S,
+        _MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S,
+    )
+    deadline = time.monotonic() + cleanup_timeout_s
+    while pending_requests:
+        incomplete_requests = []
+        for request in pending_requests:
+            try:
+                ready, _ = request.test()
+            except Exception as error:
+                logger.warning(f"Failed to poll MNNVL checkpoint request cleanup: {error}")
+                incomplete_requests.append(request)
+                continue
+            if not ready:
+                incomplete_requests.append(request)
+        pending_requests = incomplete_requests
+        if not pending_requests or time.monotonic() >= deadline:
+            break
+        time.sleep(_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S)
+
+    if pending_requests:
+        # An active receive must not be freed: mpi4py owns its receive buffer,
+        # and MPI may still write into it. Keep the wrappers alive until the
+        # enclosing fail-closed path terminates the worker.
+        _MNNVL_CHECKPOINT_ORPHANED_REQUESTS.extend(pending_requests)
+        logger.error(
+            "Retaining %d active MNNVL checkpoint requests until worker termination",
+            len(pending_requests),
+        )
+
+
+def _checkpoint_allgather(comm: Any, value: Any, *, operation: str) -> list[Any]:
+    """Run a bounded object allgather over nonblocking point-to-point requests.
+
+    Production mpi4py communicators provide ``isend`` and ``irecv`` but no
+    nonblocking object allgather. The blocking fallback is retained only for
+    lightweight test communicators that do not implement point-to-point APIs.
+    """
+    isend = getattr(comm, "isend", None)
+    irecv = getattr(comm, "irecv", None)
+    if isend is None or irecv is None:
         return comm.allgather(value)
 
-    request = iallgather(value)
-    deadline = time.monotonic() + _MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S
-    while True:
-        test_result = request.test()
-        if isinstance(test_result, tuple):
-            ready, result = test_result
-            if ready:
-                return result
-        elif test_result:
-            return request.wait()
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"Timed out waiting for MNNVL checkpoint {operation} allgather")
-        time.sleep(_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S)
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    results: list[Any] = [None] * size
+    results[rank] = value
+    receive_requests: dict[int, Any] = {}
+    send_requests: list[Any] = []
+    try:
+        for peer in range(size):
+            if peer != rank:
+                receive_requests[peer] = irecv(
+                    source=peer,
+                    tag=_MNNVL_CHECKPOINT_ALLGATHER_TAG,
+                )
+        for peer in range(size):
+            if peer != rank:
+                send_requests.append(
+                    isend(
+                        value,
+                        dest=peer,
+                        tag=_MNNVL_CHECKPOINT_ALLGATHER_TAG,
+                    )
+                )
+        if not receive_requests:
+            return results
+        deadline = time.monotonic() + _MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S
+        while receive_requests or send_requests:
+            for peer, request in list(receive_requests.items()):
+                ready, result = request.test()
+                if ready:
+                    results[peer] = result
+                    del receive_requests[peer]
+            send_requests = [request for request in send_requests if not request.test()[0]]
+            if not receive_requests and not send_requests:
+                return results
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for MNNVL checkpoint {operation} allgather")
+            time.sleep(_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S)
+    except Exception:
+        _cancel_checkpoint_requests([*receive_requests.values(), *send_requests])
+        raise
 
 
 def _check_cu_result(cu_func_ret):
@@ -570,9 +647,8 @@ class MnnvlMemory:
     def checkpoint_fail_closed(self) -> None:
         """Make a timed-out checkpoint allocation terminal.
 
-        A timed-out nonblocking MPI collective may still be outstanding.  The
-        allocation must not be reused by a later checkpoint attempt because a
-        new collective could then be matched against the abandoned request.
+        A timeout means ranks may have reached different checkpoint phases.
+        The allocation must not be reused by a later checkpoint attempt.
         """
         record = type(self).allocated_map[self.ptr]
         record.state = _MnnvlAllocationState.BROKEN

@@ -666,9 +666,12 @@ class BaseWorker(GenerationExecutor):
            prepared peer before rank-0 enters the subgroup checkpoint
            collectives. Otherwise execute the local VMM operation first.
         4. Execute the selected VMM and MNNVL operations and collect bounded
-           COMMIT ACKs. If PREPARE or pre-commit local execution fails, send
-           ABORT so peers leave the control barrier without changing VMM state.
-        5. Exit ``control_action()``, resuming rank-0's event loop.
+           COMMIT ACKs. If PREPARE or the initial rank-0 synchronization fails,
+           send ABORT before any rank changes VMM state. Once COMMIT or local
+           mutation starts, any error fail-stops the distributed worker because
+           rank state can no longer be reconciled safely.
+        5. Exit ``control_action()`` and resume rank-0 only after a successful
+           operation or a recoverable pre-COMMIT abort.
 
         Args:
             action: ``"sleep"`` or ``"wakeup"``.
@@ -728,9 +731,12 @@ class BaseWorker(GenerationExecutor):
             abort_sent = False
             commit_ranks = []
             commit_sent_early = False
+            local_commit_started = False
+            abort_incomplete = False
 
             def send_abort(reason: str,
                            ranks: Optional[list[int]] = None) -> list[int]:
+                nonlocal abort_incomplete
                 abort_ranks = []
                 abort_dests = ranks if ranks is not None else range(
                     1, world_size)
@@ -749,6 +755,7 @@ class BaseWorker(GenerationExecutor):
                         )
                         abort_ranks.append(abort_dest)
                     except Exception as abort_exc:
+                        abort_incomplete = True
                         abort_error = (
                             "rank 0 failed to send sleep/wakeup abort "
                             f"to rank {abort_dest}: {abort_exc}")
@@ -762,6 +769,7 @@ class BaseWorker(GenerationExecutor):
 
             def drain_acks(ranks: list[int],
                            phase: _SleepWakeupAction) -> list[dict]:
+                nonlocal abort_incomplete
                 received_acks = []
                 ack_deadline = time.monotonic() + _SLEEP_WAKEUP_ACK_TIMEOUT_S
                 for src in ranks:
@@ -772,6 +780,8 @@ class BaseWorker(GenerationExecutor):
                                                            expected_op_id=op_id,
                                                            expected_phase=phase)
                     except Exception as exc:
+                        if phase == _SleepWakeupAction.ABORT:
+                            abort_incomplete = True
                         errors.append(
                             f"rank 0 failed to receive {phase} ACK from "
                             f"rank {src}: {exc}")
@@ -785,6 +795,8 @@ class BaseWorker(GenerationExecutor):
                         continue
                     received_acks.append(ack)
                     if ack.get("status") != "ok":
+                        if phase == _SleepWakeupAction.ABORT:
+                            abort_incomplete = True
                         errors.append(
                             ack.get("error")
                             or f"rank {src} returned unknown {phase} ACK")
@@ -856,11 +868,14 @@ class BaseWorker(GenerationExecutor):
                     # MNNVL resource hooks contain subgroup handle exchange,
                     # so peers must enter COMMIT before rank 0 executes them.
                     if has_mnnvl_resources:
+                        # A failed MPI send has uncertain delivery, so any
+                        # attempted COMMIT requires the bounded local phase.
+                        commit_sent_early = bool(prepared_ranks)
                         commit_ranks = send_commits()
-                        commit_sent_early = True
 
                 if not errors or commit_sent_early:
                     torch.cuda.synchronize()
+                    local_commit_started = True
                     if action == _SleepWakeupAction.SLEEP:
                         run_mnnvl = (getattr(
                             self.engine, "_run_mnnvl_checkpoint_resources",
@@ -879,7 +894,7 @@ class BaseWorker(GenerationExecutor):
                             None) if has_mnnvl_resources else None)
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
-            except (RuntimeError, TimeoutError, torch.OutOfMemoryError) as exc:
+            except Exception as exc:
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
                 logger.error(
@@ -903,9 +918,30 @@ class BaseWorker(GenerationExecutor):
                     drain_acks(commit_ranks, _SleepWakeupAction.COMMIT)
 
                 if errors:
-                    raise RuntimeError(
+                    operation_error = RuntimeError(
                         f"{action}() failed on {len(errors)} rank(s):\n" +
                         "\n".join(errors))
+                    if commit_sent_early or local_commit_started or abort_incomplete:
+                        self._fail_stop_divergent_sleep_wakeup(operation_error)
+                    raise operation_error
+
+    def _fail_stop_divergent_sleep_wakeup(self, error: RuntimeError) -> None:
+        """Stop every rank after a sleep/wakeup operation may have diverged."""
+        from tensorrt_llm._torch.pyexecutor.hang_detector import \
+            propagate_hard_kill
+
+        self._set_fatal_error(error)
+        if self.engine is not None:
+            if getattr(self.engine, "_fatal_error", None) is None:
+                self.engine._fatal_error = error
+            self.engine.is_shutdown = True
+        try:
+            logger.critical(
+                "Distributed sleep/wakeup state may have diverged; hard-killing all ranks: %s",
+                error,
+            )
+        finally:
+            propagate_hard_kill()
 
     def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.

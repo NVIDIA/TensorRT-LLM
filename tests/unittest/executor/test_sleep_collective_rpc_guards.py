@@ -567,8 +567,9 @@ class TestMultiRankSendFailureRecovery:
                 if source == 1:
                     return {"status": "ok", "op_id": self.op_id}
                 return {
-                    "status": "error",
-                    "error": "rank 0 aborted sleep/wakeup before local execution",
+                    "status": "ok",
+                    "error": None,
+                    "reason": "rank 0 aborted sleep/wakeup before local execution",
                     "op_id": self.op_id,
                 }
 
@@ -589,7 +590,6 @@ class TestMultiRankSendFailureRecovery:
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
         )
-
         with (
             patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
@@ -602,7 +602,6 @@ class TestMultiRankSendFailureRecovery:
 
         msg = str(exc_info.value)
         assert "simulated mid-broadcast send failure" in msg
-        assert "rank 0 aborted sleep/wakeup" in msg
         assert release.call_count == 0
         assert send_calls == [
             (_SleepWakeupAction.PREPARE, 1, _SleepWakeupTag.ACTION),
@@ -676,6 +675,8 @@ class TestMultiRankSendFailureRecovery:
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
         )
+        fail_stop = MagicMock()
+        w._fail_stop_divergent_sleep_wakeup = fail_stop
 
         monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_TIMEOUT_S", 0.0)
         monkeypatch.setattr(py_executor, "_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S", 0.0)
@@ -689,6 +690,72 @@ class TestMultiRankSendFailureRecovery:
         ):
             with pytest.raises(RuntimeError, match="timed out waiting"):
                 w._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+        fail_stop.assert_called_once()
+
+    def test_abort_send_failure_fail_stops_prepared_worker(self):
+        """Rank 0 must not resume if a prepared peer cannot be aborted."""
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, _ = _make_proto_worker(
+            [{"status": "error", "error": "prepare failed"}],
+            world_size=2,
+        )
+        original_send = worker.engine._sleep_wakeup_comm.send
+
+        def fail_abort(payload, *args, **kwargs):
+            original_send(payload, *args, **kwargs)
+            if payload["action"] == _SleepWakeupAction.ABORT:
+                raise RuntimeError("abort send failed")
+
+        worker.engine._sleep_wakeup_comm.send = fail_abort
+        fail_stop = MagicMock()
+        worker._fail_stop_divergent_sleep_wakeup = fail_stop
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            with pytest.raises(RuntimeError, match="abort send failed"):
+                worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+        release.assert_not_called()
+        fail_stop.assert_called_once()
+
+    def test_abort_error_ack_fail_stops_prepared_worker(self):
+        """A genuine ABORT handler error leaves peer recovery inconclusive."""
+        from unittest.mock import patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, _ = _make_proto_worker(
+            [
+                {"status": "error", "error": "prepare failed"},
+                {"status": "error", "error": "abort handler failed"},
+            ],
+            world_size=2,
+        )
+        fail_stop = MagicMock()
+        worker._fail_stop_divergent_sleep_wakeup = fail_stop
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            with pytest.raises(RuntimeError, match="abort handler failed"):
+                worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+        release.assert_not_called()
+        fail_stop.assert_called_once()
 
     def test_commit_send_failure_aborts_uncommitted_rank(self):
         """A prepared rank that misses COMMIT must receive ABORT to unblock."""
@@ -743,6 +810,8 @@ class TestMultiRankSendFailureRecovery:
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
         )
+        fail_stop = MagicMock()
+        w._fail_stop_divergent_sleep_wakeup = fail_stop
 
         with (
             patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
@@ -755,6 +824,7 @@ class TestMultiRankSendFailureRecovery:
                 w._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
 
         release.assert_called_once()
+        fail_stop.assert_called_once()
         assert send_calls == [
             (_SleepWakeupAction.PREPARE, 1, _SleepWakeupTag.ACTION),
             (_SleepWakeupAction.PREPARE, 2, _SleepWakeupTag.ACTION),
@@ -822,6 +892,8 @@ class TestMultiRankSendFailureRecovery:
             _has_mnnvl_checkpoint_resources=lambda tags: True,
             _run_mnnvl_checkpoint_resources=run_mnnvl,
         )
+        fail_stop = Mock()
+        worker._fail_stop_divergent_sleep_wakeup = fail_stop
 
         with (
             patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
@@ -838,6 +910,152 @@ class TestMultiRankSendFailureRecovery:
             [ExecutorMemoryType.MODEL_ENGINE_MAIN],
         )
         release.assert_called_once_with(ExecutorMemoryType.MODEL_ENGINE_MAIN)
+        fail_stop.assert_called_once()
+
+    def test_mnnvl_all_commit_send_errors_are_treated_as_uncertain_delivery(self):
+        """A send error cannot prove that no peer received MNNVL COMMIT."""
+        import threading
+        from contextlib import contextmanager
+        from unittest.mock import Mock, patch
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import _SleepWakeupAction
+        from tensorrt_llm.executor.base_worker import BaseWorker
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        class FakeComm:
+            def __init__(self):
+                self.op_id = None
+                self.ack_phases = {1: []}
+
+            def send(self, payload, dest, tag):
+                self.op_id = payload.get("op_id", self.op_id)
+                if payload["action"] == _SleepWakeupAction.COMMIT:
+                    raise RuntimeError("injected MNNVL commit send failure")
+                self.ack_phases[dest].append(payload["action"])
+
+            def iprobe(self, source, tag):
+                return True
+
+            def recv(self, source, tag):
+                return {
+                    "status": "ok",
+                    "op_id": self.op_id,
+                    "phase": self.ack_phases[source].pop(0),
+                    "has_mnnvl_resources": True,
+                }
+
+        @contextmanager
+        def control_action(**kwargs):
+            yield None
+
+        worker = object.__new__(BaseWorker)
+        worker._backend = "pytorch"
+        worker.rank = 0
+        worker.llm_args = SimpleNamespace(
+            backend="pytorch",
+            parallel_config=SimpleNamespace(world_size=2),
+            sleep_config=object(),
+        )
+        run_mnnvl = Mock()
+        worker.engine = SimpleNamespace(
+            _sleep_wakeup_lock=threading.Lock(),
+            _sleep_wakeup_comm=FakeComm(),
+            control_action=control_action,
+            _has_mnnvl_checkpoint_resources=lambda tags: True,
+            _run_mnnvl_checkpoint_resources=run_mnnvl,
+        )
+        fail_stop = Mock()
+        worker._fail_stop_divergent_sleep_wakeup = fail_stop
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag") as release,
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            with pytest.raises(RuntimeError, match="commit send failure"):
+                worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.MODEL_ENGINE_MAIN])
+
+        run_mnnvl.assert_called_once_with(
+            _SleepWakeupAction.SLEEP,
+            [ExecutorMemoryType.MODEL_ENGINE_MAIN],
+        )
+        release.assert_called_once_with(ExecutorMemoryType.MODEL_ENGINE_MAIN)
+        fail_stop.assert_called_once()
+
+    def test_postcommit_non_runtime_error_fail_stops_worker(self):
+        """Every ordinary exception after COMMIT must take the fail-stop path."""
+        from unittest.mock import Mock, patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, _ = _make_proto_worker(
+            [{"status": "ok"}, {"status": "ok"}],
+            world_size=2,
+        )
+        worker.engine._has_mnnvl_checkpoint_resources = lambda tags: True
+        worker.engine._run_mnnvl_checkpoint_resources = Mock(
+            side_effect=ValueError("invalid checkpoint state")
+        )
+        fail_stop = Mock()
+        worker._fail_stop_divergent_sleep_wakeup = fail_stop
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag"),
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize"),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            with pytest.raises(RuntimeError, match="invalid checkpoint state"):
+                worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.MODEL_ENGINE_MAIN])
+
+        fail_stop.assert_called_once()
+
+    def test_divergent_commit_fail_stops_worker(self):
+        """A potentially divergent operation poisons the worker before returning."""
+        from unittest.mock import patch
+
+        from tensorrt_llm.executor.base_worker import BaseWorker
+
+        worker = object.__new__(BaseWorker)
+        worker._fatal_error = None
+        worker.engine = SimpleNamespace(_fatal_error=None, is_shutdown=False)
+        error = RuntimeError("divergent sleep state")
+
+        with patch("tensorrt_llm._torch.pyexecutor.hang_detector.propagate_hard_kill") as hard_kill:
+            worker._fail_stop_divergent_sleep_wakeup(error)
+
+        assert worker._fatal_error is error
+        assert worker.engine._fatal_error is error
+        assert worker.engine.is_shutdown
+        hard_kill.assert_called_once_with()
+
+    def test_precommit_local_failure_remains_recoverable(self):
+        """A failure before local mutation aborts peers without fail-stopping."""
+        from unittest.mock import Mock, patch
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker, _ = _make_proto_worker(
+            [{"status": "ok"}, {"status": "ok"}],
+            world_size=2,
+        )
+        fail_stop = Mock()
+        worker._fail_stop_divergent_sleep_wakeup = fail_stop
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.release_with_tag"),
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
+            patch("torch.cuda.synchronize", side_effect=RuntimeError("sync failed")),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+        ):
+            with pytest.raises(RuntimeError, match="sync failed"):
+                worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
+
+        fail_stop.assert_not_called()
 
 
 class TestListenerUncaughtExceptionSendsErrorAck:
@@ -979,7 +1197,7 @@ class TestListenerAbortAndShutdown:
             }
         ]
 
-    def test_abort_unblocks_control_request_and_sends_error_ack(self):
+    def test_abort_unblocks_control_request_and_sends_success_ack(self):
         """Abort messages release the non-rank executor control barrier."""
         import threading
         from unittest.mock import patch
@@ -1031,8 +1249,9 @@ class TestListenerAbortAndShutdown:
         assert executor.control_action_done.is_set()
         assert not executor.control_request_barrier.is_set()
         assert sent_acks
-        assert sent_acks[0]["status"] == "error"
-        assert "rank 0 send failed" in sent_acks[0]["error"]
+        assert sent_acks[0]["status"] == "ok"
+        assert sent_acks[0]["error"] is None
+        assert "rank 0 send failed" in sent_acks[0]["reason"]
 
     def test_abort_before_control_barrier_unblocks_later_control_request(self):
         """An early ABORT is recorded and later consumed by matching control."""
@@ -1095,7 +1314,9 @@ class TestListenerAbortAndShutdown:
         assert executor.control_requests == []
         assert not executor.control_request_barrier.is_set()
         assert sent_acks
-        assert sent_acks[0]["status"] == "error"
+        assert sent_acks[0]["status"] == "ok"
+        assert sent_acks[0]["error"] is None
+        assert "rank 0 send failed" in sent_acks[0]["reason"]
 
     def test_shutdown_sends_ack_before_listener_exits(self):
         """Shutdown messages are acknowledged so rank-0 can drain them."""
@@ -1188,6 +1409,8 @@ class TestMultiRankRank0LocalFailureDrainsAcks:
         # Two peers prepare ok, then abort ok after rank-0 local failure.
         responses = [{"status": "ok"}, {"status": "ok"}]
         w, recv_calls = _make_proto_worker(responses, world_size=3)
+        fail_stop = MagicMock()
+        w._fail_stop_divergent_sleep_wakeup = fail_stop
 
         with (
             patch(
@@ -1209,6 +1432,7 @@ class TestMultiRankRank0LocalFailureDrainsAcks:
             f"{len(recv_calls)}; stale ACKs would corrupt the next "
             "sleep/wakeup call."
         )
+        fail_stop.assert_called_once()
 
     def test_local_failure_plus_peer_error_both_reported(self):
         """When rank-0 fails locally and a peer also errors, both messages must appear.
@@ -1226,6 +1450,8 @@ class TestMultiRankRank0LocalFailureDrainsAcks:
             {"status": "error", "error": "rank 2 also failed"},
         ]
         w, _ = _make_proto_worker(responses)
+        fail_stop = MagicMock()
+        w._fail_stop_divergent_sleep_wakeup = fail_stop
 
         with (
             patch(
@@ -1243,6 +1469,7 @@ class TestMultiRankRank0LocalFailureDrainsAcks:
         msg = str(exc_info.value)
         assert "rank 0 VMM fault" in msg
         assert "rank 2 also failed" in msg
+        fail_stop.assert_called_once()
 
 
 class TestSingleRankLockAcquired:

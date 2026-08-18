@@ -170,8 +170,17 @@ def test_checkpoint_prepare_rejects_communicator_size_mismatch() -> None:
 
 def test_checkpoint_prepare_timeout_fails_closed(monkeypatch) -> None:
     lifecycle, memory, _ = _make_lifecycle()
-    request = SimpleNamespace(test=lambda: (False, None))
-    memory.comm = SimpleNamespace(iallgather=lambda value: request)
+    request = SimpleNamespace(
+        test=lambda: (False, None),
+        Cancel=Mock(),
+        Free=Mock(),
+    )
+    memory.comm = SimpleNamespace(
+        Get_rank=lambda: 0,
+        Get_size=lambda: 2,
+        irecv=lambda source, tag: request,
+        isend=lambda value, dest, tag: SimpleNamespace(test=lambda: (True, None)),
+    )
     monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_TIMEOUT_S", 0.0)
     monkeypatch.setattr(mnnvl, "_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S", 0.0)
 
@@ -555,8 +564,17 @@ def test_two_sided_checkpoint_prepare_timeout_fails_closed(
 ) -> None:
     instances = WeakSet()
     monkeypatch.setattr(NVLinkTwoSided, "_INSTANCES", instances)
-    request = SimpleNamespace(test=lambda: (False, None))
-    comm = SimpleNamespace(iallgather=lambda value: request)
+    request = SimpleNamespace(
+        test=lambda: (False, None),
+        Cancel=Mock(),
+        Free=Mock(),
+    )
+    comm = SimpleNamespace(
+        Get_rank=lambda: 0,
+        Get_size=lambda: 2,
+        irecv=lambda source, tag: request,
+        isend=lambda value, dest, tag: SimpleNamespace(test=lambda: (True, None)),
+    )
     main_workspace = Mock(mapped=True, comm=comm)
     prepare_workspace = Mock(mapped=True)
     monkeypatch.setattr(mnnvl.MnnvlMoe, "moe_workspace", main_workspace)
