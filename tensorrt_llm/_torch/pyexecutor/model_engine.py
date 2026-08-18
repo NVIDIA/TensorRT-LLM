@@ -1711,7 +1711,14 @@ class PyTorchModelEngine(ModelEngine):
             self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
     def _is_distributed_forward(self) -> bool:
-        """Return whether model forward can communicate with peer workers."""
+        """Return whether model forward can communicate with peer workers.
+
+        ``dist`` is optional. An engine built without a communicator cannot
+        enter a collective at all, so it has no peers to strand and every
+        warmup failure stays rank-local.
+        """
+        if self.dist is None:
+            return False
         return self.dist.world_size > 1 or self.mapping.dwdp_enabled
 
     def _should_run_warmup_batch(self, batch, num_tokens: int,

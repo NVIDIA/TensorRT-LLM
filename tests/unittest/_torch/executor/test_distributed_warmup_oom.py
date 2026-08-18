@@ -129,6 +129,15 @@ def test_warmup_batch_policy(
         engine._assert_all_tp_ranks_have_warmup_batch.assert_called_once()
 
 
+def test_warmup_batch_policy_without_communicator() -> None:
+    """`dist` is optional; without one there is no collective to strand a peer in."""
+    engine = _engine(world_size=4, dwdp_size=4)
+    engine.dist = None
+
+    assert engine._should_run_warmup_batch(None, 128, "general") is False
+    engine._assert_all_tp_ranks_have_warmup_batch.assert_not_called()
+
+
 def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> PyTorchModelEngine:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
     batch = object()
