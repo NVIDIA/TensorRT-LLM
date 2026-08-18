@@ -710,7 +710,7 @@ def _build_launcher(b, n, npad, k):
 # ---------------------------------------------------------------------------
 # run_impl mirror (main.cpp:39-96)
 # ---------------------------------------------------------------------------
-def _run_impl(logits, pre_idx, n_valid, indices, ws):
+def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
     if not (logits.is_cuda and pre_idx.is_cuda and indices.is_cuda):
         raise RuntimeError("all tensors must be CUDA")
     if logits.dtype is not _F32:
@@ -766,6 +766,26 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws):
     if ish[1] != k:
         indices = indices.reshape(-1)[: b * k].view(b, k)
 
+    # ---- optional values output (production parity, default OFF) ------------
+    # dsa.py allocates the values scratch only for the non-CuTeDSL path, so
+    # values stay opt-in. The indices are exact, so a gather epilogue
+    # reproduces the in-kernel writeback bit-for-bit; the constexpr in-kernel
+    # form rides the CUDA-graph per-row rewrite.
+    if values is not None:
+        if not values.is_cuda:
+            raise RuntimeError("values must be CUDA")
+        if values.dtype is not _F32:
+            raise RuntimeError("values must be float32")
+        vsh = values.shape
+        if len(vsh) != 2 or not values.is_contiguous():
+            raise RuntimeError("values must be 2-D contiguous")
+        if vsh[0] != b:
+            raise RuntimeError(f"batch dims must match: logits {b} values {vsh[0]}")
+        if vsh[1] < k:
+            raise RuntimeError(f"values width {vsh[1]} < k={k}")
+        if vsh[1] != k:
+            values = values.reshape(-1)[: b * k].view(b, k)
+
     # ---- n <= k short path (heuristicTopKDecode.cu:72-84) -------------------
     # Every valid position is in the top-K: emit identity indices and pad the
     # tail with -1 (the production pad convention; downstream treats -1 as
@@ -775,8 +795,12 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws):
     if n <= k:
         if n > 0:
             indices[:, :n] = torch.arange(n, dtype=_I32, device=indices.device)
+            if values is not None:
+                values[:, :n] = logits[:, :n]
         if n < k:
             indices[:, n:] = -1
+            if values is not None:
+                values[:, n:] = torch.finfo(_F32).min  # -FLT_MAX pad
         return
 
     key = (b, n, npad, k)
@@ -792,13 +816,17 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws):
             fn(logits, pre_idx, indices, *args)
     except Exception as e:
         raise RuntimeError(f"gvr_topk launch failed (b={b} n={n} npad={npad} k={k}): {e}") from e
+    if values is not None:
+        values.copy_(logits.gather(1, indices.to(torch.int64)))
 
 
 # ---------------------------------------------------------------------------
 # exports (main.cpp:98-124)
 # ---------------------------------------------------------------------------
-def run(logits, pre_idx, n_valid, indices):
+def run(logits, pre_idx, n_valid, indices, values=None):
     """Fast 4-arg form: signature-identical to the original candidate.
+    ``values`` (optional DPS output, default None = OFF) mirrors the
+    production values writeback; see _run_impl.
     Default per-device slab workspace resolved FIRST (main.cpp:99-102 --
     a CPU logits tensor therefore dies with 'device index out of range').
     Hot path inlines the C binding's check + atomic-load + cache-hit
@@ -809,13 +837,13 @@ def run(logits, pre_idx, n_valid, indices):
     ws = _ws_hot.get(d)
     if ws is None:
         ws = default_workspace(logits)
-    _run_impl(logits, pre_idx, n_valid, indices, ws)
+    _run_impl(logits, pre_idx, n_valid, indices, ws, values)
 
 
-def run_ws(logits, pre_idx, n_valid, indices, workspace):
+def run_ws(logits, pre_idx, n_valid, indices, workspace, values=None):
     """Explicit-workspace form for multi-stream callers (main.cpp:105-116)."""
     validate_run_ws(workspace, logits)
-    _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace))
+    _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values)
 
 
 __all__ = [

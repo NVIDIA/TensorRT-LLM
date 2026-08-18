@@ -152,6 +152,42 @@ def test_selfsampling_topk_short_path(batch_size, top_k, n_valid):
         ), "short-path tail must be -1 padded"
 
 
+def test_selfsampling_topk_values_output():
+    """Opt-in values output (default None = off, matching dsa.py, which
+    allocates the values scratch only for the non-CuTeDSL path): must equal
+    the gathered top-K values and the torch.topk value multiset."""
+    top_k, n_valid = 512, 8192
+    logits, pre_idx, indices, ref_vals = _make_case(2, n_valid, top_k, seed=11)
+    values = torch.full((2, top_k), 7.0, dtype=torch.float32, device=_DEV)
+    ss_host.run(logits, pre_idx, n_valid, indices, values)
+    torch.cuda.synchronize()
+    _check_exact(logits, indices, n_valid, ref_vals)
+    assert torch.equal(values, torch.gather(logits, 1, indices.to(torch.int64)))
+    assert torch.equal(
+        torch.sort(values + 0.0, dim=1, descending=True).values,
+        torch.sort(ref_vals + 0.0, dim=1, descending=True).values,
+    )
+
+
+def test_selfsampling_topk_values_short_path():
+    """Short path with values: head copies logits, tail pads with -FLT_MAX
+    (production heuristicTopKDecode pad convention)."""
+    top_k, n_valid, bs = 1024, 512, 4
+    gen = torch.Generator(device=_DEV).manual_seed(42)
+    logits = torch.randn((bs, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
+    pre_idx = torch.randint(
+        0, n_valid, (bs, top_k), generator=gen, dtype=torch.int32, device=_DEV
+    )
+    indices = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
+    values = torch.full((bs, top_k), 7.0, dtype=torch.float32, device=_DEV)
+    ss_host.run(logits, pre_idx, n_valid, indices, values)
+    torch.cuda.synchronize()
+    assert torch.equal(values[:, :n_valid], logits)
+    fmin = torch.finfo(torch.float32).min
+    assert bool((values[:, n_valid:] == fmin).all())
+    assert bool((indices[:, n_valid:] == -1).all())
+
+
 def test_selfsampling_topk_run_ws_explicit_workspace():
     """run_ws with a caller-owned workspace must agree with run()."""
     top_k, n_valid = 1024, 65536
