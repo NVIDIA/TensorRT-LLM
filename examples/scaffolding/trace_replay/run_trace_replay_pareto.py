@@ -6,6 +6,13 @@ them in flight, which is what a job-level Pareto point measures: many agent
 sessions served at once. One run yields one point; sweeping ``--concurrency``
 (and the server's ``--max_batch_size``) traces the curve.
 
+The result of a run is the pair ``pareto.job_x_jobs_per_h_per_user`` (agent
+tasks one user completes per hour) and ``pareto.job_y_jobs_per_h_per_gpu``
+(tasks a GPU serves per hour). Those two are the axes of the job-level Pareto
+curve. The ``token_*`` fields alongside them are the conventional token-level
+view, reported for comparison, and everything else in the JSON is the raw
+material they are derived from.
+
 Example::
 
     python examples/scaffolding/trace_replay/run_trace_replay_pareto.py \
@@ -412,15 +419,17 @@ def main() -> None:
     pareto = run["pareto"]
     if pareto.get("valid"):
         LOGGER.info(
-            "job-level: %.1f jobs/h/user, %.1f jobs/h/gpu | token-level: %.1f tokens/s/user, "
-            "%.0f tokens/s/gpu",
+            "RESULT job-level Pareto point: %.1f jobs/h/user (X), %.1f jobs/h/gpu (Y)",
             pareto["job_x_jobs_per_h_per_user"],
             pareto["job_y_jobs_per_h_per_gpu"],
+        )
+        LOGGER.info(
+            "  token-level, for comparison: %.1f tokens/s/user, %.0f tokens/s/gpu",
             pareto["token_x_tps_per_user"],
             pareto["token_y_tps_per_gpu"],
         )
     else:
-        LOGGER.warning("no steady-state window: %s", pareto.get("reason"))
+        LOGGER.warning("no steady-state window, so no Pareto point: %s", pareto.get("reason"))
 
 
 if __name__ == "__main__":

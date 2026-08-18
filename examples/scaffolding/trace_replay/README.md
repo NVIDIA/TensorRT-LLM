@@ -258,15 +258,30 @@ CLI argv, replay endpoint settings, and trace file metadata.
 A *job* is one agent session: a multi-turn conversation with tool calls in
 between, lasting minutes. That is the unit an agent's user perceives, and it
 is not derivable from tokens/s — the two views can rank configurations in
-opposite orders. The concurrent driver reports both, from client-side
-measurements only:
+opposite orders.
 
-| Axis | Field |
-|---|---|
-| jobs/h/user | `pareto.job_x_jobs_per_h_per_user` |
-| jobs/h/GPU | `pareto.job_y_jobs_per_h_per_gpu` |
-| tokens/s/user | `pareto.token_x_tps_per_user` |
-| tokens/s/GPU | `pareto.token_y_tps_per_gpu` |
+**The two job-level fields are the result this harness exists to produce.**
+Everything else in the report is either an input to them or context for
+interpreting them:
+
+| Axis | Field | |
+|---|---|---|
+| **jobs/h/user** | **`pareto.job_x_jobs_per_h_per_user`** | **the X axis of the job-level Pareto curve** |
+| **jobs/h/GPU** | **`pareto.job_y_jobs_per_h_per_gpu`** | **the Y axis of the job-level Pareto curve** |
+| tokens/s/user | `pareto.token_x_tps_per_user` | token-level comparison point |
+| tokens/s/GPU | `pareto.token_y_tps_per_gpu` | token-level comparison point |
+| tokens/s/GPU, output only | `pareto.token_y_tps_per_gpu_output_only` | reference, understates per-GPU throughput |
+
+`job_x` is `3600 / mean end-to-end job latency`, so it is how many agent tasks
+one user gets through per hour. `job_y` is completed jobs per hour per GPU
+inside the steady-state window, so it is deployment capacity. Plotting `job_x`
+against `job_y` across a sweep gives the curve a capacity plan should be built
+on: more concurrency buys `job_y` and costs `job_x`.
+
+The token-level pair is kept for comparison, not as the headline. It answers
+how fast tokens flow, which is a proxy; under heavy prefix reuse it is also
+ambiguous, since counting reused prefix tokens and counting only freshly
+computed ones differ several-fold.
 
 Two rules decide whether these numbers mean anything.
 
@@ -441,9 +456,13 @@ python examples/scaffolding/trace_replay/aggregate_pareto.py results/
 ```
 
 This writes `results/pareto.csv`, one row per successful run, sorted by
-`(max_batch_size, concurrency)` and ready to plot: `job_x_jobs_per_h_per_user`
-against `job_y_jobs_per_h_per_gpu` for the job-level curve,
-`token_x_tps_per_user` against `token_y_tps_per_gpu` for the token-level one.
+`(max_batch_size, concurrency)`. **The two columns to plot are
+`job_x_jobs_per_h_per_user` (X) and `job_y_jobs_per_h_per_gpu` (Y)** — that
+scatter is the job-level Pareto curve, and it is the deliverable. The
+`token_x_tps_per_user` / `token_y_tps_per_gpu` pair plots the token-level curve
+for comparison; the remaining columns identify the cell and let you check the
+run was well formed. The aggregator also prints the job-level coordinates of
+every point as it writes the file.
 
 **Options worth setting deliberately:**
 

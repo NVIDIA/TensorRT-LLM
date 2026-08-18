@@ -1,8 +1,13 @@
 r"""Aggregate a directory of Pareto run JSONs into one CSV, one row per run.
 
-Each row is one Pareto point. Runs without a steady-state window are skipped
-rather than replaced by a wall-clock average, which would silently average in
-the ramp-up and the drain.
+Each row is one Pareto point. The two columns to plot are
+``job_x_jobs_per_h_per_user`` (X) and ``job_y_jobs_per_h_per_gpu`` (Y): that
+scatter is the job-level Pareto curve this harness exists to produce. The
+``token_*`` columns are the token-level curve, kept for comparison.
+
+Runs without a steady-state window are skipped rather than replaced by a
+wall-clock average, which would silently average in the ramp-up and the
+drain.
 
 Example::
 
@@ -18,6 +23,7 @@ import json
 import sys
 from pathlib import Path
 
+# job_x / job_y lead the metric columns because they are the headline result.
 COLUMNS = [
     "run_json",
     "max_batch_size",
@@ -71,6 +77,13 @@ def main() -> None:
         writer.writerows(rows)
 
     print(f"wrote {output_csv} ({len(rows)} points)")
+    print("job-level Pareto curve (the result: X = jobs/h/user, Y = jobs/h/GPU):")
+    for row in rows:
+        print(
+            f"  B={row['max_batch_size']:<5} C={row['concurrency']:<5} "
+            f"{row['job_x_jobs_per_h_per_user']:8.1f} jobs/h/user   "
+            f"{row['job_y_jobs_per_h_per_gpu']:8.1f} jobs/h/gpu"
+        )
     for name, reason in skipped:
         print(f"skipped {name}: {reason}", file=sys.stderr)
 
