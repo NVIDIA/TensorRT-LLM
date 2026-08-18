@@ -74,8 +74,13 @@ worker_config:
     context_parallel_size: 1
     enable_attention_dp: true
     enable_chunked_prefill: false
+    # Every batch size from 1 to max_batch_size gets its own captured graph, so
+    # no decode step pads up to a larger graph. Not required to run, but faster.
     cuda_graph_config:
       max_batch_size: 32
+      batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+      enable_padding: true
     kv_cache_config:
       enable_block_reuse: false
       # 0.35, not the 0.25 default: K3 resolves use_kv_cache_manager_v2 to V2,
