@@ -1154,7 +1154,7 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
                     printf("dispatch(counted): ---Rank %d timed out data from rank %d counter=%llu expected=%llu\n",
                         rank_id, peer_rank, (unsigned long long) current_data_counter,
                         (unsigned long long) data_target);
-                    return;
+                    asm volatile("trap;");
                 }
                 ptrs.dispatch_counter_baseline[peer_rank] = data_target;
             }
@@ -1912,7 +1912,7 @@ __global__ void moeA2ACftCombinePushKernel(
     int rank_id, int ep_size, int max_tokens_per_rank, int bytes_per_token, uint64_t combine_payload_base,
     uint64_t combine_counter_base, int combine_counter_ep_stride, int local_stride_per_token)
 {
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000) || CLANGD_HOST_PASS
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     // Wait for prepareCombine to finish writing the workspace we read from, then immediately
     // signal the next kernel (combineCountedWrite) that it can start. combineCountedWrite
     // polls for incoming counter writes from peers — it touches disjoint memory from our
@@ -1986,6 +1986,10 @@ __global__ void moeA2ACftCombinePushKernel(
         cft_fabric_submit();
         cft_fabric_wait_reads();
     }
+#else
+    // Launched only on the CFT path, which requires sm_100+; fail loudly rather than
+    // completing with an empty body.
+    asm volatile("trap;" ::: "memory");
 #endif
 }
 
@@ -1995,7 +1999,7 @@ __global__ void moeA2ACombineCountedWriteKernel(const CombineKernelPointers ptrs
 {
     using InputT = std::conditional_t<LOW_PRECISION, __nv_fp8_e4m3, T>;
 
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000) || CLANGD_HOST_PASS
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     int local_token_idx = blockIdx.x;
     int const size_per_token = elements_per_token * sizeof(InputT);
 
@@ -2068,6 +2072,10 @@ __global__ void moeA2ACombineCountedWriteKernel(const CombineKernelPointers ptrs
     vectorized_combine<TOP_K, T, InputT>(
         token_output, size_per_token, size_per_token, rank_id, max_tokens_per_rank, ptrs);
     cudaTriggerProgrammaticLaunchCompletion();
+#else
+    // Launched only on the CFT path, which requires sm_100+; fail loudly rather than
+    // completing with an empty body.
+    asm volatile("trap;" ::: "memory");
 #endif // __CUDA_ARCH__ >= 1000
 }
 
@@ -2107,7 +2115,7 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
         if (v >= 1)
             blocks_per_rank = v;
     }
-    int kBlockThreads = push_warps * 32;
+    int blockThreads = push_warps * 32;
     int per_warp_bytes = kCftMbarrierSlotBytes + bytes_per_token;
     int smem_size = push_warps * per_warp_bytes;
 
@@ -2126,7 +2134,7 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
     SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
         auto kernel_fn = moeA2ACftCombinePushKernel<ENABLE_RANK_MASK>;
         launchWithPdlWhenEnabled("moeA2ACftCombinePushKernel", kernel_fn, dim3(params.ep_size, blocks_per_rank),
-            dim3(kBlockThreads), smem_size, params.stream, local_payload, params.recv_counters, params.flag_val, le_ids,
+            dim3(blockThreads), smem_size, params.stream, local_payload, params.recv_counters, params.flag_val, le_ids,
             params.ep_rank, params.ep_size, params.max_tokens_per_rank, bytes_per_token,
             params.cft_le_combine_payload_base, params.cft_le_combine_counter_base, params.combine_counter_ep_stride,
             local_stride_per_token);
@@ -2194,7 +2202,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         }
         int const cft_block = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize();
 
-        CombineKernelPointers kp = {}; // Zero-initialize
+        CombineKernelPointers kp = {};
         kp.src_data_ptrs[0] = params.output_data;
         for (int rank = 0; rank < params.ep_size; rank++)
         {
@@ -2212,6 +2220,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         kp.combine_counters = params.cft_le_combine_counters;
         kp.combine_counter_baseline = params.cft_combine_counter_baseline;
         kp.combine_counter_ep_stride = params.combine_counter_ep_stride;
+        kp.timeout_cycles = params.timeout_cycles;
         for (int w = 0; w < kRankMaskWords; ++w)
         {
             kp.active_rank_mask[w] = params.active_rank_mask[w];
