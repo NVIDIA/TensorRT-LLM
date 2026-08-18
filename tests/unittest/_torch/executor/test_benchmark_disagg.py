@@ -625,6 +625,7 @@ class MockPadDummyExecutor:
         self.kv_cache_manager = Mock()
         self.kv_cache_manager.mapping.has_cp_helix.return_value = False
         self.kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
+        self.kv_cache_manager.is_linear_attention = False
         dummy_req = Mock()
         dummy_req.is_attention_dp_dummy = True
         self.kv_cache_manager.add_dummy_requests.return_value = [dummy_req]
