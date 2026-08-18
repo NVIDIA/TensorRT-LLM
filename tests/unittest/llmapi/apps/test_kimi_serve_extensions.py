@@ -521,6 +521,9 @@ class TestKimiK3StrictGrammar:
         fmt = self.build(monkeypatch, [tool])
         begin = fmt["tags"][0]["content"]["tags"][0]["begin"]
         escaped = _escape_attr(name)
+        # Pin the exact K3 dialect: only '&' and '"' have escaped forms.
+        assert escaped == "we&quot;ird&amp;name"
+        assert _escape_attr("a<b>c") == "a<b>c"
         assert escaped in begin
         assert _unescape_attr(escaped) == name
         assert _parse_attrs(f'tool="{escaped}" index="1"') == {
