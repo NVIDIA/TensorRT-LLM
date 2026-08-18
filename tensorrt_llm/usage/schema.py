@@ -52,7 +52,14 @@ CPU_ARCHITECTURE = platform.uname().machine
 
 
 class _LlmCounterSnapshot(BaseModel):
-    """Process-local aggregate LLM lifecycle counters."""
+    """Process-local aggregate LLM lifecycle counters.
+
+    - Initialization attempts: entries into LLM construction.
+    - Instances created: LLM objects initialized successfully.
+    - Active instances: initialized objects not yet shut down.
+    - Maximum concurrent instances: highest active count observed.
+    - Initialization failures: construction attempts that raised an exception.
+    """
 
     llm_initialization_attempts: int = Field(
         default=0, ge=0, le=_UINT32_MAX, alias="llmInitializationAttempts"
