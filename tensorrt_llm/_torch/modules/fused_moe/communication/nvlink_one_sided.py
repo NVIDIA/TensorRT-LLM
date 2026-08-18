@@ -30,7 +30,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._mnnvl_utils import MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S,
@@ -470,6 +470,10 @@ class NVLinkOneSided(Communication):
         if not self.mnnvl_mem.mapped:
             raise RuntimeError("Native MoE All-to-All workspace handles are unmapped")
 
+    def checkpoint_resource_key(self) -> int:
+        """Identify wrappers sharing the same MNNVL workspace lifecycle."""
+        return id(self._require_workspace_lifecycle())
+
     def checkpoint_prepare(self) -> None:
         """Collectively detach handles after every shared owner is idle.
 
@@ -478,7 +482,10 @@ class NVLinkOneSided(Communication):
         """
         self._require_workspace_lifecycle().checkpoint_prepare()
 
-    def checkpoint_restore(self, comm=None) -> None:
+    def checkpoint_restore(
+        self,
+        comm: MnnvlCheckpointCommunicator | None = None,
+    ) -> None:
         """Collectively restore handles and all shared frontend state.
 
         Args:

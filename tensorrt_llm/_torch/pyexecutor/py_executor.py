@@ -41,7 +41,8 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
+from tensorrt_llm.llmapi.llm_args import (ExecutorMemoryType, PeftCacheConfig,
+                                          WaitingQueuePolicy)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
@@ -63,7 +64,8 @@ from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
-from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
+from .executor_request_queue import (ExecutorRequestQueue,
+                                     RequestAdmissionState, RequestQueueItem)
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
@@ -95,6 +97,9 @@ from .scheduler.adp_router import ADPRouter
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
+
+    from ..modules.fused_moe.communication.base import \
+        CheckpointableCommunication
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -1641,6 +1646,35 @@ class PyExecutor:
         Indicates if the current process is allowed to enqueue requests
         """
         return self.executor_request_queue.can_enqueue_request()
+
+    def begin_sleep_transition(self, tags: list[ExecutorMemoryType]) -> None:
+        self.executor_request_queue.begin_sleep_transition(tag.value
+                                                           for tag in tags)
+
+    def complete_sleep_transition(self) -> None:
+        self.executor_request_queue.complete_sleep_transition()
+
+    def abort_sleep_transition(self) -> None:
+        self.executor_request_queue.abort_sleep_transition()
+
+    def begin_wakeup_transition(self, tags: list[ExecutorMemoryType]) -> None:
+        self.executor_request_queue.begin_wakeup_transition(tag.value
+                                                            for tag in tags)
+
+    def complete_wakeup_transition(self) -> None:
+        self.executor_request_queue.complete_wakeup_transition()
+
+    def abort_wakeup_transition(self) -> None:
+        self.executor_request_queue.abort_wakeup_transition()
+
+    def fail_sleep_wakeup_transition(self) -> None:
+        self.executor_request_queue.fail_sleep_wakeup_transition()
+
+    def get_request_admission_state(self) -> RequestAdmissionState:
+        return self.executor_request_queue.get_admission_state()
+
+    def can_shutdown(self) -> bool:
+        return self.executor_request_queue.can_enqueue_control_request()
 
     def get_latest_iteration_stats(self):
         """
@@ -3235,14 +3269,13 @@ class PyExecutor:
         finally:
             set_thread_local_mpi_comm(None)
 
-    def _mnnvl_checkpoint_resources(self, tags) -> list:
+    def _mnnvl_checkpoint_resources(
+        self,
+        tags: list[ExecutorMemoryType],
+    ) -> list["CheckpointableCommunication"]:
         """Return unique native MNNVL MoE resources selected by engine tags."""
-        from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
-        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import \
-            NVLinkOneSided
-        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import \
-            NVLinkTwoSided
-        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+        from tensorrt_llm._torch.modules.fused_moe.communication.base import \
+            CheckpointableCommunication
 
         selected_engines = []
         if ExecutorMemoryType.MODEL_ENGINE_MAIN in tags:
@@ -3250,8 +3283,7 @@ class PyExecutor:
         if ExecutorMemoryType.MODEL_ENGINE_DRAFT in tags and self.draft_model_engine is not None:
             selected_engines.append(self.draft_model_engine)
 
-        resource_types = (MoeAlltoAll, NVLinkOneSided, NVLinkTwoSided)
-        resources = []
+        resources: list[CheckpointableCommunication] = []
         seen = set()
         for engine in selected_engines:
             model = getattr(engine, "model", None)
@@ -3259,22 +3291,26 @@ class PyExecutor:
                 continue
             for module in model.modules():
                 resource = getattr(module, "comm", None)
-                if not isinstance(resource, resource_types):
+                if not isinstance(resource, CheckpointableCommunication):
                     continue
-                lifecycle = getattr(resource, "_workspace_lifecycle", None)
-                key = (("workspace",
-                        id(lifecycle)) if lifecycle is not None else
-                       ("resource_type", type(resource)))
+                key = resource.checkpoint_resource_key()
                 if key in seen:
                     continue
                 seen.add(key)
                 resources.append(resource)
         return resources
 
-    def _has_mnnvl_checkpoint_resources(self, tags) -> bool:
+    def _has_mnnvl_checkpoint_resources(
+        self,
+        tags: list[ExecutorMemoryType],
+    ) -> bool:
         return bool(self._mnnvl_checkpoint_resources(tags))
 
-    def _run_mnnvl_checkpoint_resources(self, action, tags) -> None:
+    def _run_mnnvl_checkpoint_resources(
+        self,
+        action: _SleepWakeupAction,
+        tags: list[ExecutorMemoryType],
+    ) -> None:
         """Execute process-local native MNNVL hooks while the engine is parked."""
         resources = self._mnnvl_checkpoint_resources(tags)
         if action == _SleepWakeupAction.SLEEP:

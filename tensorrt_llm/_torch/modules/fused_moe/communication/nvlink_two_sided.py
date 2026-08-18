@@ -27,7 +27,7 @@ from weakref import WeakSet
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+from tensorrt_llm._mnnvl_utils import MnnvlCheckpointCommunicator, MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _collect_active_ranks
 from tensorrt_llm.mapping import Mapping
 
@@ -109,6 +109,10 @@ class NVLinkTwoSided(Communication):
         """
         return True
 
+    def checkpoint_resource_key(self) -> int:
+        """Identify the process-global TRT-native two-sided workspaces."""
+        return id(MnnvlMoe)
+
     def checkpoint_prepare(self) -> None:
         """Detach TRT-native two-sided workspaces after global quiescence.
 
@@ -142,7 +146,10 @@ class NVLinkTwoSided(Communication):
             )
         MnnvlMoe.checkpoint_prepare()
 
-    def checkpoint_restore(self, comm=None) -> None:
+    def checkpoint_restore(
+        self,
+        comm: MnnvlCheckpointCommunicator | None = None,
+    ) -> None:
         """Restore TRT-native two-sided workspaces and protocol state.
 
         Args:

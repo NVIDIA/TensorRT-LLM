@@ -22,7 +22,7 @@ import uuid
 import weakref
 from pathlib import Path
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -648,7 +648,7 @@ class BaseWorker(GenerationExecutor):
 
     def _multi_rank_sleep_wakeup(
         self,
-        action: str,
+        action: Literal["sleep", "wakeup"],
         tags: list[ExecutorMemoryType],
     ) -> None:
         """Coordinate a sleep or wakeup operation across all MPI ranks.
@@ -670,8 +670,9 @@ class BaseWorker(GenerationExecutor):
            send ABORT before any rank changes VMM state. Once COMMIT or local
            mutation starts, any error fail-stops the distributed worker because
            rank state can no longer be reconciled safely.
-        5. Exit ``control_action()`` and resume rank-0 only after a successful
-           operation or a recoverable pre-COMMIT abort.
+        5. Exit ``control_action()`` only after a successful operation or a
+           recoverable pre-COMMIT abort. The public ``sleep()``/``wakeup()``
+           wrapper owns the persistent admission transition around this helper.
 
         Args:
             action: ``"sleep"`` or ``"wakeup"``.
@@ -918,6 +919,13 @@ class BaseWorker(GenerationExecutor):
 
         self._set_fatal_error(error)
         if self.engine is not None:
+            fail_transition = getattr(
+                self.engine,
+                "fail_sleep_wakeup_transition",
+                None,
+            )
+            if fail_transition is not None:
+                fail_transition()
             if getattr(self.engine, "_fatal_error", None) is None:
                 self.engine._fatal_error = error
             self.engine.is_shutdown = True
@@ -952,9 +960,9 @@ class BaseWorker(GenerationExecutor):
                 value strings (e.g. ``["kv_cache"]``).
 
         Returns:
-            None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been released on every rank and the
-            event loop has been resumed.
+            None. The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been released on every rank and request
+            admission remains closed until ``wakeup()`` succeeds.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
@@ -966,15 +974,30 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
         logger.info(f"Sleep: {tags}")
-        if self.llm_args.parallel_config.world_size > 1:
-            self._multi_rank_sleep_wakeup("sleep", tags)
-        else:
-            with self.engine._sleep_wakeup_lock, self.engine.control_action():
-                torch.cuda.synchronize()
-                release_with_tag(*tags)
-                torch.cuda.synchronize()
-                gc.collect()
-                torch.cuda.empty_cache()
+        self.engine.begin_sleep_transition(tags)
+        local_mutation_started = False
+        try:
+            if self.llm_args.parallel_config.world_size > 1:
+                self._multi_rank_sleep_wakeup("sleep", tags)
+            else:
+                with self.engine._sleep_wakeup_lock, self.engine.control_action(
+                ):
+                    torch.cuda.synchronize()
+                    local_mutation_started = True
+                    release_with_tag(*tags)
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+        except Exception:
+            if local_mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_sleep_transition()
+            raise
+        try:
+            self.engine.complete_sleep_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     def wakeup(self, wakeup_tags: list[str]) -> None:
         """Materialize GPU virtual memory for the specified memory type tags.
@@ -990,9 +1013,10 @@ class BaseWorker(GenerationExecutor):
                 value strings (e.g. ``["kv_cache"]``).
 
         Returns:
-            None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been materialized on every rank and the
-            event loop has been resumed.
+            None. The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been materialized on every rank.
+            Request admission reopens once every tag from the corresponding
+            sleep transition has been restored.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
@@ -1004,13 +1028,28 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
         logger.info(f"Wakeup: {tags}")
-        if self.llm_args.parallel_config.world_size > 1:
-            self._multi_rank_sleep_wakeup("wakeup", tags)
-        else:
-            with self.engine._sleep_wakeup_lock, self.engine.control_action():
-                torch.cuda.synchronize()
-                materialize_with_tag(*tags)
-                torch.cuda.synchronize()
+        self.engine.begin_wakeup_transition(tags)
+        local_mutation_started = False
+        try:
+            if self.llm_args.parallel_config.world_size > 1:
+                self._multi_rank_sleep_wakeup("wakeup", tags)
+            else:
+                with self.engine._sleep_wakeup_lock, self.engine.control_action(
+                ):
+                    torch.cuda.synchronize()
+                    local_mutation_started = True
+                    materialize_with_tag(*tags)
+                    torch.cuda.synchronize()
+        except Exception:
+            if local_mutation_started:
+                self.engine.fail_sleep_wakeup_transition()
+            self.engine.abort_wakeup_transition()
+            raise
+        try:
+            self.engine.complete_wakeup_transition()
+        except Exception:
+            self.engine.fail_sleep_wakeup_transition()
+            raise
 
     def shutdown(self):
         if self.doing_shutdown:
@@ -1018,9 +1057,13 @@ class BaseWorker(GenerationExecutor):
         else:
             self.doing_shutdown = True
 
-        if self.engine is not None and self.engine.can_enqueue_requests():
-            self.engine.shutdown()
-            self.engine = None
+        if self.engine is not None:
+            can_shutdown = getattr(self.engine, "can_shutdown", None)
+            if can_shutdown is None:
+                can_shutdown = self.engine.can_enqueue_requests
+            if can_shutdown():
+                self.engine.shutdown()
+                self.engine = None
 
     def get_disaggregated_params(self) -> dict:
         if self.engine is None or self.engine.kv_cache_transceiver is None:

@@ -19,7 +19,11 @@ from weakref import WeakSet
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory, _checkpoint_allgather
+from tensorrt_llm._mnnvl_utils import (
+    MnnvlCheckpointCommunicator,
+    MnnvlMemory,
+    _checkpoint_allgather,
+)
 from tensorrt_llm._torch.alltoall_watchdog import (
     AlltoAllWatchdog,
     AlltoAllWatchdogCoordinator,
@@ -30,17 +34,8 @@ from tensorrt_llm._torch.alltoall_watchdog import (
 _WORKSPACE_LIFECYCLE_KEY = "mnnvl_alltoall_workspace_lifecycle"
 
 
-class _CollectiveCommunicator(Protocol):
-    def barrier(self) -> None:
-        """Synchronize every rank participating in the workspace."""
-
-    def allgather(self, value: bool) -> list[bool]:
-        """Gather one readiness value from each participating rank."""
-        ...
-
-
 def _collect_active_ranks(
-    comm: _CollectiveCommunicator,
+    comm: MnnvlCheckpointCommunicator,
     *,
     local_clients_idle: bool,
     expected_size: int,
@@ -60,7 +55,7 @@ def _collect_active_ranks(
 
 
 def _collect_unready_ranks(
-    comm: _CollectiveCommunicator,
+    comm: MnnvlCheckpointCommunicator,
     *,
     local_ready: bool,
     expected_size: int,
@@ -235,7 +230,7 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
         local_clients_idle = all(
             client._mnnvl_checkpoint_is_idle() for client in list(self._clients)
         )
-        comm = cast(_CollectiveCommunicator | None, self._memory.comm)
+        comm = cast(MnnvlCheckpointCommunicator | None, self._memory.comm)
         if comm is None:
             raise RuntimeError("MNNVL workspace communicator is not initialized")
         try:
@@ -257,7 +252,7 @@ class _MnnvlAlltoAllWorkspaceLifecycle:
 
     def checkpoint_restore(
         self,
-        comm: _CollectiveCommunicator,
+        comm: MnnvlCheckpointCommunicator,
         initialize_frontend: Callable[[], torch.Tensor],
     ) -> None:
         """Restore backing handles and publish the workspace after frontend readiness."""

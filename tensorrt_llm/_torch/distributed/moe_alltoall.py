@@ -28,7 +28,7 @@ from typing import Callable, Dict, Optional
 
 import torch
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._mnnvl_utils import MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S, ActiveRankMaskSnapshot,
@@ -292,6 +292,10 @@ class MoeAlltoAll:
     def _alltoall_watchdog(self) -> AlltoAllWatchdog | None:
         return self._workspace_lifecycle.watchdog_for(self)
 
+    def checkpoint_resource_key(self) -> int:
+        """Identify wrappers sharing the same MNNVL workspace lifecycle."""
+        return id(self._workspace_lifecycle)
+
     def destroy(self) -> None:
         """Stop background watchdog resources owned by this wrapper."""
         if getattr(self, "_destroyed", False):
@@ -320,7 +324,10 @@ class MoeAlltoAll:
         """
         self._workspace_lifecycle.checkpoint_prepare()
 
-    def checkpoint_restore(self, comm=None) -> None:
+    def checkpoint_restore(
+        self,
+        comm: MnnvlCheckpointCommunicator | None = None,
+    ) -> None:
         """Collectively restore handles and all shared frontend state.
 
         Args:

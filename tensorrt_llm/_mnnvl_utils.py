@@ -21,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Protocol, Union
 
 import pynvml
 import torch
@@ -41,6 +41,34 @@ _MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S = 0.01
 _MNNVL_CHECKPOINT_REQUEST_CLEANUP_TIMEOUT_S = 0.1
 _MNNVL_CHECKPOINT_ALLGATHER_TAG = 31415
 _MNNVL_CHECKPOINT_ORPHANED_REQUESTS: list[Any] = []
+
+
+class MnnvlCheckpointCommunicator(Protocol):
+    """Structural contract required by bounded MNNVL checkpoint collectives."""
+
+    def Get_rank(self) -> int:
+        """Return this process's rank in the communicator."""
+        ...
+
+    def Get_size(self) -> int:
+        """Return the communicator size."""
+        ...
+
+    def barrier(self) -> None:
+        """Synchronize all communicator members."""
+        ...
+
+    def allgather(self, value: Any) -> list[Any]:
+        """Gather a Python object from every communicator member."""
+        ...
+
+    def isend(self, value: Any, *, dest: int, tag: int) -> Any:
+        """Start a nonblocking Python-object send."""
+        ...
+
+    def irecv(self, *, source: int, tag: int) -> Any:
+        """Start a nonblocking Python-object receive."""
+        ...
 
 
 def _cancel_checkpoint_requests(requests: list[Any]) -> None:
@@ -84,7 +112,12 @@ def _cancel_checkpoint_requests(requests: list[Any]) -> None:
         )
 
 
-def _checkpoint_allgather(comm: Any, value: Any, *, operation: str) -> list[Any]:
+def _checkpoint_allgather(
+    comm: MnnvlCheckpointCommunicator,
+    value: Any,
+    *,
+    operation: str,
+) -> list[Any]:
     """Run a bounded object allgather over nonblocking point-to-point requests.
 
     Production mpi4py communicators provide ``isend`` and ``irecv`` but no
@@ -133,6 +166,7 @@ def _checkpoint_allgather(comm: Any, value: Any, *, operation: str) -> list[Any]
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Timed out waiting for MNNVL checkpoint {operation} allgather")
             time.sleep(_MNNVL_CHECKPOINT_COLLECTIVE_POLL_INTERVAL_S)
+        return results
     except Exception:
         _cancel_checkpoint_requests([*receive_requests.values(), *send_requests])
         raise
@@ -654,7 +688,7 @@ class MnnvlMemory:
         record.state = _MnnvlAllocationState.BROKEN
         record.pending_comm = None
 
-    def checkpoint_restore(self, comm) -> bool:
+    def checkpoint_restore(self, comm: MnnvlCheckpointCommunicator) -> bool:
         """Remap fresh handles while keeping data-path access disabled."""
         cls = type(self)
         record = cls.allocated_map[self.ptr]
@@ -963,7 +997,7 @@ class MnnvlMoe:
                 workspace.checkpoint_prepare()
 
     @staticmethod
-    def checkpoint_restore(comm) -> None:
+    def checkpoint_restore(comm: MnnvlCheckpointCommunicator) -> None:
         """Restore TRT-native two-sided MoE workspaces at their original virtual addresses."""
         workspaces = (MnnvlMoe.moe_workspace, MnnvlMoe.moe_prepare_workspace)
         restored_workspaces = []

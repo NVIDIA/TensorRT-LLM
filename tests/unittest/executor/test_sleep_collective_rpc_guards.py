@@ -50,6 +50,15 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
         parallel_config=SimpleNamespace(world_size=world_size),
         sleep_config=sleep_config,
     )
+    w.engine = SimpleNamespace(
+        begin_sleep_transition=MagicMock(),
+        complete_sleep_transition=MagicMock(),
+        abort_sleep_transition=MagicMock(),
+        begin_wakeup_transition=MagicMock(),
+        complete_wakeup_transition=MagicMock(),
+        abort_wakeup_transition=MagicMock(),
+        fail_sleep_wakeup_transition=MagicMock(),
+    )
     return w
 
 
@@ -111,6 +120,28 @@ class TestBaseWorkerSleepGuards:
         call_action, call_tags = mock_helper.call_args[0]
         assert call_action == method
         assert len(call_tags) == 1
+        getattr(w.engine, f"begin_{method}_transition").assert_called_once_with(call_tags)
+        getattr(w.engine, f"complete_{method}_transition").assert_called_once_with()
+        getattr(w.engine, f"abort_{method}_transition").assert_not_called()
+
+    def test_multirank_recoverable_failure_restores_admission(self, method):
+        """A helper failure before mutation restores the prior admission state."""
+        from unittest.mock import patch
+
+        w = _make_worker(world_size=2)
+        with (
+            patch.object(
+                w,
+                "_multi_rank_sleep_wakeup",
+                side_effect=RuntimeError("prepare failed"),
+            ),
+            pytest.raises(RuntimeError, match="prepare failed"),
+        ):
+            getattr(w, method)(["kv_cache"])
+
+        getattr(w.engine, f"abort_{method}_transition").assert_called_once_with()
+        getattr(w.engine, f"complete_{method}_transition").assert_not_called()
+        w.engine.fail_sleep_wakeup_transition.assert_not_called()
 
     def test_backend_checked_before_sleep_config(self, method):
         """Backend check fires even when sleep_config is also absent."""
@@ -433,21 +464,27 @@ class TestMnnvlSleepWakeupCoordination:
         from types import SimpleNamespace
         from unittest.mock import Mock
 
-        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import (
-            NVLinkOneSided,
+        from tensorrt_llm._torch.modules.fused_moe.communication.base import (
+            CheckpointableCommunication,
         )
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _SleepWakeupAction
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
-        lifecycle = object()
+        class FutureCheckpointCommunication:
+            def __init__(self, resource_key):
+                self.resource_key = resource_key
+                self.checkpoint_prepare = Mock()
+                self.checkpoint_restore = Mock()
+
+            def checkpoint_resource_key(self):
+                return self.resource_key
+
+        shared_resource_key = object()
         resources = []
         modules = []
         for _ in range(2):
-            resource = NVLinkOneSided.__new__(NVLinkOneSided)
-            resource._workspace_lifecycle = lifecycle
-            resource._workspace_registered = False
-            resource.checkpoint_prepare = Mock()
-            resource.checkpoint_restore = Mock()
+            resource = FutureCheckpointCommunication(shared_resource_key)
+            assert isinstance(resource, CheckpointableCommunication)
             resources.append(resource)
             modules.append(SimpleNamespace(comm=resource))
 
@@ -1021,7 +1058,11 @@ class TestMultiRankSendFailureRecovery:
 
         worker = object.__new__(BaseWorker)
         worker._fatal_error = None
-        worker.engine = SimpleNamespace(_fatal_error=None, is_shutdown=False)
+        worker.engine = SimpleNamespace(
+            _fatal_error=None,
+            is_shutdown=False,
+            fail_sleep_wakeup_transition=MagicMock(),
+        )
         error = RuntimeError("divergent sleep state")
 
         with patch("tensorrt_llm._torch.pyexecutor.hang_detector.propagate_hard_kill") as hard_kill:
@@ -1030,6 +1071,7 @@ class TestMultiRankSendFailureRecovery:
         assert worker._fatal_error is error
         assert worker.engine._fatal_error is error
         assert worker.engine.is_shutdown
+        worker.engine.fail_sleep_wakeup_transition.assert_called_once_with()
         hard_kill.assert_called_once_with()
 
     def test_precommit_local_failure_remains_recoverable(self):
@@ -1513,6 +1555,13 @@ class TestSingleRankLockAcquired:
         w.engine = SimpleNamespace(
             _sleep_wakeup_lock=SpyLock(),
             control_action=_noop_control_action,
+            begin_sleep_transition=MagicMock(),
+            complete_sleep_transition=MagicMock(),
+            abort_sleep_transition=MagicMock(),
+            begin_wakeup_transition=MagicMock(),
+            complete_wakeup_transition=MagicMock(),
+            abort_wakeup_transition=MagicMock(),
+            fail_sleep_wakeup_transition=MagicMock(),
         )
 
         with (
@@ -1525,6 +1574,41 @@ class TestSingleRankLockAcquired:
             getattr(w, method)(["kv_cache"])
 
         assert lock_entered, f"{method}() with world_size=1 did not acquire _sleep_wakeup_lock"
+
+    @pytest.mark.parametrize(
+        ("method", "mutation"),
+        [("sleep", "release_with_tag"), ("wakeup", "materialize_with_tag")],
+    )
+    def test_post_mutation_failure_permanently_closes_admission(self, method, mutation):
+        """A single-rank error after VMM mutation starts is fail-closed."""
+        import threading
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        w = _make_worker()
+
+        @contextmanager
+        def _noop_control_action():
+            yield None
+
+        w.engine._sleep_wakeup_lock = threading.Lock()
+        w.engine.control_action = _noop_control_action
+
+        with (
+            patch(f"tensorrt_llm._torch.virtual_memory.{mutation}"),
+            patch(
+                "torch.cuda.synchronize",
+                side_effect=[None, RuntimeError("post-mutation sync failed")],
+            ),
+            patch("gc.collect"),
+            patch("torch.cuda.empty_cache"),
+            pytest.raises(RuntimeError, match="post-mutation sync failed"),
+        ):
+            getattr(w, method)(["kv_cache"])
+
+        w.engine.fail_sleep_wakeup_transition.assert_called_once_with()
+        getattr(w.engine, f"abort_{method}_transition").assert_called_once_with()
+        getattr(w.engine, f"complete_{method}_transition").assert_not_called()
 
 
 # ---------------------------------------------------------------------------
