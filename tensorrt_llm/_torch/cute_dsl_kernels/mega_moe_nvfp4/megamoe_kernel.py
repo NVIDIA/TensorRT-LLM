@@ -1370,7 +1370,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # (fc2_output_sf); the token-back warps push that SF plane
         # token-contiguously to the peers' combine_sf (and the data plane too in
         # the dispatch modes); TopkReduce below dequantizes and reduces.
-        super().__call__(
+        # Anchor super for CuTe DSL tracing when self is the SM107 subclass.
+        super(Sm100MegaMoEKernel, self).__call__(
             activation=l1_token_buffer_nvfp4,
             fc1_weight=fc1_weight,
             activation_sf=l1_sf_buffer_fp8,
