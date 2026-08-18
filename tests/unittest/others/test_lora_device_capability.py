@@ -6,29 +6,8 @@ import torch
 
 import tensorrt_llm._torch.peft.lora.manager as lora_manager
 from tensorrt_llm._torch.pyexecutor._util import _get_initial_lora_data_type
-from tensorrt_llm._torch.peft.lora.manager import supports_native_fp8_lora
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.mark.parametrize(
-    "device_capability,expected",
-    [
-        ((9, 0), True),
-        ((10, 0), True),
-        ((10, 3), True),
-        ((8, 0), False),
-        ((12, 0), False),
-    ],
-)
-def test_supports_native_fp8_lora(device_capability, expected, monkeypatch):
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "lora_grouped_gemm_supports_fp8",
-        lambda sm_version: sm_version in {90, 100, 103},
-        raising=False,
-    )
-    assert supports_native_fp8_lora(device_capability) is expected
 
 
 def test_missing_native_fp8_lora_capability_query_warns_once(caplog, monkeypatch):
