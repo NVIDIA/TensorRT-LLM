@@ -336,6 +336,64 @@ def test_selfsampling_topk_varlen_guards():
         ss_host.run_varlen(logits, pre_idx, kv.cpu(), indices)
 
 
+def test_selfsampling_topk_varlen_cuda_graph():
+    """CUDA-graph safety of the in-kernel varlen engine: warm up, capture one
+    launch with max_seq_len (capture-stable constant — no host reads, no JIT
+    inside capture), then replay while kv_lens grows in place — including a
+    row that crosses the n <= k short-path boundary INSIDE the graph and a
+    row walking over the 131072 band edge."""
+    rows, top_k, msl = 4, 512, 262144
+    npad = msl
+    logits = torch.randn((rows, npad), dtype=torch.float32, device=_DEV) - 2.0
+    pre_idx = torch.zeros((rows, top_k), dtype=torch.int32, device=_DEV)
+    kv_lens = torch.tensor([100, 4099, 131070, 200000], dtype=torch.int32, device=_DEV)
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+
+    def refresh(step):
+        kv = [100 + step * 137, 4099 + step * 977, 131070 + step, 200000 + step * 3]
+        kv_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
+        gen = torch.Generator(device=_DEV).manual_seed(1000 + step)
+        logits.copy_(
+            torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+        )
+        for r in range(rows):
+            n = min(kv[r], npad)
+            logits[r, n:] = 3e38
+            pre_idx[r] = torch.randint(
+                0, max(n, 1), (top_k,), generator=gen, dtype=torch.int32, device=_DEV
+            )
+        return kv
+
+    refresh(0)
+    ss_host.run_varlen(logits, pre_idx, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(logits, pre_idx, kv_lens, indices, compress_ratio=1, max_seq_len=msl)
+    for step in range(1, 6):
+        kv = refresh(step)
+        indices.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        for r in range(rows):
+            n = min(kv[r], npad)
+            if n <= top_k:
+                head = torch.sort(indices[r, :n].to(torch.int64)).values
+                assert torch.equal(head, torch.arange(n, device=_DEV))
+                assert bool((indices[r, n:] == -1).all())
+            else:
+                idx = indices[r].to(torch.int64)
+                assert int(idx.min()) >= 0 and int(idx.max()) < n
+                assert int(torch.unique(idx).numel()) == top_k
+                ref = torch.topk(logits[r, :n], top_k).values
+                got = torch.sort(
+                    torch.gather(logits[r], 0, idx) + 0.0, descending=True
+                ).values
+                assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values), (
+                    f"replay step {step} row {r} inexact (n={n})"
+                )
+
+
 def test_selfsampling_topk_run_ws_explicit_workspace():
     """run_ws with a caller-owned workspace must agree with run()."""
     top_k, n_valid = 1024, 65536
