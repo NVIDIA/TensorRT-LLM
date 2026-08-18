@@ -99,6 +99,35 @@ class _K3Config:
     activation_situ_linear_beta: float = 25.0
 
 
+def test_kimi_situ_betas_require_linear_beta():
+    cfg = SimpleNamespace(activation_situ_beta=4.0, activation_situ_linear_beta=None)
+
+    with pytest.raises(ValueError, match="require activation_situ_linear_beta"):
+        modeling_kimi_linear._resolve_kimi_situ_betas(cfg)
+
+
+@pytest.mark.parametrize(
+    "situ_beta,situ_linear_beta",
+    [(0.0, 25.0), (4.0, 0.0), (-1.0, 25.0), (4.0, -1.0)],
+)
+def test_kimi_situ_betas_must_be_positive(situ_beta, situ_linear_beta):
+    cfg = SimpleNamespace(
+        activation_situ_beta=situ_beta,
+        activation_situ_linear_beta=situ_linear_beta,
+    )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        modeling_kimi_linear._resolve_kimi_situ_betas(cfg)
+
+
+def test_clear_checkpoint_fp8_pairs_releases_unconsumed_stashes():
+    linear = torch.nn.Linear(2, 2, bias=False)
+    setattr(linear.weight, modeling_kimi_linear._K3_CKPT_FP8_ATTR, (torch.ones(1), torch.ones(1)))
+
+    assert modeling_kimi_linear._clear_checkpoint_fp8_pairs(linear) == 1
+    assert not hasattr(linear.weight, modeling_kimi_linear._K3_CKPT_FP8_ATTR)
+
+
 def _init_block_weights(block: KimiK3SparseMoeBlock, seed: int = 1234):
     """Fill gate/latent/shared weights and the MXFP4 expert bank."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -1604,6 +1633,7 @@ def test_fp8_weight_read_prefers_the_checkpoint_pair():
     setattr(linear.weight, _K3_CKPT_FP8_ATTR, (ckpt_fp8, ckpt_scale.float()))
 
     converted = FP8Linear.from_linear(linear)
+    assert not hasattr(linear.weight, _K3_CKPT_FP8_ATTR)
     expected_w, expected_s = FP8Linear.prepare_checkpoint_scale(ckpt_fp8, ckpt_scale.float())
     assert _bitwise_equal(converted.weight, expected_w)
     assert _bitwise_equal(converted.weight_scale, expected_s)

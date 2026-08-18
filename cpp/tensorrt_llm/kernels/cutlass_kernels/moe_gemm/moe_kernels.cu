@@ -5037,6 +5037,18 @@ __global__ void populateRandomBufferKernel(void* buffer_void, size_t size)
         buffer[tid * elem_per_thread + i] = curand4(&state);
 }
 
+__global__ void populateProfilerSiTuParamsKernel(float* alpha, float* beta, int const numExperts)
+{
+    int const tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= numExperts)
+    {
+        return;
+    }
+
+    alpha[tid] = 1.0F;
+    beta[tid] = 1.0F;
+}
+
 template <int BLOCK_SIZE, int NUM_ROUTING_SAMPLES>
 __global__ void prepareMinLatencyBuffer(int* num_active_experts_per_node, int* active_expert_global_ids,
     int64_t* expert_first_token_offset, int const num_tokens, int const num_experts_per_token,
@@ -5299,10 +5311,12 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
         = mMinLatencyMode ? sizeof(int) * NUM_ROUTING_SAMPLES : 0; // smaller than or equal to num_experts_per_node
     size_t active_expert_global_ids_size = mMinLatencyMode ? mNumExpertsPerNode * sizeof(int) * NUM_ROUTING_SAMPLES : 0;
 
-    bool is_swiglu_bias = mActivationType == ActivationType::SwigluBias && mGemmToProfile == GemmToProfile::GEMM_1;
-    size_t swiglu_alpha_size = is_swiglu_bias ? num_experts_per_node * sizeof(float) : 0;
-    size_t swiglu_beta_size = is_swiglu_bias ? num_experts_per_node * sizeof(float) : 0;
-    size_t swiglu_limit_size = is_swiglu_bias ? num_experts_per_node * sizeof(float) : 0;
+    bool const profilesGemm1 = mGemmToProfile == GemmToProfile::GEMM_1;
+    bool const isSwigluBias = mActivationType == ActivationType::SwigluBias && profilesGemm1;
+    bool const isSitu = mActivationType == ActivationType::SiTu && profilesGemm1;
+    size_t swiglu_alpha_size = (isSwigluBias || isSitu) ? num_experts_per_node * sizeof(float) : 0;
+    size_t swiglu_beta_size = (isSwigluBias || isSitu) ? num_experts_per_node * sizeof(float) : 0;
+    size_t swiglu_limit_size = isSwigluBias ? num_experts_per_node * sizeof(float) : 0;
 
     size_t map_offset = 0;
     std::map<std::string, std::pair<size_t, size_t>> out_map;
@@ -5338,14 +5352,14 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     ADD(quant_4);
     ADD(quant_5);
     ADD(quant_6);
-    ADD(tma_ws_input_workspace);
-    ADD(w4a8_alpha);
-    ADD(alpha_scale_ptr_array);
-    ADD(fp4_act_scale_flat);
-    ADD(gemm_workspace);
     ADD(swiglu_alpha);
     ADD(swiglu_beta);
     ADD(swiglu_limit);
+    ADD(w4a8_alpha);
+    ADD(tma_ws_input_workspace);
+    ADD(alpha_scale_ptr_array);
+    ADD(fp4_act_scale_flat);
+    ADD(gemm_workspace);
 #undef ADD_NAME
 #undef ADD
 
@@ -5625,6 +5639,22 @@ void GemmProfilerBackend::prepare(
 
     auto workspace_size = getWorkspaceSize(num_tokens);
     populateRandomBuffer(workspace_ptr_char, workspace_size, stream);
+
+    if (mActivationType == ActivationType::SiTu && mGemmToProfile == GemmToProfile::GEMM_1)
+    {
+        auto const workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
+        auto const& alphaWorkspace = workspaces.at("swiglu_alpha");
+        auto const& betaWorkspace = workspaces.at("swiglu_beta");
+        size_t const expectedSize = static_cast<size_t>(mNumExpertsPerNode) * sizeof(float);
+        TLLM_CHECK_WITH_INFO(alphaWorkspace.first >= expectedSize && betaWorkspace.first >= expectedSize,
+            "SiTu profiler activation-parameter workspace has the wrong size");
+        auto* alpha = reinterpret_cast<float*>(workspace_ptr_char + alphaWorkspace.second);
+        auto* beta = reinterpret_cast<float*>(workspace_ptr_char + betaWorkspace.second);
+        constexpr int kThreadsPerBlock = 128;
+        populateProfilerSiTuParamsKernel<<<ceilDiv(mNumExpertsPerNode, kThreadsPerBlock), kThreadsPerBlock, 0,
+            stream>>>(alpha, beta, mNumExpertsPerNode);
+        sync_check_cuda_error(stream);
+    }
 
     prepareRouting(num_tokens, workspace_ptr_char, stream);
     prepareQuantParams(num_tokens, workspace_ptr_char, stream);

@@ -568,6 +568,11 @@ public:
                 base_activation_type = ActivationType::SwigluBias;
             }
         }
+        TORCH_CHECK(
+            base_activation_type != ActivationType::SiTu || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
+            "SiTu requires both swiglu_alpha and swiglu_beta.");
+        TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
+            "SiTu does not support swiglu_limit.");
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
@@ -831,6 +836,11 @@ public:
                 base_activation_type = ActivationType::SwigluBias;
             }
         }
+        TORCH_CHECK(
+            base_activation_type != ActivationType::SiTu || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
+            "SiTu requires both swiglu_alpha and swiglu_beta.");
+        TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
+            "SiTu does not support swiglu_limit.");
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
             reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),

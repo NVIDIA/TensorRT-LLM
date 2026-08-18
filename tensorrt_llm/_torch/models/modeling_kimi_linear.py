@@ -318,6 +318,23 @@ def _resolve_fp8_weight_read_gates() -> tuple[bool, bool, bool]:
     return fp8_weight_read, kda_fp8, kda_glue_fp8
 
 
+def _resolve_kimi_situ_betas(cfg: Any) -> tuple[float, float]:
+    """Return the finite SiTu betas required by the routed-expert kernels."""
+    config_situ_beta = getattr(cfg, "activation_situ_beta", None)
+    situ_beta = 1.0 if config_situ_beta is None else config_situ_beta
+    situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
+    if situ_linear_beta is None:
+        raise ValueError(
+            "Kimi K3 routed SiTu experts require activation_situ_linear_beta; "
+            "None means an identity linear branch that the fused kernels cannot represent."
+        )
+    if situ_beta <= 0 or situ_linear_beta <= 0:
+        raise ValueError(
+            f"Kimi K3 SiTu betas must be positive; got {situ_beta} and {situ_linear_beta}."
+        )
+    return float(situ_beta), float(situ_linear_beta)
+
+
 # ---------------------------------------------------------------------------
 # Config helpers.
 # ---------------------------------------------------------------------------
@@ -558,7 +575,9 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         # the scale the checkpoint was written with.
         ckpt_pair = getattr(linear.weight, _K3_CKPT_FP8_ATTR, None)
         if ckpt_pair is not None:
-            return cls.from_checkpoint_fp8(ckpt_pair[0], ckpt_pair[1], linear.out_features)
+            converted = cls.from_checkpoint_fp8(ckpt_pair[0], ckpt_pair[1], linear.out_features)
+            delattr(linear.weight, _K3_CKPT_FP8_ATTR)
+            return converted
         weight_fp8, weight_scale = cls.quantize_weight(linear.weight.data)
         return cls(weight_fp8, weight_scale, linear.out_features)
 
@@ -994,8 +1013,7 @@ class KimiK3MoERuntime(nn.Module):
         if not getattr(cfg, "latent_moe_use_norm", False):
             raise ValueError("Kimi K3 runtime expects latent_moe_use_norm=True")
 
-        situ_beta = getattr(cfg, "activation_situ_beta", None) or 1.0
-        situ_linear_beta = getattr(cfg, "activation_situ_linear_beta", None)
+        situ_beta, situ_linear_beta = _resolve_kimi_situ_betas(cfg)
         dtype = torch.bfloat16
 
         # Routing scores stay fp32; with attention-DP off the gate GEMM runs
@@ -1062,7 +1080,7 @@ class KimiK3MoERuntime(nn.Module):
             )
             self.routed_situ_beta = torch.full(
                 (local_num_experts,),
-                float(situ_linear_beta if situ_linear_beta is not None else 1.0),
+                situ_linear_beta,
                 dtype=torch.float32,
                 device=device,
             )
@@ -1076,16 +1094,14 @@ class KimiK3MoERuntime(nn.Module):
                 trtllm_gen_activation_type=ActType_TrtllmGen.SiTu,
                 # Cubin alpha is the gate-side SiTU beta; cubin beta is the
                 # linear-side SiTU beta.
-                trtllm_gen_activation_alpha=float(situ_beta),
-                trtllm_gen_activation_beta=float(
-                    situ_linear_beta if situ_linear_beta is not None else 1.0
-                ),
+                trtllm_gen_activation_alpha=situ_beta,
+                trtllm_gen_activation_beta=situ_linear_beta,
             )
         elif routed_moe_model_config.moe_backend == "MEGAMOE_DEEPGEMM":
             routed_moe_kwargs.update(
                 activation="situ",
-                situ_beta=float(situ_beta),
-                situ_linear_beta=float(situ_linear_beta if situ_linear_beta is not None else 1.0),
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
         self.routed_experts = create_moe(**routed_moe_kwargs)
         if not isinstance(self.routed_experts, ConfigurableMoE):
@@ -2756,12 +2772,22 @@ def _materialize(value) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         return value
     # ``[:]`` is how a lazy slice is realized, but it is invalid on a 0-dim
-    # entry — and the NVFP4 checkpoint stores weight_scale_2 / input_scale as
-    # scalars. Same fix as ``_ReopenSafeTensorSlice._tensor``.
+    # entry. The NVFP4 checkpoint stores weight_scale_2 / input_scale as
+    # scalars, so realize those entries with ``[()]`` instead.
     get_shape = getattr(value, "get_shape", None)
     if get_shape is not None and len(get_shape()) == 0:
         return value[()]
     return value[:]
+
+
+def _clear_checkpoint_fp8_pairs(module: nn.Module) -> int:
+    """Release checkpoint FP8 pairs left on parameters after conversion."""
+    cleared = 0
+    for param in module.parameters():
+        if hasattr(param, _K3_CKPT_FP8_ATTR):
+            delattr(param, _K3_CKPT_FP8_ATTR)
+            cleared += 1
+    return cleared
 
 
 @register_auto_model("KimiLinearForCausalLM")
@@ -3482,3 +3508,9 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 logger.info(
                     f"Kimi K3: reading {n_mla} MLA q_a/q_b/o/g projections at FP8 block-scale"
                 )
+
+        # Sub-switches may leave checkpoint pairs on BF16 parameters that were
+        # deliberately not converted. No later stage consumes them.
+        cleared_pairs = _clear_checkpoint_fp8_pairs(self.model)
+        if cleared_pairs:
+            logger.debug(f"Kimi K3: released {cleared_pairs} unconsumed checkpoint FP8 pairs")
