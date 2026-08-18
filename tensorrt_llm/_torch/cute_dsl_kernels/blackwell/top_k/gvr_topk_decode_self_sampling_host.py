@@ -1162,6 +1162,7 @@ def run_varlen(
     values=None,
     max_seq_len=None,
     engine="auto",
+    workspace=None,
 ):
     """Production-contract varlen entry (per-row device kv_lens).
 
@@ -1217,14 +1218,66 @@ def run_varlen(
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
         raise RuntimeError(f"device index out of range: {d}")
-    ws = _ws_hot.get(d)
-    if ws is None:
-        ws = default_workspace(logits)
+    if workspace is not None:
+        # multi-stream escape hatch (run_ws parity): concurrent varlen
+        # launches on one device must not share the SPLIT publish slab
+        validate_run_ws(workspace, logits)
+        ws = kernel_view(workspace)
+    else:
+        ws = _ws_hot.get(d)
+        if ws is None:
+            ws = default_workspace(logits)
 
     if engine == "auto":
         # ---- per-row in-kernel engine (gvr_main varlen port) ----------------
-        npad = logits.shape[1]
+        # Full B1-style validation battery (the engine bypasses _run_impl —
+        # every check the legacy path enforces is replayed here; the batch-dim
+        # check is CRITICAL: the kernel grid comes from logits.shape[0], so a
+        # short indices/values tensor would be written out of bounds).
+        if not (logits.is_cuda and pre_idx.is_cuda and indices.is_cuda):
+            raise RuntimeError("all tensors must be CUDA")
+        if logits.dtype is not _F32 or pre_idx.dtype is not _I32 or indices.dtype is not _I32:
+            raise RuntimeError("logits must be float32; pre_idx/indices int32")
+        if len(indices.shape) != 2 or indices.shape[0] != num_rows:
+            raise RuntimeError(
+                f"indices must be [num_rows={num_rows}, >=k], got {tuple(indices.shape)}"
+            )
         k = pre_idx.shape[1]
+        if indices.shape[1] < k:
+            raise RuntimeError(f"indices width {indices.shape[1]} < k={k}")
+        if not (pre_idx.is_contiguous() and indices.is_contiguous() and kv_lens.is_contiguous()):
+            raise RuntimeError("pre_idx/indices/kv_lens must be contiguous")
+        # logits: accept row-major views with a wider row stride (the DSL
+        # paged-MQA logits arena is 256-aligned and column-sliced — a legal
+        # NON-contiguous view). The kernel only needs (base, row stride):
+        # widen back to a compact [rows, stride] view over the same storage;
+        # the tail columns are never classified (per-row n gates all reads).
+        if logits.stride(1) != 1:
+            raise RuntimeError("logits inner stride must be 1")
+        npad = logits.stride(0) if num_rows > 1 else logits.shape[1]
+        lg = logits
+        if not logits.is_contiguous():
+            need = logits.storage_offset() + num_rows * npad
+            if logits.untyped_storage().size() // 4 < need:
+                raise RuntimeError("logits view storage too small to widen to its row stride")
+            lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
+        if npad & 3:
+            raise RuntimeError(f"npad (logits row stride) must be a multiple of 4, got {npad}")
+        if lg.data_ptr() & 15:
+            raise RuntimeError("logits base must be 16-byte aligned")
+        if values is not None:
+            if not values.is_cuda or values.dtype is not _F32:
+                raise RuntimeError("values must be CUDA float32")
+            if (
+                len(values.shape) != 2
+                or values.shape[0] != num_rows
+                or values.shape[1] < k
+                or not values.is_contiguous()
+            ):
+                raise RuntimeError(
+                    f"values must be contiguous [num_rows={num_rows}, >=k], "
+                    f"got {tuple(values.shape)}"
+                )
         cshift = 0 if cr == 1 else 2
         if max_seq_len is not None:
             n_env = int(max_seq_len) >> cshift
@@ -1236,6 +1289,10 @@ def run_varlen(
                     "constant) under CUDA graph capture"
                 )
             n_env = int(kv_lens.max().item()) >> cshift
+            # eager mode: quantize the data-dependent envelope up to the next
+            # power of two so a growing decode does not recompile at every
+            # R increment (bounded plans, bounded _VARLEN_CACHE)
+            n_env = 1 << max(n_env - 1, 1).bit_length()
         n_env = min(max(n_env, 1), npad)
         key = (num_rows, npad, k, n_env, nn, cr)
         lc = _VARLEN_CACHE.get(key)
@@ -1247,22 +1304,16 @@ def run_varlen(
                 )
             lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr)
         fn, pre, tail = lc
-        if logits.dtype is not _F32 or pre_idx.dtype is not _I32 or indices.dtype is not _I32:
-            raise RuntimeError("logits must be float32; pre_idx/indices int32")
-        if not (logits.is_contiguous() and pre_idx.is_contiguous() and indices.is_contiguous()):
-            raise RuntimeError("tensors must be contiguous")
-        if npad & 3:
-            raise RuntimeError(f"npad (logits stride) must be a multiple of 4, got {npad}")
         idx = indices
         if idx.shape[1] != k:
             idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
         vals = values
         if vals is not None and vals.shape[1] != k:
             vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
-        fn(logits, pre_idx, idx, ws, *pre, kv_lens, *tail)
+        fn(lg, pre_idx, idx, ws, *pre, kv_lens, *tail)
         if vals is not None:
             idx64 = idx.to(torch.int64)
-            vals.copy_(logits.gather(1, idx64.clamp_min(0)))
+            vals.copy_(lg.gather(1, idx64.clamp_min(0)))
             vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
         return
     if engine != "reference":
@@ -1274,19 +1325,33 @@ def run_varlen(
             "run_varlen reference engine reads kv_lens on host, "
             "illegal under CUDA graph capture"
         )
+    # match the engine's flat-packed output convention for wider-than-k
+    # buffers (pack ONCE from the tensor base, then slice per row)
+    k = pre_idx.shape[1]
+    idx = indices
+    if len(idx.shape) != 2 or idx.shape[0] != num_rows:
+        raise RuntimeError(
+            f"indices must be [num_rows={num_rows}, >=k], got {tuple(indices.shape)}"
+        )
+    if idx.shape[1] != k:
+        idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
+    vals = values
+    if vals is not None and vals.shape[1] != k:
+        vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
     kl = kv_lens.tolist()  # the ONE documented D2H sync of this engine
     for r in range(num_rows):
-        actual = kl[r // nn] - nn + (r % nn) + 1
-        if actual < 0:
-            raise RuntimeError(f"row {r}: kv_len {kl[r // nn]} < next_n {nn}")
+        # production graph slots can carry kv_len < next_n (padded / evicted
+        # requests): clamp to the empty row, emitting all -1 — the same
+        # contract the in-kernel engine implements
+        actual = max(kl[r // nn] - nn + (r % nn) + 1, 0)
         req = r // nn
         _run_impl(
             logits[r : r + 1],
             pre_idx[req : req + 1],
             actual // cr,
-            indices[r : r + 1],
+            idx[r : r + 1],
             ws,
-            None if values is None else values[r : r + 1],
+            None if vals is None else vals[r : r + 1],
         )
 
 

@@ -1839,12 +1839,24 @@ class Indexer(nn.Module):
                     self._use_self_sampling_topk
                     and self._enable_heuristic_topk
                     and pre_idx is not None
+                    # engine hardware-format gate (falls through otherwise):
+                    # row-major logits with a float4-aligned row stride and a
+                    # 16B-aligned base (the DSL paged-MQA arena view — column-
+                    # sliced from a 256-aligned buffer — satisfies this; odd
+                    # max_seq_len DeepGEMM layouts do not)
+                    and logits_decode.stride(1) == 1
+                    and logits_decode.stride(0) % 4 == 0
+                    and logits_decode.data_ptr() % 16 == 0
                 ):
                     # Self-sampling GVR varlen engine (TRTLLM_GVR_SELF_SAMPLING=1):
                     # one launch for the batch; per-row n from device kv_lens,
-                    # capture-stable tuning from indexer_max_seq_len (no host
-                    # reads — CUDA-graph safe). Hints are consumed raw for all
-                    # of DSv3.2 / Flash / Pro (offset-free hint contract).
+                    # capture-stable tuning from the max-seq-len engine
+                    # constant (no host reads — CUDA-graph safe). Hints are
+                    # consumed raw for all of DSv3.2 / Flash / Pro
+                    # (offset-free hint contract). indexer_max_seq_len is in
+                    # COMPRESSED index space (metadata divides by
+                    # compress_ratio); run_varlen's max_seq_len is in kv-token
+                    # space like kv_lens — multiply back.
                     self._selfsampling_run_varlen(
                         logits_decode,
                         pre_idx,
@@ -1852,7 +1864,7 @@ class Indexer(nn.Module):
                         topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :],
                         next_n=next_n,
                         compress_ratio=self.compress_ratio,
-                        max_seq_len=indexer_max_seq_len,
+                        max_seq_len=indexer_max_seq_len * self.compress_ratio,
                     )
                 elif self.use_cute_dsl_topk and self._enable_heuristic_topk:
                     torch.ops.trtllm.cute_dsl_gvr_topk_decode(

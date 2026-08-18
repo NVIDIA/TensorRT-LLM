@@ -321,6 +321,87 @@ def test_selfsampling_topk_varlen_values():
     _run_varlen_case([40000, 1900], 2, 4, 512, seed=5, with_values=True)
 
 
+@pytest.mark.parametrize(
+    "rows,base,step,top_k",
+    [
+        (16, 40000, 977, 1024),  # R=9 SPLIT + per-row TSH runtime gate (tsh_en=1)
+        (200, 6000, 64, 512),  # BLK=512, SPLIT=False, non-big launch mode
+    ],
+    ids=["b16_tsh_split", "b200_blk512_nonsplit"],
+)
+def test_selfsampling_topk_varlen_launch_modes(rows, base, step, top_k):
+    """Exercise the varlen kernel's other launch modes: the SPLIT + per-row
+    TSH-floor runtime gate domain (16 <= b <= 74, k <= 1024) and the
+    BLK=512 non-split wide-batch plan."""
+    _run_varlen_case([base + step * i for i in range(rows)], 1, 1, top_k, seed=rows)
+
+
+def test_selfsampling_topk_varlen_zero_kv_slot():
+    """Padded / evicted CUDA-graph request slots can carry kv_len < next_n
+    (even 0): both engines must emit the empty short row (all -1), not raise —
+    mixed with live MTP rows of another request in the same launch."""
+    for engine in ("auto", "reference"):
+        gen = torch.Generator(device=_DEV).manual_seed(9)
+        logits = torch.randn((8, 8192), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+        pre_idx = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
+        kv_lens = torch.tensor([0, 8192], dtype=torch.int32, device=_DEV)
+        indices = torch.full((8, 512), -7, dtype=torch.int32, device=_DEV)
+        for r in range(4, 8):
+            n = 8192 - 4 + (r - 4) + 1
+            logits[r, n:] = 3e38
+        ss_host.run_varlen(
+            logits, pre_idx, kv_lens, indices, next_n=4, compress_ratio=1, engine=engine
+        )
+        torch.cuda.synchronize()
+        assert bool((indices[:4] == -1).all()), f"{engine}: kv=0 rows must be all -1"
+        for r in range(4, 8):
+            n = 8192 - 4 + (r - 4) + 1
+            idx = indices[r].to(torch.int64)
+            assert int(idx.min()) >= 0 and int(idx.max()) < n
+            ref = torch.topk(logits[r, :n], 512).values
+            got = torch.sort(torch.gather(logits[r], 0, idx) + 0.0, descending=True).values
+            assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values)
+
+
+def test_selfsampling_topk_varlen_wide_buffers_flat_packed():
+    """indices wider than k follow the CUDA flat-packed contract (rows at
+    stride k from the tensor base) IDENTICALLY on both engines."""
+    kv = [9000, 300]
+    top_k, width = 512, 512 + 64
+    gen = torch.Generator(device=_DEV).manual_seed(21)
+    logits = torch.randn((2, 9024), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+    logits[0, 9000:] = 3e38
+    logits[1, 300:] = 3e38
+    pre_idx = torch.randint(0, 300, (2, top_k), generator=gen, dtype=torch.int32, device=_DEV)
+    kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    outs = {}
+    for engine in ("auto", "reference"):
+        wide = torch.full((2, width), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(logits, pre_idx, kv_lens, wide, compress_ratio=1, engine=engine)
+        torch.cuda.synchronize()
+        outs[engine] = wide.reshape(-1)[: 2 * top_k].view(2, top_k).clone()
+    packed_a, packed_r = outs["auto"], outs["reference"]
+    # row 0 (kernel row): same value multiset via the SAME packed convention
+    ga = torch.sort(
+        torch.gather(logits[0], 0, packed_a[0].to(torch.int64)) + 0.0, descending=True
+    ).values
+    gr = torch.sort(
+        torch.gather(logits[0], 0, packed_r[0].to(torch.int64)) + 0.0, descending=True
+    ).values
+    assert torch.equal(ga, gr), "wide-buffer packing convention diverged between engines"
+    # row 1 (short row): identity + -1 tail at the packed location, bit-equal
+    expect = torch.cat(
+        [
+            torch.arange(300, dtype=torch.int32, device=_DEV),
+            torch.full((top_k - 300,), -1, dtype=torch.int32, device=_DEV),
+        ]
+    )
+    assert torch.equal(torch.sort(packed_a[1, :300]).values, expect[:300])
+    assert bool((packed_a[1, 300:] == -1).all())
+    assert torch.equal(torch.sort(packed_r[1, :300]).values, expect[:300])
+    assert bool((packed_r[1, 300:] == -1).all())
+
+
 def test_selfsampling_topk_varlen_guards():
     logits = torch.randn((2, 8192), dtype=torch.float32, device=_DEV)
     pre_idx = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
@@ -334,6 +415,13 @@ def test_selfsampling_topk_varlen_guards():
         ss_host.run_varlen(logits, pre_idx, kv, indices, compress_ratio=2)
     with pytest.raises(RuntimeError, match="CUDA tensor"):
         ss_host.run_varlen(logits, pre_idx, kv.cpu(), indices)
+    with pytest.raises(RuntimeError, match="num_rows"):
+        # request-level-shaped indices under MTP: MUST be rejected (the
+        # kernel grid comes from logits rows — silent OOB writes otherwise)
+        ss_host.run_varlen(logits, pre_idx[:1], kv[:1], indices[:1], next_n=2)
+    with pytest.raises(RuntimeError, match="contiguous"):
+        strided = torch.zeros((2, 2), dtype=torch.int32, device=_DEV)[:, 0]
+        ss_host.run_varlen(logits, pre_idx, strided, indices)
 
 
 def test_selfsampling_topk_varlen_cuda_graph():

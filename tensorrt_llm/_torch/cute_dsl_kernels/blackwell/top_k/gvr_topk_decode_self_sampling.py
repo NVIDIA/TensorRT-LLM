@@ -2986,7 +2986,7 @@ def run(logits, pre_idx, n: int, out, ws):
         rt["Q"],
         rt["SS2"],
         rt["TGT2"],
-        pre_idx.new_zeros(1),  # dummy kv_lens (dead in legacy mode)
+        _legacy_dummy_kv(pre_idx),  # dummy kv_lens (dead in legacy mode)
         0,
         0,
         0,
@@ -2994,6 +2994,20 @@ def run(logits, pre_idx, n: int, out, ws):
         0,
     )
     return r
+
+
+_LEGACY_DUMMY_KV = {}
+
+
+def _legacy_dummy_kv(ref):
+    """Cached 1-element int32 tensor per device for the dead kv_lens ABI slot
+    (avoids a per-call allocator round-trip on the legacy hot path)."""
+    d = ref.get_device()
+    t = _LEGACY_DUMMY_KV.get(d)
+    if t is None:
+        t = ref.new_zeros(1)
+        _LEGACY_DUMMY_KV[d] = t
+    return t
 
 
 # ===========================================================================
