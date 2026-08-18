@@ -104,9 +104,9 @@ The pieces, one by one:
 - **Metrics collector.** It aggregates the run into job- and token-level Pareto points over the steady-state window, alongside the engine-reported KV-cache hit rate.
 - **Offline analyzer.** A no-GPU pass that walks a trace against an idealized infinite cache and reports the **optimal (upper-bound) KV-cache hit rate**.
 
-The core tracing and replay code is in [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with an example trace, runnable replay scripts, and analysis tools in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay).
-
 ### Running the Pipeline
+
+The core tracing and replay code is in [`tensorrt_llm/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/tensorrt_llm/scaffolding/trace_replay), with an example trace, runnable replay scripts, and analysis tools in [`examples/scaffolding/trace_replay/`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/scaffolding/trace_replay). Three commands cover the flow.
 
 Collecting a trace is one switch on a Scaffolding agent run: `--enable_tracing` writes a compact `*.trace.json` alongside a full one.
 
