@@ -39,6 +39,7 @@ from .common import (
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
     build_paged_kv_slot_mapping,
+    use_msa_sparse_decode,
     write_kv_slots,
 )
 from .msa_indexer import MsaIndexer, cutedsl_score_runner
@@ -1001,23 +1002,30 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     def _msa_runs_no_fmha(self) -> bool:
         """Whether nothing at all this step reaches fmha_sm100.
 
-        Sparse GQA now runs through a preplanned fmha_sm100 call on pure decode,
-        while prefill and mixed steps already use it for their context rows.
-        Hence every prepared M3 step needs the flattened page table and at
-        least the sparse GQA plan.
+        On pure decode, the CuTe scorer and trtllm-gen dense kernel already own
+        their layers. When the sparse GQA policy also selects Triton, no work is
+        left for fmha_sm100. Prefill and mixed steps always retain MSA work.
         """
-        return False
+        span = self._msa_decode_span
+        return (
+            span is not None and not span.is_mixed and not self._msa_uses_fixed_stride_page_table()
+        )
 
     def _msa_uses_fixed_stride_page_table(self) -> bool:
         """Whether sparse fmha_sm100 can consume ``msa_block_table`` directly.
 
-        A pure-decode step runs only sparse GQA through fmha_sm100; its selected
-        logical blocks can index a fixed-stride flattened 2-D table. Mixed and
-        prefill steps still contain dense/context fmha work and retain the
-        vendor's compact page-table representation.
+        A pure-decode step selected for MSA runs only sparse GQA through
+        fmha_sm100; its selected logical blocks can index a fixed-stride
+        flattened 2-D table. Triton decode, mixed, and prefill steps retain
+        their existing representations.
         """
         span = self._msa_decode_span
-        return span is not None and not span.is_mixed
+        return (
+            span is not None
+            and not span.is_mixed
+            and self._msa_params is not None
+            and use_msa_sparse_decode(self._msa_params.decode_backend, span.batch)
+        )
 
     def _msa_fmha_plan_rows(self) -> Optional[Tuple[int, int]]:
         """Batch rows this step's fmha_sm100 plans must cover.
@@ -1028,7 +1036,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         * no span: the whole batch, as fmha_sm100 runs every row;
         * a mixed span: the context prefix only, since the span takes the
           generation suffix;
-        * a pure-decode span: the whole batch for sparse GQA only.
+        * a pure-decode span: the whole batch when sparse GQA selects MSA,
+          otherwise None because all three decode paths are ported kernels.
 
         The range always starts at batch row 0, since fmha_sm100 keeps the batch
         prefix and the ported kernels take the suffix. It is returned as a range
@@ -1037,9 +1046,11 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         that.
         """
         span = self._msa_decode_span
-        if span is None or not span.is_mixed:
+        if span is None:
             return (0, self._msa_live_batch)
-        return (0, span.row_first)
+        if span.is_mixed:
+            return (0, span.row_first)
+        return (0, self._msa_live_batch) if self._msa_uses_fixed_stride_page_table() else None
 
     def _msa_index_kv_dtype(self) -> torch.dtype:
         """dtype of the paged index-K cache, which index Q is cast to.
@@ -1227,10 +1238,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
         Each plan covers only the rows its consumer still owns (see
         _msa_fmha_plan_rows). On pure decode the CuTe scorer and trtllm-gen
-        dense kernel remain ported, while sparse GQA uses the faster preplanned
-        fmha_sm100 path, so only the GQA plan is built. A mixed step keeps the
-        existing split: ported kernels take the generation suffix and all MSA
-        plans cover the context prefix.
+        dense kernel remain ported; sparse GQA either uses Triton too or builds
+        only the GQA plan for MSA, according to the configured decode policy.
+        A mixed step keeps the existing split: ported kernels take the
+        generation suffix and all MSA plans cover the context prefix.
         """
         # Drop any plan tuples from the previous step; the msa_decode_*_plan and
         # msa_eager_*_plan properties then report None until rebuilt below.
@@ -1415,7 +1426,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # so both that property and _msa_live_plans keep reporting None and the
         # graph-safe mirror copies never run.
         fixed_page_indptr = (
-            None if gqa_reused else _msa_fixed_stride_page_indptr(qo_lens_cpu, page_table_stride)
+            None
+            if gqa_plan is None or gqa_reused
+            else _msa_fixed_stride_page_indptr(qo_lens_cpu, page_table_stride)
         )
         for owner, plan, cache_signature, reused, stable_overrides in (
             (self._msa_proxy_plan, proxy_plan, None, False, None),

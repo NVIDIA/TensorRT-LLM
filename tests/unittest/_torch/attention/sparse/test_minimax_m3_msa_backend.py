@@ -17,7 +17,11 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
-from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import write_kv_slots
+from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import (
+    MSA_SPARSE_DECODE_MIN_MBS,
+    use_msa_sparse_decode,
+    write_kv_slots,
+)
 from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_scatter import (
     fused_write_layer_caches,
     fused_write_layer_caches_nvfp4,
@@ -47,6 +51,178 @@ def test_resolver_selects_msa_backend_when_available(monkeypatch):
     monkeypatch.setattr(avail, "ensure_msa_available", lambda: None)
     params = MiniMaxM3SparseAttentionConfig(implementation="msa").to_sparse_params()
     assert _resolve_minimax_m3_backend_cls(params) is MiniMaxM3MsaSparseAttention
+
+
+@pytest.mark.parametrize(
+    ("decode_backend", "rank_local_batch_size", "expected"),
+    [
+        ("default", 1, False),
+        ("default", 64, False),
+        ("msa", 1, True),
+        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS - 1, False),
+        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS, True),
+    ],
+)
+def test_sparse_decode_backend_policy_is_explicit_and_lowered(
+    decode_backend, rank_local_batch_size, expected
+):
+    cfg = MiniMaxM3SparseAttentionConfig(implementation="msa", decode_backend=decode_backend)
+
+    assert cfg.to_sparse_params().decode_backend == decode_backend
+    assert cfg.to_sparse_metadata_params().decode_backend == decode_backend
+    assert use_msa_sparse_decode(decode_backend, rank_local_batch_size) is expected
+
+
+@pytest.mark.parametrize("decode_backend", ["msa", "adaptive"])
+def test_nondefault_decode_backend_requires_msa_implementation(decode_backend):
+    with pytest.raises(ValueError, match=r"requires the 'msa' implementation"):
+        MiniMaxM3SparseAttentionConfig(implementation="triton", decode_backend=decode_backend)
+
+
+@pytest.mark.parametrize(
+    ("decode_backend", "rank_local_batch_size", "expected_backend"),
+    [
+        ("default", 16, "triton"),
+        ("msa", 1, "msa"),
+        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS - 1, "triton"),
+        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS, "msa"),
+    ],
+)
+def test_pure_decode_dispatches_by_rank_local_batch_size(
+    monkeypatch, decode_backend, rank_local_batch_size, expected_backend
+):
+    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
+        msa_utils,
+        triton_sparse_decode,
+    )
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
+
+    calls = []
+    page_size = head_dim = 128
+    num_heads = num_kv_heads = 1
+    q = torch.zeros(rank_local_batch_size, num_heads * head_dim)
+    output = torch.empty_like(q)
+    k_paged = torch.zeros(1, num_kv_heads, page_size, head_dim)
+    v_paged = torch.zeros_like(k_paged)
+    monkeypatch.setattr(msa_utils, "msa_paged_kv", lambda manager, layer_idx: (k_paged, v_paged))
+    monkeypatch.setattr(
+        triton_sparse_decode,
+        "minimax_m3_sparse_attn_decode",
+        lambda q_arg, *args, **kwargs: calls.append(("triton", int(q_arg.shape[0]))),
+    )
+    monkeypatch.setattr(
+        msa_sparse_gqa,
+        "run_msa_sparse_gqa",
+        lambda q_arg, *args, **kwargs: calls.append(("msa", int(q_arg.shape[0]))),
+    )
+
+    attention = SimpleNamespace(
+        layer_idx=0,
+        head_dim=head_dim,
+        num_heads=num_heads,
+        q_scaling=1.0,
+        sparse_params=MiniMaxM3SparseAttentionConfig(
+            implementation="msa", decode_backend=decode_backend
+        ).to_sparse_params(),
+    )
+    block_table = torch.zeros(rank_local_batch_size, 1, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        kv_cache_manager=object(),
+        _msa_prewritten_layer=None,
+        msa_decode_query_len=1,
+        msa_decode_span=_MsaDecodeSpan(
+            0,
+            rank_local_batch_size,
+            0,
+            rank_local_batch_size,
+            1,
+        ),
+        msa_block_table=block_table,
+        msa_seq_lens_cuda=torch.ones(rank_local_batch_size, dtype=torch.int32),
+        msa_kv_indices=block_table.flatten(),
+        msa_qo_lens_cpu=torch.ones(rank_local_batch_size, dtype=torch.int32),
+        msa_kv_lens_cpu=torch.ones(rank_local_batch_size, dtype=torch.int32),
+        msa_qo_offset_cpu=torch.zeros(rank_local_batch_size, dtype=torch.int32),
+    )
+    topk = torch.zeros(rank_local_batch_size, num_kv_heads, 16, dtype=torch.int32)
+    plan = object() if expected_backend == "msa" else None
+
+    msa_sparse_gqa.run_msa_paged_gqa(
+        attention,
+        q,
+        None,
+        None,
+        metadata,
+        output,
+        kv_block_indexes=topk,
+        plan=plan,
+    )
+
+    assert calls == [(expected_backend, rank_local_batch_size)]
+
+
+def test_mixed_batch_keeps_triton_generation_suffix(monkeypatch):
+    from tensorrt_llm._torch.attention_backend.fmha import msa_sparse_gqa
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import (
+        msa_utils,
+        triton_sparse_decode,
+    )
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import _MsaDecodeSpan
+
+    calls = []
+    page_size = head_dim = 128
+    q = torch.zeros(3, head_dim)
+    output = torch.empty_like(q)
+    k_paged = torch.zeros(1, 1, page_size, head_dim)
+    v_paged = torch.zeros_like(k_paged)
+    monkeypatch.setattr(msa_utils, "msa_paged_kv", lambda manager, layer_idx: (k_paged, v_paged))
+    monkeypatch.setattr(
+        triton_sparse_decode,
+        "minimax_m3_sparse_attn_decode",
+        lambda q_arg, *args, **kwargs: calls.append(("triton", int(q_arg.shape[0]))),
+    )
+    monkeypatch.setattr(
+        msa_sparse_gqa,
+        "run_msa_sparse_gqa",
+        lambda q_arg, *args, **kwargs: calls.append(("msa", int(q_arg.shape[0]))),
+    )
+
+    attention = SimpleNamespace(
+        layer_idx=0,
+        head_dim=head_dim,
+        num_heads=1,
+        q_scaling=1.0,
+        sparse_params=MiniMaxM3SparseAttentionConfig(
+            implementation="msa", decode_backend="msa"
+        ).to_sparse_params(),
+    )
+    block_table = torch.zeros(3, 1, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        kv_cache_manager=object(),
+        _msa_prewritten_layer=None,
+        msa_decode_query_len=1,
+        msa_decode_span=_MsaDecodeSpan(1, 3, 1, 3, 1),
+        msa_block_table=block_table,
+        msa_seq_lens_cuda=torch.ones(3, dtype=torch.int32),
+        msa_kv_indices=block_table.flatten(),
+        msa_qo_lens_cpu=torch.ones(3, dtype=torch.int32),
+        msa_kv_lens_cpu=torch.ones(3, dtype=torch.int32),
+        msa_qo_offset_cpu=torch.zeros(3, dtype=torch.int32),
+    )
+
+    msa_sparse_gqa.run_msa_paged_gqa(
+        attention,
+        q,
+        None,
+        None,
+        metadata,
+        output,
+        kv_block_indexes=torch.zeros(3, 1, 16, dtype=torch.int32),
+        plan=object(),
+    )
+
+    assert calls == [("triton", 2), ("msa", 1)]
 
 
 def test_msa_requires_block_size_128():
@@ -721,7 +897,13 @@ def test_lazily_allocated_scratch_publishes_the_bound_it_used(monkeypatch):
 
 
 def _resolution_metadata(
-    *, num_contexts=0, qo_lens=(1, 1), kv_lens=(9, 11), is_cuda_graph=False, page_size=128
+    *,
+    num_contexts=0,
+    qo_lens=(1, 1),
+    kv_lens=(9, 11),
+    is_cuda_graph=False,
+    page_size=128,
+    decode_backend="msa",
 ):
     """Metadata with just enough state for _resolve_decode_kernels.
 
@@ -731,7 +913,7 @@ def _resolution_metadata(
     metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
     metadata = metadata_cls.__new__(metadata_cls)
     metadata._msa_params = MiniMaxM3SparseAttentionConfig(
-        implementation="msa"
+        implementation="msa", decode_backend=decode_backend
     ).to_sparse_metadata_params()
     metadata.mapping = None
     # Assigned behind the seq_lens property, whose setter would stage a device
@@ -785,6 +967,33 @@ def test_resolve_decode_kernels_commits_on_uniform_decode(monkeypatch):
     assert (span.row_first, span.row_last) == (0, 2)
     assert (span.token_first, span.token_last) == (0, 2)
     assert span.is_mixed is False
+
+
+@pytest.mark.parametrize(
+    ("decode_backend", "batch_size", "uses_msa"),
+    [
+        ("default", 16, False),
+        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS - 1, False),
+        ("adaptive", MSA_SPARSE_DECODE_MIN_MBS, True),
+        ("msa", 1, True),
+    ],
+)
+def test_decode_policy_controls_plan_and_page_table_preparation(
+    monkeypatch, decode_backend, batch_size, uses_msa
+):
+    _force_cutedsl_supported(monkeypatch)
+    metadata = _resolution_metadata(
+        qo_lens=(1,) * batch_size,
+        kv_lens=(11,) * batch_size,
+        decode_backend=decode_backend,
+    )
+    metadata._msa_live_batch = batch_size
+
+    metadata._resolve_decode_kernels()
+
+    assert metadata._msa_uses_fixed_stride_page_table() is uses_msa
+    assert metadata._msa_runs_no_fmha() is not uses_msa
+    assert metadata._msa_fmha_plan_rows() == ((0, batch_size) if uses_msa else None)
 
 
 def test_resolve_decode_kernels_commits_the_generation_span_of_a_mixed_step(monkeypatch):
@@ -1862,6 +2071,9 @@ def _mixed_batch_sparse_gqa_case(*, page_size, head_dim, num_kv_heads, group, to
     attention.head_dim = head_dim
     attention.num_heads = num_heads
     attention.q_scaling = 1.0
+    attention.sparse_params = MiniMaxM3SparseAttentionConfig(
+        implementation="msa", decode_backend="msa"
+    ).to_sparse_params()
 
     fields = dict(
         kv_cache_manager=SimpleNamespace(
@@ -1988,6 +2200,9 @@ def test_pure_decode_sparse_gqa_uses_preplanned_msa_and_matches_triton(monkeypat
     attention.head_dim = head_dim
     attention.num_heads = num_heads
     attention.q_scaling = 1.0
+    attention.sparse_params = MiniMaxM3SparseAttentionConfig(
+        implementation="msa", decode_backend="msa"
+    ).to_sparse_params()
     metadata = SimpleNamespace(
         kv_cache_manager=SimpleNamespace(
             tokens_per_block=page_size,
