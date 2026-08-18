@@ -984,6 +984,45 @@ class TestRequestValidation:
         with pytest.raises(ValueError, match=r"video_reference.*not accepted"):
             run(VisualGenParams(video_reference="v.mp4"), optional)
 
+    def test_multi_role_slot_infers_single_required_role(self):
+        """A role-less ref against a multi-role slot is inferred when only one
+        role is required (e.g. i2v first_frame required, last_frame optional),
+        matching the pipeline's own default; a genuinely ambiguous slot (two
+        required roles) still demands an explicit role."""
+        from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        def run(params, spec):
+            validate_visual_gen_params(
+                params, declared_defaults=None, extra_param_specs={}, ref_slot_specs=spec
+            )
+
+        # i2v shape: first_frame required, last_frame optional. A single
+        # role-less upload fills first_frame -> allowed (no explicit role).
+        i2v = {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[
+                    RoleSpec(role="first_frame", min=1, max=1),
+                    RoleSpec(role="last_frame", min=0, max=1),
+                ],
+            )
+        }
+        run(VisualGenParams(image_reference="a.png"), i2v)
+
+        # Two required roles -> ambiguous, role stays mandatory.
+        ambiguous = {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[
+                    RoleSpec(role="first_frame", min=1, max=1),
+                    RoleSpec(role="last_frame", min=1, max=1),
+                ],
+            )
+        }
+        with pytest.raises(ValueError, match="'role' is required"):
+            run(VisualGenParams(image_reference="a.png"), ambiguous)
+
     def test_empty_ref_slot_specs_rejects_references(self):
         """An empty (non-None) ref_slot_specs means the pipeline declares no
         slots, so a reference is rejected; only ``None`` skips validation."""

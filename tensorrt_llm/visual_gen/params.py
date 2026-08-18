@@ -284,8 +284,9 @@ def validate_visual_gen_params(
     # --- reference role / arity checks (duck-typed RefSlotSpec) ---
     # ``ref_slot_specs`` maps a reference field name to a spec exposing
     # ``.roles`` (a list of role specs with ``.role`` / ``.min`` / ``.max``).
-    # role is required only when a modality declares more than one role;
-    # otherwise the single declared role is inferred. Reference fields are
+    # role must be explicit only when the assignment is ambiguous (a multi-role
+    # slot with more than one required role); a single-role slot or a single
+    # required role is inferred. Reference fields are
     # already normalized to ``list[*Ref]`` by the field validators. An empty
     # (but non-None) mapping means the pipeline declares no slots, so any
     # reference the client sent is rejected; only ``None`` skips validation.
@@ -301,18 +302,25 @@ def validate_visual_gen_params(
                 continue
             role_specs = list(spec.roles)
             allowed = {rs.role for rs in role_specs}
-            role_required = len(role_specs) > 1
+            # A role-less ref is inferred when unambiguous: a single-role slot,
+            # or a multi-role slot with exactly one required role (min >= 1) —
+            # e.g. i2v's first_frame — matching the pipeline's own default. Only
+            # a genuinely ambiguous slot (multiple required roles) demands one.
+            required_roles = [rs.role for rs in role_specs if rs.min >= 1]
             counts: Dict[str, int] = {}
             for r in refs:
                 role = getattr(r, "role", None)
                 if role is None:
-                    if role_required:
+                    if len(role_specs) == 1:
+                        role = role_specs[0].role
+                    elif len(required_roles) == 1:
+                        role = required_roles[0]
+                    else:
                         messages.append(
                             f"{field}: 'role' is required for this model "
                             f"(one of {sorted(allowed)})."
                         )
                         continue
-                    role = role_specs[0].role
                 if role not in allowed:
                     messages.append(
                         f"{field}: role '{role}' not supported (allowed: {sorted(allowed)})."

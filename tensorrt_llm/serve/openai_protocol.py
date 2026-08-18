@@ -2017,9 +2017,9 @@ class MediaReferenceItem(OpenAIBaseModel):
 
     ``content`` carries base64-encoded bytes, optionally as a ``data:`` URI. The
     request field it sits in (``image_reference`` / ``video_reference`` /
-    ``audio_reference``) fixes the modality. ``role`` is required only for models
-    that accept more than one role for that modality (e.g. image first/last
-    frame); single-role models infer it.
+    ``audio_reference``) fixes the modality. ``role`` is required only when it is
+    ambiguous — a model with more than one required role for that modality; a
+    single role, or a single required role (e.g. i2v first_frame), is inferred.
     """
 
     content: str = Field(
@@ -2027,8 +2027,8 @@ class MediaReferenceItem(OpenAIBaseModel):
     )
     role: Optional[Role] = Field(
         default=None,
-        description="Reference role. Required only when the model accepts "
-        "multiple roles for the modality.",
+        description="Reference role. Required only when the model has more than "
+        "one required role for the modality; otherwise inferred.",
     )
 
 

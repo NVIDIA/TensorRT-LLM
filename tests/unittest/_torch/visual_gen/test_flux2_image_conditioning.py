@@ -71,7 +71,7 @@ def test_prepare_request_resolves_dimensions_and_infer_reuses_images() -> None:
     req = SimpleNamespace(
         prompt=["edit this image"],
         params=SimpleNamespace(
-            image=_png_bytes(),
+            image_reference=[SimpleNamespace(content=_png_bytes())],
             height=None,
             width=None,
             num_inference_steps=1,
