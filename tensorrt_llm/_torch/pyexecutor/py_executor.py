@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
@@ -2791,19 +2791,18 @@ class PyExecutor:
                     # under the user_annotation / gpu_user_annotation
                     # categories so trtllm-serve /start_profile output exposes
                     # per-iteration boundaries to downstream trace viewers.
-                    pp_step_label = self._build_step_scope_label(
-                        scheduled_batch)
+                    # Elided entirely when no profile window is active.
                     if not self.dist.is_last_pp_rank:
                         with torch.cuda.nvtx.range(
                                 f"_forward_step_inter_pp pp_rank {self.dist.pp_rank}"
-                        ), torch.profiler.record_function(pp_step_label):
+                        ), self._step_scope(scheduled_batch):
                             sample_state = self._forward_step_inter_pp(
                                 scheduled_batch, gpu_forward_start,
                                 gpu_forward_end)
                     else:
                         with torch.cuda.nvtx.range(
                                 f"_forward_step_last_pp pp_rank {self.dist.pp_rank}"
-                        ), torch.profiler.record_function(pp_step_label):
+                        ), self._step_scope(scheduled_batch):
                             # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                             if self.guided_decoder is not None and self.kv_cache_transceiver:
                                 self.guided_decoder.add_batch(scheduled_batch)
@@ -4217,6 +4216,41 @@ class PyExecutor:
             label = f"step[EXTEND bs={num_ctx} toks={total_toks}]"
         return f"{label} {phase}" if phase else label
 
+    def _step_scope(self,
+                    scheduled_batch: ScheduledRequests,
+                    phase: Optional[str] = None):
+        """Return the per-iteration ``step[...]`` profiler scope.
+
+        Only builds the label and enters ``torch.profiler.record_function``
+        while a profile window is actually active. Both cost real time on
+        every executor iteration -- ``_build_step_scope_label`` formats a
+        string and sums ``context_chunk_size`` over the scheduled context
+        requests, and ``record_function`` traps into the profiler
+        machinery -- and none of that is observable unless someone is
+        profiling.
+
+        This matters beyond raw throughput: on a single-GPU deployment the
+        executor loop shares the GIL with the FastAPI event loop, so
+        per-iteration Python work in this loop delays HTTP handlers. The
+        disaggregated clock handshake (``/steady_clock_offset``) estimates
+        its offset from a single round trip, so a few milliseconds of added
+        latency there skews every timestamp the server reports afterwards.
+
+        ``_profile_enabled`` is read without ``_profile_state_lock`` on
+        purpose: this is a per-iteration fast path, and the worst case is
+        that a window that just opened or closed is reflected one
+        iteration late in the trace. Taking the lock here would put a
+        mutex in the hot loop to buy nothing.
+
+        Returns:
+            A context manager -- ``nullcontext()`` when no profile window
+            is active, otherwise a ``record_function`` for this iteration.
+        """
+        if not self._profile_enabled:
+            return nullcontext()
+        return torch.profiler.record_function(
+            self._build_step_scope_label(scheduled_batch, phase))
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -4364,8 +4398,7 @@ class PyExecutor:
                     # trtllm-serve /start_profile expose per-iteration
                     # boundaries with a consistent category and label
                     # format.
-                    with torch.profiler.record_function(
-                            self._build_step_scope_label(scheduled_batch)):
+                    with self._step_scope(scheduled_batch):
                         if scheduled_batch.encoder_requests:
                             self._submit_encoder_step(
                                 scheduled_batch.encoder_requests)
@@ -5110,10 +5143,9 @@ class PyExecutor:
                 # scope carries the bare ``step[...]`` label that marks an
                 # iteration boundary; the sampling scope gets a ``sample``
                 # phase suffix so trace consumers counting ``step[...]``
-                # annotations still see exactly one per iteration.
-                step_scope_label = self._build_step_scope_label(scheduled_batch)
-                sample_scope_label = self._build_step_scope_label(
-                    scheduled_batch, phase="sample")
+                # annotations still see exactly one per iteration. Both
+                # are elided when no profile window is active -- see
+                # ``_step_scope``.
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -5233,7 +5265,7 @@ class PyExecutor:
 
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
-                        with torch.profiler.record_function(step_scope_label):
+                        with self._step_scope(scheduled_batch):
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device,
                                 num_accepted_tokens_device)
@@ -5281,7 +5313,7 @@ class PyExecutor:
                     guided_decoder_failed_requests = None
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
-                        with torch.profiler.record_function(sample_scope_label):
+                        with self._step_scope(scheduled_batch, phase="sample"):
                             if self.guided_decoder is not None:
                                 # add_batch must be called again to have updated new tokens.
                                 self.guided_decoder.add_batch(scheduled_batch)
