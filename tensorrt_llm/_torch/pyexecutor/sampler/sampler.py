@@ -1173,6 +1173,12 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
     finish_reasons: torch.Tensor | None
     first_finish_reasons: torch.Tensor | None
     logprobs_state: LogProbsState | None = None
+    single_step_greedy: bool = False
+    """Whether `new_tokens` uses the compact `(num_requests,)` layout instead of
+    `[step, slot, beam]`. Describes these host tensors, so it must live here rather
+    than on `SampleStateTorch`: under pipeline parallelism only this object crosses
+    the ring hand-off, and a receiving rank would otherwise pair the compact buffer
+    with an outer flag left at its default."""
 
     def finish_reasons_list(self) -> FinishReasonsList:
         """`(num_seq_slots, num_steps)`"""
@@ -1187,7 +1193,6 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
-    single_step_greedy: bool = False
 
 
 class _SideStreamCopier:
@@ -2354,7 +2359,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         assert state.host is not None
         # Reuse sample_async's qualification instead of rechecking every
         # request after the asynchronous sample completes.
-        if state.single_step_greedy:
+        if state.host.single_step_greedy:
             self._update_requests_single_beam_single_step(state)
             return
 
@@ -2742,10 +2747,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 finish_reasons=finish_reasons_host,
                 first_finish_reasons=first_finish_reasons_host,
                 logprobs_state=logprobs_state,
+                single_step_greedy=single_step_greedy,
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
-            single_step_greedy=single_step_greedy,
         )
 
     @staticmethod

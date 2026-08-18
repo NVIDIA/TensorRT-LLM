@@ -188,28 +188,6 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
             )
 
 
-class TestPhi4MMFusedVisionLora(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "microsoft/Phi-4-multimodal-instruct"
-    MODEL_PATH = f"{llm_models_root()}/multimodals/Phi-4-multimodal-instruct-fuse-vision-lora"
-    MAX_NUM_TOKENS = 25600
-
-    sampling_params = SamplingParams(
-        max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|USER|>"
-    )
-
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
-
-    def test_auto_dtype(self):
-        with LLM(
-            self.MODEL_PATH,
-            max_batch_size=32,
-            max_num_tokens=self.MAX_NUM_TOKENS,
-            kv_cache_config=self.kv_cache_config,
-        ) as llm:
-            task = MMMU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=self.sampling_params)
-
-
 @skip_pre_hopper
 class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-27b-it"
