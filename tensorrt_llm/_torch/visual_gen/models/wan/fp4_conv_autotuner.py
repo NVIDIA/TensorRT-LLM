@@ -41,9 +41,12 @@ FP4_CONV_FIXED_TACTIC = FP4ConvTactic((256, 256), (2, 1), (2, 1), True)
 # A cache miss must preserve the provider-recommended product configuration.
 FP4_CONV_FALLBACK_TACTIC = FP4_CONV_FIXED_TACTIC
 
-# A small, valid shmoo over N tile size and 1CTA/2CTA scheduling. A 2CTA
-# instruction requires cluster-M to be divisible by two for both preferred and
-# fallback shapes, so all 2CTA candidates use the provider-recommended 2x1 CGA.
+# NVFP4 alignment fixes the M tile at 128 for 1CTA and 256 for 2CTA; 64 for
+# 1CTA and 128 for 2CTA are not valid. N is less constrained, so sweep the four
+# provider-supported tiles from 64 through 256. A 2CTA instruction requires
+# cluster-M to be divisible by two for both preferred and fallback shapes. The
+# provider measured comparable performance for 2x1x1 and 2x2x1 CGAs on current
+# cases, so keep the recommended 2x1x1 shape to bound JIT and profiling cost.
 FP4_CONV_TACTICS: tuple[FP4ConvTactic, ...] = (
     FP4ConvTactic((128, 64), (1, 1), (1, 1), False),
     FP4ConvTactic((128, 128), (1, 1), (1, 1), False),
