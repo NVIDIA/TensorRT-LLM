@@ -1,4 +1,4 @@
-# Copyright 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -143,8 +143,11 @@ def inputs(streaming=False):
     return {
         "text_input": ["Tell me a story."],
         "streaming": [streaming],
+        "sampling_param_n": [3],
+        "sampling_param_best_of": [80],
+        "sampling_param_use_beam_search": [True],
+        "sampling_param_beam_width_array": [[10, 50, 80]],
         "sampling_param_temperature": [0.8],
-        "sampling_param_beam_width": [4],
         "sampling_param_top_k": [0],
         "sampling_param_top_p": [1.0],
         "sampling_param_stop": ['\n', 'stop'],
@@ -169,16 +172,41 @@ def mock_model():
 def test_get_sampling_params_from_request():
     request = make_mock_triton_request(inputs(streaming=False))
     config = get_sampling_params_from_request(request)
+    assert config["n"] == 3
+    assert config["best_of"] == 80
+    assert config["use_beam_search"]
+    assert config["beam_width_array"] == [10, 50, 80]
     assert config["temperature"] == 0.8
-    # assert config["beam_width"] == 4
     assert config["top_k"] == 0
     assert config["top_p"] == 1.0
     assert config["max_tokens"] == 100
     assert config["frequency_penalty"] == 0.0
     assert config["presence_penalty"] == 0.0
     assert config["seed"] == 2
-    assert config["return_perf_metrics"] == True
+    assert config["return_perf_metrics"]
     assert np.array_equal(config["stop"], np.array(['\n', 'stop']))
+
+
+def test_get_sampling_params_without_beam_width_array():
+    request_inputs = inputs(streaming=False)
+    del request_inputs["sampling_param_beam_width_array"]
+    request = make_mock_triton_request(request_inputs)
+
+    config = get_sampling_params_from_request(request)
+
+    assert "beam_width_array" not in config
+
+
+def test_get_sampling_params_selects_batched_beam_width_array():
+    request = make_mock_triton_request({
+        "sampling_param_beam_width_array": [[10, 50], [20, 80]],
+    })
+
+    config = get_sampling_params_from_request(request,
+                                              batch_size=2,
+                                              batch_index=1)
+
+    assert config["beam_width_array"] == [20, 80]
 
 
 def test_get_streaming_from_request():
@@ -190,8 +218,8 @@ def test_get_streaming_from_request():
 def test_get_output_config_from_request():
     request = make_mock_triton_request(inputs(streaming=False))
     output_config = get_output_config_from_request(request)
-    assert output_config["return_finish_reason"] == True
-    assert output_config["return_stop_reason"] == True
+    assert output_config["return_finish_reason"]
+    assert output_config["return_stop_reason"]
 
 
 def test_convert_request_input_to_dict():
