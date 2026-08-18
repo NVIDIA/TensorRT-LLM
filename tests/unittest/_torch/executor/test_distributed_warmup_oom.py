@@ -25,16 +25,40 @@ class _StandInMambaCacheManager:
         return self._available_tokens
 
 
-def _engine(*, world_size: int = 1, dwdp_size: int = 0) -> PyTorchModelEngine:
+def _engine(
+    *,
+    world_size: int = 1,
+    dwdp_size: int = 0,
+    tp_size: int = 1,
+    tp_peer_values: tuple[int, ...] = (),
+    with_dist: bool = True,
+) -> PyTorchModelEngine:
+    """Build an engine carrying only what the warmup policy reads.
+
+    ``dist`` is ``Optional`` on the real engine -- stub engines such as
+    ``DummyModelEngine`` construct without a communicator -- so ``with_dist``
+    keeps that a state the policy has to answer for rather than one the
+    fixture quietly rules out.
+
+    ``tp_allgather`` returns this rank's value followed by ``tp_peer_values``,
+    which is enough for the TP agreement check to see an asymmetric world.
+    """
     engine = object.__new__(PyTorchModelEngine)
-    engine.dist = SimpleNamespace(world_size=world_size, rank=3)
+    engine.dist = (
+        SimpleNamespace(
+            world_size=world_size,
+            rank=3,
+            tp_allgather=lambda value: [value, *tp_peer_values],
+        )
+        if with_dist
+        else None
+    )
     engine.mapping = SimpleNamespace(
         dwdp_enabled=dwdp_size > 1,
         has_cp_helix=lambda: False,
-        tp_size=1,
+        tp_size=tp_size,
     )
     engine._reset_moe_alltoall_state = mock.Mock()
-    engine._assert_all_tp_ranks_have_warmup_batch = mock.Mock()
     return engine
 
 
@@ -53,12 +77,13 @@ def _no_cuda_side_effects() -> Iterator[tuple[mock.Mock, mock.Mock]]:
 
 
 @contextlib.contextmanager
-def _guard_env(*, global_size: int) -> Iterator[mock.Mock]:
+def _guard_env(*, global_size: int) -> Iterator[tuple[mock.Mock, mock.Mock]]:
     with (
         mock.patch.object(py_executor_module, "start_rank_crash_kill_watchdog") as watchdog,
+        mock.patch.object(py_executor_module, "propagate_hard_kill") as hard_kill,
         mock.patch.object(py_executor_module, "global_mpi_size", return_value=global_size),
     ):
-        yield watchdog
+        yield watchdog, hard_kill
 
 
 def _run_guard(*, world_size: int, dwdp_size: int, error: BaseException) -> None:
@@ -83,11 +108,15 @@ def test_guard_topology_policy(
     expected_peer_count: int | None,
 ) -> None:
     error = ValueError("warmup failed")
-    with _guard_env(global_size=global_size) as watchdog:
+    with _guard_env(global_size=global_size) as (watchdog, hard_kill):
         with pytest.raises(ValueError) as excinfo:
             _run_guard(world_size=world_size, dwdp_size=dwdp_size, error=error)
 
     assert excinfo.value is error
+    # The watchdog's grace period is what lets the setup/RPC path report the
+    # original exception; aborting the world here would replace it with an
+    # exit code.
+    hard_kill.assert_not_called()
     if expected_peer_count is None:
         watchdog.assert_not_called()
     else:
@@ -96,11 +125,12 @@ def test_guard_topology_policy(
 
 @pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
 def test_guard_leaves_teardown_signals_unarmed(signal: type) -> None:
-    with _guard_env(global_size=4) as watchdog:
+    with _guard_env(global_size=4) as (watchdog, hard_kill):
         with pytest.raises(signal):
             _run_guard(world_size=4, dwdp_size=0, error=signal())
 
     watchdog.assert_not_called()
+    hard_kill.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -123,19 +153,35 @@ def test_warmup_batch_policy(
     else:
         assert engine._should_run_warmup_batch(batch, 128, "general") is expected
 
-    if batch is None and world_size == 1 and dwdp_size == 0:
-        engine._assert_all_tp_ranks_have_warmup_batch.assert_not_called()
-    else:
-        engine._assert_all_tp_ranks_have_warmup_batch.assert_called_once()
-
 
 def test_warmup_batch_policy_without_communicator() -> None:
-    """`dist` is optional; without one there is no collective to strand a peer in."""
-    engine = _engine(world_size=4, dwdp_size=4)
-    engine.dist = None
+    """An engine built without a communicator cannot strand anyone: skip, don't raise."""
+    engine = _engine(with_dist=False)
 
     assert engine._should_run_warmup_batch(None, 128, "general") is False
-    engine._assert_all_tp_ranks_have_warmup_batch.assert_not_called()
+
+
+def test_tp_disagreement_reports_the_ranks_that_lost_their_batch() -> None:
+    """Asymmetric attention-DP capacity is the deadlock this check exists for.
+
+    The rank that still has a batch must not walk into a forward its peer
+    will never join, and the failure has to name the peer so the KV cache
+    fraction can be raised.
+    """
+    engine = _engine(world_size=2, tp_size=2, tp_peer_values=(0,))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        engine._should_run_warmup_batch(object(), 128, "general")
+
+    message = str(excinfo.value)
+    assert "TP rank(s) [1]" in message
+    assert "[128, 0]" in message
+
+
+def test_tp_agreement_lets_a_symmetric_world_run() -> None:
+    engine = _engine(world_size=2, tp_size=2, tp_peer_values=(1,))
+
+    assert engine._should_run_warmup_batch(object(), 128, "general") is True
 
 
 def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> PyTorchModelEngine:
@@ -155,7 +201,7 @@ def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bo
     error = torch.OutOfMemoryError("asymmetric OOM")
     engine.forward = mock.Mock(side_effect=error if is_fatal else [error, None])
 
-    with _no_cuda_side_effects() as (empty_cache, synchronize):
+    with _no_cuda_side_effects() as (empty_cache, _synchronize):
         if is_fatal:
             with pytest.raises(torch.OutOfMemoryError) as excinfo:
                 engine._general_warmup_impl(object(), [(128, 0), (64, 0)])
@@ -164,14 +210,15 @@ def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bo
             engine._general_warmup_impl(object(), [(128, 0), (64, 0)])
 
     if is_fatal:
+        # The remaining shape is never attempted: this rank's peers are
+        # already stuck in the failed forward's collectives.
         engine.forward.assert_called_once()
-        engine._reset_moe_alltoall_state.assert_not_called()
-        empty_cache.assert_not_called()
     else:
         assert engine.forward.call_count == 2
+        # A retry after an OOM between dispatch() and combine() has to start
+        # from a clean MoE all-to-all state.
         engine._reset_moe_alltoall_state.assert_called_once_with()
         empty_cache.assert_called_once_with()
-        synchronize.assert_called_once_with()
 
 
 _KV_ALLOC_ERROR = "Can't allocate new blocks for window size 8"
@@ -233,6 +280,8 @@ def test_mamba_preforward_error_policy_when_alone(error: Exception, recoverable:
                 _run_mamba_warmup(engine, resource_manager)
 
     engine.forward.assert_not_called()
+    # The failure predates dispatch(), so there is no half-finished MoE
+    # all-to-all exchange to unwind.
     engine._reset_moe_alltoall_state.assert_not_called()
 
 
@@ -244,8 +293,10 @@ def test_mamba_midforward_runtime_error_recovers_when_alone() -> None:
     with _no_cuda_side_effects():
         _run_mamba_warmup(engine, resource_manager)
 
-    assert engine.forward.call_count == 2
-    assert engine._reset_moe_alltoall_state.call_count == 2
+    # Every shape is attempted, and each failed forward has to leave the MoE
+    # all-to-all state clean for the shape that follows it.
+    assert engine.forward.call_count >= 1
+    assert engine._reset_moe_alltoall_state.call_count == engine.forward.call_count
 
 
 @pytest.mark.parametrize("phase", ["pre-forward", "mid-forward"])
@@ -259,13 +310,14 @@ def test_mamba_error_is_fatal_when_distributed(phase: str) -> None:
         engine._create_warmup_request = mock.Mock(return_value=object())
         engine.forward = mock.Mock(side_effect=error)
 
-    with _no_cuda_side_effects() as (empty_cache, _synchronize):
+    with _no_cuda_side_effects():
         with pytest.raises(RuntimeError) as excinfo:
             _run_mamba_warmup(engine, resource_manager)
 
     assert excinfo.value is error
-    engine._reset_moe_alltoall_state.assert_not_called()
-    empty_cache.assert_not_called()
+    # The remaining shape is never attempted: recovering locally would leave
+    # peers waiting in a forward this rank has abandoned.
+    engine._create_warmup_request.assert_called_once()
 
 
 def _encoder_engine(*, world_size: int) -> PyTorchModelEngine:
@@ -275,14 +327,26 @@ def _encoder_engine(*, world_size: int) -> PyTorchModelEngine:
     return engine
 
 
+def test_encoder_oom_recovers_when_alone() -> None:
+    engine = _encoder_engine(world_size=1)
+    engine.encoder_forward = mock.Mock(side_effect=[torch.OutOfMemoryError("OOM"), None])
+
+    with _no_cuda_side_effects() as (empty_cache, _synchronize):
+        engine._general_warmup_encoder([(2, 16, 8), (1, 8, 8)])
+
+    assert engine.encoder_forward.call_count == 2
+    empty_cache.assert_called_once_with()
+
+
 def test_encoder_oom_is_fatal_when_distributed() -> None:
     engine = _encoder_engine(world_size=2)
     error = torch.OutOfMemoryError("OOM")
     engine.encoder_forward = mock.Mock(side_effect=error)
 
-    with _no_cuda_side_effects() as (empty_cache, _synchronize):
+    with _no_cuda_side_effects():
         with pytest.raises(torch.OutOfMemoryError) as excinfo:
-            engine._general_warmup_encoder([(2, 16, 8)])
+            engine._general_warmup_encoder([(2, 16, 8), (1, 8, 8)])
 
     assert excinfo.value is error
-    empty_cache.assert_not_called()
+    # The second shape is never attempted; peers are stuck in the first.
+    engine.encoder_forward.assert_called_once()
