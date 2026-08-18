@@ -506,14 +506,21 @@ def apply_embedding_bias(
     bias_gather_indices: list[int] = []
 
     # Collect bias information
+    #
+    # NB: the mask indexes rows of 'logits', not requests: a request contributes
+    #     'steps' consecutive rows (> 1 under speculative decoding), so the offset
+    #     has to accumulate 'steps' rather than track the request index. It must
+    #     stay in step with 'bias_gather_indices', which is built in row order.
     req_bias = None
-    for i, (req, steps) in enumerate(zip(requests, request_steps_list)):
+    row_offset = 0
+    for req, steps in zip(requests, request_steps_list):
         req_bias = req._py_embedding_bias_1d
         if req_bias is not None:
-            for j in range(i, i + steps):
+            for j in range(row_offset, row_offset + steps):
                 logits_bias_masks[j] = True
             req_bias_index = bias_to_index[req_bias]
             bias_gather_indices.extend(repeat(req_bias_index, steps))
+        row_offset += steps
 
     if not bias_to_index:
         return
