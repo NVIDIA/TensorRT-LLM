@@ -511,7 +511,6 @@ def apply_embedding_bias(
     #     'steps' consecutive rows (> 1 under speculative decoding), so the offset
     #     has to accumulate 'steps' rather than track the request index. It must
     #     stay in step with 'bias_gather_indices', which is built in row order.
-    req_bias = None
     row_offset = 0
     for req, steps in zip(requests, request_steps_list):
         req_bias = req._py_embedding_bias_1d
@@ -524,7 +523,10 @@ def apply_embedding_bias(
 
     if not bias_to_index:
         return
-    assert req_bias is not None  # otherwise bias_to_index is empty
+    # NB: take the reference shape from the collected biases rather than from the
+    #     loop variable: that holds the *last* request's bias, which is None
+    #     whenever a biased request is followed by an unbiased one.
+    bias_tensors = tuple(bias_to_index)
 
     bias_gather_indices_cuda = torch.tensor(
         bias_gather_indices, pin_memory=prefer_pinned(), dtype=torch.int32
@@ -532,9 +534,11 @@ def apply_embedding_bias(
     logits_bias_mask_cuda = torch.tensor(
         logits_bias_masks, pin_memory=prefer_pinned(), dtype=torch.bool
     ).to(logits.device, non_blocking=True)
-    biases_tensor = torch.empty((len(bias_to_index), *req_bias.shape), pin_memory=prefer_pinned())
+    biases_tensor = torch.empty(
+        (len(bias_tensors), *bias_tensors[0].shape), pin_memory=prefer_pinned()
+    )
     biases_tensor = torch.stack(
-        tuple(bias_to_index.keys()),
+        bias_tensors,
         out=biases_tensor,
     )
     biases_tensor_cuda = biases_tensor.to(logits.device, non_blocking=True)
