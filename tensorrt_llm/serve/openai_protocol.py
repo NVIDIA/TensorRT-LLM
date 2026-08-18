@@ -824,9 +824,9 @@ class DynamicToolsSystemMessageParam(TypedDict, total=False):
     """System message carrying message-level (dynamic) tool declarations.
 
     Kimi-style templates render such messages as an in-conversation tool
-    declare block. Must come first in ``ChatCompletionMessageParam``: the
+    declare block. Must come first in `ChatCompletionMessageParam`: the
     stock OpenAI system-message TypedDict otherwise wins smart-union scoring
-    and silently drops the ``tools`` key.
+    and silently drops the `tools` key.
     """
     __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
 
@@ -924,12 +924,12 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
 
 
 class ChatCompletionThinkingParam(OpenAIBaseModel):
-    """Kimi/Moonshot ``thinking`` extension controlling reasoning output.
+    """Kimi/Moonshot `thinking` extension controlling reasoning output.
 
-    ``keep`` is fixed to ``"all"`` when thinking is enabled and ignored when
-    disabled; ``effort`` is only meaningful when enabled. An explicit
-    ``effort`` wins over a request-level ``reasoning_effort``, which applies
-    only when ``effort`` is absent (and never for a disabled request).
+    `keep` is fixed to `"all"` when thinking is enabled and ignored when
+    disabled; `effort` is only meaningful when enabled. An explicit
+    `effort` wins over a request-level `reasoning_effort`, which applies
+    only when `effort` is absent (and never for a disabled request).
     """
     type: Literal["enabled", "disabled"] = "enabled"
     keep: Optional[Literal["all"]] = None

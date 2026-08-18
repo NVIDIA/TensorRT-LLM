@@ -118,7 +118,7 @@ class KimiK3ToolParser(BaseToolParser):
         arguments constrained to that JSON Schema via the K3 json-block body
         form (the per-argument XTML form has no xgrammar equivalent).
         Non-strict tools keep free-form bodies. The outer triggered_tags
-        must keep ``at_least_one``/``stop_after_first`` False: True would
+        must keep `at_least_one`/`stop_after_first` False: True would
         forbid the think/response text before the section and the message
         close after it, deadlocking generation.
         """

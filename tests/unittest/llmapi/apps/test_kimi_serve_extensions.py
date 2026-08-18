@@ -15,9 +15,9 @@
 """CPU-only unit tests for the Kimi K3 serving extensions.
 
 Covers the Kimi Vendor Verifier (KVV) API contract implemented in
-``tensorrt_llm/serve``: request validators, the Kimi extension-to-chat-template
+`tensorrt_llm/serve`: request validators, the Kimi extension-to-chat-template
 mapping and its precedence rules, the immutable sampling-parameter policy, the
-kimi_k3 ``response_format`` guided-decoding branch, and the (env-gated)
+kimi_k3 `response_format` guided-decoding branch, and the (env-gated)
 strict-tools structural-tag grammar builder. No GPU or checkpoint required.
 """
 
@@ -77,11 +77,11 @@ class TestToolChoiceValidation:
         assert req.tool_choice == "required"
 
     def test_required_without_tools_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="tools.*must be set"):
+        with pytest.raises(ValidationError, match=r"tools.*must be set"):
             make_request(tool_choice="required")
 
     def test_required_with_empty_tools_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="tools.*must be set"):
+        with pytest.raises(ValidationError, match=r"tools.*must be set"):
             make_request(tools=[], tool_choice="required")
 
     def test_required_with_dynamic_only_tools_accepted(self) -> None:
@@ -91,7 +91,7 @@ class TestToolChoiceValidation:
         assert req.tool_choice == "required"
 
     def test_named_with_dynamic_only_tools_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="tools.*must be set"):
+        with pytest.raises(ValidationError, match=r"tools.*must be set"):
             make_request(
                 messages=[dynamic_system_msg([WEATHER_TOOL]), USER_MSG],
                 tool_choice={

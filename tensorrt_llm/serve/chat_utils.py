@@ -341,8 +341,8 @@ def _validate_fallback_tool_calls(
 
 def _normalize_tool_call_arguments(index: int,
                                    item: Any,
-                                   lenient_json: bool = False) -> dict[str,
-                                                                       Any]:
+                                   lenient_json: bool = False
+                                   ) -> dict[str, Any]:
     """Normalize `function.arguments` to the internal dict form."""
     item = dict(item)
     item["function"] = dict(item["function"])
@@ -356,7 +356,7 @@ def _normalize_tool_call_arguments(index: int,
         except json.JSONDecodeError as e:
             if lenient_json:
                 # Keep the raw string: python-renderer templates (kimi_k3)
-                # normalize unparseable arguments themselves and render them
+                # normalize unparsable arguments themselves and render them
                 # verbatim as a JSON block, matching the reference tokenizer.
                 return item
             raise ValueError(
@@ -395,8 +395,9 @@ def _parse_fallback_tool_calls(
 
 
 # Adapted from: https://github.com/vllm-project/vllm/blob/4574d48bab9c4e38b7c0a830eeefc8f0980e8c58/vllm/entrypoints/chat_utils.py#L1406
-def _parse_assistant_message_content(
-        message: Dict[str, Any], lenient_json: bool = False) -> Dict[str, Any]:
+def _parse_assistant_message_content(message: Dict[str, Any],
+                                     lenient_json: bool = False
+                                     ) -> Dict[str, Any]:
     result = {}
     # Include reasoning if present for interleaved thinking.
     reasoning_content = message.get("reasoning")
@@ -500,7 +501,7 @@ def parse_chat_messages_coroutines(
         content_format = ContentFormat.STRING
 
     for msg in messages:
-        # kimi_k3's reference renderer keeps unparseable tool-call argument
+        # kimi_k3's reference renderer keeps unparsable tool-call argument
         # strings verbatim; other templates expect the strict dict contract.
         parsed_msg = parse_chat_message_content(
             msg,

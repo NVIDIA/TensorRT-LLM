@@ -334,9 +334,9 @@ class BaseToolParser(ABC):
         """Build a complete structural-tag format for strict-tool decoding.
 
         Override on parsers whose wire format cannot be expressed through
-        the ``structure_info`` begin/end/trigger triples (e.g. kimi_k3's
+        the `structure_info` begin/end/trigger triples (e.g. kimi_k3's
         XTML call tags). Returns the xgrammar structural-tag format dict,
-        or None to fall back to the ``structure_info`` path.
+        or None to fall back to the `structure_info` path.
         """
         return None
 
