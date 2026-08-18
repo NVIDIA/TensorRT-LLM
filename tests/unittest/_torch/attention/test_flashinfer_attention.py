@@ -85,6 +85,55 @@ class TestFlashInferAttention(unittest.TestCase):
             flashinfer_backend._get_attention_layer_indices(FakeV1Manager()),
             [0, 1])
 
+    def test_hybrid_v2_metadata_uses_first_attention_layer_for_prepare(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        class FakeHybridManager:
+            layer_offsets = {0: 0, 1: 1}
+            layer_to_pool_mapping_dict = {0: 0, 1: 0}
+            blocks_in_primary_pool = 4
+            max_blocks_per_seq = 4
+            tokens_per_block = 32
+            is_vswa = False
+
+            def is_attention_layer(self, layer_idx: int) -> bool:
+                return layer_idx == 1
+
+            def get_layer_page_index_scale(self, layer_idx: int) -> int:
+                return 1
+
+        manager = FakeHybridManager()
+        manager.get_buffers = mock.Mock(
+            side_effect=lambda layer_idx: torch.empty(4)
+            if layer_idx == 1 else self.fail(
+                "recurrent layer queried for KV buffers"))
+        manager.get_batch_cache_indices_flat = mock.Mock(
+            return_value=torch.tensor([2], dtype=torch.int32))
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.zeros(1, dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[1],
+            ),
+            max_num_requests=1,
+            max_num_tokens=1,
+            kv_cache_manager=manager,
+            request_ids=[7],
+            workspace_buffer=torch.empty(1, dtype=torch.uint8, device="cuda"),
+            mamba_metadata=False,
+        )
+
+        self.assertEqual(metadata._primary_kv_layer_idx, 1)
+        manager.get_buffers.assert_called_once_with(1)
+
+        metadata.prepare()
+
+        manager.get_batch_cache_indices_flat.assert_called_once_with(
+            [7], [1], layer_idx=1)
+
     def test_separate_kv_draft_metadata_uses_draft_manager(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
