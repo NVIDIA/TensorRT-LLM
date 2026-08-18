@@ -594,7 +594,11 @@ def test_create_and_map_handles_close_failure_does_not_mask_original_error(monke
     monkeypatch.setattr(mnnvl.cuda, "cuMemRelease", Mock(return_value=None))
     monkeypatch.setattr(mnnvl.ctypes, "CDLL", Mock(return_value=SimpleNamespace(syscall=syscall)))
     close_fd = Mock(side_effect=[OSError("close failed"), None, None, None, None])
-    monkeypatch.setattr(mnnvl.os, "close", close_fd)
+    monkeypatch.setattr(
+        mnnvl,
+        "os",
+        SimpleNamespace(close=close_fd, getpid=mnnvl.os.getpid, strerror=mnnvl.os.strerror),
+    )
 
     with pytest.raises(RuntimeError, match="map failed"):
         _TestMnnvlMemory._create_and_map_handles(comm, 64, 1000, 256, 32)
