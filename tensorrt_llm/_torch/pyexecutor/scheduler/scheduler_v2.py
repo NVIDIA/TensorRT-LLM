@@ -946,9 +946,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Reserve one-model draft-mirror context capacity at admission time.
 
         The mirror otherwise only allocates in ``prepare_resources``, after
-        scheduling, where a shortfall can no longer be deferred and can only
-        raise.  Consulting it here converts that crash into the same SKIP (or,
-        for generation below, STOP/evict) the primary pool already uses.
+        scheduling, where a shortfall can no longer be deferred.  Consulting it
+        here lets the caller SKIP the request as it already does when the
+        primary pool is short.
         """
         if self.draft_kv_cache_manager is None:
             return True
