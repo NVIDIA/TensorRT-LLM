@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Runtime parity for the Kimi K3 FP8 packed q/k/v prefill projection."""
 
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -90,7 +91,7 @@ def test_fp8_packed_qkv_projection_matches_separate_views() -> None:
 )
 @torch.no_grad()
 def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
-    sequence_lengths, use_initial_states, has_initial_states
+    sequence_lengths: list[int], use_initial_states: bool, has_initial_states: list[bool]
 ) -> None:
     torch.manual_seed(1)
     runtime = _make_runtime()
@@ -119,8 +120,8 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
 
     calls = {"qkvg": 0, "q": 0, "k": 0, "v": 0}
 
-    def _count(name):
-        def _hook(_module, _inputs, _output):
+    def _count(name: str) -> Callable[[nn.Module, tuple, object], None]:
+        def _hook(_module: nn.Module, _inputs: tuple, _output: object) -> None:
             calls[name] += 1
 
         return _hook

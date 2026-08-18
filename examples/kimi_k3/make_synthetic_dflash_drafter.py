@@ -44,6 +44,8 @@ Usage:
   python make_synthetic_dflash_drafter.py --tiny --out <dir>
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -93,7 +95,7 @@ TINY = dict(
 )
 
 
-def even_target_layer_ids(num_target_layers: int, k: int = 6):
+def even_target_layer_ids(num_target_layers: int, k: int = 6) -> list[int]:
     """Evenly spaced capture layers, K2.7 convention (first=1, last=L-3)."""
     lo, hi = 1, max(1, num_target_layers - 3)
     if k == 1:
@@ -101,9 +103,37 @@ def even_target_layer_ids(num_target_layers: int, k: int = 6):
     return sorted({round(lo + i * (hi - lo) / (k - 1)) for i in range(k)})
 
 
+def validate_target_layer_ids(
+    target_layer_ids: list[int], num_target_layers: int | None = None
+) -> None:
+    """Validate capture-layer ids in every mode.
+
+    Uses real exceptions rather than ``assert`` so the checks survive
+    ``python -O`` (which strips asserts). ``num_target_layers`` is the
+    target stack depth when known (unavailable in --config mode, where the
+    target checkpoint is not read); the upper-bound check is skipped when it
+    is None.
+    """
+    if not target_layer_ids:
+        raise ValueError("target_layer_ids must be a non-empty list")
+    if len(set(target_layer_ids)) != len(target_layer_ids):
+        raise ValueError(f"target_layer_ids {target_layer_ids} contains duplicates")
+    if min(target_layer_ids) < 0:
+        raise ValueError(f"target_layer_ids {target_layer_ids} contains negative ids")
+    if num_target_layers is not None and max(target_layer_ids) >= num_target_layers:
+        raise ValueError(
+            f"target_layer_ids {target_layer_ids} out of range [0, {num_target_layers})"
+        )
+
+
 def drafter_tensor_plan(
-    hidden, cfg, num_capture, vocab=None, markov_rank=None, use_confidence_head=False
-):
+    hidden: int,
+    cfg: dict,
+    num_capture: int,
+    vocab: int | None = None,
+    markov_rank: int | None = None,
+    use_confidence_head: bool = False,
+) -> dict[str, tuple[int, ...]]:
     """Return {key: shape} for the drafter checkpoint.
 
     Base keys follow the K2.7 DFlash schema; the dspark heads (markov_w1/w2
@@ -144,7 +174,14 @@ def drafter_tensor_plan(
     return plan
 
 
-def drafter_config(hidden, vocab, num_target_layers, target_layer_ids, mask_token_id, cfg):
+def drafter_config(
+    hidden: int,
+    vocab: int,
+    num_target_layers: int,
+    target_layer_ids: list[int],
+    mask_token_id: int,
+    cfg: dict,
+) -> dict:
     dflash_cfg = {
         "mask_token_id": mask_token_id,
         "target_layer_ids": target_layer_ids,
@@ -197,14 +234,14 @@ def drafter_config(hidden, vocab, num_target_layers, target_layer_ids, mask_toke
     }
 
 
-def target_dims_from_ckpt(ckpt_dir):
+def target_dims_from_ckpt(ckpt_dir: str) -> tuple[int, int, int]:
     with open(os.path.join(ckpt_dir, "config.json")) as f:
         cfg = json.load(f)
     text = cfg.get("text_config", cfg)
     return (text["hidden_size"], text["vocab_size"], text["num_hidden_layers"])
 
 
-def drafter_cfg_from_real_config(path):
+def drafter_cfg_from_real_config(path: str) -> tuple[dict, dict]:
     """--config mode: adopt the REAL drafter config.json verbatim.
 
     Random weights, exact real module structure — no schema guessing.
@@ -258,7 +295,7 @@ def drafter_cfg_from_real_config(path):
     return real, dims
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--ckpt-dir", help="real K3 target checkpoint dir (reads config.json)")
@@ -298,6 +335,9 @@ def main():
         real_cfg, cfg = drafter_cfg_from_real_config(args.config)
         hidden, vocab = real_cfg["hidden_size"], real_cfg["vocab_size"]
         target_layer_ids = args.target_layer_ids or real_cfg["dflash_config"]["target_layer_ids"]
+        # No target checkpoint is read in --config mode, so the stack depth
+        # is only known if the real config carries num_target_layers.
+        validate_target_layer_ids(target_layer_ids, real_cfg.get("num_target_layers"))
         mask_token_id = (
             args.mask_token_id
             if args.mask_token_id is not None
@@ -316,9 +356,7 @@ def main():
         target_layer_ids = args.target_layer_ids or even_target_layer_ids(
             num_target_layers, default_k
         )
-        assert all(0 <= t < num_target_layers for t in target_layer_ids), (
-            f"target_layer_ids {target_layer_ids} out of range [0, {num_target_layers})"
-        )
+        validate_target_layer_ids(target_layer_ids, num_target_layers)
         mask_token_id = args.mask_token_id if args.mask_token_id is not None else vocab - 2
 
     torch.manual_seed(args.seed)

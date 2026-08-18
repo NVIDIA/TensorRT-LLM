@@ -28,17 +28,27 @@ hold disjoint request sets, so all per-rank files are merged). The
 recorder syncs a few scalars per step: keep it OFF (--no-accept-stats)
 for the TPOT-reference legs of an A/B.
 
-Example (inside the container, see run_dspark_acceptance.sbatch):
+Example (inside the container, see run_dspark_acceptance.sbatch). The
+recorder dir MUST be exported before trtllm-llmapi-launch: it pre-spawns the
+MPI worker ranks (where DFlashWorker lives), so setting os.environ inside this
+script never reaches them and the accept-stats come back empty for TP>1:
+    export TLLM_DFLASH_ACCEPT_STATS_DIR=/tmp/dspark-stats
     trtllm-llmapi-launch python3 examples/kimi_k3/measure_dspark_acceptance.py \
         --model /path/to/kimi-k3 --drafter /path/to/dspark-drafter \
         --tp-size 16 --num-prompts 64 --max-tokens 256 \
         --stats-dir /tmp/dspark-stats --output-json results_spec.json
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tensorrt_llm import LLM
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -97,7 +107,7 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_prompts(args) -> list:
+def load_prompts(args: argparse.Namespace) -> list[str]:
     if args.prompt_file:
         prompts = []
         with open(args.prompt_file) as f:
@@ -115,7 +125,7 @@ def load_prompts(args) -> list:
     ]
 
 
-def build_llm(args):
+def build_llm(args: argparse.Namespace) -> tuple[LLM, bool]:
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import KvCacheConfig
 
