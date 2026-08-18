@@ -390,8 +390,8 @@ class HangDetector:
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=run_loop, daemon=True, name="hang_detector_loop")
         self.loop_thread.start()
-        # One long-lived watcher, scheduled once. The hot path never cancels or
-        # re-arms it; it only moves ``_deadline``.
+        # One long-lived watcher, scheduled once; the hot path only moves
+        # ``_deadline``.
         self.task = asyncio.run_coroutine_threadsafe(self._watch(), self.loop)
 
     def register_status_provider(self, provider: Callable[[], str]) -> None:
@@ -409,29 +409,22 @@ class HangDetector:
         never wakes this loop, so an unclamped sleep would not notice a later
         arm.
 
-        This task only reads ``_deadline``. The lapse it last reported is kept
-        here rather than stamped back into ``_deadline``, so suppressing a
-        repeat costs no read-modify-write for a racing ``checkpoint()`` to land
-        inside and lose.
+        This task never writes ``_deadline``; the lapse it last reported is
+        watcher-local.
 
         This task outlives a report, and outlives a report that raises. A
         watchdog that quietly stopped watching would be the exact failure it
         exists to catch, and ``on_detected`` is the cross-rank hard kill, which
         can itself fail on an already-degraded job.
         """
-        # The deadline object whose lapse already ran ``on_detected``.
-        # Watcher-local, so this loop and ``checkpoint()`` never write the same
-        # state. Compared by identity: ``checkpoint()`` publishes a fresh float
-        # every time, so identity separates a genuine re-arm from the same
-        # lapse seen again without relying on the two never being numerically
-        # equal.
+        # The deadline whose lapse already ran ``on_detected``. Compared by
+        # identity, not equality: ``checkpoint()`` publishes a fresh float, so a
+        # re-arm that lands on the same value still reports.
         reported = None
         while self.active:
-            # Clock first: between these two reads a ``checkpoint()`` can land,
-            # and the orders fail in opposite directions. A stale deadline
-            # against a fresh clock reports a lapse the checkpoint already
-            # cleared -- a hard kill of a healthy job. A stale clock against a
-            # fresh deadline only defers, and the next pass corrects it.
+            # Clock first: a checkpoint can land between these two reads, and
+            # whichever is read first is the stale one. A stale deadline fires
+            # at work that was checkpointed in time; a stale clock only defers.
             now = time.monotonic()
             deadline = self._deadline
             remaining = deadline - now
@@ -439,10 +432,8 @@ class HangDetector:
                 await asyncio.sleep(min(remaining, self.timeout))
                 continue
             if deadline is reported:
-                # This lapse already ran ``on_detected``, which is not
-                # idempotent. Only a later ``checkpoint()`` or ``disarm()``
-                # moves ``_deadline``, and neither wakes this loop, so poll at
-                # the cadence the disarmed state already used.
+                # ``on_detected`` is not idempotent, so one lapse runs it once.
+                # Nothing wakes this loop, so poll for the next arm.
                 await asyncio.sleep(self.timeout)
                 continue
             reported = deadline

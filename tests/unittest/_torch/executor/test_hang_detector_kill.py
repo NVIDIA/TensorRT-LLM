@@ -66,7 +66,9 @@ def test_checkpoint_resets_timer():
         assert hd.detected() is False
 
 
-def test_checkpoint_schedules_no_work_on_the_detector_loop(monkeypatch) -> None:
+def test_checkpoint_schedules_no_work_on_the_detector_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """checkpoint() runs on the executor thread and must stay off the detector loop.
 
     Waking that loop is the per-iteration cost this detector is built to avoid,
@@ -79,7 +81,7 @@ def test_checkpoint_schedules_no_work_on_the_detector_loop(monkeypatch) -> None:
         woken = []
         real_call_soon_threadsafe = hd.loop.call_soon_threadsafe
 
-        def counting_call_soon_threadsafe(*args, **kwargs) -> asyncio.Handle:
+        def counting_call_soon_threadsafe(*args: object, **kwargs: object) -> asyncio.Handle:
             woken.append(args[0] if args else None)
             return real_call_soon_threadsafe(*args, **kwargs)
 
