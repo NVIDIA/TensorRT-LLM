@@ -825,10 +825,9 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         config = self.m3_config
         idx_sm_scale = idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
         num_tokens = int(idx_q.shape[0])
-        # idx_q and idx_k may be strided column-views of a fused buffer, so
-        # reshape to keep them zero-copy. The proxy fmha_sm100 and the index-K
-        # scatter below both honor the source strides.
-        idx_q_view = idx_q.reshape(num_tokens, config.num_index_heads, config.sparse_index_dim)
+        # Preserve split column views without allowing an implicit copy. The
+        # scorer and cache writer below both honor their source strides.
+        idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
         cache_is_fp8 = idx_k_cache.dtype == torch.float8_e4m3fn
         configured_for_fp8 = self.indexer_kv_dtype == "fp8"
@@ -850,7 +849,7 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
                     "The MiniMax-M3 BF16 indexer requires non-FP8 index-Q and "
                     "a live index-K tensor to populate the cache."
                 )
-            idx_k_view = idx_k.reshape(num_tokens, 1, config.sparse_index_dim)
+            idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
             metadata.msa_write_idx_k(self.layer_idx, idx_k_view)
         # The FP8 indexer mirrors vLLM's unscaled E4M3 contract: normalized
         # index Q/K are cast directly and the proxy accumulates their QK scores
