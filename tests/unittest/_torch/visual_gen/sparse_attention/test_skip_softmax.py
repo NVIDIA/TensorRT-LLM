@@ -17,6 +17,7 @@ from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
     SkipSoftmaxParams,
     SkipSoftmaxScheduler,
 )
+from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl import fmha as cute_dsl_fmha
 from tensorrt_llm._torch.visual_gen.attention_backend.cute_dsl.fmha import (
     CuTeDSLAttention,
     _resolve_skip_softmax_threshold_scale_factor,
@@ -494,6 +495,10 @@ class TestVisualGenSkipSoftmaxCuTeDSL:
         assert phase_fn(timestep=0.6) == 0
         assert phase_fn(timestep=0.59) == 1
 
+    @pytest.mark.skipif(
+        cute_dsl_fmha._cute_dsl_import_error is not None,
+        reason="CuTe DSL runtime unavailable",
+    )
     def test_forward_threads_timestep_and_sparse_params_to_kernel_call(self, monkeypatch):
         """The timestep-gating feature hinges on `_fwd`'s `kwargs.get("timestep")`
         reaching `cute_dsl_fmha_fwd` unchanged; nothing else in this chain would
