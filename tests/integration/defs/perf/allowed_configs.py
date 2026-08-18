@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -353,26 +353,6 @@ _allowed_configs = {
                vocab_size=49152,
                hidden_act='gelu',
                n_positions=8192,
-           )),
-    "starcoder2_3b":
-    Config(name="starcoder2_3b",
-           family="gpt",
-           benchmark_type="gpt",
-           build_config=BuildConfig(
-               max_batch_size=256,
-               max_input_len=512,
-               max_seq_len=712,
-           ),
-           model_config=ModelConfig(
-               num_layers=30,
-               num_heads=24,
-               num_kv_heads=2,
-               hidden_size=3072,
-               vocab_size=49152,
-               hidden_act='gelu',
-               n_positions=16384,
-               position_embedding_type='rope_gpt_neox',
-               rotary_pct=1.0,
            )),
     "llama_13b":
     Config(name="llama_13b",
