@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -90,26 +90,15 @@ template void invokeTopkBeamSearch<half, true>(
 __global__ void updateCacheIndirectionKernel(
     int* tgtCI, int const* srcCI, BeamHypotheses bh, int const nMaxAttentionWindow, int const nSinkTokenLength)
 {
-    // Update cache indirections which steps are between `bh.inputLength[x]` to `sequenceLengths[x]`
-    int const step = blockIdx.x * blockDim.x + threadIdx.x;
     size_t const nBM{bh.nBeamWidth};
     size_t const nBMIn{bh.nBeamWidthIn};
     size_t const nBMOut{bh.nBeamWidthOut};
     size_t const nMSL{bh.nMaxSeqLen};
-    int const indexBatch = blockIdx.y;
+    int const indexBatch = blockIdx.x;
     int const batchSlot = bh.batchSlots[indexBatch];
-    int const tgtIndexBeam = blockIdx.z;
+    int const tgtIndexBeam = blockIdx.y;
     int const tgtIndexBatchBeam = batchSlot * nBM + tgtIndexBeam;
     int const lastStep{bh.sequenceLengths[tgtIndexBatchBeam] - 1}; // minus 1 since it is updated in stage 3 kernel
-
-    // Return early when at least one of the conditions is true:
-    // 1. `step` is out of the bound
-    // 2. `step` is inside of input part (since context KV Cache is shared)
-    // 3. `step` is outside of attention widow
-    if (step >= nMSL || step < bh.inputLengths[tgtIndexBatchBeam] || step < (nMSL - nMaxAttentionWindow))
-    {
-        return;
-    }
 
     // Keep all past tokens by parentIdsPtr
     int const srcIndexBeam = bh.parentIdsPtr[batchSlot][tgtIndexBeam * nMSL + lastStep];
@@ -119,19 +108,27 @@ __global__ void updateCacheIndirectionKernel(
         return;
     }
 
-    int const stepCirc = (step >= nSinkTokenLength)
-        ? nSinkTokenLength + (step - nSinkTokenLength) % (nMaxAttentionWindow - nSinkTokenLength)
-        : step;
-    // Consider cyclic kv cache for the indir tables
-    uint32_t const tgtOffset = batchSlot * nBMOut * nMaxAttentionWindow + tgtIndexBeam * nMaxAttentionWindow + stepCirc;
-    uint32_t const srcOffset = batchSlot * nBMIn * nMaxAttentionWindow + srcIndexBeam * nMaxAttentionWindow + stepCirc;
-    tgtCI[tgtOffset] = (step == lastStep) ? tgtIndexBeam : srcCI[srcOffset];
+    // Only generated tokens can differ between beams. Assign one warp to each
+    // output beam instead of launching a warp for every 32 positions in nMSL.
+    int const firstStep = max(bh.inputLengths[tgtIndexBatchBeam], static_cast<int>(nMSL) - nMaxAttentionWindow);
+    for (int step = firstStep + threadIdx.x; step <= lastStep; step += blockDim.x)
+    {
+        int const stepCirc = (step >= nSinkTokenLength)
+            ? nSinkTokenLength + (step - nSinkTokenLength) % (nMaxAttentionWindow - nSinkTokenLength)
+            : step;
+        // Consider cyclic kv cache for the indir tables
+        uint32_t const tgtOffset
+            = batchSlot * nBMOut * nMaxAttentionWindow + tgtIndexBeam * nMaxAttentionWindow + stepCirc;
+        uint32_t const srcOffset
+            = batchSlot * nBMIn * nMaxAttentionWindow + srcIndexBeam * nMaxAttentionWindow + stepCirc;
+        tgtCI[tgtOffset] = (step == lastStep) ? tgtIndexBeam : srcCI[srcOffset];
+    }
 }
 
 void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& bh,
     runtime::SizeType32 const maxAttentionWindow, runtime::SizeType32 sinkTokenLength, cudaStream_t stream)
 {
-    dim3 const grid(common::roundUp(bh.nMaxSeqLen, 32), bh.nBatchSize, bh.nBeamWidthOut);
+    dim3 const grid(bh.nBatchSize, bh.nBeamWidthOut);
     updateCacheIndirectionKernel<<<grid, 32, 0, stream>>>(tgtCI, srcCI, bh, maxAttentionWindow, sinkTokenLength);
     sync_check_cuda_error(stream);
 }
