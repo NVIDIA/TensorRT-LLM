@@ -83,7 +83,8 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import torch
-from pydantic import BaseModel
+
+from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig
 
 from ..params import SparseBackendForwardArgs, SparseParams
 
@@ -100,14 +101,23 @@ class InklingSparseParams(SparseParams):
     algorithm = "inkling"
 
 
-class InklingSparseAttentionConfig(BaseModel):
+class InklingSparseAttentionConfig(BaseSparseAttentionConfig):
     """Architecture-derived config that carries :class:`InklingSparseParams`.
 
-    Deliberately a standalone ``BaseModel`` rather than a member of the
-    ``SparseAttentionConfig`` union in ``llmapi/llm_args.py``: it must never
-    appear in the user-facing schema (see the module docstring). ``BaseModel`` is
-    the base rather than a plain class because ``modules/attention.py`` calls
-    ``.model_dump()`` on whatever sits in that field.
+    Subclasses ``BaseSparseAttentionConfig`` but is **not** a member of the
+    ``SparseAttentionConfig`` union in ``llmapi/llm_args.py``. Those are separate
+    properties, and an earlier version of this class conflated them: it was a
+    bare ``BaseModel`` duck-typing the interface, with a test asserting it was
+    *not* a subclass. That inverted the invariant. The union is explicitly
+    enumerated (``llm_args.py:3630-3639``) and nothing builds the schema from
+    ``__subclasses__``, so inheritance costs nothing user-facing -- while
+    duck-typing cost an end-to-end run when the engine called
+    ``to_sparse_metadata_params``, a base method the imitation did not have.
+
+    Inheriting is what makes that class of failure impossible: whatever the
+    interface grows, this class gets the default. What must be asserted is only
+    "not in the union", which
+    ``test_the_fake_config_stays_out_of_the_user_facing_schema`` does.
 
     ``to_sparse_params`` mirrors the union members' signature -- the module layer
     calls it with ``pretrained_config`` and ``layer_idx`` -- and ignores both,

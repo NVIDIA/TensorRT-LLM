@@ -759,8 +759,18 @@ def test_the_fake_config_stays_out_of_the_user_facing_schema():
 
     It must still be a BaseModel, because modules/attention.py calls
     .model_dump() on whatever sits in that field.
+
+    Note what is asserted and what is NOT. "Out of the union" is the property
+    that matters; "not a subclass of the interface" is a different property, and
+    an earlier version of this test asserted the latter as if it implied the
+    former. It does not, the union is explicitly enumerated, and forbidding
+    inheritance is what let the config ship without ``to_sparse_metadata_params``
+    -- a base method the engine calls at executor init. Subclassing is now
+    required, and :func:`test_the_fake_config_implements_the_whole_interface`
+    covers why.
     """
     import inspect
+    import typing
 
     from pydantic import BaseModel
 
@@ -775,9 +785,43 @@ def test_the_fake_config_stays_out_of_the_user_facing_schema():
     assert cfg.model_dump() == {"algorithm": "inkling"}
     assert isinstance(cfg.to_sparse_params(), InklingSparseParams)
 
-    # Not a member of the user-facing union, and llm_args knows nothing of it.
-    assert not issubclass(InklingSparseAttentionConfig, la.BaseSparseAttentionConfig)
+    # The actual invariant: absent from the user-facing discriminated union, so
+    # no API-stability snapshot, golden manifest or telemetry review is touched.
+    members = typing.get_args(typing.get_args(la.SparseAttentionConfig)[0])
+    assert InklingSparseAttentionConfig not in members
     assert "inkling" not in inspect.getsource(la).lower()
+
+
+def test_the_fake_config_implements_the_whole_interface():
+    """Every public method the engine may call must exist, not just today's set.
+
+    This is the regression test for the failure that cost an end-to-end run: the
+    config duck-typed ``BaseSparseAttentionConfig`` and was missing
+    ``to_sparse_metadata_params``, which ``model_engine._set_up_attn_metadata``
+    calls unconditionally on a non-None ``sparse_attention_config``. It surfaced
+    as ``AttributeError`` during executor init, i.e. only end to end.
+
+    Asserting the subclass relation rather than enumerating method names is the
+    point: an enumeration would go stale exactly the way the imitation did.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import (
+        InklingSparseAttentionConfig,
+    )
+    from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig
+
+    assert issubclass(InklingSparseAttentionConfig, BaseSparseAttentionConfig)
+
+    cfg = InklingSparseAttentionConfig()
+    # Spot-check the two the engine calls, including the one that was missing.
+    assert cfg.to_sparse_metadata_params(pretrained_config=None) is None
+    assert cfg.algorithm == "inkling"
+    # Nothing on the interface may be left unbound.
+    missing = [
+        name
+        for name in dir(BaseSparseAttentionConfig)
+        if not name.startswith("_") and not hasattr(cfg, name)
+    ]
+    assert missing == [], missing
 
 
 def test_the_config_is_injected_from_the_checkpoint_architecture():
