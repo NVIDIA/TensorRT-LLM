@@ -328,9 +328,23 @@ def start_rank_crash_kill_watchdog(
 class HangDetector:
     """Watchdog that fires when the executor loop stops checkpointing.
 
-    When ``timeout`` seconds pass without a ``checkpoint()``, all thread stacks
-    are dumped for diagnosis and ``on_detected`` runs (the hard-kill +
-    cross-rank propagation path).
+    Contract:
+
+    - ``timeout`` seconds without a ``checkpoint()`` dumps all thread stacks for
+      diagnosis and runs ``on_detected`` (the hard-kill + cross-rank
+      propagation path).
+    - Continued checkpointing never fires it. A false positive hard-kills a
+      healthy job, so this bound is as load-bearing as detection itself.
+    - ``start()`` leaves detection disarmed; the first ``checkpoint()`` arms it,
+      so the start-to-first-checkpoint window is not hang-eligible.
+    - ``pause()`` suppresses detection in scope and re-arms on exit. It does
+      not nest: leaving an inner ``pause()`` re-arms while an outer one is
+      still open.
+    - Detection never stops while active: not after firing, and not if
+      ``on_detected`` raises an ``Exception``. ``on_detected`` is not
+      idempotent, so a single lapse invokes it once.
+    - ``checkpoint()`` is one clock read and one float store, and does no
+      cross-thread work. The executor loop calls it three times per iteration.
     """
 
     def __init__(
@@ -390,28 +404,48 @@ class HangDetector:
 
         Waking early is normal: ``checkpoint()`` pushes ``_deadline`` forward
         without touching this task, so each wake-up either finds time left and
-        sleeps again, or finds the deadline passed and reports. While disarmed
-        the deadline is ``inf``; the sleep is clamped to ``timeout`` because
-        ``checkpoint()`` only stores a float and never wakes this loop, so an
-        unclamped sleep would not notice a later arm.
+        sleeps again, or finds the deadline passed and reports. Every sleep is
+        clamped to ``timeout`` because ``checkpoint()`` only stores a float and
+        never wakes this loop, so an unclamped sleep would not notice a later
+        arm.
+
+        This task only reads ``_deadline``. The lapse it last reported is kept
+        here rather than stamped back into ``_deadline``, so suppressing a
+        repeat costs no read-modify-write for a racing ``checkpoint()`` to land
+        inside and lose.
 
         This task outlives a report, and outlives a report that raises. A
         watchdog that quietly stopped watching would be the exact failure it
         exists to catch, and ``on_detected`` is the cross-rank hard kill, which
         can itself fail on an already-degraded job.
         """
+        # The deadline object whose lapse already ran ``on_detected``.
+        # Watcher-local, so this loop and ``checkpoint()`` never write the same
+        # state. Compared by identity: ``checkpoint()`` publishes a fresh float
+        # every time, so identity separates a genuine re-arm from the same
+        # lapse seen again without relying on the two never being numerically
+        # equal.
+        reported = None
         while self.active:
+            # Clock first: between these two reads a ``checkpoint()`` can land,
+            # and the orders fail in opposite directions. A stale deadline
+            # against a fresh clock reports a lapse the checkpoint already
+            # cleared -- a hard kill of a healthy job. A stale clock against a
+            # fresh deadline only defers, and the next pass corrects it.
+            now = time.monotonic()
             deadline = self._deadline
-            remaining = deadline - time.monotonic()
+            remaining = deadline - now
             if remaining > 0:
                 await asyncio.sleep(min(remaining, self.timeout))
                 continue
-            # Disarm only the deadline observed to lapse, so one lapse reports
-            # once. A checkpoint racing this branch installs a newer deadline;
-            # clearing that would leave the watcher alive but permanently
-            # disarmed, which is the failure this watchdog exists to catch.
-            if self._deadline == deadline:
-                self._deadline = math.inf
+            if deadline is reported:
+                # This lapse already ran ``on_detected``, which is not
+                # idempotent. Only a later ``checkpoint()`` or ``disarm()``
+                # moves ``_deadline``, and neither wakes this loop, so poll at
+                # the cadence the disarmed state already used.
+                await asyncio.sleep(self.timeout)
+                continue
+            reported = deadline
             try:
                 await self._report_hang()
             except Exception as error:  # noqa: BLE001 - the watcher must survive
@@ -456,14 +490,24 @@ class HangDetector:
         if self.active:
             self._deadline = time.monotonic() + self.timeout
 
-    def cancel_task(self):
+    def disarm(self) -> None:
         """Disarm hang detection until the next checkpoint."""
         self._deadline = math.inf
+
+    def cancel_task(self) -> None:
+        """Compatibility alias for :meth:`disarm`.
+
+        The watcher is long-lived and has no task to cancel, but the old name is
+        load-bearing for the cache-transceiver precheck and its SLURM example.
+        Delegating rather than aliasing keeps a subclass override of ``disarm``
+        effective through this name.
+        """
+        self.disarm()
 
     @contextmanager
     def pause(self):
         """Pause hang detection in scope."""
-        self._deadline = math.inf
+        self.disarm()
         try:
             yield
         finally:
@@ -472,7 +516,7 @@ class HangDetector:
     def stop(self):
         """Stop hang detection."""
         self.active = False
-        self.cancel_task()
+        self.disarm()
         if self.loop is not None:
             # Cancel all pending tasks before stopping the loop
             def cancel_all_tasks():

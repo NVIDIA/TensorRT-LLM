@@ -16,7 +16,6 @@
 
 import asyncio
 import contextlib
-import math
 import os
 import shutil
 import signal
@@ -67,24 +66,32 @@ def test_checkpoint_resets_timer():
         assert hd.detected() is False
 
 
-def test_checkpoint_reuses_one_watcher_task():
-    """One watcher task serves every checkpoint, pause and resume.
+def test_checkpoint_schedules_no_work_on_the_detector_loop(monkeypatch) -> None:
+    """checkpoint() runs on the executor thread and must stay off the detector loop.
 
-    The executor loop checkpoints several times per iteration, and each
-    schedule/cancel of a task wakes the detector's event-loop thread, so the
-    single-task design is what keeps checkpoint() off that thread entirely.
+    Waking that loop is the per-iteration cost this detector is built to avoid,
+    and the executor pays it three times per iteration. Both routes into the
+    loop -- scheduling a coroutine and cancelling one -- funnel through
+    call_soon_threadsafe, so counting it catches either.
     """
     hd = HangDetector(timeout=30)
     with hd:
-        task = hd.task
-        assert task is not None
+        woken = []
+        real_call_soon_threadsafe = hd.loop.call_soon_threadsafe
+
+        def counting_call_soon_threadsafe(*args, **kwargs) -> asyncio.Handle:
+            woken.append(args[0] if args else None)
+            return real_call_soon_threadsafe(*args, **kwargs)
+
+        monkeypatch.setattr(hd.loop, "call_soon_threadsafe", counting_call_soon_threadsafe)
+
         for _ in range(10):
             hd.checkpoint()
         with hd.pause():
             hd.checkpoint()
         hd.checkpoint()
-        assert hd.task is task
-        assert not task.done()
+        hd.disarm()
+        assert woken == []
 
 
 def test_detector_is_disarmed_until_the_first_checkpoint():
@@ -118,7 +125,6 @@ def test_watcher_survives_a_raising_callback():
         assert len(fired) == 1
 
         # The watcher is still live and still able to report.
-        assert not hd.task.done()
         hd.checkpoint()
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and len(fired) < 2:
@@ -126,45 +132,23 @@ def test_watcher_survives_a_raising_callback():
         assert len(fired) == 2
 
 
-def test_a_checkpoint_racing_the_disarm_is_not_erased(monkeypatch):
-    """A checkpoint landing as the watcher disarms must survive.
+def test_one_lapse_invokes_on_detected_once() -> None:
+    """A single lapse must not re-run on_detected as the watcher keeps polling.
 
-    The watcher reads the lapsed deadline, then clears it. A checkpoint in
-    between installs a newer deadline; clearing that would leave the watcher
-    running but permanently disarmed, so the work it just armed could hang
-    undetected.
+    Nothing clears the deadline once its lapse is reported, so every later poll
+    observes the same lapse. on_detected is propagate_hard_kill(), which is not
+    idempotent -- re-running it would re-propagate to peer ranks.
     """
-    hd = HangDetector(timeout=1, on_detected=lambda: None)
-    real_monotonic = hang_detector_module.time.monotonic
-    state = {"injected": False, "busy": False}
-
-    def racing_monotonic():
-        now = real_monotonic()
-        if state["injected"] or state["busy"]:
-            return now
-        # Only inject from `_watch`'s own lapse computation. asyncio's event
-        # loop also reads the clock, and injecting from there would land
-        # outside the window and silently make this test vacuous.
-        caller = sys._getframe(1)
-        if caller.f_code.co_name != "_watch" or hd._deadline > now:
-            return now
-        # `_watch` has already read `self._deadline` into a local by now, so
-        # this checkpoint lands exactly between that read and the disarm.
-        state["busy"] = True
-        state["injected"] = True
-        hd.checkpoint()
-        state["busy"] = False
-        return now
-
-    monkeypatch.setattr(hang_detector_module.time, "monotonic", racing_monotonic)
+    fired = []
+    hd = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
     with hd:
         hd.checkpoint()
-        deadline = real_monotonic() + 5.0
-        while real_monotonic() < deadline and not state["injected"]:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not fired:
             time.sleep(0.05)
-        assert state["injected"], "the racing checkpoint never landed"
-        time.sleep(0.2)  # let the watcher finish its disarm/report pass
-        assert hd._deadline != math.inf, "the racing checkpoint's arm was erased"
+        assert len(fired) == 1
+        time.sleep(2.5)  # several further polls over the same lapse
+        assert len(fired) == 1, "the same lapse ran on_detected again"
 
 
 def test_pause_suppresses_detection():
