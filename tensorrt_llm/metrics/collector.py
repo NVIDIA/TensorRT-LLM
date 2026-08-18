@@ -806,7 +806,8 @@ class MetricsCollector:
             "kvCacheIterationStatsByPoolGroup")
         kv_iter_by_cold_pool_group = iteration_stats.get(
             "kvCacheIterationStatsByColdPoolGroup")
-        if kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group:
+        if (kv_iter or kv_iter_by_lifecycle or kv_iter_by_pool_group
+                or kv_iter_by_cold_pool_group):
             # Prefer lifecycle-level attention stats when present. An SSM-only
             # lifecycle report must not hide the legacy/window-level attention
             # aggregate. Missing kind remains attention-compatible.

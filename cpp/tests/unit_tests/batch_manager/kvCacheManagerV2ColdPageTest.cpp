@@ -27,11 +27,13 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -286,17 +288,17 @@ private:
 };
 
 SharedPtr<CommittedPage> makeCommittedPage(KvCacheManager& manager, StorageManager& storage, CacheLevel level,
-    Slot& slot, LifeCycleId lifeCycle = LifeCycleId{0})
+    Slot& slot, LifeCycleId lifeCycle = LifeCycleId{0}, Priority priority = kPriorityDefault, int tokenBase = 0)
 {
     RootBlock& root = manager.radixTree().addOrGetExisting({});
     std::vector<TokenIdExt> tokens;
     for (int token = 0; token < manager.tokensPerBlock(); ++token)
     {
-        tokens.emplace_back(TokenId{token});
+        tokens.emplace_back(TokenId{tokenBase + token});
     }
     auto block = addOrGetExistingBlock(&root, std::move(tokens), /*knownNoDigest=*/true);
     auto page = makeShared<CommittedPage>(
-        &storage, block, lifeCycle, level, static_cast<int>(block->tokens.size()), kPriorityDefault);
+        &storage, block, lifeCycle, level, static_cast<int>(block->tokens.size()), priority);
     page->setSlot(slot);
     block->storage[lifeCycle] = page.get();
     storage.scheduleForEviction(*page);
@@ -377,15 +379,11 @@ TEST(KvCacheManagerV2ColdPageTest, ColdGpuTierSupportsSingleSlotRoundTrip)
         lifeCycle, kHotLevel, coldLevel, hotSlot.slotId(), coldSlot.slotId(), reinterpret_cast<CUstream>(stream));
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-    uint8_t firstByte = 0;
-    uint8_t lastByte = 0;
-    ASSERT_EQ(
-        cudaMemcpy(&firstByte, reinterpret_cast<void const*>(hotAddress), 1, cudaMemcpyDeviceToHost), cudaSuccess);
-    ASSERT_EQ(
-        cudaMemcpy(&lastByte, reinterpret_cast<void const*>(hotAddress + hotPageBytes - 1), 1, cudaMemcpyDeviceToHost),
+    std::vector<uint8_t> restoredPage(hotPageBytes);
+    ASSERT_EQ(cudaMemcpy(
+                  restoredPage.data(), reinterpret_cast<void const*>(hotAddress), hotPageBytes, cudaMemcpyDeviceToHost),
         cudaSuccess);
-    EXPECT_EQ(firstByte, kPattern);
-    EXPECT_EQ(lastByte, kPattern);
+    EXPECT_TRUE(std::all_of(restoredPage.begin(), restoredPage.end(), [](uint8_t byte) { return byte == kPattern; }));
 
     storage.releaseSlot(lifeCycle, coldLevel, std::move(coldSlot));
     storage.releaseSlot(lifeCycle, kHotLevel, std::move(hotSlot));
@@ -583,6 +581,66 @@ TEST(KvCacheManagerV2ColdPageTest, EvictionRoutesLifecycleQueuesToDifferentColdP
         storage.getPoolGroupIndex(CacheLevel{1}, secondPage->lifeCycle));
     EXPECT_TRUE(firstPage->scheduledForEviction());
     EXPECT_TRUE(secondPage->scheduledForEviction());
+}
+
+TEST(KvCacheManagerV2ColdPageTest, FallenPagesRetainHighestPriorityAcrossLifecycleQueues)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeSplitColdGroupingConfig();
+    config.cacheTiers[1] = HostCacheTierConfig{4096};
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto& storage = manager->storage();
+    CacheLevel const coldLevel{1};
+    ASSERT_EQ(storage.numPoolGroups(kHotLevel), PoolGroupIndex{1});
+    ASSERT_EQ(storage.numPoolGroups(coldLevel), PoolGroupIndex{1});
+    ASSERT_EQ(storage.getStatistics(coldLevel).total, 1);
+
+    TypedVec<LifeCycleId, SlotCount> oneSlotPerLifeCycle(LifeCycleId{2}, 1);
+    auto hotSlots = storage.newGpuSlots(oneSlotPerLifeCycle);
+    auto highPriorityPage = makeCommittedPage(
+        *manager, storage, kHotLevel, hotSlots[LifeCycleId{0}].front(), LifeCycleId{0}, /*priority=*/100);
+    auto lowPriorityPage = makeCommittedPage(
+        *manager, storage, kHotLevel, hotSlots[LifeCycleId{1}].front(), LifeCycleId{1}, /*priority=*/1);
+
+    TypedVec<PoolGroupIndex, SlotCount> evictBoth(storage.numPoolGroups(kHotLevel), 2);
+    storage.forceEvict(kHotLevel, evictBoth);
+
+    EXPECT_EQ(highPriorityPage->cacheLevel, coldLevel);
+    EXPECT_EQ(lowPriorityPage->cacheLevel, kHotLevel);
+}
+
+TEST(KvCacheManagerV2ColdPageTest, RecursiveFallenPageMergeResortsByPriority)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeSplitColdGroupingConfig();
+    config.cacheTiers[1] = HostCacheTierConfig{4096};
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4096});
+    auto manager = std::make_shared<KvCacheManager>(std::move(config));
+    auto& storage = manager->storage();
+    CacheLevel const firstColdLevel{1};
+    CacheLevel const lastColdLevel{2};
+    ASSERT_EQ(storage.getStatistics(firstColdLevel).total, 1);
+    ASSERT_EQ(storage.getStatistics(lastColdLevel).total, 1);
+
+    TypedVec<LifeCycleId, SlotCount> oneSlotForSecondLifeCycle(LifeCycleId{2}, 0);
+    oneSlotForSecondLifeCycle[LifeCycleId{1}] = 1;
+    auto coldSlots = storage.newSlots(firstColdLevel, oneSlotForSecondLifeCycle);
+    auto highestPriorityPage = makeCommittedPage(*manager, storage, firstColdLevel, coldSlots[LifeCycleId{1}].front(),
+        LifeCycleId{1}, /*priority=*/100, /*tokenBase=*/0);
+
+    TypedVec<LifeCycleId, SlotCount> oneSlotPerLifeCycle(LifeCycleId{2}, 1);
+    auto hotSlots = storage.newGpuSlots(oneSlotPerLifeCycle);
+    auto middlePriorityPage = makeCommittedPage(*manager, storage, kHotLevel, hotSlots[LifeCycleId{0}].front(),
+        LifeCycleId{0}, /*priority=*/50, /*tokenBase=*/100);
+    auto lowestPriorityPage = makeCommittedPage(*manager, storage, kHotLevel, hotSlots[LifeCycleId{1}].front(),
+        LifeCycleId{1}, /*priority=*/1, /*tokenBase=*/200);
+
+    TypedVec<PoolGroupIndex, SlotCount> evictBoth(storage.numPoolGroups(kHotLevel), 2);
+    storage.forceEvict(kHotLevel, evictBoth);
+
+    EXPECT_EQ(middlePriorityPage->cacheLevel, firstColdLevel);
+    EXPECT_EQ(highestPriorityPage->cacheLevel, lastColdLevel);
+    EXPECT_EQ(lowestPriorityPage->cacheLevel, kHotLevel);
 }
 
 } // namespace

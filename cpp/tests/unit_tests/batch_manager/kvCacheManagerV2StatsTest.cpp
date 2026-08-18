@@ -26,10 +26,12 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <vector>
 
 namespace
 {
@@ -339,15 +341,12 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     {
         MemAddress const address = std::get<MemAddress>(
             storage.slotAddress(kHotLevel, hotPoolGroup, firstPages[index]->slotId(), PoolIndex{0}));
-        uint8_t firstByte = 0;
-        uint8_t lastByte = 0;
-        ASSERT_EQ(
-            cudaMemcpy(&firstByte, reinterpret_cast<void const*>(address), 1, cudaMemcpyDeviceToHost), cudaSuccess);
-        ASSERT_EQ(
-            cudaMemcpy(&lastByte, reinterpret_cast<void const*>(address + hotPageBytes - 1), 1, cudaMemcpyDeviceToHost),
+        std::vector<uint8_t> restoredPage(hotPageBytes);
+        ASSERT_EQ(cudaMemcpy(restoredPage.data(), reinterpret_cast<void const*>(address), hotPageBytes,
+                      cudaMemcpyDeviceToHost),
             cudaSuccess);
-        EXPECT_EQ(firstByte, pagePatterns[index]);
-        EXPECT_EQ(lastByte, pagePatterns[index]);
+        EXPECT_TRUE(std::all_of(restoredPage.begin(), restoredPage.end(),
+            [expected = pagePatterns[index]](uint8_t byte) { return byte == expected; }));
     }
     for (auto const& page : firstPages)
     {

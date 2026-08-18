@@ -580,6 +580,11 @@ HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> con
     }
 }
 
+HostMem const* HostPoolGroup::hostMem(PoolIndex poolIndex) const
+{
+    return static_cast<HostSlotPool const&>(*mPools.at(poolIndex)).hostMem();
+}
+
 // ---------------------------------------------------------------------------
 // DiskPoolGroup
 // ---------------------------------------------------------------------------

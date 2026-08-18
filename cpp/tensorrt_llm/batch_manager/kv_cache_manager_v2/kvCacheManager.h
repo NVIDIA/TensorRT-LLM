@@ -313,7 +313,7 @@ private:
     void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);
     void _updateIterationPeakNumBlocks();
 
-    // Current per-pool-group GPU utilization ratios.
+    // Current per-pool-group utilization ratios for the hot and cold representations.
     TypedVec<PoolGroupIndex, float> _currentHotRatio() const;
     TypedVec<PoolGroupIndex, float> _currentColdRatios() const;
 

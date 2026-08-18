@@ -366,6 +366,7 @@ private:
     LifeCyclePoolGroupMapping const& poolGroupMapping(CacheLevel level) const
     {
         TLLM_CHECK(level >= CacheLevel{0} && level < mSlotDescLists.size());
+        // Every cold level uses the same encoded page layout and therefore shares one pool-group mapping.
         return level == kHotLevel ? mHotPoolGroupMapping : mColdPoolGroupMapping;
     }
 

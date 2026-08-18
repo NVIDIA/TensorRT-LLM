@@ -173,6 +173,15 @@ TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(Storage
     return result;
 }
 
+void sortFallenPagesByPriority(TypedVec<LifeCycleId, std::deque<SharedPtr<Page>>>& fallenPages)
+{
+    for (auto& pages : fallenPages)
+    {
+        std::stable_sort(
+            pages.begin(), pages.end(), [](auto const& lhs, auto const& rhs) { return lhs->priority < rhs->priority; });
+    }
+}
+
 } // namespace
 
 template <typename Submit>
@@ -208,7 +217,12 @@ bool StorageManager::submitColdPageCodec(
         attributes.dstLocHint.type = CU_MEM_LOCATION_TYPE_DEVICE;
         attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
         size_t firstCopy = 0;
+#if CUDA_VERSION < 13000
+        size_t failIdx;
+        TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &src, &chunkBytes, 1, &attributes, &firstCopy, 1, &failIdx, stream));
+#else
         TLLM_CU_CHECK(cuMemcpyBatchAsync(&dst, &src, &chunkBytes, 1, &attributes, &firstCopy, 1, stream));
+#endif
 
         if (!submit(reinterpret_cast<PageIndexPair const*>(device.address()), chunkPages, stream))
         {
@@ -470,6 +484,32 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         mPageStagingManager
             = std::make_unique<StagingBufferManager>(pageStagingBytes, StagingBufferMemory::kPinnedHost);
+    }
+
+    // cuMemcpyBatchAsync cannot copy across adjacent HostMem registrations in one batch entry. The default codec needs
+    // the owning HostMem objects to split copies at registration boundaries on linux kernels that require chunked
+    // pinning.
+    if (detail::needsHostMemRegistration(codec))
+    {
+        for (CacheLevel level{0}; level < mLevels.size(); ++level)
+        {
+            if (cacheTier(level) != CacheTier::HOST_MEM)
+            {
+                continue;
+            }
+            for (PoolGroupIndex poolGroupIndex{0}; poolGroupIndex < numPoolGroups(level); ++poolGroupIndex)
+            {
+                auto const& hostPoolGroup = static_cast<HostPoolGroup const&>(poolGroup(level, poolGroupIndex));
+                for (PoolIndex poolIndex{0}; poolIndex < numPools(level, poolGroupIndex); ++poolIndex)
+                {
+                    detail::registerHostMem(codec, hostPoolGroup.hostMem(poolIndex));
+                }
+            }
+        }
+        if (mPageStagingManager)
+        {
+            detail::registerHostMem(codec, mPageStagingManager->hostMem());
+        }
     }
     mCopyEngine = std::make_unique<CopyEngine>(mPageStagingManager.get());
 }
@@ -868,6 +908,7 @@ void StorageManager::forceEvict(
             fallen.at(lifeCycle).push_back(std::move(sp));
         }
     }
+    sortFallenPagesByPriority(fallen);
     _prepareFreeSlots(goals, nextLvl, fallen, MigrationRecorder{}, dropRecorder);
     rescheduleEvictedPagesOnFailure.cancel();
 }
@@ -970,19 +1011,36 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     auto acceptFallenPages = [&](PoolGroupIndex pgIdx, SlotCount count)
     {
         auto const lifeCycles = grouping.lifeCycles(pgIdx);
-        for (int index = lifeCycles.size(); index > 0 && count > 0; --index)
+        auto backPriority = [&](LifeCycleId lifeCycle) -> std::optional<Priority>
         {
-            LifeCycleId const lifeCycle = lifeCycles[index - 1];
-            auto& fallen = fallenPages.at(lifeCycle);
-            SlotCount const numAccepted = std::min(count, slotCountValueFromSize(fallen.size()));
-            auto acceptedBegin = fallen.end() - static_cast<std::ptrdiff_t>(numAccepted);
-            auto& accepted = acceptedPages.at(lifeCycle);
-            accepted.insert(
-                accepted.end(), std::make_move_iterator(acceptedBegin), std::make_move_iterator(fallen.end()));
-            fallen.erase(acceptedBegin, fallen.end());
-            count -= numAccepted;
+            auto const& fallen = fallenPages.at(lifeCycle);
+            return fallen.empty() ? std::nullopt : std::optional<Priority>{fallen.back()->priority};
+        };
+        while (count > 0)
+        {
+            auto const bestLifeCycle = std::max_element(lifeCycles.begin(), lifeCycles.end(),
+                [&](LifeCycleId lhs, LifeCycleId rhs) { return backPriority(lhs) < backPriority(rhs); });
+            TLLM_CHECK_DEBUG(bestLifeCycle != lifeCycles.end() && backPriority(*bestLifeCycle).has_value());
+            Priority const bestPriority = *backPriority(*bestLifeCycle);
+            for (LifeCycleId lifeCycle : lifeCycles)
+            {
+                auto& fallen = fallenPages.at(lifeCycle);
+                auto matchingBegin = std::lower_bound(fallen.begin(), fallen.end(), bestPriority,
+                    [](auto const& page, Priority priority) { return page->priority < priority; });
+                SlotCount const numAccepted
+                    = std::min(count, slotCountValueFromSize(std::distance(matchingBegin, fallen.end())));
+                matchingBegin = fallen.end() - numAccepted;
+                auto& accepted = acceptedPages.at(lifeCycle);
+                accepted.insert(
+                    accepted.end(), std::make_move_iterator(matchingBegin), std::make_move_iterator(fallen.end()));
+                fallen.erase(matchingBegin, fallen.end());
+                count -= numAccepted;
+                if (count == 0)
+                {
+                    break;
+                }
+            }
         }
-        TLLM_CHECK_DEBUG(count == 0);
     };
 
     for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
@@ -1046,6 +1104,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
 
     if (!isLast)
     {
+        sortFallenPagesByPriority(fallenPages);
         _prepareFreeSlots(goals, lvlId + 1, fallenPages, migrationRecorder, dropRecorder);
     }
 
@@ -1302,6 +1361,10 @@ void StorageManager::prefetch(
         for (CacheLevel level = dstLevel + 1; level < numCacheLevels(); ++level)
         {
             auto const& levelPages = lifeCyclePages.at(level);
+            if (levelPages.empty())
+            {
+                continue;
+            }
             auto& group = migrationGroups[{level, getMigrationBatchingLayerGroupId(dstLevel, level, lifeCycle)}];
             group.insert(group.end(), levelPages.begin(), levelPages.end());
         }

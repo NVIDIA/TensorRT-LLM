@@ -261,7 +261,9 @@ UniqPageLock::UniqPageLock(SharedPtr<PageHolder> h)
     : holder(std::move(h))
 {
     if (holder->page->cacheLevel != kHotLevel)
-        throw LogicError("Lock can only be applied to GPU-memory pages");
+    {
+        throw LogicError("Lock can only be applied to hot-tier pages");
+    }
 }
 
 UniqPageLock::~UniqPageLock()

@@ -53,6 +53,13 @@ public:
         TypedVec<PoolIndex, PoolCopyPlan> copyPlans;
     };
 
+    void registerHostMem(HostMem const* memory)
+    {
+        TLLM_CHECK(
+            memory != nullptr && std::find(mHostMemories.begin(), mHostMemories.end(), memory) == mHostMemories.end());
+        mHostMemories.push_back(memory);
+    }
+
     bool configure(PoolGroupDesc const* gpuDescs, PoolGroupIndex numGpuDescs) noexcept override
     {
         try
@@ -182,6 +189,17 @@ private:
         return mGroups.at(groupIndex).get();
     }
 
+    [[nodiscard]] HostMem const* findHostMem(MemAddress address) const noexcept
+    {
+        auto const memory = std::find_if(mHostMemories.begin(), mHostMemories.end(),
+            [address](HostMem const* candidate)
+            {
+                MemAddress const begin = candidate->address();
+                return begin <= address && address - begin < candidate->size();
+            });
+        return memory == mHostMemories.end() ? nullptr : *memory;
+    }
+
     template <bool Encode>
     bool dispatch(GroupConfig const* group, void* dstBasePtr, void const* srcBasePtr, PageIndexPair const* pageIndices,
         size_t numBasePages, cudaStream_t stream) const
@@ -209,17 +227,26 @@ private:
 
         // Work around the interaction of two independent bugs. Linux kernels 6.11 through 6.13 cannot reliably pin
         // more than 2 GiB in one call, so HostMem registers a large allocation as adjacent 2 GiB regions. Separately,
-        // cuMemcpyBatchAsync cannot handle one copy entry that spans two such registrations. Split only at those
-        // registration boundaries, and only on kernels for which HostMem enables chunked registration.
-        bool const splitRegistrationChunks = HostMem::shouldUseChunkedRegistration();
-        auto appendCopy = [&](std::byte* dst, std::byte const* src, size_t coldOffset, size_t numBytes)
+        // cuMemcpyBatchAsync cannot handle one copy entry that spans two such registrations. The cold pointer can be a
+        // subrange of a larger staging allocation, so calculate boundaries relative to its owning HostMem span.
+        auto const* const coldBase
+            = Encode ? static_cast<std::byte const*>(dstBasePtr) : static_cast<std::byte const*>(srcBasePtr);
+        MemAddress const coldBaseAddress = reinterpret_cast<MemAddress>(coldBase);
+        HostMem const* const hostMem = findHostMem(coldBaseAddress);
+        bool const splitRegistrationChunks = hostMem != nullptr && hostMem->size() > HostMem::kChunkSize;
+        size_t const coldBaseOffset = splitRegistrationChunks ? coldBaseAddress - hostMem->address() : 0;
+        auto appendCopy = [&](std::byte* dst, std::byte const* src, size_t pinnedOffset, size_t numBytes)
         {
+            if (splitRegistrationChunks)
+            {
+                TLLM_CHECK(pinnedOffset <= hostMem->size() && numBytes <= hostMem->size() - pinnedOffset);
+            }
             do
             {
                 size_t copyBytes = numBytes;
                 if (splitRegistrationChunks)
                 {
-                    size_t const bytesUntilBoundary = HostMem::kChunkSize - coldOffset % HostMem::kChunkSize;
+                    size_t const bytesUntilBoundary = HostMem::kChunkSize - pinnedOffset % HostMem::kChunkSize;
                     copyBytes = std::min(copyBytes, bytesUntilBoundary);
                 }
                 dsts.push_back(reinterpret_cast<CUdeviceptr>(dst));
@@ -227,7 +254,7 @@ private:
                 sizes.push_back(copyBytes);
                 dst += copyBytes;
                 src += copyBytes;
-                coldOffset += copyBytes;
+                pinnedOffset += copyBytes;
                 numBytes -= copyBytes;
             } while (numBytes != 0);
         };
@@ -248,13 +275,14 @@ private:
                 size_t const coldOffset
                     = static_cast<size_t>(Encode ? pageIndex.dst : pageIndex.src) * group->coldPageBytes
                     + plan.coldPageOffset;
+                size_t const pinnedOffset = coldBaseOffset + coldOffset;
                 if constexpr (Encode)
                 {
-                    appendCopy(coldDstBase + coldOffset, hotBase, coldOffset, plan.hotPageBytes);
+                    appendCopy(coldDstBase + coldOffset, hotBase, pinnedOffset, plan.hotPageBytes);
                 }
                 else
                 {
-                    appendCopy(hotBase, coldSrcBase + coldOffset, coldOffset, plan.hotPageBytes);
+                    appendCopy(hotBase, coldSrcBase + coldOffset, pinnedOffset, plan.hotPageBytes);
                 }
             }
         }
@@ -263,16 +291,41 @@ private:
         attributes.srcAccessOrder = CU_MEMCPY_SRC_ACCESS_ORDER_STREAM;
         attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
         size_t firstCopy = 0;
+#if CUDA_VERSION < 13000
+        size_t failIdx;
+        CUresult const error = cuMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attributes,
+            &firstCopy, 1, &failIdx, reinterpret_cast<CUstream>(stream));
+#else
         CUresult const error = cuMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attributes,
             &firstCopy, 1, reinterpret_cast<CUstream>(stream));
+#endif
         return error == CUDA_SUCCESS;
     }
 
     TypedVec<PoolGroupIndex, std::unique_ptr<GroupConfig>> mGroups;
     TypedVec<LifeCycleId, PoolGroupIndex> mLifeCycleToGroup;
+    std::vector<HostMem const*> mHostMemories;
 };
 
 } // namespace
+
+namespace detail
+{
+
+bool needsHostMemRegistration(IKvCacheColdPageCodec const& codec) noexcept
+{
+    return HostMem::shouldUseChunkedRegistration()
+        && dynamic_cast<ConcatKvCacheColdPageCodec const*>(&codec) != nullptr;
+}
+
+void registerHostMem(IKvCacheColdPageCodec& codec, HostMem const* memory)
+{
+    auto* concatCodec = dynamic_cast<ConcatKvCacheColdPageCodec*>(&codec);
+    TLLM_CHECK(concatCodec != nullptr);
+    concatCodec->registerHostMem(memory);
+}
+
+} // namespace detail
 
 IKvCacheColdPageCodec::IKvCacheColdPageCodec() = default;
 IKvCacheColdPageCodec::~IKvCacheColdPageCodec() = default;

@@ -237,6 +237,11 @@ public:
 
     size_t alignedSize(SlotCount numSlots) const noexcept;
 
+    [[nodiscard]] HostMem const* hostMem() const noexcept
+    {
+        return &mHostMem;
+    }
+
 private:
     HostMem mHostMem;
 };
@@ -350,6 +355,8 @@ class HostPoolGroup : public PoolGroupBase
 {
 public:
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList);
+
+    [[nodiscard]] HostMem const* hostMem(PoolIndex poolIndex) const;
 };
 
 class DiskPoolGroup : public PoolGroupBase

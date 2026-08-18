@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
+#include <exception>
 #include <iterator>
 #include <stdexcept>
 #include <utility>
@@ -100,11 +101,39 @@ StagingBuffer::StagingBuffer(StagingBufferManager& manager, size_t minSize, size
 {
 }
 
-StagingBuffer::~StagingBuffer()
+StagingBuffer::~StagingBuffer() noexcept
 {
     // One completion event protects the entire reserved byte range.
-    CachedCudaEvent finishEvent
-        = mStream.has_value() ? CachedCudaEvent(reinterpret_cast<CudaStream>(*mStream)) : CachedCudaEvent::makeNull();
+    CachedCudaEvent finishEvent = CachedCudaEvent::makeNull();
+    if (mStream.has_value())
+    {
+        auto synchronizeStreamNoThrow = [stream = *mStream]() noexcept
+        {
+            CUresult const result = cuStreamSynchronize(stream);
+            if (result != CUDA_SUCCESS)
+            {
+                char const* errorString = nullptr;
+                cuGetErrorString(result, &errorString);
+                TLLM_LOG_ERROR("Failed to synchronize a staging-buffer stream after event-recording failure: %s",
+                    errorString != nullptr ? errorString : "unknown");
+            }
+        };
+
+        try
+        {
+            finishEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(*mStream));
+        }
+        catch (std::exception const& error)
+        {
+            TLLM_LOG_ERROR("Failed to record a staging-buffer completion event: %s", error.what());
+            synchronizeStreamNoThrow();
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("Failed to record a staging-buffer completion event: unknown error");
+            synchronizeStreamNoThrow();
+        }
+    }
     mManager.retire(mRange, std::move(finishEvent));
 }
 
@@ -151,26 +180,32 @@ StagingBufferManager::StagingBufferManager(size_t size, StagingBufferMemory memo
     mHead = mRanges.begin();
 }
 
-StagingBufferManager::~StagingBufferManager()
+StagingBufferManager::~StagingBufferManager() noexcept
 {
     std::vector<CachedCudaEvent*> readyEvents;
     readyEvents.reserve(mRanges.size());
     for (auto& range : mRanges)
     {
-        TLLM_CHECK_WITH_INFO(range.retired, "Destroying a staging manager with a live buffer");
-        readyEvents.push_back(&range.readyEvent);
+        if (!range.retired)
+        {
+            TLLM_LOG_ERROR("Destroying a staging-buffer manager with a live buffer");
+        }
+        else
+        {
+            readyEvents.push_back(&range.readyEvent);
+        }
     }
     try
     {
         synchronizeAll(readyEvents);
     }
-    catch (CuOOMError const& error)
+    catch (std::exception const& error)
     {
         TLLM_LOG_ERROR("Failed to drain staging-buffer events during destruction: %s", error.what());
     }
-    catch (CuError const& error)
+    catch (...)
     {
-        TLLM_LOG_ERROR("Failed to drain staging-buffer events during destruction: %s", error.what());
+        TLLM_LOG_ERROR("Failed to drain staging-buffer events during destruction: unknown error");
     }
 }
 

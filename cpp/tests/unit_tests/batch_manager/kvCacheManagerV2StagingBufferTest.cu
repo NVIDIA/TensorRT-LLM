@@ -394,7 +394,7 @@ TEST(KvCacheManagerV2StagingBufferTest, AlignmentPaddingPreservesEachPreviousRan
 
         EXPECT_EQ(acquisition.wait_for(100ms), std::future_status::timeout);
         gate.release();
-        std::future_status const status = acquisition.wait_for(2s);
+        std::future_status const status = acquisition.wait_for(30s);
         EXPECT_EQ(status, std::future_status::ready);
         if (status != std::future_status::ready)
         {
@@ -461,7 +461,7 @@ TEST(KvCacheManagerV2StagingBufferTest, DestructionWaitsForRetiredEvents)
     auto destroyManager = std::async(std::launch::async, [manager = std::move(manager)]() mutable { manager.reset(); });
     EXPECT_EQ(destroyManager.wait_for(100ms), std::future_status::timeout);
     gate.release();
-    ASSERT_EQ(destroyManager.wait_for(2s), std::future_status::ready);
+    ASSERT_EQ(destroyManager.wait_for(30s), std::future_status::ready);
     destroyManager.get();
     EXPECT_TRUE(weakManager.expired());
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);

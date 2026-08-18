@@ -296,6 +296,12 @@ TEST(KvCacheManagerV2DefaultColdPageCodecTest, ValidatesHostIndexArgumentsBefore
     EXPECT_FALSE(codec->encode(LifeCycleId{0}, cold.get(), &invalidIndex, 1, stream));
     EXPECT_FALSE(codec->encode(LifeCycleId{0}, cold.get(), &validIndex, 1, nullptr));
     EXPECT_TRUE(codec->encode(LifeCycleId{0}, nullptr, nullptr, 0, nullptr));
+    EXPECT_FALSE(codec->decode(LifeCycleId{0}, nullptr, &validIndex, 1, stream));
+    EXPECT_FALSE(codec->decode(LifeCycleId{0}, cold.get(), nullptr, 1, stream));
+    EXPECT_FALSE(codec->decode(LifeCycleId{2}, cold.get(), &validIndex, 1, stream));
+    EXPECT_FALSE(codec->decode(LifeCycleId{0}, cold.get(), &invalidIndex, 1, stream));
+    EXPECT_FALSE(codec->decode(LifeCycleId{0}, cold.get(), &validIndex, 1, nullptr));
+    EXPECT_TRUE(codec->decode(LifeCycleId{0}, nullptr, nullptr, 0, nullptr));
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 

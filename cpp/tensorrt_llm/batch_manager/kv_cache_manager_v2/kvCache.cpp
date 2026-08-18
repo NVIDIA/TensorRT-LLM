@@ -1721,14 +1721,18 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
 
     bool const commitMinSnapshot = mManager->commitMinSnapshot();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    int const numCommitted = static_cast<int>(mCommittedTokens.size()) + static_cast<int>(tokens.size());
     if (commitMinSnapshot)
     {
-        int const newNumCommitted = static_cast<int>(mCommittedTokens.size()) + static_cast<int>(tokens.size());
-        if (mHistoryLength != static_cast<int>(mCommittedTokens.size()) && mHistoryLength != newNumCommitted)
+        if (mHistoryLength != static_cast<int>(mCommittedTokens.size()) && mHistoryLength != numCommitted)
         {
             throw AssertionError("commit_min_snapshot requires commit() to start or end at history_length");
         }
     }
+
+    // Update history before mutating the committed-token state so an invalid growth leaves commit() retryable.
+    if (mCommitState != CommitState::VIRTUAL_STOP && mHistoryLength < numCommitted)
+        setHistoryLength(numCommitted);
 
     // Append tokens to committed list.
     mCommittedTokens.insert(mCommittedTokens.end(), tokens.begin(), tokens.end());
@@ -1738,12 +1742,6 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
             mCommitState = CommitState::USER_STOP;
         return;
     }
-
-    // Bump history_length to cover newly committed tokens (mirrors Python — done
-    // BEFORE the commit loop so stale-range computation sees the new history).
-    int const numCommitted = static_cast<int>(mCommittedTokens.size());
-    if (mHistoryLength < numCommitted)
-        setHistoryLength(numCommitted);
 
     int const numCommittedBlocksBefore = mNumCommittedBlocks;
     int const newNumFullBlocks = numCommitted / mTokensPerBlock;

@@ -259,6 +259,7 @@ class KVCacheManager:
         init_cuda_once()
         config = deepcopy(config)
         self._init_config = config
+        self._living_kv_caches = set[rawref.ref[_KVCache]]()
         self._life_cycles = LifeCycleRegistry(config)
         storage_config = create_storage_config(config)
         storage = StorageManager(
@@ -275,7 +276,6 @@ class KVCacheManager:
         radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         self._storage = storage
         self._radix_tree = radix_tree
-        self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
         self._avg_sqr_capacity = MovingAverage(decay)

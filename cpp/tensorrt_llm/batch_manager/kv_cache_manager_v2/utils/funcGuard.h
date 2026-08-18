@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <type_traits>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -68,7 +69,7 @@ public:
     }
 
 private:
-    F mFunc;
+    std::decay_t<F> mFunc;
     bool mActive = true;
 };
 
