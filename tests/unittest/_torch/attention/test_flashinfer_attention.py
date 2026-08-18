@@ -115,9 +115,8 @@ class TestFlashInferAttention(unittest.TestCase):
 
         manager = FakeHybridManager()
         manager.get_buffers = mock.Mock(
-            side_effect=lambda layer_idx: torch.empty(4)
-            if layer_idx == 20 else self.fail(
-                "recurrent layer queried for KV buffers"))
+            side_effect=lambda layer_idx: torch.empty(4) if layer_idx == 20 else
+            self.fail("recurrent layer queried for KV buffers"))
         manager.get_batch_cache_indices_flat = mock.Mock(
             return_value=torch.tensor([2], dtype=torch.int32))
 
