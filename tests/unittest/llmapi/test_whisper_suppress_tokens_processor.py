@@ -183,7 +183,8 @@ def test_racing_callers_share_one_published_index(monkeypatch: pytest.MonkeyPatc
     proc = _make(suppress=(3, 5), begin=())
     cache = proc._suppress_idx
     device = torch.zeros(1).device
-    both_missed = threading.Barrier(2, timeout=30)
+    rendezvous_timeout_s = 30
+    both_missed = threading.Barrier(2, timeout=rendezvous_timeout_s)
     real_tensor = torch.tensor
     builds = []
     seen = []
@@ -191,7 +192,7 @@ def test_racing_callers_share_one_published_index(monkeypatch: pytest.MonkeyPatc
     def fill() -> None:
         seen.append(proc._cached_index(cache, proc.suppress_token_ids, device))
 
-    threads = [threading.Thread(target=fill) for _ in range(2)]
+    threads = [threading.Thread(target=fill, daemon=True) for _ in range(2)]
     racers = set(threads)
 
     def rendezvous_tensor(*args: Any, **kwargs: Any) -> torch.Tensor:
@@ -209,7 +210,10 @@ def test_racing_callers_share_one_published_index(monkeypatch: pytest.MonkeyPatc
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        # Outlasts the barrier, so only a publication path that blocks after the
+        # rendezvous trips this - as a named failure rather than a hung stage.
+        t.join(timeout=2 * rendezvous_timeout_s)
+    assert not any(t.is_alive() for t in threads)
 
     # Both raced into the factory, so this really is the contended path...
     assert len(builds) == 2
