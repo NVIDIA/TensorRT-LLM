@@ -96,7 +96,9 @@ struct RankLE
     CUdeviceptr backingPtr = 0;                 //!< Device pointer for the memory bound to the LE.
     size_t allocSize = 0;                       //!< Size in bytes of the LE-backed allocation.
     bool ownsMemory = true;                     //!< False when bound to external workspace memory.
-    bool valid = false;                         //!< True after the LE has been created and bound.
+    bool leCreated = false;                     //!< True once the LE exists and must be destroyed.
+    bool memBound = false;                      //!< True once memory is bound and must be unbound.
+    bool valid = false;                         //!< True once the LE reports ready.
 };
 
 struct LeIdBlock
@@ -214,6 +216,7 @@ public:
         leProp.flags = CU_LOGICAL_ENDPOINT_FLAG_COUNTED_OPS;
 
         CU_MUST(pfnCreate_(localLe_.leId, &leProp));
+        localLe_.leCreated = true;
 
         // Wait for the local LE before binding memory to it.
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -236,6 +239,7 @@ public:
         }
 
         CU_MUST(pfnBindMem_(localLe_.leId, cuDevice, 0, localLe_.memHandle, 0, localLe_.allocSize, 0));
+        localLe_.memBound = true;
 
         return true;
     }
@@ -300,6 +304,7 @@ public:
         leProp.flags = CU_LOGICAL_ENDPOINT_FLAG_COUNTED_OPS;
 
         CU_MUST(pfnCreate_(localLe_.leId, &leProp));
+        localLe_.leCreated = true;
 
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         while (std::chrono::steady_clock::now() < deadline)
@@ -321,6 +326,7 @@ public:
         }
 
         CU_MUST(pfnBindMem_(localLe_.leId, cuDevice, 0, externalHandle, 0, localLe_.allocSize, 0));
+        localLe_.memBound = true;
 
         return true;
     }
@@ -418,21 +424,25 @@ public:
 
     void destroy()
     {
-        if (!localLe_.valid)
-            return;
-
         // Imported peer LEs reuse the reserved contiguous ID block.
-        for (int r = 0; r < epSize_; r++)
+        for (size_t r = 0; r < peerLeIds_.size(); r++)
         {
-            if (r != epRank_ && peerLeIds_[r] != 0)
+            if (static_cast<int>(r) != epRank_ && peerLeIds_[r] != 0)
             {
                 pfnDestroy_(peerLeIds_[r]);
             }
         }
+        peerLeIds_.clear();
 
         // Destroy local LE
-        pfnUnbind_(localLe_.leId, cuDevice_, 0, localLe_.allocSize);
-        pfnDestroy_(localLe_.leId);
+        if (localLe_.memBound)
+        {
+            pfnUnbind_(localLe_.leId, cuDevice_, 0, localLe_.allocSize);
+        }
+        if (localLe_.leCreated)
+        {
+            pfnDestroy_(localLe_.leId);
+        }
         if (leIdBlock_.reserved)
         {
             pfnIdRelease_(leIdBlock_.base, leIdBlock_.count);
@@ -451,7 +461,7 @@ public:
                 cuMemRelease(localLe_.memHandle);
         }
 
-        localLe_.valid = false;
+        localLe_ = RankLE{};
         initialized_ = false;
     }
 
