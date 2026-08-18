@@ -22,12 +22,12 @@ import os
 from typing import List, Optional, Tuple
 
 import torch
-from fla.modules import FusedRMSNormGated, ShortConvolution
 from torch import nn
 
 from ...attention_backend import AttentionMetadata
 from ...distributed import AllReduce, AllReduceStrategy
 from ...modules.multi_stream_utils import maybe_execute_in_parallel
+from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
 from ._kda_kernels import KDAKernelDispatch
 
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
@@ -58,18 +58,35 @@ def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
     module._apply(_cast)
 
 
-class _MetaSafeFusedRMSNormGated(FusedRMSNormGated):
-    """FLA gated RMSNorm whose initialization supports ``MetaInitMode``.
+class _KDAShortConvolution(nn.Module):
+    """Own KDA convolution weights without importing the FLA fallback."""
 
-    ``FusedRMSNormGated.reset_parameters`` uses ``nn.init.ones_`` (a plain
-    ``fill_``), which ``MetaInitMode`` rejects. ``uniform_(1, 1)`` produces
-    the same values and is on the allowed random-initialization path.
-    """
+    def __init__(self, hidden_size: int, kernel_size: int, activation: str) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.kernel_size = kernel_size
+        self.activation = activation
+        self.weight = nn.Parameter(torch.empty(hidden_size, 1, kernel_size))
+        nn.init.xavier_uniform_(self.weight)
+        self._fallback_convolution: Optional[nn.Module] = None
 
-    def reset_parameters(self) -> None:
-        if self.elementwise_affine:
-            with torch.no_grad():
-                self.weight.uniform_(1.0, 1.0)
+    def forward(
+        self, x: torch.Tensor, **kwargs: torch.Tensor | bool | None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Lazily construct the portable FLA operator with the owned weight."""
+        convolution = self._fallback_convolution
+        if convolution is None:
+            from fla.modules import ShortConvolution
+
+            convolution = ShortConvolution(
+                hidden_size=self.hidden_size,
+                kernel_size=self.kernel_size,
+                activation=self.activation,
+            )
+            # Keep the adapter out of state_dict; this module owns the checkpoint weight.
+            object.__setattr__(self, "_fallback_convolution", convolution)
+        convolution.weight = self.weight
+        return convolution(x, **kwargs)
 
 
 def _kda_split_conv_sections(
@@ -133,13 +150,13 @@ class KimiKDALinearAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-        self.q_conv1d = ShortConvolution(
+        self.q_conv1d = _KDAShortConvolution(
             hidden_size=projection_size, kernel_size=self.conv_size, activation="silu"
         )
-        self.k_conv1d = ShortConvolution(
+        self.k_conv1d = _KDAShortConvolution(
             hidden_size=projection_size, kernel_size=self.conv_size, activation="silu"
         )
-        self.v_conv1d = ShortConvolution(
+        self.v_conv1d = _KDAShortConvolution(
             hidden_size=projection_size, kernel_size=self.conv_size, activation="silu"
         )
 
@@ -169,9 +186,9 @@ class KimiKDALinearAttention(nn.Module):
         else:
             self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
             self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
-        self.o_norm = _MetaSafeFusedRMSNormGated(
-            self.head_dim, eps=self.rms_norm_eps, activation="sigmoid"
-        )
+        self.o_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+        if not self.o_norm.weight.is_meta:
+            nn.init.ones_(self.o_norm.weight)
         self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
         # Installed together by the FP8 weight loader as the fused
         # [q | k | v | g] projection and its output-section metadata.
@@ -1175,15 +1192,18 @@ class KimiKDALinearAttention(nn.Module):
     def _output_gate_and_proj(
         self, x: torch.Tensor, o: torch.Tensor, onorm_g: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        from einops import rearrange
-
         if onorm_g is not None:
             g_out = onorm_g
         elif self.use_full_rank_gate:
             g_out = self.g_proj(x)
         else:
             g_out = self.g_b_proj(self.g_a_proj(x))
-        g_out = rearrange(g_out, "... (h d) -> ... h d", d=self.head_dim)
-        o = self.o_norm(o, g_out)
-        o = rearrange(o, "b t h d -> (b t) (h d)")
-        return self.o_proj(o)
+        g_out = g_out.reshape(-1, self.num_heads, self.head_dim)
+        o = rms_norm_gated_token_major(
+            o.reshape(-1, self.head_dim),
+            g_out,
+            self.o_norm.weight,
+            self.o_norm.eps,
+            gate_activation="sigmoid",
+        )
+        return self.o_proj(o.reshape(-1, self.proj_size))
