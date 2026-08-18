@@ -2483,7 +2483,9 @@ class PyTorchModelEngine(ModelEngine):
             label = "greedy"
             if self.cuda_graph_lora_manager is not None:
                 label += ", LoRA" if use_lora_graph else ", base-only"
-            _run_capture_pass(False, label, use_lora_graph)
+            _run_capture_pass(force_non_greedy=False,
+                              label=label,
+                              force_lora_graph=use_lora_graph)
         # Pass 2: advanced sampling variant. Required because on-the-fly capture
         # is disabled outside warmup, so any inference batch that contains a
         # non-greedy request would otherwise fall back to eager. Only meaningful
@@ -2498,7 +2500,9 @@ class PyTorchModelEngine(ModelEngine):
                 label = "advanced sampling"
                 if self.cuda_graph_lora_manager is not None:
                     label += ", LoRA" if use_lora_graph else ", base-only"
-                _run_capture_pass(True, label, use_lora_graph)
+                _run_capture_pass(force_non_greedy=True,
+                                  label=label,
+                                  force_lora_graph=use_lora_graph)
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
         # The advanced-sampling capture pass above leaves is_all_greedy_sample
