@@ -25,7 +25,7 @@ class _FakePool:
     def shutdown(self):
         self.shut = True
 
-    def release_exit_joins(self):
+    def release_exit_joins(self) -> None:
         self.exit_joins_released = True
 
     def shutdown_abort(self, *args, **kwargs):
