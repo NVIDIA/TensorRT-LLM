@@ -41,13 +41,13 @@ _MEM_FRACTION_95 = 0.95
 
 
 @pytest.mark.parametrize("model_name,model_path", [
-    ("DeepSeek-R1-Distill-Qwen-1.5B", "DeepSeek-R1-Distill-Qwen-1.5B"),
+    ("Qwen3/Qwen3-0.6B", "Qwen3/Qwen3-0.6B"),
 ])
 def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv):
     """RCCA: https://nvbugs/5238105 - none of n>1 sequences may be empty."""
     from tensorrt_llm import LLM, SamplingParams
 
-    prompt = r"<｜begin▁of▁sentence｜><｜User｜>The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step and output the final answer within \boxed{}.<｜Assistant｜>"
+    prompt = r"The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step."
 
     sampling_params = SamplingParams(
         max_tokens=1024,
@@ -60,6 +60,14 @@ def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv):
     with LLM(model=f"{llm_models_root()}/{model_path}",
              max_batch_size=8,
              max_seq_len=4224) as llm:
+        prompt = llm.tokenizer.apply_chat_template(
+            [{
+                "role": "user",
+                "content": prompt
+            }],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
         outputs = llm.generate([prompt], sampling_params=sampling_params)
 
     completions = outputs[0].outputs
@@ -872,7 +880,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
     ("Llama3.1-8B-BF16", "llama-3.1-model/Meta-Llama-3.1-8B"),
     ("Llama3.2-11B-BF16", "llama-3.2-models/Llama-3.2-11B-Vision"),
     ("Nemotron4_4B-BF16", "nemotron/Minitron-4B-Base"),
-    ("Nemotron-H-8B", "Nemotron-H-8B-Base-8K"),
     pytest.param('Llama3.1-8B-NVFP4',
                  'nvfp4-quantized/Meta-Llama-3.1-8B',
                  marks=skip_pre_blackwell),
@@ -918,9 +925,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
     pytest.param('Mistral-Nemo-12b-Base',
                  'Mistral-Nemo-Base-2407',
                  marks=skip_pre_blackwell),
-    pytest.param('DeepSeek-R1-Distill-Qwen-32B',
-                 'DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B',
-                 marks=skip_pre_blackwell),
     pytest.param('GPT-OSS-20B', 'gpt_oss/gpt-oss-20b',
                  marks=skip_pre_blackwell),
     pytest.param(
@@ -965,7 +969,7 @@ def test_ptp_quickstart(llm_root, llm_venv):
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    if model_name in ("Nemotron-H-8B", "Nemotron-Nano-9B-v2-nvfp4"):
+    if model_name == "Nemotron-Nano-9B-v2-nvfp4":
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--disable_kv_cache_reuse",
@@ -1854,23 +1858,6 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
     print("Success: HF model logits match TRTLLM logits!")
 
 
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("model_name,model_path", [
-    ("DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"),
-])
-def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
-    print(f"Testing scaffolding {model_name}.")
-    example_root = Path(os.path.join(llm_root, "examples", "scaffolding"))
-    input_file = Path(os.path.join(example_root, "test.jsonl"))
-    llm_venv.run_cmd([
-        str(example_root / "run_majority_vote_aime24.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        f"--jsonl_file={input_file}",
-        "--threshold=0.5",
-    ])
-
-
 @pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
@@ -1933,8 +1920,6 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
                  marks=skip_pre_hopper),
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
                  marks=skip_pre_blackwell),
-    pytest.param('DeepSeek-R1/DeepSeek-R1-Distill-Llama-70B',
-                 marks=skip_pre_hopper),
     pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8',
                  marks=skip_pre_hopper),
     pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct',

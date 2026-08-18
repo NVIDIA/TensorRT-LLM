@@ -65,6 +65,28 @@ SeedOrTensor = Union[int, torch.Tensor]
 
 
 @_compiler_disable
+def radix_topk_op(
+    values: torch.Tensor,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sorted top-k via flashinfer's radix-select kernel.
+
+    Drop-in for ``torch.topk(values, k, dim=-1, sorted=True)`` on 2D inputs:
+    returns ``(values, indices)`` with values descending and int64 indices;
+    like torch.topk, the index order among equal values is unspecified.
+    O(n) radix select — much faster than torch.topk on large rows, but with a
+    fixed per-call cost that torch.topk undercuts on small rows (see
+    ``beam_search._beam_topk`` for the size-dispatching entry point).
+
+    ``deterministic=True``: the default collect pass races, which makes the
+    order among equal values vary run to run. This op sits on the default beam
+    path, where reproducible tie order matters for triage.
+    """
+    topk_values, topk_indices = flashinfer.top_k(values, k, sorted=True, deterministic=True)
+    return topk_values, topk_indices
+
+
+@_compiler_disable
 def top_k_top_p_sampling_from_logits_op(
     logits: torch.Tensor,
     top_k: torch.Tensor,
