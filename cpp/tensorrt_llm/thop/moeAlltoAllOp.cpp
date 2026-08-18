@@ -278,6 +278,11 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     if (g_cft_manager && g_cft_manager->isInitialized())
         return;
 
+    auto const& cftComm = tensorrt_llm::mpi::MpiComm::world();
+    TORCH_CHECK(static_cast<int64_t>(cftComm.getSize()) == epSize,
+        "CFT endpoint exchange requires the communicator size (", cftComm.getSize(), ") to equal epSize (", epSize,
+        "). MoE all-to-all with CFT counted writes must run as pure EP.");
+
     CHECK_TH_CUDA(workspace);
     CUdeviceptr workspaceRankPtr
         = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
