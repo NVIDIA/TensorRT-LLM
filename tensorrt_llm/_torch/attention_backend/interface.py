@@ -43,6 +43,13 @@ except ImportError:
         ALLOWED_LAYER_TYPES as ALLOWED_ATTENTION_LAYER_TYPES
 
 
+def _default_mamba_metadata_cls() -> Type[Any]:
+    """Import lazily to avoid an interface/Mamba metadata import cycle."""
+    from ..modules.mamba.mamba2_metadata import Mamba2Metadata
+
+    return Mamba2Metadata
+
+
 @dataclass
 class AttentionRuntimeFeatures:
     chunked_prefill: bool = False
@@ -173,6 +180,8 @@ class AttentionMetadata:
 
     mamba_metadata: Optional[Any] = None
     mamba_chunk_size: int = 128
+    mamba_metadata_cls: Type[Any] = field(
+        default_factory=_default_mamba_metadata_cls, init=False, repr=False)
 
     # The number of tokens in the padded sequence.
     padded_num_tokens: Optional[int] = None
@@ -347,9 +356,9 @@ class AttentionMetadata:
 
         if self.mamba_metadata is None:
             if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
-                from ..modules.mamba.mamba2_metadata import Mamba2Metadata
-                self.mamba_metadata = Mamba2Metadata(self.max_num_requests,
-                                                     self.mamba_chunk_size)
+                metadata_cls = self.mamba_metadata_cls
+                self.mamba_metadata = metadata_cls(self.max_num_requests,
+                                                   self.mamba_chunk_size)
             else:
                 self.mamba_metadata = False
                 return

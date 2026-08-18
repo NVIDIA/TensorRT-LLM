@@ -54,6 +54,44 @@ class _K3Cfg:
     }
 
 
+def test_forward_preserves_native_int32_state_indices(monkeypatch):
+    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0)
+    state_indices = torch.tensor([3, 1], dtype=torch.int32)
+    captured = {}
+
+    def forward_decode(hidden_states, conv_pool, ssm_pool, slot_indices, *args, **kwargs):
+        captured["slot_indices"] = slot_indices
+        captured["ssm_state_indices"] = kwargs["ssm_state_indices"]
+        return torch.zeros_like(hidden_states)
+
+    monkeypatch.setattr(attention, "forward_decode", forward_decode)
+    layer_cache = SimpleNamespace(
+        conv=torch.empty(4, 3 * attention.proj_size, attention.conv_size),
+        temporal=torch.empty(
+            4,
+            attention.num_heads,
+            attention.head_dim,
+            attention.head_k_dim,
+        ),
+    )
+    metadata = SimpleNamespace(
+        mamba_metadata=SimpleNamespace(
+            state_indices=state_indices,
+            query_start_loc_long=torch.zeros(1, dtype=torch.long),
+        ),
+        num_contexts=0,
+        num_ctx_tokens=0,
+        seq_lens=torch.tensor([1, 1]),
+        kv_cache_manager=SimpleNamespace(mamba_layer_cache=lambda _: layer_cache),
+    )
+
+    output = attention(torch.empty(2, _Cfg.hidden_size), metadata)
+
+    assert output.shape == (2, _Cfg.hidden_size)
+    assert captured["slot_indices"].data_ptr() == state_indices.data_ptr()
+    assert captured["ssm_state_indices"].data_ptr() == state_indices.data_ptr()
+
+
 class _LayerCache:
     def __init__(self, slots, dim3, w, h, v, k, t_max, device):
         self.conv = torch.zeros(slots, dim3, w, dtype=torch.bfloat16, device=device)
@@ -70,7 +108,6 @@ def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -
     batch = slot_indices.shape[0]
     mamba_metadata = SimpleNamespace(
         state_indices=slot_indices.to(torch.int32),
-        state_indices_long=slot_indices,
         query_start_loc_long=torch.zeros(1, device=slot_indices.device, dtype=torch.long),
         _arange_buffer=torch.arange(batch + 1, device=slot_indices.device, dtype=torch.int32),
     )
@@ -90,8 +127,9 @@ def _prefill_metadata(
     batch = slot_indices.shape[0]
     mamba_metadata = SimpleNamespace(
         state_indices=slot_indices.to(torch.int32),
-        state_indices_long=slot_indices,
+        query_start_loc=cu_seqlens.to(torch.int32),
         query_start_loc_long=cu_seqlens,
+        has_initial_states=torch.zeros(batch, dtype=torch.bool, device=slot_indices.device),
         use_initial_states=False,
     )
     cache_manager = SimpleNamespace(mamba_layer_cache=lambda _: layer_cache)
