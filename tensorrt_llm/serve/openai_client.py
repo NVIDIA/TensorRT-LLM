@@ -120,6 +120,13 @@ class OpenAIClient(ABC):
 
     async def shutdown(self) -> None: ...
 
+    async def get_data_transceiver_state(self, server: str) -> Optional[str]:
+        """Return the base64 DataTransceiverState of ``server``.
+        """
+
+    def forget_data_transceiver_state(self, server: str) -> None:
+        """Drop any memoized state for ``server`` so the next read fetches it again."""
+
     @abstractmethod
     async def _finish_request(
         self,
@@ -164,6 +171,7 @@ class OpenAIHttpClient(OpenAIClient):
         )
         self._max_retries = max_retries
         self._retry_interval_sec = retry_interval_sec
+        self._data_transceiver_states: dict[str, Optional[str]] = {}
         self._disagg_id_generator = disagg_id_generator
         self._request_perf_metrics = request_perf_metrics
         self._internal_disagg_auth_key = internal_disagg_auth_key
@@ -476,6 +484,33 @@ class OpenAIHttpClient(OpenAIClient):
         if ready_servers:
             await self._router.prepare_servers(ready_servers)
         return ready_servers, unready_servers
+
+    async def get_data_transceiver_state(self, server: str) -> Optional[str]:
+        if server in self._data_transceiver_states:
+            return self._data_transceiver_states[server]
+
+        url = (
+            f"{server}/v1/data_transceiver_state"
+            if server.startswith("http://")
+            else f"http://{server}/v1/data_transceiver_state"
+        )
+        state = None
+        try:
+            async with self._session.get(url) as response:
+                if response.status == 200:
+                    state = (await response.json()).get("data_transceiver_state")
+                else:
+                    logger.warning(
+                        f"{server} returned {response.status} for data_transceiver_state"
+                    )
+        except Exception as e:
+            logger.warning(f"Cannot read data_transceiver_state from {server}: {e}")
+
+        self._data_transceiver_states[server] = state
+        return state
+
+    def forget_data_transceiver_state(self, server: str) -> None:
+        self._data_transceiver_states.pop(server, None)
 
     @staticmethod
     async def check_ready_for_servers(

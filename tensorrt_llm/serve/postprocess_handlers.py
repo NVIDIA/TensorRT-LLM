@@ -97,6 +97,7 @@ class ChatPostprocArgs(PostprocArgs):
                                 ChatCompletionNamedToolChoiceParam]] = None
     return_logprobs: bool = False
     top_logprobs: bool = False
+    return_gen_token_ids: bool = False
     stream_options: Optional[StreamOptions] = None
     last_message_content: Optional[str] = None
     reasoning_parser: Optional[str] = None
@@ -142,6 +143,9 @@ class ChatPostprocArgs(PostprocArgs):
             chat_template_kwargs=request.chat_template_kwargs,
             ctx_usage=None if request.disaggregated_params is None else
             request.disaggregated_params.ctx_usage,
+            return_gen_token_ids=False
+            if request.disaggregated_params is None else
+            request.disaggregated_params.return_gen_token_ids,
         )
 
 
@@ -504,6 +508,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                 None),
             stop_reason=output.stop_reason,
         )
+        if args.return_gen_token_ids:
+            choice.token_ids = output.token_ids_diff
         if args.return_logprobs:
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
@@ -674,6 +680,8 @@ def chat_response_post_processor(
         else:
             choice.finish_reason = output.finish_reason
 
+        if args.return_gen_token_ids:
+            choice.token_ids = list(output.token_ids)
         if args.return_logprobs:
             choice.logprobs = create_logprobs(output.token_ids, args.tokenizer,
                                               output.logprobs,
