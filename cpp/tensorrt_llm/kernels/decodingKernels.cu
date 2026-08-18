@@ -329,7 +329,7 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
     // update bh.numBeamsCBA
 
     size_t const bid = blockIdx.x;       // Index of Batch
-    int const tid = threadIdx.x;         // Index of Beam
+    int const tid = threadIdx.x;         // Index of Thread
     int const nBM{static_cast<int>(bh.nBeamWidth)};
     size_t const nMBS{bh.nMaxBatchSize}; // Only for bh.logProbsTiled
     size_t const nMSL{bh.nMaxSeqLen};
@@ -395,8 +395,9 @@ __global__ void insertUnfinishedPathKernel(BeamHypotheses bh)
 
 void invokeInsertUnfinishedPath(BeamHypotheses& bh, cudaStream_t stream)
 {
+    constexpr int kThreadsPerBlock{128};
     // Beam reconstruction is serial within a beam, but beams are independent.
-    insertUnfinishedPathKernel<<<bh.nBatchSize, 128, 0, stream>>>(bh);
+    insertUnfinishedPathKernel<<<bh.nBatchSize, kThreadsPerBlock, 0, stream>>>(bh);
 }
 
 __global__ void finalizeKernel(BeamHypotheses bh)
