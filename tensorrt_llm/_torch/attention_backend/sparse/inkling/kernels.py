@@ -192,6 +192,7 @@ def _inkling_decode_kernel(
     rel_extent: tl.constexpr,
     HAS_REL: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
+    PAGE_DIV: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     Lk: tl.constexpr,
@@ -232,6 +233,16 @@ def _inkling_decode_kernel(
         page_id = tl.load(
             page_table + cur_batch * stride_ptb + page_local, mask=mask_n, other=0
         ).to(tl.int64)
+        if PAGE_DIV > 1:
+            # ``page_table`` is the base metadata's ``kv_cache_block_offsets``
+            # K plane, whose entries the C++ copy encodes as
+            # ``base_page_index * index_scale`` (kvCacheManagerV2Utils.cu). The
+            # K/V views handed in here are ``kv[:, 0]`` / ``kv[:, 1]`` of a
+            # ``[blocks, kv_factor, ...]`` buffer, so their first axis counts
+            # *blocks* rather than pages -- hence one integer division by
+            # ``kv_factor`` per KV tile. ``PAGE_DIV`` is a constexpr power of
+            # two, so this lowers to a shift.
+            page_id = page_id // PAGE_DIV
 
         k_ptrs = (
             page_id[:, None] * stride_kp
@@ -388,6 +399,7 @@ def inkling_decode_attention(
     rel_extent: int = 0,
     window_left: int = -1,
     out: Optional[torch.Tensor] = None,
+    page_div: int = 1,
 ) -> torch.Tensor:
     """Generation-phase attention: one query per request over paged KV.
 
@@ -396,7 +408,11 @@ def inkling_decode_attention(
         k_cache, v_cache: ``[num_pages, num_kv_heads, page_size, head_dim]`` HND
             views (K/V selected from the ``[num_pages, 2, ...]`` pool).
         seq_lens: ``[batch]`` int32 GPU total-KV length per request.
-        page_table: ``[batch, max_pages]`` int32 GPU physical page ids.
+        page_table: ``[batch, max_pages]`` int32 GPU page ids, indexed by
+            absolute block ordinal (``k_pos // page_size``). Entries are divided
+            by ``page_div`` before use, which lets the base metadata's
+            ``kv_cache_block_offsets`` be passed straight through instead of
+            staging a private table -- see ``page_div``.
         page_size: tokens per page.
         sm_scale: softmax scale (``1 / head_dim``).
         rel_logits: ``[batch, num_heads, rel_extent]`` fp32 aux bias, or None.
@@ -404,9 +420,16 @@ def inkling_decode_attention(
         window_left: sliding-window radius (inclusive), -1 to disable.
         out: optional pre-allocated ``[batch, num_heads, head_dim]`` output (for
             CUDA-graph static buffers).
+        page_div: divisor applied to every ``page_table`` entry. 1 when the
+            table already holds indices into the ``[blocks, ...]`` K/V views;
+            ``kv_factor`` when it holds the C++-encoded
+            ``base_page_index * index_scale`` of ``kv_cache_block_offsets``,
+            whose unit is pages and therefore counts K and V separately. Must be
+            a power of two so the division lowers to a shift.
 
     Returns ``[batch, num_heads, head_dim]`` in q's dtype.
     """
+    assert page_div >= 1 and (page_div & (page_div - 1)) == 0, page_div
     q = q.contiguous()  # kernel indexes head_dim as the stride-1 axis
     batch, num_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
@@ -454,6 +477,7 @@ def inkling_decode_attention(
         rel_extent=rel_extent if has_rel else 1,
         HAS_REL=has_rel,
         WINDOW_LEFT=window_left,
+        PAGE_DIV=page_div,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_N=BLOCK_N,
         Lk=head_dim,

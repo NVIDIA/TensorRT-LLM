@@ -226,22 +226,31 @@ class InklingTritonAttention(TrtllmAttention):
     ):
         device = q.device
         # --- Runtime CUDA-graph-safe path. ---------------------------------
-        # ``InklingAttentionMetadata.prepare()`` published this batch's decode
-        # metadata into stable GPU buffers, so the captured forward does zero
-        # host->device copy: it reads ``ink_seq_lens`` / ``ink_page_table`` and
-        # persists the new K/V with an in-graph scatter whose (page, offset)
-        # indices are derived on-GPU. Padding rows carry their own dummy request
-        # slots, so the scatter never corrupts a real request's page.
+        # ``InklingAttentionMetadata.prepare()`` validated that this batch's
+        # decode inputs are live in stable GPU buffers, so the captured forward
+        # does zero host->device copy: it slices the base metadata's
+        # ``kv_lens_cuda`` and ``kv_cache_block_offsets`` and persists the new
+        # K/V with an in-graph scatter whose (page, offset) indices are derived
+        # on-GPU. Padding rows carry their own dummy request slots, so the
+        # scatter never corrupts a real request's page.
         num_req = q.shape[0]
         if getattr(attn_metadata, "ink_num_gen", 0) == num_req:
-            # Total-KV lengths come from the base metadata's ``kv_lens_cuda``;
-            # the page table is shared by every layer of the same KV geometry.
+            # Both come from the base metadata. The page table's leading axis is
+            # per-pool, so every layer of the same KV geometry gets the same
+            # rows for free.
             sl = attn_metadata.ink_gen_seq_lens(num_req)
             pt = attn_metadata.ink_gen_page_table(cache_layer)[:num_req]
+            page_div = attn_metadata.ink_page_div
             pos = (sl - 1).long()  # write slot = total_kv_len - 1 = num_cached
             page_row = torch.div(pos, page_size, rounding_mode="floor")
             offs = pos - page_row * page_size
+            # ``pt`` entries count pages (K and V separately); ``k_cache`` /
+            # ``v_cache`` are the two planes of a [blocks, kv_factor, ...] buffer
+            # and count blocks. Divide after the gather -- [num_req] elements
+            # rather than [num_req, max_blocks].
             pages = pt.gather(1, page_row.unsqueeze(1)).squeeze(1).long()
+            if page_div > 1:
+                pages = torch.div(pages, page_div, rounding_mode="floor")
             # Paired advanced indices select one (page, slot) per request ->
             # [num_req, num_kv_heads, head_dim], matching the new k/v.
             k_cache[pages, :, offs, :] = k.to(k_cache.dtype)
@@ -257,6 +266,7 @@ class InklingTritonAttention(TrtllmAttention):
                 rel_logits,
                 self.rel_extent,
                 self.window_left,
+                page_div=page_div,
             )
         # Eager fallback (never captured): the decode metadata was not published,
         # so build it here from the host block table, like the context path. This
@@ -290,6 +300,10 @@ class InklingTritonAttention(TrtllmAttention):
         decode_seq_lens = torch.tensor(total, dtype=torch.int32, device=device)
         max_pages = max(len(b) for b in block_ids)
         decode_page_table = build_page_table(block_ids, max_pages, device)
+        # No ``page_div`` here (it defaults to 1): unlike the graph path's
+        # ``kv_cache_block_offsets`` slice, ``get_batch_cache_indices`` already
+        # divides by ``kv_factor`` itself (see
+        # ``_get_batch_cache_indices_by_pool_id``), so these are block indices.
         return inkling_decode_attention(
             q,
             k_cache,

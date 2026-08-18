@@ -427,44 +427,64 @@ def test_checkpoint_tensor_shapes_match_geometry(ckpt_config):
 # ---------------------------------------------------------------------------
 # InklingAttentionMetadata: the per-step decode publish
 # ---------------------------------------------------------------------------
-class _FakeKvManager:
-    """Minimal stand-in for KVCacheManagerV2's per-layer block-table API.
+#: Pages per logical slot, i.e. ``num_pool_layers * kv_factor``. Arbitrary here;
+#: what matters is that it is > 1 and even, so a test that forgot to apply
+#: ``ink_page_div`` produces a visibly wrong page id rather than an off-by-a-bit.
+_FAKE_INDEX_SCALE = 6
 
-    Deliberately does *not* expose ``layer_offsets`` /
-    ``layer_to_pool_mapping_dict`` / ``get_layer_page_index_scale``, so
-    ``_ink_page_group`` takes its per-layer fallback. See
-    :class:`_FakePooledKvManager` for the deduplicating path.
+
+class _FakeKvManager:
+    """Stand-in for the parts of KVCacheManagerV2 the decode metadata reads.
+
+    Much smaller than the version this replaced, which had to fake
+    ``get_batch_cache_indices`` because the metadata staged its own page table.
+    The table is now a slice of the base ``kv_cache_block_offsets``, so all that
+    is left to fake is the *static* layer -> row mapping and the encoding
+    constants. ``calls`` stays so a test can assert the per-step path asks the
+    manager for nothing at all.
     """
 
-    def __init__(self, pp_layers, blocks_by_layer, max_blocks_per_seq=4):
-        self.pp_layers = pp_layers
-        self.max_blocks_per_seq = max_blocks_per_seq
-        self._blocks = blocks_by_layer
+    kv_factor = 2
+    enable_swa_scratch_reuse = False
+
+    def __init__(self, pp_layers=(0, 1), layer_pools=None, index_scale=_FAKE_INDEX_SCALE):
+        self.pp_layers = list(pp_layers)
+        self.layer_offsets = {layer: i for i, layer in enumerate(self.pp_layers)}
+        # Default: every layer its own pool, so a test that means to exercise
+        # sharing has to say so.
+        pools = layer_pools or {layer: i for i, layer in enumerate(self.pp_layers)}
+        self.layer_to_pool_mapping_dict = {
+            self.layer_offsets[layer]: pool for layer, pool in pools.items()
+        }
+        self.num_pools = len(set(self.layer_to_pool_mapping_dict.values()))
+        self._index_scale = index_scale
+        self.index_scales = [index_scale] * self.num_pools
         self.calls = []
 
-    def get_batch_cache_indices(self, request_ids, layer_idx):
-        # One row per request id, like the real manager.
-        self.calls.append((tuple(request_ids), layer_idx))
-        return self._blocks[layer_idx][: len(request_ids)]
-
-
-class _FakePooledKvManager(_FakeKvManager):
-    """Adds the ``(pool_id, index_scale)`` mapping the real V2 manager exposes.
-
-    ``layer_pools`` maps each layer to its pool id; layers sharing a pool share
-    a page table, which is what Inkling's two KV geometries reduce to.
-    """
-
-    def __init__(self, pp_layers, blocks_by_layer, layer_pools, max_blocks_per_seq=4):
-        super().__init__(pp_layers, blocks_by_layer, max_blocks_per_seq)
-        self._layer_pools = layer_pools
-        self.layer_offsets = {layer: i for i, layer in enumerate(pp_layers)}
-        self.layer_to_pool_mapping_dict = {
-            self.layer_offsets[layer]: pool for layer, pool in layer_pools.items()
-        }
-
     def get_layer_page_index_scale(self, layer_idx):
-        return 1
+        self.calls.append(("scale", layer_idx))
+        return self._index_scale
+
+
+def _fake_block_offsets(num_pools, num_seqs, max_blocks, index_scale=_FAKE_INDEX_SCALE):
+    """What ``copyBatchBlockOffsetsToDeviceKernel`` would have written.
+
+    Plane 0 holds ``index_scale * base_page_index``, plane 1 the same plus
+    ``kv_offset``; ``BAD_PAGE_INDEX`` entries are already 0 rather than negative
+    (kvCacheManagerV2Utils.cu:224-227). Base pages are salted by pool and by
+    sequence so reading the wrong row or the wrong plane is visible, and row
+    ``seq`` owns ``seq + 1`` blocks so the padded tail is exercised.
+    """
+    import torch
+
+    offs = torch.zeros((num_pools, num_seqs, 2, max_blocks), dtype=torch.int32)
+    for pool in range(num_pools):
+        for seq in range(num_seqs):
+            n = min(seq + 1, max_blocks)
+            base = torch.arange(1, n + 1, dtype=torch.int32) + 10 * pool + 100 * seq
+            offs[pool, seq, 0, :n] = base * index_scale
+            offs[pool, seq, 1, :n] = base * index_scale + 1
+    return offs
 
 
 def _ink_metadata(
@@ -474,6 +494,9 @@ def _ink_metadata(
     pp_layers=(0, 1),
     max_blocks_per_seq=4,
     layer_pools=None,
+    max_num_sequences=None,
+    index_scale=_FAKE_INDEX_SCALE,
+    mgr=None,
 ):
     """An InklingAttentionMetadata with prepare()'s inputs stubbed in.
 
@@ -487,11 +510,7 @@ def _ink_metadata(
 
     md = object.__new__(InklingAttentionMetadata)
     md.ink_num_gen = 0
-    md.ink_max_pages = None
-    md.ink_cap = 0
-    md.ink_page_table = {}
-    md._ink_layer_groups = {}
-    md._ink_pt_host = None
+    md._ink_pt_rows = {}
     md.is_cuda_graph = False
     md.request_ids = list(request_ids)
     md._num_contexts = num_contexts
@@ -499,44 +518,90 @@ def _ink_metadata(
     # What TrtllmAttentionMetadata.prepare() would have published: total KV
     # length per request, num_cached + the one new generation token.
     md.kv_lens_cuda = torch.tensor([n + 1 for n in num_cached], dtype=torch.int32)
-    blocks = {
-        layer: [[layer * 10 + 1, -1, -1, -1], [layer * 10 + 2, layer * 10 + 3, -1, -1]]
-        for layer in pp_layers
-    }
-    if layer_pools is None:
-        md.kv_cache_manager = _FakeKvManager(list(pp_layers), blocks, max_blocks_per_seq)
-    else:
-        md.kv_cache_manager = _FakePooledKvManager(
-            list(pp_layers), blocks, layer_pools, max_blocks_per_seq
-        )
-    # seq_lens_cuda is a read-only property over this field; _ink_ensure
-    # reads it only for the device.
+    md.kv_cache_manager = (
+        mgr if mgr is not None else _FakeKvManager(pp_layers, layer_pools, index_scale)
+    )
+    # ... and the block offsets, the other buffer prepare() would have refreshed.
+    md.kv_cache_block_offsets = _fake_block_offsets(
+        md.kv_cache_manager.num_pools,
+        max_num_sequences if max_num_sequences is not None else len(request_ids),
+        max_blocks_per_seq,
+        index_scale,
+    )
     md._seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
     return md
 
 
-def test_metadata_publishes_total_kv_lengths_and_per_layer_page_table():
-    """Total-KV lengths are read from the base kv_lens_cuda, not staged again;
-    the page table is built per page group, which without the pool mapping
-    degrades to one per layer."""
+def test_metadata_reads_both_decode_inputs_from_the_base_buffers():
+    """Neither seq lengths nor the page table are staged privately.
+
+    ``kv_lens_cuda`` and ``kv_cache_block_offsets`` are both filled by
+    ``TrtllmAttentionMetadata.prepare``, so the Inkling accessors slice them.
+    The page table must come back as a *view* -- an equal-valued copy would
+    reintroduce the per-step H2D this refactor deleted, and would go stale under
+    CUDA-graph replay.
+    """
     md = _ink_metadata()
 
     md._prepare_inkling_decode()
 
     assert md.ink_num_gen == 2
-    # num_cached + 1, straight off the base buffer -- no private staging.
+    # num_cached + 1, straight off the base buffer.
     assert md.ink_gen_seq_lens(2).tolist() == [4, 131]
-    # One block-table fetch per page group; the fallback makes that per layer.
-    assert md.kv_cache_manager.calls == [((7, 9), 0), ((7, 9), 1)]
-    assert md.ink_gen_page_table(0)[:2].tolist() == [[1, 0, 0, 0], [2, 3, 0, 0]]
-    assert md.ink_gen_page_table(1)[:2].tolist() == [[11, 0, 0, 0], [12, 13, 0, 0]]
+    pt = md.ink_gen_page_table(0)
+    # Same storage as the base tensor: a view, not a copy.
+    assert pt.untyped_storage().data_ptr() == md.kv_cache_block_offsets.untyped_storage().data_ptr()
+    # Plane 0 of pool 0, generation rows. Encoded values, not block indices --
+    # the kernel divides by ink_page_div.
+    assert pt.tolist() == md.kv_cache_block_offsets[0, 0:2, 0].tolist()
+    assert pt.tolist() == [[1 * 6, 0, 0, 0], [101 * 6, 102 * 6, 0, 0]]
 
 
-def test_metadata_shares_one_page_table_per_kv_geometry():
-    """get_batch_cache_indices resolves a layer to (pool_id, index_scale) and
-    depends on nothing else, so layers of the same KV geometry get identical
-    tables. Inkling has two geometries and 66 layers; building the table once
-    per layer is ~33x the host work per decode step, and decode is host-bound.
+def test_metadata_page_div_recovers_the_block_index():
+    """The one arithmetic difference from the base encoding, stated as a test.
+
+    Entries count pages (K and V separately); the kernel's K/V views are the two
+    planes of a ``[blocks, kv_factor, ...]`` buffer and count blocks. So
+    ``entry // ink_page_div`` must be ``base_page_index * num_pool_layers``, and
+    ``ink_page_div`` must be the manager's ``kv_factor`` -- not a hardcoded 2.
+    """
+    md = _ink_metadata()
+    md._prepare_inkling_decode()
+
+    assert md.ink_page_div == md.kv_cache_manager.kv_factor == 2
+    pt = md.ink_gen_page_table(0)
+    # index_scale=6, kv_factor=2 -> block index is base_page_index * 3.
+    assert (pt // md.ink_page_div).tolist() == [[3, 0, 0, 0], [303, 306, 0, 0]]
+
+    md.kv_cache_manager.kv_factor = 1
+    assert md.ink_page_div == 1
+
+
+def test_metadata_stages_nothing_and_asks_the_manager_for_nothing():
+    """Regression on the reason for this refactor.
+
+    The previous version built a pinned host table, filled it in a Python loop
+    over requests and blocks, and issued one non-blocking H2D per KV geometry --
+    every decode step, on the host-bound path. Assert that per-step work is gone:
+    no staging buffer survives, and the manager is queried only while the static
+    row mapping is being built (once), not on the steps after it.
+    """
+    md = _ink_metadata(pp_layers=(0, 1), layer_pools={0: 0, 1: 0})
+
+    md._prepare_inkling_decode()
+    md.kv_cache_manager.calls.clear()
+    md._prepare_inkling_decode()  # a second step, mapping already cached
+
+    assert md.kv_cache_manager.calls == []
+    assert not hasattr(md, "_ink_pt_host")
+    assert not hasattr(md, "ink_page_table")
+
+
+def test_metadata_shares_one_page_table_row_per_kv_geometry():
+    """Layers of one KV geometry land in one pool, and the base tensor's leading
+    axis is per-pool -- so the deduplication an earlier version did by hand (a
+    ``(pool_id, index_scale)`` group key, one staged table per group) now comes
+    for free from the borrowed layout. Inkling has two geometries and 66 layers.
     """
     md = _ink_metadata(
         pp_layers=(0, 1, 2, 3),
@@ -546,15 +611,32 @@ def test_metadata_shares_one_page_table_per_kv_geometry():
 
     md._prepare_inkling_decode()
 
-    # Two groups, not four layers.
-    assert len(md.ink_page_table) == 2
-    assert len(md.kv_cache_manager.calls) == 2
-    # Layers sharing a pool share the buffer object itself.
-    assert md.ink_gen_page_table(0) is md.ink_gen_page_table(1)
-    assert md.ink_gen_page_table(2) is md.ink_gen_page_table(3)
-    assert md.ink_gen_page_table(0) is not md.ink_gen_page_table(2)
-    # And the staging buffer is sized to groups, not layers.
-    assert md._ink_pt_host.shape[0] == 2
+    assert md._ink_pt_rows == {0: 0, 1: 0, 2: 1, 3: 1}
+    # Layers sharing a pool address the same memory...
+    assert md.ink_gen_page_table(0).data_ptr() == md.ink_gen_page_table(1).data_ptr()
+    assert md.ink_gen_page_table(2).data_ptr() == md.ink_gen_page_table(3).data_ptr()
+    # ...and the two geometries do not.
+    assert md.ink_gen_page_table(0).data_ptr() != md.ink_gen_page_table(2).data_ptr()
+    assert md.ink_gen_page_table(0).tolist() != md.ink_gen_page_table(2).tolist()
+
+
+def test_metadata_rows_are_per_layer_under_swa_scratch_reuse():
+    """``num_attention_op_pools`` is per-pool by default but per attention-op
+    *layer* when scratch reuse is on, and the copy then keys rows by
+    ``layer_offsets``. Reading a pool id into a layer-keyed tensor would silently
+    return another layer's pages, so the mode has to be honoured."""
+    mgr = _FakeKvManager(pp_layers=(0, 1, 2, 3), layer_pools={0: 0, 1: 0, 2: 1, 3: 1})
+    mgr.enable_swa_scratch_reuse = True
+    md = _ink_metadata(pp_layers=(0, 1, 2, 3), mgr=mgr, max_num_sequences=2)
+    # One row per layer now, not per pool.
+    md.kv_cache_block_offsets = _fake_block_offsets(4, 2, 4)
+
+    md._prepare_inkling_decode()
+
+    assert md._ink_pt_rows == {0: 0, 1: 1, 2: 2, 3: 3}
+    # Every layer distinct -- no sharing in this mode.
+    ptrs = {md.ink_gen_page_table(layer).data_ptr() for layer in (0, 1, 2, 3)}
+    assert len(ptrs) == 4
 
 
 def test_metadata_skips_the_context_slice():
@@ -566,12 +648,13 @@ def test_metadata_skips_the_context_slice():
 
     assert md.ink_num_gen == 1
     assert md.ink_gen_seq_lens(1).tolist() == [131]
-    assert md.kv_cache_manager.calls == [((9,), 0), ((9,), 1)]
+    # Row 1 of the base tensor, not row 0 -- the context request's row is skipped.
+    assert md.ink_gen_page_table(0).tolist() == md.kv_cache_block_offsets[0, 1:2, 0].tolist()
 
 
 def test_metadata_reports_nothing_published_for_a_context_only_batch():
-    """A prefill-only step must not leave the previous step's page table
-    advertised as current -- that is what the old epoch counter guarded."""
+    """A prefill-only step must not leave the previous step's rows advertised as
+    current -- that is what the old epoch counter guarded."""
     md = _ink_metadata()
     md._prepare_inkling_decode()
     assert md.ink_num_gen == 2
@@ -582,29 +665,49 @@ def test_metadata_reports_nothing_published_for_a_context_only_batch():
     assert md.ink_num_gen == 0
 
 
-def test_metadata_refuses_to_grow_its_buffers_under_cuda_graph():
-    """Growth would strand the captured pointer, so it must raise rather than
-    silently reallocate."""
-    md = _ink_metadata()
-    md._prepare_inkling_decode()
+def test_metadata_refuses_a_cuda_graph_batch_carrying_contexts():
+    """The captured kernel reads both borrowed buffers at a fixed generation
+    offset, so that offset has to be constant across replays. Decode graphs are
+    pure generation, which makes it 0."""
+    md = _ink_metadata(num_contexts=1, request_ids=(7, 9), num_cached=(0, 130))
     md.is_cuda_graph = True
-    md.request_ids = [7, 9, 11, 13]
-    md.kv_cache_params = SimpleNamespace(num_cached_tokens_per_seq=[3, 130, 5, 5])
 
-    with pytest.raises(RuntimeError, match="CUDA graph"):
+    with pytest.raises(RuntimeError, match="context requests"):
         md._prepare_inkling_decode()
 
 
-def test_metadata_clamps_a_row_to_max_pages():
-    """A row longer than max_blocks_per_seq is truncated, never written past
-    the stable buffer's width."""
-    md = _ink_metadata(max_blocks_per_seq=2)
-    md.kv_cache_manager._blocks = {0: [[1, 2, 3, 4], [5, 6, 7, 8]], 1: [[1, 2, 3, 4], [5, 6, 7, 8]]}
+def test_metadata_rejects_a_batch_wider_than_the_borrowed_block_offsets():
+    """Borrowing the base tensor means inheriting its bounds. A batch past
+    max_num_sequences must raise, not slice short and silently attend over
+    another request's pages."""
+    md = _ink_metadata(request_ids=(7, 9), num_cached=(3, 130), max_num_sequences=2)
+    md.request_ids = [7, 9, 11]
+    md.kv_cache_params = SimpleNamespace(num_cached_tokens_per_seq=[3, 130, 5])
 
-    md._prepare_inkling_decode()
+    with pytest.raises(RuntimeError, match="sequence rows"):
+        md._prepare_inkling_decode()
 
-    assert md.ink_max_pages == 2
-    assert md.ink_gen_page_table(0)[:2].tolist() == [[1, 2], [5, 6]]
+
+def test_metadata_rejects_a_layer_whose_scale_disagrees_with_its_pool():
+    """The C++ copy encodes with the pool-level index_scale, while
+    ``get_layer_page_index_scale`` documents that layers in one pool may differ.
+    They agree for Inkling, but a mismatch would be a wrong page address rather
+    than a crash, so it is asserted."""
+    md = _ink_metadata(pp_layers=(0, 1), layer_pools={0: 0, 1: 0})
+    md.kv_cache_manager.index_scales = [_FAKE_INDEX_SCALE * 2]
+
+    with pytest.raises(RuntimeError, match="page-index scale"):
+        md._prepare_inkling_decode()
+
+
+def test_metadata_rejects_a_missing_block_offsets_tensor():
+    """The page table is no longer this class's to allocate, so its absence is a
+    setup error to report rather than something to paper over."""
+    md = _ink_metadata()
+    md.kv_cache_block_offsets = None
+
+    with pytest.raises(RuntimeError, match="kv_cache_block_offsets"):
+        md._prepare_inkling_decode()
 
 
 def test_backend_and_cache_manager_both_resolve_from_the_sparse_registry():
@@ -772,28 +875,24 @@ def test_attn_backend_family_override_fails_loudly():
             check(SimpleNamespace(attn_backend=bad))
 
 
-def test_metadata_stages_each_page_group_in_its_own_pinned_row():
-    """Regression: a single shared staging buffer refilled per group corrupts
-    every group but the last.
+def test_metadata_keeps_distinct_geometries_distinct():
+    """Successor to a regression test for a staging bug that can no longer exist.
 
-    The H2D copies are non_blocking, so refilling one host buffer per group
-    races the in-flight copy of the previous group. The observable symptom is
-    page tables that all end up holding the same (or torn) rows, attention
-    reading the wrong KV pages, and decode collapsing to repeated tokens --
-    accuracy 0. Assert the staging buffer has a per-group dimension and that
-    the published tables actually differ per group.
+    The old code refilled one pinned host buffer per page group and issued
+    non-blocking H2Ds, so the next group's fill raced the previous group's copy;
+    the symptom was every geometry ending up with the same (or torn) rows,
+    attention reading the wrong KV pages, and decode collapsing to repeated
+    tokens. There is no staging buffer and no copy now, but the property that bug
+    violated is still worth pinning: two geometries must not resolve to the same
+    rows.
     """
-    md = _ink_metadata(pp_layers=(0, 1))
+    md = _ink_metadata(pp_layers=(0, 1))  # default: one pool per layer
 
     md._prepare_inkling_decode()
 
-    # One staging row per group, not one buffer shared across groups.
-    assert md._ink_pt_host.dim() == 3
-    assert md._ink_pt_host.shape[0] == 2
-    # Distinct block ids must survive to distinct device tables.
-    assert md.ink_gen_page_table(0)[:2].tolist() != md.ink_gen_page_table(1)[:2].tolist()
-    assert md.ink_gen_page_table(0)[:2].tolist() == [[1, 0, 0, 0], [2, 3, 0, 0]]
-    assert md.ink_gen_page_table(1)[:2].tolist() == [[11, 0, 0, 0], [12, 13, 0, 0]]
+    assert md.ink_gen_page_table(0).tolist() != md.ink_gen_page_table(1).tolist()
+    assert md.ink_gen_page_table(0).tolist() == md.kv_cache_block_offsets[0, 0:2, 0].tolist()
+    assert md.ink_gen_page_table(1).tolist() == md.kv_cache_block_offsets[1, 0:2, 0].tolist()
 
 
 def test_conv_pool_is_owned_by_the_kv_cache_manager():
@@ -966,9 +1065,7 @@ def test_metadata_builds_the_runtime_itself_from_the_managers_pool():
         conv_state_cache = "POOL"
 
     md = _ink_metadata()
-    md.kv_cache_manager = _FakeConvManager(
-        md.kv_cache_manager.pp_layers, md.kv_cache_manager._blocks
-    )
+    md.kv_cache_manager = _FakeConvManager(md.kv_cache_manager.pp_layers)
     built = {}
 
     def _build(attn_metadata, cache):
@@ -1584,9 +1681,11 @@ def test_build_cache_config_appends_ssm_layers_for_the_conv_state(monkeypatch):
     were exactly the same size, which nothing enforced.
 
     Appended, not interleaved: keeping every attention layer_id at its original
-    index is what lets get_buffers / get_batch_cache_indices / the metadata page
-    tables stay untouched. DeepSeek-V4 has to interleave because its KV is itself
-    split across cache layers; Inkling's is not.
+    index is what lets get_buffers, get_batch_cache_indices, and the
+    layer_offsets -> layer_to_pool_mapping_dict route the metadata takes into the
+    borrowed kv_cache_block_offsets all stay untouched. DeepSeek-V4 has to
+    interleave because its KV is itself split across cache layers; Inkling's is
+    not.
     """
     from dataclasses import dataclass, field
 
