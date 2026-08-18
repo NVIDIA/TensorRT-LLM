@@ -66,6 +66,23 @@ def test_mxe4m3_mxe2m1_situ_runner_has_valid_configs(num_tokens):
     assert tactics, f"No valid SiTu tactic for num_tokens={num_tokens}"
 
 
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The SiTu kernel only supports SM100/SM103. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("num_tokens", [1, 8, 512])
+def test_e2m1_e2m1_situ_runner_has_valid_configs(num_tokens):
+    """NVFP4 twin of the MXFP4 check above.
+
+    Numerics for this path live in
+    tests/unittest/_torch/modules/moe/test_nvfp4_situ_moe.py.
+    """
+    runner = torch.classes.trtllm.FP4BlockScaleMoERunner(ActType.SiTu.value)
+    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens)
+    assert tactics, f"No valid NVFP4 SiTu tactic for num_tokens={num_tokens}"
+
+
 class moe_args:
 
     def __init__(self,
