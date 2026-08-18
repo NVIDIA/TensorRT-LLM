@@ -32,15 +32,13 @@ l0_a10:
   - unittest/_torch/executor/test_kv_cache_compression_manager.py
   - unittest/_torch/executor/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/executor/test_error_classification.py
-  - unittest/_torch/modules/moe/test_communication_factory.py
-  - unittest/_torch/modules/dwdp/test_dwdp_manager.py
-  - unittest/_torch/modules/dwdp/test_dwdp_mapping.py
-  - unittest/_torch/modules/dwdp/test_dwdp_peer_ranges.py
   - unittest/_torch/executor/test_profile_endpoints.py
+  - unittest/_torch/modules/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints
   - unittest/_torch/models/test_qwen3_next_moe_quant.py
+  - unittest/_torch/models/test_qwen3_next_eager_fusion.py
   - unittest/_torch/weight_sharing
   - unittest/inputs/test_multimodal_input_processor.py
   - unittest/others/test_cache_transceiver_precheck_config.py
@@ -114,9 +112,6 @@ l0_a10:
   - unittest/executor/test_postprocessor_hook.py
   - unittest/executor/test_proxy_postproc_terminate.py
   - unittest/executor/test_proxy_fast_death.py
-  - unittest/executor/test_rpc.py
-  - unittest/executor/test_ipc.py
-  - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_proxy_profile_sync.py
   # trtllm-serve CPU-only
   - unittest/llmapi/apps/test_encode_batcher.py
