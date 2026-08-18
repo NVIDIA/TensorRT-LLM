@@ -422,13 +422,67 @@ class KDAKernelDispatch:
         self,
         *,
         cu_seqlens: Optional[torch.Tensor],
+        num_tokens: int,
+        chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
     ) -> bool:
         """Return whether this batch can stay on the Blackwell prefill path."""
-        if self.prefill_kernel_path != "optimized":
+        if self.prefill_kernel_path != "optimized" or num_tokens == 0:
             return False
         if cu_seqlens is not None:
-            return prepare_chunk_indices(cu_seqlens, chunk_size).shape[0] >= 4
+            if chunk_indices is None:
+                chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+            return chunk_indices.shape[0] >= 4
+        return True
+
+    def can_use_indexed_prefill(
+        self,
+        *,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
+        has_initial_states: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        num_tokens: int,
+        chunk_indices: Optional[torch.Tensor] = None,
+        chunk_size: int = 64,
+    ) -> bool:
+        """Return whether prefill can update this V-first pool directly."""
+        if not self.can_use_optimized_prefill(
+            cu_seqlens=cu_seqlens,
+            num_tokens=num_tokens,
+            chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
+        ):
+            return False
+        if state_pool.dtype != torch.float32 or state_pool.ndim != 4:
+            return False
+        _, H, V, K = state_pool.shape
+        if state_pool.stride()[1:] != (V * K, K, 1):
+            return False
+        if state_pool.stride(0) < H * V * K or state_pool.stride(0) % 4:
+            return False
+        if state_pool.data_ptr() % 16:
+            return False
+        num_sequences = state_indices.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+        if (
+            state_indices.ndim != 1
+            or state_indices.shape[0] != num_sequences
+            or state_indices.dtype not in (torch.int32, torch.int64)
+            or not state_indices.is_contiguous()
+        ):
+            return False
+        if (
+            has_initial_states.ndim != 1
+            or has_initial_states.shape[0] != num_sequences
+            or has_initial_states.dtype != torch.bool
+            or not has_initial_states.is_contiguous()
+        ):
+            return False
+        if (
+            state_pool.device != state_indices.device
+            or state_pool.device != has_initial_states.device
+        ):
+            return False
         return True
 
     def prefill_chunk_kda(
@@ -446,7 +500,13 @@ class KDAKernelDispatch:
         safe_gate: bool,
         lower_bound: Optional[float],
         cu_seqlens: Optional[torch.Tensor],
+        chunk_indices: Optional[torch.Tensor] = None,
         chunk_size: int = 64,
+        state_pool: Optional[torch.Tensor] = None,
+        state_indices: Optional[torch.Tensor] = None,
+        varlen_is_aligned: Optional[bool] = None,
+        single_sequence_length: Optional[int] = None,
+        force_fallback: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA chunked prefill.
 
@@ -456,18 +516,25 @@ class KDAKernelDispatch:
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
 
-        State layout contract (both paths): ``initial_state`` is consumed
-        and ``final_state`` returned in the V-first ``[N, H, V, K]`` layout —
-        the layout of the executor's ssm pool and of the fused decode
-        kernel. The in-tree prefill op natively uses the FLA-default K-first
-        ``[N, H, K, V]`` layout, so the optimized path transposes at both
-        boundaries (K == V == 128 for Kimi K3, so shapes alone cannot catch
-        a mix-up — the transpose is semantic).
+        The optimized kernel always reads and writes indexed V-first
+        ``[slots, H, V, K]`` state-pool rows. Callers provide the executor
+        pool and reset fresh rows before entering the kernel. The FLA fallback
+        retains the batch-dense ``initial_state``/``final_state`` contract.
+
+        ``chunk_indices``, ``varlen_is_aligned``, and
+        ``single_sequence_length`` are prepared once from Kimi K3 runtime
+        metadata. They keep the optimized path from reading ``cu_seqlens``
+        back from the GPU in every KDA layer.
         """
-        use_optimized = self.prefill_kernel_path == "optimized"
-        chunk_indices = None
+        use_indexed_state = state_pool is not None
+        if use_indexed_state and (initial_state is not None or state_indices is None):
+            raise ValueError(
+                "Indexed KDA prefill requires state_indices and does not accept initial_state."
+            )
+        use_optimized = self.prefill_kernel_path == "optimized" and not force_fallback
         if use_optimized and cu_seqlens is not None:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+            if chunk_indices is None:
+                chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
             # The persistent K123 scheduler needs at least 4 total chunks
             # (cgs_per_head = NT // 4 cooperative groups per head). The
             # eqlen path guarantees this by padding to a 256-token multiple
@@ -479,6 +546,14 @@ class KDAKernelDispatch:
             # Q/K normalization and beta sigmoid in its own kernels.
             if chunk_indices.shape[0] < 4:
                 use_optimized = False
+
+        if use_indexed_state and not use_optimized:
+            raise RuntimeError(
+                "Indexed KDA prefill requires the optimized prefill path; "
+                "use the FLA state path for this batch."
+            )
+        if use_optimized and not use_indexed_state:
+            raise RuntimeError("Optimized KDA prefill requires an indexed state pool.")
 
         if use_optimized:
             import torch.nn.functional as F
@@ -506,20 +581,15 @@ class KDAKernelDispatch:
             dt_bias_kernel = dt_bias.detach() if dt_bias is not None else None
 
             _load_prefill_module()  # registers trtllm::kda_prefill
-
-            if initial_state is not None:
-                # Pool V-first [N, H, V, K] -> op K-first [N, H, K, V].
-                initial_state = initial_state.transpose(-1, -2).contiguous()
-
-            out, final_state = torch.ops.trtllm.kda_prefill(
+            out = torch.ops.trtllm.kda_prefill(
                 q=q,
                 k=k,
                 v=v,
                 g=g,
                 beta=beta,
+                state_pool=state_pool,
+                state_indices=state_indices,
                 scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
                 cu_seqlens=cu_seqlens,
                 chunk_indices=chunk_indices,
                 chunk_size=chunk_size,
@@ -529,16 +599,12 @@ class KDAKernelDispatch:
                 use_beta_sigmoid_in_kernel=True,
                 A_log=A_log_kernel,
                 dt_bias=dt_bias_kernel,
+                varlen_is_aligned=varlen_is_aligned,
+                single_sequence_length=single_sequence_length,
             )
             if out.shape[1] != real_T:
                 out = out[:, :real_T]
-            if final_state is not None and final_state.numel() > 0:
-                # Op K-first [N, H, K, V] -> pool V-first [N, H, V, K].
-                # .contiguous() also detaches the result from the op's
-                # shared per-shape S_out scratch, which the next same-shape
-                # call overwrites.
-                final_state = final_state.transpose(-1, -2).contiguous()
-            return out, final_state
+            return out, None
 
         from fla.ops.kda import chunk_kda
 
