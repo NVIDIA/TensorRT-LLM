@@ -1721,8 +1721,8 @@ class PyTorchModelEngine(ModelEngine):
             return False
         return self.dist.world_size > 1 or self.mapping.dwdp_enabled
 
-    def _should_run_warmup_batch(self, batch, num_tokens: int,
-                                 shape: str) -> bool:
+    def _should_run_warmup_batch(self, batch: Optional[ScheduledRequests],
+                                 num_tokens: int, shape: str) -> bool:
         """Decide whether this warmup shape runs, is skipped, or fails the rank.
 
         A rank that skips a shape its peers run leaves them blocked in that
@@ -1746,10 +1746,11 @@ class PyTorchModelEngine(ModelEngine):
         if batch is None:
             raise RuntimeError(
                 f"Warmup batch creation failed for shape ({shape}) on "
-                f"global_rank={global_mpi_rank()}, model_rank={self.dist.rank}. "
-                f"Peer workers may already be inside the matching forward, so "
-                f"this rank cannot skip the shape without stranding them. "
-                f"Consider increasing --kv_cache_free_gpu_mem_fraction.")
+                f"global_rank={global_mpi_rank()}, "
+                f"model_rank={self.dist.rank}. Peer workers may already be "
+                f"inside the matching forward, so this rank cannot skip the "
+                f"shape without stranding them. Consider increasing "
+                f"--kv_cache_free_gpu_mem_fraction.")
         return True
 
     def _assert_all_tp_ranks_have_warmup_batch(self, batch,
@@ -1922,7 +1923,7 @@ class PyTorchModelEngine(ModelEngine):
         if release_megamoe_scratch is not None:
             release_megamoe_scratch()
 
-    def _run_autotuner_warmup(self, resource_manager: ResourceManager):
+    def _run_autotuner_warmup(self, resource_manager: ResourceManager) -> None:
         """Runs forward passes to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
             return
@@ -1993,7 +1994,8 @@ class PyTorchModelEngine(ModelEngine):
         clear_memory_buffers()
         torch.cuda.empty_cache()
 
-    def _run_mamba_hybrid_warmup(self, resource_manager: ResourceManager):
+    def _run_mamba_hybrid_warmup(self,
+                                 resource_manager: ResourceManager) -> None:
         """Pre-JIT the Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels.
 
         Mamba hybrid models (e.g. Nemotron 3 Super 120B, Nemotron-Nano-12B-v2)
