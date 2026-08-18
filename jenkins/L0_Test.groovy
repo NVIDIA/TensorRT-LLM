@@ -229,7 +229,7 @@ COMMON_SSH_OPTIONS = Utils.DEFAULT_CUSTOM_SSH_OPTIONS
 CBTS_EXCLUDE_STAGES = [] as Set
 
 def isCbtsStage(String stageName) {
-    // Pipeline-level eligibility is decided in L0_MergeRequest.groovy and propagated via testFilter.
+    // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
@@ -443,7 +443,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                             script: Utils.sshUserCmd(
                                 remote,
                                 "\"cd '${remoteWs}' && touch '${CBTS_STOP_FILE_NAME}' && sleep 2 && " +
-                                "tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null; " +
+                                "tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite 2>/dev/null; " +
                                 "tar tzf '${cbtsArchive}' 2>/dev/null | grep -q . || rm -f '${cbtsArchive}'\""
                             ),
                             returnStatus: true,
@@ -4988,7 +4988,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 sh """
                     cd ${WORKSPACE}/${stageName} && \
                     python3 ${llmSrc}/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
-                        --glob '.cbtscov.${stageName}*' || true
+                        --glob '.cbtscov.${stageName}*.sqlite' || true
                 """
             }
         }
