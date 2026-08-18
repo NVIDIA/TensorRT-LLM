@@ -81,20 +81,26 @@ from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple
 
 import torch
+import triton  # type: ignore[import]
+import triton.language as tl  # type: ignore[import]
+import triton.language.extra.libdevice as tldevice  # type: ignore[import]
 from safetensors import safe_open
 from torch import nn
 
 from ..._utils import is_sm_100f
+from ...functional import PositionEmbeddingType
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
-from ..attention_backend import AttentionMetadata
+from ..attention_backend import AttentionMetadata, TrtllmAttention
+from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduce, AllReduceStrategy
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.fused_moe import ConfigurableMoE, create_moe
-from ..modules.kimi_k3_moe._mlp import KimiK3MLP, KimiK3RMSNorm
-from ..modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
+from ..modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod, Deepseekv3RoutingImpl
 from ..modules.linear import Linear as TrtllmLinear
+from ..modules.mla import MLA
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActType_TrtllmGen
@@ -186,6 +192,749 @@ _KIMI_K3_KDA_GLUE_FP8_ENV = "KIMI_K3_KDA_GLUE_FP8"
 # parallel layout (on under attention DP, off under TP — see the conversion
 # helper's comment); set 0/1 to force either.
 _KIMI_K3_FP8_WEIGHT_READ_GATE_UP_ENV = "KIMI_K3_FP8_WEIGHT_READ_GATE_UP"
+
+
+# ===========================================================================
+# Kimi K3 model-specific modules (moved in-file per the modeling_xxx.py
+# convention, e.g. DeepSeek-V3). Previously lived in
+# tensorrt_llm/_torch/modules/kimi_k3_moe/ and .../kimi_k3_mla/. kimi_kda
+# stays a standalone module (general enough to reuse).
+# ===========================================================================
+
+# Route the RMSNorm forward through flashinfer's single-kernel fused RMSNorm
+# instead of the eager pow/mean/rsqrt/mul/cast chain. Set to "0" to fall back
+# to the eager reference (the exact-parity rollback lever).
+_FUSED_RMSNORM = os.environ.get("KIMI_K3_FUSED_RMSNORM", "1") == "1"
+
+
+class SituAndMul(nn.Module):
+    """K3 SiTU activation with gate/up multiplicative gating.
+
+    Byte-identical to HF ``modeling_kimi.py``'s ``SituAndMul`` at
+    lines 41-59. Runs the math in fp32 for numerical stability
+    (matches HF), then casts back to the input's dtype.
+    """
+
+    def __init__(
+        self,
+        *,
+        beta: float = 1.0,
+        linear_beta: Optional[float] = None,
+    ) -> None:
+        super().__init__()
+        self.beta = beta
+        self.linear_beta = linear_beta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d].to(torch.float32)
+        up = x[..., d:].to(torch.float32)
+        situ_a = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (situ_a * up).to(x.dtype)
+
+
+@triton.jit
+def situ_and_mul_kernel(
+    o_ptr,
+    o_stride,
+    x_ptr,
+    x_stride,
+    d,
+    beta,
+    linear_beta,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_LINEAR_BETA: tl.constexpr,
+) -> None:
+    """Fused :class:`SituAndMul` on a packed ``[gate | up]`` row layout.
+
+    Loads ``gate = x[i, :d]`` and ``up = x[i, d:2d]``, computes (fp32)
+    ``beta * tanh(gate / beta) * sigmoid(gate) * up'`` with
+    ``up' = linear_beta * tanh(up / linear_beta)`` when
+    ``HAS_LINEAR_BETA`` else ``up``, and stores the product rounded to
+    ``o_ptr``'s element type.
+    """
+    i = tl.program_id(axis=0).to(tl.int64)
+    j = tl.program_id(axis=1)
+
+    o_row_ptr = o_ptr + o_stride * i
+    x_row_ptr = x_ptr + x_stride * i
+
+    offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < d
+
+    gate = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
+    up = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
+
+    situ_a = beta * tldevice.tanh(gate / beta) * tl.sigmoid(gate)
+    if HAS_LINEAR_BETA:
+        up = linear_beta * tldevice.tanh(up / linear_beta)
+    result = situ_a * up
+
+    tl.store(o_row_ptr + offsets, result, mask=mask)
+
+
+@torch.library.custom_op("trtllm::situ_and_mul", mutates_args=())
+def situ_and_mul(x: torch.Tensor, beta: float, linear_beta: Optional[float] = None) -> torch.Tensor:
+    """Fused SiTU activation (single Triton kernel, fp32 internal math).
+
+    Args:
+        x: ``[num_tokens, 2 * d]`` packed ``[gate | up]`` GEMM output
+           (fp16/bf16/fp32; the last dim must be contiguous).
+        beta: SiTU gate ``beta`` (``activation_situ_beta``).
+        linear_beta: optional up-half ``linear_beta``
+           (``activation_situ_linear_beta``); ``None`` keeps the up half
+           linear.
+
+    Returns:
+        ``[num_tokens, d]`` tensor in ``x``'s dtype, numerically matching
+        the eager :class:`SituAndMul` reference.
+    """
+    b, n = x.shape
+
+    assert n % 2 == 0
+    d = n // 2
+
+    o = torch.empty((b, d), dtype=x.dtype, device=x.device)
+
+    def grid(meta: dict) -> tuple[int, int]:
+        return (b, triton.cdiv(d, meta["BLOCK_SIZE"]))
+
+    situ_and_mul_kernel[grid](
+        o_ptr=o,
+        o_stride=o.stride(0),
+        x_ptr=x,
+        x_stride=x.stride(0),
+        d=d,
+        beta=float(beta),
+        linear_beta=float(linear_beta) if linear_beta is not None else 1.0,
+        BLOCK_SIZE=1024,
+        HAS_LINEAR_BETA=linear_beta is not None,
+    )
+
+    return o
+
+
+@situ_and_mul.register_fake
+def _(x: torch.Tensor, beta: float, linear_beta: Optional[float] = None) -> torch.Tensor:
+    b, n = x.shape
+
+    assert n % 2 == 0
+
+    return x.new_empty((b, n // 2))
+
+
+class NonSituActivation(nn.Module):
+    """SiLU/SwiGLU activation used as the non-SiTU mutation control.
+
+    Splits the last dim into gate/up, applies SiLU to the gate, and
+    multiplies element-wise. Deliberately does NOT use the SiTU
+    ``beta * tanh(gate/beta) * sigmoid(gate)`` recipe.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d]
+        up = x[..., d:]
+        return torch.nn.functional.silu(gate) * up
+
+
+class KimiK3MLP(nn.Module):
+    """K3 dense/shared-expert MLP module with TRT-LLM-style fused layout.
+
+    Weight layout:
+
+    * ``gate_up_proj``: ``nn.Linear(hidden_size, 2 * intermediate_size, bias=False)``.
+      Rows ``[:intermediate_size]`` correspond to HF's ``gate`` (KimiMLP.gate_proj
+      or KimiBlockSparseMLP.w1). Rows ``[intermediate_size:]`` correspond to
+      HF's ``up`` (KimiMLP.up_proj or KimiBlockSparseMLP.w3).
+    * ``down_proj``: ``nn.Linear(intermediate_size, hidden_size, bias=False)``.
+      Matches HF ``KimiMLP.down_proj`` or ``KimiBlockSparseMLP.w2``.
+
+    Forward: ``down_proj( activation( gate_up_proj(x) ) )``. Default
+    ``activation`` is :class:`SituAndMul`; pass a different callable to
+    run mutation controls (e.g. :class:`NonSituActivation` for a
+    negative-control test). ``use_fused_activation=True`` routes CUDA
+    inputs through the fused Triton ``trtllm::situ_and_mul`` op instead
+    of the eager module (only valid with the default SiTU activation).
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        situ_beta: float = 4.0,
+        situ_linear_beta: Optional[float] = 25.0,
+        activation: Optional[nn.Module] = None,
+        use_fused_activation: bool = False,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        if use_fused_activation and activation is not None:
+            raise ValueError(
+                "use_fused_activation only fuses the default SiTU activation; "
+                "drop the custom activation module or the flag"
+            )
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.use_fused_activation = use_fused_activation
+
+        self.gate_up_proj = nn.Linear(
+            hidden_size,
+            2 * intermediate_size,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.down_proj = nn.Linear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.activation = (
+            activation
+            if activation is not None
+            else SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h1 = self.gate_up_proj(x)
+        if self.use_fused_activation and h1.is_cuda:
+            act = self.activation
+            h2 = torch.ops.trtllm.situ_and_mul(
+                h1.reshape(-1, h1.shape[-1]), act.beta, act.linear_beta
+            ).reshape(*h1.shape[:-1], self.intermediate_size)
+        else:
+            h2 = self.activation(h1)
+        return self.down_proj(h2)
+
+
+class KimiK3RMSNorm(nn.Module):
+    """RMSNorm matching HF ``KimiRMSNorm`` semantics exactly.
+
+    HF ``KimiRMSNorm.forward``::
+
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + eps)
+        return self.weight * hidden_states.to(input_dtype)
+
+    ``self.weight`` in HF is initialised in the module's ambient dtype
+    (bf16 or fp32). Callers pin the weight dtype here too so byte-exact
+    parity holds regardless of the ambient dtype.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        dtype: torch.dtype = torch.float32,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype, device=device))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # flashinfer's fused RMSNorm does the same fp32-accumulate
+        # normalization in one kernel, collapsing the eager
+        # pow/mean/rsqrt/mul/cast launch chain. Rounding differs by one final
+        # cast: flashinfer multiplies by ``weight`` in fp32 and casts once at
+        # the end, while the eager path casts the normalized value to the
+        # input dtype BEFORE the weight multiply — so outputs can differ by
+        # ~1 ulp and byte-exact HF parity requires the eager path. It is only
+        # valid for a CUDA fp16/bf16 input whose dtype matches the weight;
+        # CPU / fp32 parity paths, meta init, and the KIMI_K3_FUSED_RMSNORM=0
+        # rollback keep the exact eager math below.
+        if (
+            _FUSED_RMSNORM
+            and IS_FLASHINFER_AVAILABLE
+            and hidden_states.is_cuda
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            and self.weight.dtype == hidden_states.dtype
+        ):
+            from ..custom_ops import flashinfer_rmsnorm
+
+            return flashinfer_rmsnorm(hidden_states.contiguous(), self.weight, self.eps)
+        input_dtype = hidden_states.dtype
+        h = hidden_states.to(torch.float32)
+        variance = h.pow(2).mean(-1, keepdim=True)
+        h = h * torch.rsqrt(variance + self.eps)
+        return self.weight * h.to(input_dtype)
+
+
+def _meta_safe_cast_dtype(module, dtype):
+    """``module.to(dtype=dtype)`` that also works under ``MetaInitMode``.
+
+    ``Module.to`` dispatches ``aten._to_copy``, which MetaInitMode rejects
+    (it would silently fall back to full CPU construction of the model —
+    ~70 GB of host RAM per rank for Kimi K3). Under meta init the values
+    are garbage anyway, so a dtype-only re-allocation via ``empty_like``
+    (an allowed init op) is equivalent; off meta this matches ``.to``.
+    """
+    import torch as _torch
+
+    def _cast(t):
+        if not t.is_floating_point():
+            return t
+        if t.is_meta:
+            return _torch.empty_like(t, dtype=dtype)
+        return t.to(dtype=dtype)
+
+    module._apply(_cast)
+
+
+def _make_pos_embd_params(
+    *,
+    qk_rope_head_dim: int,
+    max_position_embeddings: int,
+) -> PositionalEmbeddingParams:
+    """Build a valid rope config so the backend allocates a real cache.
+
+    We use rope_gpt_neox with default theta=10000 and ``duplicate_data
+    =True`` (the same convention DeepSeek-V3-style MLA uses when
+    ``qk_rope_head_dim`` is present). The resulting ``rotary_cos_sin``
+    has the exact shape the C++ MLA rope kernel indexes. Immediately
+    after backend construction we overwrite the tensor values with
+    ``(cos=1, sin=0)`` — an identity rotation, matching K3's NoPE.
+    """
+    rope_params = RopeParams(
+        dim=qk_rope_head_dim,
+        theta=10000.0,
+        max_positions=max_position_embeddings,
+        original_max_positions=max_position_embeddings,
+        duplicate_data=True,
+    )
+    return PositionalEmbeddingParams(
+        type=PositionEmbeddingType.rope_gpt_neox,
+        rope=rope_params,
+        # Match the working DeepSeek-V3-style MLA reference test
+        # (tests/unittest/_torch/attention/test_attention_mla.py) which
+        # sets ``is_neox=False``. The MLA fused rope kernel is GPT-J
+        # style regardless of this flag, but the C++ FMHA reads this bit
+        # elsewhere and stability under identity-cos-sin depends on the
+        # standard non-neox layout.
+        is_neox=False,
+    )
+
+
+def _write_identity_rope_values(cos_sin: torch.Tensor) -> None:
+    """Overwrite a rotary cos/sin table with identity values in place.
+
+    Interleaved (cos, sin) pairs: index [::2] = cos, [1::2] = sin.
+    Setting cos=1 and sin=0 per position makes the rotation the
+    identity — a mathematical no-op — which preserves K3's NoPE
+    semantics without patching the backend.
+    """
+    flat = cos_sin.reshape(-1)
+    with torch.no_grad():
+        flat[0::2] = 1.0
+        flat[1::2] = 0.0
+    # Ensure the identity write reaches CUDA memory before any kernel
+    # launched from a different stream can read the table.
+    if cos_sin.is_cuda:
+        torch.cuda.synchronize(cos_sin.device)
+
+
+def _install_identity_rope_table(backend: TrtllmAttention) -> None:
+    """Install an identity rotary cos/sin table on ``backend``.
+
+    The C++ MLA rope kernels (``mla_rope_generation`` and the context
+    preprocess) read this table and apply the rotation; identity values
+    make that a copy, preserving K3's NoPE.
+
+    The tensor SHAPE produced by ``create_rope_const_params`` is kept
+    intact so the C++ ``float2`` indexing stays valid. Only the values
+    are overwritten in place. ``_ensure_rope_table_size`` is replaced
+    with an identity-preserving resize: the table may GROW (so the
+    fused rope-generation op can never index out of bounds for long
+    sequences) but its values are always rewritten to identity right
+    after a regeneration, so the real sinusoids never leak in.
+    """
+    cos_sin = backend.rotary_cos_sin
+    if cos_sin is None:
+        raise RuntimeError(
+            "backend.rotary_cos_sin is None after construction; check "
+            "pos_embd_params has a valid RopeParams with dim > 0."
+        )
+    _write_identity_rope_values(cos_sin)
+
+    orig_resize = backend._ensure_rope_table_size  # bound method
+
+    def _identity_preserving_resize(required_max_positions: int) -> None:
+        if required_max_positions <= backend.rope_params.max_positions:
+            return
+        orig_resize(required_max_positions)
+        _write_identity_rope_values(backend.rotary_cos_sin)
+
+    backend._ensure_rope_table_size = _identity_preserving_resize
+
+
+# ---------------------------------------------------------------------------
+# KimiK3MLAAttention.
+# ---------------------------------------------------------------------------
+
+
+class KimiK3MLAAttention(MLA):
+    """Kimi K3 MLA implemented as a thin specialization of :class:`MLA`.
+
+    K3 keeps the standard dense MLA attention/cache flow and only changes the
+    checkpoint projection topology, positional encoding, KV-B runtime layout,
+    and gated output projection.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_heads: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        rms_norm_eps: Optional[float] = None,
+        dtype: Optional[torch.dtype] = None,
+        layer_idx: int = 0,
+        use_output_gate: bool = True,
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> None:
+        pos_embd_params = _make_pos_embd_params(
+            qk_rope_head_dim=qk_rope_head_dim,
+            max_position_embeddings=max_position_embeddings,
+        )
+        model_config = ModelConfig(
+            quant_config=quant_config if quant_config is not None else QuantConfig()
+        )
+        super().__init__(
+            hidden_size=hidden_size,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            predicted_tokens_per_seq=1,
+            max_position_embeddings=max_position_embeddings,
+            bias=False,
+            pos_embd_params=pos_embd_params,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            dense_bias=False,
+            config=model_config,
+            reduce_output=False,
+            fuse_qkv_a_proj=False,
+            rms_norm_eps=rms_norm_eps,
+        )
+        # K3 calls forward_impl() directly to insert its output gate before
+        # the base row-parallel o_proj. The original executor metadata remains
+        # intact, so MLA performs its native mixed context/generation split.
+        self.register_to_config = False
+
+        self.use_output_gate = use_output_gate
+
+        if use_output_gate:
+            self.g_proj = nn.Linear(
+                hidden_size,
+                num_heads * v_head_dim,
+                bias=False,
+            )
+
+        # K3 is NoPE. The base MLA backends still require real RoPE tables, so
+        # retain their expected shape and replace every rotation with identity.
+        assert isinstance(self.mha, TrtllmAttention)
+        assert isinstance(self.mqa, TrtllmAttention)
+        _install_identity_rope_table(self.mha)
+        _install_identity_rope_table(self.mqa)
+        self.rotary_emb = None
+        self.apply_rotary_emb = False
+
+        if dtype is not None:
+            _meta_safe_cast_dtype(self, dtype)
+
+    def _apply_output_gate_and_o_proj(
+        self,
+        hidden_states: torch.Tensor,
+        attn_out: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.use_output_gate:
+            attn_out = attn_out * self.g_proj(hidden_states).sigmoid()
+        return self.o_proj(attn_out)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        # _create_outputs() rather than create_output(): the base implementation
+        # takes a list so a sparse-attention backend can append its own buffers,
+        # and it routes through the sparse hooks when they are installed. The
+        # dense path this module uses is element 0.
+        attn_outputs = self._create_outputs(hidden_states, attn_metadata)
+        super().forward_impl(
+            None,
+            hidden_states,
+            attn_metadata,
+            attn_output=attn_outputs,
+        )
+        return self._apply_output_gate_and_o_proj(hidden_states, attn_outputs[0])
+
+
+class KimiK3MoEGate(nn.Module):
+    """K3 MoE routing — structural mirror of HF ``KimiMoEGate``.
+
+    Positive path reproduces HF ``KimiMoEGate.forward`` at
+    ``modeling_kimi.py:747-803`` byte-identically under K3's
+    ``sigmoid`` scoring, top-k over the full expert set, raw sigmoid
+    weights, renormalization + scaling profile.
+
+    Three mutation flags gate the negative controls required by AC6:
+
+    * ``softmax_routing_mutation`` — softmax over experts instead of
+      per-expert sigmoid.
+    * ``biased_weights_mutation`` — gather ``topk_weight`` from the
+      bias-adjusted scores rather than the raw sigmoid scores.
+    * ``omit_renormalize_mutation`` — skip the renormalize step even
+      when the config asks for it.
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        softmax_routing_mutation: bool = False,
+        biased_weights_mutation: bool = False,
+        omit_renormalize_mutation: bool = False,
+        logits_gemm_dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_token
+        self.num_experts = config.num_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.moe_router_activation_func = config.moe_router_activation_func
+        self.num_expert_group = getattr(config, "num_expert_group", 1)
+        self.topk_group = getattr(config, "topk_group", 1)
+        self.moe_renormalize = config.moe_renormalize
+        self.gating_dim = config.hidden_size
+
+        assert self.moe_router_activation_func in ("sigmoid", "softmax"), (
+            "K3 MoE gate supports sigmoid or softmax scoring only"
+        )
+
+        # Same parameter shapes / names as HF ``KimiMoEGate``.
+        #
+        # ``logits_gemm_dtype=torch.bfloat16`` stores the gate weight in
+        # bf16 and runs the logits GEMM as a single bf16xbf16 kernel with
+        # fp32 accumulate/output (``trtllm::dsv3_router_gemm_op``). The K3
+        # checkpoint stores this weight in bf16, so the fp32 master was an
+        # exact upcast and bf16 storage is lossless; this removes the
+        # per-layer bf16->fp32 input cast + fp32 splitK-reduce that ran
+        # inside the decode CUDA graph (~5 us x 92 layers per step).
+        # Default ``None`` keeps the legacy fp32 GEMM (module parity tests).
+        weight_dtype = logits_gemm_dtype or torch.float32
+        self.weight = nn.Parameter(
+            torch.empty((self.num_experts, self.gating_dim), dtype=weight_dtype, device=device)
+        )
+        self.e_score_correction_bias = nn.Parameter(torch.empty(self.num_experts, device=device))
+
+        self.softmax_routing_mutation = softmax_routing_mutation
+        self.biased_weights_mutation = biased_weights_mutation
+        self.omit_renormalize_mutation = omit_renormalize_mutation
+
+        # Fast path: the fused ``noaux_tc`` routing kernel computes exactly K3's
+        # production routing contract in one launch -- per-expert sigmoid,
+        # ``e_score_correction_bias`` added for *selection* only, top-k weights
+        # sampled from the raw sigmoid scores, renormalized by ``sum + 1e-20``,
+        # then scaled by ``routed_scaling_factor``. Route through the shared
+        # ``Deepseekv3RoutingImpl`` (same op DeepSeek-V3 uses) when the config is
+        # eligible and none of the parity-breaking mutation controls are active.
+        # The eager path below stays the reference for those controls, for
+        # softmax scoring, for ``moe_renormalize=False``, and for grouped /
+        # oversized configs the kernel does not support.
+        self._routing_impl = Deepseekv3RoutingImpl(
+            top_k=self.top_k,
+            n_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            routed_scaling_factor=self.routed_scaling_factor,
+            is_fused=True,
+        )
+        # Bounds mirror the n_group == 1 branch of
+        # ``Deepseekv3RoutingImpl.noaux_tc`` (num_experts <= 1024, top_k <= 32);
+        # staying inside them guarantees the fused kernel branch is taken (never
+        # the impl's own PyTorch fallback, whose grouped path differs from K3's).
+        self._use_fused_routing = (
+            self.moe_router_activation_func == "sigmoid"
+            and self.num_expert_group == 1
+            and self.moe_renormalize
+            and self.top_k > 1
+            and self.num_experts <= 1024
+            and self.top_k <= 32
+            and not softmax_routing_mutation
+            and not biased_weights_mutation
+            and not omit_renormalize_mutation
+        )
+
+    def _score(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.softmax_routing_mutation:
+            return logits.softmax(dim=1)
+        if self.moe_router_activation_func == "sigmoid":
+            return logits.sigmoid()
+        return logits.softmax(dim=1)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Routing logits ``[num_tokens, num_experts]``, fp32, pre-sigmoid.
+
+        Used when the MoE block is hosted under ``ConfigurableMoE``: the
+        post-linear gate math (sigmoid, bias-for-selection, renormalize,
+        ``routed_scaling_factor``) runs inside the wrapper's routing method
+        per chunk; only the gate GEMM stays here, keeping the checkpoint
+        parameter mapping identity.
+        """
+        hidden_2d = hidden_states.reshape(-1, self.gating_dim)
+        if self.weight.dtype == torch.bfloat16 and hidden_2d.dtype == torch.bfloat16:
+            # Single bf16xbf16 -> fp32 GEMM (fp32 accumulate); no input
+            # upcast kernel, no fp32 splitK-reduce. K3's 896 experts miss
+            # the op's specialized 256-expert kernels and take its cublas
+            # path, which is the point here (one fused kernel).
+            return torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_2d.contiguous(),
+                self.weight.t(),
+                bias=None,
+                out_dtype=torch.float32,
+            )
+        return torch.nn.functional.linear(
+            hidden_2d.type(torch.float32),
+            self.weight.type(torch.float32),
+            None,
+        )
+
+    @property
+    def routing_method(self) -> DeepSeekV3MoeRoutingMethod:
+        """Return the shared DeepSeekV3 router used by ConfigurableMoE."""
+        if self.moe_router_activation_func != "sigmoid":
+            raise ValueError("Kimi K3 ConfigurableMoE routing requires sigmoid scores.")
+        if not self.moe_renormalize:
+            raise ValueError(
+                "Kimi K3 ConfigurableMoE routing requires top-k weight renormalization."
+            )
+        if (
+            self.softmax_routing_mutation
+            or self.biased_weights_mutation
+            or self.omit_renormalize_mutation
+        ):
+            raise ValueError(
+                "Kimi K3 routing mutation flags are reference-test controls "
+                "and cannot be used by ConfigurableMoE."
+            )
+        return DeepSeekV3MoeRoutingMethod(
+            top_k=self.top_k,
+            n_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            routed_scaling_factor=self.routed_scaling_factor,
+            callable_e_score_correction_bias=lambda: self.e_score_correction_bias,
+            is_fused=True,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits = self.compute_logits(hidden_states)
+        # ``compute_logits`` flattens to [num_tokens, num_experts]; derive
+        # the token count from it so any input rank works.
+        num_tokens = logits.shape[0]
+
+        # ``trtllm::noaux_tc_op`` is a CUDA-only custom op; CPU inputs
+        # (reference / parity tests) fall through to the eager path below,
+        # which stays the routing-contract reference on every device.
+        if self._use_fused_routing and logits.is_cuda:
+            # One fused kernel replaces the sigmoid -> (+bias) -> top-k ->
+            # gather -> renormalize -> scale chain below. ``noaux_tc`` returns
+            # (weights, indices); return the eager dtype contract -- int64
+            # indices (as ``torch.topk`` yields) and fp32 weights -- so every
+            # downstream consumer is byte-for-byte unaffected by the swap.
+            topk_weight, topk_idx = self._routing_impl.noaux_tc(
+                logits, self.e_score_correction_bias.float()
+            )
+            return topk_idx.to(torch.int64), topk_weight.to(torch.float32)
+
+        scores = self._score(logits)
+        scores = scores.view(num_tokens, -1)
+
+        # Bias is applied for *selection*, not for the returned weight.
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+
+        if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
+            group_scores = (
+                scores_for_choice.view(num_tokens, self.num_expert_group, -1)
+                .topk(2, dim=-1)[0]
+                .sum(dim=-1)
+            )
+            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(1, group_idx, 1)
+            score_mask = (
+                group_mask.unsqueeze(-1)
+                .expand(
+                    num_tokens,
+                    self.num_expert_group,
+                    self.num_experts // self.num_expert_group,
+                )
+                .reshape(num_tokens, -1)
+            )
+            tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+        else:
+            tmp_scores = scores_for_choice
+
+        _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
+
+        # Positive contract: gather from raw ``scores`` (not bias-adjusted).
+        weight_source = scores_for_choice if self.biased_weights_mutation else scores
+        topk_weight = weight_source.gather(1, topk_idx)
+
+        if self.top_k > 1 and self.moe_renormalize and not self.omit_renormalize_mutation:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        topk_weight = topk_weight * self.routed_scaling_factor
+        return topk_idx, topk_weight
+
+
+def copy_hf_moe_gate_weights(
+    hf: nn.Module,
+    k3: KimiK3MoEGate,
+) -> dict[str, tuple[tuple[int, ...], str]]:
+    """Copy parameters from HF ``KimiMoEGate`` into ``k3``.
+
+    Identity name mapping (``weight`` + ``e_score_correction_bias``).
+    Returns a ``{name: (shape, dtype)}`` provenance dict.
+    """
+    src_params = dict(hf.named_parameters())
+    dst_params = dict(k3.named_parameters())
+    missing_on_k3 = sorted(set(src_params) - set(dst_params))
+    missing_on_hf = sorted(set(dst_params) - set(src_params))
+    if missing_on_k3:
+        raise KeyError(f"copy_hf_moe_gate_weights: HF params missing on K3: {missing_on_k3}")
+    if missing_on_hf:
+        raise KeyError(f"copy_hf_moe_gate_weights: K3 params missing on HF: {missing_on_hf}")
+    provenance = {}
+    for name, src in src_params.items():
+        dst = dst_params[name]
+        if src.shape != dst.shape:
+            raise ValueError(
+                f"shape mismatch for {name}: HF {tuple(src.shape)} vs K3 {tuple(dst.shape)}"
+            )
+        with torch.no_grad():
+            dst.data.copy_(src.data.to(dtype=dst.dtype, device=dst.device))
+        provenance[name] = (tuple(src.shape), str(src.dtype))
+    return provenance
 
 
 def _resolve_fp8_weight_read_gates() -> tuple[bool, bool, bool]:
@@ -718,8 +1467,6 @@ class KimiK3MoERuntime(nn.Module):
             model_config=routed_moe_model_config,
             override_quant_config=routed_quant_config,
             layer_idx=layer_idx,
-            # Let CommunicationFactory select the best available strategy.
-            communication_method=None,
         )
         if routed_moe_model_config.moe_backend == "TRTLLM":
             routed_moe_kwargs.update(
@@ -1940,8 +2687,6 @@ class KimiMLARuntime(nn.Module):
         allreduce_strategy=AllReduceStrategy.AUTO,
     ):
         super().__init__()
-
-        from ..modules.kimi_k3_mla import KimiK3MLAAttention
 
         max_positions = int(
             os.environ.get(

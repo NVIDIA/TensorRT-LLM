@@ -41,13 +41,12 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import (
     _K3_MOE_EP_ENV,
     _K3_MOE_TP_ENV,
+    KimiK3MoEGate,
     KimiK3MoERuntime,
 )
-from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
 from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
     _MEGA_MOE_SYMM_BUFFER_CACHE,
 )
-from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping
@@ -198,51 +197,6 @@ def test_kimi_gate_reuses_deepseek_v3_routing():
         expected_weights.gather(1, expected_order),
         actual_weights.gather(1, actual_order),
     )
-
-
-def test_communication_factory_accepts_model_selected_method(monkeypatch):
-    mapping = SimpleNamespace(
-        enable_attention_dp=True,
-        dp_size=16,
-        moe_tp_size=1,
-        moe_ep_size=16,
-    )
-    model_config = SimpleNamespace(
-        mapping=mapping,
-        pretrained_config=SimpleNamespace(hidden_size=3584),
-        torch_dtype=torch.bfloat16,
-        quant_config=None,
-        max_num_tokens=4096,
-        moe_max_num_tokens=65536,
-        use_cuda_graph=False,
-        use_low_precision_moe_combine=False,
-    )
-    selected = object()
-    method = None
-
-    def create_forced_method(force_method, *args, **kwargs):
-        nonlocal method
-        method = force_method
-        return selected
-
-    monkeypatch.delenv("TRTLLM_FORCE_COMM_METHOD", raising=False)
-    monkeypatch.setattr(
-        CommunicationFactory,
-        "_create_forced_method",
-        staticmethod(create_forced_method),
-    )
-    actual = CommunicationFactory.create_strategy(
-        model_config=model_config,
-        num_experts=896,
-        num_slots=896,
-        top_k=16,
-        expert_size_per_partition=56,
-        hidden_size=3584,
-        communication_method="ALLGATHER",
-    )
-
-    assert method == "ALLGATHER"
-    assert actual is selected
 
 
 @situ_supported
@@ -682,7 +636,6 @@ def _make_routed_moe(
         model_config=model_config,
         override_quant_config=QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8),
         layer_idx=0,
-        communication_method=None,
     )
     if moe_backend == "TRTLLM":
         moe_kwargs.update(
