@@ -188,6 +188,33 @@ def test_selfsampling_topk_values_short_path():
     assert bool((indices[:, n_valid:] == -1).all())
 
 
+@pytest.mark.parametrize("hint_kind", ["all_zero", "all_same", "all_max", "half_dup"])
+@pytest.mark.parametrize(
+    "top_k,n_valid", [(512, 8192), (2048, 131075)], ids=["k512_n8192", "k2048_n131075"]
+)
+def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
+    """Hints only steer the sampling ladder — exactness must survive the
+    degenerate hint buffers production can produce: the all-zero cold start
+    (dsa.py ``heuristic_prev_topk.zero_()`` init corners), fully duplicated
+    hints, and max-index hints (hint-robustness class of PR #17550)."""
+    logits, _, indices, ref_vals = _make_case(2, n_valid, top_k, seed=n_valid + top_k)
+    if hint_kind == "all_zero":
+        pre_idx = torch.zeros((2, top_k), dtype=torch.int32, device=_DEV)
+    elif hint_kind == "all_same":
+        pre_idx = torch.full((2, top_k), 1234, dtype=torch.int32, device=_DEV)
+    elif hint_kind == "all_max":
+        pre_idx = torch.full((2, top_k), n_valid - 1, dtype=torch.int32, device=_DEV)
+    else:
+        gen = torch.Generator(device=_DEV).manual_seed(1)
+        pre_idx = torch.randint(
+            0, n_valid, (2, top_k), generator=gen, dtype=torch.int32, device=_DEV
+        )
+        pre_idx[:, top_k // 2 :] = pre_idx[:, :1]
+    ss_host.run(logits, pre_idx, n_valid, indices)
+    torch.cuda.synchronize()
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
 def test_selfsampling_topk_run_ws_explicit_workspace():
     """run_ws with a caller-owned workspace must agree with run()."""
     top_k, n_valid = 1024, 65536
