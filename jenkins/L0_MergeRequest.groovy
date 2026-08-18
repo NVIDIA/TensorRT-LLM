@@ -152,7 +152,7 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def DISABLE_CBTS = "disable_cbts"
-// Kill switch for CBTS per-test coverage; temporarily enabled for all pipelines for CI validation.
+// Kill switch for CBTS per-test coverage; official post-merge pipeline only.
 @Field
 def ENABLE_CBTS_COVERAGE = true
 @Field
@@ -361,8 +361,8 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
     testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
     // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
-    // Temporarily allow coverage outside the official post-merge pipeline for CI validation.
-    testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE
+    // Coverage runs only on the official post-merge pipeline.
+    testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
     getContainerURIs().each { k, v ->
