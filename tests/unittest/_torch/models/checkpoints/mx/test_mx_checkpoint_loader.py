@@ -14,6 +14,7 @@ assertion is about our dependency handling, not the upstream API.
 """
 
 import json
+import logging
 import os
 import sys
 from contextlib import ExitStack
@@ -153,6 +154,25 @@ class TestConstruction:
 
         loader._source_identity_compatible_for_last_load = True
         assert loader.is_post_transform_weights_preloaded() is True
+
+    @pytest.mark.parametrize(
+        ("effective_level", "expected_level"),
+        ((logging.WARNING, logging.INFO), (logging.DEBUG, None)),
+    )
+    def test_transfer_log_dir_enables_info_records(
+        self, monkeypatch, effective_level, expected_level
+    ):
+        monkeypatch.setenv("MX_TRANSFER_LOG_DIR", "/tmp/mx-transfer-logs")
+        mx_logger = MagicMock()
+        mx_logger.getEffectiveLevel.return_value = effective_level
+
+        with patch.object(mx_checkpoint_loader.logging, "getLogger", return_value=mx_logger):
+            mx_checkpoint_loader._enable_mx_transfer_logging()
+
+        if expected_level is None:
+            mx_logger.setLevel.assert_not_called()
+        else:
+            mx_logger.setLevel.assert_called_once_with(expected_level)
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1034,35 @@ class TestMxSourceQueryTimeoutDefault:
         mx_loader = fake_mx.trtllm_live_transfer.MxLiveWeightLoader.return_value
         mx_loader.load_weights.assert_called_once()
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
+
+    def test_zero_timeout_falls_back_before_receiver_preparation(self):
+        identity = _identity()
+        disk_weights = {"disk.weight": MagicMock()}
+        prepare_receiver = MagicMock()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001", query_timeout_s=0)
+        fake_mx = _build_fake_modelexpress()
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(
+                HfCheckpointLoader, "load_weights", return_value=disk_weights
+            ) as mock_super_load,
+        ):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+                allow_post_transform_weights=True,
+                prepare_post_transform_receiver=prepare_receiver,
+            )
+
+        assert result is disk_weights
+        assert loader.is_weights_preloaded() is False
+        assert loader.is_post_transform_weights_preloaded() is False
+        prepare_receiver.assert_not_called()
+        fake_mx.trtllm_live_transfer.MxLiveWeightLoader.assert_not_called()
+        mock_super_load.assert_called_once()
 
     def test_existing_source_keeps_upstream_default_when_unset(self):
         identity = _identity()

@@ -202,6 +202,10 @@ class ReuseMatch(NamedTuple):
     blocks: list["Block"]
     num_tokens: int
     num_lookup_tokens: int
+    # Internal diagnostic: the prefix the attention pages alone would support,
+    # i.e. before recurrent-state (SSM) snapshot availability shortened it.
+    # Equal to num_tokens when the model has no SSM life cycle.
+    num_tokens_before_hybrid_pruning: int = 0
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -705,13 +709,18 @@ class BlockRadixTree:
                 block = partial_block
                 yield block, match_len
 
-    def _prune_match(self, matched: list[tuple[Block, int]]) -> list[tuple[Block, int]]:
+    def _prune_match(
+        self, matched: list[tuple[Block, int]], ssm_lc_id: LifeCycleId | None
+    ) -> list[tuple[Block, int]]:
+        """Shorten `matched` to the prefix that is actually reusable.
+
+        Passing ssm_lc_id=None skips the recurrent-snapshot constraint and yields
+        the attention-only prefix (used for num_tokens_before_hybrid_pruning).
+        """
         tokens_per_block = self._tokens_per_block
         assert all(b[1] == tokens_per_block for b in matched[:-1])
 
-        life_cycles = self._life_cycles
-        attn_life_cycles = list(life_cycles.attention_life_cycles())
-        ssm_lc_id = life_cycles.ssm_life_cycle_id
+        attn_life_cycles = list(self._life_cycles.attention_life_cycles())
 
         # Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
         # shorten the match to the coverage of a required page. Every retry strictly
@@ -773,13 +782,23 @@ class BlockRadixTree:
         The result is volatile: callers that need to reuse the returned blocks must
         acquire ownership of the pages before depending on them.
         """
-        matched = self._prune_match(
-            list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        raw_matched = list(self._match_token_path(reuse_scope, tokens, enable_partial_match))
+        ssm_lc_id = self._life_cycles.ssm_life_cycle_id
+        # Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
+        # the prefix the attention pages alone support. Only hybrid models pay for
+        # the second pass; without an SSM life cycle the two results are identical.
+        attn_only_tokens = (
+            self._num_matched_tokens(self._prune_match(list(raw_matched), None))
+            if ssm_lc_id is not None
+            else None
         )
+        matched = self._prune_match(raw_matched, ssm_lc_id)
+        num_tokens = self._num_matched_tokens(matched)
         return ReuseMatch(
             [block for block, _ in matched],
-            self._num_matched_tokens(matched),
+            num_tokens,
             len(tokens),
+            num_tokens if attn_only_tokens is None else attn_only_tokens,
         )
 
     def _check_sanity(self) -> bool:
