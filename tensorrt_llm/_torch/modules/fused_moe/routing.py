@@ -651,6 +651,20 @@ class MiniMaxM2MoeRoutingMethod(BaseMoeRoutingMethod):
         return RoutingMethodType.MiniMax2
 
 
+class SqrtSoftplusMoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
+    """MiniMaxM2 routing with sqrt-softplus scoring instead of sigmoid, for
+    checkpoints trained with sqrt-softplus (DeepSeek-V4 style). Only the scoring
+    nonlinearity changes; ``apply`` and ``routing_method_type`` are inherited.
+    """
+
+    @staticmethod
+    @torch.compile(options={"max-autotune": True})
+    def get_scores(logits, e_score_correction_bias):
+        scores = torch.sqrt(F.softplus(logits.float()))
+        scores_with_bias = scores + e_score_correction_bias
+        return scores, scores_with_bias
+
+
 class MiniMaxM3MoeRoutingMethod(MiniMaxM2MoeRoutingMethod):
     """MiniMax-M3 routing: sigmoid -> add bias -> top-k -> renorm -> scale.
 
