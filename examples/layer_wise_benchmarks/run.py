@@ -53,7 +53,9 @@ parser.add_argument(
 parser.add_argument("--load-format", type=str, choices=["AUTO", "DUMMY"])
 parser.add_argument("--max-num-tokens", type=int)
 parser.add_argument("--moe-backend", type=str)
-parser.add_argument("--moe-backend-for-prefill", type=str, choices=["CUTLASS", "DEEPGEMM"])
+# No choices= (same as --moe-backend above): both flags feed MoeConfig.backend,
+# whose Literal is the authoritative list. A second list here can only drift.
+parser.add_argument("--moe-backend-for-prefill", type=str)
 parser.add_argument("--moe-max-num-tokens", type=int)
 group = parser.add_mutually_exclusive_group()
 group.add_argument(

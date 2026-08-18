@@ -82,6 +82,7 @@ from ..._utils import binding_to_torch_dtype, mpi_rank, nvtx_range, str_dtype_to
 from ...logger import logger
 from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -939,7 +940,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"unique values={set(self.head_dim_per_layer)}"
                 )
 
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
 
         max_util_for_resume = kv_cache_config.max_util_for_resume
         quota = sys.maxsize
@@ -1029,6 +1030,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{local_ranks} co-located rank(s) on this node, "
                 f"available host memory {mem_available / (1 << 30):.2f}GiB"
             )
+            # Auto sizing reads rank-local host state, so co-scheduled ranks
+            # can get divergent host quotas (observed up to 10x). Divergent
+            # host-tier retention makes per-rank schedulers disagree, which
+            # wedges collectives on non-attention-DP TP. Sync to the fleet
+            # minimum, like the device quota above.
+            if mapping.world_size > 1:
+                host_quota = Distributed.get(mapping).allreduce(host_quota, op=ReduceOp.MIN)
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
@@ -2512,6 +2520,13 @@ class KVCacheManagerV2(BaseResourceManager):
                         cache_salt=req.cache_salt,
                         is_dummy=req.is_dummy,
                     )
+                    if kv_cache is None:
+                        # Saturated IndexMapper (e.g. slots held by disagg
+                        # generation transfers in flight): skip mirroring this
+                        # request for now; it is retried next iteration once
+                        # slots free up, before the request runs any spec-dec
+                        # forward that needs the mirror.
+                        continue
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
