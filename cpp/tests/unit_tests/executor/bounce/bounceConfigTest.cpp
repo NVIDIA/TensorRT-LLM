@@ -139,6 +139,9 @@ TEST(BounceConfig, DescriptiveNamesParse)
     EXPECT_EQ(cfg.scatterWorkerCount, 7u);
     EXPECT_EQ(cfg.minDescriptorCount, 8u);
     EXPECT_EQ(cfg.requestTimeoutMs, 900);
+    // Lease/quarantine are derived from the request timeout, not independent env knobs.
+    EXPECT_EQ(cfg.receiverFlowTimeoutMs, 1800);
+    EXPECT_EQ(cfg.quarantineMs, 900);
     EXPECT_TRUE(cfg.disableFabricMemory);
     EXPECT_FALSE(cfg.enableEagerGather);
     EXPECT_FALSE(cfg.useZeroCopyArguments);
