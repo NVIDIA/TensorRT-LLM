@@ -160,8 +160,10 @@ Python client through the optional `mx` extra:
 pip install "tensorrt-llm[mx]"
 ```
 
-The extra pins the ModelExpress client to version `0.4.1`, matching the client
-API qualified by this integration. Deploy a compatible MX server version.
+The extra accepts ModelExpress client versions `>=0.4.1,<0.6.0`. Version
+`0.4.1` is the minimum client API qualified by this integration, while the
+upper bound prevents resolving unqualified `0.6.0` or newer client APIs.
+Deploy a compatible MX server version.
 The extra can be added to an existing TensorRT LLM installation. If the MX
 loading path is configured but the client cannot be imported, TensorRT LLM
 fails with an actionable installation message instead of silently loading from

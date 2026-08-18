@@ -7,7 +7,7 @@ native SiTU kernel path; the serving runtime (``KimiK3MoERuntime`` in
 ``modeling_kimi_linear.py``) does not use it. Structural mirror of HF
 ``KimiSparseMoeBlock`` at ``modeling_kimi.py:806-918`` end to end:
 
-* :class:`KimiK3MoEGate` for routing (see :mod:`kimi_k3_moe_gate`).
+* :class:`KimiK3ReferenceMoEGate` for eager reference routing.
 * :class:`KimiK3RoutedExpertBank` — per-expert MXFP4-packed
   ``w1 / w2 / w3`` linear weights (group_size=32), dequantized on the
   fly during the Python fallback path.
@@ -59,15 +59,53 @@ from _torch.modules.moe.kimi_k3_ref_moe._mxfp4 import (
     dequantize_last_dim_mxfp4,
     quantize_last_dim_mxfp4,
 )
+from _torch.modules.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP, NonSituActivation
 from torch import nn
 
-from tensorrt_llm._torch.modules.kimi_k3_moe._mlp import (
-    KimiK3MLP,
-    KimiK3RMSNorm,
-    NonSituActivation,
-    SituAndMul,
-)
-from tensorrt_llm._torch.modules.kimi_k3_moe.kimi_k3_moe_gate import KimiK3MoEGate
+from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate, KimiK3RMSNorm
+from tensorrt_llm._torch.modules.situ import SituAndMul
+
+
+class KimiK3ReferenceMoEGate(KimiK3MoEGate):
+    """Eager HF-compatible Kimi K3 routing reference."""
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = self.compute_logits(hidden_states)
+        num_tokens = logits.shape[0]
+        if self.moe_router_activation_func == "sigmoid":
+            scores = logits.sigmoid()
+        else:
+            scores = logits.softmax(dim=1)
+        scores = scores.view(num_tokens, -1)
+
+        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        if self.num_expert_group > 1 and self.num_expert_group > self.topk_group:
+            group_scores = (
+                scores_for_choice.view(num_tokens, self.num_expert_group, -1)
+                .topk(2, dim=-1)[0]
+                .sum(dim=-1)
+            )
+            group_indices = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
+            group_mask = torch.zeros_like(group_scores)
+            group_mask.scatter_(1, group_indices, 1)
+            score_mask = (
+                group_mask.unsqueeze(-1)
+                .expand(
+                    num_tokens,
+                    self.num_expert_group,
+                    self.num_experts // self.num_expert_group,
+                )
+                .reshape(num_tokens, -1)
+            )
+            scores_for_selection = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+        else:
+            scores_for_selection = scores_for_choice
+
+        topk_indices = torch.topk(scores_for_selection, k=self.top_k, dim=-1, sorted=False)[1]
+        topk_weights = scores.gather(1, topk_indices)
+        if self.top_k > 1 and self.moe_renormalize:
+            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        return topk_indices, topk_weights * self.routed_scaling_factor
 
 
 class KimiK3RoutedExpertBank(nn.Module):
@@ -315,7 +353,7 @@ class KimiK3SparseMoeBlock(nn.Module):
         else:
             routed_activation = SituAndMul(beta=situ_beta, linear_beta=situ_linear_beta)
 
-        self.gate = KimiK3MoEGate(config, device=device)
+        self.gate = KimiK3ReferenceMoEGate(config, device=device)
 
         # Routed expert storage — the MXFP4 bank is always the checkpoint
         # quantization source of truth. The fused path derives its packed
