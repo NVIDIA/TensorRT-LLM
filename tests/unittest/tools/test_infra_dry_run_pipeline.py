@@ -160,12 +160,27 @@ class InfraDryRunPipelineTest(unittest.TestCase):
     def test_dry_run_limits_collection_to_rendered_nodeids(self):
         targets = _function_body(L0_TEST, "getInfraDryRunPytestTargets", "processShardTestList")
         preprocessing = _function_body(L0_TEST, "processShardTestList", "isValidSlurmJobId")
+        expected_target = (
+            "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
+        )
         self.assertIn("if (!isInfraDryRun())", targets)
         self.assertIn('.findAll { it.contains("::") }', targets)
+        self.assertIn(f'"{expected_target}"', targets)
+        self.assertIn("if (targets != [expectedTarget])", targets)
         self.assertIn(
             "testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)",
             preprocessing,
         )
+
+    def test_dry_run_rejects_shell_metacharacters_in_rendered_target(self):
+        targets = _function_body(L0_TEST, "getInfraDryRunPytestTargets", "processShardTestList")
+        expected_target = (
+            "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
+        )
+        metacharacter_target = f"{expected_target};touch${{IFS}}/tmp/infra-dry-run"
+        parsed_targets = [metacharacter_target.split(maxsplit=1)[0]]
+        self.assertNotEqual(parsed_targets, [expected_target])
+        self.assertIn("if (targets != [expectedTarget])", targets)
 
     def test_dry_run_conftest_does_not_require_product_bindings(self):
         dry_guard = '_INFRA_DRY_RUN = os.environ.get("TRTLLM_INFRA_DRY_RUN", "").lower() == "true"'
