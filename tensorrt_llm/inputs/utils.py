@@ -476,8 +476,24 @@ class MultimodalDataTracker:
         `index` is the item's position in `multi_modal_data[modality]`;
         `placeholder` is the exact string the input processor will look
         for when splicing this item's encoder embedding.
+
+        Items are recorded in chat-part send order. When the model's chat
+        template regroups placeholders by modality (declared via
+        `MultimodalPlaceholderMetadata.prompt_modality_order`), sort by
+        that priority so the returned list matches what the template
+        actually emits — preserving per-modality send order as the tie
+        break.
         """
-        return list(self._item_order)
+        prompt_order = MULTIMODAL_PLACEHOLDER_REGISTRY.get_prompt_modality_order(
+            self._model_type)
+        if not prompt_order:
+            return list(self._item_order)
+        rank = {m: i for i, m in enumerate(prompt_order)}
+        return sorted(
+            self._item_order,
+            key=lambda e:
+            (rank.get(e["modality"], len(prompt_order)), e["index"]),
+        )
 
 
 def add_multimodal_placeholders(
