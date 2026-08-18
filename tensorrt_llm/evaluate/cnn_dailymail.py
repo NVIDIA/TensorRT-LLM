@@ -64,6 +64,7 @@ class CnnDailymail(Evaluator):
 
     def compute_score(self, outputs: List[RequestOutput],
                       references: List[str]) -> float:
+        rouge1 = 0.0
         for beam_idx in range(len(outputs[0].outputs)):
             metrics = self.rouge.compute(
                 predictions=[output.outputs[0].text for output in outputs],
