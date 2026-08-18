@@ -215,6 +215,83 @@ def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
+def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
+    """Build a per-row-poisoned varlen batch, run run_varlen, verify every
+    row against its own n_r (production formula) — short rows included."""
+    batch, rows = len(kv), len(kv) * next_n
+    n_r = [(kv[r // next_n] - next_n + (r % next_n) + 1) // cr for r in range(rows)]
+    npad = (max(n_r) + 63) // 64 * 64
+    gen = torch.Generator(device=_DEV).manual_seed(seed)
+    logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+    for r in range(rows):
+        logits[r, n_r[r] :] = 3e38  # poison beyond each row's OWN n_r
+    pre_idx = torch.empty((batch, top_k), dtype=torch.int32, device=_DEV)
+    for q in range(batch):
+        nmin = max(min(n_r[q * next_n : (q + 1) * next_n]), 1)
+        pre_idx[q] = torch.randint(0, nmin, (top_k,), generator=gen, dtype=torch.int32, device=_DEV)
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    values = (
+        torch.full((rows, top_k), 7.0, dtype=torch.float32, device=_DEV) if with_values else None
+    )
+    kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, pre_idx, kv_lens, indices, next_n=next_n, compress_ratio=cr, values=values)
+    torch.cuda.synchronize()
+    fmin = torch.finfo(torch.float32).min
+    for r in range(rows):
+        n = n_r[r]
+        if n <= top_k:
+            head = indices[r, :n].to(torch.int64)
+            assert torch.equal(torch.sort(head).values, torch.arange(n, device=_DEV))
+            assert bool((indices[r, n:] == -1).all())
+            if values is not None:
+                assert torch.equal(values[r, :n], logits[r, :n])
+                assert bool((values[r, n:] == fmin).all())
+        else:
+            idx = indices[r].to(torch.int64)
+            assert int(idx.min()) >= 0 and int(idx.max()) < n
+            assert int(torch.unique(idx).numel()) == top_k
+            ref = torch.topk(logits[r, :n], top_k).values
+            got = torch.sort(torch.gather(logits[r], 0, idx) + 0.0, descending=True).values
+            assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values), f"row {r} inexact"
+            if values is not None:
+                assert torch.equal(values[r], torch.gather(logits[r], 0, idx))
+
+
+@pytest.mark.parametrize(
+    "kv,next_n,cr,top_k",
+    [
+        ([33000, 8200, 300], 1, 1, 512),  # v3.2-style heterogeneous + short row
+        ([131075, 32800, 2000], 1, 4, 512),  # v4-style compressed index space
+        ([9000, 5001], 2, 1, 512),  # MTP: n varies per row within a request
+        ([65540], 4, 4, 1024),  # MTP: compressed-boundary-crossing rows
+    ],
+    ids=["cr1_hetero_short", "cr4_hetero_short", "cr1_mtp2", "cr4_mtp4"],
+)
+def test_selfsampling_topk_varlen(kv, next_n, cr, top_k):
+    """run_varlen production contract: per-row n from device kv_lens with the
+    MTP window formula, request-level hints, per-row short path."""
+    _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr)
+
+
+def test_selfsampling_topk_varlen_values():
+    _run_varlen_case([40000, 1900], 2, 4, 512, seed=5, with_values=True)
+
+
+def test_selfsampling_topk_varlen_guards():
+    logits = torch.randn((2, 8192), dtype=torch.float32, device=_DEV)
+    pre_idx = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
+    indices = torch.zeros((2, 512), dtype=torch.int32, device=_DEV)
+    kv = torch.tensor([8192, 8192], dtype=torch.int32, device=_DEV)
+    with pytest.raises(RuntimeError, match="kv_lens length"):
+        ss_host.run_varlen(logits, pre_idx, kv[:1], indices)
+    with pytest.raises(RuntimeError, match="not divisible"):
+        ss_host.run_varlen(logits, pre_idx, kv, indices, next_n=3)
+    with pytest.raises(RuntimeError, match="compress_ratio"):
+        ss_host.run_varlen(logits, pre_idx, kv, indices, compress_ratio=2)
+    with pytest.raises(RuntimeError, match="CUDA tensor"):
+        ss_host.run_varlen(logits, pre_idx, kv.cpu(), indices)
+
+
 def test_selfsampling_topk_run_ws_explicit_workspace():
     """run_ws with a caller-owned workspace must agree with run()."""
     top_k, n_valid = 1024, 65536

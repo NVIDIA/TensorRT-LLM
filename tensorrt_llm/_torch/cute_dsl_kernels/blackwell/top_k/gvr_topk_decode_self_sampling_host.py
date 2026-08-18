@@ -846,10 +846,86 @@ def run_ws(logits, pre_idx, n_valid, indices, workspace, values=None):
     _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values)
 
 
+def run_varlen(logits, pre_idx, kv_lens, indices, next_n=1, compress_ratio=1, values=None):
+    """Production-contract varlen entry — REFERENCE implementation.
+
+    Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
+    ``cute_dsl_gvr_topk_decode`` runner):
+
+      ``num_rows = logits.shape[0]``, ``batch = num_rows // next_n``;
+      ``kv_lens`` int32 ``[batch]`` — per-request TOTAL cache length in
+      UNCOMPRESSED token space (dsa.py ``metadata.kv_lens_cuda_runtime``,
+      not new-token seq_lens); row ``r`` uses
+      ``n_r = (kv_lens[r // next_n] - next_n + (r % next_n) + 1) //
+      compress_ratio`` valid entries (cr 1 = DSv3.2, 4 = DSv4 Flash/Pro);
+      ``pre_idx`` ``[batch, k]`` is REQUEST-level raw prev-step top-K,
+      shared by a request's ``next_n`` rows (offset-free hint contract);
+      per-row ``n_r <= k`` takes the short path (identity + ``-1`` tail).
+
+    REFERENCE ENGINE: one host read of ``kv_lens`` (a documented D2H sync —
+    raises under CUDA-graph capture), then each row is driven through the
+    batch-uniform engine as a b=1 launch. Correctness-first scaffolding: it
+    pins the varlen/MTP contract and its test battery; the per-row in-kernel
+    rewrite replaces the loop without changing either.
+    """
+    if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
+        raise RuntimeError("kv_lens must be a CUDA tensor")
+    if kv_lens.dtype is not _I32:
+        raise RuntimeError("kv_lens must be int32")
+    if kv_lens.dim() != 1:
+        raise RuntimeError("kv_lens must be 1-D")
+    nn = _index(next_n)
+    cr = _index(compress_ratio)
+    if nn < 1:
+        raise RuntimeError(f"next_n must be >= 1, got {nn}")
+    if cr not in (1, 4):
+        raise RuntimeError(f"compress_ratio must be 1 (DSv3.2) or 4 (DSv4), got {cr}")
+    if len(logits.shape) != 2:
+        raise RuntimeError("logits must be 2-D")
+    num_rows = logits.shape[0]
+    if num_rows == 0:
+        return
+    if num_rows % nn:
+        raise RuntimeError(f"num_rows {num_rows} not divisible by next_n {nn}")
+    batch = num_rows // nn
+    if kv_lens.shape[0] != batch:
+        raise RuntimeError(f"kv_lens length {kv_lens.shape[0]} != num_rows/next_n = {batch}")
+    if len(pre_idx.shape) != 2 or pre_idx.shape[0] != batch:
+        raise RuntimeError(
+            f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
+        )
+    if _is_capturing():
+        raise RuntimeError(
+            "run_varlen reference implementation reads kv_lens on host, "
+            "illegal under CUDA graph capture"
+        )
+    d = logits.get_device()
+    if not 0 <= d < _GVR_MAX_DEV:
+        raise RuntimeError(f"device index out of range: {d}")
+    ws = _ws_hot.get(d)
+    if ws is None:
+        ws = default_workspace(logits)
+    kl = kv_lens.tolist()  # the ONE documented D2H sync of this entry
+    for r in range(num_rows):
+        actual = kl[r // nn] - nn + (r % nn) + 1
+        if actual < 0:
+            raise RuntimeError(f"row {r}: kv_len {kl[r // nn]} < next_n {nn}")
+        req = r // nn
+        _run_impl(
+            logits[r : r + 1],
+            pre_idx[req : req + 1],
+            actual // cr,
+            indices[r : r + 1],
+            ws,
+            None if values is None else values[r : r + 1],
+        )
+
+
 __all__ = [
     "route",
     "run",
     "run_ws",
+    "run_varlen",
     "workspace_bytes",
     "WS_BYTES",
     "default_workspace",
