@@ -385,7 +385,8 @@ public:
         std::optional<torch::Tensor> relative_attention_bias,
         std::optional<torch::Tensor> quant_scale_qkv = std::nullopt,
         std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache = std::nullopt,
-        bool enable_dsv4_epilogue_fusion = false) const
+        bool enable_dsv4_epilogue_fusion = false, std::optional<torch::Tensor> kv_norm_weight = std::nullopt,
+        double kv_norm_eps = 1e-6) const
         = 0;
 };
 
@@ -456,7 +457,8 @@ public:
         std::optional<torch::Tensor> flash_mla_num_splits, bool trtllm_gen_jit_warmup,
         std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
         std::optional<torch::Tensor> relative_attention_bias, std::optional<torch::Tensor> quant_scale_qkv,
-        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion) const override
+        std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
+        std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -523,6 +525,44 @@ public:
                     ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
                     : nullptr;
                 mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
+
+                // Fused kv_a_layernorm: the norm weight implies `latent_cache` is the
+                // RAW kv_a_proj output, with the caller's RMSNorm and concat dropped.
+                if (kv_norm_weight.has_value())
+                {
+                    TORCH_CHECK(kv_norm_weight->is_cuda(), "kv_norm_weight must be a CUDA tensor");
+                    TORCH_CHECK(kv_norm_weight->is_contiguous(), "kv_norm_weight must be contiguous");
+                    TORCH_CHECK(kv_norm_weight->scalar_type() == qkv_or_q.scalar_type(),
+                        "kv_norm_weight dtype must match the activation dtype");
+                    TORCH_CHECK(latent_cache.has_value(),
+                        "fused kv-norm needs latent_cache (the raw kv_a_proj output) to be provided");
+                    // The kernel norms the whole latent row, so a narrower weight would
+                    // read out of bounds. dsv3RopeOp.cpp checks the same on the
+                    // generation side.
+                    // `mla_params.meta` is not assigned until further below; read the op's copy.
+                    auto const kv_norm_width = op.mMLAParams.kv_lora_rank + op.mMLAParams.qk_rope_head_dim;
+                    TORCH_CHECK(kv_norm_weight->numel() == kv_norm_width,
+                        "kv_norm_weight must span kv_lora_rank + qk_rope_head_dim (", kv_norm_width, "), got ",
+                        kv_norm_weight->numel());
+                    // A last-dim slice, so rows are wider than the row itself. Forward
+                    // the real stride; only the innermost dim must be unit-stride.
+                    TORCH_CHECK(latent_cache->dim() == 2, "latent_cache must be 2D for fused kv-norm, got ",
+                        latent_cache->dim(), "D");
+                    TORCH_CHECK(latent_cache->stride(1) == 1, "latent_cache must be unit-stride in its last dim");
+                    // The kernel walks rows with 16-byte vector loads, so a row start
+                    // that is not 16B-aligned faults with a bare misaligned-address
+                    // error far from here.
+                    auto const kEltsPer16B = 16 / latent_cache->element_size();
+                    TORCH_CHECK(latent_cache->stride(0) % kEltsPer16B == 0, "latent_cache row stride (",
+                        latent_cache->stride(0), ") must be a multiple of ", kEltsPer16B,
+                        " for the fused kv-norm 16B vector loads");
+                    TORCH_CHECK(reinterpret_cast<uintptr_t>(latent_cache->data_ptr()) % 16 == 0,
+                        "latent_cache must be 16B-aligned for the fused kv-norm vector loads");
+                    mla_params.latent_row_stride = static_cast<int>(latent_cache->stride(0));
+                    mla_params.kv_norm_weight = static_cast<void const*>(kv_norm_weight->data_ptr());
+                    mla_params.kv_norm_eps = static_cast<float>(kv_norm_eps);
+                    mla_params.fuse_kv_norm_in_rope = true;
+                }
             }
             else if (is_context)
             {
@@ -1117,7 +1157,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
     std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
     std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences)
+    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
+    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1414,7 +1455,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias, quant_scale_qkv,
-            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion, kv_norm_weight, kv_norm_eps);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -1437,7 +1478,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             num_sparse_topk_value, sparse_attn_kv_lens, cu_q_seqlens, cu_kv_seqlens, fmha_scheduler_counter,
             mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata, flash_mla_num_splits,
             trtllm_gen_jit_warmup, aux_kv_cache_pool_ptr, is_cross, cross_kv, relative_attention_bias, quant_scale_qkv,
-            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion);
+            dsv4_inv_rope_cos_sin_cache, enable_dsv4_epilogue_fusion,
+            // Context-only here; generation gets the fusion from mla_rope_generation.
+            /*kv_norm_weight=*/std::nullopt, kv_norm_eps);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", local_layer_idx);
