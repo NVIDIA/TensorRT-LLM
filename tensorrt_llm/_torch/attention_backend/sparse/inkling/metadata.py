@@ -73,8 +73,16 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
     every input-preparation path, after the padded batch is assembled and after
     ``super().prepare()`` has re-clamped ``num_cached_tokens_per_seq`` (and
     therefore refreshed ``kv_lens_cuda`` and copied this step's block offsets).
-    ``ink_num_gen`` is reset at the top of each call, so a step that publishes
-    nothing cannot leave the previous step's rows readable.
+
+    There is no per-step publication counter. An earlier version kept
+    ``ink_num_gen``, reset at the top of ``prepare`` and set at the end, but with
+    both buffers borrowed there is nothing left for this class to publish:
+    ``model_engine`` assigns ``_num_generations`` and ``request_ids`` from one
+    scheduled batch in one block, so ``num_generations`` already *is*
+    ``len(request_ids) - num_contexts`` -- including CUDA-graph padding rows,
+    which enter that batch as dummy generation requests. The backend guards on
+    the metadata *type* instead, which is what the old counter was really doing
+    via ``getattr(..., 0)``.
 
     ``TrtllmAttentionMetadata`` is the base both because Inkling's backend
     extends ``TrtllmAttention`` and because that is where the reusable per-step
@@ -84,9 +92,6 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.kv_layout = "HND"
-        # Number of generation rows published this step. 0 means the decode
-        # buffers hold nothing valid for this forward.
-        self.ink_num_gen: int = 0
         # Global decoder layer -> leading-axis row of ``kv_cache_block_offsets``.
         # Static for the lifetime of a manager, so it is built once and cached
         # rather than recomputed per step (see :meth:`_ink_build_pt_rows`).
@@ -161,7 +166,7 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         """
         row = self._ink_pt_rows[layer]
         start = self.num_contexts
-        return self.kv_cache_block_offsets[row, start : start + self.ink_num_gen, 0]
+        return self.kv_cache_block_offsets[row, start : start + self.num_generations, 0]
 
     @property
     def ink_page_div(self) -> int:
@@ -224,10 +229,15 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         self.ink_conv_rt = InklingConvRuntime.build(self, cache)
 
     def _prepare_inkling_decode(self) -> None:
-        # Reset first: a step that returns early must not leave the previous
-        # step's buffers advertised as current -- a page table one step out of
-        # date silently drops a newly allocated page.
-        self.ink_num_gen = 0
+        # Nothing is published here, so nothing needs resetting: the accessors
+        # read ``num_generations`` and ``kv_cache_block_offsets``, both of which
+        # the base refreshes every step. This method only validates that the
+        # borrowed layout is usable and caches the static layer -> row map.
+        #
+        # The early returns below are "no decode work in this batch", not
+        # "declined". They are unreachable from the backend anyway: no manager
+        # means it cannot get_buffers, zero generation rows means it never enters
+        # _run_generation, and no owned layers means no attention module runs.
         mgr = self.kv_cache_manager
         if mgr is None or self.request_ids is None or self.kv_cache_params is None:
             return
@@ -279,7 +289,11 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
                 f"exceeds kv_cache_block_offsets' {offsets.shape[1]} sequence "
                 "rows (max_num_sequences)."
             )
-        self.ink_num_gen = num_gen
+        # Cheap invariant, and the premise of dropping the counter: the base's
+        # num_generations is assigned from the same scheduled batch as
+        # request_ids (model_engine.py:4388-4391), so the accessors can slice by
+        # it instead of by a private copy.
+        assert self.num_generations == num_gen, (self.num_generations, num_gen)
         if os.environ.get("TLLM_INKLING_PT_CROSSCHECK") == "1":
             self._ink_crosscheck_page_table(layers)
 
@@ -372,9 +386,9 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
         # base's, and the base already hands the graph metadata its own
         # capture-pool copies. That is the whole point of borrowing them.
         #
-        # Only per-step publication state is reset: stale values here would
-        # advertise the previous step's rows as current.
-        md.ink_num_gen = 0
+        # Only the short-conv state is reset. There is no page-table counter to
+        # clear any more -- the accessors read num_generations, which the base
+        # sets per step on the graph metadata too.
         md.ink_conv_cache = None
         md.ink_conv_rt = None
         # Rebuilt rather than inherited: the graph metadata may carry a different

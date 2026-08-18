@@ -509,11 +509,14 @@ def _ink_metadata(
     from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingAttentionMetadata
 
     md = object.__new__(InklingAttentionMetadata)
-    md.ink_num_gen = 0
     md._ink_pt_rows = {}
     md.is_cuda_graph = False
     md.request_ids = list(request_ids)
     md._num_contexts = num_contexts
+    # model_engine assigns _num_generations and request_ids from the same
+    # scheduled batch, so the fake keeps them consistent -- the accessors slice
+    # by num_generations now that the private counter is gone.
+    md._num_generations = len(request_ids) - num_contexts
     md.kv_cache_params = SimpleNamespace(num_cached_tokens_per_seq=list(num_cached))
     # What TrtllmAttentionMetadata.prepare() would have published: total KV
     # length per request, num_cached + the one new generation token.
@@ -545,7 +548,6 @@ def test_metadata_reads_both_decode_inputs_from_the_base_buffers():
 
     md._prepare_inkling_decode()
 
-    assert md.ink_num_gen == 2
     # num_cached + 1, straight off the base buffer.
     assert md.ink_gen_seq_lens(2).tolist() == [4, 131]
     pt = md.ink_gen_page_table(0)
@@ -646,23 +648,61 @@ def test_metadata_skips_the_context_slice():
 
     md._prepare_inkling_decode()
 
-    assert md.ink_num_gen == 1
     assert md.ink_gen_seq_lens(1).tolist() == [131]
     # Row 1 of the base tensor, not row 0 -- the context request's row is skipped.
     assert md.ink_gen_page_table(0).tolist() == md.kv_cache_block_offsets[0, 1:2, 0].tolist()
 
 
-def test_metadata_reports_nothing_published_for_a_context_only_batch():
-    """A prefill-only step must not leave the previous step's rows advertised as
-    current -- that is what the old epoch counter guarded."""
+def test_metadata_yields_no_generation_rows_for_a_context_only_batch():
+    """A prefill-only step must not expose the previous step's rows.
+
+    This used to be enforced by a private counter reset at the top of prepare.
+    It now falls out of the borrowed layout: the accessors slice by the base's
+    num_generations, which the framework sets to 0 for a context-only batch, so
+    there is no stale value to leak. Asserting the resulting slice is empty is
+    the property the counter was there to provide.
+    """
     md = _ink_metadata()
     md._prepare_inkling_decode()
-    assert md.ink_num_gen == 2
+    assert md.ink_gen_page_table(0).shape[0] == 2
 
-    md._num_contexts = 2  # same object, now a context-only batch
+    # Same object, now a context-only batch. model_engine sets both of these
+    # from one scheduled batch, so the fake moves both.
+    md._num_contexts = 2
+    md._num_generations = 0
     md._prepare_inkling_decode()
 
-    assert md.ink_num_gen == 0
+    assert md.ink_gen_page_table(0).shape[0] == 0
+    assert md.ink_gen_seq_lens(0).shape[0] == 0
+
+
+def test_the_decode_fast_path_is_guarded_by_metadata_type():
+    """The backend must decide on the metadata's type, not on a getattr default.
+
+    The previous guard was ``getattr(attn_metadata, "ink_num_gen", 0) ==
+    num_req``: a foreign metadata object -- the P4 failure, where a degraded
+    selection handed back TrtllmAttentionMetadata -- fell through on the *default
+    value* rather than on a stated check. With the counter gone, num_generations
+    exists on every metadata, so an unguarded count comparison would let a
+    foreign object into the fast path and fail later with a bare AttributeError
+    instead of the diagnostic.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import backend as be
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import (
+        InklingAttentionMetadata,
+    )
+
+    src = inspect.getsource(be.InklingTritonAttention._run_generation)
+    assert "isinstance(attn_metadata, InklingAttentionMetadata)" in src
+    # The counter is gone from both sides of the contract. Match assignments
+    # rather than the bare name: the class docstring legitimately explains why
+    # the field was dropped, and a name match would flag that prose.
+    assert "ink_num_gen" not in src
+    assert not hasattr(InklingAttentionMetadata, "ink_num_gen")
+    md_src = inspect.getsource(InklingAttentionMetadata)
+    assert "self.ink_num_gen" not in md_src and "md.ink_num_gen" not in md_src
 
 
 def test_metadata_refuses_a_cuda_graph_batch_carrying_contexts():

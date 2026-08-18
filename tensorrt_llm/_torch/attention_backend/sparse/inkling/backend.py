@@ -234,7 +234,15 @@ class InklingTritonAttention(TrtllmAttention):
         # on-GPU. Padding rows carry their own dummy request slots, so the
         # scatter never corrupts a real request's page.
         num_req = q.shape[0]
-        if getattr(attn_metadata, "ink_num_gen", 0) == num_req:
+        # Guard on the metadata *type*, explicitly. The previous version read a
+        # per-step counter through ``getattr(..., 0)``, so a foreign metadata
+        # object fell through on the default rather than on a stated check --
+        # the counter's real job, since with both buffers borrowed its value was
+        # always the base's ``num_generations``.
+        if (
+            isinstance(attn_metadata, InklingAttentionMetadata)
+            and attn_metadata.num_generations == num_req
+        ):
             # Both come from the base metadata. The page table's leading axis is
             # per-pool, so every layer of the same KV geometry gets the same
             # rows for free.
@@ -274,11 +282,11 @@ class InklingTritonAttention(TrtllmAttention):
         # ``attn_backend`` override that swapped the metadata type -- say so.
         if getattr(attn_metadata, "is_cuda_graph", False):
             raise RuntimeError(
-                "Inkling decode metadata was not published for a CUDA-graph "
-                f"batch (ink_num_gen="
-                f"{getattr(attn_metadata, 'ink_num_gen', None)}, expected "
-                f"{num_req}); attn_metadata is "
-                f"{type(attn_metadata).__name__}, not InklingAttentionMetadata. "
+                "Inkling decode metadata is unusable for a CUDA-graph batch: "
+                f"attn_metadata is {type(attn_metadata).__name__} with "
+                f"num_generations="
+                f"{getattr(attn_metadata, 'num_generations', None)}, expected an "
+                f"InklingAttentionMetadata with {num_req}. "
                 "Inkling's backend is selected through sparse/registry.py under "
                 "the TRTLLM backend family; remove any attn_backend override "
                 "from --extra_llm_api_options / LLM(attn_backend=...) so the "
