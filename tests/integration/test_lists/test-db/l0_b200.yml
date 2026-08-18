@@ -15,17 +15,6 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  # TEMPORARY (REMOVE BEFORE MERGE): these tests are post_merge-gated, so a PR
-  # pipeline never schedules them. Listed here only to prove the re-baselined
-  # goldens pass on the B200 CI lane before merge; the post_merge block below
-  # remains their permanent home.
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2i_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_t2v_lpips_against_golden TIMEOUT (15)
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_nano_v2v_lpips_against_golden TIMEOUT (10)
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[fp8-blockwise]
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_t2i_lpips_against_golden TIMEOUT (15)
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_t2v_lpips_against_golden TIMEOUT (20)
-  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_lpips_against_golden TIMEOUT (15)
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]

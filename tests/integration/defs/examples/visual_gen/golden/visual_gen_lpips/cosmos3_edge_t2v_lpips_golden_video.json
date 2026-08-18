@@ -19,6 +19,8 @@
   "cudnn_allow_tf32": true,
   "lpips_net": "alex",
   "lpips_threshold": 0.1,
+  "measured_lpips_at_creation": 0.0,
+  "threshold_rationale": "self-regeneration distance on the cutting host; threshold kept at the pre-existing gate for this test",
   "diffusers_version": "0.39.0",
   "torch_version": "2.12.0+cu130",
   "tensorrt_llm_version": "1.3.0rc25",
