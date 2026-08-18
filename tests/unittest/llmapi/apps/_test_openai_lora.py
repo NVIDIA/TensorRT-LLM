@@ -21,6 +21,7 @@ from typing import Optional
 import openai
 import pytest
 import yaml
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm.executor.request import LoRARequest
 
@@ -30,6 +31,11 @@ from .openai_server import RemoteOpenAIServer
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 _CHINESE_LORA_ADAPTER = "lora/llama-3-chinese-8b-instruct-v2-lora"
+
+
+def _get_lora_adapter_path(adapter_name: str) -> str:
+    """Resolve LoRA adapters under LLM_MODELS_ROOT, ignoring LLM_ENGINE_DIR."""
+    return str(llm_models_root() / adapter_name)
 
 
 @pytest.fixture(scope="module", ids=["Llama-3.1-8B-Instruct-FP8"])
@@ -44,7 +50,7 @@ def temp_extra_llm_api_options_file():
     try:
         extra_llm_api_options_dict = {
             "lora_config": {
-                "lora_dir": [get_model_path(_CHINESE_LORA_ADAPTER)],
+                "lora_dir": [_get_lora_adapter_path(_CHINESE_LORA_ADAPTER)],
                 "max_lora_rank": 64,
                 "max_loras": 4,
                 "max_cpu_loras": 4,
@@ -125,7 +131,7 @@ def test_lora(client: openai.OpenAI, model_name: str, prompt: str,
     extra_body = {}
     if lora_adapter_name is not None:
         lora_req = LoRARequest(lora_adapter_name, 1,
-                               get_model_path(lora_adapter_name))
+                               _get_lora_adapter_path(lora_adapter_name))
         extra_body["lora_request"] = asdict(lora_req)
 
     response = client.completions.create(
