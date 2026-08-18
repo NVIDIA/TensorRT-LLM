@@ -114,7 +114,14 @@ class VisualGenResult:
             self.executor.await_responses(self.request_id, timeout=timeout),
             self.executor._event_loop,
         )
-        response = await asyncio.wrap_future(future)
+        try:
+            response = await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            # A caller (e.g. serve's delete-in-flight) dropped the wait. The
+            # worker keeps running but its output is discarded, so run the
+            # terminal cleanup here to reclaim the materialized references.
+            self._run_finish()
+            raise
 
         if response is None:
             # Timeout before any response. Tell the executor to drop any
