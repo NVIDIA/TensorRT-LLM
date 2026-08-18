@@ -8,8 +8,6 @@ import threading
 from subprocess import PIPE, Popen
 from typing import Literal
 
-cur_dir = os.path.dirname(os.path.abspath(__file__))
-
 import pytest
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -18,10 +16,6 @@ from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              RemoteMpiCommSessionClient,
                                              _identity_barrier_timeout,
                                              split_mpi_env)
-
-# isort: off
-sys.path.append(os.path.join(cur_dir, '..'))
-# isort: on
 
 
 def task0():

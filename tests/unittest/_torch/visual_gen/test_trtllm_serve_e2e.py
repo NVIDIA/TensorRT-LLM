@@ -71,9 +71,7 @@ _REF_IMAGE_PATH = _PROJECT_ROOT / "examples" / "visual_gen" / "cat_piano.png"
 # parallel pytest sessions on the same OCI node fall into disjoint port
 # sections (CONTAINER_PORT_START / CONTAINER_PORT_NUM). It transparently falls
 # back to the plain free-port scan when those env vars are not set.
-_INTEGRATION_TESTS_DIR = _PROJECT_ROOT / "tests" / "integration"
-if str(_INTEGRATION_TESTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_INTEGRATION_TESTS_DIR))
+__extra_import_path__ = ["~/tests/integration"]
 from defs.common import get_free_port_in_ci  # noqa: E402
 
 # ---------------------------------------------------------------------------
