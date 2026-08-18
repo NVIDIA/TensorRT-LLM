@@ -1231,18 +1231,21 @@ def test_cute_dsl_gvr_topk_decode_launch_autoconfig(dtype, top_k, N, batch_size,
     _gvr_check(tie_aware_check, out, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
 
     # Override path: forcing the secant arm through launch() must also be a
-    # valid top-K and the identical index set. Restricted to fp32, where the
-    # index set is unique (tie-free) and the equality assert has teeth --
-    # on half precision the secant arm only re-checked the tie-aware value
-    # set already covered by the R0-equivalence sweep, at the cost of one
-    # extra compiled kernel per cell.
+    # valid top-K, and on fp32 the same index set up to boundary value-ties.
+    # Restricted to fp32 because on half precision the secant arm only
+    # re-checked the tie-aware value set the R0-equivalence sweep already
+    # covers, at the cost of one more compiled kernel per cell.
     if dtype != torch.float32:
         return
     out_sec = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
     _GvrTopKKernel.launch(logits, pre_idx, seq_lens, out_sec, top_k, enable_r0=False)
     torch.cuda.synchronize()
     _gvr_check(tie_aware_check, out_sec, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
-    assert torch.equal(out.sort(dim=-1).values, out_sec.sort(dim=-1).values)
+    # fp32 randn does collide bit-exactly at these sample counts, and a
+    # collision on the top-K boundary makes the two arms' distinct picks
+    # equally valid -- so compare the index sets tie-aware, not with
+    # torch.equal (same reasoning as the R0-equivalence sweep above).
+    _assert_index_sets_equal_tie_aware(out, out_sec, logits)
 
 
 @skip_not_sm100
