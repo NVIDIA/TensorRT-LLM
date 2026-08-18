@@ -403,8 +403,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2ep2pp2_gentp4_deepseek_v3_lite_one_mtp_block_reuse_chunked.yaml",
         "deepseek_v3_lite_bf16_empty_batch":
         f"{test_configs_root}/disagg_config_deepseek_v3_lite_empty_batch.yaml",
-        "deepseek_v3_lite_bf16_gentp2_cute_dsl":
-        f"{test_configs_root}/disagg_config_ctxtp1_gentp2_deepseek_v3_lite_bf16_cute_dsl.yaml",
         "llama4_kv_cache_overflow":
         f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml",
         "deepseek_v3_lite_bf16_tllm_gen_helix":
@@ -1033,8 +1031,8 @@ def run_disaggregated_test(example_dir,
     """Run disaggregated test using service discovery instead of MPI.
 
     If assert_gen_log_contains is set, the generation-worker logs are captured and, after the
-    client tests, at least one of them must contain that substring (used to prove the KV-cache
-    bounce path actually engaged instead of silently falling back to the per-fragment path).
+    client tests, at least one of them must contain that substring (used to prove an intended
+    code path actually engaged instead of silently falling back to another one).
     """
     if mpi_disabled():
         pytest.skip(
@@ -1096,8 +1094,8 @@ def run_disaggregated_test(example_dir,
         if post_client_test is not None:
             post_client_test(server_url)
         if assert_gen_log_contains is not None:
-            # Fail loudly if the marker is absent: the transfer silently fell back to the
-            # per-fragment path, so the bounce path we meant to exercise never ran.
+            # Fail loudly if the marker is absent: the code path the test means to
+            # exercise never ran and something else silently took its place.
             logs = []
             for w in gen_workers:
                 if w.log_path and os.path.exists(w.log_path):
@@ -1105,8 +1103,8 @@ def run_disaggregated_test(example_dir,
                         logs.append(f.read())
             assert any(assert_gen_log_contains in log for log in logs), (
                 f"expected marker {assert_gen_log_contains!r} in a generation-worker log, "
-                f"but none of {len(logs)} log(s) contained it (bounce did not engage)"
-            )
+                f"but none of {len(logs)} log(s) contained it "
+                f"(the intended code path did not engage)")
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -2008,44 +2006,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp(
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.skip_less_device(3)
-@pytest.mark.skipif(
-    get_sm_version() not in (100, 103),
-    reason="CuTe DSL MLA decode FMHA lib requires SM100 or SM103")
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_bf16_gentp2_cute_dsl_mla_smoke(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root) -> None:
-    """Decode-only smoke for the CuTe DSL MLA decode FMHA lib in disagg.
-
-    A disaggregated generation server runs decode-only batches, so this
-    decode-only lib takes essentially every forward there (vs a fraction in
-    aggregated serving) and has no coverage from the aggregated tests. Run a
-    minimal ctxTP1+genTP2 disagg cluster on DeepSeek MLA geometry (gen TP2
-    yields the 16 heads/rank the bf16 path admits at any batch size) and
-    require the lib's kernel-compile marker in a generation-worker log:
-    correct client output alone would not distinguish the CuTe DSL path from
-    a silent fallback to flashinfer_trtllm_gen. The lib stays enabled by
-    default; TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
-    documented off switch.
-    """
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/bf16")
-
-    env = llm_venv._new_env.copy()
-    # The kernel-compile marker is logged at INFO level.
-    env["TLLM_LOG_LEVEL"] = "INFO"
-
-    run_disaggregated_test(
-        disaggregated_example_root,
-        "deepseek_v3_lite_bf16_gentp2_cute_dsl",
-        env=env,
-        model_path=deepseek_v3_model_root,
-        cwd=llm_venv.get_working_directory(),
-        assert_gen_log_contains="CuteDSL MLA decode: compiling kernel variant")
-
-
 @pytest.mark.skip_less_device(4)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -2104,9 +2064,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_re
         cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
-@skip_arm
-@skip_no_hopper
 @skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
@@ -2121,11 +2078,34 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
     env["UCX_MM_ERROR_HANDLING"] = "y"
+
+    # No arch gate: placement is controlled by the test lists (l0_dgx_h100,
+    # l0_dgx_b200 pre_merge, l0_dgx_b300). A stale Hopper-only @skip_no_hopper
+    # used to silently skip this test on its B200/B300 registrations; dropping
+    # it makes them live.
+    #
+    # On SM100/103 this test doubles as the decode-only smoke for the CuTe DSL
+    # MLA decode FMHA lib: a disagg generation server runs decode-only batches,
+    # and gen TP2 yields the 16 heads/rank the lib's bf16-KV path admits at any
+    # batch size (the fp8 checkpoint keeps a bf16 KV cache), so the lib takes
+    # essentially every gen forward. Require its kernel-compile marker (logged
+    # at INFO) in a generation-worker log: correct client output alone would
+    # not distinguish the CuTe DSL path from a silent fallback to another FMHA
+    # library. TLLM_FMHA_LIBS=-cute_dsl_mla on the generation server is the
+    # documented off switch.
+    gen_env = None
+    assert_gen_log_contains = None
+    if get_sm_version() in (100, 103):
+        gen_env = {"TLLM_LOG_LEVEL": "INFO"}
+        assert_gen_log_contains = "CuteDSL MLA decode: compiling kernel variant"
+
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
                            env=env,
+                           gen_env=gen_env,
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           assert_gen_log_contains=assert_gen_log_contains)
 
 
 @skip_no_hopper
