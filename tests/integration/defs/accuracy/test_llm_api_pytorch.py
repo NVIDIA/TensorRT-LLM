@@ -4653,6 +4653,68 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@pytest.mark.timeout(10800)
+class TestKimiK3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K3"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.skip_less_device_memory(140000)
+    @pytest.mark.parametrize("mode", ["baseline", "reuse", "sa"])
+    def test_w4a16_mxfp4(self, mode):
+        """GSM8K on the bf16 + MXFP4-routed-expert checkpoint (16 GPUs, DEP16).
+
+        No automated L0 stage schedules 16-GPU functional tests; this case is
+        run by QA / manually (qualified on 4x4 GB300 nodes). Each mode mirrors
+        the corresponding examples/kimi_k3/eval_extra_llm_options*.yaml config
+        - keep them in sync when editing either.
+        """
+        kv_cache_kwargs = dict(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.25,
+            # tokens_per_block=64 keeps the MLA generation path on the
+            # flashinfer trtllm-gen kernel (K3 has 96 query heads).
+            tokens_per_block=64,
+        )
+        llm_kwargs = dict(
+            tensor_parallel_size=16,
+            moe_expert_parallel_size=16,
+            enable_attention_dp=True,
+            max_batch_size=32,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True,
+                                              max_batch_size=32),
+            moe_config=MoeConfig(max_num_tokens=33024,
+                                 use_low_precision_moe_combine=True),
+        )
+        if mode == "reuse":
+            kv_cache_kwargs["enable_block_reuse"] = True
+            # Hybrid models expose reusable prefixes only at KDA state
+            # snapshot boundaries; without a snapshot cadence, block reuse
+            # silently never engages.
+            kv_cache_kwargs["mamba_state_config"] = MambaStateConfig(
+                periodic_snapshot_interval=256)
+        elif mode == "sa":
+            llm_kwargs.update(
+                max_batch_size=8,
+                disable_overlap_scheduler=True,
+                enable_chunked_prefill=False,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+                speculative_config=SADecodingConfig(max_draft_len=2),
+            )
+
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=KvCacheConfig(**kv_cache_kwargs),
+                 **llm_kwargs) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.W4A16_MXFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 

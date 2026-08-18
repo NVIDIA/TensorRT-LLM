@@ -15,7 +15,10 @@
 import pytest
 
 from tensorrt_llm import LLM
-from tensorrt_llm.evaluate.post_processing import strip_thinking_and_extract_mmmu_answer
+from tensorrt_llm.evaluate.post_processing import (
+    extract_kimi_k3_mmmu_answer,
+    strip_thinking_and_extract_mmmu_answer,
+)
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
     KvCacheConfig,
@@ -505,6 +508,69 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
         ) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
+class TestKimiK3(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "moonshotai/Kimi-K3"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
+    MAX_NUM_TOKENS = 16384
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+    )
+
+    # K3 reasons inside its <|open|>response<|sep|>...<|close|> channel (no
+    # <think> markup), so the K2.5 strip-thinking extractor cannot see the
+    # answer; extract_kimi_k3_mmmu_answer reads the channel and falls back to
+    # the K2.5 cascade for channel-less outputs. No chat_template_kwargs: K3
+    # thinks by default. preserve_caller_max_tokens keeps max_tokens=16384
+    # over lm-eval's 512-token MMMU default — without it the CoT is truncated
+    # before the response channel opens, the extractor silently falls back,
+    # and the score sinks toward the K2.5 floor (81.56): treat such a score
+    # with clean logs as a harness failure, not a model regression.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        post_process_fn=extract_kimi_k3_mmmu_answer,
+        preserve_caller_max_tokens=True,
+    )
+
+    @skip_pre_blackwell
+    @pytest.mark.timeout(7200)
+    @pytest.mark.skip_less_mpi_world_size(16)
+    @pytest.mark.skip_less_device_memory(140000)
+    def test_w4a16_mxfp4(self):
+        """MMMU-val on the K3 VL checkpoint (16 GPUs, DEP16).
+
+        No automated L0 stage schedules 16-GPU functional tests; this case is
+        run by QA / manually (qualified on 4x4 GB300 nodes, reference 84.89
+        +/- 1.16). Mirrors examples/kimi_k3/run_eval_kimi_k3.sbatch
+        --task mmmu: the base eval_extra_llm_options.yaml serving config with
+        max_seq_len raised to 24576 (8192 input + 16384 output).
+        """
+        with LLM(
+            self.MODEL_PATH,
+            tensor_parallel_size=16,
+            moe_expert_parallel_size=16,
+            enable_attention_dp=True,
+            max_batch_size=32,
+            max_num_tokens=8192,
+            max_seq_len=24576,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
+            moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.25, tokens_per_block=64),
+        ) as llm:
+            # If this fires on the VL checkpoint, update the assert and the
+            # references/mmmu.yaml key together (the VL wrapper remaps the
+            # text-backbone quant config; see modeling_kimi_k3_vl.py).
+            assert llm.args.quant_config.quant_algo == QuantAlgo.W4A16_MXFP4
             task = MMMU(self.MODEL_NAME)
             task.evaluate(
                 llm,

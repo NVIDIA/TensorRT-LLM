@@ -296,6 +296,16 @@ moonshotai/Kimi-K2.5:
     accuracy: 93.06
   - quant_algo: NVFP4
     accuracy: 93.06
+# Kimi K3 (KimiLinear KDA/MLA hybrid + latent MoE): bf16 with MXFP4-packed
+# routed experts. Measured 96.51/96.44 (flexible/strict) at the K3 enablement
+# commit, DEP16 on 16 GB300s (examples/kimi_k3/README.md expected scores).
+moonshotai/Kimi-K3:
+  - quant_algo: W4A16_MXFP4
+    accuracy: 96.5
+  # SA spec dec is lossless; scores match the baseline within noise.
+  - quant_algo: W4A16_MXFP4
+    spec_dec_algo: SA
+    accuracy: 96.5
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57
   - quant_algo: FP8
