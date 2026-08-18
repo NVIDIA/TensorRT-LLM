@@ -594,11 +594,15 @@
     const model = entry._hfModel || entry.model || "";
     const configPath = entry.config_path || "";
     if (!model || !configPath) return entry.command || "";
-    return [
-      `export TRTLLM_DIR=/app/tensorrt_llm`,
-      `trtllm-serve ${model} \\`,
-      `  --config \${TRTLLM_DIR}/${configPath}`,
-    ].join("\n");
+    const lines = [`export TRTLLM_DIR=/app/tensorrt_llm`];
+    // Configs that reference another repo file through a relative path (for example
+    // moe_config.load_balancer) only resolve it when served from the TensorRT LLM
+    // directory. generate_config_table.py marks those entries with a cd prefix.
+    if ((entry.command || "").startsWith("cd ")) {
+      lines.push(`cd "\${TRTLLM_DIR}"`);
+    }
+    lines.push(`trtllm-serve ${model} \\`, `  --config \${TRTLLM_DIR}/${configPath}`);
+    return lines.join("\n");
   }
 
   function curatedEntriesForModel(curatedEntries, model) {

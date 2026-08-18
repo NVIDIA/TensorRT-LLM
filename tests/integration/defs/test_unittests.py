@@ -14,10 +14,14 @@
 # limitations under the License.
 import os
 import re
+import shlex
 import warnings
 from subprocess import CalledProcessError
+from typing import NoReturn
 
 from defs.conftest import tests_path
+
+_MAX_CULPRITS = 20
 
 
 def merge_report(base_file, extra_file, output_file, is_retry=False):
@@ -61,6 +65,101 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
 
     os.remove(extra_file)
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
+
+
+def _junit_culprits(xml_path: str) -> list[str]:
+    """Names of failed/errored tests in a JUnit report.
+
+    So a whole-case failure still names the specific culprit test(s) for
+    CI/triage attribution.
+    """
+    import xml.etree.ElementTree as ElementTree
+    try:
+        root = ElementTree.parse(xml_path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return []
+    culprits = []
+    for tc in root.iter('testcase'):
+        if not tc.get('name'):
+            continue
+        kind = 'FAILED' if tc.find('failure') is not None else (
+            'ERROR' if tc.find('error') is not None else None)
+        if kind:
+            culprits.append(
+                f"{kind} {tc.get('classname', '')}::{tc.get('name')}")
+    return culprits
+
+
+def _nodeid_matches_case(nodeid: str, case_selector: str) -> bool:
+    """Whether a possibly stage-prefixed node ID belongs to a case selector."""
+    node_path, node_separator, node_selection = nodeid.partition("::")
+    case_path, case_separator, case_selection = case_selector.partition("::")
+
+    if case_separator:
+        path_matches = (node_path == case_path
+                        or node_path.endswith("/" + case_path))
+    else:
+        path_matches = f"/{case_path}/" in f"/{node_path}/"
+    if not path_matches:
+        return False
+
+    if not case_separator:
+        return True
+    if not node_separator:
+        return False
+    if node_selection == case_selection:
+        return True
+    if "[" in case_selection:
+        return False
+    return (node_selection.startswith(case_selection + "::")
+            or node_selection.startswith(case_selection + "["))
+
+
+def _fail_unittests(reason: str, output_xml: str, output_dir: str,
+                    case: str) -> NoReturn:
+    """Raise a unittest failure naming the specific culprit test(s).
+
+    Culprits are failed/errored tests from the JUnit report, plus tests from
+    this case that were still in flight when a fatal OOM/timeout killed the run
+    (nodeids left by --periodic-save-unfinished-test).
+
+    unfinished_test.txt is shared per node and only cleared on teardown, so it
+    may retain stale entries from other cases; it is filtered to this case's
+    test path(s). Reading it is best-effort and never masks the original
+    failure.
+    """
+    junit_culprits = _junit_culprits(output_xml)
+    in_flight_culprits = []
+    unfinished = os.path.join(output_dir, "unfinished_test.txt")
+    case_selectors = []
+    for arg in shlex.split(case):
+        selector = arg.rstrip("/")
+        path = selector.split("::", 1)[0]
+        if "/" in path or path.endswith(".py"):
+            case_selectors.append(selector)
+    try:
+        with open(unfinished, encoding="utf-8") as f:
+            for line in f:
+                nodeid = line.strip()
+                if not nodeid:
+                    continue
+                if not case_selectors or any(
+                        _nodeid_matches_case(nodeid, selector)
+                        for selector in case_selectors):
+                    in_flight_culprits.append("IN-FLIGHT " + nodeid)
+    except (OSError, UnicodeDecodeError):
+        pass
+    # A fatal retry's in-flight node is the strongest signal. Put it ahead of
+    # the earlier JUnit failures so the display cap cannot hide it, and remove
+    # duplicate unfinished records left by an interrupted cleanup.
+    culprits = list(dict.fromkeys(in_flight_culprits + junit_culprits))
+    if culprits:
+        displayed_culprits = ", ".join(culprits[:_MAX_CULPRITS])
+        omitted_culprits = len(culprits) - _MAX_CULPRITS
+        if omitted_culprits > 0:
+            displayed_culprits += f" (+{omitted_culprits} more)"
+        reason += "; culprit test(s): " + displayed_culprits
+    raise AssertionError(reason)
 
 
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
@@ -180,12 +279,15 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         command += ["--run-ray"]
 
     s3_secret_key = None
+    s3_output_module = None
     s3_upload_path = request.config.getoption("--s3-upload-path", default=None)
     if s3_upload_path:
+        from test_common import s3_output as s3_output_module
+
         inner_output_dir = os.path.join(output_dir, "inner-s3", case_fn)
         inner_upload_path = os.path.join(s3_upload_path, "inner", case_fn)
         command += [
-            "-s",
+            "--capture=fd",
             f"--output-dir={inner_output_dir}",
             f"--s3-upload-path={inner_upload_path}",
             "--s3-upload-mode=deferred",
@@ -262,6 +364,18 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 )
             print(f"{'='*60}\n")
             return False
+        finally:
+            if s3_output_module is not None:
+                try:
+                    drained = s3_output_module.drain_pending_uploads(
+                        inner_output_dir,
+                        secret_key=s3_secret_key,
+                    )
+                except Exception as e:
+                    print(f"Failed to drain pending S3 test logs: {e}")
+                else:
+                    if not drained:
+                        print("Some pending S3 test logs could not be drained")
         return True
 
     if num_workers == 1:
@@ -279,9 +393,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         ]
         passed = run_command(parallel_command, num_workers)
 
-        assert os.path.exists(
-            parallel_output_xml
-        ), "no report generated, fatal failure happened in unittests (parallel phase)"
+        if not os.path.exists(parallel_output_xml):
+            _fail_unittests(
+                "no report generated, fatal failure in unittests (parallel phase)",
+                parallel_output_xml, output_dir, case)
 
         if dry_run or passed:
             os.rename(parallel_output_xml, output_xml)
@@ -302,6 +417,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                              True)
             else:
                 os.rename(parallel_output_xml, output_xml)
-                assert False, "no report generated, fatal failure happened in unittests (retry phase)"
+                _fail_unittests(
+                    "no report generated, fatal failure in unittests (retry phase)",
+                    output_xml, output_dir, case)
 
-    assert passed, "failure reported in unittests"
+    if not passed:
+        _fail_unittests("failure reported in unittests", output_xml, output_dir,
+                        case)
