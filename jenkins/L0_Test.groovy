@@ -104,6 +104,9 @@ def LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
 def INFRA_DRY_RUN_TEST_CONTEXT = "infra_dry_run"
+// Source-level dry-run invariants are covered by
+// tests/unittest/tools/test_infra_dry_run_pipeline.py. Keep those checks scoped
+// to behavior owned by this mode when refactoring the surrounding pipeline.
 
 @Field
 def BUILD_CONFIGS = [

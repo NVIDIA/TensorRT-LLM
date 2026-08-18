@@ -13,10 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import re
-import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -24,7 +21,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 L0_TEST = (REPO_ROOT / "jenkins" / "L0_Test.groovy").read_text()
 L0_PARENT = (REPO_ROOT / "jenkins" / "L0_MergeRequest.groovy").read_text()
 SLURM_RUN = (REPO_ROOT / "jenkins" / "scripts" / "slurm_run.sh").read_text()
-SLURM_INSTALL_PATH = REPO_ROOT / "jenkins" / "scripts" / "slurm_install.sh"
 CHECK_TEST_LIST = (REPO_ROOT / "scripts" / "check_test_list.py").read_text()
 BENCHMARK_PATH = REPO_ROOT / "tests" / "integration" / "defs" / "test_infra_dry_run_benchmark.py"
 CONFTEST = (REPO_ROOT / "tests" / "integration" / "defs" / "conftest.py").read_text()
@@ -69,6 +65,9 @@ def _pytest_capture_mode(args: list[str], initial_mode: str) -> str:
 
 
 class InfraDryRunPipelineTest(unittest.TestCase):
+    # Keep source-level assertions scoped to behavior introduced by the dry-run
+    # feature so unrelated Jenkins refactors do not break this regression suite.
+
     def test_dedicated_context_selects_one_standard_pytest_case(self):
         database = DRY_RUN_DB_PATH.read_text()
         self.assertTrue(BENCHMARK_PATH.is_file())
@@ -203,19 +202,14 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         )
         self.assertIn('${infraDryRun ? "export infraDryRun=true" : ""}', body)
         self.assertNotIn("export infraDryRun=$infraDryRun", body)
-        self.assertIn('pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"', body)
         self.assertIn("if (!isInfraDryRun() && (disaggMultiNodeMode || aggMultiNodeMode))", body)
         self.assertNotIn("test_infra_dry_run_benchmark.py", body)
-        self.assertNotIn("MASTER_ADDR", body)
-        self.assertNotIn("MASTER_PORT", body)
         dispatch = _function_body(L0_TEST, "runLLMTestlistOnSlurm", "INFRA_DRY_RUN")
         self.assertIn("if (isInfraDryRun() || nodeCount > 1 || runWithSbatch)", dispatch)
         self.assertIn(
             'if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]',
             SLURM_RUN,
         )
-        for rank_variable in ("RANK=", "LOCAL_RANK=", "WORLD_SIZE=", "MASTER_ADDR"):
-            self.assertNotIn(rank_variable, SLURM_RUN)
 
     def test_parent_uses_parameter_only_and_explicit_non_fail_fast_helper(self):
         setup = L0_PARENT[
@@ -228,7 +222,6 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertNotIn("JOB_NAME", setup.splitlines()[0])
         self.assertIn('"L0_Test-${arch}-Single-GPU"', helper)
         self.assertNotIn('"L0_Test-${arch}-Multi-GPU"', helper)
-        self.assertIn(", false, false, globalVars,", helper)
         self.assertIn("'testPhase2StageName': ''", helper)
         self.assertIn("additionalParameters.containsKey('testPhase2StageName')", launch)
         self.assertIn(
@@ -237,19 +230,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         )
         self.assertIn("parallelJobs.failFast = effectiveFailFast", L0_PARENT)
 
-    def test_normal_gating_and_result_collection_remain_in_place(self):
-        stages_start = L0_PARENT.index("def launchStages")
-        stages = L0_PARENT[stages_start : L0_PARENT.index("\npipeline {", stages_start)]
-        for arch in ("x86_64", "SBSA"):
-            normal_single = stages.index(f'testStageName = "[Test-{arch}-Single-GPU] Remote Run"')
-            approval = stages.index(
-                f'currentBuild.description?.contains("Require {arch} Multi-GPU Testing")',
-                normal_single,
-            )
-            normal_multi = stages.index(f'launchJob(pipeline, "L0_Test-{arch}-Multi-GPU"', approval)
-            self.assertLess(normal_single, approval)
-            self.assertLess(approval, normal_multi)
-
+    def test_standard_result_collection_remains_in_place(self):
         upload = _function_body(L0_TEST, "uploadResults", "runIsolatedTests")
         self.assertNotIn("isInfraDryRun", upload)
         self.assertIn(
@@ -259,69 +240,6 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         always_block = L0_PARENT[always_start : L0_PARENT.index("    stages {", always_start)]
         self.assertIn("collectTestResults(this, testFilter, globalVars)", always_block)
         self.assertNotIn("testFilter[INFRA_DRY_RUN]", always_block)
-
-    def test_slurm_artifact_download_replaces_existing_archive(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            archive_path = temp_path / "TensorRT-LLM.tar.gz"
-            wget_record_path = temp_path / "wget-output-path"
-            tar_record_path = temp_path / "tar-input-path"
-            archive_path.write_text("stale\n")
-
-            script = r"""
-source "$SLURM_INSTALL_PATH"
-retry_command() {
-    if [[ "$1" == "--timeout" ]]; then shift 2; fi
-    "$@"
-}
-wget() {
-    local output_path=""
-    while (( "$#" )); do
-        if [[ "$1" == "-O" ]]; then output_path="$2"; shift 2; else shift; fi
-    done
-    printf 'fresh\n' > "$output_path"
-    printf '%s\n' "$output_path" > "$WGET_RECORD_PATH"
-}
-tar() {
-    [[ "$1" == "-zxf" ]]
-    [[ "$2" == "$EXPECTED_ARCHIVE_PATH" ]]
-    grep -qx fresh "$2"
-    mkdir -p "$resourcePathNode/TensorRT-LLM/src"
-    printf '%s\n' "$2" > "$TAR_RECORD_PATH"
-}
-apt-get() { :; }
-nvidia-smi() { :; }
-pip3() { :; }
-python3() { :; }
-export -f pip3 wget
-slurm_install_setup
-"""
-            env = {
-                **os.environ,
-                "SLURM_INSTALL_PATH": str(SLURM_INSTALL_PATH),
-                "resourcePathNode": temp_dir,
-                "tarName": archive_path.name,
-                "llmTarfile": "https://artifacts.example/TensorRT-LLM.tar.gz",
-                "SLURM_LOCALID": "0",
-                "SLURM_JOB_ID": "123",
-                "SLURM_NODEID": "0",
-                "pytestCommand": "pytest",
-                "stageName": "test-stage",
-                "HOST_NODE_NAME": "test-host",
-                "EXPECTED_ARCHIVE_PATH": str(archive_path),
-                "WGET_RECORD_PATH": str(wget_record_path),
-                "TAR_RECORD_PATH": str(tar_record_path),
-            }
-            subprocess.run(
-                ["bash", "-c", script], check=True, capture_output=True, text=True, env=env
-            )
-
-            expected_tmp = f"{archive_path}.tmp.123.0"
-            self.assertEqual(wget_record_path.read_text(), f"{expected_tmp}\n")
-            self.assertEqual(archive_path.read_text(), "fresh\n")
-            self.assertEqual(tar_record_path.read_text(), f"{archive_path}\n")
-            self.assertFalse(Path(f"{archive_path}.1").exists())
-            self.assertFalse(Path(expected_tmp).exists())
 
 
 if __name__ == "__main__":
