@@ -23,6 +23,8 @@ l0_cpu:
   - disaggregated/test_aiperf_gate.py::test_gate_disabled_paths_not_affected
   - disaggregated/test_aiperf_gate.py::test_was_cancelled_metadata_fallback
   - disaggregated/test_aiperf_gate.py::test_non_request_records_excluded_from_denominator
+  # Kimi K3 disagg parity harness self-test (comparison logic only, no GPUs).
+  - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   - unittest/_torch/attention
   - unittest/_torch/cute_dsl/test_kimi_k3_kda_ptx_patch.py
   - unittest/_torch/distributed
