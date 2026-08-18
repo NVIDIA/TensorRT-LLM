@@ -1,3 +1,19 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Utilities for calling the PLC risk triage agent and recording ticket results in OpenSearch."""
 
 import json
@@ -14,6 +30,7 @@ TRIAGE_AGENT_TIMEOUT = int(os.environ.get("TRTLLM_TRIAGE_AGENT_TIMEOUT", "1800")
 
 # Cap items sent to avoid overwhelming the agent on large scans
 MAX_TRIAGE_ITEMS = int(os.environ.get("TRTLLM_TRIAGE_MAX_ITEMS", "20"))
+_TICKET_RESPONSE_KEYS = frozenset({"license_correction_ticket", "version_bump_tickets"})
 
 
 def _vuln_doc_to_agent_item(doc: dict) -> dict:
@@ -101,10 +118,37 @@ def _ref_from_url(url: str) -> str:
     return url.rstrip("/").split("/")[-1]
 
 
+def _parse_agent_response_value(value: object) -> dict:
+    """Validate and parse the agent's strict JSON-string response contract."""
+    if not isinstance(value, str):
+        raise TypeError("Triage agent response value must be a JSON string")
+
+    try:
+        parsed_value = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "Triage agent response value must contain a valid JSON object only"
+        ) from error
+
+    if not isinstance(parsed_value, dict):
+        raise ValueError("Triage agent response value must decode to a JSON object")
+
+    missing_keys = _TICKET_RESPONSE_KEYS - parsed_value.keys()
+    if missing_keys:
+        raise ValueError(f"Triage agent response is missing required keys: {sorted(missing_keys)}")
+
+    license_ticket = parsed_value["license_correction_ticket"]
+    if license_ticket is not None and not isinstance(license_ticket, dict):
+        raise ValueError("Triage agent license_correction_ticket must be an object or null")
+    if not isinstance(parsed_value["version_bump_tickets"], list):
+        raise ValueError("Triage agent version_bump_tickets must be a list")
+    return parsed_value
+
+
 def extract_ticket_refs(agent_response: dict) -> dict:
     """Parse the structured Form-B agent response into a flat list of ticket refs.
 
-    Expected agent output shape::
+    Expected agent output shape after decoding the ``value`` JSON string::
     {
         "value": {
           "license_correction_ticket": {"link": "<jira-url>", "description": "..."},
@@ -121,8 +165,11 @@ def extract_ticket_refs(agent_response: dict) -> dict:
     """
     refs = {}
 
-    print(f"[Triage agent raw response] {agent_response}", file=sys.stderr)
-    agent_resp_value = json.loads(agent_response.get("value", "{}"))
+    try:
+        agent_resp_value = _parse_agent_response_value(agent_response.get("value", "{}"))
+    except (TypeError, ValueError):
+        print(f"[Invalid triage agent response] {agent_response!r}", file=sys.stderr)
+        raise
     license_ticket = agent_resp_value.get("license_correction_ticket")
     if license_ticket:
         link = license_ticket.get("link") or ""
