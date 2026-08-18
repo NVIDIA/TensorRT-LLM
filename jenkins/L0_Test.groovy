@@ -339,6 +339,43 @@ def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath)
     }
 }
 
+// Read back the sbatch output the submit script captured to sbatch_output.txt
+// in the job workspace. A failed sh step surfaces only the exit code ("script
+// returned exit code 1"), so sbatch's stderr -- e.g. "Slurm backup controller
+// in standby mode" during a slurmctld failover -- never reaches
+// FailureClassifier.classify(), which matches the exception chain only. Like
+// scrapeSlurmLogForDeviceFault above, this is a GATE only: the caller folds
+// the returned text into a fresh exception and the shared-lib PATTERN_CATALOG
+// (the authoritative list) makes the real retry/severity decision. Returns ""
+// when the file is missing or unreadable, so the caller can rethrow the
+// original exception unchanged.
+def readSlurmSubmitOutput(def pipeline, Map remote, String jobWorkspace, String stageName) {
+    def outputPath = "${jobWorkspace}/sbatch_output.txt"
+    try {
+        return Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(remote,
+                "\"bash -c 'if [ -f \\\"${outputPath}\\\" ]; then head -c 1000 -- \\\"${outputPath}\\\"; fi'\""),
+            returnStdout: true,
+            numRetries: 1,
+        )?.trim()
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception readEx) {
+        // A dead frontend must propagate so the enclosing withSlurmFrontendFailover
+        // fails over to another remote; swallowing it as "" would return an empty
+        // read to the caller, which then rethrows the original (generic) submit
+        // exception and strands the stage on the unreachable frontend. Any other
+        // read failure (missing file, transient) is non-fatal -- the caller
+        // rethrows the original exception unchanged.
+        if (CloudManager.isSlurmFrontendConnectionFailure(readEx)) {
+            throw readEx
+        }
+        pipeline.echo("Ignorable warning: could not read ${outputPath} on ${remote.host}: ${readEx.message}")
+        return ""
+    }
+}
+
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
@@ -2159,7 +2196,48 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
 
                     touch ${slurmJobLogPath}
-                    jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
+                    # Capture sbatch's combined output and persist it before acting on
+                    # the exit code: a failed sh step carries only the exit code back
+                    # to Jenkins, so a submission rejection's stderr (e.g. "Slurm
+                    # backup controller in standby mode") would otherwise never reach
+                    # the failure classifier. The pipeline reads sbatch_output.txt
+                    # back on failure (readSlurmSubmitOutput) and folds it into the
+                    # exception it throws.
+                    #
+                    # Control-plane failover backoff: during a slurmctld failover the
+                    # backup controller rejects submissions with "Slurm backup
+                    # controller in standby mode" until it promotes, which takes up to
+                    # SlurmctldTimeout (upstream default 120s) plus takeover time. The
+                    # rejection is instant and burns no partition walltime, so retrying
+                    # it here -- every 30s, up to ~3min, inside this one stage attempt
+                    # -- rides out a failover without touching the expensive
+                    # stage-level SLURM retry budget. This window is sized to a
+                    # failover only, NOT to a cluster-wide controller outage or
+                    # maintenance: a standby condition that outlasts it falls through
+                    # to the failure classifier, whose PATTERN_CATALOG marks
+                    # "standby mode" PERSISTENT so the stage does not keep re-running
+                    # against a down controller. Any other sbatch failure still fails
+                    # immediately.
+                    sbatch_max_attempts=6
+                    sbatch_attempt=1
+                    while true; do
+                        sbatch_rc=0
+                        sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
+                        printf '%s\\n' "\${sbatch_output}"
+                        printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
+                        if [ "\${sbatch_rc}" -eq 0 ]; then
+                            break
+                        fi
+                        if [ "\${sbatch_attempt}" -lt "\${sbatch_max_attempts}" ] && printf '%s' "\${sbatch_output}" | grep -qi 'Slurm backup controller in standby mode'; then
+                            echo "sbatch rejected by a standby controller (attempt \${sbatch_attempt} of \${sbatch_max_attempts}); retrying in 30s."
+                            sbatch_attempt=\$((sbatch_attempt + 1))
+                            sleep 30
+                            continue
+                        fi
+                        echo "Error: Slurm job submission failed with exit code \${sbatch_rc}."
+                        exit "\${sbatch_rc}"
+                    done
+                    jobId=\$(printf '%s\\n' "\${sbatch_output}" | awk '/Submitted batch job/ {print \$4; exit}')
                     if [ -z "\$jobId" ]; then
                         echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1
@@ -2186,12 +2264,39 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // share the job workspace (slurm_job_id.txt, scripts) on that login
                 // node; a frontend disconnect fails the whole closure over to a fresh
                 // frontend as a unit (the submit script reuses an active job).
-                Utils.exec(
-                    pipeline,
-                    timeout: false,
-                    script: Utils.sshUserCmd(remote, scriptSubmitPathNode),
-                    numRetries: 3
-                )
+                try {
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(remote, scriptSubmitPathNode),
+                        numRetries: 3
+                    )
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception submitEx) {
+                    // Only enrich failures the classifier cannot already act on. An
+                    // interrupt (user abort / pipeline timeout) or an exception that
+                    // already classifies as infra must propagate unchanged --
+                    // wrapping them in a fresh cause-less Exception would erase the
+                    // FlowInterruptedException / typed-infra signal from the chain.
+                    def preClassified = FailureClassifier.classify(submitEx, InfraFailure.SLURM)
+                    if (preClassified instanceof PipelineInterruption || preClassified instanceof InfraFailure) {
+                        throw submitEx
+                    }
+                    // The sh step's exception carries only the exit code, so fold the
+                    // sbatch output captured by the submit script (stderr included)
+                    // into a fresh exception for FailureClassifier.classify() at the
+                    // runLLMTestlistOnSlurm caller; the shared-lib PATTERN_CATALOG
+                    // (e.g. its "Slurm backup controller in standby mode" row) then
+                    // drives the retry/severity decision. An empty read (file
+                    // missing or unreadable) preserves today's behavior by
+                    // rethrowing the original exception unchanged.
+                    def sbatchOutput = readSlurmSubmitOutput(pipeline, remote, jobWorkspace, stageName)
+                    if (sbatchOutput) {
+                        throw new Exception("SLURM job submission failed for ${stageName}: ${sbatchOutput}")
+                    }
+                    throw submitEx
+                }
 
                 def slurmMetadata = captureSlurmWorkspaceMetadata(pipeline, remote, jobWorkspace, placementContext, stageName)
                 def slurmJobId = slurmMetadata.slurmJobId
@@ -4504,6 +4609,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+                    mambaArch=\$(uname -m)
+                    pip3 install --no-deps \
+                        "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl" \
+                        "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl"
+                """)
             }
             if (!skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
