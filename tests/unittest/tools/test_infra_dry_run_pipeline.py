@@ -33,12 +33,12 @@ DRY_RUN_DB_PATH = (
 )
 
 
-def _function_body(source, name, next_name):
+def _function_body(source: str, name: str, next_name: str) -> str:
     start = source.index(f"def {name}")
     return source[start : source.index(f"def {next_name}", start + len(name))]
 
 
-def _conditional_workflow_properties(function_body):
+def _conditional_workflow_properties(function_body: str) -> set[str]:
     conditions = re.findall(r"\bif\s*\(([^)]*)\)", function_body)
     return {
         identifier
@@ -47,18 +47,18 @@ def _conditional_workflow_properties(function_body):
     }
 
 
-def _top_level_workflow_properties(source):
+def _top_level_workflow_properties(source: str) -> set[str]:
     return set(re.findall(r"(?m)^(?:def\s+)?([A-Z][A-Z0-9_]*)\s*=", source))
 
 
-def _groovy_list_values_after(source, assignment):
+def _groovy_list_values_after(source: str, assignment: str) -> list[str]:
     assignment_start = source.index(assignment)
     list_start = source.index("[", assignment_start)
     list_end = source.index("]", list_start)
     return re.findall(r'"([^"]+)"', source[list_start:list_end])
 
 
-def _pytest_capture_mode(args, initial_mode):
+def _pytest_capture_mode(args: list[str], initial_mode: str) -> str:
     capture_mode = initial_mode
     for arg in args:
         if arg == "-s":
@@ -160,9 +160,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
     def test_dry_run_limits_collection_to_rendered_nodeids(self):
         targets = _function_body(L0_TEST, "getInfraDryRunPytestTargets", "processShardTestList")
         preprocessing = _function_body(L0_TEST, "processShardTestList", "isValidSlurmJobId")
-        expected_target = (
-            "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
-        )
+        expected_target = "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
         self.assertIn("if (!isInfraDryRun())", targets)
         self.assertIn('.findAll { it.contains("::") }', targets)
         self.assertIn(f'"{expected_target}"', targets)
@@ -174,9 +172,7 @@ class InfraDryRunPipelineTest(unittest.TestCase):
 
     def test_dry_run_rejects_shell_metacharacters_in_rendered_target(self):
         targets = _function_body(L0_TEST, "getInfraDryRunPytestTargets", "processShardTestList")
-        expected_target = (
-            "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
-        )
+        expected_target = "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
         metacharacter_target = f"{expected_target};touch${{IFS}}/tmp/infra-dry-run"
         parsed_targets = [metacharacter_target.split(maxsplit=1)[0]]
         self.assertNotEqual(parsed_targets, [expected_target])
