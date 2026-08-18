@@ -59,17 +59,17 @@ def submit_sync_per_worker(mpi_session, fn, timeout: float = 60.0) -> list:
 
 
 def reset_worker_torch_compile_state() -> None:
-    """Reset per-worker torch.compile / Dynamo state (runs inside each worker).
+    """Reset per-worker torch.compile state (runs inside each worker).
 
-    Dynamo's recompile counter is process-global and per-code-object. When
-    worker processes are reused across LLMs (shared ``MpiPoolSession``), each
-    ``torch_compile`` case recompiles the same ``model.forward`` code object
-    under new guards; the count accumulates and eventually trips
-    ``recompile_limit`` (16), which is a HARD failure under ``fullgraph=True``
-    (``FailOnRecompileLimitHit``) and aborts the whole MPI job. Resetting
-    between cases makes each LLM start from a clean compile cache, like a fresh
-    process. Run on every worker via ``submit_sync_per_worker``.
+    Both Dynamo's recompile counter and TensorRT-LLM's compile-mode flag are
+    process-global. When worker processes are reused across LLMs (shared
+    ``MpiPoolSession``), each case must start with a clean compile cache and
+    compile mode disabled, like a fresh process. Run on every worker via
+    ``submit_sync_per_worker``.
     """
     import torch
 
+    from tensorrt_llm._torch.utils import set_torch_compiling
+
     torch._dynamo.reset()
+    set_torch_compiling(False)

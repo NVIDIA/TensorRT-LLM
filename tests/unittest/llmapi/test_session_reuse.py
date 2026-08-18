@@ -83,6 +83,22 @@ def test_reuse_hands_back_same_pool(reuse_cache):
     assert len(reuse_cache.prefetch.restocks) == 1  # reuse does not create a shadow
 
 
+def test_worker_reset_clears_tensorrt_llm_compile_mode(monkeypatch):
+    import torch
+    from test_common.grouped_test_utils import reset_worker_torch_compile_state
+
+    from tensorrt_llm._torch.utils import is_torch_compiling, set_torch_compiling
+
+    dynamo_resets = []
+    monkeypatch.setattr(torch._dynamo, "reset", lambda: dynamo_resets.append(True))
+    set_torch_compiling(True)
+
+    reset_worker_torch_compile_state()
+
+    assert dynamo_resets == [True]
+    assert not is_torch_compiling()
+
+
 def test_cached_handover_reaps_in_flight_retires(reuse_cache):
     # Two same-size pools released back-to-back (concurrent LLMs in one
     # test): the duplicate is retired in a BACKGROUND thread while holding
