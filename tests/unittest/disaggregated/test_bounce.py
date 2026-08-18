@@ -19,6 +19,7 @@ no-op fallback, and the TP fan-in reserve/record/settle logic (GPU allocators/st
 """
 
 import queue
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -218,6 +219,44 @@ def test_make_kv_result_msg_uses_binary_frame(result_name):
     r, rid, sl, last, code, size = tfr._KV_RESULT_PREFIX.unpack(msg[1])
     assert (r, rid, sl, last, size) == (3, 12345, 7, True, 8192)
     assert tfr._AGENT_RESULT_BY_CODE[code] is result
+
+
+def test_deliver_kv_aborts_receiver_when_session_is_gone():
+    """A slice whose TxSession was deregistered must still FAIL the peer's slice.
+
+    cancel_request()/ctx-timeout can drop the session while the slice is queued.
+    Returning without a result frame leaves the receiver's task future
+    unresolved for the whole kv_transfer_timeout_ms with its KV pages pinned.
+    """
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+
+    sent = []
+    failures = []
+    write_meta = SimpleNamespace(
+        unique_rid=4242,
+        slice_id=3,
+        task=SimpleNamespace(fail=failures.append),
+        peer_endpoint="tcp://peer:1234",
+        src_ptrs=SimpleNamespace(size=1),
+        dst_ptrs=SimpleNamespace(size=1),
+        sizes=SimpleNamespace(size=1),
+    )
+
+    sender = object.__new__(tfr.Sender)
+    sender._sessions = {}  # the real _get_session() then reports the session gone
+    sender._sessions_lock = threading.Lock()
+    sender._instance_rank = 1
+    sender._shutdown = True  # nothing real for __del__ to reap
+    sender._thread_local = threading.local()
+    sender._thread_local.dealers = {write_meta.peer_endpoint: SimpleNamespace(send=sent.append)}
+
+    tfr.Sender._deliver_kv_to_agent(sender, write_meta)
+
+    assert [type(e) for e in failures] == [RuntimeError]
+    assert len(sent) == 1, "receiver was never told the slice failed"
+    _, rid, slice_id, is_last, code, _ = tfr._KV_RESULT_PREFIX.unpack(sent[0][1])
+    assert (rid, slice_id, is_last) == (4242, 3, True)
+    assert tfr._AGENT_RESULT_BY_CODE[code] is tfr.AgentResult.FAILED
 
 
 # --------------------------------------------------------------------------- #

@@ -537,6 +537,7 @@ class Sender(SenderBase):
         assert write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size, (
             f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}"
         )
+        assert write_meta.slice_id is not None
 
         with self._sessions_lock:
             session = self._get_session(write_meta.unique_rid)
@@ -546,8 +547,12 @@ class Sender(SenderBase):
             )
             logger.error(msg)
             write_meta.task.fail(RuntimeError(msg))
+            # The session can be deregistered (cancel_request/ctx timeout) while
+            # this slice is still queued. Without a result frame the peer's RX
+            # task stays unresolved for the whole kv_transfer_timeout_ms with its
+            # KV pages pinned, so abort it here as the sibling exits below do.
+            self._abort_receiver_slice(write_meta)
             return
-        assert write_meta.slice_id is not None
         task = session.kv_tasks[write_meta.slice_id]
         timer = task._perf_timer
         if timer:
@@ -573,15 +578,7 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_dealer(write_meta.peer_endpoint).send(
-                _make_kv_result_msg(
-                    self._instance_rank,
-                    write_meta.unique_rid,
-                    write_meta.slice_id,
-                    True,  # is_last_slice — ensures receiver resolves its task future
-                    AgentResult.FAILED,
-                )
-            )
+            self._abort_receiver_slice(write_meta)
             return
 
         from .bounce import build_send_request, encode_result_tail
@@ -603,15 +600,7 @@ class Sender(SenderBase):
                     f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                 )
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
-                    _make_kv_result_msg(
-                        self._instance_rank,
-                        write_meta.unique_rid,
-                        write_meta.slice_id,
-                        True,  # is_last_slice — ensures receiver resolves its task future
-                        AgentResult.FAILED,
-                    )
-                )
+                self._abort_receiver_slice(write_meta)
                 return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
@@ -1130,6 +1119,31 @@ class Sender(SenderBase):
             if task._perf_timer is not None:
                 task._perf_timer.record_push_start(trans_meta.peer_rank)
             self._enqueue(trans_meta)
+
+    def _abort_receiver_slice(self, write_meta: WriteMeta):
+        """Tell the peer this slice failed so it resolves its RX task future now.
+
+        Called from _deliver_kv_to_agent on a _process_task_queue worker thread,
+        hence the thread-local DEALER cache: self._dealers is unsynchronized and
+        listener-thread-only. A send failure is swallowed like in
+        _send_failed_result_to_receiver — the local task is already failed and a
+        dead peer must not turn into a second, unhandled failure.
+        """
+        try:
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+                _make_kv_result_msg(
+                    self._instance_rank,
+                    write_meta.unique_rid,
+                    write_meta.slice_id,
+                    True,  # is_last_slice — ensures receiver resolves its task future
+                    AgentResult.FAILED,
+                )
+            )
+        except Exception as e:
+            logger.warning(
+                f"_deliver_kv_to_agent: failed to abort receiver slice for "
+                f"rid={write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
+            )
 
     def _send_failed_result_to_receiver(self, info: RecvReqInfo):
         try:
