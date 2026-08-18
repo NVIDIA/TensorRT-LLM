@@ -219,6 +219,7 @@ class GatedMLP(nn.Module):
         - gate_up_proj uses NVFP4 quantization
         - gate_up_proj has no bias (bias not supported in fused kernel)
         """
+
         return (self.use_cute_dsl_blockscaling_mm and self.activation == F.silu
                 and self._is_plain_swiglu()
                 and self.gate_up_proj.has_nvfp4_activation_quantization

@@ -100,6 +100,13 @@ class WideEPMoE(MoE):
 
         assert self.use_dp, "Attention DP should be used with WideEP."
         assert self.parallel_size > 1, "WideEP should only be enabled with parallel_size > 1"
+        # This backend's dispatch/combine path never forwards the clamp to the
+        # activation, so accepting one would silently drop it. Models that need
+        # a SwiGLU clamp (e.g. K-EXAONE2 late layers) must pick another backend.
+        if swiglu_limit is not None or swiglu_limit_scalar is not None:
+            raise NotImplementedError(
+                "WideEP MoE does not support a SwiGLU clamp; use the CUTLASS or "
+                "TRTLLMGen MoE backend for models that set swiglu_limit.")
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
 
