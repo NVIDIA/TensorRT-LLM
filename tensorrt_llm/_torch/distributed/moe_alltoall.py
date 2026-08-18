@@ -420,12 +420,14 @@ class MoeAlltoAll:
                               self.cft_max_batch_for_combine,
                               runtime_max_tokens_per_rank)
 
-    def cft_initialize(self):
+    def cft_initialize(self) -> None:
         """
         Initialize CFT Logical Endpoints by binding the LE to the MNNVL workspace.
         Must be called once before the first dispatch when can_use_cft_counted_writes=True.
         """
-        assert self.can_use_cft_counted_writes, "cft_initialize called but can_use_cft_counted_writes is False"
+        if not self.can_use_cft_counted_writes:
+            raise ValueError(
+                "cft_initialize called but can_use_cft_counted_writes is False")
         torch.ops.trtllm.moe_a2a_cft_initialize(
             self.workspace,
             self.mnnvl_mem.local_mem_handle,
