@@ -57,6 +57,15 @@ If any files were modified by this hook, you will need to stage and commit them 
 > See [CODING_GUIDELINES.md](CODING_GUIDELINES.md#pre-commit-linting-supplemental-rules)
 > for details on the two-group system and how to graduate files.
 
+### Secret Scanning
+
+Two complementary controls prevent accidental credential leakage:
+
+- **Local pre-commit** (`secret-scan-trufflehog`, from `NVIDIA/security-workflows`): catches credentials before commit. Self-installing — no manual setup beyond `pre-commit install`; the hook downloads a pinned, checksum-verified `trufflehog` on first use. On **Windows**, run from a Git Bash / MSYS shell.
+- **Server-side enforcement** (Pulse reusable workflow, pinned by SHA): runs on `main` on NVIDIA Linux runners and blocks on verified secrets.
+
+The local hook is skipped on hosted pre-commit.ci (no `trufflehog` binary there); Pulse remains the authoritative CI enforcement. Never commit a flagged secret; if a real credential is exposed, rotate it immediately.
+
 In addition, please try to keep pull requests (PRs) as concise as possible:
 * Avoid committing commented-out code.
 * Wherever possible, each PR should address a single concern. If there are several otherwise-unrelated things that should be fixed to reach a desired endpoint, our recommendation is to open several PRs and indicate the dependencies in the description. The more complex the changes are in a single PR, the more time it will take to review those changes.
