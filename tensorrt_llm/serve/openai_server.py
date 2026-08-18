@@ -2051,12 +2051,17 @@ class OpenAIServer(_VideoRoutesMixin):
             postproc_args = ChatPostprocArgs.from_request(request)
             if (is_kimi_k3 and request.add_generation_prompt
                     and request.prompt_token_ids is None
-                    and request.prompt_token_ids_b64 is None):
+                    and request.prompt_token_ids_b64 is None
+                    and request.chat_template is None
+                    and self.chat_template is None):
                 # Kimi's prompt-token accounting excludes the trailing 3-token
                 # generation channel opener (<|open|>think|response<|sep|>);
                 # the model still sees the full rendered prompt. b64-relayed
                 # token ids (decoded later) must behave like plain
                 # prompt_token_ids: no rendering here, so no stub to exclude.
+                # The offset presumes the checkpoint's native K3 renderer; an
+                # explicit request- or server-level chat template may end
+                # differently, so report unadjusted usage for those.
                 postproc_args.num_prompt_tokens_offset = 3
             if dynamic_tool_params:
                 # The tool parser must see dynamic tools to recognize their

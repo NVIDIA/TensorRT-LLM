@@ -141,9 +141,8 @@ class KimiK3ToolParser(BaseToolParser):
                 # dropped. Skip constrained decoding rather than teach the
                 # model a dialect the reference renderer never produces.
                 logger.warning(
-                    "Tool name %r contains '<'; skipping the kimi_k3 "
-                    "strict-tool grammar for this request.",
-                    tool.function.name,
+                    f"Tool name {tool.function.name!r} contains '<'; "
+                    "skipping the kimi_k3 strict-tool grammar for this request."
                 )
                 return None
         call_tags: List[Dict[str, Any]] = []
