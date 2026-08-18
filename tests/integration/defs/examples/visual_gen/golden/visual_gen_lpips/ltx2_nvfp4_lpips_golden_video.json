@@ -24,5 +24,5 @@
   "tensorrt_llm_version": "1.3.0rc21",
   "tensorrt_llm_commit": "b2131b181f5be6717cd302a0b53c22c6a70c65b3",
   "container_image": "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm@sha256:475999862b896593159f10f486e16a748e7b7abb5cee558932a59ea6fc690d6b",
-  "sha256": "246651c299973a05f7bc305820b5a09e660289a1bd9ade17da21765edd61fd48"
+  "sha256": "45281b21acd45d6d60ef45d5df21f455117c9fc1d3db7096898744a3377d1096"
 }
