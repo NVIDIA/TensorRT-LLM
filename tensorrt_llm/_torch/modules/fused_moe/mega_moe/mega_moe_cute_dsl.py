@@ -800,7 +800,6 @@ class MegaMoECuteDsl(MoE):
         # That makes the widening plausible, NOT proven: shared-memory and
         # register budgets grow with num_topk, and topk_reduce.py may carry
         # fixed unrolls. Accuracy at one shape is evidence, not coverage.
-        # See TODO-C in KIMI_K3_NVFP4_BRINGUP.md before relying on this.
         _MEGAMOE_CUTEDSL_MAX_TOP_K = 16
         if top_k > _MEGAMOE_CUTEDSL_MAX_TOP_K:
             raise ValueError(
