@@ -37,8 +37,7 @@ def _engine(
 
     ``dist`` is ``Optional`` on the real engine -- stub engines such as
     ``DummyModelEngine`` construct without a communicator -- so ``with_dist``
-    keeps that a state the policy has to answer for rather than one the
-    fixture quietly rules out.
+    covers that state too.
 
     ``tp_allgather`` returns this rank's value followed by ``tp_peer_values``,
     which is enough for the TP agreement check to see an asymmetric world.

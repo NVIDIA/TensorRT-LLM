@@ -279,29 +279,25 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
 @contextmanager
 def _distributed_warmup_guard(dist: Distributed,
                               mapping: Mapping) -> Iterator[None]:
-    """Hard-kill the world when warmup fails on a subset of ranks.
+    """Arm the rank-crash watchdog when warmup fails on a subset of ranks.
 
-    Warmup runs from ``PyExecutor.__init__``, i.e. before the executor loop
-    and therefore before ``_event_loop_wrapper`` arms its rank-crash kill. A
-    rank that raises here leaves every peer blocked in the warmup collective
-    it will now never join, until that peer's own HangDetector fires 300s
-    later. Arming the same watchdog closes that window for the whole warmup,
-    whatever phase and whatever exception type it failed on.
+    Warmup runs from ``PyExecutor.__init__``, before the executor loop and so
+    before ``_event_loop_wrapper`` arms this watchdog itself. A rank that
+    raises here leaves every peer blocked in a warmup collective it will
+    never join, until that peer's own HangDetector times out.
 
-    The watchdog (not an immediate ``propagate_hard_kill``) is what lets the
-    ORIGINAL exception still reach the client: its grace gives the worker's
-    setup/RPC error path time to report before the abort tears the world
-    down, and it honours the ``TLLM_RANK_CRASH_HARD_KILL_GRACE`` escape
-    hatch.
+    The watchdog's grace period is what keeps the failure diagnosable: the
+    worker's setup/RPC error path reports the exception before the abort
+    tears the world down, and ``TLLM_RANK_CRASH_HARD_KILL_GRACE`` tunes it.
 
-    ``SystemExit`` / ``KeyboardInterrupt`` are deliberately not covered, for
-    the same reason ``_event_loop_wrapper`` leaves them unarmed: they are
-    teardown signals the launcher is already acting on, and an MPI_Abort on
-    top would turn a clean Ctrl-C into exit 137.
+    ``SystemExit`` / ``KeyboardInterrupt`` are excluded for the same reason
+    ``_event_loop_wrapper`` leaves them unarmed: they are teardown signals
+    the launcher is already acting on, and an MPI_Abort on top would turn a
+    clean Ctrl-C into exit 137.
 
-    Peer count uses both the model communicator and ``MPI.COMM_WORLD``. DWDP
-    peers live only in the latter, while a TorchDist launch can have multiple
-    model ranks even when the MPI world contains only this process.
+    Peer count spans the model communicator and ``MPI.COMM_WORLD``: DWDP
+    peers live only in the latter, while a TorchDist launch can have several
+    model ranks in a single-process MPI world.
     """
     try:
         yield

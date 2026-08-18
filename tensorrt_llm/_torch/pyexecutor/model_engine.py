@@ -2102,11 +2102,10 @@ class PyTorchModelEngine(ModelEngine):
                         torch.cuda.empty_cache()
                         continue
                     except RuntimeError as e:
-                        # This known KV allocation failure happens before
-                        # forward, but is locally recoverable only when there
-                        # are no peer workers that can advance independently.
-                        # Any other RuntimeError is a defect rather than a
-                        # capacity limit, so it stays fatal.
+                        # The known KV allocation failure happens before
+                        # forward and is recoverable only when no peer worker
+                        # can advance independently. Any other RuntimeError is
+                        # a defect, not a capacity limit, and is fatal.
                         if self._is_distributed_forward():
                             raise
                         if "Can't allocate new blocks for window size" not in str(
