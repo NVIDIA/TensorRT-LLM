@@ -18,7 +18,7 @@ from tensorrt_llm.serve.openai_protocol import (
     ImageGenerationRequest,
     VideoGenerationRequest,
 )
-from tensorrt_llm.visual_gen.media_refs import _resolve_reference_string
+from tensorrt_llm.visual_gen.media_refs import _resolve_reference
 
 if TYPE_CHECKING:
     from fastapi import UploadFile
@@ -110,34 +110,30 @@ def _merge_extra_params(
         params.extra_params = None
 
 
-def _reference_payload_and_role(ref: Any) -> tuple[Any, Optional[str]]:
-    """Extract ``(content, role)`` from one raw HTTP reference for transport.
+def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
+    """Extract ``(content, format, role)`` from one raw HTTP reference.
 
-    ``ref`` is a string (base64/``data:`` URI, ``http(s)`` URL, or a local file
-    path), a multipart ``UploadFile`` (has ``.file``), or a ``MediaReferenceItem``
-    exposing ``content`` and an optional ``role``. An upload is read to ``bytes``
-    here — the only decode the boundary owns; strings pass through untouched for
-    the engine to resolve and materialize.
+    ``ref`` is a multipart ``UploadFile`` (has ``.file``) or a
+    ``MediaReferenceItem`` exposing ``content`` / ``format`` / ``role``. An
+    upload is read to ``bytes`` here — the only decode the boundary owns — and
+    its format is implied by the transport rather than declared by the client;
+    everything else passes through for the engine to resolve.
     """
-    role = getattr(ref, "role", None)
-    if isinstance(ref, str):
-        return ref, role
     if hasattr(ref, "file"):  # multipart UploadFile
-        return ref.file.read(), role
-    data = getattr(ref, "content", None)
-    if not isinstance(data, str):
+        return ref.file.read(), "bytes", getattr(ref, "role", None)
+    content = getattr(ref, "content", None)
+    if not isinstance(content, str):
         raise ValueError("reference item must carry a 'content' string.")
-    return data, role
+    return content, ref.format, getattr(ref, "role", None)
 
 
 def _build_reference_list(value: Any) -> Optional[list]:
     """Normalize one HTTP reference field into a list of ``MediaRef`` objects.
 
-    ``value`` is None, a base64/data-URI/URL/path string, a multipart
-    ``UploadFile``, a ``MediaReferenceItem``, or a list of any of those. Each
-    entry becomes a ``MediaRef`` carrying its transport content — ``bytes`` for
-    an upload, the string otherwise — plus its ``role``. Resolution and
-    materialization happen later at the engine choke point.
+    ``value`` is None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or
+    a list of those. Each entry becomes a ``MediaRef`` carrying its transport
+    content plus the declared (or, for an upload, implied) wire format.
+    Resolution and materialization happen later at the engine choke point.
     """
     if value is None:
         return None
@@ -148,8 +144,33 @@ def _build_reference_list(value: Any) -> Optional[list]:
     raw_items = value if isinstance(value, list) else [value]
     refs = []
     for item in raw_items:
-        content, role = _reference_payload_and_role(item)
-        refs.append(MediaRef(content=content, role=role))
+        content, content_format, role = _reference_transport(item)
+        refs.append(MediaRef(content=content, format=content_format, role=role))
+    return refs
+
+
+def _build_image_edit_reference_list(value: Any) -> Optional[list]:
+    """Build references from an image-edit request's OpenAI-shaped ``image``.
+
+    That field follows OpenAI's schema, which has no place to declare a wire
+    form: an entry is a bare base64 string or a multipart upload, so the format
+    is implied by the transport instead of read off the item.
+    """
+    if value is None:
+        return None
+    from tensorrt_llm.visual_gen.params import MediaRef
+
+    refs = []
+    for item in value if isinstance(value, list) else [value]:
+        if hasattr(item, "file"):  # multipart UploadFile
+            refs.append(MediaRef(content=item.file.read(), format="bytes"))
+        elif isinstance(item, str):
+            refs.append(MediaRef(content=item, format="base64"))
+        else:
+            raise ValueError(
+                "image edit inputs must be base64-encoded images or uploaded files, "
+                f"got {type(item).__name__}."
+            )
     return refs
 
 
@@ -369,14 +390,16 @@ def cleanup_materialized_conditioning_inputs(value: Any) -> None:
 def _apply_deprecated_input_reference(
     input_reference: str | UploadFile | None,
     params: VisualGenParams,
+    input_reference_format: Optional[str] = None,
 ) -> None:
     """Back-compat for the deprecated single ``input_reference``.
 
     Sniff-routes the payload to ``image_reference`` (image) or ``video_reference``
     (video), preserving the pre-typed-fields behavior. Ignored when a typed
     image/video reference is already set — the typed fields take precedence.
-    Routing needs the bytes, so a string payload is resolved here; the engine
-    materializes the resulting ``MediaRef`` like any other reference.
+    Routing needs the bytes, so the payload is resolved here using the wire form
+    from the sibling ``input_reference_format`` (implied for an upload); the
+    resolved bytes are then handed to the engine like any other reference.
     """
     if input_reference is None:
         return
@@ -385,14 +408,15 @@ def _apply_deprecated_input_reference(
         return
     from tensorrt_llm.visual_gen.params import MediaRef
 
-    payload, _ = _reference_payload_and_role(input_reference)
-    if isinstance(payload, str):
-        payload = _resolve_reference_string(payload)
+    if hasattr(input_reference, "file"):  # multipart upload — form implied
+        payload = input_reference.file.read()
+    else:
+        payload = _resolve_reference(input_reference, input_reference_format)
     kind = sniff_media_kind(payload)
     if kind == "image":
-        params.image_reference = [MediaRef(content=payload)]
+        params.image_reference = [MediaRef(content=payload, format="bytes")]
     elif kind == "video":
-        params.video_reference = [MediaRef(content=payload)]
+        params.video_reference = [MediaRef(content=payload, format="bytes")]
     else:
         raise ValueError(
             "input_reference is not a recognized media container; supported "
@@ -452,7 +476,7 @@ def parse_visual_gen_params(
         if request.n is not None:
             params.num_images_per_prompt = request.n
         _validate_image_edit_request_limits(request, generator)
-        params.image_reference = _build_reference_list(request.image)
+        params.image_reference = _build_image_edit_reference_list(request.image)
 
     elif isinstance(request, VideoGenerationRequest):
         if request.frame_rate is not None:
@@ -491,7 +515,9 @@ def parse_visual_gen_params(
         audio_refs = _build_reference_list(request.audio_reference)
         if audio_refs:
             params.audio_reference = audio_refs
-        _apply_deprecated_input_reference(request.input_reference, params)
+        _apply_deprecated_input_reference(
+            request.input_reference, params, request.input_reference_format
+        )
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _decode_inline_media(request.extra_params, generator.extra_param_specs)

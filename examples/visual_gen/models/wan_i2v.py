@@ -66,7 +66,7 @@ def main():
     # first-frame reference. Wan I2V also accepts a ``last_frame`` role, so the
     # role must be given to disambiguate.
     params = visual_gen.default_params
-    params.image_reference = [MediaRef(content=args.image, role="first_frame")]
+    params.image_reference = [MediaRef(content=args.image, format="path", role="first_frame")]
 
     output = visual_gen.generate(
         inputs="A cat presses the piano keys with its paws, soft notes filling the quiet room.",

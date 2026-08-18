@@ -26,7 +26,6 @@ import base64
 import os
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
 
 from tensorrt_llm.inputs.media_io import (
     _normalize_file_uri,
@@ -49,6 +48,10 @@ def _read_reference_payload(reference: str) -> bytes:
         comma = data.find(",")
         if comma == -1:
             raise ValueError("reference data: URI is malformed (missing comma).")
+        # Match the LLM loader: only base64 payloads are supported, and saying so
+        # beats letting a percent-encoded body fail as "not valid base64".
+        if "base64" not in data[:comma].split(";")[1:]:
+            raise ValueError("only base64 data: URIs are supported for references.")
         data = data[comma + 1 :]
     try:
         return base64.b64decode(data, validate=True)
@@ -57,41 +60,43 @@ def _read_reference_payload(reference: str) -> bytes:
         raise ValueError("reference is not valid base64 data.") from exc
 
 
-def _resolve_reference_string(reference: str) -> bytes:
-    """Resolve one reference string to raw bytes, dispatching on URL scheme.
+def _local_path(reference: str) -> Path:
+    """Normalize a ``path`` reference (bare or ``file://``) to a ``Path``."""
+    return Path(_normalize_file_uri(reference))
 
-    Mirrors the LLM multimodal loader so serve references accept the same forms:
-    ``http(s)`` fetches through the SSRF-guarded loader (private-address block,
-    redirect re-validation, timeout, size cap); ``file://`` and bare local paths
-    read from disk; ``data:`` and base64 strings decode inline. A bare string is
-    decoded as base64 first and, failing that, read as a local file path.
-    Fetch/read failures become ``ValueError`` so a bad URL or path is a client
-    400, not a server 500.
+
+def _resolve_reference(content: Any, content_format: str) -> bytes:
+    """Resolve one reference to raw bytes using its declared wire form.
+
+    Dispatch is on the caller-declared ``format``, never on the shape of the
+    value: a bare string is otherwise ambiguous between a local path and
+    base64, and guessing lets a mistyped path become base64 (or a malformed
+    base64 become a filesystem read). Fetch/read/decode failures become
+    ``ValueError`` so a bad reference is a client 400, not a server 500.
     """
-    scheme = urlparse(reference).scheme
-    if scheme in ("http", "https"):
+    if content_format == "bytes":
+        if not isinstance(content, bytes):
+            raise ValueError(
+                f"format='bytes' requires bytes content, got {type(content).__name__}."
+            )
+        return content
+    if not isinstance(content, str):
+        raise ValueError(
+            f"format={content_format!r} requires string content, got {type(content).__name__}."
+        )
+    if content_format == "url":
         try:
-            return _safe_request_get(reference).content
+            return _safe_request_get(content).content
         except Exception as exc:
             raise ValueError(f"reference URL could not be fetched: {exc}") from exc
-    if scheme == "file":
+    if content_format == "path":
         try:
-            return Path(_normalize_file_uri(reference)).read_bytes()
+            return _local_path(content).read_bytes()
         except OSError as exc:
             raise ValueError(f"reference file could not be read: {exc}") from exc
-    if scheme == "data":
-        return _read_reference_payload(reference)
-    # Bare string: base64 first (the established default), else a local file path
-    # so a plain path works without the file:// scheme.
-    try:
-        return _read_reference_payload(reference)
-    except ValueError:
-        try:
-            return Path(reference).read_bytes()
-        except OSError as exc:
-            raise ValueError(
-                f"reference is not valid base64 data, and not a readable local file: {exc}"
-            ) from exc
+    if content_format == "base64":
+        return _read_reference_payload(content)
+    raise ValueError(f"unsupported reference format: {content_format!r}")
 
 
 def _materialize_reference(
@@ -161,56 +166,48 @@ def resolve_media_storage_path() -> Path:
     return path
 
 
-def _is_local_path(content: Any) -> bool:
-    """True if ``content`` is a trusted local path to pass through untouched.
-
-    A ``file://`` URI or bare string naming an *existing* file. A missing path
-    (either form) returns False so it falls through to the resolve step, whose
-    read raises ``ValueError`` — a client 400, not a silent passthrough.
-    Everything else (bytes, ``http(s)`` / ``data:`` URLs, base64) materializes.
-    """
-    if not isinstance(content, str):
-        return False
-    scheme = urlparse(content).scheme
-    if scheme == "file":
-        return os.path.exists(_normalize_file_uri(content))
-    return scheme == "" and os.path.exists(content)
-
-
 def prepare_reference_slots(
     params: Any, *, request_id: str, media_storage_path: Optional[str]
 ) -> None:
     """Resolve + materialize each reference to a local path, in place.
 
     The single reference choke point, used by the engine (``generate_async``)
-    so serve and the standalone Python API share one path. A trusted local path
-    (``file://`` / existing bare path) passes through — not materialized, not
-    cleaned up (it is the caller's file); a ``file://`` URI is normalized to a
-    plain path so the pipeline, which opens paths, can read it. Everything else
-    (bytes / ``http(s)`` / ``data:`` / base64) resolves to bytes and materializes
-    to ``media_storage_path``; those files are reclaimed by
-    :func:`cleanup_reference_files` keyed on ``request_id``. Runs before the
-    coordinator broadcasts the request, so bad-media ``ValueError`` surfaces to
-    the caller synchronously (serve keeps its immediate 400). If a later slot
-    fails mid-materialize, the files earlier slots wrote are reclaimed here so a
-    rejected request leaves nothing on disk.
+    so serve and the standalone Python API share one path. Dispatch is on each
+    reference's declared ``format``, never on the shape of its content. A
+    ``path`` reference is the caller's own file: it passes through — not
+    materialized, not cleaned up — with a ``file://`` URI normalized to a plain
+    path so the pipeline, which opens paths, can read it. Every other form
+    (``url`` / ``base64`` / ``bytes``) resolves to bytes and materializes to
+    ``media_storage_path``; those files are reclaimed by
+    :func:`cleanup_reference_files` keyed on ``request_id``.
+
+    ``format`` is rewritten alongside ``content``: the mutated params object is
+    what gets broadcast to the workers, so a stale format would send e.g.
+    ``base64`` to a worker holding a filesystem path.
+
+    Runs before the coordinator broadcasts the request, so a bad reference
+    raises ``ValueError`` synchronously (serve keeps its immediate 400). If a
+    later slot fails mid-materialize, the files earlier slots wrote are
+    reclaimed here so a rejected request leaves nothing on disk.
     """
     try:
         for slot in ("image_reference", "video_reference", "audio_reference"):
             modality = slot.split("_", 1)[0]
             for i, ref in enumerate(getattr(params, slot, None) or []):
-                content = ref.content
-                if _is_local_path(content):
-                    if urlparse(content).scheme == "file":
-                        ref.content = _normalize_file_uri(content)
+                if ref.format == "path":
+                    path = _local_path(ref.content)
+                    if not path.exists():
+                        raise ValueError(f"reference file does not exist: {ref.content}")
+                    ref.content = str(path)
                     continue
-                data = content if isinstance(content, bytes) else _resolve_reference_string(content)
+                data = _resolve_reference(ref.content, ref.format)
                 ref.content = _materialize_reference(
                     data,
                     modality=modality,
                     ref_id=f"{request_id}_{modality}_ref_{i}",
                     media_storage_path=media_storage_path,
                 )
+                ref.format = "path"
     except Exception:
         # The terminal on_finish hook is not wired yet (the request is never
         # enqueued on failure), so reclaim any files earlier slots wrote here.

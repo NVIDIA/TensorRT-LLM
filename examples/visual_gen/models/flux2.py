@@ -25,7 +25,7 @@ Usage:
 import argparse
 from pathlib import Path
 
-from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm import MediaRef, VisualGen, VisualGenArgs
 
 
 def _output_paths(output_path: str, num_images: int) -> str | list[str]:
@@ -118,7 +118,9 @@ def main():
     # Start from per-model defaults and override only user-provided request fields.
     params = visual_gen.default_params
     params.num_images_per_prompt = args.num_images_per_prompt
-    params.image_reference = args.image
+    params.image_reference = (
+        [MediaRef(content=path, format="path") for path in args.image] if args.image else None
+    )
     if args.image:
         # Let FLUX.2 derive omitted dimensions from the first processed reference.
         params.height = args.height

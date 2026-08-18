@@ -21,6 +21,12 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 
 Role = Literal["reference", "first_frame", "last_frame"]
 
+# Wire form of a reference's ``content``. Declared explicitly rather than
+# sniffed: a bare string is otherwise ambiguous between a local path and
+# base64, and guessing lets a mistyped path silently become base64 (or a
+# malformed base64 silently become a filesystem read).
+ContentFormat = Literal["path", "url", "base64", "bytes"]
+
 
 @set_api_status("prototype")
 class MediaRef(StrictBaseModel):
@@ -34,23 +40,42 @@ class MediaRef(StrictBaseModel):
     """
 
     content: Union[str, bytes] = Field(
-        description="Local path, ``http(s)``/``data:`` URL, or raw bytes."
+        description="The reference payload, in the form declared by ``format``."
+    )
+    format: ContentFormat = Field(
+        description=(
+            "Wire form of ``content``: ``path`` (local file; a ``file://`` URI is "
+            "also accepted), ``url`` (``http(s)``, fetched through the SSRF-guarded "
+            "loader), ``base64`` (a ``data:`` URI is also accepted), or ``bytes``."
+        )
     )
     role: Optional[Role] = Field(
         default=None, description="``reference`` | ``first_frame`` | ``last_frame``."
     )
 
 
-def _normalize_refs(value: Any) -> Optional[list]:
-    """Coerce a reference field to ``list[MediaRef]`` (or ``None``).
+def _reject_bare_refs(value: Any) -> Any:
+    """Reject the bare path/bytes shorthand with an actionable message.
 
-    Accepts a bare path/bytes, a single ``MediaRef``, or a list mixing the two;
-    a bare path/bytes ``x`` becomes ``MediaRef(content=x)``.
+    Runs before coercion, so the caller sees what to do instead of a union
+    mismatch reported against an inner model. A bare string has nowhere to
+    declare its wire form, and guessing is what ``format`` exists to prevent.
     """
+    for x in value if isinstance(value, list) else [value]:
+        if isinstance(x, (str, bytes)):
+            raise ValueError(
+                "a reference must declare its wire form; a bare "
+                f"{type(x).__name__} is no longer accepted. Pass "
+                'MediaRef(content=..., format="path"|"url"|"base64"|"bytes").'
+            )
+    return value
+
+
+def _normalize_refs(value: Any) -> Optional[list]:
+    """Coerce a reference field to ``list[MediaRef]`` (or ``None``)."""
     if value is None:
         return None
-    items = value if isinstance(value, list) else [value]
-    return [x if isinstance(x, MediaRef) else MediaRef(content=x) for x in items]
+    return value if isinstance(value, list) else [value]
 
 
 @set_api_status("prototype")
@@ -111,22 +136,25 @@ class VisualGenParams(StrictBaseModel):
 
     # Conditioning inputs
     negative_prompt: Optional[str] = Field(default=None, description="Negative prompt for CFG.")
-    # Per-modality reference inputs. A bare path/bytes, a single ``MediaRef``,
-    # or a list; normalized to ``list[MediaRef]``. The field fixes the modality;
-    # ``role`` is only meaningful where a model declares more than one role for
-    # it (e.g. image first_frame / last_frame).
-    image_reference: Optional[Union[str, bytes, MediaRef, List[Union[str, bytes, MediaRef]]]] = (
-        Field(
-            default=None,
-            description="Reference image(s) for I2V/I2I; normalized to list[MediaRef].",
-        )
+    # Per-modality reference inputs. A single ``MediaRef`` or a list; normalized
+    # to ``list[MediaRef]``. The field fixes the modality; ``role`` is only
+    # meaningful where a model declares more than one role for it (e.g. image
+    # first_frame / last_frame), and each ref declares its own ``format``.
+    image_reference: Optional[Union[MediaRef, List[MediaRef]]] = Field(
+        default=None,
+        description="Reference image(s) for I2V/I2I; normalized to list[MediaRef].",
     )
-    video_reference: Optional[Union[str, bytes, MediaRef, List[Union[str, bytes, MediaRef]]]] = (
-        Field(default=None, description="Reference video(s) for V2V; normalized to list[MediaRef].")
+    video_reference: Optional[Union[MediaRef, List[MediaRef]]] = Field(
+        default=None, description="Reference video(s) for V2V; normalized to list[MediaRef]."
     )
-    audio_reference: Optional[Union[str, bytes, MediaRef, List[Union[str, bytes, MediaRef]]]] = (
-        Field(default=None, description="Reference audio(s); normalized to list[MediaRef].")
+    audio_reference: Optional[Union[MediaRef, List[MediaRef]]] = Field(
+        default=None, description="Reference audio(s); normalized to list[MediaRef]."
     )
+
+    @field_validator("image_reference", "video_reference", "audio_reference", mode="before")
+    @classmethod
+    def _reject_bare(cls, v):
+        return v if v is None else _reject_bare_refs(v)
 
     @field_validator("image_reference", "video_reference", "audio_reference", mode="after")
     @classmethod

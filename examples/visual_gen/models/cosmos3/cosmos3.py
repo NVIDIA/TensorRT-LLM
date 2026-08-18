@@ -27,7 +27,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm import MediaRef, VisualGen, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import TRANSFER_HINT_KEYS
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -336,7 +336,7 @@ def main():
         "--image_path",
         type=str,
         default=None,
-        help="Optional conditioning image path or URL for I2V/TI2V",
+        help="Optional conditioning image path for I2V/TI2V",
     )
     parser.add_argument(
         "--output_path",
@@ -477,7 +477,7 @@ def main():
     # Query per-model defaults (resolution, steps, guidance, seed, etc.).
     params = visual_gen.default_params
     if image_path is not None:
-        params.image_reference = image_path
+        params.image_reference = [MediaRef(content=image_path, format="path")]
 
     negative_prompt = resolve_negative_prompt(
         negative_prompt=args.negative_prompt,
@@ -514,7 +514,7 @@ def main():
         with open(args.action_json, encoding="utf-8") as f:
             params.extra_params["action"] = json.load(f)
     if args.video_path is not None:
-        params.video_reference = args.video_path
+        params.video_reference = [MediaRef(content=args.video_path, format="path")]
     if args.extra_params:
         # Merged last: explicit JSON wins over flag-derived values.
         params.extra_params.update(args.extra_params)

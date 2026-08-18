@@ -121,35 +121,44 @@ The asynchronous `/v1/videos` job advances through `GET /v1/videos/{id}`: `queue
 
 ### Reference Inputs
 
-Conditioning references are supplied through the typed, per-modality fields `image_reference`, `video_reference`, and `audio_reference`. These fields share the **same names and shapes** across the Python API (`VisualGenParams`) and the serve request (`VideoGenerationRequest`), and each accepts a path, raw bytes, a single reference, or a list. Every pipeline declares the reference slots and roles it accepts through `ref_slot_specs`; a request is validated against that declaration before generation begins, so a missing required reference, an excess reference, or an unsupported role is rejected at the boundary. When served, references are carried on the video endpoints and are materialized (base64, `data:` URI, `http(s)` URL, local file path, or uploaded file) to a local path before reaching the worker. A local path may be given bare or as a `file://` URI; `http(s)` URLs are fetched through the same SSRF-guarded loader as the LLM multimodal path (private-address block, redirect re-validation, timeout, and size cap).
+Conditioning references are supplied through the typed, per-modality fields `image_reference`, `video_reference`, and `audio_reference`. These fields share the **same names and shapes** across the Python API (`VisualGenParams`) and the serve request (`VideoGenerationRequest`), and each accepts a single reference or a list. A reference always declares the wire form of its content — `MediaRef(content=..., format=...)` in Python, `{"content": ..., "format": ...}` in JSON. `format` is **required** and nothing is guessed: a bare string or bare bytes is rejected, so a mistyped path can never be silently read as base64. Every pipeline declares the reference slots and roles it accepts through `ref_slot_specs`; a request is validated against that declaration before generation begins, so a missing required reference, an excess reference, or an unsupported role is rejected at the boundary. When served, references are carried on the video endpoints and are materialized to a local path before reaching the worker; `http(s)` URLs are fetched through the same SSRF-guarded loader as the LLM multimodal path (private-address block, redirect re-validation, timeout, and size cap).
+
+| `format` | Content | Notes |
+|---|---|---|
+| `path` | A local file readable by the process running generation | Bare path or `file://` URI. The file must exist, and passes through in place — it is neither copied nor deleted. |
+| `url` | An `http(s)` URL | Fetched through the SSRF-guarded loader, then materialized to a local path. |
+| `base64` | Base64 text | A `data:` URI is also accepted. |
+| `bytes` | Raw `bytes` | Python API only. Rejected over JSON (HTTP 422) — send `base64` or upload the file via multipart. |
+
+The `file://` and `data:` prefixes are still accepted, but are no longer needed to disambiguate: `format` already states which form the content is in. A multipart file upload carries no `format` — the server implies `bytes` from the transport. A reference item's `format` is distinct from the request's top-level `format` field, which selects the *output* encoding (`mp4`, `png`, …).
 
 Most models take a single reference whose role is unambiguous, so no `role` is specified:
 
 ```python
-from tensorrt_llm import VisualGen
+from tensorrt_llm import VisualGen, MediaRef
 
 # The image conditions the generated video's first frame.
 vg = VisualGen(model="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
 params = vg.default_params
-params.image_reference = "start.png"
+params.image_reference = MediaRef(content="start.png", format="path")
 output = vg.generate(inputs="the scene comes alive with gentle motion", params=params)
 
 # Cosmos conditions generation on a reference video.
 vg = VisualGen(model="nvidia/Cosmos3-Super")
 params = vg.default_params
-params.video_reference = "clip.mp4"
+params.video_reference = MediaRef(content="clip.mp4", format="path")
 ```
 
-The equivalent serve request uploads the file, or sends a base64 string, `data:` URI, `http(s)` URL, or local file path as the field value in a JSON body:
+The equivalent serve request uploads the file, or sends a `{content, format}` object as the field value in a JSON body:
 
 ```bash
 # multipart file upload (raw bytes, no base64)
 curl http://localhost:8000/v1/videos -F "prompt=the scene comes alive" -F "image_reference=@start.png"
 curl http://localhost:8000/v1/videos -F "prompt=continue the scene" -F "video_reference=@clip.mp4"
 
-# JSON body: the reference string may be base64, a data: URI, an http(s) URL, or a local file path
+# JSON body: the content plus the format it is in (path, url, or base64)
 curl http://localhost:8000/v1/videos -H 'content-type: application/json' \
-  -d '{"prompt": "the scene comes alive", "image_reference": "https://example.com/start.png"}'
+  -d '{"prompt": "the scene comes alive", "image_reference": {"content": "https://example.com/start.png", "format": "url"}}'
 ```
 
 When a model accepts the same modality in more than one role — Wan 2.1 I2V takes a first frame and an optional last frame — the `role` is required to disambiguate:
@@ -160,8 +169,8 @@ from tensorrt_llm import VisualGen, MediaRef
 vg = VisualGen(model="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers")
 params = vg.default_params
 params.image_reference = [
-    MediaRef(content="start.png", role="first_frame"),
-    MediaRef(content="end.png", role="last_frame"),  # optional
+    MediaRef(content="start.png", format="path", role="first_frame"),
+    MediaRef(content="end.png", format="path", role="last_frame"),  # optional
 ]
 ```
 
@@ -171,15 +180,15 @@ A JSON serve request carries the role and lists; a multipart upload is limited t
 curl http://localhost:8000/v1/videos -H 'content-type: application/json' -d '{
   "prompt": "the subject comes alive",
   "image_reference": [
-    {"content": "<base64>", "role": "first_frame"},
-    {"content": "<base64>", "role": "last_frame"}
+    {"content": "<base64>", "format": "base64", "role": "first_frame"},
+    {"content": "<base64>", "format": "base64", "role": "last_frame"}
   ]
 }'
 ```
 
 FLUX.2 and Qwen-Image-Edit accept multiple reference images as a list on the same `image_reference` field through the Python API.
 
-A single `input_reference` field (deprecated) is still accepted on the serve video endpoints for backward compatibility; it is routed by content signature to image-to-video or video-to-video, and is ignored when a typed `image_reference` / `video_reference` is also provided. Prefer the typed fields.
+A single `input_reference` field (deprecated) is still accepted on the serve video endpoints for backward compatibility; it is routed by content signature to image-to-video or video-to-video, and is ignored when a typed `image_reference` / `video_reference` is also provided. Being a bare value, it declares its wire form through the sibling `input_reference_format` field (`path` / `url` / `base64`), which is required when `input_reference` is a string and implied for a multipart upload. Prefer the typed fields.
 
 ## Optimizations
 

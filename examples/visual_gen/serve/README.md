@@ -286,7 +286,13 @@ You can customize these by:
 - `frame_rate` (canonical) or `fps` (alias): frames per second
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
-- `image_reference`: Reference image(s) for I2V/TI2V. `video_reference`: reference video(s) for V2V. `audio_reference`: reference audio(s). Each accepts a base64-encoded string (optionally a `data:` URI), a `{image|video|audio, role}` object, or a list of them in JSON; or a single uploaded file in multipart form-data.
+- `image_reference`: Reference image(s) for I2V/TI2V. `video_reference`: reference video(s) for V2V. `audio_reference`: reference audio(s). In JSON each accepts a `{content, format, role}` object or a list of them; `format` is required and declares how to read `content` — `"path"` (a file readable by the server; a `file://` URI is also accepted), `"url"` (`http(s)`), or `"base64"` (a `data:` URI is also accepted). Nothing is guessed, so a bare string is rejected, and `"bytes"` is rejected over JSON — upload the file instead. A multipart file upload needs no `format`: the transport implies it.
+
+    ```json
+    {"image_reference": {"content": "iVBORw0KGgoAAAANSUhEUg...", "format": "base64"}}
+    ```
+
+  - `format` here is the *input* wire form; the top-level `format` selects the *output* encoding.
   - **Supported formats**: PNG and JPEG images; MP4 and AVI video, with H.264 the tested codec and others best-effort. HEIF/AVIF are not supported.
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
