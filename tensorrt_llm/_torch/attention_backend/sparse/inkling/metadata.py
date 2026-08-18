@@ -350,14 +350,15 @@ class InklingAttentionMetadata(TrtllmAttentionMetadata):
                 checked += 1
         if not _INK_XCHK_ANNOUNCED:
             _INK_XCHK_ANNOUNCED = True
+            # f-string, not %-args: tensorrt_llm.logger.info concatenates its
+            # arguments rather than %-formatting them the way stdlib logging
+            # does, so the lazy form printed the literal "%d" (job 6276424) and
+            # the counts -- the whole point of this line -- were lost.
             logger.info(
-                "INKLING_PT_CROSSCHECK ACTIVE: %d layer/request pairs agreed "
-                "(borrowed kv_cache_block_offsets // %d == get_batch_cache_indices) "
-                "over %d layers and %d generation rows",
-                checked,
-                div,
-                len(layers),
-                len(gen_ids),
+                f"INKLING_PT_CROSSCHECK ACTIVE: {checked} layer/request pairs "
+                f"agreed (borrowed kv_cache_block_offsets // {div} == "
+                f"get_batch_cache_indices) over {len(layers)} layers and "
+                f"{len(gen_ids)} generation rows"
             )
 
     def create_cuda_graph_metadata(
