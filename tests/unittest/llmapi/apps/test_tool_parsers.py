@@ -1896,11 +1896,18 @@ def test_deepseek_streaming_prefix_is_delta_independent(
 
     for deltas in splits:
         parser = parser_cls()
-        streamed = "".join(
-            parser.parse_streaming_increment(delta, sample_tools).normal_text
-            for delta in deltas)
+        results = [
+            parser.parse_streaming_increment(delta, sample_tools)
+            for delta in deltas
+        ]
+        streamed = "".join(result.normal_text for result in results)
+        names = [
+            call.name for result in results for call in result.calls
+            if call.name
+        ]
 
         assert streamed == prefix, f"{deltas!r} streamed {streamed!r}"
+        assert names == ["get_weather"], f"{deltas!r} called {names!r}"
 
 
 # ============================================================================
