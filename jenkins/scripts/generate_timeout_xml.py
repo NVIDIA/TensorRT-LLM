@@ -52,7 +52,7 @@ def format_timeout_system_out(nodeid, snippet):
         "PYTEST TIMEOUT\n"
         f"Test: {nodeid}\n"
         "------------------------------------------------------------------------------\n"
-        "Captured pytest output:\n"
+        "pytest-timeout thread stack dump:\n"
         "------------------------------------------------------------------------------\n"
         f"{snippet.rstrip()}\n"
         "==============================================================================\n"
@@ -79,9 +79,11 @@ def load_timeout_map(paths, expected_nodeids=None):
             other tests are ignored before their snippets are retained.
 
     Returns:
-        Timeout records keyed by nodeid. When duplicate rank records exist,
-        the first record by numeric step and rank order wins deterministically.
-        Unreadable files and corrupt lines are reported and skipped.
+        Timeout records keyed by nodeid. For rank-specific files, the first
+        record by numeric step and rank order wins deterministically. For a
+        non-rank local file, later records overwrite earlier ones so the most
+        recent rerun supplies the displayed snippet. Unreadable files and
+        corrupt lines are reported and skipped.
     """
     if not paths:
         return {}
@@ -89,6 +91,7 @@ def load_timeout_map(paths, expected_nodeids=None):
         paths = [paths]
     timeout_map = {}
     for path in sorted(map(os.fspath, paths), key=timeout_data_sort_key):
+        is_rank_file = _RANK_TIMEOUT_DATA_FILE_RE.search(os.path.basename(path)) is not None
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 for lineno, raw in enumerate(f, 1):
@@ -110,7 +113,10 @@ def load_timeout_map(paths, expected_nodeids=None):
                         nodeid = rec["nodeid"]
                         if expected_nodeids is not None and nodeid not in expected_nodeids:
                             continue
-                        timeout_map.setdefault(nodeid, rec["snippet"])
+                        if is_rank_file:
+                            timeout_map.setdefault(nodeid, rec["snippet"])
+                        else:
+                            timeout_map[nodeid] = rec["snippet"]
                     except (json.JSONDecodeError, KeyError, ValueError) as exc:
                         print(
                             f"WARNING: generate_timeout_xml: skipping corrupt line "
@@ -245,7 +251,12 @@ def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage-name", required=True, help="Stage name")
-    parser.add_argument("--test-file-path", required=True, help="Test list file path")
+    parser.add_argument(
+        "--test-file-path",
+        action="append",
+        required=True,
+        help="Test list file path; may be passed for the original run and reruns",
+    )
     parser.add_argument("--output-file", required=True, help="Output file path")
     parser.add_argument(
         "--timeout-data-file",
@@ -255,26 +266,35 @@ def main():
     )
     args = parser.parse_args(sys.argv[1:])
     stageName = args.stage_name
-    testFilePath = args.test_file_path
     outputFilePath = args.output_file
 
-    full_path = os.path.join(stageName, testFilePath)
-    if not os.path.exists(full_path):
-        print(f"No {full_path} found, skipping timeout XML generation")
-        return
+    timeoutTests = []
+    for testFilePath in args.test_file_path:
+        full_path = (
+            testFilePath if os.path.isabs(testFilePath) else os.path.join(stageName, testFilePath)
+        )
+        if not os.path.exists(full_path):
+            print(f"No {full_path} found, skipping it while generating timeout XML")
+            continue
 
-    try:
-        with open(full_path, "r", encoding="utf-8") as f:
-            timeoutTests = list(dict.fromkeys(line.strip() for line in f if line.strip()))
-    except IOError as e:
-        print(f"Error reading {full_path}: {e}")
-        return
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                timeoutTests.extend(line.strip() for line in f if line.strip())
+        except OSError as exc:
+            print(f"Error reading {full_path}: {exc}")
+
+    timeoutTests = list(dict.fromkeys(timeoutTests))
 
     if len(timeoutTests) == 0:
-        print(f"No timeout tests found in {full_path}, skipping timeout XML generation")
+        print(f"No timeout tests found for {stageName}, skipping timeout XML generation")
         return
 
     timeout_map = load_timeout_map(args.timeout_data_file, set(timeoutTests))
+    classified_count = sum(test in timeout_map for test in timeoutTests)
+    print(
+        f"Timeout classification summary for {stageName}: {len(timeoutTests)} unfinished, "
+        f"{classified_count} pytest_timeout, {len(timeoutTests) - classified_count} unknown"
+    )
     generate_timeout_xml(stageName, timeoutTests, outputFilePath, timeout_map)
 
 
