@@ -41,7 +41,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MultimodalConfig,
     MultimodalEncoderCudaGraphConfig,
 )
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
 
 MODEL_PATH = str(os.path.join(llm_models_root(), "NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"))
 
@@ -496,20 +496,62 @@ def test_nemotron_nano_v2_vl_image_batch_equivalence(nano_llm_model):
         )
 
 
+class _ForceTokenScript(LogitsProcessor):
+    """Pin greedy sampling to a fixed token script, without hiding the logits.
+
+    Adds a large bias at the scripted index instead of masking the rest to
+    `-inf`: argmax becomes the scripted token, yet every other vocab entry
+    survives untouched so callers can still compare raw model output. Because
+    both the batched and the solo run add the *same* bias at the *same* index,
+    the bias cancels in their difference and even the forced index stays
+    comparable.
+    """
+
+    BIAS = 1.0e4
+
+    def __init__(self, script):
+        self._script = script
+        self._step = 0
+
+    def __call__(self, req_id, logits, token_ids, stream_ptr, client_id):
+        stream = None if stream_ptr is None else torch.cuda.ExternalStream(stream_ptr)
+        with torch.cuda.stream(stream):
+            if self._step < len(self._script):
+                logits[..., self._script[self._step]] += self.BIAS
+            self._step += 1
+
+
 @pytest.mark.threadleak(enabled=False)
 def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
     """End-to-end equivalence check for cross-request video batching.
 
-    Mirror of `test_nemotron_nano_v2_vl_image_batch_equivalence` for
-    video: two distinct video+prompt requests sent (a) together in one
-    `generate` call (engine batches them, vision_encoder sees both
-    multimodal_params at once) and (b) separately in two `generate`
-    calls. With greedy decoding, token IDs must match and logprobs stay
-    within bf16 tolerance.
+    Video counterpart of `test_nemotron_nano_v2_vl_image_batch_equivalence`:
+    two distinct video+prompt requests are run (a) together in one `generate`
+    call, so the engine batches them, and (b) separately in two calls. Every
+    decode step's logits must agree between the two paths.
 
-    Intended to detect cross-video tubelet leakage if a future change
-    batches the temporal-video path across requests inside the vision
-    encoder.
+    Intended to detect cross-request contamination under batching -- a video's
+    embeddings or decode state bleeding into the other request.
+
+    The comparison is *teacher-forced*: both paths are pinned to the same token
+    script (see `_ForceTokenScript`) rather than each following its own argmax.
+    Free-running greedy equality is not a valid invariant here, and no product
+    fix can make it one: batched decode runs its GEMMs at M=2 instead of M=1,
+    which reorders the K reduction and shifts logits by 1-2 bf16 ULP (~0.125).
+    Whenever the top-2 logits are within that shift -- and with bf16 the gaps
+    are quantized to ULP multiples, so exact ties are common -- argmax flips and
+    the two runs autoregressively diverge into different sentences. Forcing a
+    shared script removes both the tie sensitivity and the amplification, which
+    lets all `max_tokens` steps be compared instead of stopping at the first
+    divergence.
+
+    Tolerance is set from measurement on L40S. The clean diff is itself
+    ULP-quantized -- across repeated runs it only ever took the values 0.125,
+    0.1875 and 0.25 -- so it cannot drift continuously, and the next
+    representable step above the 0.25 ceiling is 0.375. Blending 1% of the
+    sibling request's decode output into each row lifts the peak to ~0.42, and
+    5% reaches ~1.9. 0.4 therefore sits above the whole observed noise band
+    while still rejecting a 1% cross-request leak.
     """
     nano_llm = nano_llm_model
     test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))
@@ -517,53 +559,89 @@ def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
         "Describe the natural environment in the video.",
         "Describe the scene in the video briefly.",
     ]
-    media = [str(test_data_root / "world.mp4"), str(test_data_root / "world.mp4")]
+    # Two *different* videos: with the same clip twice, swapping or blending the
+    # two requests' tubelet groups is a no-op and the leakage this test exists
+    # to catch would be invisible.
+    media = [
+        str(test_data_root / "world.mp4"),
+        str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
+    ]
+    max_tokens = 16
+    # See the docstring for how this was measured.
+    logit_tolerance = 0.4
 
-    sampling_params = SamplingParams(
-        max_tokens=16,
-        temperature=0.0,
-        add_special_tokens=False,
-        return_generation_logits=True,
+    # The loader builds each prompt+media item independently, so this single
+    # call serves as both the batched input list and, element-wise, the two
+    # solo inputs -- no need to decode the videos again per `generate` call.
+    inputs = default_multimodal_input_loader(
+        tokenizer=nano_llm.tokenizer,
+        model_dir=MODEL_PATH,
+        model_type="NemotronH_Nano_VL_V2",
+        modality="video",
+        prompts=prompts,
+        media=media,
+        image_data_format="pt",
+        num_frames=8,
+        device="cpu",
     )
 
-    def _build_inputs(prompts_subset, media_subset):
-        return default_multimodal_input_loader(
-            tokenizer=nano_llm.tokenizer,
-            model_dir=MODEL_PATH,
-            model_type="NemotronH_Nano_VL_V2",
-            modality="video",
-            prompts=prompts_subset,
-            media=media_subset,
-            image_data_format="pt",
-            num_frames=8,
-            device="cpu",
+    def _sampling_params(script=None):
+        return SamplingParams(
+            max_tokens=max_tokens,
+            temperature=0.0,
+            add_special_tokens=False,
+            # Only the teacher-forced runs are compared, so skip the logits
+            # storage and device-to-host copy for the script-discovery pass.
+            return_generation_logits=script is not None,
+            logits_processor=None if script is None else _ForceTokenScript(script),
         )
 
-    batched_inputs = _build_inputs(prompts, media)
-    batched_outputs = nano_llm.generate(batched_inputs, sampling_params)
+    def _assert_follows_script(label, token_ids, script):
+        assert list(token_ids) == script, (
+            f"{label} did not follow the forced script, so the teacher-forced "
+            f"comparison would not be step-aligned.\n"
+            f"  forced  : {list(token_ids)}\n"
+            f"  expected: {script}"
+        )
+
+    # Each request's own greedy continuation becomes its forcing script, so the
+    # forced path stays on the trajectory the model would naturally take.
+    scripts = [
+        list(nano_llm.generate([inp], _sampling_params())[0].outputs[0].token_ids) for inp in inputs
+    ]
+
+    sep_logits = []
+    for i, inp in enumerate(inputs):
+        out = nano_llm.generate([inp], _sampling_params(scripts[i]))[0]
+        _assert_follows_script(f"Request {i}: separate run", out.outputs[0].token_ids, scripts[i])
+        sep_logits.append(out.outputs[0].generation_logits.float().cpu())
+
+    batched_outputs = nano_llm.generate(inputs, [_sampling_params(script) for script in scripts])
     assert len(batched_outputs) == 2
 
-    sep_outputs = []
-    for p, m in zip(prompts, media):
-        sep_inputs = _build_inputs([p], [m])
-        sep_outputs.append(nano_llm.generate(sep_inputs, sampling_params)[0])
+    for i, (b_out, s_logits) in enumerate(zip(batched_outputs, sep_logits)):
+        _assert_follows_script(f"Request {i}: batched run", b_out.outputs[0].token_ids, scripts[i])
 
-    for i, (b_out, s_out) in enumerate(zip(batched_outputs, sep_outputs)):
-        b_token_ids = list(b_out.outputs[0].token_ids)
-        s_token_ids = list(s_out.outputs[0].token_ids)
-        assert b_token_ids == s_token_ids, (
-            f"Request {i}: token_ids differ between batched and separate runs.\n"
-            f"  batched : {b_token_ids}\n"
-            f"  separate: {s_token_ids}"
+        b_logits = b_out.outputs[0].generation_logits.float().cpu()
+        assert b_logits.shape == s_logits.shape, (
+            f"Request {i}: generation_logits shape differs between batched "
+            f"{tuple(b_logits.shape)} and separate {tuple(s_logits.shape)} runs."
+        )
+        assert b_logits.shape[0] == max_tokens, (
+            f"Request {i}: expected {max_tokens} decode steps of logits, got "
+            f"{b_logits.shape[0]}; the comparison below would silently cover "
+            f"fewer steps than intended."
         )
 
-        b_logp = extract_decode_logprobs(b_out).cpu()
-        s_logp = extract_decode_logprobs(s_out).cpu()
-        max_diff = (b_logp - s_logp).abs().max().item()
-        assert max_diff < 0.15, (
-            f"Request {i}: logprob diff too large ({max_diff:.4f}).\n"
-            f"  batched : {b_logp}\n"
-            f"  separate: {s_logp}"
+        per_step = (b_logits - s_logits).abs().flatten(1).amax(dim=1)
+        max_diff = per_step.max().item()
+        assert max_diff < logit_tolerance, (
+            f"Request {i}: teacher-forced logit diff too large "
+            f"({max_diff:.4f} >= {logit_tolerance}) at step "
+            f"{int(per_step.argmax())}, indicating cross-request contamination "
+            f"rather than batched-GEMM rounding.\n"
+            f"  per-step max |batched - separate|: "
+            f"{[round(v, 4) for v in per_step.tolist()]}"
         )
 
 
