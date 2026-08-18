@@ -1,3 +1,18 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 @Library(['trtllm-jenkins-shared-lib@main']) _
 import groovy.json.JsonSlurper
 
@@ -305,11 +320,35 @@ def pulseScanContainer(llmRepo, ref) {
     }
     container("pulse-container-scanner") {
         sh "apk add jq curl"
-        withCredentials([usernamePassword(credentialsId: 'trtllm-artifactory-credentials', usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
-            sh """
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'trtllm-artifactory-credentials',
+                usernameVariable: 'ARTIFACTORY_USER',
+                passwordVariable: 'ARTIFACTORY_PASSWORD'
+            ),
+            usernamePassword(
+                credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                usernameVariable: 'GITLAB_REGISTRY_USER',
+                passwordVariable: 'GITLAB_REGISTRY_PASSWORD'
+            ),
+            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+        ]) {
+            sh '''
+                set +x
                 mkdir -p /root/.docker
-                echo '{"auths":{"artifactory.nvidia.com":{"auth":"'"\$(echo -n "\${ARTIFACTORY_USER}:\${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\\n')"'"}}}' > /root/.docker/config.json
-            """
+                ARTIFACTORY_AUTH="$(printf '%s' "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" | base64 | tr -d '\n')"
+                GITLAB_REGISTRY_AUTH="$(printf '%s' "${GITLAB_REGISTRY_USER}:${GITLAB_REGISTRY_PASSWORD}" | base64 | tr -d '\n')"
+                jq -n \
+                    --arg artifactoryAuth "${ARTIFACTORY_AUTH}" \
+                    --arg gitlabRegistry "${DEFAULT_GIT_URL}:5005" \
+                    --arg gitlabRegistryAuth "${GITLAB_REGISTRY_AUTH}" \
+                    '{auths: {
+                        "artifactory.nvidia.com": {auth: $artifactoryAuth},
+                        ($gitlabRegistry): {auth: $gitlabRegistryAuth}
+                    }}' > /root/.docker/config.json
+                unset ARTIFACTORY_AUTH GITLAB_REGISTRY_AUTH
+                set -x
+            '''
         }
         def token = getPulseToken("x9thwm-cootr2q1jdv5p7b8iw4fs4ob3x6nqqsoznyk", "nspect.verify%20scan.anchore")
         if (!token) {
