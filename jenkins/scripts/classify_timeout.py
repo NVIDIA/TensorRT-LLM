@@ -57,18 +57,27 @@ _TRUNCATED_MARKER = "\n[truncated]"
 def _is_first_banner(line, unfinished):
     """Return (True, nodeid) if *line* is a first timeout banner for a known nodeid.
 
-    A first banner simultaneously contains a ``<-`` separator and a
-    ``+++...Timeout...+++`` marker, and the nodeid extracted from the left-hand
-    side of ``<-`` must be present in *unfinished*.
+    A first banner contains a ``+++...Timeout...+++`` marker and a known
+    nodeid.  With the CI's normal ``pytest -vv`` invocation, pytest's terminal
+    reporter includes the ``<-`` separator, so the nodeid is extracted from
+    its left-hand side.  At lower verbosity pytest omits that separator; fall
+    back to a bare ``<nodeid> `` prefix so a verbosity change does not silently
+    disable timeout classification.
     """
-    if not _ARROW_RE.search(line):
-        return False, ""
     if not _TIMEOUT_MARKER_RE.search(line):
         return False, ""
-    # The nodeid is the part before " <- "
-    nodeid = _ARROW_RE.split(line, maxsplit=1)[0].strip()
-    if nodeid in unfinished:
-        return True, nodeid
+
+    if _ARROW_RE.search(line):
+        # The nodeid is the part before " <- " when pytest runs with -vv.
+        nodeid = _ARROW_RE.split(line, maxsplit=1)[0].strip()
+        if nodeid in unfinished:
+            return True, nodeid
+
+    # pytest -v omits " <- ".  A whitespace boundary prevents a shorter
+    # parameterized nodeid from matching the prefix of a longer one.
+    for nodeid in unfinished:
+        if line.startswith(nodeid) and len(line) > len(nodeid) and line[len(nodeid)].isspace():
+            return True, nodeid
     return False, ""
 
 

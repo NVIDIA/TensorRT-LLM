@@ -268,6 +268,14 @@ def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     return "sshpass -p '${remote.passwd}' scp ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
 }
 
+def sshRemoteCmd(Map remote, String remoteCommand) {
+    String portOpt = remote.port ? "-p ${remote.port} " : ""
+    if (remote.privateKeyPath) {
+        return "ssh -i ${remote.privateKeyPath} ${portOpt}${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host} \"${remoteCommand}\""
+    }
+    return "sshpass -p '${remote.passwd}' ssh ${portOpt}${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host} \"${remoteCommand}\""
+}
+
 // Print the last `lines` lines of the remote Slurm job log file to the console when the Slurm job fails.
 // If the log file does not exist, print a message to the console.
 def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 200) {
@@ -356,7 +364,16 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             // Each Slurm rank records independently. Download all completed
             // rank files after the job exits; no cross-rank write is needed.
             sh "rm -f '${stageName}'/timeout_data_step*_rank*.jsonl || true"
-            Utils.exec(pipeline, script: scpFromRemoteCmd(remote, "/home/svc_tensorrt/bloom/scripts/${nodeName}/timeout_data_step*_rank*.jsonl", "${stageName}/"), returnStatus: true, numRetries: 3)
+            def timeoutDataDir = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+            def hasTimeoutData = Utils.exec(
+                pipeline,
+                script: sshRemoteCmd(remote, "find ${timeoutDataDir} -maxdepth 1 -type f -name 'timeout_data_step*_rank*.jsonl' -print -quit | grep -q ."),
+                returnStatus: true,
+                numRetries: 1,
+            ) == 0
+            if (hasTimeoutData) {
+                Utils.exec(pipeline, script: scpFromRemoteCmd(remote, "${timeoutDataDir}/timeout_data_step*_rank*.jsonl", "${stageName}/"), returnStatus: true, numRetries: 3)
+            }
             if (downloadTimeoutTestSucceed) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
@@ -3611,7 +3628,7 @@ def runPytestWithLog(stageName, pytestCommand, invIdx, unfinishedFile, timeoutDa
     def cmdFile = "${WORKSPACE}/pytest_cmd_${safeStageName}_${invIdx}.sh"
     def wrapperScript = "${llmSrc}/jenkins/scripts/run_pytest_with_log.sh"
 
-    writeFile file: cmdFile, text: "#!/usr/bin/env bash\ncd '${llmSrc}/tests/integration/defs' || exit 1\n${pytestCommand.join(' ')}"
+    writeFile file: cmdFile, text: "#!/usr/bin/env bash\nset -ex\ncd '${llmSrc}/tests/integration/defs'\n${pytestCommand.join(' ')}"
     try {
         sh "mkdir -p '${outDir}'"
         sh "bash '${wrapperScript}' '${cmdFile}' '${outDir}' '${timeoutDataFile}' '${invIdx}' '${unfinishedFile}'"
@@ -3627,12 +3644,22 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
     ).trim()
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
+    def unfinishedTestFiles = sh(
+        script: "find '${curPath}/${stageName}' -type f -name 'unfinished_test.txt' -print | sort",
+        returnStdout: true,
+    ).trim().split("\\n").findAll { it }
+    // Preserve the historical no-op behavior when pytest never created an
+    // unfinished list (for example, if the stage failed before pytest setup).
+    if (unfinishedTestFiles.isEmpty()) {
+        unfinishedTestFiles = ["unfinished_test.txt"]
+    }
+    def unfinishedTestArgs = unfinishedTestFiles.collect { "--test-file-path '${it}'" }.join(" ")
     def timeoutDataFiles = sh(
         script: "find '${curPath}/${stageName}' -maxdepth 1 -type f -name 'timeout_data*.jsonl' -print | sort",
         returnStdout: true,
     ).trim().split("\\n").findAll { it }
     def timeoutDataArgs = timeoutDataFiles.collect { "--timeout-data-file '${it}'" }.join(" ")
-    sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}' ${timeoutDataArgs}"""
+    sh """python3 ${scriptPath} --stage-name '${stageName}' ${unfinishedTestArgs} --output-file '${outputFilePath}' ${timeoutDataArgs}"""
     sh "find '${curPath}/${stageName}' -maxdepth 1 -type f -name 'timeout_data*.jsonl' -delete || true"
     if (fileExists(outputFilePath)) {
         return true
@@ -4013,9 +4040,13 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             "--periodic-junit-xmlpath ${xmlFile}",
             "--reruns ${times - 1}"
         ]
+        // periodic_junit.py stores unfinished_test.txt next to the XML path.
+        // Start each attempt with a fresh file so a successful later rerun
+        // clears any stale interruption record from an earlier attempt.
+        sh "rm -f '${rerunDir}/unfinished_test.txt' || true"
         try {
             runPytestWithLog(stageName, newTestCmdLine, times,
-                "${WORKSPACE}/${stageName}/unfinished_test.txt",
+                "${rerunDir}/unfinished_test.txt",
                 "${WORKSPACE}/${stageName}/timeout_data.jsonl",
                 llmSrc)
         } catch(InterruptedException e) {

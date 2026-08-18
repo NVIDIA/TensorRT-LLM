@@ -48,6 +48,24 @@ CLASSIFY="$(dirname "$0")/classify_timeout.py"
 # Ensure the output directory exists before writing the log.
 mkdir -p "${OUT_DIR}"
 
+# The normal post-processing path removes this log explicitly.  Keep an EXIT
+# trap as well so an early shell exit does not leave a potentially large log
+# in the workspace for later artifact collection.
+cleanup_log() {
+    rm -f "${LOG}" || true
+}
+
+cleanup_and_exit() {
+    cleanup_log
+    trap - EXIT
+    exit "$1"
+}
+
+trap cleanup_log EXIT
+trap 'cleanup_and_exit 129' HUP
+trap 'cleanup_and_exit 130' INT
+trap 'cleanup_and_exit 143' TERM
+
 # ---------------------------------------------------------------------------
 # Run pytest, capturing stdout+stderr to LOG while still streaming to the
 # Jenkins console.  tee's exit code is discarded; we read pytest's via
@@ -71,7 +89,7 @@ if [ "${CLASSIFY_RC}" -ne 0 ]; then
          "'unknown' instead of 'pytest_timeout'. Log: ${LOG}" >&2
 fi
 
-rm -f "${LOG}" || true
+cleanup_log
 
 # Always exit with pytest's original exit code.
 exit "${PYTEST_RC}"

@@ -111,6 +111,23 @@ TIMEOUT_DATA_RANK="${jobWorkspace}/timeout_data_step${slurm_step_id}_rank${SLURM
 UNFINISHED_FILE="${jobWorkspace}/unfinished_test.txt"
 CLASSIFY_SCRIPT="${llmSrcNode}/jenkins/scripts/classify_timeout.py"
 
+# The normal post-processing path removes this node-local log explicitly.
+# Keep an EXIT trap as well so normal early exits do not leave it behind.
+cleanup_pytest_log() {
+    rm -f "${PYTEST_LOG}" || true
+}
+
+cleanup_and_exit() {
+    cleanup_pytest_log
+    trap - EXIT
+    exit "$1"
+}
+
+trap cleanup_pytest_log EXIT
+trap 'cleanup_and_exit 129' HUP
+trap 'cleanup_and_exit 130' INT
+trap 'cleanup_and_exit 143' TERM
+
 # Turn off "exit on error" so the following lines always run
 set +e
 
@@ -139,7 +156,7 @@ python3 "${CLASSIFY_SCRIPT}" \
     echo "WARNING: slurm_run.sh: classify_timeout.py failed for rank" \
          "${SLURM_PROCID}; timed-out tests in this invocation may be" \
          "reported as 'unknown' instead of 'pytest_timeout'." >&2
-rm -f "${PYTEST_LOG}" || true
+cleanup_pytest_log
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved
