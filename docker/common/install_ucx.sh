@@ -5,7 +5,8 @@ UCX_VERSION="v1.22.x"
 UCX_COMMIT="8a6b06fb880accbb933a79cda893883872c68d9d"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 CUDA_PATH="/usr/local/cuda"
-UCX_REPO="https://github.com/openucx/ucx.git"
+GITHUB_URL="${GITHUB_MIRROR:-https://github.com}"
+UCX_REPO="${GITHUB_URL}/openucx/ucx.git"
 
 mkdir -p /third-party-source
 
