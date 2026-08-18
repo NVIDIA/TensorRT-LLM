@@ -216,7 +216,7 @@ def test_the_conv_seeding_site_warns_against_a_partial_fix():
     reintroduces the bug in a form that no longer raises."""
     import inspect
 
-    from tensorrt_llm._torch.attention_backend.inkling import InklingConvRuntime
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingConvRuntime
 
     src = inspect.getsource(InklingConvRuntime.build)
     assert "not sufficient" in src.lower(), src
@@ -428,7 +428,13 @@ def test_checkpoint_tensor_shapes_match_geometry(ckpt_config):
 # InklingAttentionMetadata: the per-step decode publish
 # ---------------------------------------------------------------------------
 class _FakeKvManager:
-    """Minimal stand-in for KVCacheManagerV2's per-layer block-table API."""
+    """Minimal stand-in for KVCacheManagerV2's per-layer block-table API.
+
+    Deliberately does *not* expose ``layer_offsets`` /
+    ``layer_to_pool_mapping_dict`` / ``get_layer_page_index_scale``, so
+    ``_ink_page_group`` takes its per-layer fallback. See
+    :class:`_FakePooledKvManager` for the deduplicating path.
+    """
 
     def __init__(self, pp_layers, blocks_by_layer, max_blocks_per_seq=4):
         self.pp_layers = pp_layers
@@ -442,8 +448,32 @@ class _FakeKvManager:
         return self._blocks[layer_idx][: len(request_ids)]
 
 
+class _FakePooledKvManager(_FakeKvManager):
+    """Adds the ``(pool_id, index_scale)`` mapping the real V2 manager exposes.
+
+    ``layer_pools`` maps each layer to its pool id; layers sharing a pool share
+    a page table, which is what Inkling's two KV geometries reduce to.
+    """
+
+    def __init__(self, pp_layers, blocks_by_layer, layer_pools, max_blocks_per_seq=4):
+        super().__init__(pp_layers, blocks_by_layer, max_blocks_per_seq)
+        self._layer_pools = layer_pools
+        self.layer_offsets = {layer: i for i, layer in enumerate(pp_layers)}
+        self.layer_to_pool_mapping_dict = {
+            self.layer_offsets[layer]: pool for layer, pool in layer_pools.items()
+        }
+
+    def get_layer_page_index_scale(self, layer_idx):
+        return 1
+
+
 def _ink_metadata(
-    num_contexts=0, request_ids=(7, 9), num_cached=(3, 130), pp_layers=(0, 1), max_blocks_per_seq=4
+    num_contexts=0,
+    request_ids=(7, 9),
+    num_cached=(3, 130),
+    pp_layers=(0, 1),
+    max_blocks_per_seq=4,
+    layer_pools=None,
 ):
     """An InklingAttentionMetadata with prepare()'s inputs stubbed in.
 
@@ -453,25 +483,32 @@ def _ink_metadata(
     """
     import torch
 
-    from tensorrt_llm._torch.attention_backend.inkling import InklingAttentionMetadata
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingAttentionMetadata
 
     md = object.__new__(InklingAttentionMetadata)
     md.ink_num_gen = 0
     md.ink_max_pages = None
     md.ink_cap = 0
-    md.ink_seq_lens = None
     md.ink_page_table = {}
-    md._ink_sl_host = None
+    md._ink_layer_groups = {}
     md._ink_pt_host = None
     md.is_cuda_graph = False
     md.request_ids = list(request_ids)
     md._num_contexts = num_contexts
     md.kv_cache_params = SimpleNamespace(num_cached_tokens_per_seq=list(num_cached))
+    # What TrtllmAttentionMetadata.prepare() would have published: total KV
+    # length per request, num_cached + the one new generation token.
+    md.kv_lens_cuda = torch.tensor([n + 1 for n in num_cached], dtype=torch.int32)
     blocks = {
         layer: [[layer * 10 + 1, -1, -1, -1], [layer * 10 + 2, layer * 10 + 3, -1, -1]]
         for layer in pp_layers
     }
-    md.kv_cache_manager = _FakeKvManager(list(pp_layers), blocks, max_blocks_per_seq)
+    if layer_pools is None:
+        md.kv_cache_manager = _FakeKvManager(list(pp_layers), blocks, max_blocks_per_seq)
+    else:
+        md.kv_cache_manager = _FakePooledKvManager(
+            list(pp_layers), blocks, layer_pools, max_blocks_per_seq
+        )
     # seq_lens_cuda is a read-only property over this field; _ink_ensure
     # reads it only for the device.
     md._seq_lens_cuda = torch.zeros(1, dtype=torch.int32)
@@ -479,18 +516,45 @@ def _ink_metadata(
 
 
 def test_metadata_publishes_total_kv_lengths_and_per_layer_page_table():
-    """seq_lens is num_cached + 1 and layer-independent; the page table is
-    per-layer because get_batch_cache_indices is per pool_id."""
+    """Total-KV lengths are read from the base kv_lens_cuda, not staged again;
+    the page table is built per page group, which without the pool mapping
+    degrades to one per layer."""
     md = _ink_metadata()
 
     md._prepare_inkling_decode()
 
     assert md.ink_num_gen == 2
-    assert md.ink_seq_lens[:2].tolist() == [4, 131]
-    # One block-table fetch per layer this rank owns, all on the generation ids.
+    # num_cached + 1, straight off the base buffer -- no private staging.
+    assert md.ink_gen_seq_lens(2).tolist() == [4, 131]
+    # One block-table fetch per page group; the fallback makes that per layer.
     assert md.kv_cache_manager.calls == [((7, 9), 0), ((7, 9), 1)]
-    assert md.ink_page_table[0][:2].tolist() == [[1, 0, 0, 0], [2, 3, 0, 0]]
-    assert md.ink_page_table[1][:2].tolist() == [[11, 0, 0, 0], [12, 13, 0, 0]]
+    assert md.ink_gen_page_table(0)[:2].tolist() == [[1, 0, 0, 0], [2, 3, 0, 0]]
+    assert md.ink_gen_page_table(1)[:2].tolist() == [[11, 0, 0, 0], [12, 13, 0, 0]]
+
+
+def test_metadata_shares_one_page_table_per_kv_geometry():
+    """get_batch_cache_indices resolves a layer to (pool_id, index_scale) and
+    depends on nothing else, so layers of the same KV geometry get identical
+    tables. Inkling has two geometries and 66 layers; building the table once
+    per layer is ~33x the host work per decode step, and decode is host-bound.
+    """
+    md = _ink_metadata(
+        pp_layers=(0, 1, 2, 3),
+        # Inkling's shape: local layers in one pool, global layers in another.
+        layer_pools={0: 0, 1: 0, 2: 1, 3: 1},
+    )
+
+    md._prepare_inkling_decode()
+
+    # Two groups, not four layers.
+    assert len(md.ink_page_table) == 2
+    assert len(md.kv_cache_manager.calls) == 2
+    # Layers sharing a pool share the buffer object itself.
+    assert md.ink_gen_page_table(0) is md.ink_gen_page_table(1)
+    assert md.ink_gen_page_table(2) is md.ink_gen_page_table(3)
+    assert md.ink_gen_page_table(0) is not md.ink_gen_page_table(2)
+    # And the staging buffer is sized to groups, not layers.
+    assert md._ink_pt_host.shape[0] == 2
 
 
 def test_metadata_skips_the_context_slice():
@@ -501,7 +565,7 @@ def test_metadata_skips_the_context_slice():
     md._prepare_inkling_decode()
 
     assert md.ink_num_gen == 1
-    assert md.ink_seq_lens[:1].tolist() == [131]
+    assert md.ink_gen_seq_lens(1).tolist() == [131]
     assert md.kv_cache_manager.calls == [((9,), 0), ((9,), 1)]
 
 
@@ -540,45 +604,126 @@ def test_metadata_clamps_a_row_to_max_pages():
     md._prepare_inkling_decode()
 
     assert md.ink_max_pages == 2
-    assert md.ink_page_table[0][:2].tolist() == [[1, 2], [5, 6]]
+    assert md.ink_gen_page_table(0)[:2].tolist() == [[1, 2], [5, 6]]
 
 
-def test_inkling_backend_is_registered_and_carries_the_metadata():
-    from tensorrt_llm._torch.attention_backend.inkling import (
+def test_inkling_backend_and_metadata_resolve_from_the_backend_NAME():
+    """The name is Inkling's only identity outside the Attention module.
+
+    PyTorchModelEngine, the KV-cache creator and a dozen vision encoders call
+    get_attention_backend(name) with no ModelConfig and read .Metadata off the
+    result. Routing selection through sparse/registry.py instead was tried and
+    reverted: SparseParams only exists at the module layer, so the engine fell
+    back to TrtllmAttentionMetadata, ink_conv_rt was never published, and warmup's
+    mixed batch died inside InklingTritonAttention.forward (job 6245984).
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import (
         InklingAttentionMetadata,
         InklingTritonAttention,
     )
     from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 
     assert get_attention_backend("INKLING") is InklingTritonAttention
+    assert get_attention_backend("inkling") is InklingTritonAttention
     assert InklingTritonAttention.Metadata is InklingAttentionMetadata
+    # The degraded path the revert exists to prevent.
+    assert get_attention_backend("TRTLLM").Metadata is not InklingAttentionMetadata
+
+
+def test_the_family_selector_has_no_model_specific_branch():
+    """get_attention_backend chooses among the base backend *families*; a
+    model-specific name is resolved from a lazily-imported registry instead of a
+    branch in its body, so adding a model does not edit the selector.
+
+    The name is still what callers pass -- see the sibling test -- this only moves
+    where that name is looked up.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.attention_backend import utils as backend_utils
+
+    body = inspect.getsource(backend_utils.get_attention_backend)
+    assert "INKLING" not in body.upper(), "model-specific branch back in the selector"
+    assert "INKLING" in backend_utils._MODEL_BACKEND_MODULES
+
+    # Registration is the extension point, and it resolves lazily: importing
+    # utils must not drag in the model packages (they import trtllm /
+    # resource_manager and would cycle).
+    assert callable(backend_utils.register_attention_backend)
+    src = inspect.getsource(backend_utils._model_specific_backend)
+    assert "import_module" in src
+
+
+def test_rel_logits_rides_the_registered_backend_args_slot():
+    """rel_logits is [num_query_tokens, heads, rel_extent] -- content-dependent,
+    with a leading per-query axis. AttentionForwardArgs.relative_attention_bias
+    is T5's [num_heads, num_buckets] table broadcast across the batch, so it
+    cannot carry this; sparse_backend_args is the registered slot for exactly
+    this kind of model-specific input."""
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import (
+        InklingBackendForwardArgs,
+        inkling_forward_args,
+    )
+
+    rel = torch.zeros(3, 2, 5)
+    args = inkling_forward_args(rel, allow_mixed=True)
+    assert isinstance(args.sparse_backend_args, InklingBackendForwardArgs)
+    assert args.sparse_backend_args.rel_logits is rel
+    assert args.sparse_backend_args.allow_mixed is True
+    # The shared T5 field stays untouched -- it has no room for the query axis.
+    assert args.relative_attention_bias is None
+    # allow_mixed is REQUIRED, not defaulted. It certifies that the short-conv
+    # state pool is active for this forward; a caller that forgets it would get
+    # a mixed context+generation batch convolved across the packed boundary,
+    # which is silently wrong output rather than an error. There is one call
+    # site and it must state which case it is in, so the keyword has no default
+    # even though the dataclass field does.
+    with pytest.raises(TypeError, match="allow_mixed"):
+        inkling_forward_args(rel)
+
+
+def test_backend_forward_refuses_foreign_backend_args():
+    """The standard forward() signature means anything can call it; a plain
+    AttentionForwardArgs carries no rel_logits, and silently attending without
+    the bias would produce plausible, wrong text."""
+    from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingTritonAttention
+
+    backend = object.__new__(InklingTritonAttention)  # no CUDA needed for this guard
+    with pytest.raises(TypeError, match="sparse_backend_args"):
+        backend.forward(None, None, None, None, forward_args=AttentionForwardArgs())
 
 
 def test_llm_args_is_untouched_by_the_inkling_backend():
-    """Adding INKLING to the attn_backend telemetry list would change
+    """Inkling adds no user-facing attention configuration: no attn_backend
+    enum value and no SparseAttentionConfig union member. Either would change
     llmapi/llm_args.py, which trips the API-stability label gate and stales the
-    golden manifest -- for a value no user ever supplies. Keep that file out of
-    this PR."""
+    golden manifest -- for a value no user ever supplies."""
     from tensorrt_llm.llmapi import llm_args as la
 
-    src = inspect.getsource(la.TorchLlmArgs)
-    assert "INKLING" not in src
+    src = inspect.getsource(la)
+    assert "INKLING" not in src.upper()
 
 
-def test_model_defaults_select_the_inkling_backend():
+def test_model_defaults_pin_the_inkling_backend_name():
+    """The engine resolves attn_metadata from this name, so the default has to
+    carry it; a user override is caught by _assert_inkling_attn_backend."""
     from tensorrt_llm._torch.models.modeling_inkling import InklingForConditionalGeneration
 
-    assert InklingForConditionalGeneration.get_model_defaults(None)["attn_backend"] == "INKLING"
+    defaults = InklingForConditionalGeneration.get_model_defaults(None)
+    assert defaults["attn_backend"] == "INKLING"
+    assert defaults["kv_cache_config"]["use_kv_cache_manager_v2"] is True
 
 
 def test_attn_backend_override_fails_loudly():
-    """An attn_backend override silently removes the decode publish and the run
-    then dies inside CUDA-graph capture with a message that names neither
-    Inkling nor the setting. Catch it at load instead."""
+    """Any other name degrades attn_metadata instead of failing, so catch it at
+    load rather than at the first mixed batch."""
     from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
 
     check = InklingForCausalLM._assert_inkling_attn_backend
-    check(SimpleNamespace(attn_backend="INKLING"))  # no raise
+    check(SimpleNamespace(attn_backend="INKLING"))
     check(SimpleNamespace(attn_backend="inkling"))  # case-insensitive
     check(SimpleNamespace(attn_backend=None))  # nothing to check
 
@@ -587,35 +732,35 @@ def test_attn_backend_override_fails_loudly():
             check(SimpleNamespace(attn_backend=bad))
 
 
-def test_metadata_stages_each_layer_in_its_own_pinned_row():
-    """Regression: a single shared staging buffer refilled per layer corrupts
-    every layer but the last.
+def test_metadata_stages_each_page_group_in_its_own_pinned_row():
+    """Regression: a single shared staging buffer refilled per group corrupts
+    every group but the last.
 
-    The H2D copies are non_blocking, so refilling one host buffer per layer
-    races the in-flight copy of the previous layer. The observable symptom is
+    The H2D copies are non_blocking, so refilling one host buffer per group
+    races the in-flight copy of the previous group. The observable symptom is
     page tables that all end up holding the same (or torn) rows, attention
     reading the wrong KV pages, and decode collapsing to repeated tokens --
-    accuracy 0. Assert the staging buffer has a per-layer dimension and that
-    the published tables actually differ per layer.
+    accuracy 0. Assert the staging buffer has a per-group dimension and that
+    the published tables actually differ per group.
     """
     md = _ink_metadata(pp_layers=(0, 1))
 
     md._prepare_inkling_decode()
 
-    # One staging row per layer, not one buffer shared across layers.
+    # One staging row per group, not one buffer shared across groups.
     assert md._ink_pt_host.dim() == 3
     assert md._ink_pt_host.shape[0] == 2
-    # Distinct per-layer block ids must survive to distinct device tables.
-    assert md.ink_page_table[0][:2].tolist() != md.ink_page_table[1][:2].tolist()
-    assert md.ink_page_table[0][:2].tolist() == [[1, 0, 0, 0], [2, 3, 0, 0]]
-    assert md.ink_page_table[1][:2].tolist() == [[11, 0, 0, 0], [12, 13, 0, 0]]
+    # Distinct block ids must survive to distinct device tables.
+    assert md.ink_gen_page_table(0)[:2].tolist() != md.ink_gen_page_table(1)[:2].tolist()
+    assert md.ink_gen_page_table(0)[:2].tolist() == [[1, 0, 0, 0], [2, 3, 0, 0]]
+    assert md.ink_gen_page_table(1)[:2].tolist() == [[11, 0, 0, 0], [12, 13, 0, 0]]
 
 
 def test_conv_pool_is_owned_by_the_kv_cache_manager():
     """The pool must be part of the cache manager, not a resource manager beside
     it: that is what frees the conv row with the request's KV blocks and lets
     the model reach it through attn_metadata.kv_cache_manager."""
-    from tensorrt_llm._torch.attention_backend.inkling import InklingHybridCacheManager
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingHybridCacheManager
     from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 
     assert issubclass(InklingHybridCacheManager, KVCacheManagerV2)
@@ -632,7 +777,7 @@ def test_conv_state_resource_type_is_gone():
 
 
 def test_inkling_selects_the_hybrid_cache_manager():
-    from tensorrt_llm._torch.attention_backend.inkling import InklingHybridCacheManager
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingHybridCacheManager
     from tensorrt_llm._torch.pyexecutor._util import _non_hybrid_kv_cache_manager_cls
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
@@ -647,7 +792,7 @@ def test_conv_pool_dtype_is_a_torch_dtype_not_the_kv_cache_dtype():
     conv pool must take its dtype from the model config instead."""
     import torch
 
-    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as csm
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import cache_manager as csm
 
     src = inspect.getsource(csm.InklingHybridCacheManager.__init__)
     code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
@@ -670,38 +815,44 @@ def test_conv_pool_dtype_refuses_to_guess():
     release builds the whole pool in the wrong dtype. Nothing checks it until
     causal_conv1d_update reports a dtype mismatch, layers deep and with no
     mention of the config field that caused it."""
-    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as csm
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import cache_manager as csm
 
     for cfg in (SimpleNamespace(torch_dtype="not-a-dtype"), SimpleNamespace()):
         with pytest.raises(ValueError, match="torch_dtype"):
             csm._resolve_conv_dtype(cfg)
 
 
-def test_inkling_attention_lives_in_its_own_package_not_under_sparse():
-    """Layout follows sparse/minimax_m3 -- kernels, metadata, backend and cache
-    manager in separate modules -- but NOT under sparse/.
+def test_inkling_attention_lives_under_sparse_and_says_it_is_not_sparse():
+    """Layout follows sparse/minimax_m3 -- kernels, metadata, backend, params and
+    cache manager in separate modules -- and sits beside it under sparse/.
 
-    sparse/ is gated on sparse_attention_config / SparseParams and its
-    machinery assumes only part of the KV is scored. Inkling's attention is
-    dense: full causal on global layers, a 512-token sliding window on local
-    ones, with a learned relative-bias score_mod.
+    Inkling's attention is dense (full causal on global layers, a 512-token
+    sliding window on local ones, with a learned relative-bias score_mod), so
+    the package must say so in as many words: what actually unifies sparse/'s
+    members is that each needs its own backend + metadata + cache manager and is
+    selected through sparse/registry.py, not the base-family dispatch. Whoever
+    reads this next should not have to re-derive that.
     """
     import importlib
 
-    pkg = importlib.import_module("tensorrt_llm._torch.attention_backend.inkling")
-    for mod in ("kernels", "metadata", "backend", "cache_manager"):
-        importlib.import_module(f"tensorrt_llm._torch.attention_backend.inkling.{mod}")
+    pkg = importlib.import_module("tensorrt_llm._torch.attention_backend.sparse.inkling")
+    for mod in ("kernels", "metadata", "backend", "cache_manager", "params"):
+        importlib.import_module(f"tensorrt_llm._torch.attention_backend.sparse.inkling.{mod}")
     for sym in (
         "InklingAttentionMetadata",
         "InklingTritonAttention",
         "InklingHybridCacheManager",
+        "InklingBackendForwardArgs",
         "inkling_prefill_attention",
         "inkling_decode_attention",
     ):
         assert hasattr(pkg, sym), sym
 
+    # The old top-level package must be gone, not left as a stale duplicate.
     with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("tensorrt_llm._torch.attention_backend.sparse.inkling")
+        importlib.import_module("tensorrt_llm._torch.attention_backend.inkling")
+
+    assert "not a sparse-attention algorithm" in pkg.__doc__.lower().replace("**", "")
 
 
 def test_no_conv_state_protocol_and_no_inkling_file_in_pyexecutor():
@@ -734,7 +885,7 @@ def test_metadata_builds_the_runtime_itself_from_the_managers_pool():
     """prepare() must react to a manager that owns a conv pool, and the split
     it builds is metadata work: the manager is asked for the pool, not for a
     per-forward runtime object."""
-    from tensorrt_llm._torch.attention_backend.inkling import conv_state as cs
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import conv_state as cs
 
     class _FakeConvManager(_FakeKvManager):
         conv_state_cache = "POOL"
@@ -1001,7 +1152,7 @@ def test_every_deferred_import_in_the_inkling_package_resolves():
     import tensorrt_llm
 
     root = pathlib.Path(tensorrt_llm.__file__).parent
-    pkg_dir = root / "_torch" / "attention_backend" / "inkling"
+    pkg_dir = root / "_torch" / "attention_backend" / "sparse" / "inkling"
     assert pkg_dir.is_dir(), pkg_dir
 
     unresolved = []
@@ -1142,7 +1293,7 @@ def test_dense_mlp_still_tp_shards_and_reduces_without_attention_dp(no_collectiv
 def _conv_pool(tp_size, kv_heads=16, head_dim=8, num_request_slots=2, **kwargs):
     import torch
 
-    from tensorrt_llm._torch.attention_backend.inkling import InklingConvStateCache
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingConvStateCache
 
     cfg = SimpleNamespace(
         num_hidden_layers=2,
@@ -1154,6 +1305,77 @@ def _conv_pool(tp_size, kv_heads=16, head_dim=8, num_request_slots=2, **kwargs):
     return InklingConvStateCache(
         cfg, tp_size, num_request_slots, torch.device("cpu"), torch.bfloat16, **kwargs
     )
+
+
+def test_conv_pool_zeroes_a_row_even_when_the_allocator_hands_back_garbage():
+    """V2 pool memory arrives uninitialized, unlike the torch.zeros this used to do.
+
+    Backing the pool with V2 SSM-layer buffers moved allocation out of this class,
+    and with it the free zero-fill. Correctness now rests on slots_for zeroing a
+    row the first time it hands it out -- if that ever regresses, a fresh request
+    convolves against whatever the allocator last left there, which is wrong
+    output rather than a crash. Simulate a dirty allocator and assert the
+    invariant directly.
+    """
+    import torch
+
+    def dirty(_layer_idx, _role, state_shape):
+        # num_slots is 2 request rows + 1 padding row here; hand back more than
+        # needed so the slice in __init__ is exercised too.
+        return torch.full((8, *state_shape), 7.0, dtype=torch.bfloat16)
+
+    pool = _conv_pool(tp_size=1, num_request_slots=2, allocate=dirty)
+    slot = pool.slots_for([11])[0]
+
+    for layer in range(2):
+        for buf in pool.layer_state(layer):
+            assert float(buf[slot].abs().sum()) == 0.0, (layer, slot)
+
+    # A row that was never handed out keeps the allocator's contents -- that is
+    # fine, nothing reads it, and asserting otherwise would re-impose the
+    # whole-pool zero-fill this change deliberately dropped.
+    other = next(s for s in range(2) if s != slot)
+    assert float(pool.layer_state(0).k[other].abs().sum()) > 0.0
+
+
+def test_reserved_slot_count_is_defined_once_and_asked_for():
+    """The pool and _InklingConvGeometry must agree on the row count exactly:
+    the geometry declares a min-slots floor to V2, and a V2 buffer sized from a
+    smaller number is indexed out of bounds by slots_for. Two independent copies
+    of `1 + int(adp)` would drift silently, so the layout owner exposes it and
+    the geometry asks."""
+    import inspect
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingConvStateCache
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import cache_manager as cm
+
+    assert InklingConvStateCache.reserved_slot_count(reserve_attention_dp_slot=False) == 1
+    assert InklingConvStateCache.reserved_slot_count(reserve_attention_dp_slot=True) == 2
+
+    # The geometry calls it rather than recomputing the formula.
+    src = inspect.getsource(cm._InklingConvGeometry.__init__)
+    assert "reserved_slot_count(" in src
+    assert "1 + int(" not in src, "geometry re-derived the count instead of asking"
+
+    # And the pool actually sizes itself by it.
+    for adp in (False, True):
+        pool = _conv_pool(tp_size=1, num_request_slots=3, reserve_attention_dp_slot=adp)
+        assert pool.num_slots == 3 + InklingConvStateCache.reserved_slot_count(
+            reserve_attention_dp_slot=adp
+        )
+
+
+def test_conv_pool_refuses_an_allocator_that_returns_too_few_slots():
+    """The row count is declared twice -- here and in _InklingConvGeometry, which
+    feeds V2 the min-slots constraint. They must agree; a V2 buffer sized from a
+    smaller count would be indexed out of bounds by slots_for."""
+    import torch
+
+    def too_small(_layer_idx, _role, state_shape):
+        return torch.zeros((2, *state_shape), dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="slots but the pool needs"):
+        _conv_pool(tp_size=1, num_request_slots=4, allocate=too_small)
 
 
 def test_conv_pool_k_v_width_follows_the_split_it_is_given():
@@ -1252,10 +1474,19 @@ def test_cache_manager_sizes_the_conv_pool_by_attention_tp(monkeypatch):
     rather than at load."""
     import torch
 
-    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as cm
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import cache_manager as cm
 
     seen = _patch_pool(monkeypatch, cm)
-    cfg = SimpleNamespace(torch_dtype=torch.bfloat16)
+    # The manager now sizes the V2 SSM buffers itself, so it reads the conv
+    # geometry off the config before the pool is built.
+    cfg = SimpleNamespace(
+        torch_dtype=torch.bfloat16,
+        sconv_kernel_size=4,
+        hidden_size=8,
+        num_hidden_layers=2,
+        layer_num_kv_heads=lambda i: 2,
+        layer_head_dim=lambda i: 4,
+    )
 
     cm.InklingHybridCacheManager(
         pretrained_config=cfg, mapping=_adp_mapping(True), max_batch_size=8
@@ -1268,13 +1499,101 @@ def test_cache_manager_sizes_the_conv_pool_by_attention_tp(monkeypatch):
     assert seen["tp_size"] == 4, "without ADP the conv pool must keep the TP slice"
 
 
+def test_build_cache_config_appends_ssm_layers_for_the_conv_state(monkeypatch):
+    """The conv rows are declared to V2 as SSM layers so their bytes land inside
+    the same quota as the paged KV.
+
+    They used to be a side torch allocation that no byte quota knew about,
+    counted only because the throwaway manager built during capacity estimation
+    also held one -- correct only while the estimation pool and the serving pool
+    were exactly the same size, which nothing enforced.
+
+    Appended, not interleaved: keeping every attention layer_id at its original
+    index is what lets get_buffers / get_batch_cache_indices / the metadata page
+    tables stay untouched. DeepSeek-V4 has to interleave because its KV is itself
+    split across cache layers; Inkling's is not.
+    """
+    from dataclasses import dataclass, field
+
+    import torch
+
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import cache_manager as cm
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, SsmLayerConfig
+
+    _patch_pool(monkeypatch, cm)
+    cfg = SimpleNamespace(
+        torch_dtype=torch.bfloat16,
+        sconv_kernel_size=4,  # kwin = 3
+        hidden_size=8,
+        num_hidden_layers=2,
+        layer_num_kv_heads=lambda i: 2,
+        layer_head_dim=lambda i: 4,  # kv_dim = 8, /tp_size 1 -> 8
+    )
+    mgr = cm.InklingHybridCacheManager(
+        pretrained_config=cfg, mapping=_adp_mapping(False, tp_size=1), max_batch_size=3
+    )
+    mgr.pp_layers = [0, 1]
+    mgr.num_local_layers = 2
+
+    @dataclass
+    class _Cfg:
+        layers: list
+        constraints: list = field(default_factory=list)
+        commit_min_snapshot: bool = False
+
+    base = _Cfg(layers=[AttentionLayerConfig(layer_id=i, buffers=[]) for i in range(2)])
+    out = mgr._build_cache_config(base)
+
+    # Attention layers survive at their original ids; SSM layers follow.
+    assert [type(layer) for layer in out.layers] == [
+        AttentionLayerConfig,
+        AttentionLayerConfig,
+        SsmLayerConfig,
+        SsmLayerConfig,
+    ]
+    assert [int(layer.layer_id) for layer in out.layers] == [0, 1, 2, 3]
+    assert mgr._conv_layer_id(0) == 2 and mgr._conv_layer_id(1) == 3
+
+    # Four roles per layer, sized per request (not per block): channels * kwin.
+    ssm = out.layers[2]
+    assert [b.role for b in ssm.buffers] == list(cm.CONV_ROLES)
+    itemsize = torch.empty((), dtype=torch.bfloat16).element_size()
+    assert [b.size for b in ssm.buffers] == [
+        8 * 3 * itemsize,  # k, kv_dim
+        8 * 3 * itemsize,  # v, kv_dim
+        8 * 3 * itemsize,  # attn, hidden
+        8 * 3 * itemsize,  # mlp, hidden
+    ]
+    # SsmLayerConfig forbids a per-block override -- these are not paged.
+    assert all(b.tokens_per_block_override is None for b in ssm.buffers)
+
+    # A min-slots floor, so the pool cannot be sized for fewer sequences than
+    # the scheduler admits. Zero-capacity requests cost no attention pages.
+    floor = out.constraints[-1]
+    assert len(floor.kv_caches) == 3 + 1  # max_batch_size*pp_size + 1 padding row
+    assert all(d.capacity == 0 for d in floor.kv_caches)
+
+    # KVCacheManagerConfig hard-asserts this whenever an SSM layer is present.
+    # Omitting it took a full serve job to surface (job 6244892 died in
+    # _create_kv_cache_manager), because nothing on the CPU-only path builds a
+    # real KVCacheManagerConfig.
+    assert out.commit_min_snapshot is True
+
+
 def _patch_pool(monkeypatch, cm):
     """Replace the pool with a recorder and the V2 base __init__ with a no-op,
     so the manager's sizing arithmetic can be read off without a GPU."""
     seen = {}
 
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingConvStateCache
+
     class _FakePool:
         num_slots = 0
+
+        # Delegated, not reimplemented: _InklingConvGeometry asks the pool class
+        # for this, and a hand-rolled copy in the double would let the real
+        # formula drift without any test noticing.
+        reserved_slot_count = InklingConvStateCache.reserved_slot_count
 
         def __init__(self, pretrained_config, tp_size, num_request_slots, device, dtype, **kwargs):
             seen.update(tp_size=tp_size, num_request_slots=num_request_slots, dtype=dtype, **kwargs)
@@ -1297,10 +1616,19 @@ def test_cache_manager_sizes_the_conv_pool_for_every_resident_sequence(monkeypat
     graphs have captured the pool's pointers."""
     import torch
 
-    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as cm
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import cache_manager as cm
 
     seen = _patch_pool(monkeypatch, cm)
-    cfg = SimpleNamespace(torch_dtype=torch.bfloat16)
+    # The manager now sizes the V2 SSM buffers itself, so it reads the conv
+    # geometry off the config before the pool is built.
+    cfg = SimpleNamespace(
+        torch_dtype=torch.bfloat16,
+        sconv_kernel_size=4,
+        hidden_size=8,
+        num_hidden_layers=2,
+        layer_num_kv_heads=lambda i: 2,
+        layer_head_dim=lambda i: 4,
+    )
 
     cm.InklingHybridCacheManager(
         pretrained_config=cfg,
@@ -1322,7 +1650,7 @@ def test_cache_manager_requires_its_three_pool_arguments_by_name(monkeypatch):
     because they were read back out of **kwargs."""
     import torch
 
-    from tensorrt_llm._torch.attention_backend.inkling import cache_manager as cm
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import cache_manager as cm
 
     _patch_pool(monkeypatch, cm)
     cfg = SimpleNamespace(torch_dtype=torch.bfloat16)
@@ -1499,7 +1827,7 @@ def test_attention_keeps_every_head_and_channel_under_attention_dp(no_collective
 
 
 def test_the_backend_gets_this_layer_s_own_attention_scalars(no_collectives):
-    """The compute lives in InklingTritonAttention.forward_inkling, which reads
+    """The compute lives in InklingTritonAttention.forward, which reads
     sm_scale / rel_extent / window_left off itself -- so InklingAttention has to
     put them there (create_attention() takes a fixed kwarg list, with no
     passthrough for model-specific values).

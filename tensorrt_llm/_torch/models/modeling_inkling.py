@@ -23,7 +23,7 @@ Architecture summary:
   * RoPE-free attention with per-head q/k RMSNorm and score scale ``1/head_dim``.
   * Learned relative-position bias (``RelLogitsProj``), added pre-softmax as a
     ``score_mod`` inside the Inkling Triton attention kernels (prefill + paged
-    decode); see ``attention_backend/inkling/``.
+    decode); see ``attention_backend/sparse/inkling/``.
   * Hybrid layers: 55 local sliding-window (win=512, 16 kv-heads) + 11 global
     full-causal (8 kv-heads). Global layers apply log-scaling tau (a no-op below
     128k tokens, still implemented for correctness).
@@ -48,10 +48,11 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.attention_backend import AttentionMetadata
-from tensorrt_llm._torch.attention_backend.inkling import (
+from tensorrt_llm._torch.attention_backend.sparse.inkling import (
     InklingConvRuntime,
     InklingConvState,
     apply_short_conv,
+    inkling_forward_args,
 )
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -332,11 +333,19 @@ class InklingAttention(QKNormRoPEAttention):
 
     Everything below that -- the KV write, page-table construction and the
     prefill/decode dispatch over ``KVCacheManagerV2``'s HND paged layout -- runs
-    in :meth:`InklingTritonAttention.forward_inkling`, per
-    ``ATTENTION_DEVELOPER_GUIDE.md`` §1.1. The three per-layer scalars that
-    compute needs (``sm_scale``, ``rel_extent``, ``window_left``) are handed to
-    the backend in ``__init__`` because ``create_attention()`` takes a fixed
+    in :meth:`InklingTritonAttention.forward`, per
+    ``ATTENTION_DEVELOPER_GUIDE.md`` §1.1, reached through the standard backend
+    contract with ``rel_logits`` carried in
+    ``AttentionForwardArgs.sparse_backend_args``. The three per-layer scalars
+    that compute needs (``sm_scale``, ``rel_extent``, ``window_left``) are handed
+    to the backend in ``__init__`` because ``create_attention()`` takes a fixed
     kwarg list.
+
+    ``forward`` overrides the base rather than reusing ``Attention.forward``:
+    the k/v short-convs must run between ``split_qkv`` and ``apply_qk_norm``, and
+    ``rel_logits`` is projected from ``hidden_states`` -- which the base's
+    ``forward_impl`` (and therefore ``AttentionSparseHooks.forward``) never
+    receives, since by then only q/k/v remain.
     """
 
     def __init__(self, model_config: ModelConfig[InklingTextConfig], layer_idx: int):
@@ -395,9 +404,9 @@ class InklingAttention(QKNormRoPEAttention):
         # hand it the three per-layer scalars here. They differ between local
         # (sliding-window) and global (full-causal) layers, so they must be set
         # per module instance, not derived in the backend. Assignment is
-        # unconditional: if a non-INKLING backend was forced, ``forward`` fails
-        # loudly on the missing ``forward_inkling`` rather than silently running
-        # a different attention.
+        # unconditional: if some other backend were built, ``forward`` fails
+        # loudly on the unexpected ``sparse_backend_args`` type rather than
+        # silently running a different attention.
         self.attn.sm_scale = self.sm_scale
         self.attn.rel_extent = self.rel_extent
         self.attn.window_left = self.window_left
@@ -531,8 +540,16 @@ class InklingAttention(QKNormRoPEAttention):
         hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
         q, k, v = self._project(hidden_states, conv_pool_kv, conv_rt)
         rel_logits = self._build_rel_logits(hidden_states, position_ids)
-        attn_out = self.attn.forward_inkling(
-            q, k, v, rel_logits, attn_metadata, allow_mixed=conv_rt is not None
+        # Standard backend contract; rel_logits and the mixed-batch certificate
+        # ride AttentionForwardArgs.sparse_backend_args (see inkling/params.py).
+        attn_out = self.attn.forward(
+            q,
+            k,
+            v,
+            attn_metadata,
+            forward_args=inkling_forward_args(
+                rel_logits, allow_mixed=conv_rt is not None
+            ),
         )
         attn_out = attn_out.reshape(num_tokens, self.q_size)
         return self.o_proj(attn_out)
@@ -920,25 +937,30 @@ class InklingForCausalLM(DecoderModelForCausalLM[InklingModel, InklingTextConfig
     def _assert_inkling_attn_backend(model_config) -> None:
         """Fail at load if the Inkling attention backend was overridden.
 
-        ``get_model_defaults`` selects ``attn_backend='INKLING'`` because
-        ``InklingAttentionMetadata`` is what publishes the decode seq_lens and
-        page table into CUDA-graph-stable buffers. Model defaults are a
-        deep-merge in which an explicit user value wins, so an
-        ``attn_backend: TRTLLM`` left in ``--extra_llm_api_options`` -- a very
-        easy thing to carry over from another model's serve config -- silently
-        removes that publish. The run then dies deep in CUDA-graph capture with
-        "Cannot copy between CPU and CUDA tensors", which names neither Inkling
-        nor the setting responsible.
+        ``get_model_defaults`` selects ``attn_backend='INKLING'`` because the
+        backend NAME is what every consumer outside the Attention module has to
+        go on: ``PyTorchModelEngine`` and the KV-cache creator call
+        ``get_attention_backend(name)`` and read ``.Metadata`` off it, with no
+        ModelConfig in hand. Model defaults are a deep-merge in which an explicit
+        user value wins, so an ``attn_backend: TRTLLM`` left in
+        ``--extra_llm_api_options`` -- a very easy thing to carry over from
+        another model's serve config -- silently degrades attn_metadata to
+        ``TrtllmAttentionMetadata``: the decode seq lens and page table are never
+        published and the short-conv runtime is never built. The run then dies
+        far from the setting responsible (a mixed-batch refusal out of
+        ``InklingTritonAttention.forward``, or "Cannot copy between CPU and CUDA
+        tensors" deep in CUDA-graph capture).
         """
         backend = getattr(model_config, "attn_backend", None)
         if backend is not None and str(backend).upper() != "INKLING":
             raise ValueError(
                 f"Inkling requires attn_backend='INKLING' (got {backend!r}). "
                 "The Triton decode kernel reads its per-step seq_lens and page "
-                "table from InklingAttentionMetadata, which only the INKLING "
-                "backend supplies. Remove the attn_backend override from "
-                "--extra_llm_api_options / LLM(attn_backend=...) so the model "
-                "default applies."
+                "table from InklingAttentionMetadata, which the model engine "
+                "resolves from the backend NAME -- so any other value degrades "
+                "the metadata rather than failing loudly here. Remove the "
+                "attn_backend override from --extra_llm_api_options / "
+                "LLM(attn_backend=...) so the model default applies."
             )
 
     @staticmethod
@@ -1210,8 +1232,10 @@ class InklingForConditionalGeneration(InklingForCausalLM):
         #
         # ``attn_backend``: ``InklingAttentionMetadata`` publishes the decode
         # seq_lens and page table into fixed-pointer GPU buffers before
-        # CUDA-graph capture, and ``InklingTritonAttention.forward_inkling`` is
-        # the only implementation of Inkling's relative-bias attention.
+        # CUDA-graph capture, and the model engine resolves that metadata class
+        # from the backend NAME alone (get_attention_backend(name).Metadata),
+        # with no access to model-scoped state. The name is therefore the only
+        # way to make Inkling's backend identity visible engine-side.
         return {
             "attn_backend": "INKLING",
             "kv_cache_config": {

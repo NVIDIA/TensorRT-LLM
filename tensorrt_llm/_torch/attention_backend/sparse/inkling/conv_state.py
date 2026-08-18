@@ -24,11 +24,13 @@ It therefore lives beside the cache manager and the metadata rather than in
 
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 
-from ...._utils import prefer_pinned
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+
+from ....._utils import prefer_pinned
 
 # Per-request short-conv state of one decoder layer, carried across decode steps.
 # Each field is a ``[num_req, channels, sconv_kernel_size - 1]`` window of the
@@ -37,15 +39,45 @@ from ...._utils import prefer_pinned
 InklingConvState = namedtuple("InklingConvState", ["k", "v", "attn", "mlp"])
 
 
+class InklingRole:
+    """V2 pool roles for the four short convolutions of a decoder layer.
+
+    Four roles rather than two despite only two distinct widths: a role is the
+    identity a buffer is addressed by, and k/v/attn/mlp are separate states that
+    merely happen to pair up in size. V2 coalesces same-sized buffers into shared
+    pool slots on its own, so naming them apart costs nothing -- and the pairing
+    is a property of today's config (``kv_dim`` vs ``hidden_size``), not
+    something worth baking into the role space.
+
+    Lives here rather than in ``cache_manager`` so the pool and its roles are
+    declared together, and so the two modules do not import each other.
+    """
+
+    CONV_K = DataRole("inkling_conv_k")
+    CONV_V = DataRole("inkling_conv_v")
+    CONV_ATTN = DataRole("inkling_conv_attn")
+    CONV_MLP = DataRole("inkling_conv_mlp")
+
+
+# Order matches InklingConvState's fields so the two can be zipped.
+CONV_ROLES = (InklingRole.CONV_K, InklingRole.CONV_V, InklingRole.CONV_ATTN, InklingRole.CONV_MLP)
+
+
 class InklingConvStateCache:
     """Runtime-owned per-request short-conv state pool for the whole decoder.
 
     Carries the four causal short-convs of every decoder layer per request
     across decode steps, with the same lifetime as the paged KV cache.
 
-    Per layer it allocates the four :class:`InklingConvState` buffers, each
+    Per layer it holds the four :class:`InklingConvState` buffers, each
     ``[num_slots, channels, kernel_size - 1]``. The k/v conv channels follow the
     fused-qkv k/v split (TP-sharded); the residual-stream convs are replicated.
+
+    The buffers themselves come from the ``allocate`` callback, which
+    :class:`InklingHybridCacheManager` wires to V2 SSM-layer pool memory -- this
+    class owns the request-to-row mapping, V2 owns the bytes. That split matches
+    ``MambaHybridCacheManagerV2``, which likewise keeps its own slot allocator
+    over V2-provided state buffers.
 
     The row count is fixed at construction and never changes:
 
@@ -65,13 +97,34 @@ class InklingConvStateCache:
     holds, and a graph replaying against a freed buffer does not raise -- it
     reads whatever the allocator handed out next.
 
-    Fixing the size also keeps KV-cache capacity estimation honest. The pool is
-    a plain torch allocation, invisible to the V2 manager's own byte quota, and
-    it is counted only because the throwaway estimation manager holds one while
-    ``configure_kv_cache_capacity`` reads peak memory. That accounting is
-    correct exactly when the estimation pool and the serving pool are the same
-    size, which is true iff neither can grow.
+    Fixing the size is no longer what keeps KV-cache capacity estimation honest
+    -- the rows are declared to V2 as SSM-layer buffers and a min-slots
+    constraint, so their bytes sit inside the same quota as the paged KV (see
+    ``cache_manager``). Before that they were a side allocation counted only
+    because the throwaway estimation manager happened to hold one while
+    ``configure_kv_cache_capacity`` read peak memory, which was correct only
+    while the two pools were exactly the same size. The two reasons above still
+    stand on their own.
     """
+
+    @staticmethod
+    def reserved_slot_count(*, reserve_attention_dp_slot: bool) -> int:
+        """Rows sitting above the per-request ones.
+
+        One row shared by every CUDA-graph padding sentinel, plus one for the
+        attention-DP idle dummy when that is enabled. Neither may consume real
+        request capacity -- the graph runner keeps one sentinel id per runtime
+        draft length, so charging each a real row silently shrinks the servable
+        batch.
+
+        Exposed as a static method because the count is needed twice: here, to
+        size the pool, and in ``_InklingConvGeometry``, to declare the min-slots
+        floor to KVCacheManagerV2. Those two must agree exactly -- a V2 buffer
+        sized from a smaller count is indexed out of bounds by ``slots_for`` --
+        and the slot layout is this class's to define, so the geometry asks
+        rather than re-deriving.
+        """
+        return 1 + int(reserve_attention_dp_slot)
 
     def __init__(
         self,
@@ -83,6 +136,7 @@ class InklingConvStateCache:
         *,
         reserve_attention_dp_slot: bool = False,
         max_draft_len: int = 0,
+        allocate: Optional[Callable[[int, object, List[int]], torch.Tensor]] = None,
     ):
         # Takes the pretrained config + tp_size rather than a ``ModelConfig`` so
         # the KV cache manager can build the pool from what it already has.
@@ -97,20 +151,47 @@ class InklingConvStateCache:
         self._padding_slot = num_request_slots
         self._attention_dp_dummy_slot = num_request_slots + 1 if reserve_attention_dp_slot else None
         self._max_draft_len = max(0, int(max_draft_len))
-        num_slots = num_request_slots + 1 + int(reserve_attention_dp_slot)
+        num_slots = num_request_slots + self.reserved_slot_count(
+            reserve_attention_dp_slot=reserve_attention_dp_slot
+        )
         self.num_slots = num_slots
         self.kwin = kwin
 
-        def buf(channels):
-            return torch.zeros(num_slots, channels, kwin, device=device, dtype=dtype)
+        # ``allocate`` hands back V2 pool memory when the cache manager built us
+        # (see InklingHybridCacheManager._conv_state_buffer): that is what puts
+        # these bytes inside V2's quota instead of beside it. Standalone
+        # construction -- unit tests, and any caller with no V2 manager to hand
+        # -- falls back to a private allocation with the same shapes.
+        #
+        # Pool memory arrives uninitialized, unlike the torch.zeros this used to
+        # do. That is safe only because ``slots_for`` zeroes a row the first time
+        # it hands it to a request, and every row that is ever read has been
+        # handed out first (``write_state_indices`` runs each forward, ahead of
+        # any conv). Anything that starts reading rows without claiming them
+        # would need an explicit zero-fill here.
+        if allocate is None:
+
+            def allocate(_layer_idx, _role, state_shape):
+                return torch.zeros(num_slots, *state_shape, device=device, dtype=dtype)
 
         self._layers: List[InklingConvState] = []
         for i in range(config.num_hidden_layers):
             kv_dim = (config.layer_num_kv_heads(i) * config.layer_head_dim(i)) // tp_size
             hidden = config.hidden_size
-            self._layers.append(
-                InklingConvState(k=buf(kv_dim), v=buf(kv_dim), attn=buf(hidden), mlp=buf(hidden))
-            )
+            bufs = [
+                allocate(i, role, [channels, kwin])
+                for role, channels in zip(CONV_ROLES, (kv_dim, kv_dim, hidden, hidden))
+            ]
+            for buf in bufs:
+                if buf.shape[0] < num_slots:
+                    raise RuntimeError(
+                        f"Inkling conv pool layer {i}: allocator returned "
+                        f"{buf.shape[0]} slots but the pool needs {num_slots} "
+                        f"({num_request_slots} request + reserved). The V2 SSM "
+                        "layer was sized from a different slot count than "
+                        "InklingConvStateCache assumes."
+                    )
+            self._layers.append(InklingConvState(*(b[:num_slots] for b in bufs)))
         # Stable per-batch-row slot-index buffer, refreshed in place per forward
         # from input preparation (see :meth:`write_state_indices`) so a captured
         # decode graph aliases it and every replay sees the current batch. It is
@@ -141,8 +222,8 @@ class InklingConvStateCache:
         length (``CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len``), so the whole
         descending range has to map here, not just the exact sentinel.
         """
-        from ...pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-        from ...pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+        from ....pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        from ....pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 
         if CUDA_GRAPH_DUMMY_REQUEST_ID - self._max_draft_len <= request_id:
             return self._padding_slot

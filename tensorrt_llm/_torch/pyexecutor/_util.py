@@ -102,7 +102,7 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
         # KV cache's lifetime, so the cache manager owns that pool too (the
         # CppMambaHybridCacheManager shape): it reaches the model through
         # attn_metadata and is freed alongside the request's KV blocks.
-        from ..attention_backend.inkling import InklingHybridCacheManager
+        from ..attention_backend.sparse.inkling import InklingHybridCacheManager
         return InklingHybridCacheManager
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 

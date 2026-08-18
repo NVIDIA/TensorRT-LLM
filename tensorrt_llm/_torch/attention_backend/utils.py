@@ -1,4 +1,5 @@
-from typing import Optional, Sequence, Type
+from importlib import import_module
+from typing import Dict, Optional, Sequence, Type
 
 import torch
 
@@ -7,12 +8,52 @@ from tensorrt_llm.logger import logger
 from ...models.modeling_utils import QuantConfig
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
-from .sparse import (get_flashinfer_sparse_attn_attention_backend,
-                     get_trtllm_sparse_attn_attention_backend,
-                     get_vanilla_sparse_attn_attention_backend)
+from .sparse import (
+    get_flashinfer_sparse_attn_attention_backend,
+    get_trtllm_sparse_attn_attention_backend,
+    get_vanilla_sparse_attn_attention_backend,
+)
 from .sparse.params import SparseParams
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention
+
+# ---- model-specific backends ------------------------------------------------
+# Backends that are not one of the base families (TRTLLM / VANILLA / FLASHINFER,
+# see ATTENTION_DEVELOPER_GUIDE.md §2.1). Keyed by NAME rather than by
+# SparseParams -- which is what sparse/registry.py dispatches on -- because the
+# name is all most callers have: PyTorchModelEngine, the KV-cache creator and a
+# dozen vision encoders call this function with a bare string and then read
+# ``.Metadata`` off the result, holding no ModelConfig. A backend reachable only
+# through SparseParams silently degrades to its family default for those callers,
+# and that metadata mismatch surfaces not here but at the first forward needing
+# the model-specific metadata fields.
+#
+# Values are (module, attribute) and resolved on demand: these packages import
+# ``trtllm`` / ``resource_manager`` and would form an import cycle at module load.
+#
+# Names here are never user-supplied -- ``get_model_defaults`` selects them and
+# the model rejects an explicit override at load -- so they are deliberately
+# absent from the ``attn_backend`` categorical list in ``llmapi/llm_args.py``,
+# which is a telemetry surface and an API-stability snapshot.
+_MODEL_BACKEND_MODULES = {
+    "INKLING": (".sparse.inkling", "InklingTritonAttention"),
+}
+_MODEL_BACKENDS: Dict[str, Type[AttentionBackend]] = {}
+
+
+def register_attention_backend(name: str, cls: Type[AttentionBackend]) -> None:
+    """Register a model-specific backend under a reserved (non user-facing) name."""
+    _MODEL_BACKENDS[name.upper()] = cls
+
+
+def _model_specific_backend(backend_name: str) -> Optional[Type[AttentionBackend]]:
+    """The registered backend for ``backend_name``, or None for a base family."""
+    if backend_name not in _MODEL_BACKENDS and backend_name in _MODEL_BACKEND_MODULES:
+        module, attr = _MODEL_BACKEND_MODULES[backend_name]
+        register_attention_backend(
+            backend_name, getattr(import_module(module, __package__), attr)
+        )
+    return _MODEL_BACKENDS.get(backend_name)
 
 
 def get_attention_backend(
@@ -20,6 +61,9 @@ def get_attention_backend(
     sparse_params: Optional[SparseParams] = None,
 ) -> Type[AttentionBackend]:
     backend_name = backend_name.upper()
+    model_specific = _model_specific_backend(backend_name)
+    if model_specific is not None:
+        return model_specific
     if backend_name == "VANILLA":
         if sparse_params is not None:
             return get_vanilla_sparse_attn_attention_backend(sparse_params)
@@ -28,12 +72,6 @@ def get_attention_backend(
         if sparse_params is not None:
             return get_trtllm_sparse_attn_attention_backend(sparse_params)
         return TrtllmAttention
-    elif backend_name == "INKLING":
-        # Intentionally not added to the attn_backend telemetry categorical list
-        # in llm_args.py: "INKLING" is never user-supplied -- get_model_defaults
-        # selects it and an explicit override is rejected at load.
-        from .inkling import InklingTritonAttention
-        return InklingTritonAttention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
         if sparse_params is not None:
