@@ -37,24 +37,21 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 try:
-    import sys
     from pathlib import Path
 
     from diffusers import DiffusionPipeline
 
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
     from tensorrt_llm.visual_gen.args import (
         AttentionConfig,
         ParallelConfig,
         TorchCompileConfig,
         VisualGenArgs,
     )
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:

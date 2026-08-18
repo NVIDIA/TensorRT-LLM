@@ -4,7 +4,6 @@ import datetime
 import json
 import os
 import random
-import sys
 import time
 from typing import List, Optional, Union
 
@@ -31,7 +30,6 @@ from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor)
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, altered_env

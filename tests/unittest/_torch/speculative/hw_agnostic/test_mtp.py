@@ -1,11 +1,10 @@
-import os
-import sys
 import unittest
 from types import SimpleNamespace
 
 import pytest
 import torch
 from parameterized import parameterized
+from utils.llm_data import llm_models_root
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
@@ -21,9 +20,6 @@ from tensorrt_llm._torch.speculative.utils import (
     uses_mtp_head_checkpoint,
 )
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from utils.llm_data import llm_models_root
 
 
 def unittest_name_func(testcase_func, param_num, param):

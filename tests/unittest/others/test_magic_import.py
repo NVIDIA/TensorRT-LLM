@@ -85,8 +85,12 @@ class _Tree:
         path.write_text(textwrap.dedent(body))
 
         name = path.stem
-        if (path.suffix == ".py" and name not in self._MAY_COLLIDE
-                and not name.startswith(("test_", "__")) and name != "conftest"):
+        if (
+            path.suffix == ".py"
+            and name not in self._MAY_COLLIDE
+            and not name.startswith(("test_", "__"))
+            and name != "conftest"
+        ):
             try:
                 existing = importlib.util.find_spec(name)
             except (ImportError, ValueError):
@@ -94,7 +98,8 @@ class _Tree:
             assert existing is None, (
                 f"fixture module {name!r} is already importable from "
                 f"{existing.origin!r}; the finder will not shadow it, so this "
-                f"fixture cannot test what it intends -- pick a unique name")
+                f"fixture cannot test what it intends -- pick a unique name"
+            )
         return path
 
     def run(self, path: Path, register: bool = True) -> dict:
@@ -170,7 +175,9 @@ def test_declaration_at_the_pytest_ini_directory_is_used(tree):
     tree.write("tests/unittest/shared/mi_helper.py", "VALUE = 'root-level'\n")
     tree.write("tests/unittest/pytest.ini", "[pytest]\n")
     tree.write("tests/unittest/conftest.py", "__extra_import_path__ = ['shared']\n")
-    case = tree.write("tests/unittest/deep/test_deep.py", "import mi_helper\nRESULT = mi_helper.VALUE\n")
+    case = tree.write(
+        "tests/unittest/deep/test_deep.py", "import mi_helper\nRESULT = mi_helper.VALUE\n"
+    )
 
     assert tree.run(case)["RESULT"] == "root-level"
 

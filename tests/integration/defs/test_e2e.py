@@ -17,7 +17,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -30,10 +29,7 @@ from defs.trt_test_alternative import (check_call, check_call_negative_test,
 from .common import get_mmlu_accuracy, venv_check_call
 from .conftest import (get_device_count, get_sm_version, llm_models_root,
                        skip_no_sm120, skip_post_blackwell, skip_pre_ada,
-                       skip_pre_blackwell, skip_pre_hopper, tests_path,
-                       unittest_path)
-
-sys.path.append(os.path.join(str(tests_path()), '/../examples/apps'))
+                       skip_pre_blackwell, skip_pre_hopper, unittest_path)
 
 _MEM_FRACTION_50 = 0.5
 _MEM_FRACTION_80 = 0.8

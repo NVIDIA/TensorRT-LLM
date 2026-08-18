@@ -24,23 +24,18 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
-    import sys
-    from pathlib import Path
-
     from tensorrt_llm._torch.visual_gen.config import (
         DiffusionModelConfig,
         create_attention_metadata_state,
     )
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.rope import LTXRopeType
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, TorchCompileConfig
 
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, TorchCompileConfig
+    from ._visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:

@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 
 import torch
@@ -8,8 +6,6 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.speculative.drafting_loops import StaticTreeDraftingLoopWrapper
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 class DummyModel(torch.nn.Module):

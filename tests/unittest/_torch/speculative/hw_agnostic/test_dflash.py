@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import sys
 import unittest
 
 import pytest
@@ -23,8 +21,6 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, DFlashDecodingConfig, KvCacheConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 PROMPTS = [
     "The capital of France is",
