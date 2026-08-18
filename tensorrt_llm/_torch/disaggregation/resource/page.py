@@ -300,7 +300,6 @@ MAMBA_SSM_ROLE = frozenset({"mamba_ssm"})
 
 
 @dataclass
-@dataclass
 class MambaLayerGroup(LayerGroup):
     """Layer group for Mamba SSM states.
 
