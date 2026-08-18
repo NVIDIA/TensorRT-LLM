@@ -3397,7 +3397,7 @@ class PyExecutor:
                 # so next iter's rejection kernel would read a stale draft_probs
                 # row. Mark it (pre-pad signal) so _prepare_tp_inputs writes a
                 # one-hot placeholder row after spec_metadata.prepare().
-                request.py_needs_onehot_draft_probs = (
+                request.py_needs_onehot_draft_probs |= (
                     rejection_on and current_num_draft_tokens == 0)
                 if spec_dec_mode.is_pard():
                     # special case: PARD carries 2K-1 draft tokens per request
@@ -3841,11 +3841,19 @@ class PyExecutor:
             # two-model normalization so scheduling reserves the correct token budget.
             # model_engine is guarded first so partially-constructed executors in unit tests
             # (which may not set model_engine) do not raise AttributeError.
+            rejection_on = (
+                self.model_engine.spec_config is not None
+                and self.model_engine.spec_config.use_rejection_sampling)
             for request in self.active_requests:
                 if request.state not in (
                         LlmRequestState.GENERATION_IN_PROGRESS,
                         LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
+                # Populate the Python-side count only when no real draft tokens
+                # are available from the previous iteration.
+                if not request.py_draft_tokens:
+                    request.py_needs_onehot_draft_probs |= rejection_on
+                    request.py_draft_tokens = [0] * self.max_total_draft_tokens
                 request.draft_tokens = [0] * self.max_total_draft_tokens
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
