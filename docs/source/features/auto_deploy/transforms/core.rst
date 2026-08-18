@@ -23,7 +23,6 @@ Transform Interface
    :members:
    :undoc-members:
    :show-inheritance:
-   :no-index:
 
 Transform Registry
 ------------------
@@ -36,7 +35,6 @@ configuration entries to the transform implementation and configuration model.
    :members:
    :undoc-members:
    :show-inheritance:
-   :no-index:
 
 Transform Results
 -----------------
@@ -44,7 +42,9 @@ Transform Results
 .. autopydantic_model:: tensorrt_llm._torch.auto_deploy.transform.interface.TransformInfo
    :members:
    :show-inheritance:
-   :no-index:
+
+Other Interface Utilities
+-------------------------
 
 .. automodule:: tensorrt_llm._torch.auto_deploy.transform.interface
    :members:
