@@ -30,7 +30,7 @@ except NotImplementedError:  # pragma: no cover
 
 from cutlass._mlir import ir
 
-from .flag_batch import GpuReleaseFlagBatchTracker
+from .flag_batch import make_flag_batch_tracker
 from .grid_sync import software_grid_sync
 from .moe_utils import _nanosleep, spin_wait
 from .ptx_helpers import (cp_reduce_async_bulk_add_noftz_bf16_s2g, fns_b32,
@@ -785,7 +785,8 @@ class TokenInPullTokenBackPush:
         # is drained CTA-locally by ``cp_async_bulk_wait_group(0)`` before its
         # release target is accumulated; the eventual red.release.gpu add
         # publishes the corresponding pool data to GPU scope.
-        flag_tracker = GpuReleaseFlagBatchTracker(
+        flag_tracker = make_flag_batch_tracker(
+            use_async=self._flag_batch == 1,
             flag_addr=Int64(0),
             cumulated_flags=Int32(0),
             phase=Int32(0),

@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Fused fc1 + fc2 MegaMoE scheduler."""
 
+import math
 from enum import IntEnum
 from typing import List, Literal, Optional, Tuple
 
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover
 except NotImplementedError:  # pragma: no cover
     from .iket_compat import iket
 
+from .custom_mix_cga_helpers import make_runtime_init_pipeline_async
 from .moe_persistent_scheduler import (_DEFAULT_SCHED_EXT, MoESchedulerBase,
                                        MoESchedulerParamsBase, MoEWorkTileInfo,
                                        WorkTileState)
@@ -33,6 +35,8 @@ from .moe_utils import (compute_expert_token_count_from_sizes,
                         compute_expert_token_range,
                         mbarrier_arrive_expect_tx_on_peer,
                         store_i32_to_peer_cluster_smem_async)
+from .non_clc_mixed_cga import (NonClcMixedCgaConfig,
+                                NonClcMixedCgaSchedulerWorker)
 
 # =============================================================================
 # Block phase
@@ -244,9 +248,163 @@ class _DynamicLoadBalanceState:
         )
 
 
+class _PhaseFc12CursorState:
+    """Monotonic expert cursor for one phase-local work-ID stream."""
+
+    def __init__(
+        self,
+        expert_idx: Int32,
+        expert_tile_start: Int32,
+        expert_tile_end: Int32,
+        current_expert_token_count: Int32,
+        current_token_block_count: Int32,
+        data_cumulative: Int32,
+        sf_cumulative: Int32,
+        token_block_cumulative: Int32,
+        blocks_per_token_block: int | Int32,
+    ) -> None:
+        self.expert_idx = expert_idx
+        self.expert_tile_start = expert_tile_start
+        self.expert_tile_end = expert_tile_end
+        self.current_expert_token_count = current_expert_token_count
+        self.current_token_block_count = current_token_block_count
+        self.data_cumulative = data_cumulative
+        self.sf_cumulative = sf_cumulative
+        self.token_block_cumulative = token_block_cumulative
+        self.blocks_per_token_block = blocks_per_token_block
+
+    def _runtime_fields(self) -> Tuple:
+        fields = (
+            self.expert_idx,
+            self.expert_tile_start,
+            self.expert_tile_end,
+            self.current_expert_token_count,
+            self.current_token_block_count,
+            self.data_cumulative,
+            self.sf_cumulative,
+            self.token_block_cumulative,
+        )
+        if isinstance(self.blocks_per_token_block, Int32):
+            fields = (*fields, self.blocks_per_token_block)
+        return fields
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        values: List[ir.Value] = []
+        for field in self._runtime_fields():
+            values.extend(extract_mlir_values(field))
+        return values
+
+    def __new_from_mlir_values__(
+            self, values: List[ir.Value]) -> "_PhaseFc12CursorState":
+        value_index = 0
+
+        def rebuild(field):
+            nonlocal value_index
+            field_value_count = len(extract_mlir_values(field))
+            result = new_from_mlir_values(
+                field, values[value_index:value_index + field_value_count])
+            value_index += field_value_count
+            return result
+
+        result = type(self)(
+            expert_idx=rebuild(self.expert_idx),
+            expert_tile_start=rebuild(self.expert_tile_start),
+            expert_tile_end=rebuild(self.expert_tile_end),
+            current_expert_token_count=rebuild(self.current_expert_token_count),
+            current_token_block_count=rebuild(self.current_token_block_count),
+            data_cumulative=rebuild(self.data_cumulative),
+            sf_cumulative=rebuild(self.sf_cumulative),
+            token_block_cumulative=rebuild(self.token_block_cumulative),
+            blocks_per_token_block=(rebuild(
+                self.blocks_per_token_block) if isinstance(
+                    self.blocks_per_token_block, Int32) else
+                                    self.blocks_per_token_block),
+        )
+        if value_index != len(values):
+            raise ValueError("_PhaseFc12CursorState MLIR value count mismatch: "
+                             f"consumed {value_index}, got {len(values)}.")
+        return result
+
+
+class _PhaseInterleaveState:
+    """Independent phase cursors and the FC1/FC2 claim cadence."""
+
+    def __init__(
+        self,
+        fc1_cursor: _PhaseFc12CursorState,
+        fc2_cursor: _PhaseFc12CursorState,
+        prologue_remaining: Int32,
+        cycle_position: Int32,
+        fc1_exhausted: Boolean,
+        fc2_exhausted: Boolean,
+    ) -> None:
+        self.fc1_cursor = fc1_cursor
+        self.fc2_cursor = fc2_cursor
+        self.prologue_remaining = prologue_remaining
+        self.cycle_position = cycle_position
+        self.fc1_exhausted = fc1_exhausted
+        self.fc2_exhausted = fc2_exhausted
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        values: List[ir.Value] = []
+        for field in (
+                self.fc1_cursor,
+                self.fc2_cursor,
+                self.prologue_remaining,
+                self.cycle_position,
+                self.fc1_exhausted,
+                self.fc2_exhausted,
+        ):
+            values.extend(extract_mlir_values(field))
+        return values
+
+    def __new_from_mlir_values__(
+            self, values: List[ir.Value]) -> "_PhaseInterleaveState":
+        value_index = 0
+
+        def rebuild(field):
+            nonlocal value_index
+            field_value_count = len(extract_mlir_values(field))
+            result = new_from_mlir_values(
+                field, values[value_index:value_index + field_value_count])
+            value_index += field_value_count
+            return result
+
+        result = type(self)(
+            fc1_cursor=rebuild(self.fc1_cursor),
+            fc2_cursor=rebuild(self.fc2_cursor),
+            prologue_remaining=rebuild(self.prologue_remaining),
+            cycle_position=rebuild(self.cycle_position),
+            fc1_exhausted=rebuild(self.fc1_exhausted),
+            fc2_exhausted=rebuild(self.fc2_exhausted),
+        )
+        if value_index != len(values):
+            raise ValueError("_PhaseInterleaveState MLIR value count mismatch: "
+                             f"consumed {value_index}, got {len(values)}.")
+        return result
+
+
 # =============================================================================
 # Scheduler Parameters
 # =============================================================================
+
+
+def minimum_phase_interleave_hint(
+    *,
+    blocks_fc1: int,
+    blocks_fc2: int,
+    launch_cluster_cnt_merge_as_preferred: int,
+) -> int:
+    """Return the FC1 prologue covering one canonical FC2 claim wave."""
+    effective_wave_width = launch_cluster_cnt_merge_as_preferred
+    max_dependent_token_blocks = (effective_wave_width + blocks_fc2 - 1 +
+                                  blocks_fc2 - 1) // blocks_fc2
+    required_fc1_work = max_dependent_token_blocks * blocks_fc1
+    return max(
+        1,
+        (required_fc1_work + launch_cluster_cnt_merge_as_preferred - 1) //
+        launch_cluster_cnt_merge_as_preferred,
+    )
 
 
 class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
@@ -285,6 +443,14 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         # serialization is type-discriminated below.
         expert_token_sizes: Optional[cute.Tensor] = None,
         expert_token_prefix_sum: Optional[cute.Tensor] = None,
+        fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None,
+        schedule_policy: Optional[Tuple[str, Optional[int]]] = None,
+        work_id_mode: Optional[Literal["grid_stride", "atomic_counter"]] = None,
+        launch_cluster_count: Optional[int] = None,
+        preferred_cluster_count: Optional[int] = None,
+        fallback_cluster_count: Optional[int] = None,
+        fallback_registration_counter_ptr=None,
+        fallback_group_token_ptr=None,
     ):
         """Create fused fc12 scheduler params."""
         if scenario != "2Dx3D":
@@ -324,13 +490,159 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             override_num_stages=override_num_stages,
             is_swap_ab=is_swap_ab,
         )
-        self.group_hint = group_hint
+        legacy_schedule = (fallback_cluster_shape_mn is None
+                           and schedule_policy is None and work_id_mode is None
+                           and launch_cluster_count is None
+                           and preferred_cluster_count is None
+                           and fallback_cluster_count is None)
+        if schedule_policy is None:
+            schedule_policy = ("grouped", group_hint)
+        if (not isinstance(schedule_policy, tuple)
+                or len(schedule_policy) != 2):
+            raise ValueError("schedule_policy must be a (mode, hint) tuple.")
+        schedule_mode, schedule_hint = schedule_policy
+        if schedule_mode not in ("grouped", "phase_interleave"):
+            raise ValueError("schedule_policy mode must be 'grouped' or "
+                             f"'phase_interleave', got {schedule_mode!r}.")
+
+        resolved_work_id_mode = work_id_mode
+        if resolved_work_id_mode is None:
+            resolved_work_id_mode = ("atomic_counter" if load_balance_mode
+                                     == "atomic_counter" else "grid_stride")
+        if resolved_work_id_mode not in ("grid_stride", "atomic_counter"):
+            raise ValueError(
+                "work_id_mode must be 'grid_stride' or 'atomic_counter'.")
+        expected_load_balance_mode = ("atomic_counter" if resolved_work_id_mode
+                                      == "atomic_counter" else "static")
+        if (load_balance_mode != "clc"
+                and load_balance_mode != expected_load_balance_mode):
+            raise ValueError(
+                f"load_balance_mode={load_balance_mode!r} conflicts with "
+                f"work_id_mode={resolved_work_id_mode!r}.")
+        if schedule_mode == "phase_interleave" and (resolved_work_id_mode
+                                                    != "atomic_counter"):
+            raise ValueError(
+                "phase_interleave requires work_id_mode='atomic_counter'.")
+
+        fallback_cluster_shape_internal = fallback_cluster_shape_mn
+        if fallback_cluster_shape_internal is not None and is_swap_ab:
+            fallback_cluster_shape_internal = (
+                fallback_cluster_shape_internal[1],
+                fallback_cluster_shape_internal[0],
+            )
+        mixed_cga_config = None
+        if not legacy_schedule:
+            mixed_cga_config = NonClcMixedCgaConfig(
+                preferred_cluster_shape=self.cluster_shape_mn,
+                fallback_cluster_shape=fallback_cluster_shape_internal,
+                launch_cluster_count=launch_cluster_count,
+                preferred_cluster_count=preferred_cluster_count,
+                fallback_cluster_count=fallback_cluster_count,
+            )
+            canonical_cluster_count = (
+                mixed_cga_config.launch_cluster_cnt_merge_as_preferred)
+            if (launch_cluster_count is not None
+                    and launch_cluster_count != canonical_cluster_count):
+                raise ValueError(
+                    "launch_cluster_count must equal the canonical preferred-"
+                    "cluster slot count resolved from preferred and fallback "
+                    "cluster counts.")
+        else:
+            canonical_cluster_count = None
+
+        if schedule_hint is None:
+            if schedule_mode == "grouped":
+                schedule_hint = canonical_cluster_count
+            else:
+                if not all(
+                        isinstance(dimension, int)
+                        for dimension in (self.intermediate, self.hidden,
+                                          self.cluster_tile_n)):
+                    raise ValueError(
+                        "phase_interleave requires static expert dimensions.")
+                blocks_fc1 = ((self.intermediate + self.cluster_tile_n - 1) //
+                              self.cluster_tile_n)
+                blocks_fc2 = ((self.hidden + self.cluster_tile_n - 1) //
+                              self.cluster_tile_n)
+                schedule_hint = minimum_phase_interleave_hint(
+                    blocks_fc1=blocks_fc1,
+                    blocks_fc2=blocks_fc2,
+                    launch_cluster_cnt_merge_as_preferred=
+                    canonical_cluster_count,
+                )
+        if (isinstance(schedule_hint, bool)
+                or not isinstance(schedule_hint, int) or schedule_hint <= 0):
+            raise ValueError(
+                f"schedule_policy hint must be a positive int, got "
+                f"{schedule_hint!r}.")
+
+        self.group_hint = schedule_hint
+        self.schedule_policy = (schedule_mode, schedule_hint)
+        self.schedule_mode = schedule_mode
+        self.work_id_mode = resolved_work_id_mode
+        self.mixed_cga_config = mixed_cga_config
+        self.uses_legacy_work_id_path = legacy_schedule
+        self.launch_cluster_count = (canonical_cluster_count
+                                     if canonical_cluster_count is not None else
+                                     launch_cluster_count)
+        self.fallback_cluster_shape_mn = fallback_cluster_shape_internal
+        self.preferred_cluster_count = preferred_cluster_count
+        self.fallback_cluster_count = fallback_cluster_count
         self.token_padding_block = token_padding_block
         self.sf_padding_block = sf_padding_block
         self.load_balance_mode = load_balance_mode
         self.load_balance_counter_ptr = load_balance_counter_ptr
+        self.fallback_registration_counter_ptr = (
+            fallback_registration_counter_ptr)
+        self.fallback_group_token_ptr = fallback_group_token_ptr
         self.expert_token_sizes = expert_token_sizes
         self.expert_token_prefix_sum = expert_token_prefix_sum
+        self.interleave_fc2_slots = 0
+        self.interleave_cycle_length = 0
+
+        if (mixed_cga_config is not None and mixed_cga_config.is_mixed
+                and resolved_work_id_mode == "atomic_counter"
+                and (fallback_registration_counter_ptr is None
+                     or fallback_group_token_ptr is None)):
+            raise ValueError(
+                "mixed atomic_counter scheduling requires fallback "
+                "registration and group-token pointers.")
+        if schedule_mode == "phase_interleave":
+            if not all(
+                    isinstance(dimension, int)
+                    and not isinstance(dimension, bool)
+                    for dimension in (self.expert_cnt, self.intermediate,
+                                      self.hidden)):
+                raise ValueError(
+                    "phase_interleave requires static expert dimensions.")
+            maximum_int32 = (1 << 31) - 1
+            for field_name in ("expert_cnt", "intermediate", "hidden"):
+                dimension = getattr(self, field_name)
+                if dimension <= 0:
+                    raise ValueError(
+                        f"{field_name} must be a positive Python int.")
+                if dimension > maximum_int32:
+                    raise ValueError(
+                        f"{field_name} must fit in a signed Int32, got "
+                        f"{dimension}.")
+            blocks_fc1 = ((self.intermediate + self.cluster_tile_n - 1) //
+                          self.cluster_tile_n)
+            blocks_fc2 = ((self.hidden + self.cluster_tile_n - 1) //
+                          self.cluster_tile_n)
+            minimum_hint = minimum_phase_interleave_hint(
+                blocks_fc1=blocks_fc1,
+                blocks_fc2=blocks_fc2,
+                launch_cluster_cnt_merge_as_preferred=canonical_cluster_count,
+            )
+            interleave_gcd = math.gcd(blocks_fc1, blocks_fc2)
+            self.interleave_fc2_slots = blocks_fc2 // interleave_gcd
+            self.interleave_cycle_length = ((blocks_fc1 + blocks_fc2) //
+                                            interleave_gcd)
+            if schedule_hint < minimum_hint:
+                raise ValueError(
+                    f"phase_interleave hint {schedule_hint} cannot cover a "
+                    f"{canonical_cluster_count}-cluster FC2 claim wave; "
+                    f"raise hint to at least {minimum_hint}.")
 
     def get_scheduler_type(self) -> type:
         return MoEFusedFc12PersistentTileScheduler
@@ -339,16 +651,24 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         self,
         max_active_clusters: int,
     ) -> Tuple[int, int, int]:
+        launch_cluster_count = max_active_clusters
+        if not self.uses_legacy_work_id_path:
+            launch_cluster_count = self.launch_cluster_count
+            if (not self.mixed_cga_config.is_mixed
+                    and max_active_clusters < launch_cluster_count):
+                raise ValueError(
+                    f"max_active_clusters ({max_active_clusters}) must be at "
+                    f"least launch_cluster_count ({launch_cluster_count}).")
         if self.is_swap_ab:
             return (
                 self.cluster_shape_mn[1],
                 self.cluster_shape_mn[0],
-                max_active_clusters,
+                launch_cluster_count,
             )
         return (
             self.cluster_shape_mn[0],
             self.cluster_shape_mn[1],
-            max_active_clusters,
+            launch_cluster_count,
         )
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
@@ -373,6 +693,12 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             values.extend(extract_mlir_values(self.hidden))
         if self.load_balance_mode == "atomic_counter":
             values.extend(extract_mlir_values(self.load_balance_counter_ptr))
+            if (self.mixed_cga_config is not None
+                    and self.mixed_cga_config.is_mixed):
+                values.extend(
+                    extract_mlir_values(self.fallback_registration_counter_ptr))
+                values.extend(extract_mlir_values(
+                    self.fallback_group_token_ptr))
         if self.expert_token_sizes is not None:
             values.extend(extract_mlir_values(self.expert_token_sizes))
         else:
@@ -395,6 +721,17 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         result.token_padding_block = self.token_padding_block
         result.sf_padding_block = self.sf_padding_block
         result.load_balance_mode = self.load_balance_mode
+        result.schedule_policy = self.schedule_policy
+        result.schedule_mode = self.schedule_mode
+        result.work_id_mode = self.work_id_mode
+        result.mixed_cga_config = self.mixed_cga_config
+        result.uses_legacy_work_id_path = self.uses_legacy_work_id_path
+        result.launch_cluster_count = self.launch_cluster_count
+        result.fallback_cluster_shape_mn = self.fallback_cluster_shape_mn
+        result.preferred_cluster_count = self.preferred_cluster_count
+        result.fallback_cluster_count = self.fallback_cluster_count
+        result.interleave_fc2_slots = self.interleave_fc2_slots
+        result.interleave_cycle_length = self.interleave_cycle_length
 
         # Type-discriminated rebind: Python int fields copy from
         # prototype (``self``), Int32 fields consume from ``values``.
@@ -421,8 +758,26 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
             result.load_balance_counter_ptr = new_from_mlir_values(
                 self.load_balance_counter_ptr, values[idx:idx + ptr_len])
             idx += ptr_len
+            if (self.mixed_cga_config is not None
+                    and self.mixed_cga_config.is_mixed):
+                ptr_len = len(
+                    extract_mlir_values(self.fallback_registration_counter_ptr))
+                result.fallback_registration_counter_ptr = (
+                    new_from_mlir_values(self.fallback_registration_counter_ptr,
+                                         values[idx:idx + ptr_len]))
+                idx += ptr_len
+                ptr_len = len(extract_mlir_values(
+                    self.fallback_group_token_ptr))
+                result.fallback_group_token_ptr = new_from_mlir_values(
+                    self.fallback_group_token_ptr, values[idx:idx + ptr_len])
+                idx += ptr_len
+            else:
+                result.fallback_registration_counter_ptr = None
+                result.fallback_group_token_ptr = None
         else:
             result.load_balance_counter_ptr = None
+            result.fallback_registration_counter_ptr = None
+            result.fallback_group_token_ptr = None
         # Sizes / prefix_sum: prototype tells us which side carries the
         # actual tensor; the other side stays None on the result.
         if self.expert_token_sizes is not None:
@@ -477,6 +832,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         cluster_pipeline,
         producer_state,
         sched_storage=None,
+        work_id_worker: Optional[NonClcMixedCgaSchedulerWorker] = None,
+        phase_state: Optional[_PhaseInterleaveState] = None,
     ):
         # Per-expert token range data source lives on ``params``: either
         # ``params.expert_token_sizes`` (sizes-mode, e.g. zero-copy view of
@@ -490,6 +847,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         self.current_work = current_work
         self._fused_state = fused_state
         self._dynamic_state = dynamic_state
+        self._work_id_worker = work_id_worker
+        self._phase_state = phase_state
         self._num_fc1_intermediate_blocks = num_fc1_intermediate_blocks
         self._num_fc2_hidden_blocks = num_fc2_hidden_blocks
         self._ext = ext
@@ -565,6 +924,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         num_consumer_threads: int,
         ext=_DEFAULT_SCHED_EXT,
         *,
+        is_fallback_cluster: Optional[Boolean] = None,
         loc: Optional[ir.Location] = None,
         ip: Optional[ir.InsertionPoint] = None,
     ) -> "MoEFusedFc12PersistentTileScheduler":
@@ -714,7 +1074,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         # starts at 0; ``internal_init`` overwrites it with the first claimed
         # cluster-linear tile id.
         dynamic_state: Optional[_DynamicLoadBalanceState] = None
-        if const_expr(params.load_balance_mode == "atomic_counter"):
+        if const_expr(params.load_balance_mode == "atomic_counter"
+                      and params.uses_legacy_work_id_path):
             is_leader_cta = (cta_id_in_cluster[0] + cta_id_in_cluster[1] +
                              cta_id_in_cluster[2]) == Int32(0)
             cluster_producer_state = pipeline.make_pipeline_state(
@@ -728,6 +1089,65 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 producer_state=cluster_producer_state,
                 consumer_state=cluster_consumer_state,
                 atomic_res=Int32(0),
+            )
+
+        work_id_worker: Optional[NonClcMixedCgaSchedulerWorker] = None
+        if const_expr(not params.uses_legacy_work_id_path):
+            stream_count = 2 if params.schedule_mode == "phase_interleave" else 1
+            work_id_worker = NonClcMixedCgaSchedulerWorker(
+                config=params.mixed_cga_config,
+                work_id_mode=params.work_id_mode,
+                stream_count=stream_count,
+            )
+            internal_block_idx = block_idx
+            if const_expr(params.is_swap_ab):
+                internal_block_idx = (bidy, bidx, bidz)
+            broadcast_pointer = None
+            if const_expr(params.work_id_mode == "atomic_counter"):
+                broadcast_pointer = (
+                    sched_storage.cluster_broadcast_slot.data_ptr())
+            work_id_worker.assign_device_members(
+                is_fallback_cluster=is_fallback_cluster,
+                block_idx=internal_block_idx,
+                counter_pointer=params.load_balance_counter_ptr,
+                registration_counter_pointer=params.
+                fallback_registration_counter_ptr,
+                group_token_pointer=params.fallback_group_token_ptr,
+                broadcast_pointer=broadcast_pointer,
+                cluster_pipeline=None,
+            )
+
+        phase_state: Optional[_PhaseInterleaveState] = None
+        if const_expr(params.schedule_mode == "phase_interleave"):
+            fc1_cursor = _PhaseFc12CursorState(
+                expert_idx=Int32(-1),
+                expert_tile_start=Int32(0),
+                expert_tile_end=Int32(0),
+                current_expert_token_count=Int32(0),
+                current_token_block_count=Int32(0),
+                data_cumulative=Int32(0),
+                sf_cumulative=Int32(0),
+                token_block_cumulative=Int32(0),
+                blocks_per_token_block=num_fc1_intermediate_blocks,
+            )
+            fc2_cursor = _PhaseFc12CursorState(
+                expert_idx=Int32(-1),
+                expert_tile_start=Int32(0),
+                expert_tile_end=Int32(0),
+                current_expert_token_count=Int32(0),
+                current_token_block_count=Int32(0),
+                data_cumulative=Int32(0),
+                sf_cumulative=Int32(0),
+                token_block_cumulative=Int32(0),
+                blocks_per_token_block=num_fc2_hidden_blocks,
+            )
+            phase_state = _PhaseInterleaveState(
+                fc1_cursor=fc1_cursor,
+                fc2_cursor=fc2_cursor,
+                prologue_remaining=Int32(params.group_hint),
+                cycle_position=Int32(0),
+                fc1_exhausted=Boolean(False),
+                fc2_exhausted=Boolean(False),
             )
 
         return MoEFusedFc12PersistentTileScheduler(
@@ -746,6 +1166,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             cluster_pipeline=None,
             producer_state=producer_state,
             sched_storage=sched_storage,
+            work_id_worker=work_id_worker,
+            phase_state=phase_state,
         )
 
     # -------------------------------------------------------------------------
@@ -763,7 +1185,23 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         ip: Optional[ir.InsertionPoint] = None,
     ) -> None:
         """Claim/decode the first work tile during kernel prologue."""
-        if const_expr(self.params.load_balance_mode == "atomic_counter"):
+        if const_expr(not self.params.uses_legacy_work_id_path):
+            if const_expr(self.params.work_id_mode == "atomic_counter"):
+                cluster_size = self._work_id_worker.active_cluster_size
+                preferred_cluster_size = (self.params.cluster_shape_mn[0] *
+                                          self.params.cluster_shape_mn[1])
+                self._cluster_pipeline = make_runtime_init_pipeline_async(
+                    num_stages=1,
+                    static_consumer_group_size=32 * preferred_cluster_size,
+                    consumer_arrive_count=Int32(32 * cluster_size),
+                    barrier_storage=self._sched_storage.cluster_pipeline_mbar.
+                    data_ptr(),
+                    defer_sync=True,
+                )
+                self._work_id_worker.set_cluster_pipeline(
+                    self._cluster_pipeline)
+            self._first_advance_pending = False
+        elif const_expr(self.params.load_balance_mode == "atomic_counter"):
             cluster_size = (self.params.cluster_shape_mn[0] *
                             self.params.cluster_shape_mn[1])
 
@@ -822,7 +1260,20 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         # Codegen-time signal: gen_next_work's first trace site sees
         # this True and emits the first-tile-finalize path; second trace
         # site (while-body) sees False and emits the vanilla path.
-        self._first_advance_pending = True
+        if const_expr(self.params.uses_legacy_work_id_path):
+            self._first_advance_pending = True
+
+    @dsl_user_op
+    @cute.jit
+    def initialize_fallback_group(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        """Register one fallback cluster after the cluster init wait."""
+        if const_expr(not self.params.uses_legacy_work_id_path):
+            self._work_id_worker.initialize_fallback_group()
 
     # -------------------------------------------------------------------------
     # State-machine advance helpers (group → phase → expert)
@@ -1180,13 +1631,18 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             cluster_intermediate_or_hidden_block_idx = (
                 local_id - cluster_token_block_idx * num_fc2_hidden_blocks)
 
+        cta_id_in_cluster = self.cta_id_in_cluster
+        if const_expr(not params.uses_legacy_work_id_path):
+            cta_id_in_cluster = (
+                self._work_id_worker.cta_coord_in_preferred_cluster)
+
         # Cluster → CTA granularity (mirrors MoESchedulerBase._get_work_tile_for_linear_idx)
         cta_token_block_idx = (
             cluster_token_block_idx * params.cluster_shape_mn[0] +
-            self.cta_id_in_cluster[0])
+            cta_id_in_cluster[0])
         cta_intermediate_or_hidden_block_idx = (
             cluster_intermediate_or_hidden_block_idx *
-            params.cluster_shape_mn[1] + self.cta_id_in_cluster[1])
+            params.cluster_shape_mn[1] + cta_id_in_cluster[1])
 
         # valid_tokens_in_cta_tile: clip cta_tile_m tokens at the current expert
         # right boundary.
@@ -1326,6 +1782,305 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
     @dsl_user_op
     @cute.jit
+    def _advance_phase_cursor(
+        self,
+        cursor: _PhaseFc12CursorState,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> _PhaseFc12CursorState:
+        """Advance one phase-local cursor to its next expert."""
+        params = self.params
+        previous_token_count = cursor.current_expert_token_count
+        cursor.data_cumulative = cursor.data_cumulative + (
+            (previous_token_count + Int32(params.token_padding_block - 1)) //
+            Int32(params.token_padding_block)) * Int32(
+                params.token_padding_block)
+        cursor.sf_cumulative = cursor.sf_cumulative + (
+            (previous_token_count + Int32(params.sf_padding_block - 1)) //
+            Int32(params.sf_padding_block)) * Int32(params.sf_padding_block)
+        cursor.token_block_cumulative = (cursor.token_block_cumulative +
+                                         cursor.current_token_block_count)
+
+        cursor.expert_idx = cursor.expert_idx + Int32(1)
+        token_count = Int32(0)
+        if const_expr(params.expert_token_sizes is not None):
+            token_count = compute_expert_token_count_from_sizes(
+                params.expert_token_sizes,
+                cursor.expert_idx,
+                loc=loc,
+                ip=ip,
+            )
+        else:
+            _, token_count = compute_expert_token_range(
+                params.expert_token_prefix_sum,
+                cursor.expert_idx,
+                loc=loc,
+                ip=ip,
+            )
+        cursor.current_expert_token_count = token_count
+        cursor.current_token_block_count = (
+            token_count + Int32(params.cluster_tile_m - 1)) // Int32(
+                params.cluster_tile_m)
+        cursor.expert_tile_start = cursor.expert_tile_end
+        cursor.expert_tile_end = (
+            cursor.expert_tile_start +
+            cursor.current_token_block_count * cursor.blocks_per_token_block)
+        return cursor
+
+    @dsl_user_op
+    @cute.jit
+    def _seek_phase_cursor(
+        self,
+        linear_work_id: Int32,
+        cursor: _PhaseFc12CursorState,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> _PhaseFc12CursorState:
+        """Advance a phase cursor until it contains the selected ID."""
+        expert_tile_end = cursor.expert_tile_end
+        next_expert_idx = cursor.expert_idx + Int32(1)
+        while (linear_work_id >= expert_tile_end
+               and next_expert_idx < self.expert_cnt):
+            cursor = self._advance_phase_cursor(cursor, loc=loc, ip=ip)
+            expert_tile_end = cursor.expert_tile_end
+            next_expert_idx = cursor.expert_idx + Int32(1)
+        return cursor
+
+    @dsl_user_op
+    @cute.jit
+    def _decode_phase_work_id(
+        self,
+        linear_work_id: Int32,
+        phase: Int32,
+        cursor: _PhaseFc12CursorState,
+        cta_coord_in_preferred_cluster: cute.Coord,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> MoEWorkTileInfo:
+        """Decode one phase-local canonical ID into a CTA work tile."""
+        params = self.params
+        local_work_id = linear_work_id - cursor.expert_tile_start
+        cluster_token_block_idx = (local_work_id //
+                                   cursor.blocks_per_token_block)
+        cluster_output_block_idx = (
+            local_work_id -
+            cluster_token_block_idx * cursor.blocks_per_token_block)
+        cta_token_block_idx = (
+            cluster_token_block_idx * Int32(params.cluster_shape_mn[0]) +
+            cta_coord_in_preferred_cluster[0])
+        cta_output_block_idx = (
+            cluster_output_block_idx * Int32(params.cluster_shape_mn[1]) +
+            cta_coord_in_preferred_cluster[1])
+
+        cta_tile_m = params.cta_tile_shape_mnk[0]
+        token_start = cta_token_block_idx * Int32(cta_tile_m)
+        remaining_tokens = cutlass.max(
+            cursor.current_expert_token_count - token_start, Int32(0))
+        valid_tokens_in_cta_tile = cutlass.min(remaining_tokens,
+                                               Int32(cta_tile_m))
+        if const_expr(params.is_swap_ab):
+            return self._ext.WorkTileInfo(
+                expert_idx=cursor.expert_idx,
+                tile_m_idx=cta_output_block_idx,
+                tile_n_idx=cta_token_block_idx,
+                cumulative_data_physical_row=cursor.data_cumulative,
+                cumulative_sf_physical_row=cursor.sf_cumulative,
+                cumulative_token_block_count=cursor.token_block_cumulative,
+                valid_tokens_in_cta_tile=valid_tokens_in_cta_tile,
+                phase_and_peek=phase,
+            )
+
+        cluster_tile_m = params.cluster_shape_mn[0] * cta_tile_m
+        cluster_token_start = cluster_token_block_idx * Int32(cluster_tile_m)
+        remaining_cluster_tokens = cutlass.max(
+            cursor.current_expert_token_count - cluster_token_start, Int32(0))
+        valid_tokens_in_cluster_tile = cutlass.min(remaining_cluster_tokens,
+                                                   Int32(cluster_tile_m))
+        return self._ext.WorkTileInfo(
+            expert_idx=cursor.expert_idx,
+            tile_m_idx=cta_token_block_idx,
+            tile_n_idx=cta_output_block_idx,
+            cumulative_data_physical_row=cursor.data_cumulative,
+            cumulative_sf_physical_row=cursor.sf_cumulative,
+            cumulative_token_block_count=cursor.token_block_cumulative,
+            valid_tokens_in_cta_cluster_tile=(
+                (valid_tokens_in_cta_tile << Int32(16))
+                | valid_tokens_in_cluster_tile),
+            phase_and_peek=phase,
+            fc1_counter_index=cluster_token_block_idx,
+        )
+
+    @dsl_user_op
+    @cute.jit
+    def _map_phase_work_id(
+        self,
+        linear_work_id: Int32,
+        phase: Int32,
+        cta_coord_in_preferred_cluster: cute.Coord,
+        phase_state: _PhaseInterleaveState,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> Tuple[MoEWorkTileInfo, Boolean, _PhaseInterleaveState]:
+        """Map a phase-local ID and report whether its stream has work."""
+        if const_expr(self.params.is_swap_ab):
+            work_tile = self._ext.WorkTileInfo(
+                expert_idx=Int32(WorkTileState.DONE),
+                tile_m_idx=Int32(0),
+                tile_n_idx=Int32(0),
+                cumulative_data_physical_row=Int32(0),
+                cumulative_sf_physical_row=Int32(0),
+                cumulative_token_block_count=Int32(0),
+                valid_tokens_in_cta_tile=Int32(0),
+                phase_and_peek=Int32(BlockPhase.None_),
+            )
+        else:
+            work_tile = self._ext.WorkTileInfo(
+                expert_idx=Int32(WorkTileState.DONE),
+                tile_m_idx=Int32(0),
+                tile_n_idx=Int32(0),
+                cumulative_data_physical_row=Int32(0),
+                cumulative_sf_physical_row=Int32(0),
+                cumulative_token_block_count=Int32(0),
+                valid_tokens_in_cta_cluster_tile=Int32(0),
+                phase_and_peek=Int32(BlockPhase.None_),
+                fc1_counter_index=Int32(0),
+            )
+        stream_has_work = Boolean(False)
+        if phase == Int32(BlockPhase.Linear1):
+            fc1_cursor = self._seek_phase_cursor(linear_work_id,
+                                                 phase_state.fc1_cursor,
+                                                 loc=loc,
+                                                 ip=ip)
+            if linear_work_id < fc1_cursor.expert_tile_end:
+                work_tile = self._decode_phase_work_id(
+                    linear_work_id,
+                    phase,
+                    fc1_cursor,
+                    cta_coord_in_preferred_cluster,
+                    loc=loc,
+                    ip=ip)
+                stream_has_work = Boolean(True)
+            phase_state.fc1_cursor = fc1_cursor
+        else:
+            fc2_cursor = self._seek_phase_cursor(linear_work_id,
+                                                 phase_state.fc2_cursor,
+                                                 loc=loc,
+                                                 ip=ip)
+            if linear_work_id < fc2_cursor.expert_tile_end:
+                work_tile = self._decode_phase_work_id(
+                    linear_work_id,
+                    phase,
+                    fc2_cursor,
+                    cta_coord_in_preferred_cluster,
+                    loc=loc,
+                    ip=ip)
+                stream_has_work = Boolean(True)
+            phase_state.fc2_cursor = fc2_cursor
+        return work_tile, stream_has_work, phase_state
+
+    @dsl_user_op
+    @cute.jit
+    def _gen_phase_interleaved_work(
+        self,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        """Claim until one phase yields work or both streams terminate."""
+        if const_expr(self.params.is_swap_ab):
+            done_work = self._ext.WorkTileInfo(
+                expert_idx=Int32(WorkTileState.DONE),
+                tile_m_idx=Int32(0),
+                tile_n_idx=Int32(0),
+                cumulative_data_physical_row=Int32(0),
+                cumulative_sf_physical_row=Int32(0),
+                cumulative_token_block_count=Int32(0),
+                valid_tokens_in_cta_tile=Int32(0),
+                phase_and_peek=Int32(BlockPhase.None_),
+            )
+        else:
+            done_work = self._ext.WorkTileInfo(
+                expert_idx=Int32(WorkTileState.DONE),
+                tile_m_idx=Int32(0),
+                tile_n_idx=Int32(0),
+                cumulative_data_physical_row=Int32(0),
+                cumulative_sf_physical_row=Int32(0),
+                cumulative_token_block_count=Int32(0),
+                valid_tokens_in_cta_cluster_tile=Int32(0),
+                phase_and_peek=Int32(BlockPhase.None_),
+                fc1_counter_index=Int32(0),
+            )
+        work_id_worker = self._work_id_worker
+        phase_state = self._phase_state
+        prologue_remaining = phase_state.prologue_remaining
+        cycle_position = phase_state.cycle_position
+        fc1_exhausted = phase_state.fc1_exhausted
+        fc2_exhausted = phase_state.fc2_exhausted
+        resolved = Boolean(False)
+        selected_work = done_work
+
+        while not resolved:
+            if fc1_exhausted and fc2_exhausted:
+                resolved = Boolean(True)
+            else:
+                want_fc1 = Boolean(True)
+                if prologue_remaining <= Int32(0):
+                    is_fc2_slot = ((cycle_position *
+                                    Int32(self.params.interleave_fc2_slots)) %
+                                   Int32(self.params.interleave_cycle_length)
+                                   < Int32(self.params.interleave_fc2_slots))
+                    want_fc1 = not is_fc2_slot
+                if want_fc1 and fc1_exhausted:
+                    want_fc1 = Boolean(False)
+                if (not want_fc1) and fc2_exhausted:
+                    want_fc1 = Boolean(True)
+
+                stream_index = Int32(1)
+                if want_fc1:
+                    stream_index = Int32(0)
+                linear_work_id = work_id_worker.claim_next_work(stream_index)
+                want_fc1 = work_id_worker.claimed_stream_index == Int32(0)
+                phase = Int32(BlockPhase.Linear2)
+                if want_fc1:
+                    phase = Int32(BlockPhase.Linear1)
+                work_tile, stream_has_work, phase_state = (
+                    self._map_phase_work_id(
+                        linear_work_id,
+                        phase,
+                        work_id_worker.cta_coord_in_preferred_cluster,
+                        phase_state,
+                        loc=loc,
+                        ip=ip,
+                    ))
+                if stream_has_work:
+                    if prologue_remaining > Int32(0):
+                        prologue_remaining = prologue_remaining - Int32(1)
+                    else:
+                        cycle_position = (
+                            (cycle_position + Int32(1)) %
+                            Int32(self.params.interleave_cycle_length))
+                    selected_work = self._ext.enrich_work_tile_info(work_tile)
+                    resolved = Boolean(True)
+                else:
+                    if want_fc1:
+                        fc1_exhausted = Boolean(True)
+                    else:
+                        fc2_exhausted = Boolean(True)
+
+        phase_state.prologue_remaining = prologue_remaining
+        phase_state.cycle_position = cycle_position
+        phase_state.fc1_exhausted = fc1_exhausted
+        phase_state.fc2_exhausted = fc2_exhausted
+        self._work_id_worker = work_id_worker
+        self._phase_state = phase_state
+        self.current_work = selected_work
+
+    @dsl_user_op
+    @cute.jit
     def gen_next_work(
         self,
         *,
@@ -1362,23 +2117,38 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         # decode pipeline.  ``_advance_work_linear_tile_idx_dynamic`` itself
         # const_expr-forks on _first_advance_pending to consume the cached
         # atomic_res on its own first trace site.
-        if cutlass.const_expr(self._first_advance_pending
-                              and self.params.load_balance_mode == "static"):
-            pass
+        if const_expr(not self.params.uses_legacy_work_id_path):
+            if const_expr(self.params.schedule_mode == "phase_interleave"):
+                self._gen_phase_interleaved_work(loc=loc, ip=ip)
+            else:
+                cluster_linear_tile_idx = (
+                    self._work_id_worker.claim_next_work())
+                self._gen_work_from_cluster_idx(cluster_linear_tile_idx,
+                                                loc=loc,
+                                                ip=ip)
         else:
-            if const_expr(self.params.load_balance_mode == "atomic_counter"):
-                cluster_linear_tile_idx = (
-                    self._advance_work_linear_tile_idx_dynamic(loc=loc, ip=ip))
-            elif const_expr(self.params.load_balance_mode == "static"):
-                cluster_linear_tile_idx = (
-                    self._advance_work_linear_tile_idx_static(loc=loc, ip=ip))
-            else:  # "clc"
-                raise NotImplementedError(
-                    "load_balance_mode='clc' is reserved; CLC scheduler is "
-                    "MoEDynamicPersistentTileScheduler, not the mega scheduler")
-            self._gen_work_from_cluster_idx(cluster_linear_tile_idx,
-                                            loc=loc,
-                                            ip=ip)
+            if cutlass.const_expr(
+                    self._first_advance_pending
+                    and self.params.load_balance_mode == "static"):
+                pass
+            else:
+                if const_expr(
+                        self.params.load_balance_mode == "atomic_counter"):
+                    cluster_linear_tile_idx = (
+                        self._advance_work_linear_tile_idx_dynamic(loc=loc,
+                                                                   ip=ip))
+                elif const_expr(self.params.load_balance_mode == "static"):
+                    cluster_linear_tile_idx = (
+                        self._advance_work_linear_tile_idx_static(loc=loc,
+                                                                  ip=ip))
+                else:  # "clc"
+                    raise NotImplementedError(
+                        "load_balance_mode='clc' is reserved; CLC scheduler "
+                        "is MoEDynamicPersistentTileScheduler, not the mega "
+                        "scheduler")
+                self._gen_work_from_cluster_idx(cluster_linear_tile_idx,
+                                                loc=loc,
+                                                ip=ip)
 
         # Codegen-time flip after the first trace site so subsequent traces
         # (the while-body call) pick the vanilla path.  This Python
@@ -1397,7 +2167,12 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         values.extend(extract_mlir_values(self._fused_state))
         values.extend(extract_mlir_values(self._num_fc1_intermediate_blocks))
         values.extend(extract_mlir_values(self._num_fc2_hidden_blocks))
-        if self.params.load_balance_mode == "atomic_counter":
+        if not self.params.uses_legacy_work_id_path:
+            values.extend(extract_mlir_values(self._work_id_worker))
+            if self.params.schedule_mode == "phase_interleave":
+                values.extend(extract_mlir_values(self._phase_state))
+        if (self.params.uses_legacy_work_id_path
+                and self.params.load_balance_mode == "atomic_counter"):
             values.extend(extract_mlir_values(self._dynamic_state))
         values.extend(extract_mlir_values(self._producer_state))
         return values
@@ -1422,9 +2197,14 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         new_num_fc1_intermediate_blocks = _take(
             self._num_fc1_intermediate_blocks)
         new_num_fc2_hidden_blocks = _take(self._num_fc2_hidden_blocks)
-        new_dynamic_state = (_take(self._dynamic_state)
-                             if self.params.load_balance_mode
-                             == "atomic_counter" else None)
+        new_work_id_worker = (_take(self._work_id_worker)
+                              if not self.params.uses_legacy_work_id_path else
+                              None)
+        new_phase_state = (_take(self._phase_state) if self.params.schedule_mode
+                           == "phase_interleave" else None)
+        new_dynamic_state = (
+            _take(self._dynamic_state) if self.params.uses_legacy_work_id_path
+            and self.params.load_balance_mode == "atomic_counter" else None)
         new_producer_state = _take(self._producer_state)
 
         result = MoEFusedFc12PersistentTileScheduler.__new__(
@@ -1437,6 +2217,8 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         result._num_fc1_intermediate_blocks = new_num_fc1_intermediate_blocks
         result._num_fc2_hidden_blocks = new_num_fc2_hidden_blocks
         result._dynamic_state = new_dynamic_state
+        result._work_id_worker = new_work_id_worker
+        result._phase_state = new_phase_state
         result._ext = self._ext
         result._pipeline = self._pipeline
         result._smem_buf_tensor = self._smem_buf_tensor

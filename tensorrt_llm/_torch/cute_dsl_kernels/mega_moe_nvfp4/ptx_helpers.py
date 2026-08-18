@@ -365,6 +365,31 @@ def red_add_release_gpu_s32(
 
 
 @dsl_user_op
+def red_async_add_release_gpu_s32(
+    counter_ptr,
+    value,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Issue an asynchronous GPU-scope release reduction to GMEM."""
+    llvm.inline_asm(
+        None,
+        [
+            counter_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            value.ir_value(loc=loc, ip=ip),
+        ],
+        "red.async.release.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_async_add_release_sys_u32_raw(addr: Int64,
                                       val: Int32,
                                       *,
