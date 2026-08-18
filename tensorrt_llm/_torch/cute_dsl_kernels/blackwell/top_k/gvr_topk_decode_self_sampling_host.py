@@ -592,6 +592,144 @@ def route_split(b, n, npad, k):
     return plan
 
 
+def route_streaming(b, n, npad, k, force_main=False):
+    """route() restricted to its STREAMING half (main / clus) — the varlen
+    capture policy: per-row kernels must be picked from the families that are
+    correct for ANY row length, so the register-resident specialists are
+    skipped even when the envelope n would normally land on them.  Where
+    route() itself lands on main/clus this is IDENTICAL to route() (fuzz:
+    110,003/110,003 agreement).  force_main additionally skips the clus
+    rounding (v1 varlen engine ships the gvr_main port first; the raw
+    min(r1, r2) R then matches the CUDA else-branch exactly)."""
+    R = 1
+    if b <= 32:
+        r1 = max(148 // b, 1)
+        r2 = max(((n >> 2) + 1023) // 1024, 1)
+        R = max(min(r1, r2), 1)
+    elif b <= 74 and (n >> 2) >= 16384 and k <= 1024:
+        R = 2
+    useclus = False
+    if not force_main and 2 <= R <= 8 and k <= 1024:
+        p2 = 1
+        while (p2 << 1) <= R:
+            p2 <<= 1
+        if p2 == 8 and b > 15:
+            p2 = 4
+        R = p2
+        useclus = True
+    big = b * R <= 148
+    scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
+    cmp_ = (4096 if k > 1024 else 2048) if big else 1024
+    aim = (
+        ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
+        if big
+        else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
+    )
+    r_ = int(0.5 + math.sqrt(float(6 * n)))
+    if r_ > aim:
+        aim = r_
+    sfac = (32 if R == 2 else (48 if k > 1024 else 16)) if R > 1 else (64 if k >= 1024 else 32)
+    amin = 3 * k if R == 2 else (7 * k) // 2
+    if R > 1 and aim < amin:
+        aim = amin
+    if aim > (scap >> 1):
+        aim = scap >> 1
+    if aim < k:
+        aim = k
+    n4s = n >> 2
+    smp, ss2, tgt, tgt2 = 0, 1, 0, 0
+    small_dense = (k > 1024) and (not big) and n <= scap and n > 2 * k
+    if (n > scap or small_dense) and n4s >= 4:
+        sel = min(max(sfac * n // aim, 256), n // 2)
+        pairs = min(max(sel >> 3, 1), max(n4s >> 1, 1))
+        half = max(n4s >> 1, 1)
+        ss2 = max(half // pairs, 1)
+        smp = max(half // ss2, 1)
+        tgt = max((aim * (smp * 8)) // n, 1)
+        tgt2 = max((k * (smp * 8)) // n, 1)
+    q_ = (n4s + R - 1) // R
+    if useclus:
+        if n > scap and n4s >= 4:
+            sel = min(max(sfac * n // aim, 256), n // 2)
+            quads = min(max(sel >> 4, 1), max(n4s >> 2, 1))
+            quarter = max(n4s >> 2, 1)
+            ss2 = max(quarter // quads, 1)
+            smp = max(quarter // ss2, 1)
+            tgt = max((aim * (smp * 16)) // n, 1)
+            tgt2 = max((k * (smp * 16)) // n, 1)
+        smc = SNB * 8 + (scap + 4) * 8 + cmp_ * 8
+        per = q_ >> 10
+        u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
+        cs = 2 if R == 2 else (4 if R == 4 else 8)
+        return {
+            "kernel": "clus",
+            "tpl": (1024, u_, 1, SNB, cs),
+            "rt": {"n": n, "npad": npad, "k": k, "SCAP": scap, "CMP": cmp_,
+                   "SMP": smp, "TGT": tgt, "Q": q_, "SS2": ss2, "TGT2": tgt2},
+            "grid": (cs, b), "cluster": cs, "block": 1024, "smem": smc, "ws": False,
+        }
+    smem_main = (scap + 4) * (8 if (R > 1 or b <= 296) else 4) + (cmp_ + 1) * 8
+
+    def _main(blk_, minb_, u_, split_):
+        kpt = 1 if k <= blk_ else (2 if k <= 2 * blk_ else (4 if k <= 4 * blk_ else 8))
+        tshg = bool(split_) and b > 15 and k <= 1024 and (n >> 2) <= 32768
+        return {
+            "kernel": "main",
+            "tpl": (blk_, u_, minb_, SNB, kpt, split_, tshg),
+            "rt": {"n": n, "npad": npad, "k": k, "SCAP_": scap, "CMP_": cmp_, "R": R,
+                   "SMP": smp, "TGT": tgt, "Q": q_, "SS2": ss2, "TGT2": tgt2},
+            "grid": (R, b), "cluster": 1, "block": blk_, "smem": smem_main, "ws": True,
+        }
+
+    if big:
+        per = q_ >> 10
+        u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
+        return _main(1024, 1, u_, R > 1)
+    if b <= 296:
+        return _main(512, 2, 8, False)
+    return _main(256, 4, 8, False)
+
+
+_VARLEN_CACHE = {}
+
+
+def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
+    """Capture-time varlen plan + compiled launcher (v1 = the gvr_main port,
+    universally correct across the envelope; the clus port follows).  Every
+    choice here is a function of capture-stable quantities only — mirroring
+    the in-tree runner's pick_tuning(graph_capture=...) discipline."""
+    key = (num_rows, npad, k, n_env, next_n, cr)
+    hit = _VARLEN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    plan = route_streaming(num_rows, max(min(n_env, npad), k + 1), npad, k, force_main=True)
+    tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
+    rt = plan["rt"]
+    r_const = rt["R"]
+    cr_shift = 0 if cr == 1 else 2
+    dev = _device()
+    fn = dev.get_compiled(tpl + (next_n, cr_shift, r_const))
+    big = num_rows * r_const <= 148
+    aim_base = (
+        ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
+        if big
+        else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
+    )
+    sfac = (
+        (32 if r_const == 2 else (48 if k > 1024 else 16))
+        if r_const > 1
+        else (64 if k >= 1024 else 32)
+    )
+    amin = 3 * k if r_const == 2 else (7 * k) // 2
+    sd_en = 1 if (k > 1024 and not big) else 0
+    tsh_en = 1 if (tpl[5] and num_rows > 15 and k <= 1024) else 0
+    pre = (0, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
+    tail = (aim_base, sfac, amin, sd_en, tsh_en)
+    lc = (fn, pre, tail)
+    _VARLEN_CACHE[key] = lc
+    return lc
+
+
 def route_bands(b, npad, k, n_lo=None, n_hi=None):
     """Enumerate maximal n-intervals on which route_static is constant.
     Dense O(n_hi - n_lo) scan of the pure host dispatch — an offline /
@@ -784,6 +922,17 @@ module's __call__ signature):
 
 # shape key (b, n, npad, k) -> (fn, args tuple of python ints, needs_ws)
 _LAUNCH_CACHE = {}
+_DUMMY_KV = {}
+
+
+def _dummy_kv(dev_index, device):
+    """Cached 1-element int32 tensor per device — the dead kv_lens slot of
+    the extended gvr_main ABI in legacy (batch-uniform) mode."""
+    t = _DUMMY_KV.get(dev_index)
+    if t is None:
+        t = torch.zeros(1, dtype=_I32, device=device)
+        _DUMMY_KV[dev_index] = t
+    return t
 
 # hot-path local bindings (each torch.<attr> lookup costs ~0.1 us; the B1
 # battery runs on EVERY call — mirror of main.cpp's "sub-100ns predicted
@@ -813,9 +962,15 @@ def _build_launcher(b, n, npad, k):
         return (fn, args, False)
     if fam == "main":
         dev = _device()
-        fn = dev.get_compiled(tpl)
+        raw = dev.get_compiled(tpl)
         # compiled ABI: (logits, pre_idx, out, ws, n, npad, k, SCAP_, CMP_,
-        #                R, SMP, TGT, Q, SS2, TGT2)  [SCAP_/CMP_ dead, ABI parity]
+        #                R, SMP, TGT, Q, SS2, TGT2,
+        #                kv_lens, aim_base, sfac, amin, sd_en, tsh_en)
+        # [SCAP_/CMP_ dead, ABI parity; the trailing varlen block is dead in
+        #  legacy mode — a cached dummy kv_lens tensor + five zeros]
+        def fn(lg, pi, o, w, *a, _raw=raw):
+            _raw(lg, pi, o, w, *a, _dummy_kv(lg.get_device(), lg.device), 0, 0, 0, 0, 0)
+
         args = (
             rt["n"],
             rt["npad"],
@@ -997,8 +1152,18 @@ def run_ws(logits, pre_idx, n_valid, indices, workspace, values=None):
     _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values)
 
 
-def run_varlen(logits, pre_idx, kv_lens, indices, next_n=1, compress_ratio=1, values=None):
-    """Production-contract varlen entry — REFERENCE implementation.
+def run_varlen(
+    logits,
+    pre_idx,
+    kv_lens,
+    indices,
+    next_n=1,
+    compress_ratio=1,
+    values=None,
+    max_seq_len=None,
+    engine="auto",
+):
+    """Production-contract varlen entry (per-row device kv_lens).
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -1013,11 +1178,15 @@ def run_varlen(logits, pre_idx, kv_lens, indices, next_n=1, compress_ratio=1, va
       shared by a request's ``next_n`` rows (offset-free hint contract);
       per-row ``n_r <= k`` takes the short path (identity + ``-1`` tail).
 
-    REFERENCE ENGINE: one host read of ``kv_lens`` (a documented D2H sync —
-    raises under CUDA-graph capture), then each row is driven through the
-    batch-uniform engine as a b=1 launch. Correctness-first scaffolding: it
-    pins the varlen/MTP contract and its test battery; the per-row in-kernel
-    rewrite replaces the loop without changing either.
+    ENGINES: ``engine="auto"`` (default) launches the per-row IN-KERNEL
+    gvr_main varlen port — ONE launch for the whole batch; each CTA reads its
+    row's kv_len on device and re-derives the sampling ladder (route_dynamic
+    formula mirror), so with ``max_seq_len`` given (a capture-stable engine
+    constant, e.g. dsa.py's ``indexer_max_seq_len``) the call performs NO
+    host reads.  Without ``max_seq_len`` the envelope comes from ONE
+    ``kv_lens.max()`` host read (documented sync, refused under capture).
+    ``engine="reference"`` keeps the b=1 host-loop reference implementation —
+    the differential oracle the in-kernel engine is validated against.
     """
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")
@@ -1045,18 +1214,67 @@ def run_varlen(logits, pre_idx, kv_lens, indices, next_n=1, compress_ratio=1, va
         raise RuntimeError(
             f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
         )
-    if _is_capturing():
-        raise RuntimeError(
-            "run_varlen reference implementation reads kv_lens on host, "
-            "illegal under CUDA graph capture"
-        )
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
         raise RuntimeError(f"device index out of range: {d}")
     ws = _ws_hot.get(d)
     if ws is None:
         ws = default_workspace(logits)
-    kl = kv_lens.tolist()  # the ONE documented D2H sync of this entry
+
+    if engine == "auto":
+        # ---- per-row in-kernel engine (gvr_main varlen port) ----------------
+        npad = logits.shape[1]
+        k = pre_idx.shape[1]
+        cshift = 0 if cr == 1 else 2
+        if max_seq_len is not None:
+            n_env = int(max_seq_len) >> cshift
+        else:
+            if _is_capturing():
+                raise RuntimeError(
+                    "run_varlen without max_seq_len reads kv_lens.max() on "
+                    "host — pass max_seq_len (a capture-stable engine "
+                    "constant) under CUDA graph capture"
+                )
+            n_env = int(kv_lens.max().item()) >> cshift
+        n_env = min(max(n_env, 1), npad)
+        key = (num_rows, npad, k, n_env, nn, cr)
+        lc = _VARLEN_CACHE.get(key)
+        if lc is None:
+            if _is_capturing():
+                raise RuntimeError(
+                    "varlen launcher not compiled for this shape — warm up "
+                    "before CUDA graph capture"
+                )
+            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr)
+        fn, pre, tail = lc
+        if logits.dtype is not _F32 or pre_idx.dtype is not _I32 or indices.dtype is not _I32:
+            raise RuntimeError("logits must be float32; pre_idx/indices int32")
+        if not (logits.is_contiguous() and pre_idx.is_contiguous() and indices.is_contiguous()):
+            raise RuntimeError("tensors must be contiguous")
+        if npad & 3:
+            raise RuntimeError(f"npad (logits stride) must be a multiple of 4, got {npad}")
+        idx = indices
+        if idx.shape[1] != k:
+            idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
+        vals = values
+        if vals is not None and vals.shape[1] != k:
+            vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
+        fn(logits, pre_idx, idx, ws, *pre, kv_lens, *tail)
+        if vals is not None:
+            idx64 = idx.to(torch.int64)
+            vals.copy_(logits.gather(1, idx64.clamp_min(0)))
+            vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
+        return
+    if engine != "reference":
+        raise RuntimeError(f"engine must be 'auto' or 'reference', got {engine!r}")
+
+    # ---- reference engine (differential oracle): b=1 host loop --------------
+    if _is_capturing():
+        raise RuntimeError(
+            "run_varlen reference engine reads kv_lens on host, "
+            "illegal under CUDA graph capture"
+        )
+    kl = kv_lens.tolist()  # the ONE documented D2H sync of this engine
     for r in range(num_rows):
         actual = kl[r // nn] - nn + (r % nn) + 1
         if actual < 0:

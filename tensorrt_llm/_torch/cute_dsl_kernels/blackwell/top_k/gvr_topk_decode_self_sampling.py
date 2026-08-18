@@ -47,6 +47,7 @@ import sys
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.math as cmath
 from cutlass._mlir.dialects import arith as mlir_arith
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass._mlir.dialects import llvm as mlir_llvm
@@ -1332,7 +1333,8 @@ class GvrMainKernel:
     """CuTeDSL port of gvr_main<BLK, U, MINB, NBS, KPT, SPLIT> (kernel.cu L377)."""
 
     def __init__(
-        self, blk: int, u: int, minb: int, nbs: int, kpt: int, split: bool, tshg: bool = False
+        self, blk: int, u: int, minb: int, nbs: int, kpt: int, split: bool, tshg: bool = False,
+        varlen: bool = False, next_n: int = 1, cr_shift: int = 0, r_const: int = 1,
     ):
         assert nbs == 256, "SNB must stay 256 (kernel.cu L170-177, measured)"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1343,10 +1345,27 @@ class GvrMainKernel:
         self.nbs = nbs
         self.kpt = kpt
         self.split = bool(split)
+        # ---- per-row varlen mode (production heuristicTopKDecode contract) --
+        # n and the sampling-ladder scalars are re-derived PER ROW inside the
+        # kernel from a device kv_lens tensor (route_dynamic formula mirror);
+        # the scalar n/SMP/TGT/Q/SS2/TGT2 launch args become dead.  next_n /
+        # cr_shift (log2 compressRatio: 0 = DSv3.2, 2 = DSv4) / r_const (the
+        # frozen grid.x) are compile-time so their divisions strength-reduce.
+        self.varlen = bool(varlen)
+        self.next_n = int(next_n)
+        self.cr_shift = int(cr_shift)
+        self.r_const = int(r_const)
+        if self.varlen:
+            assert self.next_n >= 1 and self.cr_shift in (0, 2) and self.r_const >= 1
         # knife5 (layer 7): TSH-floor staging arm.  SPLIT-only compile-time
         # key; the CUDA form is a grid-uniform runtime gate over the same
-        # predicate (b > 15 && k <= 1024 && n4 <= 32768).
-        self.tshg = bool(tshg) and bool(split)
+        # predicate (b > 15 && k <= 1024 && n4 <= 32768).  varlen mode
+        # compiles the machinery in whenever SPLIT and gates it per row at
+        # runtime (tsh_en && n4 <= 32768) — mirroring the CUDA runtime gate.
+        if self.varlen:
+            self.tshg = bool(split)
+        else:
+            self.tshg = bool(tshg) and bool(split)
         # derived constexprs (kernel.cu L394-523)
         self.hb = nbs  # L394
         self.kbig = (kpt >= 2) and (kpt * blk >= 2048)  # L413
@@ -1454,6 +1473,12 @@ class GvrMainKernel:
         Q: cutlass.Int32,
         SS2: cutlass.Int32,
         TGT2: cutlass.Int32,
+        kv_lens: cute.Tensor,
+        aim_base: cutlass.Int32,
+        sfac: cutlass.Int32,
+        amin: cutlass.Int32,
+        sd_en: cutlass.Int32,
+        tsh_en: cutlass.Int32,
     ):
         BLK = self.blk
         U = self.u
@@ -1472,6 +1497,128 @@ class GvrMainKernel:
         if cutlass.const_expr(self.split):
             part = bx
         lane = tidx & cutlass.Int32(31)
+
+        # ================= per-row varlen prologue (varlen mode only) =========
+        # Production contract: row r serves request r // next_n with
+        # kv_len = kv_lens[r // next_n], n = (kv_len - next_n + r % next_n + 1)
+        # >> cr_shift.  The sampling-ladder scalars are then re-derived from
+        # this row's n by the EXACT route_dynamic() host formulas (the scalar
+        # launch args are dead in this mode).  n <= k rows have no runtime
+        # `return` in CuTe DSL: they run the body as a zero-work pass
+        # (n = 0, TGT = INT_MAX so no rung ever accepts) and the identity/pad
+        # emission happens in the epilogue at the end of the kernel.  Every
+        # value below is a pure function of `row`, so all R split CTAs of a
+        # row (and all threads) compute identical scalars — grid-uniform per
+        # row by construction.
+        short = cutlass.Int32(0)
+        n_row = cutlass.Int32(0)
+        tsh_run = cutlass.Int32(1)
+        if cutlass.const_expr(self.varlen):
+            req = row // cutlass.Int32(self.next_n)
+            rr = row % cutlass.Int32(self.next_n)
+            kvl = kv_lens[req]
+            nv = (kvl - cutlass.Int32(self.next_n) + rr + cutlass.Int32(1)) >> cutlass.Int32(
+                self.cr_shift
+            )
+            if nv < cutlass.Int32(0):
+                nv = cutlass.Int32(0)
+            if nv > npad:
+                nv = npad
+            n_row = nv
+            if nv <= k:
+                short = cutlass.Int32(1)
+                n = cutlass.Int32(0)
+                SMP = cutlass.Int32(0)
+                SS2 = cutlass.Int32(1)
+                TGT = cutlass.Int32(0x7FFFFFFF)
+                TGT2 = cutlass.Int32(0x7FFFFFFF)
+                Q = cutlass.Int32(0)
+            if short == cutlass.Int32(0):
+                n = nv
+                # ---- aim ladder (route_dynamic mirror) ----
+                # r6 = int(0.5 + sqrt(6n)) computed EXACTLY in integers: f32
+                # sqrt seed, fixup to isqrt, then round-half-up via the
+                # (x - r*r > r) test (bit-parity with the host double form,
+                # fuzz-proven over the whole n domain).
+                x6 = cutlass.Int32(6) * n
+                ri = cutlass.Int32(cmath.sqrt(cutlass.Float32(x6)))
+                while ri * ri > x6:
+                    ri = ri - cutlass.Int32(1)
+                while (ri + cutlass.Int32(1)) * (ri + cutlass.Int32(1)) <= x6:
+                    ri = ri + cutlass.Int32(1)
+                r6 = ri
+                if x6 - ri * ri > ri:
+                    r6 = ri + cutlass.Int32(1)
+                aim = aim_base
+                if r6 > aim:
+                    aim = r6
+                if cutlass.const_expr(self.r_const > 1):
+                    if aim < amin:
+                        aim = amin
+                scap_c = cutlass.Int32(SCPB)  # SCAP == SCPB for gvr_main (proven identity)
+                if aim > (scap_c >> cutlass.Int32(1)):
+                    aim = scap_c >> cutlass.Int32(1)
+                if aim < k:
+                    aim = k
+                n4v = n >> cutlass.Int32(2)
+                SMP = cutlass.Int32(0)
+                SS2 = cutlass.Int32(1)
+                TGT = cutlass.Int32(0)
+                TGT2 = cutlass.Int32(0)
+                # pair-sample gate: (n > SCAP or small_dense) and n4 >= 4;
+                # small_dense = k > 1024 and not big and n <= SCAP and n > 2k
+                # (k/big folded into the launch-constant sd_en flag).
+                gate = cutlass.Int32(0)
+                if n > scap_c:
+                    gate = cutlass.Int32(1)
+                if sd_en != cutlass.Int32(0):
+                    if n <= scap_c:
+                        if n > (k << cutlass.Int32(1)):
+                            gate = cutlass.Int32(1)
+                if n4v < cutlass.Int32(4):
+                    gate = cutlass.Int32(0)
+                if gate != cutlass.Int32(0):
+                    sel = sfac * n // aim
+                    if sel < cutlass.Int32(256):
+                        sel = cutlass.Int32(256)
+                    nh = n >> cutlass.Int32(1)
+                    if sel > nh:
+                        sel = nh
+                    pairs = sel >> cutlass.Int32(3)
+                    if pairs < cutlass.Int32(1):
+                        pairs = cutlass.Int32(1)
+                    half = n4v >> cutlass.Int32(1)
+                    if half < cutlass.Int32(1):
+                        half = cutlass.Int32(1)
+                    if pairs > half:
+                        pairs = half
+                    SS2 = half // pairs
+                    if SS2 < cutlass.Int32(1):
+                        SS2 = cutlass.Int32(1)
+                    SMP = half // SS2
+                    if SMP < cutlass.Int32(1):
+                        SMP = cutlass.Int32(1)
+                    # TGT/TGT2 are 64-bit products in the CUDA host (aim*SMP*8
+                    # overflows i32 at large n) — mirror with Int64.
+                    smp8 = cutlass.Int64(SMP) * cutlass.Int64(8)
+                    tgt64 = cutlass.Int64(aim) * smp8 // cutlass.Int64(n)
+                    TGT = cutlass.Int32(tgt64)
+                    if TGT < cutlass.Int32(1):
+                        TGT = cutlass.Int32(1)
+                    tgt264 = cutlass.Int64(k) * smp8 // cutlass.Int64(n)
+                    TGT2 = cutlass.Int32(tgt264)
+                    if TGT2 < cutlass.Int32(1):
+                        TGT2 = cutlass.Int32(1)
+                if cutlass.const_expr(self.split):
+                    Q = (n4v + cutlass.Int32(self.r_const - 1)) // cutlass.Int32(self.r_const)
+                else:
+                    Q = cutlass.Int32(0)
+            # per-row TSH-floor runtime gate (CUDA parity: b>15 && k<=1024 in
+            # tsh_en, n4 <= 32768 per row)
+            tsh_run = cutlass.Int32(0)
+            if tsh_en != cutlass.Int32(0):
+                if (n >> cutlass.Int32(2)) <= cutlass.Int32(32768):
+                    tsh_run = cutlass.Int32(1)
 
         # ---- shared memory (one blob, compile-time offsets; spec §5.1 map) ----
         smem = SmemAllocator()
@@ -1559,7 +1706,13 @@ class GvrMainKernel:
         # _pin_i64: keep the row base a REGISTER across the attempt/tile scf
         # regions (NVVM otherwise re-derives ld.param+%ctaid.y+mul per region)
         x_addr = _pin_i64(logits.iterator.toint() + row64 * cutlass.Int64(npad) * cutlass.Int64(4))
-        p_addr = pre_idx.iterator.toint() + row64 * cutlass.Int64(k) * cutlass.Int64(4)
+        # varlen: pre_idx is REQUEST-level [num_rows/next_n, k] — a request's
+        # next_n rows share one hint row (production contract); legacy mode
+        # keeps the per-row mapping (next_n == 1 makes them identical).
+        prow64 = row64
+        if cutlass.const_expr(self.varlen):
+            prow64 = cutlass.Int64(row // cutlass.Int32(self.next_n))
+        p_addr = pre_idx.iterator.toint() + prow64 * cutlass.Int64(k) * cutlass.Int64(4)
         out_row = out[row, None]
         ws_addr = ws.iterator.toint()
         gdon_addr = ws_addr  # L386-388 slab views
@@ -1802,9 +1955,12 @@ class GvrMainKernel:
             # count(>=TSH) >= k.  TSH miss falls to GMIN/degen unchanged.
             cute.arch.barrier()
             t5s = s_tsh[0]
-            if t5s > cutlass.Float32(_NEG_INF):
-                if t5s < T:
-                    T = t5s
+            # varlen: per-row runtime gate (tsh_run == 1 always in legacy
+            # mode, so legacy codegen semantics are unchanged)
+            if tsh_run != cutlass.Int32(0):
+                if t5s > cutlass.Float32(_NEG_INF):
+                    if t5s < T:
+                        T = t5s
 
         # ============ attempt loop (L729-1019) — MUST NOT unroll ============
         listN = cutlass.Int32(0)
@@ -2676,6 +2832,23 @@ class GvrMainKernel:
                         )
                         it = it + cutlass.Int32(1)
 
+        # ---- varlen short-row epilogue (production heuristicTopKDecode
+        # L72-84 convention): every valid position is in the top-K — emit
+        # identity indices and pad the tail with -1.  The body above ran as
+        # a zero-work pass for these rows (n = 0, TGT = INT_MAX) so nothing
+        # was written; only part 0 of a SPLIT row emits.
+        if cutlass.const_expr(self.varlen):
+            if short != cutlass.Int32(0):
+                if part == cutlass.Int32(0):
+                    i = tidx
+                    while i < n_row:
+                        out_row[i] = i
+                        i = i + cutlass.Int32(BLK)
+                    j = n_row + tidx
+                    while j < k:
+                        out_row[j] = cutlass.Int32(-1)
+                        j = j + cutlass.Int32(BLK)
+
     # ------------------------------------------------------------------
     # host launcher (grid dim3(R, b) L2750; MINB wall via min_blocks_per_mp)
     # ------------------------------------------------------------------
@@ -2697,11 +2870,18 @@ class GvrMainKernel:
         Q: cutlass.Int32,
         SS2: cutlass.Int32,
         TGT2: cutlass.Int32,
+        kv_lens: cute.Tensor,
+        aim_base: cutlass.Int32,
+        sfac: cutlass.Int32,
+        amin: cutlass.Int32,
+        sd_en: cutlass.Int32,
+        tsh_en: cutlass.Int32,
         stream,
     ):
         b = logits.shape[0]
         self.kern(
-            logits, pre_idx, out, ws, n, npad, k, scap_dead, cmp_dead, R, SMP, TGT, Q, SS2, TGT2
+            logits, pre_idx, out, ws, n, npad, k, scap_dead, cmp_dead, R, SMP, TGT, Q, SS2, TGT2,
+            kv_lens, aim_base, sfac, amin, sd_en, tsh_en,
         ).launch(grid=(R, b, 1), block=(self.blk, 1, 1), stream=stream, min_blocks_per_mp=self.minb)
 
 
@@ -2713,17 +2893,28 @@ _COMPILE_CACHE = {}
 
 def get_compiled(tpl, options_extra: str = ""):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
-    tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)."""
+    tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
+    tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
+    — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
+    machinery in whenever SPLIT and gates it per row at runtime)."""
     key = (tuple(tpl), options_extra)
     hit = _COMPILE_CACHE.get(key)
     if hit is not None:
         return hit
-    blk, u, minb, nbs, kpt, split, tshg = tpl
-    kern = GvrMainKernel(blk, u, minb, nbs, kpt, bool(split), bool(tshg))
+    if len(tpl) == 7:
+        blk, u, minb, nbs, kpt, split, tshg = tpl
+        kern = GvrMainKernel(blk, u, minb, nbs, kpt, bool(split), bool(tshg))
+    else:
+        blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
+        kern = GvrMainKernel(
+            blk, u, minb, nbs, kpt, bool(split), bool(tshg),
+            varlen=True, next_n=next_n, cr_shift=cr_shift, r_const=r_const,
+        )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
     r2, c2 = cute.sym_int(), cute.sym_int()
     w0 = cute.sym_int()
+    v0 = cute.sym_int()
     logits_fake = _crt.make_fake_compact_tensor(
         cutlass.Float32, (r0, c0), stride_order=(1, 0), assumed_align=16
     )
@@ -2736,6 +2927,9 @@ def get_compiled(tpl, options_extra: str = ""):
     ws_fake = _crt.make_fake_compact_tensor(
         cutlass.Int32, (w0,), stride_order=(0,), assumed_align=16
     )
+    kv_fake = _crt.make_fake_compact_tensor(
+        cutlass.Int32, (v0,), stride_order=(0,), assumed_align=4
+    )
     fake_stream = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
     compiled = cute.compile(
         kern,
@@ -2744,6 +2938,8 @@ def get_compiled(tpl, options_extra: str = ""):
         out_fake,
         ws_fake,
         *([cutlass.Int32(0)] * 11),
+        kv_fake,
+        *([cutlass.Int32(0)] * 5),
         stream=fake_stream,
         options=("--enable-tvm-ffi " + options_extra).strip(),
     )
@@ -2787,6 +2983,12 @@ def run(logits, pre_idx, n: int, out, ws):
         rt["Q"],
         rt["SS2"],
         rt["TGT2"],
+        pre_idx.new_zeros(1),  # dummy kv_lens (dead in legacy mode)
+        0,
+        0,
+        0,
+        0,
+        0,
     )
     return r
 

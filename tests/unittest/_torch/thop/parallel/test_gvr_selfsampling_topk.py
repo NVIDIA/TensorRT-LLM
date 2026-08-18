@@ -215,7 +215,7 @@ def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
-def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
+def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="auto"):
     """Build a per-row-poisoned varlen batch, run run_varlen, verify every
     row against its own n_r (production formula) — short rows included."""
     batch, rows = len(kv), len(kv) * next_n
@@ -234,7 +234,10 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
         torch.full((rows, top_k), 7.0, dtype=torch.float32, device=_DEV) if with_values else None
     )
     kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
-    ss_host.run_varlen(logits, pre_idx, kv_lens, indices, next_n=next_n, compress_ratio=cr, values=values)
+    ss_host.run_varlen(
+        logits, pre_idx, kv_lens, indices,
+        next_n=next_n, compress_ratio=cr, values=values, engine=engine,
+    )
     torch.cuda.synchronize()
     fmin = torch.finfo(torch.float32).min
     for r in range(rows):
@@ -257,6 +260,7 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
                 assert torch.equal(values[r], torch.gather(logits[r], 0, idx))
 
 
+@pytest.mark.parametrize("engine", ["auto", "reference"])
 @pytest.mark.parametrize(
     "kv,next_n,cr,top_k",
     [
@@ -267,10 +271,50 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
     ],
     ids=["cr1_hetero_short", "cr4_hetero_short", "cr1_mtp2", "cr4_mtp4"],
 )
-def test_selfsampling_topk_varlen(kv, next_n, cr, top_k):
+def test_selfsampling_topk_varlen(kv, next_n, cr, top_k, engine):
     """run_varlen production contract: per-row n from device kv_lens with the
-    MTP window formula, request-level hints, per-row short path."""
-    _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr)
+    MTP window formula, request-level hints, per-row short path — on BOTH the
+    per-row in-kernel engine ("auto") and the b=1 reference loop."""
+    _run_varlen_case(kv, next_n, cr, top_k, seed=sum(kv) + next_n + cr, engine=engine)
+
+
+def test_selfsampling_topk_varlen_engine_matches_reference():
+    """Differential: the in-kernel engine's per-row value multisets must
+    equal the reference loop's on a mixed batch (deep SPLIT rows, tsh band,
+    short rows, compressed space)."""
+    kv = [524288, 131075, 32800, 2000, 65540, 8192, 262144, 900]
+    top_k, next_n, cr = 1024, 1, 4
+    rows = len(kv)
+    n_r = [(v - 1 + 1) // cr for v in kv]
+    npad = (max(n_r) + 63) // 64 * 64
+    gen = torch.Generator(device=_DEV).manual_seed(77)
+    logits = torch.randn((rows, npad), generator=gen, dtype=torch.float32, device=_DEV) - 2.0
+    for r in range(rows):
+        logits[r, n_r[r] :] = 3e38
+    pre_idx = torch.empty((rows, top_k), dtype=torch.int32, device=_DEV)
+    for q in range(rows):
+        pre_idx[q] = torch.randint(
+            0, max(n_r[q], 1), (top_k,), generator=gen, dtype=torch.int32, device=_DEV
+        )
+    kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    out_a = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    out_r = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, pre_idx, kv_lens, out_a, compress_ratio=cr)
+    ss_host.run_varlen(logits, pre_idx, kv_lens, out_r, compress_ratio=cr, engine="reference")
+    torch.cuda.synchronize()
+    for r in range(rows):
+        if n_r[r] <= top_k:
+            assert torch.equal(out_a[r], out_r[r]) or torch.equal(
+                torch.sort(out_a[r]).values, torch.sort(out_r[r]).values
+            )
+        else:
+            ga = torch.sort(
+                torch.gather(logits[r], 0, out_a[r].to(torch.int64)) + 0.0, descending=True
+            ).values
+            gr = torch.sort(
+                torch.gather(logits[r], 0, out_r[r].to(torch.int64)) + 0.0, descending=True
+            ).values
+            assert torch.equal(ga, gr), f"row {r}: engine != reference"
 
 
 def test_selfsampling_topk_varlen_values():
