@@ -1290,7 +1290,8 @@ class ModelConfig(Generic[TConfig]):
             # the next line and `sparse_attention_config` is not on
             # `__setattr__`'s allow-list; this is the same seam DeepSeek-V4 uses
             # to derive its own config from the checkpoint.
-            from .attention_backend.sparse.inkling import InklingSparseAttentionConfig
+            from .attention_backend.sparse.inkling import \
+                InklingSparseAttentionConfig
             kwargs['sparse_attention_config'] = InklingSparseAttentionConfig()
 
         model_config = cls(pretrained_config=pretrained_config,

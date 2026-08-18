@@ -649,10 +649,8 @@ def test_the_decode_fast_path_is_guarded_by_metadata_type():
     """
     import inspect
 
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingAttentionMetadata
     from tensorrt_llm._torch.attention_backend.sparse.inkling import backend as be
-    from tensorrt_llm._torch.attention_backend.sparse.inkling import (
-        InklingAttentionMetadata,
-    )
 
     src = inspect.getsource(be.InklingTritonAttention._run_generation)
     assert "isinstance(attn_metadata, InklingAttentionMetadata)" in src
@@ -734,8 +732,10 @@ def test_backend_and_cache_manager_both_resolve_from_the_sparse_registry():
     params = InklingSparseParams()
     assert get_trtllm_sparse_attn_attention_backend(params) is InklingTritonAttention
     assert InklingTritonAttention.Metadata is InklingAttentionMetadata
-    assert (get_sparse_attn_kv_cache_manager(InklingSparseAttentionConfig())
-            is InklingHybridCacheManager)
+    assert (
+        get_sparse_attn_kv_cache_manager(InklingSparseAttentionConfig())
+        is InklingHybridCacheManager
+    )
 
 
 def test_the_family_selector_has_no_model_specific_branch():
@@ -804,9 +804,7 @@ def test_the_fake_config_implements_the_whole_interface():
     Asserting the subclass relation rather than enumerating method names is the
     point: an enumeration would go stale exactly the way the imitation did.
     """
-    from tensorrt_llm._torch.attention_backend.sparse.inkling import (
-        InklingSparseAttentionConfig,
-    )
+    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingSparseAttentionConfig
     from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig
 
     assert issubclass(InklingSparseAttentionConfig, BaseSparseAttentionConfig)
@@ -943,13 +941,16 @@ def test_inkling_selects_the_hybrid_cache_manager():
     from tensorrt_llm._torch.pyexecutor._util import _non_hybrid_kv_cache_manager_cls
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
-    assert (get_sparse_attn_kv_cache_manager(InklingSparseAttentionConfig())
-            is InklingHybridCacheManager)
+    assert (
+        get_sparse_attn_kv_cache_manager(InklingSparseAttentionConfig())
+        is InklingHybridCacheManager
+    )
 
     # The sparse branch runs before the non-hybrid helper is ever consulted.
     outer = inspect.getsource(_util.get_kv_cache_manager_cls)
     assert outer.index("get_sparse_attn_kv_cache_manager") < outer.index(
-        "_non_hybrid_kv_cache_manager_cls")
+        "_non_hybrid_kv_cache_manager_cls"
+    )
 
     # V2 backstop survives: is_inkling still forces V2 even though the manager
     # itself now comes from the registry.

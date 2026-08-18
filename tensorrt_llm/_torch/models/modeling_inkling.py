@@ -547,9 +547,7 @@ class InklingAttention(QKNormRoPEAttention):
             k,
             v,
             attn_metadata,
-            forward_args=inkling_forward_args(
-                rel_logits, allow_mixed=conv_rt is not None
-            ),
+            forward_args=inkling_forward_args(rel_logits, allow_mixed=conv_rt is not None),
         )
         attn_out = attn_out.reshape(num_tokens, self.q_size)
         return self.o_proj(attn_out)

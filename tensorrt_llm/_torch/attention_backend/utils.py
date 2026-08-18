@@ -7,11 +7,9 @@ from tensorrt_llm.logger import logger
 from ...models.modeling_utils import QuantConfig
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from .interface import AttentionBackend, MLAParams, PositionalEmbeddingParams
-from .sparse import (
-    get_flashinfer_sparse_attn_attention_backend,
-    get_trtllm_sparse_attn_attention_backend,
-    get_vanilla_sparse_attn_attention_backend,
-)
+from .sparse import (get_flashinfer_sparse_attn_attention_backend,
+                     get_trtllm_sparse_attn_attention_backend,
+                     get_vanilla_sparse_attn_attention_backend)
 from .sparse.params import SparseParams
 from .trtllm import TrtllmAttention
 from .vanilla import VanillaAttention

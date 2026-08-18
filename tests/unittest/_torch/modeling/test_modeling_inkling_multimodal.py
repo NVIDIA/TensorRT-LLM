@@ -349,7 +349,7 @@ def test_serving_and_profiler_interface_contract():
     demand = proc.get_mm_max_tokens_per_item()
     # Empty demand -> the profiler's ``total_demand <= 0`` guard returns early.
     assert isinstance(demand, dict) and sum(demand.values()) == 0
-    assert callable(getattr(proc, "get_dummy_mm_data_for_tokens", None))
+    assert callable(getattr(proc, "get_dummy_mm_data", None))
 
 
 def test_text_only_passthrough():

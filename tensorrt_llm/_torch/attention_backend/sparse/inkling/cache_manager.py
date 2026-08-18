@@ -229,9 +229,7 @@ class InklingHybridCacheManager(KVCacheManagerV2):
 
         # Non-request rows as zero-capacity requests, like Mamba: no attention
         # pages, one state slot each -- exactly their effect on the pool.
-        dummies = [
-            KVCacheDesc(capacity=0, history_length=0) for _ in range(geo.num_reserved_slots)
-        ]
+        dummies = [KVCacheDesc(capacity=0, history_length=0) for _ in range(geo.num_reserved_slots)]
         constraints = [
             replace(batch, kv_caches=[*batch.kv_caches, *dummies]) for batch in config.constraints
         ]
@@ -250,9 +248,7 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         # KVCacheManagerConfig hard-asserts this whenever an SSM layer exists.
         # Harmless here -- Inkling refuses block reuse, so nothing ever commits
         # -- but the invariant is still required (as Mamba's manager does).
-        return replace(
-            config, layers=layers, constraints=constraints, commit_min_snapshot=True
-        )
+        return replace(config, layers=layers, constraints=constraints, commit_min_snapshot=True)
 
     def _get_pool_roles(self, pool_id: int):
         """Name a role that actually exists in ``pool_id``.
