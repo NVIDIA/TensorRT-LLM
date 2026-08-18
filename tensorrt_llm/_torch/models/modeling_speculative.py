@@ -995,7 +995,8 @@ class DFlashForCausalLM(nn.Module):
                     pretrained_config.vocab_size))
 
         self.target_layer_ids = dflash_config.get('target_layer_ids', None)
-        self.block_size = getattr(pretrained_config, 'block_size', None)
+        self.block_size = dflash_config.get(
+            'block_size', getattr(pretrained_config, 'block_size', None))
         self.dflash_attention_backend = dflash_attention_backend
         if self.dflash_attention_backend == 'VANILLA':
             self._dflash_flash_attention = get_dflash_flash_attention()
