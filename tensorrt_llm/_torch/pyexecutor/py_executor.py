@@ -4252,9 +4252,8 @@ class PyExecutor:
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
-                if not self._is_kv_manager_v2:
-                    self._terminate_requests(scheduled_batch.paused_requests)
-                    self._pause_requests(scheduled_batch.paused_requests)
+                self._terminate_requests(scheduled_batch.paused_requests)
+                self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
                 sample_state = None
@@ -4801,8 +4800,7 @@ class PyExecutor:
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
-                if not self._is_kv_manager_v2:
-                    self._terminate_requests(scheduled_batch.paused_requests)
+                self._terminate_requests(scheduled_batch.paused_requests)
 
                 gpu_forward_events_from_perf_pool = False
                 can_queue, can_queue_this_rank = self._can_queue(
@@ -4963,8 +4961,7 @@ class PyExecutor:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                if not self._is_kv_manager_v2:
-                    self._pause_requests(scheduled_batch.paused_requests)
+                self._pause_requests(scheduled_batch.paused_requests)
 
                 if can_queue:
                     guided_decoder_failed_requests = None

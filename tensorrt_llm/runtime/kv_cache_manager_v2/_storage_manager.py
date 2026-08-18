@@ -490,7 +490,6 @@ class StorageManager:
                 )
                 fallen_held_cnt = len(held_pages[pg_idx])
                 if fallen_held_cnt > old_free_cnt + evictable_cnt:
-                    # Do we need to revert the eviction we did before? Maybe not.
                     raise OutOfPagesError(
                         "Too many held pages are being evicted to the last-level cache for group {pg_idx}"
                     )
@@ -530,6 +529,7 @@ class StorageManager:
                 fallen_pages[pg_idx].clear()
         else:
             assert all(len(g) == 0 for g in held_pages)
+            evicted_at_this_level = [list(pages) for pages in evicted]
             for pg_idx in typed_range(self.num_pool_groups):
                 old_free_cnt = storage.get_num_free_slots(pg_idx)
                 e = evicted[pg_idx]
@@ -543,13 +543,26 @@ class StorageManager:
                 if num_accepted > 0:
                     accepted_pages[pg_idx] = fallen_pages[pg_idx][-num_accepted:]
                     del fallen_pages[pg_idx][-num_accepted:]
-            self._prepare_free_slots(
-                goals,
-                CacheLevel(lvl_id + 1),
-                fallen_pages,
-                migration_recorder,
-                drop_recorder,
-            )
+            next_level_prepared = False
+            try:
+                self._prepare_free_slots(
+                    goals,
+                    CacheLevel(lvl_id + 1),
+                    fallen_pages,
+                    migration_recorder,
+                    drop_recorder,
+                )
+                next_level_prepared = True
+            finally:
+                if not next_level_prepared:
+                    # Restore pages removed from this level's eviction
+                    # controller that have not already migrated before
+                    # propagating the allocation failure.
+                    for pages in evicted_at_this_level:
+                        for page in reversed(pages):
+                            if page.cache_level == lvl_id and not page.scheduled_for_eviction:
+                                assert self.is_evictable(page)
+                                ctrl.schedule_for_eviction(page, evict_first=True)
         assert all(len(f) == 0 for f in fallen_pages)
         # migrate pages
         for pg_idx in typed_range(self.num_pool_groups):

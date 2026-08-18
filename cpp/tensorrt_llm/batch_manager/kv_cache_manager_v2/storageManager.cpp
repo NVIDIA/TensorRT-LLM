@@ -547,6 +547,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             std::all_of(heldPages.begin(), heldPages.end(), [](auto const& hp) { return hp.empty(); }),
             "held_pages must be empty at non-last level");
 
+        auto const evictedAtThisLevel = evicted;
         CacheLevel nextLvl = lvlId + 1;
         for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
         {
@@ -566,7 +567,30 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
                 fp.erase(fp.end() - static_cast<std::ptrdiff_t>(numAccepted), fp.end());
             }
         }
-        _prepareFreeSlots(goals, nextLvl, fallenPages, migrationRecorder, dropRecorder);
+        try
+        {
+            _prepareFreeSlots(goals, nextLvl, fallenPages, migrationRecorder, dropRecorder);
+        }
+        catch (...)
+        {
+            // Restore every page that was removed from this level's eviction
+            // controller and has not already migrated before propagating the
+            // allocation failure.
+            for (PoolGroupIndex pgIdx{0}; pgIdx < evictedAtThisLevel.size(); ++pgIdx)
+            {
+                auto const& pages = evictedAtThisLevel.at(pgIdx);
+                for (auto it = pages.rbegin(); it != pages.rend(); ++it)
+                {
+                    auto const& page = *it;
+                    if (page->cacheLevel == lvlId && !page->scheduledForEviction())
+                    {
+                        TLLM_CHECK_DEBUG(isEvictable(*page));
+                        ctrl.scheduleForEviction(*page, /*evictFirst=*/true);
+                    }
+                }
+            }
+            throw;
+        }
     }
 
     // A13: all fallen pages must have been consumed.

@@ -17,7 +17,7 @@ import time
 import types
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 import torch
@@ -2803,11 +2803,15 @@ class TestPendingTransferResponseFlush:
         # Once for the retry pass and once for the following clean exit.
         assert executor._flush_pending_transfer_responses.call_count == 2
 
-    def test_idle_pass_has_one_flush(self, monkeypatch):
-        """An idle pass must not pay an additional response gather."""
+    @pytest.mark.parametrize("is_kv_manager_v2", [False, True])
+    def test_idle_pass_processes_hard_pause_and_has_one_flush(self, monkeypatch, is_kv_manager_v2):
+        """Both cache-manager generations use the executor pause lifecycle."""
         executor = self._make_executor_loop_stub()
+        executor._is_kv_manager_v2 = is_kv_manager_v2
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        paused_request = Mock()
         scheduled_batch = types.SimpleNamespace(
-            encoder_requests=[], paused_requests=[], generation_requests=[]
+            encoder_requests=[], paused_requests=[paused_request], generation_requests=[]
         )
         executor._prepare_and_schedule_batch = Mock(
             side_effect=[(scheduled_batch, None), (None, None)]
@@ -2828,9 +2832,50 @@ class TestPendingTransferResponseFlush:
 
         PyExecutor._executor_loop(executor)
 
+        executor._terminate_requests.assert_called_once_with([paused_request])
+        executor._pause_requests.assert_called_once_with([paused_request])
         # One completed idle pass plus the clean-exit drain, not two flushes
         # during the idle pass itself.
         assert executor._flush_pending_transfer_responses.call_count == 2
+
+    def test_overlap_v2_hard_pause_releases_before_request_pause(self, monkeypatch):
+        """V2 hard pause preserves the overlap batch's sampled-token boundary."""
+        executor = self._make_executor_loop_stub()
+        executor._is_kv_manager_v2 = True
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        executor._wait_for_model_engine_input_copy = Mock()
+        paused_request = Mock()
+        scheduled_batch = types.SimpleNamespace(
+            encoder_requests=[], paused_requests=[paused_request], generation_requests=[]
+        )
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        lifecycle = Mock()
+        executor._terminate_requests = lifecycle.terminate
+        executor._pause_requests = lifecycle.pause
+        executor._can_queue = Mock(return_value=(False, True))
+        executor.kv_connector_manager = None
+        executor._revert_gen_alloc = Mock()
+        executor._finalize_adp_dummy_allocation = Mock()
+        executor.kv_cache_transceiver = None
+        executor.previous_batch = None
+        executor.enable_early_first_token_response = False
+        executor.drafter = None
+        executor._enqueue_responses = Mock()
+        executor._handle_kv_transfer_timeouts_synced = Mock()
+        executor._flush_iter_stats_synced = Mock()
+        executor._kv_connector_terminate_requests = Mock()
+        executor.iter_counter = 0
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        assert lifecycle.mock_calls == [
+            call.terminate([paused_request]),
+            call.pause([paused_request]),
+        ]
 
     def test_overlap_flushes_before_clean_scheduler_shutdown(self, monkeypatch):
         """The overlap loop must not drop a buffered response on clean exit."""
