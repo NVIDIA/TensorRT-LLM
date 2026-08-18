@@ -1530,8 +1530,11 @@ class GvrMainKernel:
                 n = cutlass.Int32(0)
                 SMP = cutlass.Int32(0)
                 SS2 = cutlass.Int32(1)
-                TGT = cutlass.Int32(0x7FFFFFFF)
-                TGT2 = cutlass.Int32(0x7FFFFFFF)
+                # "never accepts" sentinels; 2^30-1 so the TGT*2 scan target
+                # stays positive (0x7FFFFFFF would overflow to -2 and flip
+                # every tot0 >= TGT*2 gate on the all-zero histogram)
+                TGT = cutlass.Int32(0x3FFFFFFF)
+                TGT2 = cutlass.Int32(0x3FFFFFFF)
                 Q = cutlass.Int32(0)
             if short == cutlass.Int32(0):
                 n = nv
