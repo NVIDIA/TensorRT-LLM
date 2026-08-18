@@ -168,8 +168,7 @@ class MLP(nn.Module):
 
         return x_down
 
-    def _unquantized_gelu_fusion_eligible(self,
-                                          x: torch.Tensor) -> bool:
+    def _unquantized_gelu_fusion_eligible(self, x: torch.Tensor) -> bool:
         """Whether the unquantized up projection can use the cuBLASLt GELU
         epilogue without bypassing Linear post-processing or another GEMM
         backend.
@@ -207,8 +206,7 @@ class MLP(nn.Module):
         The runtime quant_method check is applied in forward (quant_method can
         be downgraded after this).
         """
-        if (self.activation is not gelu_tanh
-                or self.up_proj.gather_output
+        if (self.activation is not gelu_tanh or self.up_proj.gather_output
                 or get_sm_version() not in (100, 103) or not getattr(
                     self.up_proj, "has_nvfp4_activation_quantization", False)):
             return False, False
