@@ -30,6 +30,7 @@ import importlib.util
 import os
 import shutil
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -181,6 +182,53 @@ def test_warm_noop_is_stable(sync_tree, tmp_path):
     old_dir = tmp_path / "old"
     old_copy(src, old_dir)
     assert_trees_equal(new_dir, old_dir)
+
+
+def test_rewrite_without_mtime_change_is_not_skipped(sync_tree, tmp_path):
+    """A same-size rewrite that leaves the source mtime untouched must copy.
+
+    Inode timestamps come from a coarse clock, so a file rewritten shortly
+    after being copied can still report the mtime the copy recorded, and a
+    size+mtime comparison would call it unchanged. utime pins the mtime to the
+    copied value, making that collision deterministic instead of a race.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    mod = src / "mod.py"
+    mod.write_bytes(b"def f():\n    return 42\n")
+    new_dir = tmp_path / "new"
+    sync_tree(src, new_dir)
+
+    copied = mod.stat()
+    mod.write_bytes(b"def f():\n    return 99\n")  # same size
+    os.utime(mod, (copied.st_atime, copied.st_mtime))
+    sync_tree(src, new_dir)
+
+    assert (new_dir / "mod.py").read_bytes() == b"def f():\n    return 99\n"
+
+
+def test_settled_file_is_not_recopied(sync_tree, tmp_path):
+    """A file whose mtime has aged out of the race window is left alone.
+
+    Pins the incremental behaviour itself: the destination is diverged behind
+    sync_tree's back, so surviving the re-sync proves the file was skipped
+    rather than rewritten.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    aged = src / "aged.bin"
+    aged.write_bytes(b"aged\n")
+    old = time.time() - 3600
+    os.utime(aged, (old, old))
+    new_dir = tmp_path / "new"
+    sync_tree(src, new_dir)
+
+    dst_file = new_dir / "aged.bin"
+    dst_file.write_bytes(b"kept\n")  # same size as the source
+    os.utime(dst_file, (old, old))
+    sync_tree(src, new_dir)
+
+    assert dst_file.read_bytes() == b"kept\n"
 
 
 def test_same_src_dst_is_noop(sync_tree, tmp_path):
