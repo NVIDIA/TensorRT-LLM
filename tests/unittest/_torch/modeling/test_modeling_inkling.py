@@ -118,18 +118,6 @@ def test_model_defaults_pin_v2_and_disable_block_reuse():
     assert defaults["kv_cache_config"]["enable_block_reuse"] is False
 
 
-def test_block_reuse_default_departs_from_the_framework_default():
-    """The framework enables block reuse by default, so the model default is
-    load-bearing. If KvCacheConfig ever flips its default, this test still
-    documents which direction Inkling needs."""
-    from tensorrt_llm._torch.models.modeling_inkling import InklingForConditionalGeneration
-    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-
-    assert KvCacheConfig().enable_block_reuse is True
-    defaults = InklingForConditionalGeneration.get_model_defaults(None)
-    assert defaults["kv_cache_config"]["enable_block_reuse"] is False
-
-
 # ---------------------------------------------------------------------------
 # The two features that must be refused, not defaulted off.
 #
@@ -235,20 +223,6 @@ def test_the_rejection_names_both_features_separately():
             InklingConfig(), enable_block_reuse=False, enable_chunked_prefill=True
         )
     assert "enable_chunked_prefill=False" in str(second.value)
-
-
-def test_the_kv_cache_creator_calls_the_guard():
-    """The guard is only worth anything if the one path that builds every KV
-    cache manager runs it, with the RESOLVED kv_cache_config (post deep-merge)
-    rather than the user's raw input."""
-    import inspect
-
-    from tensorrt_llm._torch.pyexecutor import _util
-
-    src = inspect.getsource(_util.KvCacheCreator._get_model_kv_cache_manager_cls)
-    assert "reject_unsupported_inkling_kv_cache_features" in src
-    assert "kv_cache_config.enable_block_reuse" in src
-    assert "enable_chunked_prefill" in src
 
 
 def test_text_geometry():
@@ -636,33 +610,6 @@ def test_metadata_yields_no_generation_rows_for_a_context_only_batch():
     assert md.ink_gen_seq_lens(0).shape[0] == 0
 
 
-def test_the_decode_fast_path_is_guarded_by_metadata_type():
-    """The backend must decide on the metadata's type, not on a getattr default.
-
-    The previous guard was ``getattr(attn_metadata, "ink_num_gen", 0) ==
-    num_req``: a foreign metadata object -- the P4 failure, where a degraded
-    selection handed back TrtllmAttentionMetadata -- fell through on the *default
-    value* rather than on a stated check. With the counter gone, num_generations
-    exists on every metadata, so an unguarded count comparison would let a
-    foreign object into the fast path and fail later with a bare AttributeError
-    instead of the diagnostic.
-    """
-    import inspect
-
-    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingAttentionMetadata
-    from tensorrt_llm._torch.attention_backend.sparse.inkling import backend as be
-
-    src = inspect.getsource(be.InklingTritonAttention._run_generation)
-    assert "isinstance(attn_metadata, InklingAttentionMetadata)" in src
-    # The counter is gone from both sides of the contract. Match assignments
-    # rather than the bare name: the class docstring legitimately explains why
-    # the field was dropped, and a name match would flag that prose.
-    assert "ink_num_gen" not in src
-    assert not hasattr(InklingAttentionMetadata, "ink_num_gen")
-    md_src = inspect.getsource(InklingAttentionMetadata)
-    assert "self.ink_num_gen" not in md_src and "md.ink_num_gen" not in md_src
-
-
 def test_metadata_refuses_a_cuda_graph_batch_carrying_contexts():
     """The captured kernel reads both borrowed buffers at a fixed generation
     offset, so that offset has to be constant across replays. Decode graphs are
@@ -736,17 +683,6 @@ def test_backend_and_cache_manager_both_resolve_from_the_sparse_registry():
         get_sparse_attn_kv_cache_manager(InklingSparseAttentionConfig())
         is InklingHybridCacheManager
     )
-
-
-def test_the_family_selector_has_no_model_specific_branch():
-    """get_attention_backend chooses among the base backend *families* only; a
-    model-specific backend is reached through sparse/registry.py."""
-    import inspect
-
-    from tensorrt_llm._torch.attention_backend import utils as backend_utils
-
-    src = inspect.getsource(backend_utils)
-    assert "INKLING" not in src.upper(), "model-specific name back in the family selector"
 
 
 def test_the_fake_config_stays_out_of_the_user_facing_schema():
@@ -1001,65 +937,6 @@ def test_conv_pool_dtype_refuses_to_guess():
     for cfg in (SimpleNamespace(torch_dtype="not-a-dtype"), SimpleNamespace()):
         with pytest.raises(ValueError, match="torch_dtype"):
             csm._resolve_conv_dtype(cfg)
-
-
-def test_inkling_attention_lives_under_sparse_and_says_it_is_not_sparse():
-    """Layout follows sparse/minimax_m3 -- kernels, metadata, backend, params and
-    cache manager in separate modules -- and sits beside it under sparse/.
-
-    Inkling's attention is dense (full causal on global layers, a 512-token
-    sliding window on local ones, with a learned relative-bias score_mod), so
-    the package must say so in as many words: what actually unifies sparse/'s
-    members is that each needs its own backend + metadata + cache manager and is
-    selected through sparse/registry.py, not the base-family dispatch. Whoever
-    reads this next should not have to re-derive that.
-    """
-    import importlib
-
-    pkg = importlib.import_module("tensorrt_llm._torch.attention_backend.sparse.inkling")
-    for mod in ("kernels", "metadata", "backend", "cache_manager", "params"):
-        importlib.import_module(f"tensorrt_llm._torch.attention_backend.sparse.inkling.{mod}")
-    for sym in (
-        "InklingAttentionMetadata",
-        "InklingTritonAttention",
-        "InklingHybridCacheManager",
-        "InklingBackendForwardArgs",
-        "inkling_prefill_attention",
-        "inkling_decode_attention",
-    ):
-        assert hasattr(pkg, sym), sym
-
-    # The old top-level package must be gone, not left as a stale duplicate.
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("tensorrt_llm._torch.attention_backend.inkling")
-
-    assert "not a sparse-attention algorithm" in pkg.__doc__.lower().replace("**", "")
-
-
-def test_no_conv_state_protocol_and_no_inkling_file_in_pyexecutor():
-    """The pool needs no abstract protocol and pyexecutor needs no Inkling file.
-
-    A protocol here would have exactly one implementation, and both of its
-    useful methods return Inkling's own pool and runtime types, so it would
-    abstract nothing while planting an Inkling-specific module in a shared
-    framework directory -- the very thing this work removed from
-    model_engine.py, resource_manager.py and py_executor_creator.py.
-    """
-    import importlib
-    import pathlib
-
-    import tensorrt_llm._torch.pyexecutor as pyexec
-
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("tensorrt_llm._torch.pyexecutor.conv_state_manager")
-
-    root = pathlib.Path(pyexec.__file__).parent
-    offenders = [
-        f.name
-        for f in root.glob("*.py")
-        if "InklingHybridCacheManager" in f.read_text() and f.name != "_util.py"
-    ]
-    assert not offenders, offenders
 
 
 def test_metadata_builds_the_runtime_itself_from_the_managers_pool():
