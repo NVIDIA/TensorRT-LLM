@@ -153,6 +153,23 @@ def _assert_lora_changes_output(out_lora, out_base):
     assert any_differ, "LoRA outputs identical to base model (same tokens AND same logprobs)"
 
 
+def _assert_outputs_match(actual, expected):
+    """Assert that two request outputs have identical tokens and logprobs."""
+    actual_completion = actual.outputs[0]
+    expected_completion = expected.outputs[0]
+    assert actual_completion.token_ids == expected_completion.token_ids
+
+    actual_logprobs = actual_completion.logprobs
+    expected_logprobs = expected_completion.logprobs
+    assert len(actual_logprobs) == len(expected_logprobs)
+    for actual_step, expected_step in zip(actual_logprobs, expected_logprobs, strict=True):
+        assert actual_step.keys() == expected_step.keys()
+        for token_id in actual_step:
+            assert actual_step[token_id].logprob == pytest.approx(
+                expected_step[token_id].logprob, abs=1e-6
+            )
+
+
 def _run_lora_test(
     model_path,
     target_modules,
@@ -185,6 +202,52 @@ def _run_lora_test(
             ["The capital of France is", "Hello, how are you"],
         )
         _assert_lora_changes_output(out_lora, out_base)
+
+
+def _run_mixed_lora_cuda_graph_test(model_path, target_modules, trtllm_modules):
+    """Verify base rows remain unchanged when sharing a LoRA-specialized graph."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        lora_dir = _create_lora_adapter(
+            os.path.join(tmpdir, "lora"),
+            model_path,
+            target_modules,
+        )
+        lora_config = LoraConfig(
+            lora_dir=[lora_dir],
+            lora_target_modules=trtllm_modules,
+            max_lora_rank=16,
+            max_loras=2,
+            cuda_graph_specialize_lora=True,
+        )
+        with LLM(
+            model=model_path,
+            backend="pytorch",
+            lora_config=lora_config,
+            tensor_parallel_size=1,
+            max_batch_size=4,
+            max_num_tokens=256,
+        ) as llm:
+            sampling = SamplingParams(max_tokens=20, temperature=0.0, logprobs=0)
+            prompts = [
+                "The capital of France is",
+                "The capital of France is",
+                "Hello, how are you",
+                "Hello, how are you",
+            ]
+            lora_request = LoRARequest("test-lora", 0, lora_dir)
+            mixed_outputs = llm.generate(
+                prompts,
+                sampling,
+                lora_request=[lora_request, None, lora_request, None],
+            )
+            base_outputs = llm.generate(prompts, sampling)
+
+        for index in (1, 3):
+            _assert_outputs_match(mixed_outputs[index], base_outputs[index])
+        _assert_lora_changes_output(
+            [mixed_outputs[index] for index in (0, 2)],
+            [base_outputs[index] for index in (0, 2)],
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="LoRA overlap requires CUDA streams.")
@@ -265,6 +328,14 @@ class TestQwen3LoRA:
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
             specialize_cuda_graph=True,
         )
+
+    def test_qwen3_bf16_lora_cuda_graph_specialization_mixed_batch(self):
+        _run_mixed_lora_cuda_graph_test(
+            self.model_path,
+            {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
+            _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
+        )
+
 
 @skip_gpu_memory_less_than_80gb
 class TestQwen3MoELoRA:
