@@ -858,6 +858,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
     }
 
+    supports_encoder_data_parallel = True
     supports_encoder_cache = True
     supports_mm_encoder_item_scheduling = True
 

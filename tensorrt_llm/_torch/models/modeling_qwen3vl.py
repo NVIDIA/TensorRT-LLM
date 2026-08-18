@@ -1622,6 +1622,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
     }
 
+    supports_encoder_data_parallel = True
     supports_mm_encoder_item_scheduling = True
     supports_vision_gpu_normalize = True
 
