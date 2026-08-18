@@ -2988,7 +2988,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         model_tp_rank = self.model_config.mapping.tp_rank
         # Keep each FP8_PB_WO checkpoint pair alongside the BF16
         # parameter only when the later weight-read conversion consumes it.
-        stash_ckpt_fp8 = os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_ENV, "0") != "0" and is_sm_100f()
+        stash_ckpt_fp8 = _resolve_fp8_weight_read_gates()[0]
         # KDA head-shard (attention-DP off): rank r loads head rows/cols
         # [r*local : (r+1)*local] of every head-major KDA tensor.
         kda_tp_size, kda_tp_rank = 1, 0
