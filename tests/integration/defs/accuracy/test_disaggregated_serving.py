@@ -667,6 +667,55 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
+    @parametrize_with_ids("enable_block_reuse", [True, False])
+    def test_pipelined_kv_transfer_nixl_python_accuracy(
+            self, enable_block_reuse: bool):
+        """Pipelined KV transfer accuracy on a dense GQA model.
+
+        max_num_tokens caps the prefill chunk so a GSM8K prompt really is split
+        into several chunks; without that the feature degenerates to one slice.
+        """
+        kv_cache_config = {
+            "use_kv_cache_manager_v2": False,
+            "enable_block_reuse": enable_block_reuse,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+            "enable_pipelined_transfer": True,
+        }
+        ctx_server_config = {
+            "max_num_tokens": 256,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": dict(kv_cache_config),
+            "cache_transceiver_config": dict(cache_transceiver_config),
+            "enable_chunked_prefill": True,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": dict(kv_cache_config),
+            "cache_transceiver_config": dict(cache_transceiver_config),
+            "enable_chunked_prefill": True,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "schedule_style": "generation_first",
+            "context_servers": {
+                "num_instances": 1,
+            },
+            "generation_servers": {
+                "num_instances": 1,
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
     # Literal NIXL bypasses the harness's legacy UCX fallback. Omitting the
     # runtime then exercises Llama's automatic preference for Python V2.
 
@@ -1071,6 +1120,53 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(60000)
+    @skip_pre_hopper
+    @parametrize_with_ids("enable_block_reuse", [True, False])
+    def test_pipelined_kv_transfer_nixl_python_accuracy(
+            self, enable_block_reuse: bool):
+        """Pipelined KV transfer accuracy on MLA.
+
+        MLA stores one latent per token instead of per-head K/V, so the chunk
+        projection runs over a different pool layout than the GQA models.
+        """
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+            "enable_pipelined_transfer": True,
+        }
+        kv_cache_config = {"enable_block_reuse": enable_block_reuse}
+        ctx_server_config = {
+            "max_num_tokens": 256,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": dict(kv_cache_config),
+            "cache_transceiver_config": dict(cache_transceiver_config),
+            "enable_chunked_prefill": True,
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": dict(kv_cache_config),
+            "cache_transceiver_config": dict(cache_transceiver_config),
+            "enable_chunked_prefill": True,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "schedule_style": "generation_first",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
@@ -2036,6 +2132,65 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 class TestKimiK25(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K2.5"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(180000)
+    def test_pipelined_kv_transfer_nvfp4(self):
+        """Pipelined KV transfer accuracy for Kimi-K2.5 (NVFP4), ctx TP4 + gen TP4.
+
+        Exercises chunking with tensor parallelism on the sender: each ctx rank
+        chunks independently and every rank must agree on which slice is last.
+        Sequence budget is capped for the same startup reason as test_nvfp4.
+        """
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+            "enable_pipelined_transfer": True,
+        }
+        ctx_server_config = {
+            "max_batch_size": 16,
+            "max_seq_len": 8192,
+            "max_num_tokens": 1024,  # cap prefill chunk size
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": dict(cache_transceiver_config),
+            "tensor_parallel_size": 4,
+            "enable_attention_dp": True,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.6,
+            },
+        }
+        gen_server_config = {
+            "max_batch_size": 16,
+            "max_seq_len": 8192,
+            "max_num_tokens": 8192,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": dict(cache_transceiver_config),
+            "tensor_parallel_size": 4,
+            "enable_attention_dp": True,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.6,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "schedule_style": "generation_first",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(180000)

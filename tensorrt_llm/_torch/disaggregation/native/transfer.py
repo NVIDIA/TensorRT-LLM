@@ -148,6 +148,27 @@ class WriteMetaType(Enum):
     AUX = "AUX"
 
 
+def project_blocks_to_chunk(
+    block_ids: np.ndarray,
+    chunk_block_start: int,
+    chunk_block_end: int,
+    resident_block_end: int,
+) -> np.ndarray:
+    """Return the part of ``block_ids`` covering global blocks [start, end).
+
+    ``block_ids`` is the resident *suffix* of ``[0, resident_block_end)``, so the
+    ranges are intersected rather than indexed from the front.
+    """
+    if chunk_block_end <= chunk_block_start or len(block_ids) == 0:
+        return block_ids[:0]
+    resident_start = max(0, resident_block_end - len(block_ids))
+    overlap_start = max(chunk_block_start, resident_start)
+    overlap_end = min(chunk_block_end, resident_block_end)
+    if overlap_start >= overlap_end:
+        return block_ids[:0]
+    return block_ids[overlap_start - resident_start : overlap_end - resident_start]
+
+
 @dataclass
 class WriteMeta:
     task: Union[SendTaskBase, "KVRecvTask"]
@@ -161,6 +182,10 @@ class WriteMeta:
     sizes: np.ndarray  # dtype=np.int64
     dst_device_id: Optional[int] = None
     slice_id: Optional[int] = None
+    # The peer's task index (RecvReqInfo.slice_id): a chunking sender has more
+    # slices than the receiver has tasks, so results address the receiver by
+    # this, while slice_id stays the sender's index for local lookup.
+    receiver_slice_id: int = 0
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
@@ -577,7 +602,7 @@ class Sender(SenderBase):
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
-                    write_meta.slice_id,
+                    write_meta.receiver_slice_id,
                     True,  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED,
                 )
@@ -607,7 +632,7 @@ class Sender(SenderBase):
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
-                        write_meta.slice_id,
+                        write_meta.receiver_slice_id,
                         True,  # is_last_slice — ensures receiver resolves its task future
                         AgentResult.FAILED,
                     )
@@ -651,7 +676,7 @@ class Sender(SenderBase):
         result_msg = _make_kv_result_msg(
             self._instance_rank,
             write_meta.unique_rid,
-            write_meta.slice_id,
+            write_meta.receiver_slice_id,
             write_meta.is_last_slice,
             agent_result,
             transfer_size=transfer_size,
@@ -855,6 +880,22 @@ class Sender(SenderBase):
             lg_info = extractor.page_table.layer_groups[self_lg]
             window_size = getattr(lg_info, "sliding_window_size", None)
 
+            # Block lists are the suffix of [..., slice_end); cached prefix
+            # is implicit in their size. token_start = (total_blocks - n) * tpb.
+            slice_end = token_range.end if token_range is not None else 0
+            total_blocks = (slice_end + tpb - 1) // tpb
+
+            # The receiver posts one RecvReqInfo for the whole prompt, so narrow
+            # it to this slice; a whole-request slice projects onto itself. Must
+            # precede _trim_receiver_window_head, which rejects dst longer than src.
+            if token_range is not None and task._prompt_len is not None:
+                dst_block_ids = project_blocks_to_chunk(
+                    dst_block_ids,
+                    chunk_block_start=token_range.start // tpb,
+                    chunk_block_end=total_blocks,
+                    resident_block_end=(task._prompt_len + tpb - 1) // tpb,
+                )
+
             peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
             dst_block_ids = Sender._trim_receiver_window_head(
                 src_block_ids,
@@ -862,11 +903,6 @@ class Sender(SenderBase):
                 peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
                 beam_width=task._beam_width,
             )
-
-            # Block lists are the suffix of [..., slice_end); cached prefix
-            # is implicit in their size. token_start = (total_blocks - n) * tpb.
-            slice_end = token_range.end if token_range is not None else 0
-            total_blocks = (slice_end + tpb - 1) // tpb
             src_beam0_blocks = Sender._beam0_block_count(
                 src_block_ids, total_blocks, task._beam_width
             )
@@ -961,6 +997,7 @@ class Sender(SenderBase):
             peer_endpoint=peer_ri.self_endpoint,
             unique_rid=task._unique_rid,
             slice_id=task.slice_id,
+            receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._slice.is_last_slice,
             bounce_dst_base=req_info.bounce_dst_base,
         )
@@ -1293,6 +1330,10 @@ class TxSession(TxSessionBase):
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
+        # A chunk can fail long before the last one is built; without this the
+        # checks below would leave the session in READY forever.
+        if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self.kv_tasks):
+            return SessionStatus.ERROR
         kv_all_transferred = bool(self.kv_tasks) and all(
             t.status == TaskStatus.TRANSFERRED for t in self.kv_tasks
         )

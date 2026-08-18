@@ -44,7 +44,11 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TokenRange,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    TransferWorker,
+    TransferWorkerConfig,
+    project_blocks_to_chunk,
+)
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
@@ -605,9 +609,18 @@ def get_block_ids_per_layer_groups(
 
 
 def add_and_verify_request(
-    setup, ctx_request_id, gen_request_id, request_len, send_first: bool = True
+    setup,
+    ctx_request_id,
+    gen_request_id,
+    request_len,
+    send_first: bool = True,
+    send_chunk_blocks: Optional[int] = None,
 ):
-    """Helper function to add and verify a request transfer."""
+    """Helper function to add and verify a request transfer.
+
+    ``send_chunk_blocks`` splits the send into that many blocks per slice
+    (pipelined transfer); ``None`` sends the whole request as one slice.
+    """
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
@@ -754,16 +767,38 @@ def add_and_verify_request(
         ]
 
         token_range = TokenRange(start=0, end=request_len)
-        send_kv_slices = [
-            KVSlice(
-                is_last_slice=True,
-                block_ids_per_layer_groups=ctx_block_ids_per_group,
-                token_range=token_range,
-            )
-            for ctx_block_ids_per_group in ctx_block_ids_per_groups
-        ]
-        for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices):
-            sender_session.send(send_kv_slice)
+        if send_chunk_blocks is None:
+            send_kv_slices = [
+                KVSlice(
+                    is_last_slice=True,
+                    block_ids_per_layer_groups=ctx_block_ids_per_group,
+                    token_range=token_range,
+                )
+                for ctx_block_ids_per_group in ctx_block_ids_per_groups
+            ]
+            for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices):
+                sender_session.send(send_kv_slice)
+        else:
+            # Pipelined transfer: the sender emits one slice per prefill chunk
+            # while the receiver still posts a single whole-prompt receive.
+            total_blocks = (request_len + tokens_per_block - 1) // tokens_per_block
+            for start in range(0, total_blocks, send_chunk_blocks):
+                end = min(start + send_chunk_blocks, total_blocks)
+                for sender_session, ctx_block_ids_per_group in zip(
+                    sender_sessions, ctx_block_ids_per_groups
+                ):
+                    sender_session.send(
+                        KVSlice(
+                            is_last_slice=(end == total_blocks),
+                            block_ids_per_layer_groups=[
+                                project_blocks_to_chunk(ids, start, end, total_blocks)
+                                for ids in ctx_block_ids_per_group
+                            ],
+                            token_range=TokenRange(
+                                start=start * tokens_per_block, end=end * tokens_per_block
+                            ),
+                        )
+                    )
 
         for sender_session in sender_sessions:
             assert sender_session.status == SessionStatus.INIT
@@ -1601,6 +1636,92 @@ def test_incompatible_peer_fails_only_affected_requests():
                 worker.shutdown()
             for worker in s["gen_transfer_workers"]:
                 worker.shutdown()
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("use_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize(
+    "request_len",
+    # tokens_per_block=8: exact multiples and every unaligned remainder, so
+    # chunk cuts land both on and off block boundaries.
+    [8, 16, 17, 23, 64, 65, 71, 129],
+)
+@pytest.mark.parametrize("chunk_blocks", [1, 2, 3, 5])
+def test_chunked_send_matches_monolithic(use_v2, request_len, chunk_blocks):
+    """A chunking sender must deliver exactly what a single-slice sender does.
+
+    The receiver posts one whole-prompt receive either way, so this covers the
+    destination block projection, the receiver-index routing of KV_AGENT_RESULT,
+    and is_last_slice completion. Verification is the shared ctx-vs-gen KV
+    comparison, i.e. real bytes over NIXL, not just index arithmetic.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=use_v2,
+    )
+    try:
+        add_and_verify_request(
+            setup, 0, 1, request_len, send_first=True, send_chunk_blocks=chunk_blocks
+        )
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("chunk_blocks", [1, 3])
+def test_chunked_send_with_sliding_window(chunk_blocks):
+    """Same equivalence for a windowed layer group.
+
+    SWA trims the source list to a resident suffix, so the chunk projection has
+    to intersect ranges rather than index from the front.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=True,
+        max_attention_window_vec=[1024, 32],
+    )
+    try:
+        add_and_verify_request(setup, 0, 1, 129, send_first=True, send_chunk_blocks=chunk_blocks)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("ctx_tp,gen_tp", [(2, 1), (1, 2), (2, 2)])
+def test_chunked_send_multi_rank(ctx_tp, gen_tp):
+    """Chunking is per-rank; every ctx rank must still agree on is_last_slice."""
+    setup = create_transfer_worker_setup(
+        ctx_tp=ctx_tp,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=gen_tp,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=True,
+    )
+    try:
+        add_and_verify_request(setup, 0, 1, 65, send_first=True, send_chunk_blocks=2)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
 
 
 if __name__ == "__main__":

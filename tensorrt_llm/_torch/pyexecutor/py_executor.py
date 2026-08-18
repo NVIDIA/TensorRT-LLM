@@ -7473,6 +7473,9 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
 
         if self.kv_cache_transceiver:
+            # A cancel that could not finish leaves the request prefilling with
+            # an already-CANCELLED session; further chunks would only fail.
+            cancel_pending_ids = set(self.canceled_req_ids)
             for req in scheduled_requests:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
@@ -7490,6 +7493,16 @@ class PyExecutor:
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
+                elif (req.is_context_only_request
+                      and self.kv_cache_transceiver.pipeline_transfer_enabled
+                      and not req.is_finished_due_to_cancellation
+                      and req.state != LlmRequestState.GENERATION_COMPLETE
+                      and (req.py_request_id if not req.is_child else
+                           req.parent_request_id) not in cancel_pending_ids):
+                    # Ship the chunk that just finished so it overlaps the ones
+                    # still to be computed. GENERATION_COMPLETE means an error
+                    # path already freed the request, so its bounds are stale.
+                    self.kv_cache_transceiver.respond_and_send_async(req)
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -8102,11 +8115,16 @@ class PyExecutor:
             self.result_wait_queues.pop(request.py_request_id, None)
 
     def _is_request_in_transmission(self, request) -> bool:
-        """Check if a request is currently in transmission state."""
-        return (request.state
-                == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        """Check whether a request's KV cache may still be read by the fabric.
+
+        request.state only tracks compute; a chunk can be in flight during prefill.
+        """
+        if (request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
                 or request.state
-                == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
+                == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS):
+            return True
+        return (self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.has_inflight_transfer(request))
 
     def _try_cancel_request(self, request) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.

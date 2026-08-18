@@ -236,6 +236,18 @@ class KvCacheTransceiver(ABC):
     def has_poisoned_transfer_buffer(self) -> bool:
         return False
 
+    @property
+    def pipeline_transfer_enabled(self) -> bool:
+        """Whether each prefill chunk ships as soon as it is computed (v2 only)."""
+        return False
+
+    def has_inflight_transfer(self, req: LlmRequest) -> bool:
+        """Whether the fabric may still read this request's KV blocks.
+
+        Only meaningful when transfer outlives a compute-phase state.
+        """
+        return False
+
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]):
         """
