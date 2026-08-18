@@ -846,7 +846,7 @@ pipeline {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                            def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
+                            def nspect_commit = "79e9ddf29362cb3c654bda70645aa76e77eedd05"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {
                                 echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
