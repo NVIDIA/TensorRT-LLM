@@ -19,7 +19,7 @@ References:
 1. A pure-torch fp32 CPU golden (vendored from the kernel drop's
    ``cpu_reference`` self-check).
 2. An FLA sequential reference built from the exact op sequence
-   ``KimiKDARuntime._forward_verify`` uses in-tree: per-step fp32 causal
+   ``KimiKDALinearAttention.forward_verify`` uses in-tree: per-step fp32 causal
    conv + SiLU followed by ``fla.ops.kda.fused_recurrent_kda`` with
    ``use_qk_l2norm/use_gate/use_beta_sigmoid`` in kernel, ``lower_bound``,
    ``state_v_first=True``.
@@ -319,7 +319,7 @@ def cute_run(data, zero_accepted_hint=False):
 def _fla_sequential_reference(data, num_accepted):
     """Per-request sequential conv+SiLU (fp32 torch) + fused_recurrent_kda.
 
-    Mirrors ``KimiKDARuntime._forward_verify``'s op sequence, extended with
+    Mirrors ``KimiKDALinearAttention.forward_verify``'s op sequence, extended with
     the replay prefix: for request ``n`` with ``a = num_accepted[n]``, the
     processed token sequence is ``a`` cached raw tokens (re-convolved from
     the extended conv-cache slots) followed by the ``1 + M`` new tokens.
@@ -452,7 +452,7 @@ def test_round1_zero_accepted(B, H):
     for name in ("qkg_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
         _assert_close(f"{name}(cute vs cpu)", cute_out[name], cpu[name], atol=2e-2)
 
-    # Kernel vs the FLA sequential path (the in-tree _forward_verify math).
+    # Kernel vs the FLA sequential path (the in-tree fused verify math).
     _assert_close(
         "out(cute vs fla)",
         cute_out["out"][0, new_rows].float(),
