@@ -81,6 +81,16 @@ KVCacheManagerConfig makeSplitColdGroupingConfig()
 class RejectingColdPageCodec final : public IKvCacheColdPageCodec
 {
 public:
+    explicit RejectingColdPageCodec(int& destructionCount)
+        : mDestructionCount(destructionCount)
+    {
+    }
+
+    ~RejectingColdPageCodec() override
+    {
+        ++mDestructionCount;
+    }
+
     bool configure(PoolGroupDesc const*, PoolGroupIndex) noexcept override
     {
         return false;
@@ -105,6 +115,9 @@ public:
     {
         return false;
     }
+
+private:
+    int& mDestructionCount;
 };
 
 class SplitColdPageCodec final : public IKvCacheColdPageCodec
@@ -122,16 +135,16 @@ public:
 
     size_t queryColdPageBytes(LayerGroupId layerGroupId) const noexcept override
     {
-        if (layerGroupId == LifeCycleId{0})
+        if (layerGroupId == LayerGroupId{0})
             return 1024;
-        if (layerGroupId == LifeCycleId{1})
+        if (layerGroupId == LayerGroupId{1})
             return 2048;
         return 0;
     }
 
     LayerGroupId getBatchingLayerGroupId(LayerGroupId layerGroupId) const noexcept override
     {
-        return mBatchTogether ? LifeCycleId{0} : layerGroupId;
+        return mBatchTogether ? LayerGroupId{0} : layerGroupId;
     }
 
     PageIndexLocation queryPageIndexLocation(LayerGroupId) const noexcept override
@@ -197,12 +210,12 @@ public:
 
     LayerGroupId getBatchingLayerGroupId(LayerGroupId) const noexcept override
     {
-        return LifeCycleId{0};
+        return LayerGroupId{0};
     }
 
     PageIndexLocation queryPageIndexLocation(LayerGroupId layerGroupId) const noexcept override
     {
-        return layerGroupId == LifeCycleId{0} ? PageIndexLocation::kHost : PageIndexLocation::kDevice;
+        return layerGroupId == LayerGroupId{0} ? PageIndexLocation::kHost : PageIndexLocation::kDevice;
     }
 
     bool encode(LayerGroupId, void*, PageIndexPair const*, size_t, cudaStream_t) noexcept override
@@ -305,10 +318,11 @@ SharedPtr<CommittedPage> makeCommittedPage(KvCacheManager& manager, StorageManag
     return page;
 }
 
-TEST(KvCacheManagerV2ColdPageTest, ConstructionFailureConsumesCodecUniquePtr)
+TEST(KvCacheManagerV2ColdPageTest, ConstructionFailureDestroysCodec)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<RejectingColdPageCodec>();
+    int destructionCount = 0;
+    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<RejectingColdPageCodec>(destructionCount);
     EXPECT_THROW(
         {
             auto manager = std::make_shared<KvCacheManager>(makeConfig(), nullptr, std::move(codec));
@@ -316,33 +330,29 @@ TEST(KvCacheManagerV2ColdPageTest, ConstructionFailureConsumesCodecUniquePtr)
         },
         TllmException);
 
-    EXPECT_EQ(codec, nullptr);
+    EXPECT_EQ(destructionCount, 1);
 }
 
 TEST(KvCacheManagerV2ColdPageTest, RejectsColdPageStagingSizeOverflow)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<OversizedColdPageCodec>();
     EXPECT_THROW(
         {
-            auto manager = std::make_shared<KvCacheManager>(makeDiskTieredConfig(), nullptr, std::move(codec));
+            auto manager = std::make_shared<KvCacheManager>(
+                makeDiskTieredConfig(), nullptr, std::make_unique<OversizedColdPageCodec>());
             (void) manager;
         },
         TllmException);
-
-    EXPECT_EQ(codec, nullptr);
 }
 
 TEST(KvCacheManagerV2ColdPageTest, DoesNotSizePageStagingWithoutColdTier)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<OversizedColdPageCodec>();
-
     EXPECT_NO_THROW({
-        auto manager = std::make_shared<KvCacheManager>(makeConfig(), nullptr, std::move(codec));
+        auto manager
+            = std::make_shared<KvCacheManager>(makeConfig(), nullptr, std::make_unique<OversizedColdPageCodec>());
         (void) manager;
     });
-    EXPECT_EQ(codec, nullptr);
 }
 
 TEST(KvCacheManagerV2ColdPageTest, ColdGpuTierSupportsSingleSlotRoundTrip)
@@ -497,31 +507,25 @@ TEST(KvCacheManagerV2ColdPageTest, AsyncDecodeRejectionFencesRecycledGpuSlot)
 TEST(KvCacheManagerV2ColdPageTest, RejectsBatchingClassWithDifferentColdPageSizes)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<SplitColdPageCodec>(true);
-
     EXPECT_THROW(
         {
-            auto manager = std::make_shared<KvCacheManager>(makeSplitColdGroupingConfig(), nullptr, std::move(codec));
+            auto manager = std::make_shared<KvCacheManager>(
+                makeSplitColdGroupingConfig(), nullptr, std::make_unique<SplitColdPageCodec>(true));
             (void) manager;
         },
         TllmException);
-
-    EXPECT_EQ(codec, nullptr);
 }
 
 TEST(KvCacheManagerV2ColdPageTest, RejectsBatchingClassWithDifferentIndexLocations)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    std::unique_ptr<IKvCacheColdPageCodec> codec = std::make_unique<MixedIndexLocationColdPageCodec>();
-
     EXPECT_THROW(
         {
-            auto manager = std::make_shared<KvCacheManager>(makeSplitColdGroupingConfig(), nullptr, std::move(codec));
+            auto manager = std::make_shared<KvCacheManager>(
+                makeSplitColdGroupingConfig(), nullptr, std::make_unique<MixedIndexLocationColdPageCodec>());
             (void) manager;
         },
         TllmException);
-
-    EXPECT_EQ(codec, nullptr);
 }
 
 TEST(KvCacheManagerV2ColdPageTest, ColdGroupingIsIndependentOfHotGrouping)

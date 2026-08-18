@@ -631,7 +631,7 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator& physMemAllocator)
     : mPhysMemAllocator(physMemAllocator)
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == slotDescList.size(),
+    TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
@@ -647,7 +647,7 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 HostCacheLevelStorage::HostCacheLevelStorage(
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList)
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == slotDescList.size(),
+    TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "HostCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
@@ -664,7 +664,7 @@ DiskCacheLevelStorage::DiskCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::string directory)
     : mDirectory(std::move(directory))
 {
-    TLLM_CHECK_DEBUG_WITH_INFO(slotCountList.size() == slotDescList.size(),
+    TLLM_CHECK_WITH_INFO(slotCountList.size() == slotDescList.size(),
         "DiskCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {

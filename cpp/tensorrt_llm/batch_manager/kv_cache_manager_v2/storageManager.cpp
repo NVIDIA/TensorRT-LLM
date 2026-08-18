@@ -1724,7 +1724,7 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
 TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsFromConstraints(std::vector<BatchDesc> const& constraints,
     int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
 {
-    TLLM_CHECK_DEBUG(maxUtilForResume > 0.0f && maxUtilForResume <= 1.0f);
+    TLLM_CHECK_WITH_INFO(maxUtilForResume > 0.0F && maxUtilForResume <= 1.0F, "max_util_for_resume must be in (0, 1]");
     // All returned elements are positive. Constraint-derived floors include headroom
     // for the utilization gate checked by KvCache::resume.
     TypedVec<LifeCycleId, SlotCount> maxSlots(numLifeCycles(), 0);

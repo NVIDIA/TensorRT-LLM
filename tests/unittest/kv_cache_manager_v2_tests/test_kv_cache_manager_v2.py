@@ -17,6 +17,7 @@ import functools
 import gc
 import hashlib
 import itertools
+import math
 import os
 import random
 import time
@@ -3398,6 +3399,16 @@ class TestInitRatioConfig(unittest.TestCase):
         cfg = self._make_config(initial_pool_ratio=ratio)
 
         with self.assertRaisesRegex(ValueError, error):
+            KVCacheManager(cfg)
+
+    @parameterized.expand(
+        [("zero", 0.0), ("negative", -0.1), ("greater_than_one", 1.1), ("nan", math.nan)]
+    )
+    def test_invalid_max_util_for_resume(self, _name: str, max_util_for_resume: float):
+        cfg = self._make_config()
+        cfg.max_util_for_resume = max_util_for_resume
+
+        with self.assertRaisesRegex((ValueError, RuntimeError), "max_util_for_resume must be in"):
             KVCacheManager(cfg)
 
     def test_ratio_slot_count_rounding_matches_python(self):
