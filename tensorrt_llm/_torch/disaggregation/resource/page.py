@@ -72,6 +72,7 @@ class MapperKind(IntEnum):
     INDEXED = 0
     REPLICATED = 1
     NHD = 2
+    SECTIONED = 3  # Sectioned layout: [Sec0|Sec1|...], each section independently TP-sharded
 
 
 @dataclass
@@ -226,13 +227,34 @@ class PoolView:
         )
 
 
+class CacheKind(IntEnum):
+    """How region IDs in block_ids_per_layer_groups are interpreted.
+
+    PAGED: multiple block IDs per request (attention KV cache).
+           Extraction: per-block base pointers. Alignment: window/beam/SWA.
+    SLOT:  single slot ID per request (recurrent state, e.g. mamba).
+           Extraction: per-layer pointers within one slot. No block alignment.
+    """
+
+    PAGED = 0
+    SLOT = 1
+
+
 @dataclass
 class LayerGroup:
-    """
-    Base class for one life cycle / layer-group.
+    """Base class for one life cycle / layer-group.
+
+    Shared structure:
+      - kind: how this group's region IDs are interpreted (PAGED vs SLOT)
+      - pool_group_idx: index into KVCachePageTable.pool_groups
+      - local_layers: local ↔ global layer ID mapping
+      - pool_views: logical views into pool_groups[pool_group_idx].pools
     """
 
     pool_group_idx: int
+    kind: CacheKind = CacheKind.PAGED
+    local_layers: List[LocalLayer] = field(default_factory=list)
+    pool_views: List[PoolView] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         raise NotImplementedError
@@ -252,8 +274,6 @@ class AttentionLayerGroup(LayerGroup):
 
     kv_head_num_per_rank: int = 0
     sliding_window_size: Optional[int] = None
-    local_layers: List[LocalLayer] = field(default_factory=list)
-    pool_views: List[PoolView] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -268,46 +288,94 @@ class AttentionLayerGroup(LayerGroup):
     def from_dict(cls, data: dict) -> "AttentionLayerGroup":
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
-            kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
-            sliding_window_size=data.get("sliding_window_size"),
             local_layers=[LocalLayer.from_dict(x) for x in data.get("local_layers", [])],
             pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
+            kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
+            sliding_window_size=data.get("sliding_window_size"),
         )
 
 
+MAMBA_CONV_ROLE = frozenset({"mamba_conv"})
+MAMBA_SSM_ROLE = frozenset({"mamba_ssm"})
+
+
+@dataclass
 @dataclass
 class MambaLayerGroup(LayerGroup):
-    """Layer group for Mamba SSM states."""
+    """Layer group for Mamba SSM states.
 
+    Pools are accessed the same way as attention:
+        pool_groups[pool_group_idx].pools[pool_view.pool_idx]
+    where pool_idx=0 is conv, pool_idx=1 is ssm.
+    """
+
+    kind: CacheKind = CacheKind.SLOT
     mamba_layer_offsets: Dict[int, int] = field(default_factory=dict)
-    conv_states: Optional[PhysicalPool] = None
-    ssm_states: Optional[PhysicalPool] = None
     conv_section_bytes: Optional[List[int]] = None
     ssm_bytes_per_head: Optional[int] = None
+    built_from_v2: bool = False  # True for MambaHybridCacheManagerV2 (slot-major coalesced pools)
 
     def to_dict(self) -> dict:
         return {
             "pool_group_idx": int(self.pool_group_idx),
             "mamba_layer_offsets": {int(k): int(v) for k, v in self.mamba_layer_offsets.items()},
-            "conv_states": self.conv_states.to_dict(),
-            "ssm_states": self.ssm_states.to_dict(),
+            "local_layers": [ll.to_dict() for ll in self.local_layers],
+            "pool_views": [pv.to_dict() for pv in self.pool_views],
             "conv_section_bytes": self.conv_section_bytes,
             "ssm_bytes_per_head": self.ssm_bytes_per_head,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "MambaLayerGroup":
-        conv_section_bytes = data.get("conv_section_bytes")
-        ssm_bytes_per_head = data.get("ssm_bytes_per_head")
+        mamba_layer_offsets = {int(k): int(v) for k, v in data["mamba_layer_offsets"].items()}
+        local_layers = [LocalLayer.from_dict(x) for x in data.get("local_layers", [])]
+        pool_views = [PoolView.from_dict(pv) for pv in data.get("pool_views", [])]
+
+        # Legacy format: rebuild pool_views/local_layers from inline pool dicts
+        if not pool_views and data.get("conv_states") and data.get("ssm_states"):
+            conv_pool = PhysicalPool.from_dict(data["conv_states"])
+            ssm_pool = PhysicalPool.from_dict(data["ssm_states"])
+            sorted_lids = [
+                lid for _, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
+            ]
+            pool_views = [
+                PoolView(
+                    pool_idx=0,
+                    buffer_entries=np.array(
+                        [(lid, 0, conv_pool.slot_bytes) for lid in sorted_lids],
+                        dtype=BUFFER_ENTRY_DTYPE,
+                    ),
+                    pool_role=MAMBA_CONV_ROLE,
+                    mapper_kind=MapperKind.SECTIONED,
+                    bytes_per_layer=conv_pool.slot_bytes,
+                ),
+                PoolView(
+                    pool_idx=1,
+                    buffer_entries=np.array(
+                        [(lid, 0, ssm_pool.slot_bytes) for lid in sorted_lids],
+                        dtype=BUFFER_ENTRY_DTYPE,
+                    ),
+                    pool_role=MAMBA_SSM_ROLE,
+                    mapper_kind=MapperKind.INDEXED,
+                    bytes_per_layer=ssm_pool.slot_bytes,
+                ),
+            ]
+            local_layers = [
+                LocalLayer(local_layer_id=lid, global_layer_id=gid)
+                for gid, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
+            ]
+
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
-            mamba_layer_offsets={int(k): int(v) for k, v in data["mamba_layer_offsets"].items()},
-            conv_states=PhysicalPool.from_dict(data["conv_states"]),
-            ssm_states=PhysicalPool.from_dict(data["ssm_states"]),
-            conv_section_bytes=[int(x) for x in conv_section_bytes]
-            if conv_section_bytes is not None
+            local_layers=local_layers,
+            pool_views=pool_views,
+            mamba_layer_offsets=mamba_layer_offsets,
+            conv_section_bytes=[int(x) for x in data["conv_section_bytes"]]
+            if data.get("conv_section_bytes")
             else None,
-            ssm_bytes_per_head=int(ssm_bytes_per_head) if ssm_bytes_per_head is not None else None,
+            ssm_bytes_per_head=int(data["ssm_bytes_per_head"])
+            if data.get("ssm_bytes_per_head")
+            else None,
         )
 
 

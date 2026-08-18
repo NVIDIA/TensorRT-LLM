@@ -17,7 +17,14 @@ from __future__ import annotations
 
 from typing import Dict, List, Set
 
-from .page import AttentionLayerGroup, KVCachePageTable, MambaLayerGroup, PhysicalPool, PoolView
+from .page import (
+    AttentionLayerGroup,
+    CacheKind,
+    KVCachePageTable,
+    LayerGroup,
+    PhysicalPool,
+    PoolView,
+)
 
 # -------------------------------------------------------------------------
 # PhysicalPool helpers
@@ -117,9 +124,7 @@ def get_pool_view_num_layers(pool_view: PoolView) -> int:
     return len(get_unique_layers(pool_view))
 
 
-def get_pool_view_global_layer_ids(
-    pool_view: PoolView, layer_group: AttentionLayerGroup
-) -> List[int]:
+def get_pool_view_global_layer_ids(pool_view: PoolView, layer_group: "LayerGroup") -> List[int]:
     """
     Global layer IDs for the layers that appear in *pool_view*, ordered by their
     physical offset within the coalesced buffer (ascending).
@@ -190,31 +195,40 @@ def get_unique_pool_memory_descs(
     unique_pools: dict[tuple[int, int], int] = {}  # (ptr, size) -> index
     pool_counter = 0
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        if isinstance(lg, MambaLayerGroup):
-            # V2 Mamba layer groups reference manager-owned physical pools.
-            # V1 Mamba state views are standalone and use the first invalid
-            # pool-group index after the attention groups.
-            has_physical_pool_group = 0 <= int(lg.pool_group_idx) < len(page_table.pool_groups)
-            if has_physical_pool_group:
-                pools_and_sizes = [
-                    (pool, get_pool_bytes(pool))
-                    for pool in page_table.pool_groups[int(lg.pool_group_idx)].pools
-                ]
+        if lg.kind == CacheKind.SLOT:
+            if getattr(lg, "built_from_v2", False):
+                # MambaHybridCacheManagerV2: roles may share one allocation
+                # (interleaved, equal sizes) or be separate (unequal sizes).
+                # Process lowest-base first so the covering region registers
+                # before higher-offset roles that fall inside it.
+                pools = sorted(
+                    (get_physical_pool(page_table, lg_idx, pv.pool_idx) for pv in lg.pool_views),
+                    key=lambda p: p.base_address,
+                )
+                for pool in pools:
+                    pool_size = pool.num_slots * pool.slot_stride_bytes
+                    if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
+                        continue
+                    pool_key = (pool.base_address, pool_size)
+                    if pool_key not in unique_pools:
+                        unique_pools[pool_key] = pool_counter
+                        pool_counter += 1
             else:
-                num_mamba_layers = len(lg.mamba_layer_offsets)
-                pools_and_sizes = [
-                    (pool, num_mamba_layers * pool.num_slots * pool.slot_bytes)
-                    for pool in [lg.conv_states, lg.ssm_states]
-                ]
-            for pool, pool_size in pools_and_sizes:
-                pool_key = (pool.base_address, pool_size)
-                if pool_key not in unique_pools:
-                    unique_pools[pool_key] = pool_counter
-                    pool_counter += 1
+                # Layer-major (MambaHybridCacheManager): each role is a separate
+                # allocation. Register each: size = num_layers * layer_stride.
+                for pv in lg.pool_views:
+                    pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
+                    num_layers = len({int(e["local_layer_id"]) for e in pv.buffer_entries})
+                    pool_size = num_layers * pool.layer_stride_bytes
+                    pool_key = (pool.base_address, pool_size)
+                    if pool_key not in unique_pools:
+                        unique_pools[pool_key] = pool_counter
+                        pool_counter += 1
         else:
+            # PAGED (attention): each pool view is an independent allocation
             for pv in lg.pool_views:
                 pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
-                pool_key = (pool.base_address, get_pool_bytes(pool))
+                pool_key = (pool.base_address, pool.num_slots * pool.slot_stride_bytes)
                 if pool_key not in unique_pools:
                     unique_pools[pool_key] = pool_counter
                     pool_counter += 1
@@ -229,24 +243,33 @@ def get_unique_pool_memory_descs(
 # -------------------------------------------------------------------------
 
 
-def get_layer_to_layer_group(page_table: KVCachePageTable) -> Dict[int, int]:
+def get_layer_to_layer_group(
+    page_table: KVCachePageTable,
+    layer_group_type: type | None = None,
+) -> Dict[int, int]:
     """
     Build ``{global_layer_id: lg_idx}`` mapping.
 
-    Layer groups must partition a rank's attention layers: every
-    global_layer_id belongs to exactly one group. Peer matching relies on
-    this, so a duplicate raises instead of silently keeping the last group.
+    When *layer_group_type* is ``None`` (legacy default), only
+    ``AttentionLayerGroup`` is indexed — this preserves backward
+    compatibility with callers that assume attention layers partition
+    without overlap. When a specific type is given, only layer groups of
+    that type are indexed; within one type, every global_layer_id must
+    belong to exactly one group. Peer matching relies on this, so a
+    duplicate raises instead of silently keeping the last group.
     """
+    if layer_group_type is None:
+        layer_group_type = AttentionLayerGroup
     out: Dict[int, int] = {}
     for lg_idx, lg in enumerate(page_table.layer_groups):
-        if isinstance(lg, AttentionLayerGroup):
+        if isinstance(lg, layer_group_type):
             for ll in lg.local_layers:
                 gid = int(ll.global_layer_id)
                 if gid in out:
                     raise ValueError(
                         f"global_layer_id {gid} appears in layer groups "
                         f"{out[gid]} and {lg_idx}; layer groups must partition "
-                        "a rank's attention layers"
+                        "a rank's layers (within type {layer_group_type.__name__})"
                     )
                 out[gid] = int(lg_idx)
     return out

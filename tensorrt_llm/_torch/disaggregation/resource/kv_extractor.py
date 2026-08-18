@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -27,6 +27,8 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
+    MAMBA_CONV_ROLE,
+    MAMBA_SSM_ROLE,
     AttentionLayerGroup,
     KVCachePageTable,
     LayerGroup,
@@ -83,6 +85,36 @@ class KVRegionExtractorV1(RegionExtractorBase):
     def page_table(self) -> KVCachePageTable:
         return self._page_table
 
+    @nvtx_range("KVRegionExtractorV1.extract_slot")
+    def extract_slot(
+        self,
+        slot_id: int,
+        layer_group_id: int = 0,
+        pool_idx: int = 0,
+    ) -> SpecRegion:
+        """Extract per-layer pointers for a single slot (used for mamba state).
+
+        Returns a SpecRegion with one pointer per layer:
+            ptr[i] = base + local_layer_id[i] * layer_stride + slot_id * slot_stride
+        """
+        lg = self._page_table.layer_groups[layer_group_id]
+        pv = lg.pool_views[pool_idx]
+        pool = get_physical_pool(self._page_table, layer_group_id, pv.pool_idx)
+
+        base_ptr = pool.base_address
+        layer_stride = pool.layer_stride_bytes
+        slot_stride = pool.slot_stride_bytes
+        assert layer_stride is not None
+        assert slot_stride is not None
+
+        local_layer_ids = sorted(set(int(e["local_layer_id"]) for e in pv.buffer_entries))
+        ptrs = np.array(
+            [base_ptr + lid * layer_stride + slot_id * slot_stride for lid in local_layer_ids],
+            dtype=np.int64,
+        )
+        memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=pool.slot_bytes)
+        return SpecRegion(memory=memory)
+
     @nvtx_range("KVRegionExtractorV1.extract")
     def extract(
         self,
@@ -125,6 +157,36 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 
 
+def _build_mamba_pool_views(conv_pool, ssm_pool, mamba_layer_offsets):
+    """Build pool_views for mamba: conv at pool_idx=0, ssm at pool_idx=1.
+
+    Mamba mapper dispatch is by pool_role (not mapper_kind), so mapper_kind
+    is left as default — MambaPolicy.build_cache_mapper uses the role to
+    select ConvStateMismatchMapper vs MambaHeadMismatchMapper.
+    """
+    sorted_lids = [lid for _, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])]
+    return [
+        PoolView(
+            pool_idx=0,
+            buffer_entries=np.array(
+                [(lid, 0, conv_pool.slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_CONV_ROLE,
+            mapper_kind=MapperKind.SECTIONED,
+            bytes_per_layer=conv_pool.slot_bytes,
+        ),
+        PoolView(
+            pool_idx=1,
+            buffer_entries=np.array(
+                [(lid, 0, ssm_pool.slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
+            ),
+            pool_role=MAMBA_SSM_ROLE,
+            mapper_kind=MapperKind.INDEXED,
+            bytes_per_layer=ssm_pool.slot_bytes,
+        ),
+    ]
+
+
 def _build_layer_group_for_mamba(
     manager: MambaHybridCacheManager, pool_group_idx: int
 ) -> MambaLayerGroup:
@@ -164,14 +226,20 @@ def _build_layer_group_for_mamba(
     ssm_elem_size = ssm_state.element_size()
     ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
 
-    return MambaLayerGroup(
+    local_layers = [
+        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
+        for gid, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
+    ]
+    pool_group = PhysicalPoolGroup(pools=[conv_pool, ssm_pool])
+    layer_group = MambaLayerGroup(
         pool_group_idx=pool_group_idx,
+        local_layers=local_layers,
+        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, mamba_layer_offsets),
         mamba_layer_offsets=mamba_layer_offsets,
-        conv_states=conv_pool,
-        ssm_states=ssm_pool,
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
     )
+    return layer_group, pool_group
 
 
 def _slot_stride_bytes(tensor: torch.Tensor) -> int:
@@ -249,14 +317,59 @@ def _build_layer_group_for_v2_mamba(
     ssm_elem_size = first_ssm_state.element_size()
     ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
 
-    return MambaLayerGroup(
+    local_layers = [
+        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
+        for gid, lid in sorted(mamba_layer_offsets.items(), key=lambda x: x[1])
+    ]
+    pool_group = PhysicalPoolGroup(pools=[conv_pool, ssm_pool])
+    layer_group = MambaLayerGroup(
         pool_group_idx=pool_group_idx,
+        local_layers=local_layers,
+        pool_views=_build_mamba_pool_views(conv_pool, ssm_pool, mamba_layer_offsets),
         mamba_layer_offsets=mamba_layer_offsets,
-        conv_states=conv_pool,
-        ssm_states=ssm_pool,
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
+        built_from_v2=True,
     )
+    return layer_group, pool_group
+
+
+def _build_non_kv_layers(
+    manager,
+    layer_groups: List[LayerGroup],
+    pool_groups: List[PhysicalPoolGroup],
+    *,
+    v2_mamba_pool_group_idx: Optional[int] = None,
+    v2_mamba_insert_idx: Optional[int] = None,
+) -> None:
+    """Append (or insert) non-KV (recurrent/state) layer groups to the page table.
+
+    Extension point for non-attention layer types. Currently handles Mamba;
+    add elif branches here for future recurrent/state layer types.
+
+    Args:
+        v2_mamba_pool_group_idx: If set, the V2 manager already placed mamba
+            pools into pool_groups at this index — reuse it instead of
+            appending a new pool group.
+        v2_mamba_insert_idx: If set, insert the mamba layer group at this
+            position (preserving original lifecycle ordering) instead of
+            appending at the end.
+    """
+    if isinstance(manager, MambaHybridCacheManagerV2):
+        if v2_mamba_pool_group_idx is not None and manager.local_num_mamba_layers > 0:
+            # Append a dedicated pool group (don't mutate the shared V2 entry).
+            mamba_pg_idx = len(pool_groups)
+            layer_group, local_pool_group = _build_layer_group_for_v2_mamba(manager, mamba_pg_idx)
+            pool_groups.append(local_pool_group)
+            if v2_mamba_insert_idx is not None:
+                layer_groups.insert(v2_mamba_insert_idx, layer_group)
+            else:
+                layer_groups.append(layer_group)
+    elif isinstance(manager, MambaHybridCacheManager):
+        pool_group_idx = len(pool_groups)
+        layer_group, pool_group = _build_layer_group_for_mamba(manager, pool_group_idx)
+        layer_groups.append(layer_group)
+        pool_groups.append(pool_group)
 
 
 def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
@@ -400,10 +513,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
                 pool_views=pool_views,
             )
         )
-    if isinstance(kv_cache_manager, MambaHybridCacheManager):
-        mamba_layer_group_idx = len(pool_groups)
-        mamba_layer_group = _build_layer_group_for_mamba(kv_cache_manager, mamba_layer_group_idx)
-        layer_groups.append(mamba_layer_group)
+    _build_non_kv_layers(kv_cache_manager, layer_groups, pool_groups)
 
     return KVCachePageTable(
         tokens_per_block=tokens_per_block,
@@ -515,6 +625,8 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
     layer_groups_by_id: List[LayerGroup | None] = [None] * len(manager.impl.layer_grouping)
+    v2_mamba_pool_group_idx: Optional[int] = None
+    v2_mamba_layer_group_ids: set = set()  # layer_group_ids handled by _build_non_kv_layers
 
     for pg_desc in pool_group_descs:
         storage_pg_idx = int(pg_desc.pool_group_index)
@@ -543,9 +655,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             if isinstance(manager, MambaHybridCacheManagerV2) and any(
                 manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
             ):
-                layer_groups_by_id[layer_group_id] = _build_layer_group_for_v2_mamba(
-                    manager, storage_pg_to_list_idx[storage_pg_idx]
-                )
+                # Record the pool_group_idx for mamba; handled by _build_non_kv_layers later.
+                v2_mamba_pool_group_idx = storage_pg_to_list_idx[storage_pg_idx]
+                v2_mamba_layer_group_ids.add(layer_group_id)
                 continue
 
             all_global_layer_ids = _compute_global_layer_ids(manager, layer_group_id)
@@ -642,18 +754,23 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 pool_views=pool_views,
             )
 
+    # Preserve original lifecycle ordering: mamba groups stay at their
+    # original layer_group_id positions. _build_non_kv_layers fills them in.
     layer_groups: List[LayerGroup] = []
     for layer_group_id, layer_group in enumerate(layer_groups_by_id):
-        if layer_group is None:
+        if layer_group is None and layer_group_id not in v2_mamba_layer_group_ids:
             raise ValueError(f"Missing V2 layer group descriptor for layer group {layer_group_id}")
-        layer_groups.append(layer_group)
+        if layer_group is not None:
+            layer_groups.append(layer_group)
+        # For skipped mamba IDs, a placeholder is inserted by _build_non_kv_layers below
 
-    if isinstance(manager, MambaHybridCacheManager) and not isinstance(
-        manager, MambaHybridCacheManagerV2
-    ):
-        mamba_layer_group_idx = len(pool_groups)
-        mamba_layer_group = _build_layer_group_for_mamba(manager, mamba_layer_group_idx)
-        layer_groups.append(mamba_layer_group)
+    _build_non_kv_layers(
+        manager,
+        layer_groups,
+        pool_groups,
+        v2_mamba_pool_group_idx=v2_mamba_pool_group_idx,
+        v2_mamba_insert_idx=min(v2_mamba_layer_group_ids) if v2_mamba_layer_group_ids else None,
+    )
 
     return KVCachePageTable(
         tokens_per_block=config.tokens_per_block,

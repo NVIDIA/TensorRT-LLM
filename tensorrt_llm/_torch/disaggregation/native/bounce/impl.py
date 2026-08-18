@@ -245,16 +245,15 @@ class VmmBounceTransport(BounceTransport):
         total = 0
         for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
             if int(block_ids.size) == 0:
-                # Nothing to transfer for this group. Hybrid models (Kimi K3: KDA + MLA) always
-                # carry a trailing empty entry for the mamba layer group — its state is not paged
-                # and rides extra_bytes instead — so an empty group must not disable bounce.
                 continue
-            known = g < len(self._block_bytes_per_group) and self._block_bytes_per_group[g]
-            if not known:
+            if g >= len(self._block_bytes_per_group):
                 return self._skip_bounce(
                     f"layer group {g} has blocks but no known slot size",
                     warn_key="kv-bounce-unknown-slot-size",
                 )
+            if not self._block_bytes_per_group[g]:
+                # In-range None = SLOT group (mamba/KDA); bytes in extra_bytes.
+                continue
             total += int(block_ids.size) * self._block_bytes_per_group[g]
         if extra_bytes > 0 and num_writers > 1:
             # Each fan-in writer appends its own recurrent-state fragments, whose sizes may differ

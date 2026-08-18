@@ -481,6 +481,14 @@ class AttentionPolicy:
     def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
 
+    def should_send(self, peer_overlap, peer_rank_info) -> bool:
+        """Attention uses head-duplication routing."""
+        dup = peer_overlap.duplicate_head_factor
+        if dup <= 1:
+            return True
+        tp_rank = self._ri.tp_rank % self._ri.tp_size_per_dp_group
+        return (peer_rank_info.dp_rank % dup) == (tp_rank % dup)
+
     def _tp_per_dp(self, ri: RankInfo) -> int:
         if getattr(ri.attention, "enable_attention_dp", False):
             return ri.tp_size // ri.dp_size
@@ -597,7 +605,7 @@ class AttentionPolicy:
         peer_dup_head = max(1, factor_peer // factor_self)
         return dup_head, peer_dup_head
 
-    def build_kv_mapper(
+    def build_mapper(
         self,
         *,
         peer_ri: RankInfo,
@@ -608,6 +616,8 @@ class AttentionPolicy:
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int = 1,
         peer_buffers_per_layer: int = 1,
+        self_lg=None,
+        peer_lg=None,
     ) -> RegionMapperBase:
         """Pick the mapper for one view pair.
 
