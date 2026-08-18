@@ -31,6 +31,12 @@ from tensorrt_llm.commands import serve
 pytestmark = pytest.mark.cpu_only
 
 
+@pytest.fixture(autouse=True)
+def _isolate_prometheus_multiproc_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent launcher tests from reusing a deleted Prometheus temp dir."""
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+
+
 def _mock_llmapi_modules(
     monkeypatch: pytest.MonkeyPatch,
     split_mpi_env: Callable[[], tuple[dict[str, str], dict[str, str]]],
