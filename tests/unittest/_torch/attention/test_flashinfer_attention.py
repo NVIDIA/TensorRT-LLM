@@ -66,11 +66,13 @@ class CUDAGraphTestScenario:
 
 class TestFlashInferAttention(unittest.TestCase):
 
-    def test_attention_layer_indices_ignore_zero_kv_layers(self):
+    def test_attention_layer_indices_ignore_zero_kv_layers(self) -> None:
 
         class FakeHybridManager:
-            layer_offsets = {10: 0, 20: 1, 30: 2}
-            num_kv_heads_per_layer = [8, 0, 8]
+
+            def __init__(self) -> None:
+                self.layer_offsets = {10: 0, 20: 1, 30: 2}
+                self.num_kv_heads_per_layer = [8, 0, 8]
 
             def is_attention_layer(self, layer_idx: int) -> bool:
                 return layer_idx != 20
@@ -79,26 +81,31 @@ class TestFlashInferAttention(unittest.TestCase):
             flashinfer_backend._get_attention_layer_indices(
                 FakeHybridManager()), [10, 30])
 
-    def test_attention_layer_indices_support_v1_manager(self):
+    def test_attention_layer_indices_support_v1_manager(self) -> None:
 
         class FakeV1Manager:
-            layer_offsets = {10: 0, 20: 1}
+
+            def __init__(self) -> None:
+                self.layer_offsets = {10: 0, 20: 1}
 
         self.assertEqual(
             flashinfer_backend._get_attention_layer_indices(FakeV1Manager()),
             [10, 20])
 
-    def test_hybrid_v2_metadata_uses_first_attention_layer_for_prepare(self):
+    def test_hybrid_v2_metadata_uses_first_attention_layer_for_prepare(
+            self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
         class FakeHybridManager:
-            layer_offsets = {10: 0, 20: 1}
-            layer_to_pool_mapping_dict = {0: 0, 1: 0}
             blocks_in_primary_pool = 4
             max_blocks_per_seq = 4
             tokens_per_block = 32
             is_vswa = False
+
+            def __init__(self) -> None:
+                self.layer_offsets = {10: 0, 20: 1}
+                self.layer_to_pool_mapping_dict = {0: 0, 1: 0}
 
             def is_attention_layer(self, layer_idx: int) -> bool:
                 return layer_idx == 20
