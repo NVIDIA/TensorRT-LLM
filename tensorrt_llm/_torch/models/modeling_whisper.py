@@ -381,6 +381,12 @@ class WhisperLogMelFrontend(nn.Module):
         extractor = _load_hf_feature_extractor(config)
         self.n_fft = int(extractor.n_fft)
         self.hop_length = int(extractor.hop_length)
+        # The extractor's own padded window length, kept verbatim because
+        # `WhisperInputProcessor` pads every request to exactly this many
+        # samples. `encoder_graph_spec` reports it as the fixed encoder input
+        # shape, so deriving it a second way would risk disagreeing with the
+        # tensors the processor actually produces.
+        self.n_samples = int(extractor.n_samples)
         # Pre-STFT Gaussian noise, applied where HF applies it; 0.0 (all
         # official checkpoints) disables it.
         self.dither = float(getattr(extractor, "dither", 0.0))
@@ -663,7 +669,7 @@ class WhisperInputProcessor(InputProcessor):
         different length (see `_resolve_decoder_prompt`) misses the mixed graph
         and runs that batch eagerly.
         """
-        return len(self._build_decoder_prompt())
+        return len(self._decoder_prompt)
 
     def _resolve_decoder_prompt(self, prompt_text: Optional[str]) -> List[int]:
         """Checkpoint-default forced prompt, or the user's decoder prompt.
@@ -895,21 +901,23 @@ class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         """Fixed-shape encoder contract for enc-dec encoder CUDA graphs.
 
         Every Whisper encoder request is an fp32 waveform zero-padded by
-        `WhisperInputProcessor` to the fixed window that yields exactly
+        `WhisperInputProcessor` to the extractor's window, which yields exactly
         ``max_source_positions`` encoder positions — so the encoder graph key
         degenerates to the batch size.
 
-        The window is derived rather than hardcoded: the conv stem halves the
-        STFT frame count, so ``n_samples = max_source_positions * 2 *
-        hop_length``. ``hop_length`` comes from the checkpoint's feature
-        extractor, the same source the input processor validates its own
-        window against.
+        The window is read from the feature extractor rather than recomputed.
+        ``max_source_positions * 2 * hop_length`` inverts the conv stem
+        correctly but only up to the truncation in the processor's own
+        ``n_samples // hop_length // 2`` check, so a checkpoint whose
+        ``n_samples`` is not an exact multiple of ``2 * hop_length`` would
+        pass that check while disagreeing with this shape — capturing graphs
+        that every runtime batch then misses. Taking the extractor's value
+        keeps both sides on one number.
 
         Returns ``(per_request_feature_shape, dtype, fixed_seq_len)``.
         """
         fixed_seq_len = int(self.config.max_source_positions)
-        hop_length = int(self.model.encoder.log_mel.hop_length)
-        n_samples = fixed_seq_len * 2 * hop_length
+        n_samples = int(self.model.encoder.log_mel.n_samples)
         return ((n_samples,), torch.float32, fixed_seq_len)
 
     def forward(

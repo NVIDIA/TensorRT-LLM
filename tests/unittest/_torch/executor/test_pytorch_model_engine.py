@@ -25,7 +25,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
-    _make_single_token_context_graph_batch)
+    _filter_cuda_graph_batch_sizes, _make_single_token_context_graph_batch)
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
                                           PrefillCudaGraphBackend,
@@ -1161,7 +1161,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
     @staticmethod
     def _encoder_spec_engine(encoder_cuda_graph_config,
                              declares_spec: bool,
-                             tp_size: int = 1):
+                             tp_size: int = 1,
+                             is_encode_only: bool = False):
         """A bare engine carrying only what `_encoder_graph_spec` reads."""
         spec = ((480000, ), torch.float32, 1500)
 
@@ -1176,6 +1177,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
         engine.encoder_cuda_graph_config = encoder_cuda_graph_config
         engine.is_draft_model = False
+        engine._is_encode_only = is_encode_only
         engine.model = _Model()
         engine.mapping = SimpleNamespace(tp_size=tp_size)
         return engine, spec
@@ -1239,6 +1241,90 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 seq_lens = config.seq_lens if config else []
                 engine._check_encoder_graph_bucket_config(
                     num_tokens or [], seq_lens or [])
+
+    def test_encoder_graph_bucket_config_warns_for_encode_only(self) -> None:
+        # An encode-only model receives its buckets through `cuda_graph_config`,
+        # a slot that has always accepted a batch-sizes-only
+        # EncodeCudaGraphConfig and run eager. Raising there would break
+        # deployments that predate feature mode, so warn and stay eager.
+        engine, _ = self._encoder_spec_engine(
+            EncodeCudaGraphConfig(batch_sizes=[1, 2]),
+            declares_spec=False,
+            is_encode_only=True)
+        with patch("tensorrt_llm._torch.pyexecutor.model_engine.logger.warning"
+                   ) as warning:
+            engine._check_encoder_graph_bucket_config([], [])
+        warning.assert_called_once()
+        self.assertIn("stays eager", warning.call_args.args[0])
+
+    def test_feature_encoder_batch_sizes_drop_past_the_token_budget(
+            self) -> None:
+        # A feature request costs a whole fixed_seq_len against the encoder
+        # token budget, so the budget caps the bucket list far below
+        # encoder_max_batch_size. An empty result is the signal to stay eager;
+        # a floor of 1 here would capture a graph larger than the metadata
+        # budget the encoder step actually builds.
+        fixed = 1500
+        for name, max_batch_size, max_num_tokens, expected in [
+            ("budget allows every bucket", 8, 8 * fixed, [1, 2, 4, 8]),
+            ("budget truncates the tail", 8, 2 * fixed, [1, 2]),
+            ("budget below one request", 8, fixed - 1, []),
+            ("batch size caps below the budget", 2, 8 * fixed, [1, 2]),
+        ]:
+            with self.subTest(name):
+                self.assertEqual(
+                    _filter_cuda_graph_batch_sizes([1, 2, 4, 8],
+                                                   max_batch_size,
+                                                   max_num_tokens,
+                                                   fixed,
+                                                   enable_padding=False),
+                    expected)
+
+    def test_feature_pad_batch_refuses_wide_bucket_gaps(self) -> None:
+        # A feature pad slot is a full fixed_seq_len encoder forward, unlike the
+        # 1-token pads of the token path, so padding is bounded at 12.5% extra
+        # work. Consecutive powers of two never clear that bound; a batch of 8
+        # padding to a configured bucket of 9 is the first case that does.
+        fixed = 1500
+        runner = self._feature_encoder_runner([1, 2, 4, 9], fixed)
+        runner.enabled = True
+
+        for name, batch_size, expected_seq_lens in [
+            ("exact bucket yields unchanged", 4, [fixed] * 4),
+            ("8 -> 9 is within 12.5%", 8, [fixed] * 9),
+            ("3 -> 4 exceeds 12.5%", 3, [fixed] * 3),
+            ("5 -> 9 exceeds 12.5%", 5, [fixed] * 5),
+        ]:
+            with self.subTest(name):
+                inputs = {'seq_lens': [fixed] * batch_size}
+                with runner.pad_batch(inputs, batch_size) as padded:
+                    self.assertEqual(padded['seq_lens'], expected_seq_lens)
+
+    def test_captured_graph_metadata_skips_the_eager_metadata_build(
+            self) -> None:
+        # The runtime path asks for captured metadata before building any, so a
+        # graph hit must not need an attn_metadata argument at all: on a hit
+        # `maybe_get_cuda_graph` only reads it for a backend check.
+        fixed = 1500
+        runner = self._feature_encoder_runner([1, 2], fixed)
+        runner.enabled = True
+        runner.retire_staging = Mock()
+        sentinel = object()
+        key = (2, 2 * fixed, fixed)
+        runner.graph_metadata[key] = {"attn_metadata": sentinel}
+
+        metadata, hit_key = runner.captured_graph_metadata(
+            {'seq_lens': [fixed] * 2})
+        self.assertIs(metadata, sentinel)
+        self.assertEqual(hit_key, key)
+        runner.retire_staging.assert_called_once()
+
+        # An uncaptured bucket must miss, leaving the caller to build metadata
+        # and take the full path rather than silently reusing another key's.
+        runner.retire_staging.reset_mock()
+        self.assertEqual(runner.captured_graph_metadata({'seq_lens': [fixed]}),
+                         (None, None))
+        runner.retire_staging.assert_not_called()
 
     def test_encoder_cuda_graph_stages_and_restores_fixed_sequence_slots(
             self) -> None:

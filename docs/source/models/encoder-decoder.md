@@ -440,12 +440,24 @@ decoder sequences after beam expansion.
 Which encoder buckets you must supply depends on the model. A text encoder,
 such as BART or T5, packs a variable number of tokens per request, so
 `num_tokens` and `seq_lens` are part of its key space and are required; leaving
-either unset is an error at engine construction. An encoder whose input is a
-fixed-shape per-request feature tensor, such as Whisper's audio waveform,
-produces the same number of encoder positions for every request, so both lists
-follow from the model and are derived rather than configured. For those models
+either unset is rejected when the model engine initializes, which happens in
+the worker after weights load rather than at `LLM(...)` construction — only the
+engine knows which kind of encoder the model has. An encoder whose input is a
+fixed-shape per-request feature tensor, such as Whisper's fixed 30-second
+zero-padded audio waveform (the mel transform runs inside the encoder, so the
+per-request input is the waveform itself, not a spectrogram), produces the same
+number of encoder positions for every request, so both lists follow from the
+model and are derived rather than configured. For those models
 `batch_sizes` alone enables capture, and any `num_tokens` or `seq_lens` you set
-is ignored:
+is ignored.
+
+Batch sizes that do not fit `encoder_max_num_tokens` divided by the model's
+encoder output length are dropped, and the encoder stays eager when none fit.
+Size the encoder token budget for the largest bucket before setting the
+buckets: Whisper emits 1500 encoder positions per request, so `batch_sizes` up
+to 8 needs `encoder_max_num_tokens` of at least 12000. `encoder_max_num_tokens`
+falls back to `max_num_tokens` when unset, which is a decoder-sized number and
+usually too small.
 
 ```python
 from tensorrt_llm.llmapi import EncodeCudaGraphConfig
@@ -457,13 +469,14 @@ llm = LLM(
     attn_backend="TRTLLM",
     max_batch_size=8,
     encoder_max_batch_size=8,
+    # 8 buckets * 1500 encoder positions. Leave this at the default and the
+    # 4 and 8 buckets are silently dropped.
+    encoder_max_num_tokens=12000,
     encoder_cuda_graph_config=EncodeCudaGraphConfig(batch_sizes=[1, 2, 4, 8]),
-    # ... the remaining Whisper settings from "Transcribe audio with Whisper"
+    # ... the remaining Whisper settings from "Transcribe audio with Whisper",
+    # whose `max_batch_size=4` this example raises to 8
 )
 ```
-
-Batch sizes that do not fit `encoder_max_num_tokens` divided by the model's
-encoder output length are dropped, and the encoder stays eager when none fit.
 
 `max_batch_size` controls the total decoder concurrency, while
 `encoder_max_batch_size` controls encoder microbatch admission. For better

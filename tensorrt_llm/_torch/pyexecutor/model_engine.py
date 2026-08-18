@@ -1053,12 +1053,18 @@ class PyTorchModelEngine(ModelEngine):
             max_cuda_graph_num_tokens=encoder_graph_max_num_tokens,
             max_num_tokens=self.encoder_max_num_tokens,
             max_seq_len=self.max_seq_len,
-            # The encoder runner takes its own graph pool. Encoder replay runs
-            # on `encoder_stream`, device-concurrent with decoder replay, and
-            # torch's pool-sharing contract assumes replays from a shared pool
-            # are not concurrent. That concurrency exists for every
-            # encoder-decoder model, so the token encoder path (T5/BART) stops
-            # sharing the decoder pool too, at the cost of its own allocation.
+            # The encoder runner must never be handed the decoder's pool:
+            # encoder replay runs on `encoder_stream`, device-concurrent with
+            # decoder replay, and torch's pool-sharing contract assumes
+            # replays from a shared pool are not concurrent.
+            #
+            # Literal None rather than `self._cuda_graph_mem_pool` states that
+            # as a requirement instead of leaving it to a coincidence. The
+            # engine attribute is None for the engine's whole life (nothing
+            # assigns it after its declaration), so each runner already
+            # created its own pool at its first capture and this allocates
+            # nothing new — but reading it here would silently start sharing
+            # the day someone gives that attribute a value.
             cuda_graph_mem_pool=None,
             is_encoder_decoder=self._is_encoder_decoder_model(),
             use_fixed_sequence_slots=(self._is_encoder_decoder_model()
@@ -4132,6 +4138,12 @@ class PyTorchModelEngine(ModelEngine):
         user to supply them — and for that encoder the buckets are the whole
         key space, so a config missing them can only ever run eager. Raise
         rather than degrade silently: the request to capture was explicit.
+
+        Encode-only is the exception. Its buckets arrive through
+        `cuda_graph_config` (see `__init__`), a slot that has always accepted a
+        batch-sizes-only `EncodeCudaGraphConfig` and run eager, so raising here
+        would break deployments that predate feature mode. Warn instead — the
+        silence was itself the defect.
         """
         if (self.encoder_cuda_graph_config is None
                 or self._model_encoder_graph_spec() is not None):
@@ -4142,6 +4154,12 @@ class PyTorchModelEngine(ModelEngine):
         if not encoder_cuda_graph_seq_lens:
             missing.append("seq_lens/max_seq_len")
         if not missing:
+            return
+        if self._is_encode_only:
+            logger.warning(
+                f"Encoder CUDA graph configuration has {' and '.join(missing)} "
+                f"unset. This model's encoder consumes packed tokens, so it "
+                f"needs both dimensions; the encode step stays eager.")
             return
         raise ValueError(
             f"Encoder CUDA graph configuration has {' and '.join(missing)} "
@@ -8467,6 +8485,21 @@ class PyTorchModelEngine(ModelEngine):
             if (f is None or int(request.encoder_output_len) != fixed
                     or tuple(f.shape) != (1, *runner.config.feature_shape)
                     or f.dtype != runner.config.feature_dtype):
+                # A shape the model's `encoder_graph_spec()` did not predict
+                # misses on every request, not just this one: capture already
+                # spent its time and memory and nothing will ever replay. Say
+                # so once — silence here reads as "graphs are working".
+                logger.warning_once(
+                    "Encoder CUDA graph: request features do not match the "
+                    "captured contract (expected shape "
+                    f"{(1, *runner.config.feature_shape)} dtype "
+                    f"{runner.config.feature_dtype} encoder_output_len "
+                    f"{fixed}, got shape "
+                    f"{None if f is None else tuple(f.shape)} dtype "
+                    f"{None if f is None else f.dtype} encoder_output_len "
+                    f"{int(request.encoder_output_len)}); the encoder step "
+                    "stays eager.",
+                    key="encoder_cuda_graph_feature_contract_warning")
                 return None
             features.append(f)
 
@@ -8509,10 +8542,16 @@ class PyTorchModelEngine(ModelEngine):
                 -(i + 1)
                 for i in range(len(padded_seq_lens) - len(request_ids))
             ]
-            eager_attn_metadata = self._make_encoder_attn_metadata(
-                padded_seq_lens, padded_request_ids)
-            graph_attn_metadata, key = runner.maybe_get_cuda_graph(
-                padded_inputs, eager_attn_metadata)
+            # A captured bucket is served from graph-resident metadata, so
+            # only a miss pays for a fresh `TrtllmAttentionMetadata` +
+            # `prepare_encoder_only()`.
+            graph_attn_metadata, key = runner.captured_graph_metadata(
+                padded_inputs)
+            if key is None:
+                eager_attn_metadata = self._make_encoder_attn_metadata(
+                    padded_seq_lens, padded_request_ids)
+                graph_attn_metadata, key = runner.maybe_get_cuda_graph(
+                    padded_inputs, eager_attn_metadata)
             if key is None:
                 return None
             padded_inputs['attn_metadata'] = graph_attn_metadata

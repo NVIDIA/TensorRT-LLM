@@ -1648,6 +1648,57 @@ class EncoderCUDAGraphRunner:
             source_sequence_lengths)]
         return prepared_inputs
 
+    def _resolve_graph_key(self, inputs: Dict[str,
+                                              Any]) -> Optional[EncoderKeyType]:
+        """The capture key `inputs` maps to, or None if no graph can serve it.
+
+        Everything here is derived from `inputs` alone, so it is safe to ask
+        before building attention metadata.
+        """
+        if not self.enabled or ExpertStatistic.should_record():
+            return None
+
+        if len(inputs['seq_lens']) not in self.supported_batch_sizes:
+            return None
+
+        key, is_padding_performed, is_padding_successful = self.get_graph_key(
+            inputs)
+        if self.is_encoder_decoder and key not in self.capture_keys:
+            return None
+        if (not self.padding_enabled and is_padding_performed) \
+                or not is_padding_successful:
+            return None
+        return key
+
+    def _captured_metadata_for_key(self, key: EncoderKeyType) -> Optional[Any]:
+        """Graph-resident metadata for an already-resolved `key`, or None."""
+        if key not in self.graph_metadata:
+            return None
+        # Token-path graph keys all alias the same host staging buffers, so
+        # retire a prior graph's captured reads before the caller updates
+        # them. Feature mode stages elsewhere and this is a no-op there.
+        self.retire_staging()
+        return self.graph_metadata[key]["attn_metadata"]
+
+    def captured_graph_metadata(
+        self,
+        inputs: Dict[str, Any],
+    ) -> Tuple[Optional[Any], Optional[EncoderKeyType]]:
+        """Graph-resident metadata for `inputs`, if its key is already captured.
+
+        Resolvable from `inputs` alone, so the runtime path can call this
+        before building eager attention metadata that a graph hit would never
+        read. Returns (None, None) on a miss, leaving the caller to build that
+        metadata and take the full path.
+        """
+        key = self._resolve_graph_key(inputs)
+        if key is None:
+            return None, None
+        graph_attn_metadata = self._captured_metadata_for_key(key)
+        if graph_attn_metadata is None:
+            return None, None
+        return graph_attn_metadata, key
+
     def maybe_get_cuda_graph(
         self,
         inputs: Dict[str, Any],
@@ -1676,28 +1727,13 @@ class EncoderCUDAGraphRunner:
                 key="encoder_cuda_graph_backend_warning")
             return None, None
 
-        if ExpertStatistic.should_record():
+        key = self._resolve_graph_key(inputs)
+        if key is None:
             return None, None
 
-        seq_lens = inputs['seq_lens']
-        padded_batch_size = len(seq_lens)
-        if padded_batch_size not in self.supported_batch_sizes:
-            return None, None
-
-        key, is_padding_performed, is_padding_successful = self.get_graph_key(
-            inputs)
-        if self.is_encoder_decoder and key not in self.capture_keys:
-            return None, None
-        padded_max_seq_len = key[2]
-        if (not self.padding_enabled and is_padding_performed) \
-                or not is_padding_successful:
-            return None, None
-
-        if key in self.graph_metadata:
-            # Every graph key aliases the same host staging buffers. Retire a
-            # prior graph's captured reads before the caller updates them.
-            self.retire_staging()
-            return self.graph_metadata[key]["attn_metadata"], key
+        graph_attn_metadata = self._captured_metadata_for_key(key)
+        if graph_attn_metadata is not None:
+            return graph_attn_metadata, key
 
         # New key not yet captured. Only create graph metadata during explicit
         # startup warmup; unseen runtime keys fall back to eager execution.
@@ -1721,6 +1757,8 @@ class EncoderCUDAGraphRunner:
 
         # First sighting of this key: create graph-resident metadata and bind
         # it to stable pinned seq_lens storage for future replays.
+        padded_batch_size = len(inputs['seq_lens'])
+        padded_max_seq_len = key[2]
         graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
             padded_batch_size,
             False,
@@ -2010,12 +2048,13 @@ class EncoderCUDAGraphRunner:
         """Capture setup for the fixed-shape feature mode.
 
         The capture region receives the static device feature buffer sliced to
-        the padded batch size, and never captures the input H2D: all buckets
-        share one pinned mirror, and consecutive encoder batches (different
-        buckets) can be enqueued back-to-back, so a captured H2D would read the
-        mirror at replay-execution time, after the host has already refilled it
-        for the next batch. The eager H2D in `_replay_features` is
-        stream-ordered and guarded by per-mirror events instead.
+        the padded batch size, and never captures the input H2D: mirrors are
+        pooled across buckets rather than owned per bucket
+        (`FEATURE_MIRROR_SLOTS` of them, rotated), and consecutive encoder
+        batches can be enqueued back-to-back, so a captured H2D would read a
+        mirror at replay-execution time, after the host had already rotated
+        back onto it. The eager H2D in `_replay_features` is stream-ordered
+        and guarded by per-mirror events instead.
         """
         padded_batch_size, _, _ = key
 
