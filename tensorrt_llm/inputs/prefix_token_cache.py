@@ -39,21 +39,23 @@ class PrefixTokenCache:
     every entry. Eviction is LRU on insertion order.
     """
 
-    def __init__(self,
-                 max_entries: int = 512,
-                 overlap: int = 64,
-                 resync: int = 32,
-                 min_chars: int = 4096,
-                 bucket_chars: int = 2048) -> None:
+    def __init__(
+        self,
+        max_entries: int = 512,
+        overlap: int = 64,
+        resync: int = 32,
+        min_chars: int = 4096,
+        bucket_chars: int = 2048,
+    ) -> None:
         self._lock = threading.Lock()
         self._max_entries = max_entries
         self._overlap = overlap
         self._resync = resync
         self._min_chars = min_chars
         self._bucket_chars = bucket_chars
-        self._buckets = {}   # bucket key -> [entry id]
-        self._entries = {}   # entry id -> (text, ids, ends, starts, bucket key)
-        self._order = []     # entry ids, oldest first
+        self._buckets = {}  # bucket key -> [entry id]
+        self._entries = {}  # entry id -> (text, ids, ends, starts, bucket key)
+        self._order = []  # entry ids, oldest first
         self._next_id = 0
         # counters, for logging/tests only
         self.hits = 0
@@ -65,7 +67,7 @@ class PrefixTokenCache:
         return self._min_chars
 
     def _bucket_key(self, text: str):
-        return hash(text[:self._bucket_chars])
+        return hash(text[: self._bucket_chars])
 
     def _find_longest_prefix(self, text: str):
         """Longest cached entry that is a prefix of `text`. Caller holds lock."""
@@ -105,25 +107,22 @@ class PrefixTokenCache:
                     prev = (pids, pends, pstarts)
 
         # tokenize outside the lock: this is the expensive part
-        enc = tokenizer(text[start_char:],
-                        add_special_tokens=False,
-                        return_offsets_mapping=True,
-                        **kwargs)
+        enc = tokenizer(
+            text[start_char:], add_special_tokens=False, return_offsets_mapping=True, **kwargs
+        )
         new_ids, new_offsets = enc["input_ids"], enc["offset_mapping"]
 
         if reuse:
             pids, pends, pstarts = prev
             span = min(self._resync, len(pids) - reuse, len(new_ids))
-            if span <= 0 or list(new_ids[:span]) != list(pids[reuse:reuse +
-                                                             span]):
+            if span <= 0 or list(new_ids[:span]) != list(pids[reuse : reuse + span]):
                 # the tokenizer did not re-synchronize at the seam
                 with self._lock:
                     self.resync_failures += 1
                 reuse, start_char = 0, 0
-                enc = tokenizer(text,
-                                add_special_tokens=False,
-                                return_offsets_mapping=True,
-                                **kwargs)
+                enc = tokenizer(
+                    text, add_special_tokens=False, return_offsets_mapping=True, **kwargs
+                )
                 new_ids, new_offsets = enc["input_ids"], enc["offset_mapping"]
 
         if reuse:
@@ -162,16 +161,9 @@ def get_prefix_token_cache() -> PrefixTokenCache:
         with _CACHE_LOCK:
             if _CACHE is None:
                 _CACHE = PrefixTokenCache(
-                    max_entries=int(
-                        os.environ.get("TLLM_PREFIX_TOKEN_CACHE_ENTRIES",
-                                       "512")),
-                    overlap=int(
-                        os.environ.get("TLLM_PREFIX_TOKEN_CACHE_OVERLAP",
-                                       "64")),
-                    resync=int(
-                        os.environ.get("TLLM_PREFIX_TOKEN_CACHE_RESYNC", "32")),
-                    min_chars=int(
-                        os.environ.get("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS",
-                                       "4096")),
+                    max_entries=int(os.environ.get("TLLM_PREFIX_TOKEN_CACHE_ENTRIES", "512")),
+                    overlap=int(os.environ.get("TLLM_PREFIX_TOKEN_CACHE_OVERLAP", "64")),
+                    resync=int(os.environ.get("TLLM_PREFIX_TOKEN_CACHE_RESYNC", "32")),
+                    min_chars=int(os.environ.get("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS", "4096")),
                 )
     return _CACHE

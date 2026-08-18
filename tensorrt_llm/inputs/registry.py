@@ -39,6 +39,7 @@ from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
 from .multimodal_data import serialize_item
+from .prefix_token_cache import get_prefix_token_cache, prefix_cache_enabled
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -75,10 +76,6 @@ class InputProcessor(Protocol):
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         ...
-
-
-from .prefix_token_cache import (get_prefix_token_cache,
-                                 prefix_cache_enabled)
 
 
 class DefaultInputProcessor(InputProcessor):
@@ -133,7 +130,8 @@ class DefaultInputProcessor(InputProcessor):
         prompt = inputs.get("prompt")
         cache = get_prefix_token_cache() if prefix_cache_enabled() else None
         use_cache = (cache is not None and isinstance(prompt, str)
-                     and len(prompt) >= cache.min_chars and "query" not in inputs
+                     and len(prompt) >= cache.min_chars
+                     and "query" not in inputs
                      and getattr(self.tokenizer, "is_fast", False)
                      and not sampling_params.add_special_tokens
                      and sampling_params.truncate_prompt_tokens is None)
