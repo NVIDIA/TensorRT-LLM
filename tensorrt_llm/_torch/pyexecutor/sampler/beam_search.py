@@ -1207,7 +1207,7 @@ def _prepare_beam_history_cba(
         return BeamHistory(
             tokens=tokens,
             # [beam, tokens, 1]: the sampled token's logprob per position,
-            # matching the shape contract of _convert_logprobs_tensor_to_list.
+            # matching the shape contract of convert_logprobs_tensor_to_list.
             logprobs=log_probs.unsqueeze(-1) if log_probs is not None else None,
             logprobs_indices=tokens.unsqueeze(-1) if return_log_probs else None,
             cum_logprobs=cum_logprobs,
