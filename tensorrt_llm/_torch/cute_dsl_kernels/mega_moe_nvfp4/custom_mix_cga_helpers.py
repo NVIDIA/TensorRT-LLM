@@ -46,6 +46,9 @@ class _RuntimeInitMbarrierArray(pipeline.MbarrierArray):
         # CUTLASS DSL 4.5 requires static participant metadata. The hardware
         # barrier itself is initialized with init_arrive_count below.
         self.arrive_count = self.cg.size
+        mbarrier_layout = getattr(pipeline, "MbarrierLayout", None)
+        self.mbarrier_layout = mbarrier_layout.V0 if mbarrier_layout is not None else None
+        self.name = ""
         self.mbarrier_base = barrier_storage
 
         def initialize_barriers() -> None:
@@ -71,6 +74,8 @@ class _RuntimeInitMbarrierArray(pipeline.MbarrierArray):
         result.op_type = self.op_type
         result.cg = self.cg
         result.arrive_count = self.arrive_count
+        result.mbarrier_layout = self.mbarrier_layout
+        result.name = self.name
         result.mbarrier_base = values[0]
         return result
 
