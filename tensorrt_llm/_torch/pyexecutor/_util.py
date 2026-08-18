@@ -1939,8 +1939,8 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
-        # Estimation managers are throwaway probes whose pools only hold the
-        # dummy requests. An explicit host tier is prefaulted and page-locked at
+        # Estimation managers are throwaway probes whose pools only hold dummy
+        # requests. An explicit host tier is prefaulted and page-locked at
         # construction, so a probe would pin the whole configured budget to back
         # a cache it cannot fill.
         if estimating_kv_cache:
@@ -1955,9 +1955,9 @@ class KvCacheCreator:
             or self._should_create_separate_draft_kv_cache())  # one-model
         draft_kv_cache_config = None
         if has_draft:
-            # Used when each manager sizes pools from max_gpu_total_bytes (V2
-            # and V1 VSWA). V1 non-VSWA and estimation size GPU pools from a
-            # shared max_tokens instead.
+            # The GPU split applies when each manager sizes its pools from
+            # max_gpu_total_bytes (V2 and V1 VSWA). V1 non-VSWA and estimation
+            # size GPU pools from a shared max_tokens instead.
             needs_gpu_split = (not estimating_kv_cache
                                and self._needs_gpu_kv_cache_budget_split(
                                    original_max_seq_len, self_kv_cache_config))
@@ -1971,8 +1971,8 @@ class KvCacheCreator:
                             and self._draft_model_engine is not None)
             if not v2_two_model:
                 # Target and draft are alive together and each sizes its host
-                # pool from host_cache_size directly, so they have to divide the
-                # configured budget instead of both claiming all of it.
+                # pool from host_cache_size directly, so they must divide the
+                # configured budget.
                 self_kv_cache_config, draft_kv_cache_config = (
                     self._split_kv_cache_budget_for_draft(
                         "host_cache_size", self_kv_cache_config,
