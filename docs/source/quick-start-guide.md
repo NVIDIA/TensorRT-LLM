@@ -19,11 +19,17 @@ To start the server, you can run a command like the following example inside a D
 trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
-If the server reports `MPI_ERR_SPAWN` or hangs after logging that rank 0 is using
-`MpiPoolSession` to spawn MPI processes, launch it through `mpirun`:
+```{note}
+On a Slurm-managed node, if the server reports `MPI_ERR_SPAWN` or hangs after
+logging that rank 0 is using `MpiPoolSession` to spawn MPI processes, launch it
+through `mpirun`:
 
 ```bash
 mpirun -n 1 --oversubscribe --allow-run-as-root trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+```
+
+The `--allow-run-as-root` option is only required when running as root, such as
+inside some containers. Omit it when running as a non-root user.
 ```
 
 You may also deploy pre-quantized models to improve performance.
