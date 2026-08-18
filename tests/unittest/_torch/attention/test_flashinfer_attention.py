@@ -69,28 +69,31 @@ class TestFlashInferAttention(unittest.TestCase):
     def test_attention_layer_indices_ignore_zero_kv_layers(self):
 
         class FakeHybridManager:
-            layer_offsets = {0: 0, 1: 1, 2: 2}
-            num_kv_heads_per_layer = [0, 8, 8]
+            layer_offsets = {10: 0, 20: 1, 30: 2}
+            num_kv_heads_per_layer = [8, 0, 8]
+
+            def is_attention_layer(self, layer_idx: int) -> bool:
+                return layer_idx != 20
 
         self.assertEqual(
             flashinfer_backend._get_attention_layer_indices(
-                FakeHybridManager()), [1, 2])
+                FakeHybridManager()), [10, 30])
 
     def test_attention_layer_indices_support_v1_manager(self):
 
         class FakeV1Manager:
-            layer_offsets = {0: 0, 1: 1}
+            layer_offsets = {10: 0, 20: 1}
 
         self.assertEqual(
             flashinfer_backend._get_attention_layer_indices(FakeV1Manager()),
-            [0, 1])
+            [10, 20])
 
     def test_hybrid_v2_metadata_uses_first_attention_layer_for_prepare(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
         class FakeHybridManager:
-            layer_offsets = {0: 0, 1: 1}
+            layer_offsets = {10: 0, 20: 1}
             layer_to_pool_mapping_dict = {0: 0, 1: 0}
             blocks_in_primary_pool = 4
             max_blocks_per_seq = 4
@@ -98,7 +101,7 @@ class TestFlashInferAttention(unittest.TestCase):
             is_vswa = False
 
             def is_attention_layer(self, layer_idx: int) -> bool:
-                return layer_idx == 1
+                return layer_idx == 20
 
             def get_layer_page_index_scale(self, layer_idx: int) -> int:
                 return 1
@@ -106,7 +109,7 @@ class TestFlashInferAttention(unittest.TestCase):
         manager = FakeHybridManager()
         manager.get_buffers = mock.Mock(
             side_effect=lambda layer_idx: torch.empty(4)
-            if layer_idx == 1 else self.fail(
+            if layer_idx == 20 else self.fail(
                 "recurrent layer queried for KV buffers"))
         manager.get_batch_cache_indices_flat = mock.Mock(
             return_value=torch.tensor([2], dtype=torch.int32))
@@ -126,13 +129,13 @@ class TestFlashInferAttention(unittest.TestCase):
             mamba_metadata=False,
         )
 
-        self.assertEqual(metadata._primary_kv_layer_idx, 1)
-        manager.get_buffers.assert_called_once_with(1)
+        self.assertEqual(metadata._primary_kv_layer_idx, 20)
+        manager.get_buffers.assert_called_once_with(20)
 
         metadata.prepare()
 
         manager.get_batch_cache_indices_flat.assert_called_once_with(
-            [7], [1], layer_idx=1)
+            [7], [1], layer_idx=20)
 
     def test_separate_kv_draft_metadata_uses_draft_manager(self):
         if not torch.cuda.is_available():
