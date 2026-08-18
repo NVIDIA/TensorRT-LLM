@@ -898,6 +898,9 @@ class Runner:
             )
         else:
             raise NotImplementedError("Unsupported config")
+        # is_gen regardless of --run-type: these dummies only reserve blocks. The
+        # measured step takes its shape from the attn_metadata built in forward(),
+        # which sets num_contexts and prompt_lens per run type.
         # The prefill pass below writes the history itself, so ask for materialized
         # blocks where the manager takes the argument. Checked by signature, not by
         # class: MambaHybridCacheManagerV2 subclasses KVCacheManagerV2 but overrides
