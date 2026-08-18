@@ -147,6 +147,15 @@ def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> No
         pytest.skip("CUDA required for MegaMoE tests")
     if dist.is_initialized():
         return
+    if world_size == 1:
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend="nccl",
+            store=dist.HashStore(),
+            rank=rank,
+            world_size=world_size,
+        )
+        return
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29561")
     os.environ["RANK"] = str(rank)
