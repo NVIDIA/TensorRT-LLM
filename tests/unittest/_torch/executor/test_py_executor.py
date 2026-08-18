@@ -971,6 +971,7 @@ class TestDisaggTransferIdleProgress:
 
     def test_polls_generation_transfer_when_admission_blocked(self):
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
@@ -988,6 +989,7 @@ class TestDisaggTransferIdleProgress:
 
     def test_peer_rank_enters_bounded_progress_poll(self):
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
         executor.dist.allreduce.return_value = 1
         executor._check_disagg_gen_cache_transfer_status = Mock()
@@ -1007,6 +1009,7 @@ class TestDisaggTransferIdleProgress:
 
     def test_falls_back_to_context_transfer_when_not_generation_blocked(self):
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=1)
         executor._check_disagg_gen_cache_transfer_status = Mock()
         executor._check_disagg_ctx_cache_transfer_status = Mock()
@@ -1022,11 +1025,40 @@ class TestDisaggTransferIdleProgress:
         executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
         executor._check_disagg_gen_cache_transfer_status.assert_not_called()
 
+    @pytest.mark.parametrize("in_flight", [True, False])
+    def test_inflight_gen_receive_routes_idle_wait_to_generation(self, in_flight):
+        """An in-flight receive alone must select the generation wait.
+
+        The context wait never sleeps for a receive-only worker, so routing
+        there would spin and starve the transfer threads finishing the receive.
+        """
+        executor = object.__new__(PyExecutor)
+        executor.active_requests = [_make_disagg_transfer_request(1, 32, in_progress=in_flight)]
+        executor.dist = Mock(tp_size=1)
+        executor._check_disagg_gen_cache_transfer_status = Mock()
+        executor._check_disagg_ctx_cache_transfer_status = Mock()
+
+        PyExecutor._check_disagg_transfer_progress_when_idle(
+            executor,
+            num_fitting_reqs=0,
+            fitting_disagg_gen_init_requests=[],
+            wait_for_disagg_gen_transfer_progress=False,
+            all_gen_first=False,
+        )
+
+        if in_flight:
+            executor._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
+            executor._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        else:
+            executor._check_disagg_ctx_cache_transfer_status.assert_called_once_with(1)
+            executor._check_disagg_gen_cache_transfer_status.assert_not_called()
+
     def test_gen_only_no_context_benchmark_polls_context_when_idle(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=4, cp_size=1, world_size=4)
         executor.dist.allreduce.return_value = 0
         executor.dist.tp_allreduce.return_value = 1
@@ -1167,6 +1199,7 @@ class TestDisaggTransferIdleProgress:
 
     def test_peer_cp_rank_enters_context_progress_poll(self):
         executor = object.__new__(PyExecutor)
+        executor.active_requests = []
         executor.dist = Mock(tp_size=1, cp_size=4, world_size=4)
         executor.dist.allreduce.return_value = 0
         executor.dist.tp_cp_allgather.return_value = [0, 1, 0, 0]

@@ -3626,8 +3626,18 @@ class PyExecutor:
                 and not self._is_disagg_gen_only_no_context_benchmark()):
             return
 
-        local_need_gen_check = (uses_async_gen_transfer and local_needs_progress
-                                and wait_for_disagg_gen_transfer_progress)
+        # An in-flight receive must vote too, not just admission-budget
+        # pressure. The context wait is a no-op for a receive-only worker:
+        # check_context_transfer_status() returns on `not
+        # _ever_had_send_session` *above* its poll, so it never sleeps. Such a
+        # worker would spin the scheduler loop and starve the GIL from the
+        # transfer threads that alone finish the receive it is waiting on,
+        # whereas the generation wait does reach its poll interval.
+        local_need_gen_check = (
+            uses_async_gen_transfer and local_needs_progress
+            and (wait_for_disagg_gen_transfer_progress
+                 or any(req.is_disagg_generation_transmission_in_progress
+                        for req in self.active_requests)))
 
         any_need_gen_check = self._sync_disagg_gen_status_entry(
             local_need_gen_check)
@@ -3635,7 +3645,8 @@ class PyExecutor:
             if local_need_gen_check:
                 logger.debug(
                     "Waiting for generation KV cache transfer progress to "
-                    "free disagg admission budget")
+                    "complete an in-flight receive or free disagg admission "
+                    "budget")
             self._check_disagg_gen_cache_transfer_status(1)
             return
 
