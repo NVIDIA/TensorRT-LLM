@@ -58,7 +58,7 @@ commands:
       backend:
         type: Choice(['_autodeploy', 'pytorch'])
         default: pytorch
-        status: beta
+        status: deprecated
         required: false
         multiple: false
         is_flag: false
@@ -377,7 +377,7 @@ commands:
         flags:
         - "--post_processor_hook"
       reasoning_parser:
-        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'gemma4', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'qwen3', 'qwen3_5'])
+        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'gemma4', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
         default: null
         status: prototype
         required: false
@@ -385,6 +385,15 @@ commands:
         is_flag: false
         flags:
         - "--reasoning_parser"
+      report_addr:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--report_addr"
       revision:
         type: str
         default: null
@@ -520,6 +529,15 @@ commands:
         is_flag: false
         flags:
         - "--metrics-log-interval"
+      report_addr:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--report_addr"
       request_timeout:
         type: int
         default: 180

@@ -939,15 +939,16 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
 
 def register_ar_fusions(custom_passes: List[PatternMatcherPass],
                         mapping: Mapping, enable_ub: bool):
-    register_ar_residual_norm(custom_passes[-1], mapping,
-                              torch.ops.trtllm.allreduce)
-    register_ar_residual_norm(custom_passes[-1], mapping,
-                              torch.ops.trtllm.tunable_allreduce)
+    allreduce_funcs = [
+        torch.ops.trtllm.allreduce,
+        torch.ops.trtllm.tunable_allreduce,
+        torch.ops.trtllm.autotuned_allreduce,
+    ]
+    for allreduce_func in allreduce_funcs:
+        register_ar_residual_norm(custom_passes[-1], mapping, allreduce_func)
 
     _append_named_pass(custom_passes, "ar_residual_norm_quant")
-    for allreduce_func in [
-            torch.ops.trtllm.allreduce, torch.ops.trtllm.tunable_allreduce
-    ]:
+    for allreduce_func in allreduce_funcs:
         register_ar_residual_norm_fp8_quant(custom_passes[-1], mapping,
                                             allreduce_func)
         register_ar_residual_norm_fp4_quant(custom_passes[-1], mapping,
@@ -961,6 +962,5 @@ def register_ar_fusions(custom_passes: List[PatternMatcherPass],
                                                     allreduce_func)
 
     if enable_ub:
-        register_ub_patterns(custom_passes, mapping, torch.ops.trtllm.allreduce)
-        register_ub_patterns(custom_passes, mapping,
-                             torch.ops.trtllm.tunable_allreduce)
+        for allreduce_func in allreduce_funcs:
+            register_ub_patterns(custom_passes, mapping, allreduce_func)

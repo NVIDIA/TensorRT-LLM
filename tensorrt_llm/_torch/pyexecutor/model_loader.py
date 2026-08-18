@@ -413,6 +413,7 @@ class ModelLoader:
             # No config to resolve a model class from; still resolve the
             # "auto" sentinel so it never leaks past config loading.
             _resolve_transceiver_runtime_auto(llm_args)
+            _resolve_kv_cache_manager_v2_auto(llm_args)
             return llm_args
 
         config_kwargs = {
@@ -423,13 +424,28 @@ class ModelLoader:
             config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
 
         if llm_args.speculative_config:
+            from tensorrt_llm._torch.speculative.utils import \
+                resolve_mtp_checkpoint_source
+
+            resolve_mtp_checkpoint_source(llm_args.speculative_config,
+                                          checkpoint_dir)
             config_kwargs['spec_config'] = llm_args.speculative_config
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
-        use_kv_cache_manager_v2 = (
+        original_kv_cache_manager_setting = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
+
+        # Preferences follow the checkpoint's original architecture:
+        # _resolve_class may rewrite it to an execution class (e.g.
+        # MTPDraftModelForCausalLM), which must not drop the target model's
+        # preferences.
+        preference_cls = model_cls
+        architectures = getattr(config.pretrained_config, 'architectures', None)
+        if architectures:
+            preference_cls = get_registered_model_class(
+                architectures[0]) or model_cls
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -452,23 +468,13 @@ class ModelLoader:
             update_spec_config_from_model_config(llm_args.speculative_config,
                                                  config.pretrained_config)
 
-        # The transceiver preference follows the checkpoint's original
-        # architecture: _resolve_class may rewrite it to an execution class
-        # (e.g. MTPDraftModelForCausalLM), which must not drop the target
-        # model's preference.
-        preference_cls = model_cls
-        architectures = getattr(config.pretrained_config, 'architectures', None)
-        if architectures:
-            preference_cls = get_registered_model_class(
-                architectures[0]) or model_cls
-
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
                                           config.pretrained_config)
-        _resolve_kv_cache_manager_v2_auto(
-            llm_args, model_defaults, original_setting=use_kv_cache_manager_v2)
+        _resolve_kv_cache_manager_v2_auto(llm_args, preference_cls,
+                                          config.pretrained_config)
         _validate_and_adjust_mamba_snapshot_config(config, llm_args)
-        if use_kv_cache_manager_v2 == "auto":
+        if original_kv_cache_manager_setting == "auto":
             logger.info(
                 "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
                 llm_args.kv_cache_config.use_kv_cache_manager_v2,
@@ -566,8 +572,7 @@ class ModelLoader:
 
             loads_draft_weights = (
                 self.spec_config is not None
-                and (self.spec_config.spec_dec_mode.need_load_draft_weights()
-                     or self.spec_config._use_shared_kv_cache))
+                and self.spec_config.needs_separate_draft_weights)
             speculative_mode = self._speculative_mode_name(self.spec_config)
             post_transform_qualification = self._qualify_post_transform_profile(
                 model,
@@ -719,19 +724,7 @@ class ModelLoader:
                                             self.weight_mapper)
 
                 if loads_draft_weights:
-                    weights = checkpoint_loader.load_weights(
-                        self.spec_config.speculative_model,
-                        mapping=self.mapping)
-
-                    draft_model_arch = model.draft_config.pretrained_config.architectures[
-                        0]
-                    draft_weight_mapper = AutoCheckpointMapper.get(
-                        checkpoint_loader.checkpoint_format, draft_model_arch)
-                    draft_weight_mapper.init_model_and_config(
-                        model.draft_model, model.draft_config)
-
-                    self._call_load_weights(model.load_draft_weights, weights,
-                                            draft_weight_mapper)
+                    self._load_separate_draft_weights(model, checkpoint_loader)
 
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a
@@ -854,21 +847,8 @@ class ModelLoader:
                                     "pool.")
 
                             if loads_draft_weights:
-                                draft_weights = checkpoint_loader.load_weights(
-                                    self.spec_config.speculative_model,
-                                    mapping=self.mapping)
-
-                                draft_model_arch = model.draft_config.pretrained_config.architectures[
-                                    0]
-                                draft_weight_mapper = AutoCheckpointMapper.get(
-                                    checkpoint_loader.checkpoint_format,
-                                    draft_model_arch)
-                                draft_weight_mapper.init_model_and_config(
-                                    model.draft_model, model.draft_config)
-
-                                self._call_load_weights(
-                                    model.load_draft_weights, draft_weights,
-                                    draft_weight_mapper)
+                                self._load_separate_draft_weights(
+                                    model, checkpoint_loader)
 
                             # Run post_load hooks INSIDE the pool so any
                             # tensors they create or rebind (fused QKV,
@@ -1128,6 +1108,32 @@ class ModelLoader:
             return "unknown"
         return mode_name.lower()
 
+    def _load_separate_draft_weights(
+            self, model: DecoderModelForCausalLM,
+            checkpoint_loader: BaseCheckpointLoader) -> None:
+        """Load draft/MTP weights from ``speculative_model`` into the one-engine model.
+
+        Eagle3 / external drafters use a draft-specific mapper and ``draft_config``.
+        One-model MTP with separate heads reuses the target architecture mapper
+        because MTP modules are already attached under the target model.
+        """
+        draft_weights = checkpoint_loader.load_weights(
+            self.spec_config.speculative_model, mapping=self.mapping)
+
+        if model.draft_config is not None:
+            draft_model_arch = model.draft_config.pretrained_config.architectures[
+                0]
+            draft_weight_mapper = AutoCheckpointMapper.get(
+                checkpoint_loader.checkpoint_format, draft_model_arch)
+            draft_weight_mapper.init_model_and_config(model.draft_model,
+                                                      model.draft_config)
+        else:
+            # MTP one-model + separate MTP checkpoint: no draft HF architecture.
+            draft_weight_mapper = self.weight_mapper
+
+        self._call_load_weights(model.load_draft_weights, draft_weights,
+                                draft_weight_mapper)
+
     @classmethod
     def _qualify_post_transform_profile(
             cls,
@@ -1370,6 +1376,12 @@ class ModelLoader:
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
+        from tensorrt_llm._torch.speculative.utils import (
+            loads_mtp_from_speculative_model, resolve_mtp_checkpoint_source,
+            update_spec_config_from_model_config)
+
+        resolve_mtp_checkpoint_source(self.spec_config, checkpoint_dir)
+
         load_config_kwargs = dict(
             checkpoint_dir=checkpoint_dir,
             trust_remote_code=self.llm_args.trust_remote_code,
@@ -1413,6 +1425,14 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+
+        if loads_mtp_from_speculative_model(self.spec_config):
+            # `load_config_and_apply_defaults` already ran this, but against a
+            # config object it then discards. The MTP heads' structure fields
+            # (head count, block pattern) come from `speculative_model` and
+            # have to reach the config the model is actually built from.
+            update_spec_config_from_model_config(self.spec_config,
+                                                 config.pretrained_config)
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[
