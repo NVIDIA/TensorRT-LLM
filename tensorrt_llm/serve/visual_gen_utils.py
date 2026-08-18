@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from tensorrt_llm.inputs.media_io import is_isobmff_image_bytes, sniff_media_kind
+from tensorrt_llm.inputs.media_io import sniff_media_kind
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
+from tensorrt_llm.visual_gen.media_refs import _resolve_reference
 
 if TYPE_CHECKING:
+    from fastapi import UploadFile
+
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -90,28 +91,85 @@ def _merge_extra_params(
         params.extra_params = None
 
 
-def _read_reference_payload(reference) -> bytes:
-    """Read the ``input_reference`` payload (base64 JSON or multipart file).
+def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
+    """Extract ``(content, format, role)`` from one raw HTTP reference.
 
-    Payload size is deliberately not checked here: encoded size is not part
-    of the request-validity contract, and body limits belong to the
-    proxy/ASGI deployment layer (HTTP 413). Base64 decodes strictly so
-    malformed encodings — not sizes — are rejected.
+    ``ref`` is a multipart ``UploadFile`` (has ``.file``) or a
+    ``MediaReferenceItem`` exposing ``content`` / ``format`` / ``role``. An
+    upload is read to ``bytes`` here — the only decode the boundary owns — and
+    its format is implied by the transport rather than declared by the client;
+    everything else passes through for the engine to resolve.
     """
-    if isinstance(reference, str):
-        try:
-            return base64.b64decode(reference, validate=True)
-        except ValueError as exc:
-            # binascii.Error subclasses ValueError.
-            raise ValueError("input_reference is not valid base64 data.") from exc
-    return reference.file.read()
+    if hasattr(ref, "file"):  # multipart UploadFile
+        return ref.file.read(), "bytes", getattr(ref, "role", None)
+    content = getattr(ref, "content", None)
+    if not isinstance(content, str):
+        raise ValueError("reference item must carry a 'content' string.")
+    return content, ref.format, getattr(ref, "role", None)
+
+
+def _build_reference_list(value: Any) -> Optional[list]:
+    """Normalize one HTTP reference field into a list of ``MediaRef`` objects.
+
+    ``value`` is None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or
+    a list of those. Each entry becomes a ``MediaRef`` carrying its transport
+    content plus the declared (or, for an upload, implied) wire format.
+    Resolution and materialization happen later at the engine choke point.
+    """
+    if value is None:
+        return None
+    # Local import: the visual_gen tree is already loaded in a VisualGen serving
+    # process, and this keeps it out of every plain-LLM process (see TYPE_CHECKING).
+    from tensorrt_llm.visual_gen.params import MediaRef
+
+    raw_items = value if isinstance(value, list) else [value]
+    refs = []
+    for item in raw_items:
+        content, content_format, role = _reference_transport(item)
+        refs.append(MediaRef(content=content, format=content_format, role=role))
+    return refs
+
+
+def _apply_deprecated_input_reference(
+    input_reference: str | UploadFile | None,
+    params: VisualGenParams,
+    input_reference_format: Optional[str] = None,
+) -> None:
+    """Back-compat for the deprecated single ``input_reference``.
+
+    Sniff-routes the payload to ``image_reference`` (image) or ``video_reference``
+    (video), preserving the pre-typed-fields behavior. Ignored when a typed
+    image/video reference is already set — the typed fields take precedence.
+    Routing needs the bytes, so the payload is resolved here using the wire form
+    from the sibling ``input_reference_format`` (implied for an upload); the
+    resolved bytes are then handed to the engine like any other reference.
+    """
+    if input_reference is None:
+        return
+    logger.warning("'input_reference' is deprecated; use 'image_reference' / 'video_reference'.")
+    if params.image_reference or params.video_reference:
+        return
+    from tensorrt_llm.visual_gen.params import MediaRef
+
+    if hasattr(input_reference, "file"):  # multipart upload — form implied
+        payload = input_reference.file.read()
+    else:
+        payload = _resolve_reference(input_reference, input_reference_format)
+    kind = sniff_media_kind(payload)
+    if kind == "image":
+        params.image_reference = [MediaRef(content=payload, format="bytes")]
+    elif kind == "video":
+        params.video_reference = [MediaRef(content=payload, format="bytes")]
+    else:
+        raise ValueError(
+            "input_reference is not a recognized media container; supported "
+            "inputs are PNG/JPEG images and MP4/AVI video."
+        )
 
 
 def parse_visual_gen_params(
     request: ImageGenerationRequest | VideoGenerationRequest,
-    id: str,
     generator: VisualGen,
-    media_storage_path: Optional[str] = None,
 ) -> VisualGenParams:
     """Translate an HTTP request into :class:`VisualGenParams`.
 
@@ -176,42 +234,21 @@ def parse_visual_gen_params(
                     "directly."
                 )
             params.num_frames = derived
-        if request.input_reference is not None:
-            payload = _read_reference_payload(request.input_reference)
-            kind = sniff_media_kind(payload)
-            if kind == "image":
-                # Rejected on signature alone, not on a failed decode:
-                # whether Pillow reads HEIF/AVIF depends on optional plugins,
-                # and the worker process need not have the same ones.
-                if is_isobmff_image_bytes(payload):
-                    raise ValueError(
-                        "input_reference is a HEIF/AVIF image, which is not "
-                        "a supported reference format; convert it to PNG or "
-                        "JPEG."
-                    )
-                # I2V: the stored image file is the cross-model contract.
-                # every I2V pipeline reads ``params.image`` as a path.
-                if media_storage_path is None:
-                    raise ValueError(
-                        "media_storage_path is required when input_reference is an image"
-                    )
-                ref_path = os.path.join(media_storage_path, f"{id}_reference")
-                with open(ref_path, "wb") as f:
-                    f.write(payload)
-                params.image = ref_path
-            elif kind == "video":
-                # V2V: encoded bytes pass through untouched; the worker
-                # demuxes and NVDEC-decodes them (acceptance happens there,
-                # so corrupt content behind a valid signature still fails as
-                # a client error).
-                if params.extra_params is None:
-                    params.extra_params = {}
-                params.extra_params["video"] = payload
-            else:
-                raise ValueError(
-                    "input_reference is not a recognized media container; "
-                    "supported inputs are PNG/JPEG images and MP4/AVI video."
-                )
+        # Reference inputs: hand the pipeline a ``MediaRef`` carrying the
+        # transport content (``bytes`` for an upload, the string otherwise).
+        # The engine resolves and materializes; the boundary never touches disk.
+        image_refs = _build_reference_list(request.image_reference)
+        if image_refs:
+            params.image_reference = image_refs
+        video_refs = _build_reference_list(request.video_reference)
+        if video_refs:
+            params.video_reference = video_refs
+        audio_refs = _build_reference_list(request.audio_reference)
+        if audio_refs:
+            params.audio_reference = audio_refs
+        _apply_deprecated_input_reference(
+            request.input_reference, params, request.input_reference_format
+        )
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)

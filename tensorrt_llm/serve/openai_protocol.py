@@ -61,6 +61,7 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
+from tensorrt_llm.visual_gen.params import ContentFormat, Role
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
@@ -1716,6 +1717,43 @@ class ImageGenerationResponse(OpenAIBaseModel):
     size: Optional[str] = None
 
 
+class MediaReferenceItem(OpenAIBaseModel):
+    """One media reference (image / video / audio) for conditioning (mirrors ``MediaRef``).
+
+    ``format`` declares how to read ``content``; it is required, so no wire form
+    is ever guessed. The request field it sits in (``image_reference`` /
+    ``video_reference`` / ``audio_reference``) fixes the modality. ``role`` is
+    required only when it is ambiguous — a model with more than one required role
+    for that modality; a single role, or a single required role (e.g. i2v
+    first_frame), is inferred.
+    """
+
+    content: str = Field(
+        description="The reference payload, in the form declared by ``format``."
+    )
+    format: ContentFormat = Field(description=(
+        "Wire form of ``content``: ``path`` (a file readable by the server; a "
+        "``file://`` URI is also accepted), ``url`` (``http(s)``, fetched "
+        "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
+        "also accepted). ``bytes`` cannot be carried in JSON — upload the file "
+        "as multipart/form-data instead. Distinct from the top-level "
+        "``format``, which selects the *output* encoding."))
+    role: Optional[Role] = Field(
+        default=None,
+        description="Reference role. Required only when the model has more than "
+        "one required role for the modality; otherwise inferred.",
+    )
+
+    @field_validator("format")
+    @classmethod
+    def _reject_bytes_over_json(cls, v: str) -> str:
+        if v == "bytes":
+            raise ValueError(
+                "format='bytes' cannot be carried in JSON; upload the file as "
+                "multipart/form-data, or send format='base64'.")
+        return v
+
+
 class VideoGenerationRequest(OpenAIBaseModel):
     """Video generation request (extended API).
 
@@ -1739,14 +1777,52 @@ class VideoGenerationRequest(OpenAIBaseModel):
     seed: Optional[int] = Field(default=None,
                                 ge=0,
                                 description="Random seed for reproducibility.")
+    image_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Image reference(s) conditioning generation (e.g. image-to-video "
+             "first frame). Send a ``{content, format, role}`` object or a list "
+             "of them, where ``format`` is ``path`` / ``url`` / ``base64``; or "
+             "upload a single image file via multipart, whose form is implied. "
+             "PNG or JPEG only — HEIF/AVIF are not supported."),
+        )
+    video_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Video reference(s) conditioning generation (video-to-video). Send "
+             "a ``{content, format}`` object or a list of them, where ``format`` "
+             "is ``path`` / ``url`` / ``base64``; or upload a single video file "
+             "via multipart, whose form is implied. MP4 or AVI, with H.264 the "
+             "tested codec and others best-effort."),
+        )
+    audio_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Audio reference(s) conditioning generation. Send a "
+             "``{content, format}`` object or a list of them, where ``format`` "
+             "is ``path`` / ``url`` / ``base64``; or upload a single audio "
+             "file via multipart, whose form is implied. Accepted only by "
+             "models that declare an audio reference slot."),
+        )
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
+        description=
+        ("Deprecated. A single image or video reference, routed by content "
+         "signature to image-to-video or video-to-video. Kept for backward "
+         "compatibility; prefer the typed ``image_reference`` / "
+         "``video_reference`` fields, which take precedence — this field is "
+         "ignored whenever a typed ``image_reference`` or ``video_reference`` "
+         "is provided. A string form requires ``input_reference_format``."),
+    )
+    input_reference_format: Optional[ContentFormat] = Field(
+        default=None,
         description=(
-            "Optional image or video reference that guides generation. PNG or "
-            "JPEG images condition image-to-video; MP4 or AVI video conditions "
-            "video-to-video, with H.264 the tested codec and others "
-            "best-effort. HEIF/AVIF are not supported. JSON requests carry "
-            "base64 bytes; multipart requests upload the file."),
+            "Deprecated, alongside ``input_reference``: the wire form of that "
+            "field's value (``path`` / ``url`` / ``base64``). Required when "
+            "``input_reference`` is a string; implied for a multipart upload."),
     )
 
     # Resolution
@@ -1798,6 +1874,25 @@ class VideoGenerationRequest(OpenAIBaseModel):
             raise ValueError(
                 "width and height must be sent together; got width="
                 f"{self.width!r}, height={self.height!r}")
+        return self
+
+    @model_validator(mode="after")
+    def _check_input_reference_format(self):
+        """Require the deprecated ``input_reference``'s wire form when it is a string.
+
+        A multipart upload carries its own form, so the sibling is only needed
+        for the string spelling.
+        """
+        if isinstance(self.input_reference, str):
+            if self.input_reference_format is None:
+                raise ValueError(
+                    "'input_reference_format' is required when 'input_reference' is a "
+                    "string; send 'path', 'url' or 'base64' (or upload the file via "
+                    "multipart/form-data)")
+            if self.input_reference_format == "bytes":
+                raise ValueError(
+                    "input_reference_format='bytes' cannot be carried in JSON; upload "
+                    "the file as multipart/form-data, or send 'base64'")
         return self
 
 

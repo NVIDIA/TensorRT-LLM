@@ -12,11 +12,69 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
+
+Role = Literal["reference", "first_frame", "last_frame"]
+
+# Wire form of a reference's ``content``. Declared explicitly rather than
+# sniffed: a bare string is otherwise ambiguous between a local path and
+# base64, and guessing lets a mistyped path silently become base64 (or a
+# malformed base64 silently become a filesystem read).
+ContentFormat = Literal["path", "url", "base64", "bytes"]
+
+
+@set_api_status("prototype")
+class MediaRef(StrictBaseModel):
+    """A single media reference (image / video / audio).
+
+    Carried by ``image_reference`` / ``video_reference`` / ``audio_reference``;
+    the field it sits in fixes the modality. ``role`` is required only when the
+    target model accepts that modality in more than one role (e.g. image first +
+    last frame); otherwise the pipeline knows the reference's meaning and
+    ``role`` may be omitted (video/audio are always the single ``reference``).
+    """
+
+    content: Union[str, bytes] = Field(
+        description="The reference payload, in the form declared by ``format``."
+    )
+    format: ContentFormat = Field(
+        description=(
+            "Wire form of ``content``: ``path`` (local file; a ``file://`` URI is "
+            "also accepted), ``url`` (``http(s)``, fetched through the SSRF-guarded "
+            "loader), ``base64`` (a ``data:`` URI is also accepted), or ``bytes``."
+        )
+    )
+    role: Optional[Role] = Field(
+        default=None, description="``reference`` | ``first_frame`` | ``last_frame``."
+    )
+
+
+def _reject_bare_refs(value: Any) -> Any:
+    """Reject the bare path/bytes shorthand with an actionable message.
+
+    Runs before coercion, so the caller sees what to do instead of a union
+    mismatch reported against an inner model. A bare string has nowhere to
+    declare its wire form, and guessing is what ``format`` exists to prevent.
+    """
+    for x in value if isinstance(value, list) else [value]:
+        if isinstance(x, (str, bytes)):
+            raise ValueError(
+                "a reference must declare its wire form; a bare "
+                f"{type(x).__name__} is no longer accepted. Pass "
+                'MediaRef(content=..., format="path"|"url"|"base64"|"bytes").'
+            )
+    return value
+
+
+def _normalize_refs(value: Any) -> Optional[list]:
+    """Coerce a reference field to ``list[MediaRef]`` (or ``None``)."""
+    if value is None:
+        return None
+    return value if isinstance(value, list) else [value]
 
 
 @set_api_status("prototype")
@@ -69,9 +127,31 @@ class VisualGenParams(StrictBaseModel):
 
     # Conditioning inputs
     negative_prompt: Optional[str] = Field(default=None, description="Negative prompt for CFG.")
-    image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = Field(
-        default=None, description="Reference image(s) for I2V/I2I."
+    # Per-modality reference inputs. A single ``MediaRef`` or a list; normalized
+    # to ``list[MediaRef]``. The field fixes the modality; ``role`` is only
+    # meaningful where a model declares more than one role for it (e.g. image
+    # first_frame / last_frame), and each ref declares its own ``format``.
+    image_reference: Optional[Union[MediaRef, List[MediaRef]]] = Field(
+        default=None,
+        description="Reference image(s) for I2V/I2I; normalized to list[MediaRef].",
     )
+    video_reference: Optional[Union[MediaRef, List[MediaRef]]] = Field(
+        default=None, description="Reference video(s) for V2V; normalized to list[MediaRef]."
+    )
+    audio_reference: Optional[Union[MediaRef, List[MediaRef]]] = Field(
+        default=None, description="Reference audio(s); normalized to list[MediaRef]."
+    )
+
+    @field_validator("image_reference", "video_reference", "audio_reference", mode="before")
+    @classmethod
+    def _reject_bare(cls, v):
+        return v if v is None else _reject_bare_refs(v)
+
+    @field_validator("image_reference", "video_reference", "audio_reference", mode="after")
+    @classmethod
+    def _norm_refs(cls, v):
+        return _normalize_refs(v)
+
     # Per-prompt multiplier
     num_images_per_prompt: int = Field(default=1, description="Number of images per prompt.")
 
@@ -117,6 +197,7 @@ def validate_visual_gen_params(
     *,
     declared_defaults: Optional[Dict[str, Any]],
     extra_param_specs: Dict[str, Any],
+    ref_slot_specs: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Validate *params* against pipeline-declared defaults and extra specs.
 
@@ -193,6 +274,61 @@ def validate_visual_gen_params(
                     messages.append(
                         f"extra_params['{key}'] value {value} is out of range [{lo}, {hi}]"
                     )
+
+    # --- reference role / arity checks (duck-typed RefSlotSpec) ---
+    # ``ref_slot_specs`` maps a reference field name to a spec exposing
+    # ``.roles`` (a list of role specs with ``.role`` / ``.min`` / ``.max``).
+    # role must be explicit only when the assignment is ambiguous (a multi-role
+    # slot with more than one required role); a single-role slot or a single
+    # required role is inferred. Reference fields are
+    # already normalized to ``list[*Ref]`` by the field validators. An empty
+    # (but non-None) mapping means the pipeline declares no slots, so any
+    # reference the client sent is rejected; only ``None`` skips validation.
+    if ref_slot_specs is not None:
+        for field in ("image_reference", "video_reference", "audio_reference"):
+            refs = getattr(params, field, None) or []
+            spec = ref_slot_specs.get(field)
+            if spec is None:
+                # An undeclared slot is only an error if the client actually
+                # sent one; an absent undeclared slot is fine.
+                if refs:
+                    messages.append(f"'{field}' is not accepted by the loaded pipeline.")
+                continue
+            role_specs = list(spec.roles)
+            allowed = {rs.role for rs in role_specs}
+            # A role-less ref is inferred when unambiguous: a single-role slot,
+            # or a multi-role slot with exactly one required role (min >= 1) —
+            # e.g. i2v's first_frame — matching the pipeline's own default. Only
+            # a genuinely ambiguous slot (multiple required roles) demands one.
+            required_roles = [rs.role for rs in role_specs if rs.min >= 1]
+            counts: Dict[str, int] = {}
+            for r in refs:
+                role = getattr(r, "role", None)
+                if role is None:
+                    if len(role_specs) == 1:
+                        role = role_specs[0].role
+                    elif len(required_roles) == 1:
+                        role = required_roles[0]
+                    else:
+                        messages.append(
+                            f"{field}: 'role' is required for this model "
+                            f"(one of {sorted(allowed)})."
+                        )
+                        continue
+                if role not in allowed:
+                    messages.append(
+                        f"{field}: role '{role}' not supported (allowed: {sorted(allowed)})."
+                    )
+                    continue
+                counts[role] = counts.get(role, 0) + 1
+            # Arity runs even for an absent slot: a role with ``min >= 1`` is a
+            # required reference, enforced here as a clean 400 instead of a deep
+            # worker crash. ``min == 0`` leaves the slot optional.
+            for rs in role_specs:
+                n = counts.get(rs.role, 0)
+                if n < rs.min or (rs.max is not None and n > rs.max):
+                    bound = f"{rs.min}..{'inf' if rs.max is None else rs.max}"
+                    messages.append(f"{field} role '{rs.role}': expected {bound}, got {n}.")
 
     if not messages:
         return

@@ -286,7 +286,13 @@ You can customize these by:
 - `frame_rate` (canonical) or `fps` (alias): frames per second
 - `num_frames`: when set, wins over the `seconds * frame_rate` derivation
 - `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
-- `input_reference`: Reference image (I2V/TI2V) or video (V2V), accepted as a base64-encoded string in JSON or as a file in multipart form-data
+- `image_reference`: Reference image(s) for I2V/TI2V. `video_reference`: reference video(s) for V2V. `audio_reference`: reference audio(s). In JSON each accepts a `{content, format, role}` object or a list of them; `format` is required and declares how to read `content` — `"path"` (a file readable by the server; a `file://` URI is also accepted), `"url"` (`http(s)`), or `"base64"` (a `data:` URI is also accepted). Nothing is guessed, so a bare string is rejected, and `"bytes"` is rejected over JSON — upload the file instead. A multipart file upload needs no `format`: the transport implies it.
+
+    ```json
+    {"image_reference": {"content": "iVBORw0KGgoAAAANSUhEUg...", "format": "base64"}}
+    ```
+
+  - `format` here is the *input* wire form; the top-level `format` selects the *output* encoding.
   - **Supported formats**: PNG and JPEG images; MP4 and AVI video, with H.264 the tested codec and others best-effort. HEIF/AVIF are not supported.
 - `extra_params`: model-specific overflow (see below)
 - `response_format`: `"b64_json"` or `"url"`
@@ -352,7 +358,7 @@ curl -X POST "http://localhost:8000/v1/videos" \
 ```bash
 curl -X POST "http://localhost:8000/v1/videos" \
   -F "prompt=She turns around and smiles" \
-  -F "input_reference=@./media/woman_skyline_original_720p.jpeg" \
+  -F "image_reference=@./media/woman_skyline_original_720p.jpeg" \
   -F "seconds=4.0" \
   -F "fps=24" \
   -F "size=256x256" \
@@ -361,11 +367,12 @@ curl -X POST "http://localhost:8000/v1/videos" \
 
 ### Video-to-Video (Multipart with File Upload, Cosmos3)
 ```bash
-# The reference is classified by content: image -> I2V, video -> V2V.
-# V2V conditioning knobs ride in extra_params (values below are the defaults).
+# The modality is declared by the field name: image_reference -> I2V,
+# video_reference -> V2V. V2V conditioning knobs ride in extra_params
+# (values below are the defaults).
 curl -X POST "http://localhost:8000/v1/videos" \
   -F "prompt=Continue the same scene with smooth natural motion and consistent subjects." \
-  -F "input_reference=@./media/reference.mp4" \
+  -F "video_reference=@./media/reference.mp4" \
   -F "num_frames=189" \
   -F "fps=24" \
   -F 'extra_params={"condition_video_latent_indexes": [0, 1], "condition_video_keep": "first"}'

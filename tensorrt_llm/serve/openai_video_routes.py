@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen.params import VisualGenParams
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
 
 def _video_content_type(suffix: str) -> str:
@@ -52,6 +53,9 @@ def _video_content_type(suffix: str) -> str:
 # File suffixes the GET /v1/videos/{id}/content and DELETE
 # /v1/videos/{id} routes try when the stored output_path is missing.
 _KNOWN_VIDEO_OUTPUT_SUFFIXES = (".mp4", ".avi", ".safetensors", ".pt")
+
+# Reference fields whose multipart text form is a JSON object, not a scalar.
+_REFERENCE_FIELDS = ("image_reference", "video_reference", "audio_reference")
 
 
 def _preflight_encoder_format(fmt):
@@ -102,30 +106,33 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference file
         """
+        # Names this request's output files (``{video_id}_{i}``) and the b64
+        # response id; references are keyed and reclaimed by the engine instead.
+        video_id = f"video_{uuid.uuid4().hex}"
         try:
             # Client-side ValueErrors from content-type parsing, request
             # translation, encoder-format preflight, parameter validation,
-            # and the synchronous engine call return 400. Serialization /
-            # encoder failures further down (server-side) fall through to
-            # the outer ``except Exception`` → 500.
+            # and the engine call return 400. Serialization / encoder failures
+            # further down (server-side) fall through to the outer
+            # ``except Exception`` → 500.
             try:
                 # Parse request based on content-type
                 request = await self._parse_video_generation_request(raw_request)
-                video_id = f"video_{uuid.uuid4().hex}"
-                params = parse_visual_gen_params(
-                    request,
-                    video_id,
-                    self.generator,
-                    media_storage_path=str(self.media_storage_path),
-                )
+                params = parse_visual_gen_params(request, self.generator)
                 resolved_encoder_fmt = _preflight_encoder_format(request.format)
                 logger.info(
                     f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
                 )
                 sync_video_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt, params=params)
+                # Offload the blocking resolve/materialize/enqueue off the event
+                # loop but await it, so bad media / bad params still surface as
+                # 400 here; then await generation on the executor's loop.
+                handle = await asyncio.to_thread(
+                    self.generator.generate_async, request.prompt, params
+                )
+                output = await handle.aresult()
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:
@@ -256,8 +263,8 @@ class _VideoRoutesMixin:
             for key in form:
                 value = form[key]
                 if hasattr(value, "file"):
-                    # Uploaded file (``input_reference``) — pass through
-                    # so the conversion layer reads ``.file``.
+                    # Uploaded reference file (image_reference / video_reference)
+                    # — pass through so the conversion layer reads ``.file``.
                     data[key] = value
                     continue
                 if key == "extra_params":
@@ -268,6 +275,19 @@ class _VideoRoutesMixin:
                     except json.JSONDecodeError as exc:
                         raise ValueError(
                             f"'extra_params' must be a JSON object string; {exc}"
+                        ) from exc
+                    continue
+                if key in _REFERENCE_FIELDS:
+                    # A reference sent as a text part is the object form; a file
+                    # part was already routed above and carries its own format.
+                    if value == "":
+                        continue
+                    try:
+                        data[key] = json.loads(value)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"'{key}' must be an uploaded file or a JSON object string "
+                            f'like {{"content": ..., "format": "url"}}; {exc}'
                         ) from exc
                     continue
                 if value == "":
@@ -320,32 +340,27 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference file
         """
+        # Names this request's output files and VIDEO_STORE entry; references
+        # are keyed and reclaimed by the engine when the task awaits the handle.
+        video_id = f"video_{uuid.uuid4().hex}"
         try:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
 
-            video_id = f"video_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(
-                request, video_id, self.generator, media_storage_path=str(self.media_storage_path)
-            )
-            # Synchronously validate the resolved params against the
-            # loaded pipeline's extra-param specs / declared defaults
-            # so unknown ``extra_params`` keys and similar engine-side
-            # rejections surface as HTTP 400 here instead of becoming
-            # a queued job whose background task later fails.
-            from tensorrt_llm.visual_gen.params import validate_visual_gen_params
-
-            validate_visual_gen_params(
-                params,
-                declared_defaults=self.generator.executor.default_generation_params,
-                extra_param_specs=self.generator.executor.extra_param_specs,
-            )
+            params = parse_visual_gen_params(request, self.generator)
             _preflight_encoder_format(request.format)
             logger.info(
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
+
+            # Resolve/materialize references, validate params, and enqueue in the
+            # foreground (offloaded but awaited) so bad media / unknown
+            # extra_params surface as 400 here, before the 202 — not as a queued
+            # job that later fails. The engine reclaims the references via its
+            # terminal hook once the background task awaits the handle.
+            handle = await asyncio.to_thread(self.generator.generate_async, request.prompt, params)
 
             # Persist the queued job before scheduling the background task so
             # that a fast-completing task can always look it up in VIDEO_STORE.
@@ -362,12 +377,13 @@ class _VideoRoutesMixin:
             )
             await VIDEO_STORE.upsert(video_id, video_job)
 
-            # Start background generation task
+            # Start background task to await generation and save the result.
             task = asyncio.create_task(
                 self._generate_video_background(
                     video_id=video_id,
                     request=request,
                     params=params,
+                    handle=handle,
                 )
             )
             self.video_gen_tasks[video_id] = task
@@ -393,12 +409,12 @@ class _VideoRoutesMixin:
         video_id: str,
         request: VideoGenerationRequest,
         params: VisualGenParams,
+        handle: "VisualGenResult",
     ):
-        """Background task to generate video and save to storage."""
+        """Background task to await generation and save to storage."""
         try:
             background_start = time.perf_counter()
-            future = self.generator.generate_async(inputs=request.prompt, params=params)
-            output = await future
+            output = await handle
 
             if output.video is None:
                 # Update job status to failed since we're in a background task

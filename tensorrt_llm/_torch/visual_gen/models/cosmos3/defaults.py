@@ -233,16 +233,4 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         default=None,
         description="Optional scheduler flow shift override. Uses the Cosmos3 mode default when omitted.",
     ),
-    "video": ExtraParamSchema(
-        type="bytes",
-        default=None,
-        description=(
-            "V2V reference: encoded MP4/AVI bytes (e.g. "
-            "Path(video).read_bytes()). Each worker rank demuxes them from "
-            "memory and NVDEC-decodes only the conditioning window per "
-            "condition_video_latent_indexes / condition_video_keep, resized "
-            "to the output resolution, then VAE-encodes it."
-        ),
-        validator=_validate_video_reference,
-    ),
 }

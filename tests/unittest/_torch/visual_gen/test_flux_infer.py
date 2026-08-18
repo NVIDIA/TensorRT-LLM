@@ -30,7 +30,7 @@ def test_infer_forwards_num_images_per_prompt(
             seed=42,
             max_sequence_length=512,
             num_images_per_prompt=2,
-            image=[b"reference"],
+            image_reference=[SimpleNamespace(content=b"reference")],
         ),
     )
 

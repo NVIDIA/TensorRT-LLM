@@ -381,7 +381,7 @@ class TestWanImageToVideo:
                     "format": format_,
                 },
                 files={
-                    "input_reference": ("cat_piano.png", f, "image/png"),
+                    "image_reference": ("cat_piano.png", f, "image/png"),
                 },
             )
         assert resp.status_code == 200, resp.text
@@ -418,7 +418,7 @@ class TestWanImageToVideo:
                     "format": format_,
                 },
                 files={
-                    "input_reference": ("cat_piano.png", f, "image/png"),
+                    "image_reference": ("cat_piano.png", f, "image/png"),
                 },
             )
         assert create_resp.status_code == 202, create_resp.text

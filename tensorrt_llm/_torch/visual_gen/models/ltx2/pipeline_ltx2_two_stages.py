@@ -1225,6 +1225,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
     def infer(self, req):
         extra = req.params.extra_params or {}
+        refs = req.params.image_reference
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
@@ -1238,7 +1239,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             output_type=extra["output_type"],
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
-            image=req.params.image,
+            image=refs[0].content if refs else None,
             image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],

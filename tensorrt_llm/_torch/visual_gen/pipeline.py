@@ -27,9 +27,11 @@ from pydantic import Field
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.visual_gen.params import Role
 
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
@@ -58,6 +60,30 @@ class ExtraParamSchema(StrictBaseModel):
         "values. Must be a module-level function (specs are pickled to the "
         "coordinator in the READY handshake).",
     )
+
+
+class RoleSpec(StrictBaseModel):
+    """One accepted role for a reference modality, with its count bounds."""
+
+    role: Role = Field(description="Role of the reference input.")
+    min: int = Field(default=1, description="Minimum count for this role.")
+    max: Optional[int] = Field(
+        default=1, description="Maximum count for this role (None = unbounded)."
+    )
+
+
+class RefSlotSpec(StrictBaseModel):
+    """Reference slot a pipeline accepts for one modality.
+
+    A request item's ``role`` is required only when ``roles`` has more than one
+    entry (same modality carries multiple roles, e.g. first + last frame);
+    otherwise the single declared role is inferred. Exposed via
+    ``VisualGen.ref_slot_specs`` and enforced by ``validate_visual_gen_params``.
+    Pickled to the coordinator in the READY handshake, so keep it plain data.
+    """
+
+    modality: MediaModality = Field(description="Reference modality.")
+    roles: List[RoleSpec] = Field(description="Accepted roles + counts for this modality.")
 
 
 if TYPE_CHECKING:
@@ -326,6 +352,17 @@ class BasePipeline(nn.Module):
         Subclasses override to declare which ``extra_params`` keys they
         accept and their metadata.  Maps parameter names to
         ``ExtraParamSchema`` instances.
+        """
+        return {}
+
+    @property
+    def ref_slot_specs(self) -> Dict[str, RefSlotSpec]:
+        """Reference slots this pipeline accepts.
+
+        Maps a ``VisualGenParams`` reference field name
+        (``image_reference`` / ``video_reference`` / ``audio_reference``) to a
+        :class:`RefSlotSpec` declaring the accepted roles and per-role counts.
+        Empty by default (pipeline takes no reference inputs).
         """
         return {}
 

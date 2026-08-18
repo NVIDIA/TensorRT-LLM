@@ -27,7 +27,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm import MediaRef, VisualGen, VisualGenArgs
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -202,7 +202,7 @@ def main():
         "--image_path",
         type=str,
         default=None,
-        help="Optional conditioning image path or URL for I2V/TI2V",
+        help="Optional conditioning image path for I2V/TI2V",
     )
     parser.add_argument(
         "--output_path",
@@ -263,7 +263,7 @@ def main():
     # Query per-model defaults (resolution, steps, guidance, seed, etc.).
     params = visual_gen.default_params
     if image_path is not None:
-        params.image = image_path
+        params.image_reference = [MediaRef(content=image_path, format="path")]
 
     negative_prompt = resolve_negative_prompt(
         negative_prompt=args.negative_prompt,
@@ -281,7 +281,7 @@ def main():
     params.extra_params["output_type"] = output_type
 
     if args.video_path is not None:
-        params.extra_params["video"] = Path(args.video_path).read_bytes()
+        params.video_reference = [MediaRef(content=args.video_path, format="path")]
 
     params.negative_prompt = negative_prompt
 

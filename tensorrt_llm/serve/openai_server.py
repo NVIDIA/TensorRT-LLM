@@ -2479,14 +2479,16 @@ class OpenAIServer(_VideoRoutesMixin):
             # through to the outer ``except Exception`` → 500 so the
             # client doesn't get blamed for a server-internal failure.
             try:
-                params = parse_visual_gen_params(request, image_id,
-                                                 self.generator)
+                params = parse_visual_gen_params(request, self.generator)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
                 image_gen_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt,
-                                                 params=params)
+                # Offload the blocking materialize/enqueue off the event loop but
+                # await it (bad params → 400 here); then await generation.
+                handle = await asyncio.to_thread(self.generator.generate_async,
+                                                 request.prompt, params)
+                output = await handle.aresult()
             except ValueError as exc:
                 logger.error(f"Image request error: {exc}")
                 return self.create_error_response(
@@ -2634,8 +2636,8 @@ class OpenAIServer(_VideoRoutesMixin):
     async def openai_image_edit(self, raw_request: Request) -> Response:
         """OpenAI-compatible image editing endpoint — returns HTTP 501.
 
-        No in-tree pipeline implements image editing today: Flux/Flux2 are
-        text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
+        No in-tree pipeline implements image editing today: Flux/Flux2 do
+        text-to-image (references condition, not edit); Wan and LTX-2 produce
         video, not edited images. The route is registered so callers get an
         honest NotImplemented signal instead of a 404. The request body is
         not parsed because no schema is committed for this endpoint yet —

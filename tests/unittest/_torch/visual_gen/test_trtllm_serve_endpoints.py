@@ -30,7 +30,13 @@ from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
+from tensorrt_llm.visual_gen.media_refs import (
+    cleanup_reference_files,
+    prepare_reference_slots,
+    resolve_media_storage_path,
+)
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
+from tensorrt_llm.visual_gen.params import validate_visual_gen_params
 
 pytestmark = pytest.mark.cpu_only
 
@@ -156,6 +162,9 @@ class MockVisualGen:
         # used by tests to assert forwarded VisualGenParams fields.
         self.last_inputs = None
         self.last_params = None
+        # Snapshot of materialized reference-file contents at generation time,
+        # captured before the route cleans them up. Keyed by stored path.
+        self.last_ref_bytes = {}
         # Stand-in for the coordinator-side executor proxy. The async video
         # route reads ``default_generation_params`` / ``extra_param_specs``
         # directly off this attribute when running synchronous pre-flight
@@ -164,7 +173,7 @@ class MockVisualGen:
         # reject legitimate width/height/num_frames/... requests;
         # ``extra_param_specs`` lists a single known key so tests can
         # exercise both the accept-known and reject-unknown paths.
-        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec, RoleSpec
 
         self.executor = SimpleNamespace(
             default_generation_params={
@@ -179,6 +188,14 @@ class MockVisualGen:
             extra_param_specs={
                 "stg_scale": ExtraParamSchema(type="float", default=1.0),
             },
+            ref_slot_specs={
+                "image_reference": RefSlotSpec(
+                    modality="image", roles=[RoleSpec(role="first_frame", min=0, max=1)]
+                ),
+                "video_reference": RefSlotSpec(
+                    modality="video", roles=[RoleSpec(role="reference", min=0, max=1)]
+                ),
+            },
         )
 
     def _maybe_batch(self, tensor, n):
@@ -189,36 +206,52 @@ class MockVisualGen:
 
     # --- VisualGen interface ---
 
+    def _snapshot_refs(self, params) -> None:
+        # Capture materialized reference bytes before the route cleans them up,
+        # so tests can still assert byte-identity after the request finishes.
+        self.last_ref_bytes = {}
+        for field in ("image_reference", "video_reference", "audio_reference"):
+            for ref in getattr(params, field, None) or []:
+                path = getattr(ref, "content", None)
+                if isinstance(path, str) and os.path.exists(path):
+                    with open(path, "rb") as fh:
+                        self.last_ref_bytes[path] = fh.read()
+
     def generate(self, inputs=None, params=None) -> VisualGenOutput:
-        self.last_inputs = inputs
-        self.last_params = params
-        if self._validation_error is not None:
-            raise self._validation_error
-        if self._generate_error is not None:
-            raise self._generate_error
-        if self._should_fail:
-            raise RuntimeError("Generation intentionally failed")
-        n = getattr(params, "num_images_per_prompt", 1) if params else 1
-        return VisualGenOutput(
-            request_id=self._next_request_id(),
-            image=self._maybe_batch(self._image, n),
-            video=self._maybe_batch(self._video, n),
-            audio=self._audio,
-            metrics=_make_dummy_metrics(),
-        )
+        return self.generate_async(inputs=inputs, params=params).result()
 
     def generate_async(self, inputs=None, params=None) -> "MockVisualGenResult":
         self.last_inputs = inputs
         self.last_params = params
         if self._validation_error is not None:
             raise self._validation_error
+        # Mirror the real engine entry: validate against the pipeline metadata
+        # (unknown extra_params / undeclared fields / ref arity) before doing any
+        # work, so the route's synchronous 400 path is exercised end-to-end.
+        if params is not None:
+            validate_visual_gen_params(
+                params,
+                declared_defaults=self.executor.default_generation_params,
+                extra_param_specs=self.executor.extra_param_specs,
+                ref_slot_specs=self.executor.ref_slot_specs,
+            )
+        # Materialize references at the coordinator, then hand the result a
+        # terminal cleanup keyed on the same request id.
+        req_id = self._next_request_id()
+        media_storage_path = str(resolve_media_storage_path())
+        prepare_reference_slots(
+            params, request_id=str(req_id), media_storage_path=media_storage_path
+        )
+        self._snapshot_refs(params)
         n = getattr(params, "num_images_per_prompt", 1) if params else 1
         return MockVisualGenResult(
-            request_id=self._next_request_id(),
+            request_id=req_id,
             image=self._maybe_batch(self._image, n),
             video=self._maybe_batch(self._video, n),
             audio=self._audio,
             should_fail=self._should_fail,
+            generate_error=self._generate_error,
+            on_finish=lambda: cleanup_reference_files(media_storage_path, str(req_id)),
         )
 
     def _next_request_id(self) -> int:
@@ -272,37 +305,58 @@ class MockVisualGenResult:
         video: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         should_fail: bool = False,
+        generate_error: Optional[BaseException] = None,
+        on_finish=None,
     ):
         self.request_id = request_id
         self._image = image
         self._video = video
         self._audio = audio
         self._should_fail = should_fail
+        # Engine-side failure surfaced through the result (capacity/client),
+        # distinct from a coordinator preflight rejection.
+        self._generate_error = generate_error
+        self._on_finish = on_finish
+        self._cleaned = False
+
+    def _run_finish(self):
+        # Terminal reference cleanup, run once (idempotent), mirroring the real
+        # VisualGenResult so it fires on success and failure alike.
+        if self._cleaned or self._on_finish is None:
+            return
+        self._cleaned = True
+        try:
+            self._on_finish()
+        except Exception:
+            pass
+
+    def _resolve(self) -> VisualGenOutput:
+        if self._generate_error is not None:
+            raise self._generate_error
+        if self._should_fail:
+            raise RuntimeError("Async generation intentionally failed")
+        return VisualGenOutput(
+            request_id=self.request_id,
+            image=self._image,
+            video=self._video,
+            audio=self._audio,
+            metrics=_make_dummy_metrics(),
+        )
 
     def __await__(self):
         return self.aresult().__await__()
 
     async def aresult(self, timeout=None):
-        if self._should_fail:
-            raise RuntimeError("Async generation intentionally failed")
-        return VisualGenOutput(
-            request_id=self.request_id,
-            image=self._image,
-            video=self._video,
-            audio=self._audio,
-            metrics=_make_dummy_metrics(),
-        )
+        try:
+            return self._resolve()
+        finally:
+            self._run_finish()
 
     def result(self, timeout=None):
-        if self._should_fail:
-            raise RuntimeError("Async generation intentionally failed")
-        return VisualGenOutput(
-            request_id=self.request_id,
-            image=self._image,
-            video=self._video,
-            audio=self._audio,
-            metrics=_make_dummy_metrics(),
-        )
+        try:
+            return self._resolve()
+        finally:
+            self._run_finish()
 
 
 # ---------------------------------------------------------------------------
@@ -702,8 +756,8 @@ class TestImageGeneration:
 class TestImageEdit:
     """``/v1/images/edits`` returns 501 NotImplemented in the current release.
 
-    No in-tree pipeline implements image editing: Flux/Flux2 are
-    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
+    No in-tree pipeline implements image editing: Flux/Flux2 do
+    text-to-image (references condition, not edit); Wan and LTX-2 produce
     video, not edited images. Restore the full happy-path coverage when an
     edit-capable pipeline lands.
     """
@@ -817,7 +871,7 @@ class TestVideoGenerationSync:
         assert params.num_frames == int(2.0 * 8)
 
     def test_sync_video_generation_multipart(self, video_client, tmp_path):
-        """Multipart sync request with a real ``input_reference`` file."""
+        """Multipart sync request with a real ``image_reference`` file."""
         ref_path = tmp_path / "ref.png"
         Image.new("RGB", (4, 4), (64, 64, 64)).save(str(ref_path))
         with open(ref_path, "rb") as f:
@@ -829,7 +883,7 @@ class TestVideoGenerationSync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.png", f, "image/png")},
+                files={"image_reference": ("ref.png", f, "image/png")},
             )
         assert resp.status_code == 200
         assert len(resp.content) > 0
@@ -848,25 +902,25 @@ class TestVideoGenerationSync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.png", f, "image/png")},
+                files={"image_reference": ("ref.png", f, "image/png")},
             )
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # input_reference should have been written to media storage and passed
-        # through as params.image (a filesystem path).
+        # image_reference is materialized to media storage and passed through as
+        # a MediaRef carrying the filesystem path.
         params = video_client.mock_gen.last_params
-        assert isinstance(params.image, str)
-        assert params.image.endswith("_reference")
-        assert os.path.exists(params.image)
+        ref_path = params.image_reference[0].content
+        assert isinstance(ref_path, str)
+        assert ref_path.endswith("_image_ref_0")
+        # The materialized reference is input-only and is cleaned up once the
+        # request finishes, so it must not linger in media storage.
+        assert not os.path.exists(ref_path)
 
     def test_sync_video_generation_multipart_with_video_reference(self, video_client):
-        """A video ``input_reference`` rides through as the encoded payload on
-        the model-specific ``video`` extra param (V2V), byte-identical — the
-        serve never decodes video; the worker demuxes/NVDEC-decodes it.
-
-        Routed by container signature, so a checked-in H.264/MP4 fixture drives
-        the boundary directly.
+        """A ``video_reference`` upload is persisted byte-identical (V2V) — the
+        serve never decodes video; the worker demuxes/NVDEC-decodes the stored
+        file. A checked-in H.264/MP4 fixture drives the boundary directly.
         """
         payload = _V2V_FIXTURE_MP4.read_bytes()
         with open(_V2V_FIXTURE_MP4, "rb") as f:
@@ -878,17 +932,20 @@ class TestVideoGenerationSync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.mp4", f, "video/mp4")},
+                files={"video_reference": ("ref.mp4", f, "video/mp4")},
             )
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # Video content must NOT land on params.image; it rides the
-        # model-specific ``video`` extra param as the untouched encoded bytes
-        # (the same intake the offline example's --video_path uses).
+        # Video conditioning arrives as a MediaRef holding a stored path; no
+        # image_reference is set, and the encoded bytes were persisted
+        # byte-identical (snapshotted at generation time, since the route cleans
+        # the reference up once the request finishes).
         params = video_client.mock_gen.last_params
-        assert params.image is None
-        assert params.extra_params["video"] == payload
+        assert params.image_reference is None
+        ref_path = params.video_reference[0].content
+        assert video_client.mock_gen.last_ref_bytes[ref_path] == payload
+        assert not os.path.exists(ref_path)
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
         """Content matching no image or video container signature is rejected
@@ -896,10 +953,10 @@ class TestVideoGenerationSync:
         resp = video_client.post(
             "/v1/videos/generations",
             data={"prompt": "x"},
-            files={"input_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
+            files={"image_reference": ("doc.txt", BytesIO(b"not media"), "text/plain")},
         )
         assert resp.status_code == 400
-        assert "not a recognized media container" in resp.text
+        assert "not a recognized image" in resp.text
 
     def test_sync_video_failure(self, failing_client):
         resp = failing_client.post(
@@ -1072,7 +1129,7 @@ class TestVideoGenerationAsync:
         assert data["size"] == "64x64"
 
     def test_async_video_multipart(self, video_client, tmp_path):
-        """Multipart async request with a real ``input_reference`` file."""
+        """Multipart async request with a real ``image_reference`` file."""
         ref_path = tmp_path / "ref.png"
         Image.new("RGB", (4, 4), (16, 16, 16)).save(str(ref_path))
         with open(ref_path, "rb") as f:
@@ -1084,7 +1141,7 @@ class TestVideoGenerationAsync:
                     "seconds": "1.0",
                     "fps": "8",
                 },
-                files={"input_reference": ("ref.png", f, "image/png")},
+                files={"image_reference": ("ref.png", f, "image/png")},
             )
         assert resp.status_code == 202
 

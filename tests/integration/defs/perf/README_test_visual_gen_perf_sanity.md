@@ -150,7 +150,7 @@ server_configs:
   `server_config.parallel_config`
 - `client_configs[].generation_mode` should be set explicitly for stable
   bucketing, especially for `i2v` and `t2v`
-- `client_configs[].extra_body.input_reference` is the current way to express
+- `client_configs[].extra_body.image_reference` is the current way to express
   `i2v` requests in checked-in YAMLs
 
 ## Test Case Formats

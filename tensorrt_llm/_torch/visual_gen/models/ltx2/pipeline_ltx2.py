@@ -20,7 +20,12 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import (
+    BasePipeline,
+    ExtraParamSchema,
+    RefSlotSpec,
+    RoleSpec,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
@@ -1374,9 +1379,20 @@ class LTX2Pipeline(BasePipeline):
             ),
         }
 
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                # Optional first-frame conditioning (min=0); LTX-2 also runs T2V.
+                roles=[RoleSpec(role="first_frame", min=0, max=1)],
+            ),
+        }
+
     def infer(self, req):
         """Run inference with request parameters."""
         extra = req.params.extra_params or {}
+        refs = req.params.image_reference
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
@@ -1390,7 +1406,7 @@ class LTX2Pipeline(BasePipeline):
             output_type=extra["output_type"],
             guidance_rescale=extra["guidance_rescale"],
             max_sequence_length=req.params.max_sequence_length,
-            image=req.params.image,
+            image=refs[0].content if refs else None,
             image_cond_strength=extra["image_cond_strength"],
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
