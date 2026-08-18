@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -176,7 +174,6 @@ def test_wan_pertoken_adaln_module_torch_compile_fullgraph() -> None:
     hidden_size = 768
     x, temb, table = _make_inputs(hidden_size)
     adaln = WanPerTokenAdaLN(
-        SimpleNamespace(quant_config=None, quant_config_dict=None),
         hidden_size,
         x.dtype,
         competing_fusion=False,

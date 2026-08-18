@@ -18,15 +18,12 @@ Keeps kernel selection, eligibility, tensor contracts, and dispatch behind
 model-level normalization operations used by WanBlock.
 """
 
-from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence, Union
+from typing import NamedTuple, Optional, Sequence, Union
 
 import torch
 
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
 try:
     from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln import (
@@ -65,24 +62,22 @@ class _PerTokenAdaLNContext(NamedTuple):
 
 
 class WanPerTokenAdaLN:
-    """Adapt Wan's per-token normalization sites to the fused SM100 kernels."""
+    """Adapt Wan's BF16 per-token normalization sites to the fused SM100 kernels.
+
+    Downstream Linear modules may independently quantize these BF16 activations.
+    """
 
     def __init__(
         self,
-        model_config: "DiffusionModelConfig",
         hidden_size: int,
         dtype: torch.dtype,
         competing_fusion: bool,
     ) -> None:
-        quant_config = model_config.quant_config
-        has_quant = bool(quant_config is not None and getattr(quant_config, "quant_algo", None))
-        has_quant = has_quant or bool(getattr(model_config, "quant_config_dict", None))
         self._eligible = (
             _PERTOKEN_ADALN_IMPORT_OK
             and dtype == torch.bfloat16
             and hidden_size % 256 == 0
             and hidden_size <= 8192
-            and not has_quant
             and not competing_fusion
         )
         self._enabled = False

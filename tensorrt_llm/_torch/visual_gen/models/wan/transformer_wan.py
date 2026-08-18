@@ -390,7 +390,6 @@ class WanBlock(nn.Module):
         self._fused_ln_supported = hidden_size == 5120
 
         self._pertoken_adaln = WanPerTokenAdaLN(
-            model_config,
             hidden_size,
             dtype,
             competing_fusion=self._fused_ln_supported,

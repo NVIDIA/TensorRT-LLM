@@ -475,6 +475,8 @@ class TestWan22TI2V5BCombinedOptimizations:
             assert t2v_result.video.dim() == 5
             B, _T, H, W, C = t2v_result.video.shape
             assert B == 1 and H == 704 and W == 1280 and C == 3
+            if torch.cuda.get_device_capability() == (10, 0):
+                assert all(block._pertoken_adaln._enabled for block in pipeline.transformer.blocks)
 
             assert pipeline.cache_accelerator is not None
             assert pipeline.cache_accelerator.is_enabled()
