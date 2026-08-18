@@ -48,6 +48,16 @@ public:
     static TypedVec<PoolGroupIndex, SlotCount> computeSlotsForBatch(KvCacheManager& manager, BatchDesc const& batch,
         int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse);
 
+    // Aggregate KvCache lifetime counters and the auto-tuner's moving averages. Read-only
+    // views of private state, so a regression test can pin them on either backend without
+    // widening KvCacheManager's public API.
+    static int numCreatedKvCaches(KvCacheManager const& manager);
+    static int numClosedKvCaches(KvCacheManager const& manager);
+    static int numSampledKvCaches(KvCacheManager const& manager);
+    static double avgReusedLength(KvCacheManager const& manager);
+    static double avgSqrCapacity(KvCacheManager const& manager);
+    static double avgSqrHistoryLength(KvCacheManager const& manager);
+
     // White-box test hooks: mutate auto-tuner state so accuracy tests can force a
     // pool rebalance. Reach KvCacheManager's private members via friendship.
     static void setNumSampledKvCaches(KvCacheManager& manager, int value);

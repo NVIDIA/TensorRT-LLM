@@ -777,6 +777,7 @@ void KvCacheManager::registerKvCache(KvCache* kvc)
 void KvCacheManager::unregisterKvCache(KvCache* kvc)
 {
     mLivingKvCaches.erase(kvc);
+    ++mNumClosedKvCaches;
 }
 
 void KvCacheManager::tryUpdateTargetRatios()

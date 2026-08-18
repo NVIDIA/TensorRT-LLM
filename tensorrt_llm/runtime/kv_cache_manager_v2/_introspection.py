@@ -219,6 +219,54 @@ def current_gpu_ratio(manager: Any) -> list[float]:
     return list(manager._current_gpu_ratio)
 
 
+def num_created_kv_caches(manager: Any) -> int:
+    """Return how many KV caches the manager has created."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return int(cpp_introspection.num_created_kv_caches(manager))
+    return int(manager._num_created_kv_caches)
+
+
+def num_closed_kv_caches(manager: Any) -> int:
+    """Return how many KV caches the manager has closed."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return int(cpp_introspection.num_closed_kv_caches(manager))
+    return int(manager._num_closed_kv_caches)
+
+
+def num_sampled_kv_caches(manager: Any) -> int:
+    """Return how many closed KV caches contributed to the auto-tuner statistics."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return int(cpp_introspection.num_sampled_kv_caches(manager))
+    return int(manager._num_sampled_kv_caches)
+
+
+def avg_reused_length(manager: Any) -> float:
+    """Return the moving average of reused prefix length at KV cache creation."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return float(cpp_introspection.avg_reused_length(manager))
+    return float(manager._avg_reused_length.value)
+
+
+def avg_sqr_capacity(manager: Any) -> float:
+    """Return the moving average of squared per-cache average capacity."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return float(cpp_introspection.avg_sqr_capacity(manager))
+    return float(manager._avg_sqr_capacity.value)
+
+
+def avg_sqr_history_length(manager: Any) -> float:
+    """Return the moving average of squared per-cache average history length."""
+    cpp_introspection = _cpp_introspection_module()
+    if cpp_introspection is not None:
+        return float(cpp_introspection.avg_sqr_history_length(manager))
+    return float(manager._avg_sqr_history_length.value)
+
+
 def set_num_sampled_kv_caches(manager: Any, value: int) -> None:
     """Set the sampled-KV-cache counter that gates auto-tuner rebalancing."""
     cpp_introspection = _cpp_introspection_module()

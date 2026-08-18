@@ -1934,18 +1934,18 @@ class TestResizeQuota(TestKVCacheManagerV2):
         self.manager.shutdown()
 
 
-@requires_python_backend
 class TestKVCacheAggregateCounters(unittest.TestCase):
     """Aggregate manager counters must reflect creation/close events deterministically.
 
-    The cache-level ``Average``s (``_avg_capacity``, ``_avg_history_length``) must be
-    sampled at the same set points -- construction plus explicit user resizes -- because
-    ``_try_update_target_ratios`` divides one by the other. In particular ``commit()``'s
-    implicit ``history_length`` bump must not be sampled, or the two averages would be
-    taken over different event sets.
+    The cache-level ``Average``s (capacity, history length) must be sampled at the same
+    set points -- construction plus explicit user resizes -- because
+    ``_try_update_target_ratios`` feeds one against the other when it re-derives pool
+    ratios. In particular ``commit()``'s implicit ``history_length`` bump must not be
+    sampled, or the two averages would be taken over different event sets and the
+    auto-tuner would size pools from a history/capacity ratio that no request had.
 
-    These counters have no ``_introspection`` accessor, so this is gated to the
-    pure-Python backend rather than reaching into the C++ manager.
+    Read through ``_introspection`` so this runs on both the C++ and pure-Python
+    backends; the counters are private on both.
     """
 
     manager: KVCacheManager | None
@@ -1978,21 +1978,23 @@ class TestKVCacheAggregateCounters(unittest.TestCase):
 
         Scenario (tokens_per_block=8, full attention only):
           R1: empty tree, ``input_tokens=[0..15]`` (16 tokens, exactly 2 full blocks).
-              No reuse. Cache._avg_capacity sees update(0) at init, update(16) at
-              resize -> cache average 8. Cache._avg_history_length sees update(0)
+              No reuse. The cache capacity average sees update(0) at init, update(16)
+              at resize -> cache average 8. The history-length average sees update(0)
               at init only -> cache average 0. close() pushes 8**2=64 into
-              manager._avg_sqr_capacity and 0**2=0 into _avg_sqr_history_length;
-              create-time pushes history_length=0 into _avg_reused_length.
+              avg_sqr_capacity and 0**2=0 into avg_sqr_history_length; create-time
+              pushes history_length=0 into avg_reused_length.
           R2: tree fully populated with R1's blocks under the same reuse scope, full
-              reuse -> _setup_for_reuse sets _history_length = _capacity = 16
-              before the cache-level averages are constructed. Cache._avg_capacity
-              sees update(16) twice (init + resize) -> cache average 16.
-              Cache._avg_history_length sees update(16) once (init) -> 16.
-              close() pushes 16**2=256 into both _avg_sqr_* counters; create-time
-              pushes 16 into _avg_reused_length.
+              reuse -> the reuse setup sets history_length = capacity = 16 before the
+              cache-level averages are constructed. The capacity average sees
+              update(16) twice (init + resize) -> cache average 16. The history-length
+              average sees update(16) once (init) -> 16. close() pushes 16**2=256 into
+              both avg_sqr_* counters; create-time pushes 16 into avg_reused_length.
 
         ``MovingAverage(decay=0.9999)`` formula (see _moving_average.py):
           weight_n = 1 + decay * weight_(n-1);  avg_n = avg_(n-1) + (v - avg_(n-1)) / weight_n.
+
+        Both close()s are sampled, so num_sampled equals num_closed here -- the
+        stats-excluded path (dummy/warmup caches) is not exercised.
         """
         cfg = create_config(
             tokens_per_block=8,
@@ -2019,25 +2021,28 @@ class TestKVCacheAggregateCounters(unittest.TestCase):
         self._commit_and_close(kv_b, tokens, capacity=16)
 
         # 2 create_kv_cache calls -> 2 created.
-        self.assertEqual(self.manager._num_created_kv_caches, 2)
+        self.assertEqual(_introspection.num_created_kv_caches(self.manager), 2)
         # 2 close() calls -> 2 closed.
-        self.assertEqual(self.manager._num_closed_kv_caches, 2)
+        self.assertEqual(_introspection.num_closed_kv_caches(self.manager), 2)
+        self.assertEqual(_introspection.num_sampled_kv_caches(self.manager), 2)
 
-        # _avg_reused_length: MovingAverage updated with 0, then 16.
+        # avg_reused_length: MovingAverage updated with 0, then 16.
         #   step 1: weight=1.0,         avg = 0.0
         #   step 2: weight=1.9999,      avg = 0 + (16 - 0)/1.9999 = 8.000400020001
-        self.assertEqual(round(self.manager._avg_reused_length.value), 8)
+        self.assertEqual(round(_introspection.avg_reused_length(self.manager)), 8)
 
-        # _avg_sqr_capacity: MovingAverage updated with 64 (=8^2), then 256 (=16^2).
+        # avg_sqr_capacity: MovingAverage updated with 64 (=8^2), then 256 (=16^2).
         #   step 1: weight=1.0,         avg = 64.0
         #   step 2: weight=1.9999,      avg = 64 + (256 - 64)/1.9999 = 160.004800240012
-        self.assertAlmostEqual(self.manager._avg_sqr_capacity.value, 160.004800240012, places=6)
+        self.assertAlmostEqual(
+            _introspection.avg_sqr_capacity(self.manager), 160.004800240012, places=6
+        )
 
-        # _avg_sqr_history_length: MovingAverage updated with 0, then 256 (=16^2).
+        # avg_sqr_history_length: MovingAverage updated with 0, then 256 (=16^2).
         #   step 1: weight=1.0,         avg = 0.0
         #   step 2: weight=1.9999,      avg = 0 + (256 - 0)/1.9999 = 128.006400320016
         self.assertAlmostEqual(
-            self.manager._avg_sqr_history_length.value, 128.006400320016, places=6
+            _introspection.avg_sqr_history_length(self.manager), 128.006400320016, places=6
         )
 
 

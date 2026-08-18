@@ -1784,6 +1784,32 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::move(ratio.raw());
         },
         nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    // Aggregate KvCache lifetime counters and auto-tuner moving averages, mirroring the
+    // Python manager's internal attributes so one test can pin both backends.
+    mIntrospection.def(
+        "num_created_kv_caches",
+        [](kv::KvCacheManager const& manager) { return kv::KvCacheIntrospection::numCreatedKvCaches(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "num_closed_kv_caches",
+        [](kv::KvCacheManager const& manager) { return kv::KvCacheIntrospection::numClosedKvCaches(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "num_sampled_kv_caches",
+        [](kv::KvCacheManager const& manager) { return kv::KvCacheIntrospection::numSampledKvCaches(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "avg_reused_length",
+        [](kv::KvCacheManager const& manager) { return kv::KvCacheIntrospection::avgReusedLength(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "avg_sqr_capacity",
+        [](kv::KvCacheManager const& manager) { return kv::KvCacheIntrospection::avgSqrCapacity(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "avg_sqr_history_length",
+        [](kv::KvCacheManager const& manager) { return kv::KvCacheIntrospection::avgSqrHistoryLength(manager); },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
     // White-box test hooks: mutate auto-tuner state so accuracy tests can force
     // a pool rebalance. Mirror the Python manager's internal attributes.
     mIntrospection.def(

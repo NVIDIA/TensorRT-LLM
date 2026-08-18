@@ -106,6 +106,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     _refreshGenerationAllocReady();
 
     mAvgHistoryLength.update(static_cast<double>(mHistoryLength));
+    mAvgCapacity.update(static_cast<double>(mCapacity));
 
     mManager->registerKvCache(this);
     mManager->updateAvgReusedLength(static_cast<double>(mHistoryLength));
@@ -567,7 +568,6 @@ void KvCache::close()
     // already tracked as stats-excluded at creation; honour that here too.
     if (mCapacity > 0 && !mManager->isStatsExcluded(id))
     {
-        mAvgCapacity.update(static_cast<double>(mCapacity));
         mManager->updateAvgSqrCapacity(mAvgCapacity.value() * mAvgCapacity.value());
         mManager->updateAvgSqrHistoryLength(mAvgHistoryLength.value() * mAvgHistoryLength.value());
         mManager->incrementNumSampledKvCaches();
@@ -956,7 +956,7 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
 // resize
 // ---------------------------------------------------------------------------
 
-bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLength)
+bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLength, bool trackAvg)
 {
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(mBlocks.size() == BlockOrdinal{divUp(mCapacity, mTokensPerBlock)});
@@ -964,9 +964,9 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     int newCap = capacity.value_or(mCapacity);
     int newHist = historyLength.value_or(mHistoryLength);
 
-    if (capacity.has_value())
+    if (trackAvg && capacity.has_value())
         mAvgCapacity.update(static_cast<double>(newCap));
-    if (historyLength.has_value())
+    if (trackAvg && historyLength.has_value())
         mAvgHistoryLength.update(static_cast<double>(newHist));
 
     if (newHist < mHistoryLength)
@@ -1764,7 +1764,11 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
     // BEFORE the commit loop so stale-range computation sees the new history).
     int const numCommitted = static_cast<int>(mCommittedTokens.size());
     if (mHistoryLength < numCommitted)
-        setHistoryLength(numCommitted);
+    {
+        bool const success = resize(std::nullopt, numCommitted, /*trackAvg=*/false);
+        TLLM_CHECK_DEBUG(success);
+        (void) success;
+    }
 
     int const numCommittedBlocksBefore = mNumCommittedBlocks;
     int const newNumFullBlocks = numCommitted / mTokensPerBlock;

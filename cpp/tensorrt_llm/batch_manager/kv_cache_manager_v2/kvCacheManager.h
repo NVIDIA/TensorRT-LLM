@@ -349,6 +349,7 @@ private:
     TypedVec<PoolGroupIndex, float> mTargetRatioListOther;
 
     int mNumCreatedKvCaches{0};
+    int mNumClosedKvCaches{0};
     int mNumSampledKvCaches{0};
     double mLastAdjustmentTime{0.0};
     int mLastUpdateNumSampledKvCaches{0};

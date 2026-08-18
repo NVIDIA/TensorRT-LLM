@@ -202,7 +202,9 @@ public:
 
     // Resize capacity and/or history_length.
     // Returns true if the resize was a no-op shortcut.
-    bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt);
+    // `trackAvg` false skips the cache-level average sampling, so implicit resizes driven by
+    // commit() do not pollute averages that must reflect only explicit user set points.
+    bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt, bool trackAvg = true);
 
     // Convenience: set only capacity or history length.
     void setCapacity(int capacity);

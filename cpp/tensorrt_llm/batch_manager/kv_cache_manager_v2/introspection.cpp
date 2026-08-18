@@ -129,6 +129,36 @@ bool KvCacheIntrospection::allTreePagesDroppable(KvCacheManager& manager)
     return true;
 }
 
+int KvCacheIntrospection::numCreatedKvCaches(KvCacheManager const& manager)
+{
+    return manager.mNumCreatedKvCaches;
+}
+
+int KvCacheIntrospection::numClosedKvCaches(KvCacheManager const& manager)
+{
+    return manager.mNumClosedKvCaches;
+}
+
+int KvCacheIntrospection::numSampledKvCaches(KvCacheManager const& manager)
+{
+    return manager.mNumSampledKvCaches;
+}
+
+double KvCacheIntrospection::avgReusedLength(KvCacheManager const& manager)
+{
+    return manager.mAvgReusedLength.value();
+}
+
+double KvCacheIntrospection::avgSqrCapacity(KvCacheManager const& manager)
+{
+    return manager.mAvgSqrCapacity.value();
+}
+
+double KvCacheIntrospection::avgSqrHistoryLength(KvCacheManager const& manager)
+{
+    return manager.mAvgSqrHistoryLength.value();
+}
+
 void KvCacheIntrospection::setNumSampledKvCaches(KvCacheManager& manager, int value)
 {
     manager.mNumSampledKvCaches = value;
