@@ -1856,6 +1856,53 @@ def test_deepseek_streaming_emits_text_before_tool_call(
     assert "get_weather" in [call.name for call in result.calls if call.name]
 
 
+@pytest.mark.parametrize(
+    "parser_cls, tool_call_text",
+    [
+        (
+            DeepSeekV3Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+             'get_weather\n```json\n{"location": "Tokyo"}\n```'
+             "<｜tool▁call▁end｜><｜tool▁calls▁end｜>"),
+        ),
+        (
+            DeepSeekV31Parser,
+            ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+             '{"location": "Tokyo"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'),
+        ),
+        (
+            DeepSeekV32Parser,
+            ('<｜DSML｜function_calls><｜DSML｜invoke name="get_weather">'
+             '{"location": "Tokyo"}</｜DSML｜invoke></｜DSML｜function_calls>'),
+        ),
+        (
+            DeepSeekV4Parser,
+            ('<｜DSML｜tool_calls><｜DSML｜invoke name="get_weather">'
+             '{"location": "Tokyo"}</｜DSML｜invoke></｜DSML｜tool_calls>'),
+        ),
+    ],
+)
+def test_deepseek_streaming_prefix_is_delta_independent(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], tool_call_text: str) -> None:
+    """The prefix is streamed verbatim however the deltas are cut."""
+    prefix = "  Normal text  "
+    text = prefix + tool_call_text
+    splits = [
+        [text],
+        [prefix, tool_call_text],
+        [text[:8], text[8:]],
+    ]
+
+    for deltas in splits:
+        parser = parser_cls()
+        streamed = "".join(
+            parser.parse_streaming_increment(delta, sample_tools).normal_text
+            for delta in deltas)
+
+        assert streamed == prefix, f"{deltas!r} streamed {streamed!r}"
+
+
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
