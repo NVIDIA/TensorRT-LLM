@@ -45,6 +45,21 @@ def test_recompute_pause_does_not_apply_executor_max_input_len() -> None:
     request.reset_for_recompute.assert_called_once_with(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
 
 
+def test_recompute_pause_skips_request_finished_during_overlap() -> None:
+    executor = _make_executor(None)
+    request = _StubRequest()
+    executor.active_requests = [request]
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.recompute_paused_requests = [request]
+
+    executor._terminate_recompute_paused_requests(scheduled_batch)
+    request.is_finished = True
+    executor._pause_recompute_paused_requests(scheduled_batch)
+
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    request.reset_for_recompute.assert_not_called()
+
+
 def test_recompute_pause_defers_reset_until_pp_consensus() -> None:
     handler = Mock()
     executor = _make_executor(handler)

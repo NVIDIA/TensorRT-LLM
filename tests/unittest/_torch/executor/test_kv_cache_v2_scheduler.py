@@ -587,6 +587,24 @@ class TestKVCacheFailuresGen:
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_not_called()
 
+    def test_recompute_pause_skips_generation_to_complete_victim(self):
+        """A finalizing request cannot be replayed by destructive pause."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        current = make_gen_request(0)
+        current.is_generation_to_complete_state = False
+        victim = make_gen_request(1)
+        victim.state_value = GEN_TO_COMPLETE
+        victim.is_generation_to_complete_state = True
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+
+        out = sched.schedule_request([current, victim], set())
+
+        assert out.generation_requests == []
+        assert ids(out.paused_requests) == [0]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
     def test_recompute_frontier_survives_ordinary_frontier_shrink(self):
         """Recompute still sees a suspended tail after ordinary eviction skips it."""
         attempts = {}

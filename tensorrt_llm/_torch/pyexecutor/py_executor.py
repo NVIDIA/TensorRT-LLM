@@ -8234,7 +8234,12 @@ class PyExecutor:
         if not requests:
             return
         for req in requests:
-            if req.py_request_id not in self._pending_recompute_pause_ids:
+            should_recompute = (
+                req.py_request_id not in self._pending_recompute_pause_ids
+                and any(active_request is req
+                        for active_request in self.active_requests)
+                and not req.is_finished)
+            if should_recompute:
                 self._pause_recompute_request(req)
 
     def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):

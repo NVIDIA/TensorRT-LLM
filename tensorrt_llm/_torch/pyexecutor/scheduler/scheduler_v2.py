@@ -1071,6 +1071,10 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> bool:
         if req.request_id in inflight_request_ids:
             return False
+        # is_generation_in_progress_state also includes GENERATION_TO_COMPLETE,
+        # which is outside the schedulable range and may still be finalizing.
+        if req.state_value == self._gen_to_complete_state_value:
+            return False
         # Completed multimodal prefill deliberately releases the inputs and
         # embedding needed for replay, leaving an empty or MRoPE-only dict as
         # the durable marker. Partial-context requests still retain replay data.
