@@ -581,8 +581,10 @@ def getInfraDryRunPytestTargets(testListPath) {
     def targets = readFile(file: testListPath).readLines()
         .collect { it.trim().split(/\s+/, 2)[0] }
         .findAll { it.contains("::") }
-    if (!targets) {
-        error "No pytest targets found in infrastructure dry-run list ${testListPath}"
+    def expectedTarget =
+        "test_infra_dry_run_benchmark.py::test_infra_dry_run_benchmark"
+    if (targets != [expectedTarget]) {
+        error "Unexpected pytest targets in infrastructure dry-run list ${testListPath}: ${targets}"
     }
     return targets
 }
