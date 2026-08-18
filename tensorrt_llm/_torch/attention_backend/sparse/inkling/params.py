@@ -15,39 +15,34 @@
 """Inkling's selection key, its per-forward backend inputs, and the architecture
 config that carries the former.
 
-**Inkling is not sparse attention** (see the package docstring). It reuses three
-``sparse/`` mechanisms because none is actually about sparsity -- they are the
-framework's only registered seams for "select a model-specific backend"
-(:class:`SparseParams`, the key ``sparse/registry.py`` dispatches on) and "pass a
-model-specific per-forward input" (:class:`SparseBackendForwardArgs`, the slot on
-``AttentionForwardArgs``; ``merge_attention_forward_args`` rejects unknown
-kwargs, and widening the shared dataclass per model is what that slot avoids).
+**Inkling is not sparse attention** (see the package docstring). It reuses two
+``sparse/`` seams because neither is about sparsity: :class:`SparseParams`, the
+key ``sparse/registry.py`` dispatches on, and :class:`SparseBackendForwardArgs`,
+the slot on ``AttentionForwardArgs`` that exists so a model-specific forward
+input does not require widening the shared dataclass.
 
-**Why the config exists.** The registry dispatches on ``SparseParams``, which the
-module layer derives from ``ModelConfig.sparse_attention_config``. Consumers
-holding no ``ModelConfig`` -- ``PyTorchModelEngine``, the KV-cache creator, the
-vision encoders -- instead call ``get_attention_backend(name)`` and read
-``.Metadata``. Left ``None``, those resolved ``TrtllmAttentionMetadata`` and
-warmup's first mixed batch died inside the backend. Populating it makes the
-registry the single selection path, so ``get_attention_backend`` needs no
-model-specific branch.
+**Why the config exists.** The registry dispatches on ``SparseParams``, derived
+from ``ModelConfig.sparse_attention_config``. Consumers holding no
+``ModelConfig`` -- ``PyTorchModelEngine``, the KV-cache creator, the vision
+encoders -- instead call ``get_attention_backend(name)`` and read ``.Metadata``.
+Left ``None`` they resolved ``TrtllmAttentionMetadata``, and warmup's first mixed
+batch died inside the backend. Populating it makes the registry the single
+selection path.
 
-**Why it is not in the user-facing union.** ``ModelConfig`` is a plain dataclass
-and never validates that field against the discriminated union in
-``llmapi/llm_args.py``, so this subclasses ``BaseSparseAttentionConfig`` without
-joining the union: no api-stability snapshot, golden manifest or telemetry
-review. Inkling has one correct backend, so a user knob would have one legal
-value. Injected by ``ModelConfig.from_pretrained`` keyed on architecture, the
-same seam DeepSeek-V4 uses.
+**Why it is not in the user-facing union.** ``ModelConfig`` never validates that
+field against the discriminated union, so this subclasses
+``BaseSparseAttentionConfig`` without joining it: no api-stability snapshot,
+golden manifest or telemetry review, and no user knob with one legal value.
+Injected by ``ModelConfig.from_pretrained`` keyed on architecture, the seam
+DeepSeek-V4 uses.
 
-**The cost.** ``sparse_attention_config`` is non-``None`` for a dense model, so
-every reader treating that as "is sparse" must know about Inkling.
+**The cost.** The field is non-``None`` for a dense model, so every reader
+treating it as "is sparse" must know about Inkling.
 ``get_sparse_attn_kv_cache_manager`` is handled; the ``Using sparse attention:``
-log line in ``modules/attention.py`` is tolerated -- silencing it needs a
-model-specific branch in a shared file, which is what this arrangement exists to
-avoid. A reader added later needs the same audit, and fails by taking a wrong
-branch rather than erroring. That is the standing liability; the alternative is
-one ``elif`` in ``get_attention_backend``, which cannot be reached by accident.
+log line is tolerated, since silencing it needs a model-specific branch in a
+shared file. A reader added later fails by taking a wrong branch rather than
+erroring -- the standing liability of this route versus one ``elif`` in
+``get_attention_backend``.
 """
 
 from dataclasses import dataclass

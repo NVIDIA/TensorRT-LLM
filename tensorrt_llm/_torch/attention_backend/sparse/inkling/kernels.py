@@ -15,23 +15,21 @@
 """Inkling Triton attention: paged prefill + decode with a learned relative-bias
 ``score_mod`` and native sliding window.
 
-Inkling adds a learned per-(query-token, head, relative-distance) additive bias
-inside the attention score, and windows local layers separately. No fused,
-CUDA-graph-safe TensorRT-LLM backend exposes a ``score_mod`` hook, so Inkling's
-production attention path is this pair of Triton kernels.
+Inkling adds a learned per-(query-token, head, relative-distance) bias inside
+the attention score. No fused, CUDA-graph-safe TensorRT-LLM backend exposes a
+``score_mod`` hook, which is why this pair of Triton kernels is the production
+path.
 
-The bias is precomputed torch-side into a contiguous ``rel_logits`` aux tensor
+The bias is precomputed torch-side into ``rel_logits``
 ``[num_query_tokens, num_heads, rel_extent]``; the kernels only gather+add:
 
     rel_dist = q_pos - k_pos
     bias     = rel_logits[q_idx, head, clamp(rel_dist, 0, rel_extent - 1)]
                if 0 <= rel_dist < rel_extent else 0
-    qk      += bias
 
-``rel_logits`` keeps a static shape, so the decode kernel is CUDA-graph
-capturable: the launch grid is fixed and sequence lengths are read from a GPU
-tensor (no host sync). Both kernels read the paged KV cache in the
-``KVCacheManagerV2`` HND layout through a per-request page table.
+Its shape is static, so the decode kernel is graph-capturable: fixed launch
+grid, sequence lengths read from a GPU tensor. Both kernels read the paged KV
+cache in HND layout through a per-request page table.
 """
 
 from typing import Optional

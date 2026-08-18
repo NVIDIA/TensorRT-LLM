@@ -33,29 +33,20 @@ from .params import InklingBackendForwardArgs
 class InklingTritonAttention(TrtllmAttention):
     """Runs Inkling's Triton attention over the paged KV cache.
 
-    Entry point is the standard :meth:`AttentionBackend.forward`. The two inputs
-    that are Inkling's alone -- the per-(query, head, relative-distance) additive
-    bias ``rel_logits`` and the ``allow_mixed`` certificate -- ride
-    ``AttentionForwardArgs.sparse_backend_args`` as an
-    :class:`InklingBackendForwardArgs`, which is the registered slot for exactly
-    this (``ATTENTION_DEVELOPER_GUIDE.md`` §1.2). Widening the shared
-    ``AttentionForwardArgs`` for one model, or reusing T5's
-    ``relative_attention_bias`` field, were the alternatives; see
-    ``params.py`` for why neither works.
+    Standard :meth:`AttentionBackend.forward`. Inkling's two private inputs
+    (``rel_logits``, ``allow_mixed``) ride
+    ``AttentionForwardArgs.sparse_backend_args``, the registered slot for
+    exactly this; ``params.py`` covers why neither widening the shared dataclass
+    nor reusing T5's ``relative_attention_bias`` works.
 
-    Subclassing ``TrtllmAttention`` rather than ``AttentionBackend`` is
-    deliberate: :class:`InklingAttentionMetadata` extends
-    ``TrtllmAttentionMetadata`` to reuse its ``prepare()`` (page tables, seq
-    lens), the model engine gates attention warmup on that same subclass check,
-    and the base ``Attention`` module calls ``support_fused_qkv()`` /
-    ``update_quant_config()`` on whatever backend it built.
+    Subclasses ``TrtllmAttention``, not ``AttentionBackend``:
+    :class:`InklingAttentionMetadata` extends the Trtllm metadata to reuse its
+    ``prepare()``, and the model engine gates warmup on that same subclass check.
 
-    Three per-layer scalars the moved compute reads (``sm_scale``,
-    ``rel_extent``, ``window_left``) are assigned by ``InklingAttention``
-    after construction, because ``create_attention()`` has a fixed kwarg list
-    with no passthrough. ``layer_idx`` comes from ``create_attention`` and is
-    the *global* layer index, which is what ``KVCacheManagerV2`` expects (it
-    maps through ``layer_offsets`` itself).
+    ``sm_scale`` / ``rel_extent`` / ``window_left`` are assigned by
+    ``InklingAttention`` after construction -- ``create_attention()`` has a fixed
+    kwarg list. ``layer_idx`` is the *global* index, which is what
+    ``KVCacheManagerV2`` expects.
     """
 
     Metadata = InklingAttentionMetadata
@@ -72,18 +63,13 @@ class InklingTritonAttention(TrtllmAttention):
         """Dispatch prefill / decode over the paged cache, supporting mixed
         context+generation batches.
 
-        The runtime packs context requests first (each with its full new-token
-        span) then one-token generation requests (``seq_lens == 1``). We slice
-        the packed q/k/v/rel_logits + per-request metadata at that boundary and
-        run the context slice through the prefill kernel and the generation
-        slice through the paged-decode kernel, concatenating the outputs. Pure
-        context (``num_contexts == num_seqs``) and pure generation
-        (``num_contexts == 0``) fall out as the single-slice cases.
+        The runtime packs context requests first, then one-token generation
+        requests, so slicing at that boundary feeds the prefill and paged-decode
+        kernels respectively; the pure cases fall out as single slices.
 
-        Overriding ``forward`` outright rather than delegating to
+        Overriding ``forward`` rather than delegating to
         ``TrtllmAttention.forward`` is what keeps Inkling off the sparse
-        prediction hooks (``prepare_sparse_runtime_params`` is called from that
-        method); see ``params.py``.
+        prediction hooks that method calls.
         """
         forward_args = merge_attention_forward_args(forward_args, kwargs)
         args = forward_args.sparse_backend_args

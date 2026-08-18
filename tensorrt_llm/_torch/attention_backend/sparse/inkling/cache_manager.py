@@ -108,15 +108,11 @@ class _InklingConvGeometry:
         self.config = config
         self.dtype = _resolve_conv_dtype(pretrained_config)
         self.kwin = config.sconv_kernel_size - 1
-        # The conv pool's k/v width follows the attention kv-head split, so it
-        # takes the attention TP, not the global one -- the same rule
-        # KVCacheManagerV2 applies to the paged pool. Dividing by the global
-        # tp_size would allocate narrow conv rows for full-width convs.
+        # k/v width follows the attention kv-head split, so this takes the
+        # attention TP, not the global one -- as V2 does for the paged pool.
         self.tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
-        # One row per sequence that can be resident at once. Pipeline stages
-        # each hold a microbatch, so the bound is max_batch_size * pp_size --
-        # the same count MambaHybridCacheManagerV2 calls
-        # ``_max_resident_sequences``.
+        # One row per resident sequence; pipeline stages each hold a
+        # microbatch, hence * pp_size (Mamba's _max_resident_sequences).
         self.num_request_slots = max_batch_size * mapping.pp_size
         self.reserve_attention_dp_slot = bool(mapping.enable_attention_dp)
         self.max_draft_len = int(getattr(spec_config, "max_draft_len", 0) or 0)
@@ -153,16 +149,10 @@ class InklingHybridCacheManager(KVCacheManagerV2):
     """
 
     def __init__(self, *args, pretrained_config, mapping, max_batch_size, **kwargs):
-        # The three arguments the pool needs are declared, not read back out of
-        # ``**kwargs``. KVCacheManagerV2 takes ``mapping`` / ``max_batch_size``
-        # keyword-only and absorbs ``pretrained_config`` into ``**kwargs``
-        # without storing it, so subscripting kwargs worked only as long as
-        # every caller passed all three by keyword: omitting one surfaced as a
-        # bare KeyError from inside this constructor rather than as a TypeError
-        # naming the parameter.
-        #
-        # The conv geometry is computed BEFORE super().__init__() because
-        # ``_build_cache_config`` runs inside it and has to size the SSM buffers.
+        # Declared rather than dug out of **kwargs: a missing one then fails as
+        # a TypeError naming the parameter, not a KeyError from in here.
+        # Geometry is computed BEFORE super().__init__() because
+        # _build_cache_config runs inside it and must size the SSM buffers.
         self._conv_geometry = _InklingConvGeometry(
             pretrained_config,
             mapping,
@@ -217,10 +207,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
         geo = self._conv_geometry
         layers = list(config.layers)
         num_attention_layers = len(layers)
-        # ``_conv_layer_id`` derives the SSM ids as ``num_local_layers + offset``
-        # rather than by lookup, so the base must have emitted exactly one
-        # attention layer per local decoder layer. Assert it here instead of
-        # letting a mismatch surface as a wrong pool address at first decode.
+        # _conv_layer_id derives SSM ids arithmetically, so the base must have
+        # emitted one attention layer per local decoder layer. A mismatch would
+        # otherwise surface as a wrong pool address at first decode.
         assert num_attention_layers == self.num_local_layers, (
             num_attention_layers,
             self.num_local_layers,
@@ -238,21 +227,18 @@ class InklingHybridCacheManager(KVCacheManagerV2):
                 )
             )
 
-        # Reserve the non-request rows (CUDA-graph padding sentinels, and the
-        # attention-DP idle dummy) the same way Mamba does: as zero-capacity
-        # requests. They cost no attention pages but each holds one state slot,
-        # which is exactly their effect on the pool.
+        # Non-request rows as zero-capacity requests, like Mamba: no attention
+        # pages, one state slot each -- exactly their effect on the pool.
         dummies = [
             KVCacheDesc(capacity=0, history_length=0) for _ in range(geo.num_reserved_slots)
         ]
         constraints = [
             replace(batch, kv_caches=[*batch.kv_caches, *dummies]) for batch in config.constraints
         ]
-        # A floor on the state slots, independent of sequence length. Attention
-        # pages scale with tokens so the base's constraints already bound them,
-        # but a conv row is fixed-size per resident sequence: without this the
-        # pool can be sized for fewer sequences than the scheduler will admit,
-        # and the failure is a mid-run "out of rows" rather than a startup error.
+        # Length-independent floor. Attention pages scale with tokens so the
+        # base's constraints bound them, but a conv row is fixed per resident
+        # sequence; without this the pool can be sized below what the scheduler
+        # admits, failing mid-run rather than at startup.
         constraints.append(
             BatchDesc(
                 [
@@ -261,12 +247,9 @@ class InklingHybridCacheManager(KVCacheManagerV2):
                 ]
             )
         )
-        # KVCacheManagerConfig asserts this whenever any SSM layer is present:
-        # their lifecycle needs minimum-snapshot commit semantics. Harmless for
-        # Inkling, which refuses block reuse outright, so no commit is ever
-        # attempted -- but the runtime config still requires the invariant, and
-        # it is a hard assert rather than a default (MambaHybridCacheManagerV2
-        # sets it for the same reason).
+        # KVCacheManagerConfig hard-asserts this whenever an SSM layer exists.
+        # Harmless here -- Inkling refuses block reuse, so nothing ever commits
+        # -- but the invariant is still required (as Mamba's manager does).
         return replace(
             config, layers=layers, constraints=constraints, commit_min_snapshot=True
         )

@@ -14,26 +14,18 @@
 # limitations under the License.
 """Inkling attention: Triton kernels, per-step metadata, backend, cache manager.
 
-**Inkling is not a sparse-attention algorithm.** Its attention is dense: full
-causal on global layers, a sliding window on local ones, plus a learned
-relative-bias ``score_mod``. It lives under ``sparse/`` anyway, and that is a
-deliberate structural choice rather than a claim about the math:
+**Inkling is not a sparse-attention algorithm** -- its attention is dense (full
+causal, sliding window on local layers, plus a learned relative-bias
+``score_mod``). It lives under ``sparse/`` because that is where every
+*model-specific* attention backend already lives: the package name is
+historical, and what unifies its members is needing a private
+``AttentionBackend`` + metadata + cache manager, which is Inkling's shape
+exactly.
 
-``sparse/`` is where every *model-specific* attention backend already lives
-(``dsa``, ``deepseek_v4``, ``minimax_m3``, ``rocket``). The package name is
-historical -- what unifies its members is that each needs its own
-``AttentionBackend`` + metadata + cache manager, which is exactly Inkling's
-shape. Keeping it beside them means one place to look for "models with a private
-attention stack" rather than that package plus a lone top-level exception.
-
-Selection goes through ``sparse/registry.py`` on ``SparseParams``, like its
-neighbours, so ``attention_backend/utils.py`` needs no model-specific branch;
-``params.py`` explains the config that makes that reachable and what it costs.
-The other sparse interface reused there is ``SparseBackendForwardArgs``, as the
-carrier for ``rel_logits``.
-
-If these mechanisms are ever renamed to something algorithm-neutral, Inkling
-should follow: nothing here depends on sparsity semantics.
+Selection goes through ``sparse/registry.py`` like its neighbours, so
+``attention_backend/utils.py`` needs no model-specific branch; ``params.py``
+covers the config that makes that reachable and what it costs. Nothing here
+depends on sparsity semantics.
 """
 
 from .backend import InklingTritonAttention

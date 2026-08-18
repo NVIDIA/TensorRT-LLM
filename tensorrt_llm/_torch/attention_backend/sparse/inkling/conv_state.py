@@ -135,18 +135,13 @@ class InklingConvStateCache:
         self.num_slots = num_slots
         self.kwin = kwin
 
-        # ``allocate`` hands back V2 pool memory when the cache manager built us
-        # (see InklingHybridCacheManager._conv_state_buffer): that is what puts
-        # these bytes inside V2's quota instead of beside it. Standalone
-        # construction -- unit tests, and any caller with no V2 manager to hand
-        # -- falls back to a private allocation with the same shapes.
+        # ``allocate`` hands back V2 pool memory when the cache manager built us,
+        # which is what puts these bytes inside V2's quota. Standalone callers
+        # (unit tests) fall back to a private allocation of the same shapes.
         #
-        # Pool memory arrives uninitialized, unlike the torch.zeros this used to
-        # do. That is safe only because ``slots_for`` zeroes a row the first time
-        # it hands it to a request, and every row that is ever read has been
-        # handed out first (``write_state_indices`` runs each forward, ahead of
-        # any conv). Anything that starts reading rows without claiming them
-        # would need an explicit zero-fill here.
+        # Pool memory arrives UNINITIALIZED. Safe only because ``slots_for``
+        # zeroes a row when it first hands it out, and every row that is read was
+        # handed out first. A reader that skips claiming needs a zero-fill.
         if allocate is None:
 
             def allocate(_layer_idx, _role, state_shape):
@@ -170,11 +165,9 @@ class InklingConvStateCache:
                         "InklingConvStateCache assumes."
                     )
             self._layers.append(InklingConvState(*(b[:num_slots] for b in bufs)))
-        # Stable per-batch-row slot-index buffer, refreshed in place per forward
-        # from input preparation (see :meth:`write_state_indices`) so a captured
-        # decode graph aliases it and every replay sees the current batch. It is
-        # indexed by batch position, not by slot, so it needs one entry per row
-        # the padded batch can carry -- which ``num_slots`` bounds.
+        # Refreshed in place per forward so a captured graph aliases it and every
+        # replay sees the current batch. Indexed by batch position, not by slot,
+        # so it needs one entry per row the padded batch can carry.
         self.state_indices = torch.arange(num_slots, dtype=torch.int32, device=device)
         # Pinned host staging for that write: one async H2D copy per forward,
         # legal under graph capture. Kept in lock-step size with ``state_indices``.
@@ -314,17 +307,14 @@ class InklingConvRuntime:
                 0
             )
             query_start_loc = cu
-            # Fresh prefill carries no prior conv window. This is correct only
-            # because the two features that would leave a context request with a
-            # prior window -- KV block reuse and chunked prefill -- are refused
-            # up front by ``reject_unsupported_inkling_kv_cache_features``.
-            #
-            # Do NOT "fix" this line on its own. Deriving has_initial_state from
-            # ``num_cached_tokens_per_seq`` (the ``Mamba2Metadata`` pattern) is
-            # necessary but NOT sufficient: ``_run_context`` attends only to the
-            # tokens of its own call, so a request carrying cached history would
-            # still lose that history in attention and stay silently wrong. See
+            # Fresh prefill carries no prior conv window -- correct only because
+            # KV block reuse and chunked prefill are refused up front by
             # ``reject_unsupported_inkling_kv_cache_features``.
+            #
+            # Do NOT "fix" this line alone. Deriving has_initial_state from
+            # num_cached_tokens_per_seq is necessary but NOT sufficient:
+            # ``_run_context`` attends only to its own call's tokens, so a
+            # request with cached history would still lose it, silently.
             has_initial_state = torch.zeros(num_contexts, dtype=torch.bool, device=device)
         return cls(
             num_ctx_tokens=num_ctx_tokens,

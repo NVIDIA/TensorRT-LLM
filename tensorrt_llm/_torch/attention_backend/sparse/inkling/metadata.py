@@ -31,33 +31,22 @@ _INK_XCHK_ANNOUNCED = False
 class InklingAttentionMetadata(TrtllmAttentionMetadata):
     """Per-step decode metadata for the Inkling Triton kernels.
 
-    The decode kernel needs the total KV length and the page table per generation
-    request, through fixed-pointer GPU buffers (building either from host lists is
-    illegal under CUDA-graph capture). Neither is this class's to own: it slices
-    the base's ``kv_lens_cuda`` and ``kv_cache_block_offsets``, which
+    The decode kernel needs each generation request's total KV length and page
+    table through fixed-pointer GPU buffers. Neither is this class's to own: it
+    slices the base's ``kv_lens_cuda`` and ``kv_cache_block_offsets``, which
     ``TrtllmAttentionMetadata.prepare`` already fills and keeps graph-stable.
 
-    ``kv_cache_block_offsets`` is laid out for the C++ attention op, and every
-    difference from what these kernels want is absorbed for free:
+    The latter is laid out for the C++ attention op, but pool-major is what we
+    want (one table per KV geometry, for free), plane 0 serves both K and V, and
+    absent blocks are already 0. The one real difference is that entries count
+    pages while the kernel's views count blocks -- hence :attr:`ink_page_div`,
+    once per KV tile. Borrowing also removes an assumption: the hand-built table
+    packed valid ids to the front, which matches the kernel's
+    ``k_pos // page_size`` addressing only while no request has an interior hole.
 
-    - pool-major, so indexing the leading axis by pool id gives one table per KV
-      geometry -- deduplication this class used to do by hand;
-    - the ``2`` axis is the K/V plane, and
-      ``copyBatchBlockOffsetsToDeviceKernel`` writes
-      ``index_scale * base_page_index`` into plane 0, so plane 0 serves both;
-    - entries count pages while the kernel's ``kv[:, 0]`` / ``kv[:, 1]`` views
-      count blocks, hence :attr:`ink_page_div` once per KV tile;
-    - absent blocks are already 0, matching the kernel's ``seq_len`` mask.
-
-    Borrowing also *removes* an assumption: the hand-built table packed valid ids
-    to the front, which matches the kernel's ``k_pos // page_size`` addressing
-    only while no request has an interior hole. The borrowed one is positional by
-    construction.
-
-    There is no per-step publication counter. ``model_engine`` assigns
-    ``_num_generations`` and ``request_ids`` from one scheduled batch, so
-    ``num_generations`` already is ``len(request_ids) - num_contexts``,
-    CUDA-graph padding rows included. The backend guards on the metadata *type*.
+    No per-step publication counter: ``num_generations`` already is
+    ``len(request_ids) - num_contexts``, padding rows included, so the backend
+    guards on the metadata *type* instead.
     """
 
     def __post_init__(self) -> None:
