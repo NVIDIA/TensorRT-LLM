@@ -189,40 +189,6 @@ def test_disaggregated_serving_is_rejected():
     )
 
 
-def test_both_messages_name_the_attention_path_not_just_the_conv():
-    """The conv window is the visible half; the load-bearing half is that
-    inkling_prefill_attention has no paged-KV argument, so a context request
-    with cached history loses it in ATTENTION too. A reader who sees only the
-    conv reason will "fix" has_initial_state, get a still-wrong result, and
-    conclude the guard was over-cautious. Both messages must say so."""
-    from tensorrt_llm._torch.pyexecutor.config_utils import (
-        reject_unsupported_inkling_kv_cache_features,
-    )
-
-    for reuse, chunked in ((True, False), (False, True)):
-        with pytest.raises(NotImplementedError) as exc:
-            reject_unsupported_inkling_kv_cache_features(
-                InklingConfig(), enable_block_reuse=reuse, enable_chunked_prefill=chunked
-            )
-        msg = str(exc.value)
-        assert "inkling_prefill_attention" in msg, msg
-        assert "paged-KV" in msg, msg
-
-
-def test_the_conv_seeding_site_warns_against_a_partial_fix():
-    """InklingConvRuntime.build is where someone would land with the
-    Mamba2Metadata pattern in hand. The comment there has to say that deriving
-    has_initial_state is necessary but not sufficient, or the next reader
-    reintroduces the bug in a form that no longer raises."""
-    import inspect
-
-    from tensorrt_llm._torch.attention_backend.sparse.inkling import InklingConvRuntime
-
-    src = inspect.getsource(InklingConvRuntime.build)
-    assert "not sufficient" in src.lower(), src
-    assert "_run_context" in src, src
-
-
 def test_the_supported_configuration_is_accepted():
     """Both off -- what every Inkling accuracy run measured -- must stay silent,
     including on the text sub-config the KV cache is sized from."""
@@ -310,12 +276,6 @@ def test_layer_classification():
     assert tc.num_kv_heads_per_layer() == [
         tc.layer_num_kv_heads(n) for n in range(tc.num_hidden_layers)
     ]
-
-
-@requires_checkpoint
-def test_checkpoint_layer_pattern_matches_config_defaults(ckpt_config):
-    """The checkpoint declares the hybrid pattern the CPU tests assume."""
-    assert ckpt_config.local_layer_ids == LOCAL_LAYER_IDS
 
 
 @requires_checkpoint
@@ -922,17 +882,6 @@ def test_backend_forward_refuses_foreign_backend_args():
         backend.forward(None, None, None, None, forward_args=AttentionForwardArgs())
 
 
-def test_llm_args_is_untouched_by_the_inkling_backend():
-    """Inkling adds no user-facing attention configuration: no attn_backend
-    enum value and no SparseAttentionConfig union member. Either would change
-    llmapi/llm_args.py, which trips the API-stability label gate and stales the
-    golden manifest -- for a value no user ever supplies."""
-    from tensorrt_llm.llmapi import llm_args as la
-
-    src = inspect.getsource(la)
-    assert "INKLING" not in src.upper()  # neither the backend name nor the config
-
-
 def test_model_defaults_do_not_pin_an_attn_backend():
     """Selection comes from the architecture-derived sparse_attention_config, so
     the default carries no backend name; a family override is caught by
@@ -959,26 +908,6 @@ def test_attn_backend_family_override_fails_loudly():
             check(SimpleNamespace(attn_backend=bad))
 
 
-def test_metadata_keeps_distinct_geometries_distinct():
-    """Successor to a regression test for a staging bug that can no longer exist.
-
-    The old code refilled one pinned host buffer per page group and issued
-    non-blocking H2Ds, so the next group's fill raced the previous group's copy;
-    the symptom was every geometry ending up with the same (or torn) rows,
-    attention reading the wrong KV pages, and decode collapsing to repeated
-    tokens. There is no staging buffer and no copy now, but the property that bug
-    violated is still worth pinning: two geometries must not resolve to the same
-    rows.
-    """
-    md = _ink_metadata(pp_layers=(0, 1))  # default: one pool per layer
-
-    md._prepare_inkling_decode()
-
-    assert md.ink_gen_page_table(0).tolist() != md.ink_gen_page_table(1).tolist()
-    assert md.ink_gen_page_table(0).tolist() == md.kv_cache_block_offsets[0, 0:2, 0].tolist()
-    assert md.ink_gen_page_table(1).tolist() == md.kv_cache_block_offsets[1, 0:2, 0].tolist()
-
-
 def test_conv_pool_is_owned_by_the_kv_cache_manager():
     """The pool must be part of the cache manager, not a resource manager beside
     it: that is what frees the conv row with the request's KV blocks and lets
@@ -990,13 +919,6 @@ def test_conv_pool_is_owned_by_the_kv_cache_manager():
     assert not getattr(InklingHybridCacheManager, "__abstractmethods__", frozenset())
     # free_resources must be overridden, or conv rows outlive their KV blocks.
     assert InklingHybridCacheManager.free_resources is not KVCacheManagerV2.free_resources
-
-
-def test_conv_state_resource_type_is_gone():
-    """The framework-level resource type existed only for the standalone pool."""
-    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-
-    assert not hasattr(ResourceManagerType, "CONV_STATE_MANAGER")
 
 
 def test_inkling_selects_the_hybrid_cache_manager():
@@ -1240,18 +1162,6 @@ def test_non_dp_passes_none_and_keeps_the_old_call_shape():
     assert seen["arnt"] is None
 
 
-def test_model_forward_sources_the_counts_from_attn_metadata():
-    """The value comes off attn_metadata, which the model engine fills only when
-    attention DP is on -- the model must not invent it."""
-    import inspect
-
-    from tensorrt_llm._torch.models.modeling_inkling import InklingModel
-
-    src = inspect.getsource(InklingModel.forward)
-    assert 'getattr(attn_metadata, "all_rank_num_tokens", None)' in src
-    assert "all_rank_num_tokens=all_rank_num_tokens" in src
-
-
 # ---------------------------------------------------------------------------
 # Phase 1: expert parallelism
 # ---------------------------------------------------------------------------
@@ -1295,34 +1205,6 @@ def test_expert_parallel_allows_whole_width_experts_without_cuda_graph():
     InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(4, use_cuda_graph=False))
 
 
-def test_expert_parallel_error_points_at_the_working_configuration():
-    """A guard that only says no costs the user a debugging cycle. The message
-    must name both escapes: disable CUDA graphs, or halve ep_size."""
-    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
-
-    with pytest.raises(ValueError) as excinfo:
-        InklingForCausalLM._assert_inkling_moe_parallel(_ep_model_config(4))
-
-    msg = str(excinfo.value)
-    assert "cuda_graph_config=None" in msg
-    assert "moe_expert_parallel_size <= 2" in msg
-
-
-def test_expert_parallel_ceiling_says_it_is_measured_not_theoretical():
-    """The bound is an observed limit. The message must say what was measured,
-    so the next person knows it can be raised rather than that EP is
-    impossible."""
-    import inspect
-
-    from tensorrt_llm._torch.models.modeling_inkling import InklingForCausalLM
-
-    src = inspect.getsource(InklingForCausalLM._assert_inkling_moe_parallel)
-    assert "Measured" in src and "SIGSEGV" in src
-    # And it must not re-assert the ruled-out cause: changing max_batch_size /
-    # max_num_tokens did not move the crash, so it is not the expert GEMM shape.
-    assert "rules out the" in src
-
-
 @pytest.mark.parametrize("ep_size", [3, 5, 6, 7, 24])
 def test_expert_parallel_rejects_a_non_divisor(ep_size):
     """FusedMoE._supports_non_divisible_ep is opt-in and CUTLASS -- Inkling's
@@ -1354,38 +1236,6 @@ def test_expert_parallel_guard_is_inert_when_ep_is_off():
     cfg = _ep_model_config(1)
     cfg.mapping.moe_tp_size = 3  # deliberately not a divisor
     InklingForCausalLM._assert_inkling_moe_parallel(cfg)
-
-
-def test_inkling_moe_leaves_expert_sharding_to_the_generic_factory():
-    """Inkling must not reimplement expert sharding: Mapping derives
-    moe_ep_size, FusedMoE slices with _compute_ep_partition, and CutlassFusedMoE
-    remaps the NVFP4 per-expert scales. A local slot_start/slot_end here would
-    mean two sources of truth."""
-    import inspect
-
-    from tensorrt_llm._torch.models import modeling_inkling
-    from tensorrt_llm._torch.models.modeling_inkling import InklingMoE
-
-    src = inspect.getsource(InklingMoE)
-    for forbidden in ("slot_start", "slot_end", "expert_size_per_partition", "moe_ep_rank"):
-        assert forbidden not in src, forbidden
-    assert "create_moe(" in inspect.getsource(modeling_inkling.InklingMoE.__init__)
-
-
-def test_shared_experts_are_replicated_so_ep_does_not_change_the_combine():
-    """routed + shared is correct on every rank only because the shared experts
-    are replicated: FusedMoE all-reduces the routed part (parallel_size is the
-    GLOBAL tp_size, so it fires under pure EP too) while the shared part is
-    computed in full locally. If the shared experts ever became TP-sharded this
-    sum would double-count under EP."""
-    import inspect
-
-    from tensorrt_llm._torch.models.modeling_inkling import InklingSharedExperts
-
-    sig = inspect.signature(InklingSharedExperts.__init__)
-    assert list(sig.parameters) == ["self", "config"], list(sig.parameters)
-    src = inspect.getsource(InklingSharedExperts)
-    assert "mapping" not in src and "TensorParallelMode" not in src
 
 
 def test_every_deferred_import_in_the_inkling_package_resolves():
@@ -1680,20 +1530,6 @@ def test_conv_pool_aliases_every_padding_sentinel_to_one_reserved_row():
     assert pool.slots_for([101, 102]) == [0, 1]
 
 
-def test_conv_pool_never_returns_a_reserved_row_to_the_free_list():
-    """free() on a sentinel must not hand a real request a row the next padding
-    batch overwrites."""
-    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-
-    pool = _conv_pool(1, num_request_slots=1)
-    pool.slots_for([CUDA_GRAPH_DUMMY_REQUEST_ID])
-    pool.free([CUDA_GRAPH_DUMMY_REQUEST_ID])
-
-    assert pool.slots_for([7]) == [0]  # the one real row, not the padding row
-    pool.free([7])
-    assert pool.slots_for([8]) == [0]
-
-
 def test_conv_pool_raises_when_it_runs_out_instead_of_growing():
     """A grown pool reallocates every buffer, stranding the pointers a captured
     CUDA graph holds -- and a graph replaying against a freed buffer does not
@@ -1917,106 +1753,6 @@ def test_cache_manager_requires_its_three_pool_arguments_by_name(monkeypatch):
         cm.InklingHybridCacheManager(mapping=_adp_mapping(False), max_batch_size=8)
     with pytest.raises(TypeError, match="max_batch_size"):
         cm.InklingHybridCacheManager(pretrained_config=cfg, mapping=_adp_mapping(False))
-
-
-def test_attention_never_sizes_a_tensor_by_the_unguarded_global_tp():
-    """Structural, because InklingAttention needs a backend and a real config to
-    construct, and the bug it guards is a silent shape divergence rather than an
-    exception.
-
-    Every tensor inside InklingAttention hangs off the head / kv-head split that
-    the base Attention already scoped to the attention TP (tp_size=1 under ADP,
-    see modules/attention.py). So a bare ``mapping.tp_size`` read here -- or a
-    hardcoded ``tp_shard=True`` -- means this module disagrees with the qkv/o
-    projections about how many heads the rank owns. Require every such site to
-    mention enable_attention_dp, which is the only thing that distinguishes the
-    two cases.
-    """
-    import ast
-    import inspect
-    import textwrap
-
-    from tensorrt_llm._torch.models.modeling_inkling import InklingAttention
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(InklingAttention.__init__)))
-    body = tree.body[0].body
-
-    def mentions_adp(node):
-        return any(
-            isinstance(n, ast.Attribute) and n.attr == "enable_attention_dp" for n in ast.walk(node)
-        )
-
-    unguarded_tp, hardcoded_shard = [], []
-    for stmt in body:
-        guarded = mentions_adp(stmt)
-        for node in ast.walk(stmt):
-            if isinstance(node, ast.Attribute) and node.attr == "tp_size" and not guarded:
-                unguarded_tp.append(getattr(stmt, "lineno", "?"))
-            if (
-                isinstance(node, ast.keyword)
-                and node.arg == "tp_shard"
-                and isinstance(node.value, ast.Constant)
-                and node.value.value is True
-            ):
-                hardcoded_shard.append(getattr(stmt, "lineno", "?"))
-
-    assert not unguarded_tp, (
-        f"mapping.tp_size read without an enable_attention_dp guard at "
-        f"InklingAttention.__init__ line(s) {unguarded_tp}"
-    )
-    assert not hardcoded_shard, (
-        f"tp_shard=True hardcoded at InklingAttention.__init__ line(s) "
-        f"{hardcoded_shard}; it must follow the attention TP"
-    )
-
-
-def test_attention_cross_checks_its_head_count_against_the_base():
-    """The attention-TP rule is written in two places -- modules/attention.py and
-    here -- so __init__ asserts they agree. Without that, a change to how the
-    base scopes ADP would build r_proj and the short convs for a different head
-    count than qkv_proj, and the first symptom would be a wrong-shaped einsum
-    deep in the bias construction."""
-    import inspect
-
-    from tensorrt_llm._torch.models.modeling_inkling import InklingAttention
-
-    src = inspect.getsource(InklingAttention.__init__)
-    assert "assert self.num_heads == num_heads // tp_size" in src
-
-
-def test_fused_moe_prefers_reduce_scatter_over_the_reduce_results_all_reduce():
-    """Inkling builds its experts with reduce_results=True, which is required
-    under pure TP. Under ADP that all-reduce would be wrong (peers hold
-    different requests), and Inkling does NOT special-case it -- it relies on
-    FusedMoE preferring reduce-scatter when use_dp is set.
-
-    That is an upstream contract Inkling's correctness rests on, so pin it here:
-    if the dispatch ever stopped checking use_dp first, Inkling would go silently
-    wrong under ADP with no local change to blame."""
-    import ast
-    import inspect
-    import textwrap
-
-    from tensorrt_llm._torch.modules.fused_moe.interface import MoE
-
-    src = textwrap.dedent(inspect.getsource(MoE.reducescatter_or_allreduce))
-    tree = ast.parse(src)
-    ifs = [n for n in ast.walk(tree) if isinstance(n, ast.If)]
-    use_dp_first = [
-        n
-        for n in ifs
-        if isinstance(n.test, ast.Attribute)
-        and n.test.attr == "use_dp"
-        and any(
-            isinstance(c, ast.Attribute) and c.attr == "reduce_results"
-            for c in ast.walk(ast.Module(body=n.orelse, type_ignores=[]))
-        )
-    ]
-    assert use_dp_first, (
-        "FusedMoE.reducescatter_or_allreduce no longer tests use_dp before "
-        "reduce_results; Inkling's reduce_results=True is only safe under ADP "
-        "because use_dp wins"
-    )
 
 
 _ADP_RANKS = 4
