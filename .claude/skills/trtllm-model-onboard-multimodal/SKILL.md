@@ -53,9 +53,9 @@ metadata:
 
 [4] Per-iteration staging  (model engine)
     Context:    build MultimodalRuntimeData (positions / lengths / chunk bounds).
-                For item-scheduled models, reserve entries in the one model-owned
-                TensorLRUCache, select unique miss producers under the encoder item /
-                token / output-byte budgets, then H2D + encode only those items.
+                For item-scheduled models, reserve space in the model's one
+                TensorLRUCache. Reuse ready outputs and encode each missing item only
+                once, within the encoder item / token / output-byte limits.
                 Legacy models stage the request payload here as before. H2D obeys
                 multimodal_data_device_paths and uses pinned, non-blocking copies.
     Generation (mRoPE only): strip everything except mrope_position_deltas.
@@ -80,7 +80,12 @@ metadata:
 - The producer hands off as **handles** at the end of [2], so the broadcast in [3] stays small (Contract 3).
 - [4] is the only per-iteration GPU staging; H2D is `non_blocking=True` from pinned host memory.
 - [5] runs on the compute stream and must be sync-free (Contract 1).
-- Item-scheduled encoder outputs live only in the model-owned `TensorLRUCache`. A request owns prompt-ordered entry IDs/references and READY state, never a second output tensor or contiguous buffer. On cache-owning ranks its capacity is `max(runtime output-byte budget, encoder_cache_max_bytes)`; persistent reuse controls retention after release, not whether the correctness store exists. Stable item keys deduplicate producers; unkeyable items use request-scoped transient entries.
+- Item-scheduled encoder outputs live only in the model-owned `TensorLRUCache`.
+  Each request remembers the cache entry for every item, in prompt order, but
+  does not keep a second output tensor or combined output buffer. The cache is
+  large enough for one legal encoder iteration; `encoder_cache_max_bytes` may
+  make it larger when reuse is enabled. Stable item keys let requests share
+  one encoded output. Items without a stable key use a request-local key.
 
 ### EPD-disaggregated path
 
@@ -89,7 +94,11 @@ When `@support_multimodal_disaggregated` is set and the deployment uses `TLLM_MU
 - **Encoder worker:** runs as a standalone `MultimodalEncoder` (`mm_encoder_only=True`). It executes only the multimodal encoder and ships `mm_embeddings` (+ mRoPE position ids/deltas) to prefill+decode workers as shared-tensor handles.
 - **Prefill+decode worker:** the model's `__init__` skips constructing `self.mm_encoder` when `_is_mm_disagg()` is true; the input processor's `attach_multimodal_embeddings()` override binds the encoder handles into the request. For context-only requests, the engine re-clones mrope tensors so IPC handles outlive the encoder worker's freed memory — replicate that pattern for any new GPU-resident mm tensors.
 
-The item-scheduled unified-cache ownership described above currently applies to the in-process aggregated path. `mm_encoder_only` / EPD keeps this existing shared-handle transfer path; do not silently route disaggregated embeddings through the aggregated cache lifecycle. Item scheduling also rejects side-stream encoder prefetch today, and prefill waits until every item in a request is READY; side-stream integration and prompt-window prefill overlap are separate follow-ups.
+This item-scheduled cache path currently applies only when the encoder and LLM
+run in the same process. `mm_encoder_only` / EPD keeps its existing
+shared-handle transfer path. Item scheduling also rejects side-stream encoder
+prefetch today, and LLM prefill waits until every item in a request is ready.
+Side-stream support and item/LLM prefill overlap are separate follow-ups.
 
 ### Templates to study
 
@@ -182,10 +191,11 @@ A 1024×1024 fp32 patch tensor is ~12 MB; a video clip can be hundreds of MB. Na
 
 - **Always use `MultimodalParams.to_handle`/`to_tensor`.** `to_handle` swaps each tensor inside `multimodal_data` for a small dict — `{method_key, tensor_size, storage_handle, ...}` — that points at the same memory: a CUDA-IPC handle for GPU tensors (`REBUILD_CUDA`) or a POSIX-shm handle for CPU tensors (`REBUILD_CPU`). The dict is a few hundred bytes regardless of the original tensor size. Consumers call `to_tensor` to rebuild local tensor views from the handle. See `_torch/shared_tensor/`.
 - **Where it crosses ranks:** the executor broadcasts `py_multimodal_data` via `dist.broadcast` / `tp_cp_broadcast` / PP send-recv. Payload size = the literal byte size of whatever's in `py_multimodal_data` — confirm every tensor inside has been swapped for its handle dict (i.e. `to_handle` ran) before this point.
-- **Release and strip after prefill.** `PyExecutor._release_py_multimodal_resources` first drains
-  the request's item-cache references (idempotently), then calls
-  `strip_mm_data_for_generation`. If your model needs to retain something across decode, update
-  `strip_mm_data_for_generation` explicitly; do not add a second post-prefill strip helper.
+- **Release and strip after prefill.** `PyExecutor._release_multimodal_resources`
+  releases the request's cache entries and then calls
+  `strip_mm_data_for_generation`. Repeated cleanup is safe. If your model needs
+  data during decode, update `strip_mm_data_for_generation`; do not add another
+  post-prefill strip helper.
 - **EPD disagg.** Embeddings still cross workers as shared tensors, not bytes — see the EPD-disaggregated path section above for the encoder/prefill-worker split.
 - **Hashes are small; broadcast eagerly.** `MultimodalInput.multimodal_hashes` (blake3) drives KV-cache reuse — never substitute raw pixels for them.
 
@@ -340,7 +350,12 @@ The workspace dimension comes from `encoder_max_num_tokens`, falling back to the
 
 > Mixed image+video+audio models profile the supported modality with the largest legal per-item workload under the configured limits. Runtime mixed-modality requests still share the same aggregate token limit.
 
-**Atomic-item scheduling.** Override `get_mm_encoder_item_metadata` to return prompt-ordered `item_refs`, physical `encoder_token_lengths`, and post-encoder `output_embedding_lengths`; the wrapper validates and stores it. Also implement `get_max_mm_encoder_output_embeddings` so the engine can convert one legal iteration's output into the unified store's correctness byte budget. The declared output lengths must exactly match the MM placeholder spans and the tensor splits from `forward_multimodal_encoder_items`.
+**Atomic-item scheduling.** Override `get_mm_encoder_item_metadata` to return
+prompt-ordered `item_refs`, the encoder-token cost of each item, and each
+item's output length. Also implement `get_max_mm_encoder_output_embeddings` so
+the engine can size the cache for one legal encoder iteration. The declared
+output lengths must match both the MM placeholder spans and the tensor splits
+from `forward_multimodal_encoder_items`.
 
 Implement `call_with_text_prompt(inputs, sampling_params)` — the per-model text-prompt path. **Don't override `__call__`**: the base class's concrete `__call__` dispatches here for text prompts, and also detokenizes `prompt_token_ids → prompt` and falls through to here for non-fast-path VLMs. `call_with_text_prompt` does:
 

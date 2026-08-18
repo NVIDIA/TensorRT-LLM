@@ -816,7 +816,7 @@ class PyExecutor:
         self.send_handles = [None] * self.num_micro_batches
         # schedule handle for PP to propagate the first PP rank's schedule result
         self.send_schedule_handles = [None] * self.num_micro_batches
-        self.send_mm_encoder_result_handles = [None] * self.num_micro_batches
+        self.send_mm_encoder_error_handles = [None] * self.num_micro_batches
         self.send_expected_batch_num_handles = [None] * self.num_micro_batches
         self.unhandled_batch_counter = 0
         self.pp_scheduler_max_retry_count = int(
@@ -2575,8 +2575,8 @@ class PyExecutor:
             try:
                 self.wait_on_pp_send_handles(self.send_handles, i)
                 self.wait_on_pp_send_handles(self.send_schedule_handles, i)
-                self.wait_on_pp_send_handles(
-                    self.send_mm_encoder_result_handles, i)
+                self.wait_on_pp_send_handles(self.send_mm_encoder_error_handles,
+                                             i)
                 self.wait_on_pp_send_handles(
                     self.send_expected_batch_num_handles, i)
             except Exception:
@@ -2643,22 +2643,22 @@ class PyExecutor:
         return (scheduled_batch, fitting_disagg_gen_init_requests,
                 num_fitting_reqs, wait_for_disagg_gen_transfer_progress)
 
-    def _pp_propagate_mm_encoder_result(
+    def _share_mm_encoder_error_across_pp(
         self,
-        result: Optional[Tuple[str, List[int]]],
+        error: Optional[Tuple[str, List[int]]],
         microbatch_id: int,
     ) -> Optional[Tuple[str, List[int]]]:
-        """Relay PP0's request-scoped MM encoder outcome before LLM forward."""
+        """Send a request-scoped MM encoder error through the PP ranks."""
         if not self.dist.is_first_pp_rank:
-            result = self.dist.recv_object(self.dist.prev_pp_rank,
-                                           PPCommTag.MM_ENCODER_RESULT)
+            error = self.dist.recv_object(self.dist.prev_pp_rank,
+                                          PPCommTag.MM_ENCODER_RESULT)
         if not self.dist.is_last_pp_rank:
-            self.wait_on_pp_send_handles(self.send_mm_encoder_result_handles,
+            self.wait_on_pp_send_handles(self.send_mm_encoder_error_handles,
                                          microbatch_id)
-            self.send_mm_encoder_result_handles[
+            self.send_mm_encoder_error_handles[
                 microbatch_id] = self.dist.isend_object(
-                    result, self.dist.next_pp_rank, PPCommTag.MM_ENCODER_RESULT)
-        return result
+                    error, self.dist.next_pp_rank, PPCommTag.MM_ENCODER_RESULT)
+        return error
 
     def _pp_retry_until_can_schedule(self, scheduled_batch):
         """
@@ -2761,7 +2761,7 @@ class PyExecutor:
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
                     if isinstance(self.scheduler, MultimodalScheduler):
-                        local_scheduler_output = self.scheduler.replay_request(
+                        local_scheduler_output = self.scheduler.schedule_request_with_mm_decisions(
                             self.active_requests,
                             self.inflight_req_ids,
                             blocked_request_ids=(
@@ -2782,10 +2782,10 @@ class PyExecutor:
                             local_disagg_candidates,
                             fitting_disagg_gen_init_requests)
 
-                mm_encoder_result = None
+                mm_encoder_error = None
                 if (self._mm_encoder_item_scheduling_enabled
                         and self.dist.is_first_pp_rank):
-                    mm_encoder_result = self._forward_multimodal_encoder_step(
+                    mm_encoder_error = self._forward_multimodal_encoder_step(
                         scheduled_batch)
                 elif (self.dist.pp_size > 1
                       and self._mm_encoder_item_scheduling_enabled):
@@ -2793,11 +2793,11 @@ class PyExecutor:
                         if request.py_multimodal_data is not None:
                             strip_mm_encoder_inputs(request.py_multimodal_data)
                 if self._mm_encoder_item_scheduling_enabled:
-                    mm_encoder_result = self._pp_propagate_mm_encoder_result(
-                        mm_encoder_result, microbatch_id)
+                    mm_encoder_error = self._share_mm_encoder_error_across_pp(
+                        mm_encoder_error, microbatch_id)
                     if (not self.dist.is_first_pp_rank
-                            and mm_encoder_result is not None):
-                        error_msg, failed_request_ids = mm_encoder_result
+                            and mm_encoder_error is not None):
+                        error_msg, failed_request_ids = mm_encoder_error
                         self._handle_multimodal_encoder_request_error(
                             scheduled_batch, error_msg, set(failed_request_ids))
 
@@ -6287,10 +6287,9 @@ class PyExecutor:
             self.active_requests, self.inflight_req_ids)
 
         if self._pending_mm_encoder_cache_removals:
-            if not self._is_mm_encoder_cache_authority():
+            if not self._owns_mm_encoder_cache_refs():
                 raise RuntimeError(
-                    "MM physical replica queued an authority-only cache removal"
-                )
+                    "A rank without MM cache references queued a cache removal")
             scheduler_output = scheduler_output._replace(
                 mm_encoder_cache_removals=(
                     self._pending_mm_encoder_cache_removals +
@@ -6359,13 +6358,13 @@ class PyExecutor:
     def _forward_multimodal_encoder_step(
         self, scheduled_requests: ScheduledRequests
     ) -> Optional[Tuple[str, List[int]]]:
-        """Apply the MM cache delta and run selected producers before prefill."""
+        """Update the MM cache and encode selected items before LLM prefill."""
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items or {}
         try:
-            self.model_engine.replay_multimodal_cache_plan(
+            self.model_engine.apply_multimodal_encoder_schedule(
                 self.active_requests,
                 scheduled_requests,
-                is_cache_authority=self._is_mm_encoder_cache_authority(),
+                owns_cache_refs=self._owns_mm_encoder_cache_refs(),
             )
         except MultimodalEncoderRequestError as e:
             error_msg = str(e)
@@ -7786,23 +7785,24 @@ class PyExecutor:
                 request.set_exclude_last_generation_logits(False)
                 request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
-    def _is_mm_encoder_cache_authority(self) -> bool:
+    def _owns_mm_encoder_cache_refs(self) -> bool:
+        """Return whether this rank tracks MM cache references and eviction."""
         return (self._mm_encoder_item_scheduling_enabled
                 and self.dist.is_first_pp_rank
                 and (self.dist.pp_size == 1 or self.enable_attention_dp
                      or self.global_rank == 0))
 
-    def _release_py_multimodal_resources(self, request: LlmRequest) -> None:
-        """Release MM references and strip request-owned data exactly once."""
+    def _release_multimodal_resources(self, request: LlmRequest) -> None:
+        """Release this request's cache entries and discard unused MM data."""
         state = request.py_mm_encoder_state
         if state is not None:
-            entry_ids = state.drain_entry_ids()
+            entry_ids = state.pop_all_entry_ids()
             request.py_mm_encoder_state = None
-            if self._is_mm_encoder_cache_authority():
+            if self._owns_mm_encoder_cache_refs():
                 encoder_cache = self.model_engine.mm_encoder_cache
                 if encoder_cache is None:
                     raise RuntimeError(
-                        "MM cache authority has no model-owned encoder cache")
+                        "The MM cache-reference rank has no encoder cache")
                 for entry_id in entry_ids:
                     removed_entry_id = encoder_cache.release(entry_id)
                     if (removed_entry_id is not None and self.dist.pp_size > 1):
@@ -7836,7 +7836,7 @@ class PyExecutor:
                 # on `py_multimodal_data`. Without this, encoder inputs and outputs for multi-modal
                 # requests stay pinned on GPU through the full decode lifetime and can lead to OOMs
                 # at high concurrency.
-                self._release_py_multimodal_resources(request)
+                self._release_multimodal_resources(request)
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
                     request.set_exclude_last_generation_logits(False)
@@ -8172,7 +8172,7 @@ class PyExecutor:
         self.resource_manager.free_resources(request)
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
-        self._release_py_multimodal_resources(request)
+        self._release_multimodal_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
@@ -8668,9 +8668,8 @@ class PyExecutor:
                 "cannot update weights with live multimodal cache references: "
                 f"request_ids={live_request_ids}")
         self.model_engine.invalidate_multimodal_encoder_cache()
-        # Hard invalidation also clears every follower's physical store. Do
-        # not later replay transient deletions selected for the old weight
-        # generation against that now-empty store.
+        # Every first-stage rank clears its local cache. Discard removals that
+        # were queued for the old weights because those entries are gone.
         self._pending_mm_encoder_cache_removals.clear()
 
     def _handle_guided_decoder_errors(

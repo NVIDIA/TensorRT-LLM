@@ -98,32 +98,26 @@ _UNSET = _Unset()
 
 @dataclass
 class MultimodalEncoderRequestState:
-    """Per-item MM encoder bookkeeping owned by one request.
+    """Tracks the encoder-cache entry for each MM item in a request.
 
-    Created at admission by `initialize_multimodal_encoder_request` for
-    requests whose raw MM payloads run through the item scheduler; the
-    request's `py_mm_encoder_state` is `None` otherwise.
+    The state is created when an item-scheduled request enters the executor.
+    Other requests leave `py_mm_encoder_state` as `None`.
 
-    Encoder outputs live only in the model-owned `TensorLRUCache`. This state
-    keeps one prompt-ordered entry identity per item and one READY bit; on the
-    scheduling authority each non-empty slot owns one anonymous cache
-    reference. Duplicate item identities intentionally occupy multiple slots
-    and therefore acquire and release multiple references. The request never
-    owns a second embedding tensor or contiguous output buffer.
+    Encoder outputs live only in the model-owned `TensorLRUCache`. This object
+    stores one cache entry ID and one ready flag per item, in prompt order. On
+    the rank that tracks cache references, each non-empty slot holds one. Two
+    identical items may point to the same entry, but each item still holds and
+    releases its own reference. The request does not store another output
+    tensor or combined output buffer.
 
-    Cleanup drains the slots before releasing their cache references, making
-    request teardown idempotent without weakening the cache's double-release
-    checks. Worker replicas retain the same non-owning entry identities for
-    deterministic physical replay but never mutate logical reference counts.
-
-    The state is rank-local and never crosses a serialization boundary:
-    schedule distribution carries producer items, blocked-request IDs, and
-    exact removals only.
+    Cleanup clears the slots before releasing their references, so repeated
+    request cleanup is safe. Other first-stage ranks keep the same entry IDs
+    but do not change reference counts. The schedule sent between ranks only
+    contains selected items, blocked request IDs, and cache removals.
     """
 
     embedding_lengths: List[int]
-    """Declared embedding row count of each atomic item, in prompt order.
-    Cache materialization validates incoming tensors against these."""
+    """Expected encoder-output rows for each item, in prompt order."""
 
     encoder_token_lengths: List[int]
     """Validated encoder attention-token cost of each atomic item.
@@ -136,20 +130,18 @@ class MultimodalEncoderRequestState:
     """Whether each atomic item's bound cache entry is READY, in prompt order."""
 
     entry_ids: List[Optional[Hashable]] = field(default_factory=list)
-    """Prompt-ordered unified-cache identities held by this request.
+    """Cache entry IDs held by this request, in prompt order.
 
-    A non-empty slot owns one logical cache reference on the scheduling
-    authority. `recorded` distinguishes a materialized `READY` entry from a
-    metadata-only `RESERVED` entry without adding a binding object.
+    A non-empty slot holds one reference on the rank that tracks them.
+    `recorded` tells whether the entry already contains its encoder output.
     """
 
     cache_item_keys: Union[List[Hashable], None, "_Unset"] = _UNSET
-    """Memoized per-item encoder cache keys, or `None` once known to be
-    unkeyable. Derived from the request's content hashes and item metadata,
-    both fixed at admission, so this never goes stale and is computed on the
-    first iteration that schedules any of the request's items rather than on
-    every one. `_UNSET` distinguishes "not computed yet" from "computed, and
-    this request cannot participate in the cache"."""
+    """Cached per-item reuse keys.
+
+    `_UNSET` means the keys have not been computed. `None` means stable keys
+    cannot be built, so this request uses request-local entry IDs instead.
+    """
 
     @classmethod
     def from_embedding_lengths(
@@ -191,16 +183,16 @@ class MultimodalEncoderRequestState:
             item_idx for item_idx, done in enumerate(self.recorded) if not done
         ]
 
-    def bind_entry(self, item_idx: int, entry_id: Hashable, *,
-                   ready: bool) -> None:
-        """Record one acquired cache reference in its prompt-order slot."""
+    def set_item_entry(self, item_idx: int, entry_id: Hashable, *,
+                       ready: bool) -> None:
+        """Assign a cache entry to one item."""
         if self.entry_ids[item_idx] is not None:
             raise RuntimeError(f"MM item {item_idx} already has a cache entry")
         self.entry_ids[item_idx] = entry_id
         self.recorded[item_idx] = ready
 
-    def unbind_entry(self, item_idx: int) -> Hashable:
-        """Clear and return one acquired entry during admission rollback."""
+    def clear_item_entry(self, item_idx: int) -> Hashable:
+        """Clear one item's cache entry and return its ID."""
         entry_id = self.entry_ids[item_idx]
         if entry_id is None:
             raise RuntimeError(f"MM item {item_idx} has no cache entry")
@@ -209,7 +201,7 @@ class MultimodalEncoderRequestState:
         return entry_id
 
     def mark_entry_ready(self, entry_id: Hashable) -> int:
-        """Mark every prompt slot bound to `entry_id` as materialized."""
+        """Mark every item using `entry_id` as ready."""
         marked = 0
         for item_idx, bound_entry_id in enumerate(self.entry_ids):
             if bound_entry_id == entry_id and not self.recorded[item_idx]:
@@ -217,8 +209,8 @@ class MultimodalEncoderRequestState:
                 marked += 1
         return marked
 
-    def drain_entry_ids(self) -> List[Hashable]:
-        """Clear and return live references in prompt order, preserving duplicates."""
+    def pop_all_entry_ids(self) -> List[Hashable]:
+        """Return and clear all entry IDs, keeping prompt order and duplicates."""
         entry_ids = [
             entry_id for entry_id in self.entry_ids if entry_id is not None
         ]

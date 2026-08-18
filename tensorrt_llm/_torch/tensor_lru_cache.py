@@ -94,24 +94,22 @@ class _CacheCounters:
 class TensorLRUCache(Generic[K]):
     """Thread-safe LRU cache from hashable keys to tensor values.
 
-    Size accounting uses logical tensor bytes: `tensor.numel() * tensor.element_size()`.
-    Returned tensors alias the cache-owned tensor objects. Callers must treat them as immutable
-    while they remain cache-owned.
+    Each tensor uses `tensor.numel() * tensor.element_size()` bytes. Returned
+    tensors are the cache-owned tensors and must not be changed by callers.
 
-    The cache owns a detached copy rather than the caller's tensor or view. This prevents later
-    caller mutations from changing a cached value and prevents a small cached view from retaining
-    the caller's larger backing allocation. The copy is made before acquiring the lock and before
-    replacement or eviction, preserving existing cache entries if copying fails. Consequently,
-    `max_bytes` bounds steady-state logical cache contents, not peak allocation: insertion
-    temporarily needs both the source tensor and its copy and may exceed the cache limit until
-    eviction completes.
+    The cache stores a detached copy, not the caller's tensor or view. This
+    keeps later caller changes out of the cache and prevents a small view from
+    retaining a larger source allocation. Copying happens before replacement
+    or eviction, so a failed copy leaves existing entries unchanged. During an
+    insertion, both the source tensor and cache copy exist briefly; therefore
+    `max_bytes` limits stored cache data, not temporary peak memory.
 
     In CUDA-stream-aware mode, each entry owns the event recorded after its clone. Replacement,
     eviction, and clear drop that event with the entry; events are not reused because an evicted
     tensor may still have outstanding consumers on another stream.
 
     Args:
-        max_bytes: Maximum logical tensor bytes held by this cache.
+        max_bytes: Maximum tensor bytes stored by this cache.
         name: Short label used in debug log messages.
         cuda_stream_aware: When enabled, synchronize CUDA tensor producers and consumers across
             streams and extend allocation lifetime through every consuming stream. CPU tensors are
@@ -158,11 +156,11 @@ class TensorLRUCache(Generic[K]):
         *,
         retain_after_release: bool = True,
     ) -> CacheAllocationKind | None:
-        """Acquire one logical reference or reserve one missing entry.
+        """Add one reference, reserving a missing entry when needed.
 
-        `None` indicates temporary capacity pressure. A value larger than the
-        full cache or a size/policy conflict for an existing key is a permanent
-        caller contract error.
+        Returns `None` when active requests temporarily use all cache space.
+        An entry larger than the full cache, or a conflicting size or retention
+        setting for an existing key, raises an error.
         """
         if expected_bytes <= 0:
             raise ValueError("expected_bytes must be positive")
@@ -190,7 +188,7 @@ class TensorLRUCache(Generic[K]):
                     raise RuntimeError(f"unexpected cache entry state: {entry.state}")
 
                 if entry.reference_count == 0:
-                    if self._accounted_bytes + entry.size_bytes > self._max_bytes:
+                    if self._in_use_bytes + entry.size_bytes > self._max_bytes:
                         self._counters.blocked_allocations += 1
                         return None
                     self._pinned_bytes += entry.size_bytes
@@ -199,7 +197,7 @@ class TensorLRUCache(Generic[K]):
                 self._counters.hits += 1
                 return CacheAllocationKind.READY_HIT
 
-            if self._accounted_bytes + expected_bytes > self._max_bytes:
+            if self._in_use_bytes + expected_bytes > self._max_bytes:
                 self._counters.blocked_allocations += 1
                 return None
 
@@ -243,9 +241,9 @@ class TensorLRUCache(Generic[K]):
     ) -> bool:
         """Insert or replace a tensor.
 
-        Returns `False` and leaves the cache unchanged when `value` is larger than the full
-        cache capacity. Supplying `expected_state` enables strict planned
-        insertion without implicit replacement or eviction.
+        Returns `False` and leaves the cache unchanged when `value` is larger
+        than the cache. When `expected_state` is set, the method verifies the
+        current state and size and does not replace or evict entries by itself.
         """
         size_bytes = self._tensor_size_bytes(value)
 
@@ -283,7 +281,7 @@ class TensorLRUCache(Generic[K]):
 
         with self._lock:
             if expected_state is not None:
-                return self._put_strict(key, value, size_bytes, expected_state)
+                return self._put_with_expected_state(key, value, size_bytes, expected_state)
 
             old_entry = self._items.get(key)
             if old_entry is not None:
@@ -318,14 +316,14 @@ class TensorLRUCache(Generic[K]):
                 )
             return True
 
-    def evict_for(self, key: K, *, additional_bytes: int = 0) -> list[K]:
-        """Evict exact LRU victims for `key` and earlier planned producers."""
+    def make_space_for(self, key: K, *, additional_bytes: int = 0) -> list[K]:
+        """Remove enough unused LRU entries to store the selected outputs."""
         if additional_bytes < 0:
             raise ValueError("additional_bytes must be non-negative")
         with self._lock:
             entry = self._items.get(key)
             if entry is None or entry.state is not CacheEntryState.RESERVED:
-                raise RuntimeError("evict_for requires an existing reserved entry")
+                raise RuntimeError("make_space_for requires an existing reserved entry")
 
             required_bytes = max(
                 0,
@@ -345,7 +343,7 @@ class TensorLRUCache(Generic[K]):
                     break
 
             if freed_bytes < required_bytes:
-                raise RuntimeError("reserved entry has insufficient evictable physical capacity")
+                raise RuntimeError("reserved entry does not have enough removable cache space")
 
             for victim_key, victim in victims:
                 del self._items[victim_key]
@@ -354,9 +352,9 @@ class TensorLRUCache(Generic[K]):
             return [victim_key for victim_key, _ in victims]
 
     def release(self, key: K) -> K | None:
-        """Release one reference and remove non-retained state at the last release.
+        """Release one reference and remove a non-reusable entry when unused.
 
-        Returns the key only when a materialized physical entry was removed.
+        Returns the key only when a stored tensor was removed.
         """
         with self._lock:
             entry = self._items.get(key)
@@ -389,12 +387,10 @@ class TensorLRUCache(Generic[K]):
             entry = self._items.get(key)
             if entry is None:
                 if expected_state is not None:
-                    raise RuntimeError("planned cache removal target is absent")
+                    raise RuntimeError("expected cache removal target is absent")
                 return None
             if expected_state is not None and entry.state is not expected_state:
-                raise RuntimeError(
-                    f"planned cache removal expected {expected_state}, found {entry.state}"
-                )
+                raise RuntimeError(f"cache removal expected {expected_state}, found {entry.state}")
             if entry.reference_count:
                 raise RuntimeError("cannot remove a referenced cache entry")
 
@@ -411,13 +407,12 @@ class TensorLRUCache(Generic[K]):
     def clear(self) -> None:
         """Remove every unreferenced ready entry.
 
-        A live reference or reservation is correctness state rather than
-        reusable cache state. Silently dropping it would leave request entry
-        slots pointing at absent tensors, so hard invalidation is allowed only
-        after the owner has quiesced those lifetimes.
+        Active references and reservations belong to running requests. They
+        cannot be cleared because those requests would still point to missing
+        entries.
         """
         with self._lock:
-            if self._accounted_bytes:
+            if self._in_use_bytes:
                 raise RuntimeError("cannot clear cache with live references or reservations")
             self._items.clear()
             self._current_bytes = 0
@@ -456,7 +451,7 @@ class TensorLRUCache(Generic[K]):
         )
 
     @property
-    def _accounted_bytes(self) -> int:
+    def _in_use_bytes(self) -> int:
         return self._reserved_bytes + self._pinned_bytes
 
     @staticmethod
@@ -473,7 +468,7 @@ class TensorLRUCache(Generic[K]):
             producer_event.record(torch.cuda.current_stream(stored_value.device))
         return stored_value, producer_event
 
-    def _put_strict(
+    def _put_with_expected_state(
         self,
         key: K,
         value: torch.Tensor,
@@ -483,9 +478,7 @@ class TensorLRUCache(Generic[K]):
         entry = self._items.get(key)
         actual_state = CacheEntryState.ABSENT if entry is None else entry.state
         if actual_state is not expected_state:
-            raise RuntimeError(
-                f"planned cache insertion expected {expected_state}, found {actual_state}"
-            )
+            raise RuntimeError(f"cache insertion expected {expected_state}, found {actual_state}")
 
         if expected_state is CacheEntryState.RESERVED:
             assert entry is not None
@@ -494,7 +487,7 @@ class TensorLRUCache(Generic[K]):
                     f"tensor size ({size_bytes}) does not match reserved bytes ({entry.size_bytes})"
                 )
             if self._current_bytes + size_bytes > self._max_bytes:
-                raise RuntimeError("reserved entry was not given physical cache headroom")
+                raise RuntimeError("reserved entry does not have enough cache space")
 
             stored_value, producer_event = self._clone_for_storage(value)
             entry.state = CacheEntryState.READY
@@ -509,7 +502,7 @@ class TensorLRUCache(Generic[K]):
 
         assert expected_state is CacheEntryState.ABSENT
         if self._current_bytes + size_bytes > self._max_bytes:
-            raise RuntimeError("planned replica insertion exceeds physical cache capacity")
+            raise RuntimeError("remote cache insertion exceeds cache capacity")
 
         stored_value, producer_event = self._clone_for_storage(value)
         self._items[key] = _Entry(
@@ -535,7 +528,7 @@ class TensorLRUCache(Generic[K]):
           eviction drops the cache's own reference.
         """
         if entry.value is None:
-            raise RuntimeError("cannot access an unmaterialized cache entry")
+            raise RuntimeError("cannot access a cache entry before its value is stored")
         if not self._cuda_stream_aware or not entry.value.is_cuda:
             return
 
@@ -558,5 +551,5 @@ class TensorLRUCache(Generic[K]):
             evicted_count += 1
             evicted_bytes += entry.size_bytes
         if self._current_bytes > self._max_bytes:
-            raise RuntimeError("cache has insufficient evictable physical capacity")
+            raise RuntimeError("cache does not have enough removable space")
         return evicted_count, evicted_bytes

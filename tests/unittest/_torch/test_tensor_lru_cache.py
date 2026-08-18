@@ -206,7 +206,7 @@ def test_parallel_operations_keep_cache_metadata_consistent() -> None:
             assert hit.numel() * hit.element_size() == 8
 
 
-def test_reservation_deduplicates_materialization_and_retains_ready_entry() -> None:
+def test_shared_reservation_stores_one_output_and_keeps_reusable_entry() -> None:
     cache = TensorLRUCache[str](max_bytes=16)
     value = torch.ones(2, dtype=torch.float32)
 
@@ -216,7 +216,7 @@ def test_reservation_deduplicates_materialization_and_retains_ready_entry() -> N
     assert cache.stats().reserved_bytes == 8
     assert cache.stats().pinned_bytes == 0
 
-    assert cache.evict_for("key") == []
+    assert cache.make_space_for("key") == []
     assert cache.put("key", value, expected_state=CacheEntryState.RESERVED)
     assert cache.current_bytes == 8
     assert cache.stats().reserved_bytes == 0
@@ -265,7 +265,7 @@ def test_non_retained_entries_are_removed_on_their_final_release() -> None:
     assert cache.stats().pinned_bytes == 0
 
 
-def test_allocation_backpressure_and_prelaunch_eviction_are_separate() -> None:
+def test_reservation_limit_and_output_space_are_checked_separately() -> None:
     cache = TensorLRUCache[str](max_bytes=16)
     assert cache.put("old-1", torch.ones(2, dtype=torch.float32))
     assert cache.put("old-2", torch.ones(2, dtype=torch.float32))
@@ -275,8 +275,8 @@ def test_allocation_backpressure_and_prelaunch_eviction_are_separate() -> None:
     assert cache.allocate("old-1", 8) is None
     assert cache.stats().blocked_allocations == 1
 
-    assert cache.evict_for("new-1") == ["old-1"]
-    assert cache.evict_for("new-2", additional_bytes=8) == ["old-2"]
+    assert cache.make_space_for("new-1") == ["old-1"]
+    assert cache.make_space_for("new-2", additional_bytes=8) == ["old-2"]
     assert cache.current_bytes == 0
     assert cache.put(
         "new-1",
@@ -291,7 +291,7 @@ def test_allocation_backpressure_and_prelaunch_eviction_are_separate() -> None:
     assert cache.current_bytes == 16
 
 
-def test_strict_replica_put_and_removal_reject_plan_drift() -> None:
+def test_remote_cache_put_and_removal_require_the_expected_state() -> None:
     cache = TensorLRUCache[str](max_bytes=16)
     value = torch.ones(2, dtype=torch.float32)
 
