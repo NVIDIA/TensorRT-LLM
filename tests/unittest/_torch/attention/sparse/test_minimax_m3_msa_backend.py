@@ -20,9 +20,9 @@ from tensorrt_llm._torch.attention_backend.sparse.registry import _resolve_minim
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
 
-def test_msa_cutlass_46_compatibility_aliases(monkeypatch):
+def test_msa_package_availability_installs_cutlass_46_compatibility_aliases(monkeypatch):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
-        _install_msa_cutlass_compatibility,
+        msa_package_available,
     )
 
     cute = ModuleType("cutlass.cute")
@@ -33,11 +33,15 @@ def test_msa_cutlass_46_compatibility_aliases(monkeypatch):
     cutlass.cute = cute
     monkeypatch.setitem(sys.modules, "cutlass", cutlass)
     monkeypatch.setitem(sys.modules, "cutlass.cute", cute)
+    monkeypatch.setattr("importlib.util.find_spec", lambda unused_name: object())
 
-    _install_msa_cutlass_compatibility()
-
-    assert cute.core.ThrMma is cute.ThrMma
-    assert cute.make_fragment is cute.make_rmem_tensor
+    msa_package_available.cache_clear()
+    try:
+        assert msa_package_available()
+        assert cute.core.ThrMma is cute.ThrMma
+        assert cute.make_fragment is cute.make_rmem_tensor
+    finally:
+        msa_package_available.cache_clear()
 
 
 def test_resolver_selects_msa_backend_when_available(monkeypatch):

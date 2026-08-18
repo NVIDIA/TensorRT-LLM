@@ -38,13 +38,16 @@ def _install_msa_cutlass_compatibility() -> None:
 
 @functools.lru_cache(maxsize=1)
 def msa_package_available() -> bool:
-    """Return whether the packaged fmha_sm100 module can be imported.
+    """Prepare and report whether the packaged fmha_sm100 module can be imported.
 
     Cached: each call scans sys.path until fmha_sm100 is first imported, and
     create_fmha_libs asks once per attention layer. Whether the package is
     installed cannot change within a process.
     """
-    return importlib.util.find_spec("fmha_sm100") is not None
+    if importlib.util.find_spec("fmha_sm100") is None:
+        return False
+    _install_msa_cutlass_compatibility()
+    return True
 
 
 def require_msa_module() -> types.ModuleType:
