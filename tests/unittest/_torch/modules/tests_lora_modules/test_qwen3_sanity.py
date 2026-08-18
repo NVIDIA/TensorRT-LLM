@@ -159,7 +159,7 @@ def _run_lora_test(
     trtllm_modules,
     dtype=torch.bfloat16,
     overlap=False,
-    specialize_cudagraph=False,
+    specialize_cuda_graph=False,
 ):
     """End-to-end helper: create adapter, run inference, assert output differs."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -176,7 +176,7 @@ def _run_lora_test(
             max_lora_rank=16,
             max_loras=2,
             overlap_lora_and_base=overlap,
-            cudagraph_specialize_lora=specialize_cudagraph,
+            cuda_graph_specialize_lora=specialize_cuda_graph,
         )
         out_lora, out_base = _run_with_and_without_lora(
             model_path,
@@ -258,12 +258,12 @@ class TestQwen3LoRA:
             overlap=True,
         )
 
-    def test_qwen3_bf16_lora_cudagraph_specialization(self):
+    def test_qwen3_bf16_lora_cuda_graph_specialization(self):
         _run_lora_test(
             self.model_path,
             {**_ATTN_LORA_MODULES, **_MLP_LORA_MODULES},
             _ATTN_TRTLLM_MODULES + _MLP_TRTLLM_MODULES,
-            specialize_cudagraph=True,
+            specialize_cuda_graph=True,
         )
 
 @skip_gpu_memory_less_than_80gb

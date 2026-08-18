@@ -117,7 +117,7 @@ class LoraConfig(StrictBaseModel):
         "Whether to place LoRA operations on a secondary CUDA stream and overlap them "
         "with base model computations. Improves latency in memory-bound regimes."
     )
-    cudagraph_specialize_lora: bool = Field(
+    cuda_graph_specialize_lora: bool = Field(
         default=False,
         description=
         "Whether to capture separate CUDA graphs for batches with and without "

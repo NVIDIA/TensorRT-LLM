@@ -1149,14 +1149,14 @@ class PyTorchModelEngine(ModelEngine):
                              scheduled_requests: ScheduledRequests) -> bool:
         """
         Determines whether a non-LoRA or LoRA CUDA graph should be used, if
-        both are available (cudagraph_specialize_lora==True).
+        both are available (cuda_graph_specialize_lora==True).
         """
         if self.cuda_graph_lora_manager is None:
             return False
         # Needed during graph capture to enforce a given mode
         if self._force_lora_graph_for_capture is not None:
             return self._force_lora_graph_for_capture
-        if not self.llm_args.lora_config.cudagraph_specialize_lora:
+        if not self.llm_args.lora_config.cuda_graph_specialize_lora:
             return True
         return any(request.lora_task_id is not None
                    for request in scheduled_requests.generation_requests)
@@ -2471,7 +2471,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.cuda_graph_lora_manager is None:
             lora_graph_cases = [False]
-        elif self.llm_args.lora_config.cudagraph_specialize_lora:
+        elif self.llm_args.lora_config.cuda_graph_specialize_lora:
             # Capture the larger LoRA graph first so the base-only graph can
             # reuse its CUDA graph memory-pool allocations.
             lora_graph_cases = [True, False]
