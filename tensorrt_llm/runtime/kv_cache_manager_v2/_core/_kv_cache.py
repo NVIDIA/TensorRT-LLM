@@ -1237,8 +1237,18 @@ class _KVCache:
 
         max_utilization = self.manager._init_config.max_util_for_resume
         gpu_stats = storage.get_statistics(GPU_LEVEL)
+        # The resume headroom protects pools whose working set can grow after
+        # admission. A live SSM state occupies one fixed slot for the whole
+        # request, so applying the threshold to an SSM-only pool strands
+        # (1 - max_utilization) of its request slots. Keep the threshold when
+        # an SSM lifecycle shares a pool group with an attention lifecycle.
+        needs_resume_headroom = filled_list(False, storage.num_pool_groups)
+        for lc_idx, lc in life_cycles.items():
+            if not isinstance(lc, SsmLifeCycle):
+                needs_resume_headroom[storage.get_pool_group_index(lc_idx)] = True
         if any(
-            additional_unavailable[pg_idx] > 0
+            needs_resume_headroom[pg_idx]
+            and additional_unavailable[pg_idx] > 0
             and stat.unavailable + additional_unavailable[pg_idx] > stat.total * max_utilization
             for pg_idx, stat in typed_enumerate(gpu_stats)
         ):

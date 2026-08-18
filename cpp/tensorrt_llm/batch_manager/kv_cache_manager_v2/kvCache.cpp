@@ -319,12 +319,28 @@ bool KvCache::resume(std::optional<CUstream> stream)
         }
     }
 
+    // The resume headroom protects pools whose working set can grow after
+    // admission. A live SSM state occupies one fixed slot for the whole
+    // request, so applying the threshold to an SSM-only pool strands part of
+    // its request capacity. Keep the threshold when an SSM lifecycle shares
+    // a pool group with an attention lifecycle.
+    TypedVec<PoolGroupIndex, int> needsResumeHeadroom(storageMgr.numPoolGroups(), false);
+    for (LifeCycleId lc{0}; lc < numLc; ++lc)
+    {
+        bool const isSsm = ssmLcId.has_value() && lc == *ssmLcId;
+        if (!isSsm)
+        {
+            needsResumeHeadroom[storageMgr.getPoolGroupIndex(lc)] = true;
+        }
+    }
+
     for (PoolGroupIndex pgIdx{0}; pgIdx < storageMgr.numPoolGroups(); ++pgIdx)
     {
         auto const stats = storageMgr.getStatistics(kGpuLevel, pgIdx);
         auto const projectedUnavailable = stats.unavailable() + additionalUnavailable[pgIdx];
         auto const limit = static_cast<double>(stats.total) * mManager->config().maxUtilForResume;
-        if (additionalUnavailable[pgIdx] > 0 && static_cast<double>(projectedUnavailable) > limit)
+        if (needsResumeHeadroom[pgIdx] && additionalUnavailable[pgIdx] > 0
+            && static_cast<double>(projectedUnavailable) > limit)
         {
             return false;
         }

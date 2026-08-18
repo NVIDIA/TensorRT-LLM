@@ -2240,6 +2240,41 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(initial_slot, resumed_slot, "SSM slot unchanged after suspend/resume")
         kv_cache.close()
 
+    def test_ssm_only_pool_resume_uses_full_capacity(self) -> None:
+        """Fixed-size live SSM states do not need decode-growth headroom."""
+        cfg = self._make_ssm_config(
+            gpu_quota=8 << 20,
+            num_attn_layers=0,
+            num_ssm_layers=1,
+            ssm_buffer_size=1 << 20,
+            max_util_for_resume=0.5,
+        )
+        self.manager = KVCacheManager(cfg)
+        stats = _introspection.storage_statistics(self.manager, GPU_LEVEL)
+        self.assertEqual(len(stats), 1)
+        num_slots = stats[0].total
+        self.assertGreater(num_slots, 1)
+
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_caches = []
+        try:
+            for _ in range(num_slots):
+                kv_cache = self.manager.create_kv_cache()
+                kv_caches.append(kv_cache)
+                self.assertTrue(kv_cache.resume(stream))
+
+            self.assertEqual(
+                _introspection.storage_statistics(self.manager, GPU_LEVEL)[0].unavailable,
+                num_slots,
+            )
+            overflow = self.manager.create_kv_cache()
+            kv_caches.append(overflow)
+            self.assertFalse(overflow.resume(stream))
+        finally:
+            for kv_cache in kv_caches:
+                kv_cache.close()
+
     def test_suspend_and_resume_preserves_evicted_recurrent_state(self) -> None:
         """The manager can evict suspended recurrent state under GPU pressure."""
         host_level = CacheLevel(1)

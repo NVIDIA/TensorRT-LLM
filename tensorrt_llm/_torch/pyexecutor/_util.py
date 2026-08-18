@@ -22,8 +22,9 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 is_flashinfer_gdn_supported_arch, is_sm_100f,
+                                 prefer_pinned, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -411,6 +412,60 @@ def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
         w_bytes_per_token * kv_len_cap, budget_bytes * w_bytes_per_token /
         (k_bytes_per_token + w_bytes_per_token))
     return reserve, int(reserve / w_bytes_per_token)
+
+
+def get_gdn_prefill_state_workspace_reserve(
+    model_config: ModelConfig,
+    mapping: Mapping,
+    max_batch_size: int,
+    max_num_tokens: int,
+    sm_version: Optional[int] = None,
+) -> int:
+    """Return the unprofiled FlashInfer GDN state workspace in bytes.
+
+    The capacity profiling request maximizes tokens, which is normally one
+    long sequence. FlashInfer's GDN prefill kernel instead allocates one
+    gathered initial state and one output state for every sequence in the
+    forward batch. Its serving peak therefore scales with
+    ``min(max_batch_size, max_num_tokens)`` and is not represented by that
+    profiling shape.
+
+    Only Qwen hybrid ranks with a local GDN layer need this buffer. Consumer
+    Blackwell and unsupported architectures use the vendored Triton kernel,
+    which updates indexed states in place and has no equivalent allocation.
+    """
+    config = model_config.pretrained_config
+    if (os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") != "1"
+            or not is_qwen3_hybrid(config)
+            or not is_flashinfer_gdn_supported_arch(sm_version)):
+        return 0
+
+    mamba_params = extract_mamba_kv_cache_params(
+        config,
+        quant_config=model_config.quant_config,
+    )
+    local_layer_indices = mapping.pp_layers(len(mamba_params.mamba_layer_mask))
+    if not any(mamba_params.mamba_layer_mask[layer_idx]
+               for layer_idx in local_layer_indices):
+        return 0
+
+    tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+    assert mamba_params.num_heads % tp_size == 0
+    assert mamba_params.n_groups % tp_size == 0
+    num_output_heads = max(mamba_params.num_heads,
+                           mamba_params.n_groups) // tp_size
+    state_dtype = (mamba_params.mamba_ssm_cache_dtype
+                   if is_sm_100f(sm_version) else torch.float32)
+    # This mirrors flashinfer_chunk.py's allocation: num_o_heads is the
+    # larger of Q/K and V heads, while head_size comes from Q/K.
+    state_bytes_per_sequence = (num_output_heads * mamba_params.state_size**2 *
+                                state_dtype.itemsize)
+    max_num_sequences = min(max_batch_size, max_num_tokens)
+    # flashinfer_chunk.py holds the gathered initial state until the kernel
+    # has populated a separate output-state buffer. Both have this shape.
+    num_simultaneous_state_buffers = 2
+    return (max(max_num_sequences, 0) * state_bytes_per_sequence *
+            num_simultaneous_state_buffers)
 
 
 def _normalize_attention_windows(
@@ -1250,6 +1305,33 @@ class KvCacheCreator:
                     f"{self._fp8_ctx_mla_kv_len_cap} tokens of summed attended KV): KV cache budget "
                     f"{budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
                 )
+
+        # The token-maximizing profiling request under-measures FlashInfer
+        # GDN's batch-dependent transient state buffers. Keep that workspace
+        # outside the cache quota so a large mixed context/decode batch cannot
+        # exhaust the device after cache allocation. The scheduler does not
+        # need a separate sequence cap: its existing max_batch_size and
+        # max_num_tokens limits are the bounds used for this reservation.
+        gdn_workspace_reserve = get_gdn_prefill_state_workspace_reserve(
+            self._model_engine.model.model_config,
+            self._mapping,
+            self._max_batch_size,
+            self._max_num_tokens,
+        )
+        if gdn_workspace_reserve > 0:
+            budget_before = kv_cache_max_memory
+            if gdn_workspace_reserve >= budget_before:
+                raise RuntimeError(
+                    "Insufficient GPU memory for the FlashInfer GDN prefill "
+                    f"state workspace: requires {gdn_workspace_reserve / GB:.2f} GiB, "
+                    f"but only {budget_before / GB:.2f} GiB remains for the KV cache and workspace."
+                )
+            kv_cache_max_memory = budget_before - gdn_workspace_reserve
+            logger.info(
+                f"Reserving {gdn_workspace_reserve / GB:.2f} GiB for the "
+                "FlashInfer GDN prefill state workspace: KV cache budget "
+                f"{budget_before / GB:.2f} -> {kv_cache_max_memory / GB:.2f} GiB."
+            )
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
