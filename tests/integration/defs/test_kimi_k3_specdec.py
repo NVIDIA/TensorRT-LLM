@@ -81,11 +81,9 @@ def test_kimi_k3_disagg_parity_selftest():
     Comparison logic only: canned responses, no servers or GPUs.
     """
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kimi_k3_disagg_parity.py")
-    if not os.path.exists(script):
-        pytest.skip(
-            "kimi_k3_disagg_parity.py harness not present on this branch "
-            "(ships with the disagg parity PR)"
-        )
+    # Hard failure, not a skip: this test is CI-listed (l0_cpu), so a moved or
+    # renamed harness must surface as a regression instead of a silent skip.
+    assert os.path.exists(script), f"kimi_k3_disagg_parity.py harness missing at {script}"
     result = subprocess.run(
         [sys.executable, script, "--self-test"], capture_output=True, text=True, timeout=120
     )
