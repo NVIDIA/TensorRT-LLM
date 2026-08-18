@@ -829,25 +829,26 @@ class MiniMaxM3MsaSparseAttention(TrtllmAttention):
         # scorer and cache writer below both honor their source strides.
         idx_q_view = idx_q.view(num_tokens, config.num_index_heads, config.sparse_index_dim)
         idx_k_cache = metadata.msa_idx_k_cache(self.layer_idx)
-        cache_is_fp8 = idx_k_cache.dtype == torch.float8_e4m3fn
         configured_for_fp8 = self.indexer_kv_dtype == "fp8"
-        if cache_is_fp8 != configured_for_fp8:
+        expected_cache_dtype = torch.float8_e4m3fn if configured_for_fp8 else torch.bfloat16
+        if idx_k_cache.dtype != expected_cache_dtype:
             raise ValueError(
                 "MiniMax-M3 index-K cache dtype does not match indexer_kv_dtype="
-                f"{self.indexer_kv_dtype!r}: got {idx_k_cache.dtype}."
+                f"{self.indexer_kv_dtype!r}: expected {expected_cache_dtype}, "
+                f"got {idx_k_cache.dtype}."
             )
-        query_is_fp8 = idx_q_view.dtype == torch.float8_e4m3fn
-        if cache_is_fp8:
-            if not query_is_fp8 or idx_k is not None:
+        if configured_for_fp8:
+            if idx_q_view.dtype != torch.float8_e4m3fn or idx_k is not None:
                 raise ValueError(
                     "The MiniMax-M3 FP8 indexer requires fused FP8 index-Q and "
                     "an already-populated index-K cache (live index-K must be None)."
                 )
         else:
-            if query_is_fp8 or idx_k is None:
+            if idx_q_view.dtype != torch.bfloat16 or idx_k is None or idx_k.dtype != torch.bfloat16:
+                live_k_dtype = None if idx_k is None else idx_k.dtype
                 raise ValueError(
-                    "The MiniMax-M3 BF16 indexer requires non-FP8 index-Q and "
-                    "a live index-K tensor to populate the cache."
+                    "The MiniMax-M3 BF16 indexer requires BF16 index-Q and a live "
+                    f"BF16 index-K tensor; got Q={idx_q_view.dtype}, K={live_k_dtype}."
                 )
             idx_k_view = idx_k.view(num_tokens, 1, config.sparse_index_dim)
             metadata.msa_write_idx_k(self.layer_idx, idx_k_view)

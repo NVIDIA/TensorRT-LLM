@@ -404,10 +404,19 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
     bf16_metadata = FakeMetadata(torch.bfloat16)
     with pytest.raises(ValueError, match=r"does not match indexer_kv_dtype"):
         attention.run_indexer(idx_q, idx_k, fp8_metadata)
-    with pytest.raises(ValueError, match=r"requires non-FP8 index-Q"):
+    with pytest.raises(ValueError, match=r"requires BF16 index-Q"):
         attention.run_indexer(fused_q, idx_k, bf16_metadata)
-    with pytest.raises(ValueError, match=r"live index-K tensor"):
+    with pytest.raises(ValueError, match=r"live BF16 index-K tensor"):
         attention.run_indexer(idx_q, None, bf16_metadata)
+    for unsupported_dtype in (torch.float16, torch.float32):
+        with pytest.raises(ValueError, match=r"requires BF16 index-Q"):
+            attention.run_indexer(
+                idx_q.to(unsupported_dtype),
+                idx_k.to(unsupported_dtype),
+                bf16_metadata,
+            )
+        with pytest.raises(ValueError, match=r"does not match indexer_kv_dtype"):
+            attention.run_indexer(idx_q, idx_k, FakeMetadata(unsupported_dtype))
     result = attention.run_indexer(idx_q, idx_k, bf16_metadata)
     assert result.shape == (2, 4, 16)
     assert captured["idx_q"].data_ptr() == idx_q.data_ptr()
@@ -418,7 +427,14 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
     torch.testing.assert_close(bf16_metadata.cache[1, 0, 0], idx_k[1])
 
 
-def test_msa_proxy_max_score_strided_index_k_matches_packed():
+@pytest.mark.parametrize(
+    "indexer_dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8_e4m3fn"],
+)
+def test_msa_proxy_max_score_strided_index_k_matches_packed(
+    indexer_dtype: torch.dtype,
+) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 10:
@@ -449,7 +465,7 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed():
         generator=generator,
         device="cuda",
         dtype=torch.bfloat16,
-    )
+    ).to(indexer_dtype)
     index_k_strided = index_k_pool[:, 0]
     index_k_packed = index_k_strided.contiguous()
     index_q = torch.randn(
@@ -459,7 +475,7 @@ def test_msa_proxy_max_score_strided_index_k_matches_packed():
         generator=generator,
         device="cuda",
         dtype=torch.bfloat16,
-    )
+    ).to(indexer_dtype)
     kwargs = {
         "qo_lens_cpu": torch.ones_like(kv_lens_cpu),
         "kv_lens_cpu": kv_lens_cpu,
