@@ -5196,6 +5196,9 @@ def launchTestJobs(pipeline, testFilter)
 
     parallelJobs += parallelSlurmJobs
 
+    // [M3 bringup] All SBSA Kubernetes stages disabled for feat branch.
+    SBSATestConfigs = [:]
+    /*
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
         "CPU-Generic-arm-1": ["cpu", "l0_cpu_arm", 1, 1],
@@ -5203,9 +5206,14 @@ def launchTestJobs(pipeline, testFilter)
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
     ]
+    */ // [/M3 bringup]
+
     SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
     fullSet += SBSATestConfigs.keySet()
 
+    // [M3 bringup] All SBSA Slurm stages disabled for feat branch.
+    SBSASlurmTestConfigs = [:]
+    /*
     SBSASlurmTestConfigs = [
         // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
         // useClusterDurations=true: record actual test times so each cluster builds its own
@@ -5233,9 +5241,14 @@ def launchTestJobs(pipeline, testFilter)
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 3, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 3, 4],
     ]
+    */ // [/M3 bringup]
+
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
 
+    // [M3 bringup] All SBSA Slurm stages disabled for feat branch.
+    multiNodesSBSAConfigs = [:]
+    /*
     multiNodesSBSAConfigs = [
         // Each testcase uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
@@ -5447,6 +5460,8 @@ def launchTestJobs(pipeline, testFilter)
         56,
         14
     )
+    */ // [/M3 bringup]
+
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -5516,9 +5531,61 @@ def launchTestJobs(pipeline, testFilter)
 
     // Python version and OS for sanity check
     // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall, platName]
-    // [M3 bringup] Sanity check stages disabled for feat branch.
-    x86SanityCheckConfigs = [:]
-    aarch64SanityCheckConfigs = [:]
+    x86SanityCheckConfigs = [
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "B200_PCIe",
+            X86_64_TRIPLE,
+            false,
+            true,
+            DLFW_IMAGE,
+            false,
+            'manylinux_2_39_x86_64',
+        ],
+        "PY310-UB2204": [
+            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
+            "A10",
+            X86_64_TRIPLE,
+            true,
+            false,
+            UBUNTU_22_04_IMAGE,
+            true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+            'manylinux_2_28_x86_64',
+        ],
+        "PY312-UB2404": [
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
+            "A100X",
+            X86_64_TRIPLE,
+            true,
+            false,
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 13.0 install
+            'manylinux_2_28_x86_64',
+        ],
+    ]
+
+    aarch64SanityCheckConfigs = [
+        "PY312-UB2404": [
+            LLM_WHEEL_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            false,
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 13.0 install
+            'manylinux_2_39_aarch64',
+        ],
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            true,
+            DLFW_IMAGE,
+            false,
+            'manylinux_2_39_aarch64',
+        ],
+    ]
 
     def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
     fullSet += x86SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
