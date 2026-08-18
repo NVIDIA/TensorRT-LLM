@@ -21,18 +21,35 @@ other GPU architectures may be added in a future release.
   [build from source](../../docs/source/installation/build-from-source.md)
   for details.
 
-  `build_wheel.py` creates the virtual environment at the repository
-  root, named after the container's Python version: `.venv-3.12` for the
-  current containers (Python 3.12). If your container ships a different
-  Python, substitute the matching `.venv-<major>.<minor>` path in the
-  commands on this page. Adjust `--cuda_architectures` to the target
-  GPUs (`103-real` for GB300).
+  `build_wheel.py` creates the `.venv-3.12` virtual environment at the
+  repository root (named after the container's Python version). If your
+  container ships a different Python, substitute `.venv-<major>.<minor>`
+  for `.venv-3.12` in every command below and export
+  `TRTLLM_VENV=/path/to/repo/.venv-<major>.<minor>` when submitting the
+  Slurm jobs (they default to the repository-root `.venv-3.12`). Adjust
+  `--cuda_architectures` to the target GPUs (`103-real` for GB300).
 - A complete Hugging Face-format Kimi K3 checkpoint and tokenizer, e.g.
   [moonshotai/Kimi-K3](https://huggingface.co/moonshotai/Kimi-K3) downloaded
   from the Hugging Face Hub (the example scripts take a local filesystem
   path).
 - A Slurm cluster with 16 NVIDIA Blackwell GPUs and a TensorRT-LLM container
-  image.
+  image. The image passed as `--image` below must already provide
+  TensorRT-LLM's runtime dependencies, that is, a release-style TensorRT-LLM
+  container; a build or devel image without them does not work. The Slurm
+  scripts start a fresh container from that image. They mount the
+  repository, including `.venv-3.12`, and the checkpoint, so packages installed in
+  that virtual environment are available. Packages installed only in the preparation
+  container's base environment are not:
+  repository-root `.venv-3.12` is the build environment created by `build_wheel.py`
+  (it contains Conan and pip, not PyTorch or Transformers), and `pip install
+  --no-deps -e .` installs `tensorrt_llm` alone. With an image that lacks the dependencies, every rank
+  fails with a `ModuleNotFoundError` that does not name the image, such as
+  `No module named 'transformers'`.
+
+  The scripts also export `PYTHONPATH="$REPO"` before launching the example.
+  Keep that export when adapting them: `python3 <script>` puts the script's
+  directory on `sys.path`, not the repository root, so without it the job
+  fails with `No module named 'tensorrt_llm'` even when the image is correct.
 - The `fla-core` and `einops` packages, installed into the same in-place
   environment. Note: these dependencies might be removed in a future
   release, replaced by other kernels.
@@ -54,7 +71,7 @@ other GPU architectures may be added in a future release.
   provides FlashInfer's runtime
   dependencies; `--no-deps` prevents pip from replacing its pinned PyTorch,
   Triton, CUDA, and CuTeDSL packages. Install FlashInfer last: TensorRT-LLM
-  currently pins `flashinfer-python==0.6.16`, so a later
+  currently pins `flashinfer-python==0.6.14`, so a later
   dependency-resolving TensorRT-LLM install can replace this source revision.
 
 ## Run the model
@@ -77,13 +94,13 @@ should report `True` for all four checks.
 For a full GSM8K evaluation, submit:
 
 ```bash
-sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model /path/to/kimi-k3-checkpoint \
     --image /path/to/tensorrt-llm-container.sqsh
 ```
 
 This job writes progress and results to
-`kimi-k3-gsm8k-<job-id>.log`. If no local dataset path is configured,
+`kimi-k3-eval-<job-id>.log`. If no local dataset path is configured,
 `trtllm-eval` downloads GSM8K from the Hugging Face Hub. The completed log
 contains a results table with the normalized GSM8K exact-match scores. With
 the tested checkpoint and the settings in this example, users should expect
@@ -96,6 +113,21 @@ approximately:
 
 The expected average accuracy is approximately 96.47. Small differences are
 possible with different checkpoint or dependency revisions.
+
+To evaluate with suffix-automaton (SA) speculative decoding, add `--sa`:
+
+```bash
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
+    --model /path/to/kimi-k3-checkpoint \
+    --image /path/to/tensorrt-llm-container.sqsh \
+    --sa
+```
+
+This selects `eval_extra_llm_options_sa.yaml` (see Current limitations
+below for what SA changes) and logs a speculative-decoding acceptance
+summary at the end of the run. SA is lossless, so the scores should match
+the non-SA run within noise. Speedup is workload-dependent, proportional
+to the n-gram repetition in the generated output.
 
 For serving performance, use the standard sweep under
 `examples/kimi_k3/perf_sweep/` (this supersedes the older
@@ -153,7 +185,7 @@ Request a longer allocation if the time is not sufficient for your environment:
 sbatch --time=02:00:00 examples/kimi_k3/quick_start_kimi_k3.sbatch \
     --model MODEL --image IMAGE
 
-sbatch --time=04:00:00 examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch --time=04:00:00 examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model MODEL --image IMAGE
 ```
 
@@ -163,24 +195,21 @@ Chunked prefill is supported and enabled by default in this example
 (`enable_chunked_prefill: true` in the quick start and in
 `eval_extra_llm_options.yaml`).
 
-KV-cache block reuse is supported. The LLM API enables it by default
-(`KvCacheConfig.enable_block_reuse` defaults to `true`), but the example
-configurations here explicitly disable it and treat reuse as an opt-in:
-set `kv_cache_config.enable_block_reuse: true`, or use the example
-flags — `--enable-block-reuse` for the quick start and `--reuse` for the
-GSM8K job (which selects `eval_extra_llm_options_reuse.yaml`):
+KV-cache block reuse is supported as an opt-in: set
+`kv_cache_config.enable_block_reuse: true`, or use the example flags —
+`--enable-block-reuse` for the quick start and `--reuse` for the GSM8K
+job (which selects `eval_extra_llm_options_reuse.yaml`):
 
 ```bash
 sbatch examples/kimi_k3/quick_start_kimi_k3.sbatch \
     --model MODEL --image IMAGE --enable-block-reuse
 
-sbatch examples/kimi_k3/run_gsm8k_kimi_k3.sbatch \
+sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
     --model MODEL --image IMAGE --reuse
 ```
 
-Unless one of the flags above is passed, these examples run with block
-reuse disabled; the tested evaluation and serving configurations use the
-default cache manager.
+Block reuse stays off by default because suffix-automaton speculative
+decoding requires the default cache manager, which cannot reuse blocks.
 
 ## Current limitations
 
@@ -192,4 +221,4 @@ default cache manager.
   and the TEP16/TEP8 latency recipes are unaffected. Tracked as
   TRTLLM-14904.
 - FP8 KV cache (`kv_cache_config.dtype: fp8`) is not yet supported.
-- Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). Combining speculation with disaggregated serving is not yet supported.
+- Speculative decoding: suffix-automaton speculation is supported for aggregated serving (`speculative_config: {decoding_type: SA}` in the extra LLM API options). For evaluation, use `eval_extra_llm_options_sa.yaml` (the `--sa` flag of the GSM8K job): that configuration runs with the overlap scheduler off, `max_batch_size` 8, and a matching CUDA-graph `max_batch_size`. Combining speculation with disaggregated serving is not yet supported.

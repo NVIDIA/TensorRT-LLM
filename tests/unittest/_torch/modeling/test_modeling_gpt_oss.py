@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import os
 import shutil
@@ -21,8 +24,7 @@ from tensorrt_llm.bindings.executor import \
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
-                                           apply_model_defaults_to_llm_args)
+from tensorrt_llm.llmapi.llm_utils import _resolve_kv_cache_manager_v2_auto
 from tensorrt_llm.mapping import Mapping
 
 configs = """
@@ -56,51 +58,21 @@ def test_gpt_oss_prefers_python_transceiver() -> None:
 
 
 def _resolve_gpt_oss_kv_cache_manager_v2(**llm_args_kwargs) -> bool:
-    """Run GPT-OSS model defaults through the same path model loading uses."""
+    """Resolve the GPT-OSS preference through the model-loading path."""
     llm_args = TorchLlmArgs(model="/tmp/dummy_model", **llm_args_kwargs)
-    original_setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
-    model_defaults = GptOssForCausalLM.get_model_defaults(llm_args)
-    apply_model_defaults_to_llm_args(llm_args, model_defaults)
-    return _resolve_kv_cache_manager_v2_auto(llm_args,
-                                             model_defaults,
-                                             original_setting=original_setting)
+    return _resolve_kv_cache_manager_v2_auto(llm_args, GptOssForCausalLM)
 
 
-def test_gpt_oss_model_defaults_select_v2():
+def test_gpt_oss_model_preference_selects_v2():
     """GPT-OSS is VSWA, so "auto" resolves to KVCacheManagerV2."""
     assert _resolve_gpt_oss_kv_cache_manager_v2() is True
 
 
 @pytest.mark.parametrize("user_setting", [False, True])
 def test_gpt_oss_explicit_setting_wins(user_setting):
-    """An explicit user value is never overridden by the model default."""
+    """An explicit user value is never overridden by the model preference."""
     assert _resolve_gpt_oss_kv_cache_manager_v2(kv_cache_config=KvCacheConfig(
         use_kv_cache_manager_v2=user_setting)) is user_setting
-
-
-def test_gpt_oss_two_model_eagle3_falls_back_to_v1():
-    """Two-model Eagle3 builds a separate draft engine with its own KV cache
-    manager, and V2 sizes both from the full budget, so the model default is
-    demoted to V1."""
-    assert _resolve_gpt_oss_kv_cache_manager_v2(
-        speculative_config=Eagle3DecodingConfig(
-            max_draft_len=3,
-            speculative_model="/tmp/dummy_eagle_model",
-            eagle3_one_model=False)) is False
-
-
-def test_gpt_oss_explicit_v2_rejects_two_model_eagle3():
-    """The demotion above only applies to the model default. An explicit
-    request for the same unsupported combination is rejected rather than
-    silently honored."""
-    with pytest.raises(ValueError,
-                       match="use_kv_cache_manager_v2=True is not supported"):
-        _resolve_gpt_oss_kv_cache_manager_v2(
-            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-            speculative_config=Eagle3DecodingConfig(
-                max_draft_len=3,
-                speculative_model="/tmp/dummy_eagle_model",
-                eagle3_one_model=False))
 
 
 def test_gpt_oss_one_model_eagle3_keeps_v2():

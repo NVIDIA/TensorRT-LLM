@@ -23,6 +23,9 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
+
+    from ..model_config import ModelConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -34,6 +37,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..pyexecutor.config_utils import is_mla
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .interface import (AttentionBackend, AttentionForwardArgs,
@@ -158,11 +162,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
-    # Block IDs per sequence; populated in __post_init__ when a KV cache
-    # manager is present. Declared here so encoder-only metadata (no KV cache)
-    # still exposes the attribute.
+    # Active block-ID buffers, defaulting to the target cache. Separate draft
+    # storage lets CUDA graphs bind stable target and draft addresses.
     block_ids_per_seq: Optional[torch.Tensor] = None
     kv_block_ids_per_seq: Optional[torch.Tensor] = None
+    draft_block_ids_per_seq: Optional[torch.Tensor] = None
+    draft_kv_block_ids_per_seq: Optional[torch.Tensor] = None
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -335,6 +340,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.host_kv_cache_block_offsets = self.kv_cache_manager.host_kv_cache_block_offsets
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
+            self.draft_block_ids_per_seq = None
+            self.draft_kv_block_ids_per_seq = None
 
             # Allocate separate block offset tensors for draft KV cache manager
             # Used in one-model speculative decoding with different KV cache layouts
@@ -374,6 +381,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
+                if self.draft_kv_cache_manager is not None:
+                    self.draft_block_ids_per_seq = self.get_empty(
+                        buffers,
+                        [
+                            self.draft_kv_cache_manager.max_batch_size,
+                            self.draft_kv_cache_manager.max_blocks_per_seq
+                        ],
+                        cache_name="draft_block_ids_per_seq",
+                        dtype=torch.int32,
+                        capture_graph=capture_graph,
+                    )
+                    self.draft_kv_block_ids_per_seq = self.get_empty(
+                        buffers,
+                        [
+                            self.draft_kv_cache_manager.max_batch_size,
+                            self.draft_kv_cache_manager.max_blocks_per_seq
+                        ],
+                        cache_name="draft_kv_block_ids_per_seq",
+                        dtype=torch.int32,
+                        capture_graph=capture_graph,
+                    )
                 # Allocate fixed-size buffers for pre-computed FlashMLA metadata.
                 # These are pre-allocated so their GPU addresses are stable across CUDA graph captures.
                 sm_count = torch.cuda.get_device_properties(
@@ -753,9 +781,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_total_kv_lens[0] = padded_num_tokens
 
     def prepare_flash_mla(self) -> None:
-        # Invalidate the pre-computed metadata so that forward() recomputes it
-        # for this forward pass before the first attention layer runs.
         self._flash_mla_metadata_valid = False
+        # Request-specific fills and H2D copies must happen before replay, not
+        # become fixed operations in the captured graph.
+        if torch.cuda.is_current_stream_capturing():
+            return
+
         block_ids_per_seq = maybe_pin_memory(
             self.kv_cache_manager.get_block_ids_per_seq(self.request_ids))
         num_blocks = block_ids_per_seq.shape[1]
@@ -1364,6 +1395,60 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
         self.create_fmha_libs()
 
+    @classmethod
+    def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
+                                          mapping: "Mapping") -> int:
+        """fp8 context-MLA stages a K/V dequant workspace sized by the summed attended KV length
+        (``total_kv_len``) across the context requests in a forward step, not by ``max_num_tokens`` -- so
+        KV-cache reuse can push it far past the profiling floor. This buffer is shared across attention
+        layers. ``0`` for non-MLA / non-fp8-KV / absorption-mode sparse MLA (which reads K/V straight from
+        the paged cache and stages no dequant buffer).
+
+        The per-token cost is the single source of truth in C++
+        (``AttentionOp::contextMlaWorkspaceBytesPerToken``, exposed via nanobind), so it cannot drift
+        from the runtime allocation.
+        """
+        config = model_config.pretrained_config
+        if not is_mla(config):
+            return 0
+        quant_config = model_config.quant_config
+        fp8_context_mla = (quant_config is not None
+                           and quant_config.quant_mode.has_fp8_kv_cache()
+                           and get_sm_version() in (90, 100, 103, 120))
+        if not fp8_context_mla:
+            return 0
+        # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
+        # mNumAttnHeads).
+        attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
+        num_attn_heads = config.num_attention_heads // attn_tp
+        # The buffer is skipped only where AttentionOp::useSparseMLA() holds, which needs all three of:
+        #   * DSA / DeepSeek-V4 -- only these lower to the absorption path that reads K/V from the paged
+        #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
+        #     so those layers still run dense MLA. The workspace is shared, so one dense layer forces the
+        #     reserve.
+        #   * SM 100 / 103 -- mUseTllmGen is `sm >= 100 && sm != 120`.
+        #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
+        # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
+        # under-reserving OOMs mid-forward.
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
+                      and get_sm_version() in (100, 103))
+        short_seq_mha_enabled = int(
+            os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
+        stages_no_buffer = sparse_mla and not short_seq_mha_enabled
+        return int(
+            thop.get_context_mla_workspace_bytes_per_token(
+                num_attn_heads=num_attn_heads,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                v_head_dim=config.v_head_dim,
+                fp8_context_mla=fp8_context_mla,
+                # Paged context MLA always uses separate Q/KV input; the term is otherwise gated to 0.
+                separate_q_and_kv_input=True,
+                sparse_mla=stages_no_buffer,
+            ))
+
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if self.local_layer_idx is not None:
             return self.local_layer_idx
@@ -1697,9 +1782,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self, q, k, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
-        # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
-        # recomputation when cache_seq_lens change. The metadata must always match the
-        # compacted generation sub-batch, which is also the layout used by block_ids_per_seq.
+        # The flag is invalidated whenever FlashMLA inputs change. The metadata
+        # must always match the compacted generation sub-batch, which is also
+        # the layout used by block_ids_per_seq.
         if (metadata.enable_flash_mla and forward_args.attention_input_type
                 != AttentionInputType.context_only
                 and metadata.num_generations > 0

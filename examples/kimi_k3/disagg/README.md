@@ -53,14 +53,12 @@ for constraints.
 
 ## Launch sequence (manual, single ctx + single gen)
 
-Each K3 worker spans 16 GPUs (4 NVL72 nodes at 4 GPUs/node). Environment
-prerequisites for every worker shell (see caveats below for why):
-
-```bash
-export UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc   # on clusters where verbs cannot
-                                                # initialize; a container-default
-                                                # UCX_TLS=tcp breaks V2 NIXL
-```
+Each K3 worker spans 16 GPUs (4 NVL72 nodes at 4 GPUs/node). Leave
+`UCX_TLS` unset in every worker shell so UCX selects transports itself,
+RDMA/verbs included; in particular, unset any container-default
+`UCX_TLS=tcp`, which breaks V2 NIXL VRAM registration. Override the
+transport list only on clusters whose verbs transports cannot
+initialize (see caveats 1 and 4 below for the symptom and the override).
 
 1. Start the context server (16-rank MPI world across its 4 nodes):
 
@@ -103,9 +101,11 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
 - **Gen-only baseline**: set `benchmark.mode: gen_only_no_context`
   (submit.py exports `TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1` to the
   workers) to measure the decode-side ceiling without KV transfer.
-- The harness's `start_worker.sh` clears `UCX_TLS`; the config carries
-  the transport pin via `TRTLLM_WORKER_UCX_TLS`, which `start_worker.sh`
-  re-exports as `UCX_TLS` after the clear.
+- The harness's `start_worker.sh` clears any container-provided
+  `UCX_TLS`, so workers run with UCX's own transport selection by
+  default. Clusters that need a transport override (caveat 4) carry it
+  via `TRTLLM_WORKER_UCX_TLS` in `worker_env_var`, which
+  `start_worker.sh` re-exports as `UCX_TLS` after the clear.
 - pyxis/enroot resets image-defined variables (notably `PATH`) at
   container start, so the config injects the in-place TRT-LLM venv via
   `TRTLLM_PATH_PREPEND` / `TRTLLM_PYTHONPATH_PREPEND`, applied inside
@@ -131,11 +131,14 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
 3. **Matched-DP only.** Keep ctx and gen at identical DEP16 with
    attention-DP on both sides; heterogeneous parallelism with
    attention-DP off is rejected (see constraints above).
-4. **Cluster environment** (NVL72 nodes): on clusters where verbs
-   transports cannot initialize, pin
-   `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` (`UCX_TLS=all` hangs setup,
-   see caveat 1) and never run V2 NIXL with a container-default
-   `UCX_TLS=tcp` (breaks V2 NIXL VRAM registration) — unset/override it.
+4. **Cluster environment** (NVL72 nodes): the default is to leave
+   `UCX_TLS` unset and let UCX pick transports (RDMA/verbs included).
+   Two exceptions: never run V2 NIXL with a container-default
+   `UCX_TLS=tcp` (breaks V2 NIXL VRAM registration; unset it), and on
+   clusters whose verbs transports cannot initialize, pin
+   `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` (an effective `UCX_TLS=all`
+   hangs setup there, see caveat 1). The pin excludes RDMA/verbs, so do
+   not carry it to clusters where verbs works.
    No bounce env override is needed: the byte gate
    (`TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES`, default 2 MiB) is always cleared
    by K3 payloads (constraints section above).
