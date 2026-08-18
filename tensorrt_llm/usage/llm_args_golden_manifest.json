@@ -1064,6 +1064,13 @@
       "path": "multimodal_config.encoder_cache_max_bytes"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "multimodal_config.encoder_data_parallel_size"
+    },
+    {
       "allowed_values": [
         "DISABLED",
         "DEFAULT",
@@ -1075,13 +1082,6 @@
     },
     {
       "capture_policy": "int",
-      "kind": "value",
-      "path": "multimodal_config.encoder_data_parallel_size"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "<class 'int'>",
-      "converter": "",
       "kind": "value",
       "path": "multimodal_config.encoder_side_stream_max_ahead"
     },
