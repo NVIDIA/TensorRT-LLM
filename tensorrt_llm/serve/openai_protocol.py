@@ -246,6 +246,9 @@ class DisaggregatedParams(OpenAIBaseModel):
     # Orchestrator -> context-worker instruction: return prompt_token_ids as a
     # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
     return_prompt_token_ids_b64: bool = False
+    # Orchestrator -> generation-worker instruction to also emit the generated token
+    # ids on each streaming chunk. Required for warm_ctx.
+    return_gen_token_ids: bool = False
     # Context worker -> generation worker: the reasoning mode the context
     # worker read off the prompt it rendered. The generation worker only sees
     # prompt_token_ids, so it cannot resolve this for itself.
@@ -850,6 +853,7 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
 class ChatCompletionResponseChoice(OpenAIBaseModel):
     index: int
     message: ChatMessage
+    token_ids: Optional[List[int]] = None
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
@@ -887,6 +891,7 @@ class DeltaMessage(OpenAIBaseModel):
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     index: int
+    token_ids: Optional[List[int]] = None
     delta: DeltaMessage
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
