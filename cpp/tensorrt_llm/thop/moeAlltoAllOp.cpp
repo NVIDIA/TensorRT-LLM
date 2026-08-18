@@ -275,15 +275,28 @@ static std::unique_ptr<tensorrt_llm::kernels::moe_comm::CftLeManager> g_cft_mana
 void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemHandle, int64_t workspaceSizePerRank,
     int64_t epRank, int64_t epSize)
 {
+    using tensorrt_llm::kernels::moe_comm::kMaxRanks;
+
     if (g_cft_manager && g_cft_manager->isInitialized())
+    {
         return;
+    }
+
+    // Validate inputs
+    CHECK_TH_CUDA(workspace);
+    CHECK_TYPE(workspace, torch::kUInt8);
+    TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor of shape [epSize, sizePerRank]");
+    TORCH_CHECK(workspace.size(0) == epSize, "workspace first dimension must equal epSize");
+    TORCH_CHECK(epSize > 0 && epSize <= kMaxRanks, "epSize must be in the range (0, ", kMaxRanks, "]");
+    TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
+    TORCH_CHECK(workspaceSizePerRank > 0 && workspaceSizePerRank <= workspace.stride(0),
+        "workspaceSizePerRank must be in the range (0, workspace.stride(0)]");
 
     auto const& cftComm = tensorrt_llm::mpi::MpiComm::world();
     TORCH_CHECK(static_cast<int64_t>(cftComm.getSize()) == epSize,
         "CFT endpoint exchange requires the communicator size (", cftComm.getSize(), ") to equal epSize (", epSize,
         "). MoE all-to-all with CFT counted writes must run as pure EP.");
 
-    CHECK_TH_CUDA(workspace);
     CUdeviceptr workspaceRankPtr
         = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
 
@@ -294,7 +307,7 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
         "CUDA logical endpoint API that CFT requires.");
 
     int localDevIdx = -1;
-    cudaGetDevice(&localDevIdx);
+    TORCH_CHECK(cudaGetDevice(&localDevIdx) == cudaSuccess, "cudaGetDevice failed during CFT initialization");
     TORCH_CHECK(g_cft_manager->createEndpointExternal(localDevIdx,
                     static_cast<CUmemGenericAllocationHandle>(workspaceMemHandle), workspaceRankPtr,
                     static_cast<size_t>(workspaceSizePerRank), static_cast<int>(epRank), static_cast<int>(epSize)),
@@ -796,7 +809,9 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     {
         auto const* leIds = g_cft_manager->getAllLeIds();
         for (int i = 0; i < static_cast<int>(epSize); i++)
+        {
             params.cft_peer_le_ids[i] = leIds[i];
+        }
 
         // Dedicated combine receive region: prepare writes the local slice and fabric pushes write peer slices.
         int64_t combineRecvRegionOffset = alignOffset(combinePayloadOffset + payloadSize, CACHELINE_ALIGNMENT);
