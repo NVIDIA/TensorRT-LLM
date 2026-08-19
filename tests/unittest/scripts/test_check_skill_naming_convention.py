@@ -65,7 +65,9 @@ def test_main_reports_malformed_yaml_without_crashing(
     assert "skills/perf-later/SKILL.md" in stderr
 
 
-@pytest.mark.parametrize("frontmatter", ["- item", "scalar", "7"])
+@pytest.mark.parametrize(
+    "frontmatter", ["- item", "scalar", "7", "null", "[]", "false", "0", '""']
+)
 def test_main_reports_non_mapping_frontmatter(
     frontmatter: str,
     tmp_path: Path,
