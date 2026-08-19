@@ -1467,7 +1467,12 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
     )
-    if spec_config.spec_dec_mode.is_dspark():
+    # Only the embedded DSpark draft shares the target's EPLB namespace (its
+    # stages are target decoder blocks registered into the target's balancer).
+    # A standalone DSpark drafter is an independent checkpoint, so it falls
+    # under the "other external drafters" rule above.
+    if (spec_config.spec_dec_mode.is_dspark()
+            and spec_config.draft_is_embedded_in_target):
         kwargs["moe_load_balancer"] = model_config.moe_load_balancer
     return kwargs
 

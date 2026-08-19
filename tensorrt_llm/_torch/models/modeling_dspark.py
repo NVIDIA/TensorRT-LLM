@@ -2107,18 +2107,20 @@ _DSPARK_DRAFTERS_BY_MODEL_TYPE = {
 }
 
 
-def draft_is_embedded_in_target(model_config, draft_config) -> bool:
+def draft_is_embedded_in_target(model_config) -> bool:
     """True when the DSpark draft weights live inside the target checkpoint.
 
     That is the DeepSeek-V4-Pro layout: the draft is ``mtp.*`` inside the target
     checkpoint and inherits its block definition, EPLB layer namespace and
-    quantization. The probe is the weight index rather than a config field
-    because the index is authoritative and cannot be left unset; the model_type
-    check is the fallback for a checkpoint whose index file is absent.
+    quantization.
+
+    The answer comes from ``DSparkDecodingConfig.draft_is_embedded_in_target``
+    rather than being re-derived here, because the worker and the spec metadata
+    have to make the same call from ``_torch/speculative/`` -- which cannot
+    import this package -- and a builder that disagreed with them would hand
+    the worker a draft model whose attributes it does not have.
     """
-    if count_dspark_stages(model_config.spec_config.speculative_model) is not None:
-        return True
-    return getattr(draft_config.pretrained_config, "model_type", None) == "deepseek_v4"
+    return bool(model_config.spec_config.draft_is_embedded_in_target)
 
 
 @register_draft_model(SpeculativeDecodingMode.DSPARK)
@@ -2142,7 +2144,7 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     Returns:
         The draft ``nn.Module`` for this drafter.
     """
-    if draft_is_embedded_in_target(model_config, draft_config):
+    if draft_is_embedded_in_target(model_config):
         num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
         validate_dspark_eplb_layer_base(model_config, draft_config)
         return DSv4DSparkForCausalLM(

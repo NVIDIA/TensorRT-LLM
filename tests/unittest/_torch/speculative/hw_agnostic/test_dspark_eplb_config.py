@@ -68,8 +68,12 @@ def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
     )
 
 
-def _spec_config(mode):
-    return SimpleNamespace(spec_dec_mode=mode)
+def _spec_config(mode, *, embedded=True):
+    # Only the embedded DSpark draft shares the target's EPLB layer namespace:
+    # its stages are target decoder blocks registered into the target's
+    # balancer. A standalone DSpark drafter is an independent checkpoint and is
+    # treated like the other external drafters.
+    return SimpleNamespace(spec_dec_mode=mode, draft_is_embedded_in_target=embedded)
 
 
 @pytest.fixture
@@ -120,6 +124,17 @@ def test_non_dspark_external_drafters_do_not_inherit_load_balancer(mode):
     # silently generalized by a future refactor.
     kwargs = external_drafter_config_kwargs(
         _model_config(_lb_config(DSPARK_LAYERS)), _spec_config(mode)
+    )
+    assert "moe_load_balancer" not in kwargs
+
+
+def test_standalone_dspark_drafter_does_not_inherit_load_balancer():
+    # The flavour, not the mode, decides: a standalone DSpark drafter is its own
+    # checkpoint, so forwarding the target's EPLB config would key its experts
+    # against a layer namespace that is not the drafter's.
+    kwargs = external_drafter_config_kwargs(
+        _model_config(_lb_config(DSPARK_LAYERS)),
+        _spec_config(SpeculativeDecodingMode.DSPARK, embedded=False),
     )
     assert "moe_load_balancer" not in kwargs
 

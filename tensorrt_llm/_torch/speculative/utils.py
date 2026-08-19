@@ -465,7 +465,13 @@ def _build_spec_metadata(spec_config,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
         )
-    if spec_config.spec_dec_mode.is_dflash():
+    # A standalone DSpark drafter is drafted by DFlashWorker, so it needs the
+    # DFlash metadata (paged draft KV, DFlash capture buffer). Only the
+    # embedded DeepSeek-V4-Pro draft uses DSparkSpecMetadata and its rolling
+    # window. See DSparkDecodingConfig.draft_is_embedded_in_target.
+    if spec_config.spec_dec_mode.is_dflash() or (
+            spec_config.spec_dec_mode.is_dspark()
+            and not spec_config.draft_is_embedded_in_target):
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
         return DFlashSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
@@ -788,7 +794,14 @@ def get_spec_worker(spec_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
-    if spec_dec_mode.is_dflash():
+    # Only the embedded DeepSeek-V4-Pro draft is served by DSparkWorker, whose
+    # rolling-window plumbing reads V4-draft-only attributes (num_stages,
+    # write_context_windows, forward_batched). A standalone DSpark drafter is a
+    # DFlash-lineage model and is served by DFlashWorker, which already probes
+    # the DSpark heads defensively (getattr has_markov_head / _dspark_shift_label).
+    if spec_dec_mode.is_dflash() or (
+            spec_dec_mode.is_dspark()
+            and not spec_config.draft_is_embedded_in_target):
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dspark():
         return DSparkWorker(spec_config, mapping, use_separate_draft_kv_cache)
