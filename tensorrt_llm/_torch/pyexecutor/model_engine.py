@@ -18,6 +18,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
@@ -42,8 +44,6 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
-from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend.interface import (AttentionMetadata,
@@ -675,21 +675,6 @@ class PyTorchModelEngine(ModelEngine):
                 "for cuda_graph_config and configure encoder graphs through "
                 "encoder_cuda_graph_config. Decoder CUDA graphs will be "
                 "disabled.")
-            self.cuda_graph_config = None
-
-        if (self.cuda_graph_config is not None and self.dtype == torch.float32
-                and self._is_encoder_decoder_model()):
-            # fp32 enc-dec runs unfused cross-attention, whose thop workspace
-            # size query hardcodes cross_kv_length=0 (attentionOp.cpp,
-            # Runner::getWorkspaceSize) and undersizes the workspace. The
-            # graph-capture warmup runs cross_attn in isolation, so the carve
-            # overruns the allocation (surfaces as cublas EXECUTION_FAILED).
-            # Keep eager until the upstream size query is fixed.
-            logger.warning(
-                "Decoder CUDA graphs are not supported for float32 "
-                "encoder-decoder models. Decoder CUDA graphs will be disabled; "
-                "use a half-precision checkpoint or "
-                "model_kwargs={'torch_dtype': ...} to enable them.")
             self.cuda_graph_config = None
 
         cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
