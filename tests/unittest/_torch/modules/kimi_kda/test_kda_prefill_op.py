@@ -42,42 +42,45 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_attention_pair(
+def _make_kda(
     expected_prefill_kernel_path: str = "optimized",
     source_state_dict: Mapping[str, torch.Tensor] | None = None,
-) -> tuple[KimiKDALinearAttention, KimiKDAReference]:
-    common = {
-        "hidden_size": HIDDEN_SIZE,
-        "num_heads": NUM_HEADS,
-        "head_dim": HEAD_DIM,
-        "conv_kernel_size": CONV_KERNEL_SIZE,
-        "use_full_rank_gate": True,
-        "gate_lower_bound": -5.0,
-        "rms_norm_eps": 1e-5,
-        "dtype": torch.bfloat16,
-    }
+) -> KimiKDALinearAttention:
     cfg = SimpleNamespace(
         hidden_size=HIDDEN_SIZE,
-        rms_norm_eps=common["rms_norm_eps"],
+        rms_norm_eps=1e-5,
         linear_attn_config={
             "num_heads": NUM_HEADS,
             "head_dim": HEAD_DIM,
             "short_conv_kernel_size": CONV_KERNEL_SIZE,
-            "use_full_rank_gate": common["use_full_rank_gate"],
-            "gate_lower_bound": common["gate_lower_bound"],
+            "use_full_rank_gate": True,
+            "gate_lower_bound": -5.0,
         },
     )
-    optimized = KimiKDALinearAttention(cfg, layer_idx=0).to("cuda")
+    kda = KimiKDALinearAttention(cfg, layer_idx=0).to("cuda")
     with torch.no_grad():
-        optimized.dt_bias.zero_()
+        kda.dt_bias.zero_()
     if source_state_dict is not None:
-        optimized.load_state_dict(source_state_dict)
-    reference = KimiKDAReference(**common).to("cuda")
-    reference.load_state_dict(optimized.state_dict())
-    optimized.finalize_decode_weights()
+        kda.load_state_dict(source_state_dict)
+    kda.finalize_decode_weights()
 
-    assert get_production_prefill_kernel_path(optimized) == expected_prefill_kernel_path
-    return optimized, reference
+    assert get_production_prefill_kernel_path(kda) == expected_prefill_kernel_path
+    return kda
+
+
+def _make_reference(source_state_dict: Mapping[str, torch.Tensor]) -> KimiKDAReference:
+    reference = KimiKDAReference(
+        hidden_size=HIDDEN_SIZE,
+        num_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        conv_kernel_size=CONV_KERNEL_SIZE,
+        use_full_rank_gate=True,
+        gate_lower_bound=-5.0,
+        rms_norm_eps=1e-5,
+        dtype=torch.bfloat16,
+    ).to("cuda")
+    reference.load_state_dict(source_state_dict)
+    return reference
 
 
 def _run_production_prefill(
@@ -313,7 +316,8 @@ def test_copy_kda_replay_conv_window_preserves_slot_padding() -> None:
 @torch.no_grad()
 def test_optimized_prefill_matches_fla_reference() -> None:
     torch.manual_seed(0)
-    optimized, reference = _make_attention_pair()
+    optimized = _make_kda()
+    reference = _make_reference(optimized.state_dict())
 
     # Keep B=2 across a T transition: eqlen mBeta/mAqk/mAkk batch strides
     # depend on T and therefore require distinct compiled kernel variants.
@@ -446,7 +450,7 @@ def test_kda_prefill_op_empty_token_batch_variants():
 @torch.no_grad()
 def test_kda_mixer_empty_prefill():
     """The production mixer handles an empty token payload without raising."""
-    optimized, _ = _make_attention_pair()
+    optimized = _make_kda()
     hidden_states = torch.empty(1, 0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     out = _run_production_prefill(optimized, hidden_states)
     assert out.shape == (1, 0, HIDDEN_SIZE)
@@ -470,7 +474,8 @@ def test_kda_prefill_op_partial_final_chunk_large_batch():
     - [8000, 150, 42]: interior partial chunks (cross-sequence rows) plus
       a partial final chunk, at eval-like scale.
     """
-    optimized, reference = _make_attention_pair()
+    optimized = _make_kda()
+    reference = _make_reference(optimized.state_dict())
     for sequence_lengths in ([8191, 1], [8000, 150, 42]):
         cumulative_lengths = torch.tensor(
             [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
@@ -512,7 +517,8 @@ def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_length
     one-, two-, and three-chunk configurations must use FLA; the final case
     has exactly four chunks and verifies the optimized boundary.
     """
-    optimized, reference = _make_attention_pair()
+    optimized = _make_kda()
+    reference = _make_reference(optimized.state_dict())
     cumulative_lengths = torch.tensor(
         [0, *torch.tensor(sequence_lengths).cumsum(0).tolist()],
         dtype=torch.long,
@@ -537,9 +543,9 @@ def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_length
 def test_kda_prefill_unavailable_kernel_fallback_preserves_mixed_initial_states(monkeypatch):
     """The FLA core preserves prefix and continuation pool states."""
     torch.manual_seed(3)
-    optimized, _ = _make_attention_pair()
+    optimized = _make_kda()
     monkeypatch.setattr(_kda_kernels, "is_intree_prefill_available", lambda: False)
-    fallback, _ = _make_attention_pair(
+    fallback = _make_kda(
         expected_prefill_kernel_path="fla",
         source_state_dict=optimized.state_dict(),
     )
@@ -632,7 +638,8 @@ def test_kda_prefill_op_shape_growth_and_cu_dtype_transitions():
     against FLA (catches the silent-corruption direction too).
     """
     torch.manual_seed(0)
-    optimized, reference = _make_attention_pair()
+    optimized = _make_kda()
+    reference = _make_reference(optimized.state_dict())
     cases = [
         ([517, 654], torch.long),  # small batch, int64 cu (dump-replay-like)
         ([8191], torch.int32),  # buffer growth + dtype flip (crashed pre-fix)

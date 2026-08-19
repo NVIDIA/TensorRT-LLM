@@ -129,6 +129,7 @@ def test_kda_fused_qkvg_prefill_matches_separate_projections():
     reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
     reference._build_mtp_conv_weights()
+    assert reference._qkvg_proj_weight is None
     runtime.finalize_decode_weights()
     assert runtime._qkvg_proj_weight is not None
     assert runtime._bfa_proj_weight is not None
@@ -143,20 +144,10 @@ def test_kda_fused_qkvg_prefill_matches_separate_projections():
     )
 
     expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
-    with (
-        patch.object(reference.q_proj, "forward", wraps=reference.q_proj.forward) as q_proj,
-        patch.object(reference.k_proj, "forward", wraps=reference.k_proj.forward) as k_proj,
-        patch.object(reference.v_proj, "forward", wraps=reference.v_proj.forward) as v_proj,
-        patch.object(reference.g_proj, "forward", wraps=reference.g_proj.forward) as g_proj,
-    ):
-        expected = reference(
-            hidden_states,
-            _prefill_metadata(expected_cache, slot_indices, cu_seqlens),
-        )
-    for projection in (q_proj, k_proj, v_proj, g_proj):
-        projection.assert_called_once()
+    expected = reference(hidden_states, _prefill_metadata(expected_cache, slot_indices, cu_seqlens))
 
     actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    # Fused QKVG uses the merged weight directly and must bypass these modules.
     fused_qkvg_error = AssertionError("fused QKVG prefill called a separate projection")
     with (
         patch.object(runtime.q_proj, "forward", side_effect=fused_qkvg_error),
