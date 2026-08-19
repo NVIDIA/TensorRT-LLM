@@ -18,7 +18,13 @@ context_servers:
   print_iter_log: true
   cache_transceiver_config:
     backend: DEFAULT
-    max_tokens_in_buffer: 16384
+    # DisaggTransferAdmissionController spends max_tokens_in_buffer /
+    # tokens_per_block as an aggregate budget for concurrent generation KV
+    # transfers, so an arena-sized value (~one sequence) admits ~2 of the 512
+    # requests this test offers at 8K ISL and the rest die on the router's 180s
+    # timeout. Sized to the batch declared above (max_batch_size * 8K ISL);
+    # this model runs the Python transceiver, which allocates no such arena.
+    max_tokens_in_buffer: 1048576
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
@@ -47,4 +53,6 @@ generation_servers:
   print_iter_log: true
   cache_transceiver_config:
     backend: DEFAULT
-    max_tokens_in_buffer: 16384
+    # Kept in step with the context server above: the generation side is the one
+    # whose admission gate defers the transfers.
+    max_tokens_in_buffer: 1048576
