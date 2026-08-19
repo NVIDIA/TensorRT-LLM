@@ -60,6 +60,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
@@ -1031,8 +1032,16 @@ class PyExecutor:
                     "connector scheduler / worker hooks and are not "
                     "distinguished from real requests.")
 
+            if self.kv_cache_manager is None:
+                raise ValueError(
+                    "KV Cache Connector requires a KV Cache Manager.")
+
+            is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
+                                                KVCacheManagerV2)
+
             kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
-            if kv_cache_config is not None and kv_cache_config.host_cache_size:
+            if not is_kv_cache_manager_v2 and (kv_cache_config is not None and
+                                               kv_cache_config.host_cache_size):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with KV cache host "
                     "offloading (KvCacheConfig.host_cache_size). The connector "
@@ -1042,11 +1051,11 @@ class PyExecutor:
                     "streams are not synchronized with the internal "
                     "onboard/offload streams.")
 
-            if self.kv_cache_manager is None:
-                raise ValueError(
-                    "KV Cache Connector requires a KV Cache Manager.")
-
-            if getattr(self.kv_cache_manager, 'is_vswa', False):
+            # VSWA allocates one pool per window size. That is fatal for the V1
+            # single-tensor registration, but is the normal case for V2, whose
+            # layout describes one region set per layer group.
+            if not is_kv_cache_manager_v2 and getattr(self.kv_cache_manager,
+                                                      'is_vswa', False):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with variable "
                     "sliding-window attention (per-layer max_attention_window "
@@ -1062,8 +1071,20 @@ class PyExecutor:
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
 
-            kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
-            self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
+            if is_kv_cache_manager_v2:
+                # A registered region is only a valid address while its page is
+                # pinned to GPU. V2 migrates pages between cache tiers, and it
+                # provisions a host tier by default, so reject any non-GPU tier
+                # until the connector participates in migration. Read the
+                # resolved tier list rather than KvCacheConfig.host_cache_size:
+                # the default of None is falsy but still yields a host tier.
+                self._reject_non_gpu_cache_tiers(self.kv_cache_manager)
+                layout = build_kv_cache_layout_v2(self.kv_cache_manager)
+                self.kv_connector_manager.worker.register_kv_cache_layout(
+                    layout)
+            else:
+                kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
+                self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
             # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
@@ -1075,6 +1096,35 @@ class PyExecutor:
                         self.kv_connector_manager.layer_post_hook)
 
             self.kv_connector_manager.wait_for_initialization()
+
+    @staticmethod
+    def _reject_non_gpu_cache_tiers(kv_cache_manager) -> None:
+        """Reject KVCacheManagerV2 cache tiers below GPU while a connector runs.
+
+        A registered region is only a valid device address while its page is
+        pinned to GPU; eviction to another tier reassigns the page's slot. Until
+        the connector participates in migration, allow GPU-only configurations.
+
+        The resolved tier list is read from the manager rather than from
+        ``KvCacheConfig.host_cache_size`` on purpose: V2 provisions a host tier
+        automatically when that field is left at its default of ``None``, which
+        is falsy and would slip past a truthiness check.
+        """
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+
+        cache_tiers = getattr(kv_cache_manager.impl.init_config, "cache_tiers",
+                              None)
+        if not cache_tiers:
+            return
+        extra = [tier for tier in cache_tiers if tier.tier != CacheTier.GPU_MEM]
+        if extra:
+            names = ", ".join(str(tier.tier) for tier in extra)
+            raise NotImplementedError(
+                "KV Cache Connector is not supported with KVCacheManagerV2 "
+                f"cache tiers below GPU (found: {names}). Pages evicted to "
+                "another tier have their GPU slot reassigned, which would "
+                "invalidate the addresses registered with the connector. Set "
+                "KvCacheConfig.host_cache_size=0 to disable the host tier.")
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
