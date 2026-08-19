@@ -185,6 +185,21 @@ def test_forward_with_lse_values(make_te_attn):
     )
 
 
+def test_forward_with_lse_gqa(make_te_attn):
+    B, S, H, Hkv, D = 1, 64, 8, 2, 64
+    attn = make_te_attn(num_heads=H, head_dim=D, num_kv_heads=Hkv)
+    torch.manual_seed(7)
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, S, Hkv, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, S, Hkv, D, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        out, lse = attn.forward_with_lse(q, k, v)
+    assert out.shape == (B, S, H, D)
+    assert lse.shape == (B, H, S)
+    assert lse.dtype == torch.float32
+    assert torch.isfinite(lse).all()
+
+
 def test_attn_op_rebuilt_on_trait_change(make_te_attn):
     attn = make_te_attn(num_heads=4, head_dim=64)
     B, S = 1, 64
