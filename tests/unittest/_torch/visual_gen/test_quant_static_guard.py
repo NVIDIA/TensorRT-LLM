@@ -17,6 +17,10 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+# Pure-CPU test (stub Linear, no device): runs in the CPU lane (l0_cpu.yml),
+# which selects with `-m cpu_only`; GPU stages deselect it via `not cpu_only`.
+pytestmark = pytest.mark.cpu_only
+
 
 class _StubLinear:
     """Records load_weights calls; quant_algo resolves via the loader's global config."""
