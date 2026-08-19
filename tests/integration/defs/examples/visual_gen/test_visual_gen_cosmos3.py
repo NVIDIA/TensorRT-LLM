@@ -576,7 +576,13 @@ def _run_cosmos3_i2v_4step_lpips_pipeline(image_path):
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
-            with torch.no_grad(), _lpips_pinned_fp32_matmul_precision():
+            # Deliberately NOT pinned with _lpips_pinned_fp32_matmul_precision:
+            # this golden is a diffusers cross-stack reference whose provenance
+            # records no fp32-matmul state, so whether pinning improves or
+            # degrades agreement is unknown. The test is skipped in CI anyway
+            # (checkpoint absent), and its golden is not re-cut here. Pin this
+            # path when the golden is re-cut and the flag can be recorded.
+            with torch.no_grad():
                 result = pipeline.forward(
                     prompt=COSMOS3_I2V_4STEP_LPIPS_PROMPT,
                     # The goldens were generated against an empty uncond branch,
