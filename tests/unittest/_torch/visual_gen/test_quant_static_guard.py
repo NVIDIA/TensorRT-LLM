@@ -54,6 +54,20 @@ class TestStaticQuantGuard:
             loader.load_linear_weights(module, "blocks.0.attn1.to_q", [_bf16_weights()])
         assert module.loaded is None
 
+    @pytest.mark.parametrize(
+        "quant_algo",
+        [QuantAlgo.W4A16_AWQ, QuantAlgo.W4A8_AWQ, QuantAlgo.W8A8_SQ_PER_CHANNEL],
+    )
+    def test_unregistered_static_algo_fails_closed(self, quant_algo):
+        """Algos accepted by config parsing but absent from _STATIC_SCALE_KEYS
+        (their VisualGen checkpoint layout is unverified) must also refuse a
+        high-precision weight instead of silently skipping the check."""
+        loader = _make_loader(quant_algo)
+        module = _StubLinear()
+        with pytest.raises(ValueError, match="fails closed for unverified algos"):
+            loader.load_linear_weights(module, "blocks.0.attn1.to_q", [_bf16_weights()])
+        assert module.loaded is None
+
     def test_static_fp8_checkpoint_with_scales_loads(self):
         loader = _make_loader(QuantAlgo.FP8)
         module = _StubLinear()
