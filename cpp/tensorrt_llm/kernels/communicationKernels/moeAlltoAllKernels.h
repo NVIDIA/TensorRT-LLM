@@ -47,6 +47,10 @@ static constexpr size_t kCftCounterStrideU64 = kCftCounterStride / sizeof(uint64
 // 16 B-aligned (cp.async.bulk requires 16 B-aligned source AND destination).
 static constexpr int kCftMbarrierSlotBytes = 64;
 
+// Default per-block dynamic shared-memory cap on sm_90+; larger requests must opt in via
+// cudaFuncAttributeMaxDynamicSharedMemorySize.
+static constexpr int kDefaultDynamicSmemBytes = 48 * 1024;
+
 // Fixed-size peer metadata passed by value to the CFT combine push kernel.
 struct CftPeerLeIds
 {

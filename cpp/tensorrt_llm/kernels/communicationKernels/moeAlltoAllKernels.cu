@@ -1229,9 +1229,28 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
 
     if (params.use_cft_counted_writes)
     {
+        // Per-block dynamic smem cap is 48KB by default on sm_90+; opt-in to use up to the
+        // architectural max, as the CFT combine push launch does.
+        if (shared_bytes > kDefaultDynamicSmemBytes)
+        {
+            int maxOptinBytes = 0;
+            int deviceIdx = 0;
+            TLLM_CUDA_CHECK(cudaGetDevice(&deviceIdx));
+            TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&maxOptinBytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, deviceIdx));
+            TLLM_CHECK_WITH_INFO(shared_bytes <= maxOptinBytes,
+                "MoE all-to-all CFT dispatch needs %d bytes of shared memory per block, above the %d byte maximum on "
+                "this device. Reduce the per-token payload size or disable CFT counted writes.",
+                shared_bytes, maxOptinBytes);
+        }
+
         SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK,
             {SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
                 auto kernel_fn = moeA2ADispatchCountedWriteKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK>;
+                if (shared_bytes > kDefaultDynamicSmemBytes)
+                {
+                    TLLM_CUDA_CHECK(
+                        cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+                }
                 launchWithPdlWhenEnabled("moeA2ADispatchCountedWriteKernel", kernel_fn, grid_size, kBlockSize,
                     shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size,
