@@ -392,9 +392,10 @@ def _mutated_or_rebound_names(tree: ast.AST) -> set[str]:
 
     Conservative (over-approximating) soundness guard for module_consts: a name
     that is augmented-assigned, mutated in place (``NAME[i] = ...``,
-    ``NAME.attr = ...``, ``NAME.method(...)``), or rebound by a non-Assign
-    statement (for/with target, import alias, walrus) cannot be trusted to still
-    equal its initial literal, so it must not be resolved as a constant. The AST
+    ``NAME.attr = ...``, ``NAME.method(...)``, ``del NAME[i]``), rebound by a
+    non-Assign statement (for/with target, import alias, walrus, def/class), or
+    unbound by ``del NAME`` cannot be trusted to still equal its initial literal,
+    so it must not be resolved as a constant. The AST
     walk is scope-insensitive, so this may also drop a name that is only shadowed
     in a nested scope -- that costs resolver coverage, never soundness (an
     unresolved name becomes unverifiable, not a wrong INVALID error).
@@ -434,6 +435,17 @@ def _mutated_or_rebound_names(tree: ast.AST) -> set[str]:
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 unsafe.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node,
+                        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # A def/class binds its name, shadowing any same-named const.
+            unsafe.add(node.name)
+        elif isinstance(node, ast.Delete):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    unsafe.add(tgt.id)  # del NAME unbinds it entirely.
+                else:
+                    _flag_inplace_target(
+                        tgt)  # del NAME[i] / NAME.attr mutates.
         elif (isinstance(node, ast.Call)
               and isinstance(node.func, ast.Attribute)
               and isinstance(node.func.value, ast.Name)):

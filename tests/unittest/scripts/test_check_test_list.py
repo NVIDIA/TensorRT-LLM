@@ -388,6 +388,39 @@ def test_for_rebound_name_punts(mod, tmp_path):
     assert _valid_ids(mod, tmp_path, src) is None
 
 
+def test_function_rebound_name_punts(mod, tmp_path):
+    src = (
+        "import pytest\n"
+        'PARAMS = ["a"]\n'
+        "def PARAMS(): pass\n"
+        '@pytest.mark.parametrize("x", PARAMS)\n'
+        "def test_f(x): pass\n"
+    )
+    assert _valid_ids(mod, tmp_path, src) is None
+
+
+def test_class_rebound_name_punts(mod, tmp_path):
+    src = (
+        "import pytest\n"
+        'PARAMS = ["a"]\n'
+        "class PARAMS: pass\n"
+        '@pytest.mark.parametrize("x", PARAMS)\n'
+        "def test_f(x): pass\n"
+    )
+    assert _valid_ids(mod, tmp_path, src) is None
+
+
+def test_deleted_name_punts(mod, tmp_path):
+    src = (
+        "import pytest\n"
+        'PARAMS = ["a"]\n'
+        "del PARAMS\n"
+        '@pytest.mark.parametrize("x", PARAMS)\n'
+        "def test_f(x): pass\n"
+    )
+    assert _valid_ids(mod, tmp_path, src) is None
+
+
 def test_mutated_or_rebound_names_helper(mod, tmp_path):
     import ast
 
@@ -401,10 +434,14 @@ def test_mutated_or_rebound_names_helper(mod, tmp_path):
         "for E in x:\n    pass\n"
         "with ctx() as F:\n    pass\n"
         "(G := 5)\n"
+        "def H(): pass\n"
+        "class I: pass\n"
+        "J = [1]\ndel J\n"
     )
     unsafe = mod._mutated_or_rebound_names(ast.parse(src))
-    # Rebound / mutated / imported names are unsafe; the clean const A is not.
-    assert {"B", "C", "D", "E", "F", "G", "os", "np"} <= unsafe
+    # Rebound / mutated / imported / def / class / deleted names are unsafe;
+    # the clean const A is not.
+    assert {"B", "C", "D", "E", "F", "G", "H", "I", "J", "os", "np"} <= unsafe
     assert "A" not in unsafe
 
 
@@ -419,7 +456,7 @@ def test_validate_mutated_name_is_unverifiable_not_error(mod, tmp_path):
         "def test_f(x): pass\n"
     )
     lists_dir, base = _make_layout(tmp_path, source, ["test_sample.py::test_f[b]"])
-    errors, unverifiable, accepted, rejected = mod.validate_test_lists(lists_dir, base)
+    errors, unverifiable, _accepted, rejected = mod.validate_test_lists(lists_dir, base)
     assert errors == []
     assert rejected == []
     assert len(unverifiable) == 1
