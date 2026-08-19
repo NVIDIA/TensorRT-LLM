@@ -265,7 +265,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
 
-        is_gen_only = req.is_generation_only_request()
+        is_gen_only = req.is_generation_only_request
         cached_per_lg = (
             adapter.get_cached_token_count_per_layer_group(req, layer_groups)
             if is_gen_only

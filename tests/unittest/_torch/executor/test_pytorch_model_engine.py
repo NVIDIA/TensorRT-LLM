@@ -179,7 +179,7 @@ def _make_request_stub(req_id: int, prompt_len: int = 4) -> SimpleNamespace:
         py_draft_tokens=[],
         py_is_first_draft=False,
         is_context_only_request=False,
-        is_generation_only_request=lambda: False,
+        is_generation_only_request=False,
         py_disaggregated_params=None,
         py_multimodal_data=None,
         py_mm_encoder_event=None,
@@ -432,7 +432,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_generation_only_request_in_context_list_falls_back(self) -> None:
         context = _make_request_stub(1)
-        context.is_generation_only_request = lambda: True
+        context.is_generation_only_request = True
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = [context]
         graph_batch, promoted_ids = _make_single_token_context_graph_batch(
