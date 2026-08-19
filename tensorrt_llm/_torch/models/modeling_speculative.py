@@ -2439,19 +2439,18 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
 @register_draft_model(SpeculativeDecodingMode.EAGLE3_ONE_MODEL)
 def _build_eagle3_one_model_draft(model_config, draft_config, lm_head, model):
     """Build the EAGLE3 one-model drafter for the configured draft arch."""
-    spec_dec_mode = model_config.spec_config.spec_dec_mode
-    if model_config.spec_config.eagle3_model_arch == "llama3":
+    eagle3_model_arch = model_config.spec_config.eagle3_model_arch
+    if eagle3_model_arch == "llama3":
         # Eagle3ForCausalLM handles both Llama3 and DeepSeekV3 architectures
         return Eagle3ForCausalLM(
             draft_config, model_config.pretrained_config.num_hidden_layers)
-    elif model_config.spec_config.eagle3_model_arch == "mistral_large3":
+    elif eagle3_model_arch == "mistral_large3":
         return MistralLarge3EagleForCausalLM(
             draft_config, model_config.pretrained_config.num_hidden_layers,
             model.aux_stream_dict)
     else:
         raise ValueError(
-            f"Unsupported eagle3 model architecture: {spec_dec_mode.eagle3_model_arch}"
-        )
+            f"Unsupported eagle3 model architecture: {eagle3_model_arch}")
 
 
 @register_draft_model(SpeculativeDecodingMode.MTP)
