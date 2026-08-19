@@ -28,6 +28,7 @@ from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     MultimodalEncoderGraphRunner)
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
+from tensorrt_llm._torch.utils import torch_compiling
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -916,15 +917,19 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
 
     def _run_blocks(self, x: torch.Tensor,
                     attn_metadata: AttentionMetadata) -> torch.Tensor:
-        if self._blocks_graph_runner is not None:
-            seq_lengths = attn_metadata.seq_lens.tolist()
-            output = self._blocks_graph_runner.maybe_run(
-                seq_lengths=seq_lengths,
-                inputs={"x": x},
-            )
-            if output is not None:
-                return output["x"]
-        return self._run_blocks_eager(x, attn_metadata)
+        # RADIO runs outside the compiled LM region and receives its vision
+        # metadata explicitly. Keep both graph replay and eager fallback off
+        # the custom-op path, which resolves the LM metadata from extra_attrs.
+        with torch_compiling(False):
+            if self._blocks_graph_runner is not None:
+                seq_lengths = attn_metadata.seq_lens.tolist()
+                output = self._blocks_graph_runner.maybe_run(
+                    seq_lengths=seq_lengths,
+                    inputs={"x": x},
+                )
+                if output is not None:
+                    return output["x"]
+            return self._run_blocks_eager(x, attn_metadata)
 
     def _run_blocks_eager(self, x: torch.Tensor,
                           attn_metadata: AttentionMetadata) -> torch.Tensor:
