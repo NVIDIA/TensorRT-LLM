@@ -1047,6 +1047,13 @@ def main():
         "soundness bugs and stale entries.",
     )
     args = parser.parse_args()
+    # Parity needs a fresh validation run (for the accepted/rejected buckets) and
+    # a fresh collectable list. Reject invocations that would otherwise compare
+    # against empty results or stale l0_test.txt / qa_test.txt artifacts.
+    if args.parity and not args.validate:
+        parser.error("--parity requires --validate")
+    if args.parity and not (args.l0 or args.qa):
+        parser.error("--parity requires --l0 or --qa in the same invocation")
     script_dir = os.path.dirname(os.path.realpath(__file__))
     llm_src = os.path.abspath(os.path.join(script_dir, "../"))
 
