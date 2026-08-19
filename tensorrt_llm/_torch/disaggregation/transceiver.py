@@ -793,14 +793,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         for rid in cancelled:
-            self._send_sessions[rid].close()
+            if self._send_sessions[rid].close() is False:
+                continue
             del self._send_reqs[rid]
             del self._send_sessions[rid]
 
         for rid in completed:
             if mark_complete:
                 self._send_reqs[rid].state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-            self._send_sessions[rid].close()
+            if self._send_sessions[rid].close() is False:
+                continue
             del self._send_reqs[rid]
             del self._send_sessions[rid]
         self._close_failed_sessions(self._send_sessions, self._send_reqs, failed)
@@ -985,18 +987,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if self._send_sessions[rid].has_transferring_tasks():
                 has_transferring = True
             else:
-                self._send_sessions[rid].close()
-                del self._send_reqs[rid]
-                del self._send_sessions[rid]
+                if self._send_sessions[rid].close() is False:
+                    has_transferring = True
+                else:
+                    del self._send_reqs[rid]
+                    del self._send_sessions[rid]
 
         if rid in self._recv_sessions:
             self._recv_sessions[rid].cancel()
             if self._recv_sessions[rid].has_transferring_tasks():
                 has_transferring = True
             else:
-                self._recv_sessions[rid].close()
-                del self._recv_reqs[rid]
-                del self._recv_sessions[rid]
+                if self._recv_sessions[rid].close() is False:
+                    has_transferring = True
+                else:
+                    del self._recv_reqs[rid]
+                    del self._recv_sessions[rid]
 
         if has_transferring:
             return False
