@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 from collections.abc import Callable
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -646,14 +645,11 @@ class QwenJointAttention(Attention):
     def _qkv_pack_eligibility(self) -> bool:
         """Post-load eligibility for the packed joint-QKV addmm path.
 
-        Study-time env kill-switch TRTLLM_DISABLE_QKV_PACK=1 (read once here,
-        i.e. at post-load; never a public VisualGenArgs knob). The fused path
-        only ever runs inside `_prepare_qkv_fused`, so fused QK-norm+RoPE
-        being configured (`fuse_qk_norm_rope`, TP=1) is a precondition; the
-        runtime bf16/cuda/head-dim gate stays `_use_fused_qk_norm_rope`.
+        The fused path only ever runs inside `_prepare_qkv_fused`, so fused
+        QK-norm+RoPE being configured (`fuse_qk_norm_rope`, TP=1) is a
+        precondition; the runtime bf16/cuda/head-dim gate stays
+        `_use_fused_qk_norm_rope`.
         """
-        if os.environ.get("TRTLLM_DISABLE_QKV_PACK", "0") == "1":
-            return False
         if not (self.fuse_qk_norm_rope and self.qk_norm):
             return False
         if self.tp_size != 1:
