@@ -139,6 +139,10 @@ class TEAttention(AttentionBackend):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """FP8 attention returning output and log-sum-exp. Required for Attention2D.
 
+        TE's DotProductAttention does not expose softmax stats, so LSE is
+        computed separately from BF16 Q/K scores. This is numerically accurate
+        and satisfies the partition property Attention2D relies on.
+
         Returns:
             output: [B, S, H, D]
             lse:    [B, H, S] float32 -- log-sum-exp per query position
@@ -147,11 +151,20 @@ class TEAttention(AttentionBackend):
         attn_op = self._get_attn_op(num_gqa_groups, attn_mask_type)
         B, S = q.shape[0], q.shape[1]
         with fp8_autocast(enabled=True, fp8_recipe=self.recipe):
-            out, lse = attn_op(q, k, v, attention_mask=None, return_softmax_stats=True)
+            out = attn_op(q, k, v, attention_mask=None)
         # out: [B, S, H*D] -> [B, S, H, D]
         out = out.unflatten(-1, (self.num_heads, self.head_dim))
-        # lse: TE may return [B, H, S] or [B, H, S, 1] depending on version.
-        lse = lse.reshape(B, self.num_heads, S).float()
+
+        # Compute LSE from BF16 scores: [B, H, S, S] -> [B, H, S]
+        # q/k: [B, S, H, D] -> [B, H, S, D]
+        scores = torch.matmul(
+            q.transpose(1, 2).float(),
+            k.transpose(1, 2).float().transpose(-1, -2),
+        ) * self.scale
+        if attn_mask_type == "causal":
+            causal_mask = torch.ones(S, S, device=q.device, dtype=torch.bool).triu(diagonal=1)
+            scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)  # [B, H, S] float32
         return out, lse
 
     @property
