@@ -1288,6 +1288,9 @@ class TestLTX2TwoStageLoRAHelpers:
                 return self.lin(x)
 
         pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        # __init__ is bypassed here; BasePipeline.device now reads self._device
+        # (set in __init__), so initialize it explicitly for the warmup path.
+        pipeline._device = torch.device("cuda")
         pipeline.pipeline_config = DiffusionPipelineConfig(
             cuda_graph=CudaGraphConfig(enable=True),
             torch_compile=TorchCompileConfig(enable=False),
