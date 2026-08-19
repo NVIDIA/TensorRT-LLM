@@ -161,10 +161,9 @@ class KimiK3ToolParser(BaseToolParser):
             )
         if matched_calls < opened_calls:
             logger.warning(
-                "kimi_k3 tool parser: %d of %d call blocks were malformed or "
-                "truncated and could not be parsed",
-                opened_calls - matched_calls,
-                opened_calls,
+                f"kimi_k3 tool parser: {opened_calls - matched_calls} of "
+                f"{opened_calls} call blocks were malformed or truncated and "
+                "could not be parsed"
             )
         return calls
 
@@ -237,7 +236,7 @@ class KimiK3ToolParser(BaseToolParser):
             # stream is over, so it is plain text after all.
             return StreamingParseResult(normal_text=buffer)
         logger.warning(
-            "kimi_k3 tool parser: stream ended before %s; parsing the partial tools section",
-            self.eot_token,
+            f"kimi_k3 tool parser: stream ended before {self.eot_token}; "
+            "parsing the partial tools section"
         )
         return self.detect_and_parse(buffer, tools)

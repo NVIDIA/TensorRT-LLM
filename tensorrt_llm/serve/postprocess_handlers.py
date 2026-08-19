@@ -252,13 +252,13 @@ def _forced_call_name(calls: List[ToolCallItem], forced_name: str) -> str:
     """
     if len(calls) > 1:
         logger.warning(
-            "Forced tool_choice '%s' produced %d tool calls; keeping the first.",
-            forced_name, len(calls))
+            f"Forced tool_choice '{forced_name}' produced {len(calls)} tool "
+            "calls; keeping the first.")
     parsed_name = calls[0].name
     if parsed_name and parsed_name != forced_name:
         logger.warning(
-            "Forced tool_choice '%s' but the model emitted a call to '%s'; "
-            "using the forced name.", forced_name, parsed_name)
+            f"Forced tool_choice '{forced_name}' but the model emitted a call "
+            f"to '{parsed_name}'; using the forced name.")
     return forced_name
 
 
@@ -492,9 +492,9 @@ def chat_response_post_processor(
                 # as arguments would hand the caller garbage JSON, so return
                 # it as content and keep finish_reason honest.
                 logger.warning(
-                    "Forced tool_choice '%s' but the model emitted no tool-"
-                    "call markup; returning the text as content.",
-                    forced_tool.function.name)
+                    f"Forced tool_choice '{forced_tool.function.name}' but the "
+                    "model emitted no tool-call markup; returning the text as "
+                    "content.")
                 message = ChatMessage(role=role,
                                       content=text,
                                       reasoning_content=reasoning_text)
