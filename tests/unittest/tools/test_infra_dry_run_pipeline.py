@@ -205,7 +205,11 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         self.assertIn("if (!isInfraDryRun() && (disaggMultiNodeMode || aggMultiNodeMode))", body)
         self.assertNotIn("test_infra_dry_run_benchmark.py", body)
         dispatch = _function_body(L0_TEST, "runLLMTestlistOnSlurm", "INFRA_DRY_RUN")
-        self.assertIn("if (isInfraDryRun() || nodeCount > 1 || runWithSbatch)", dispatch)
+        self.assertIn("if (nodeCount > 1 || runWithSbatch)", dispatch)
+        self.assertNotIn("isInfraDryRun() || nodeCount", dispatch)
+        agent = _function_body(L0_TEST, "runLLMTestlistWithAgent", "executeLLMTestOnSlurm")
+        self.assertIn("runInDockerOnNodeMultiStage", agent)
+        self.assertIn("runInEnrootOnNode", agent)
         self.assertIn(
             'if [[ "${infraDryRun:-false}" == "true" || "$stageName" != *Disagg* ]]',
             SLURM_RUN,
