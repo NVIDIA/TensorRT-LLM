@@ -22,7 +22,11 @@ DO NOT ADD ANYTHING TO THIS FILE.
 
 import warnings
 
-from tensorrt_llm._torch.peft.lora.config import LoraConfig  # noqa: F401
+from tensorrt_llm._torch.peft.lora.config import (  # noqa: F401
+    LoraConfig,
+    get_default_trtllm_modules_to_hf_modules,
+    get_missing_qkv_modules_from_lora_modules,
+)
 
 warnings.warn(
     "tensorrt_llm.lora_helper has moved to "
@@ -34,4 +38,6 @@ warnings.warn(
 
 __all__ = [
     "LoraConfig",
+    "get_default_trtllm_modules_to_hf_modules",
+    "get_missing_qkv_modules_from_lora_modules",
 ]
