@@ -115,6 +115,51 @@ def _compute_acceptance_length(llm) -> float:
     return (accepted + reqs) / reqs
 
 
+def _assert_non_greedy_cuda_graph_matches_eager(build_llm_kwargs,
+                                                graph_cuda_graph_config=None):
+    """TRTLLM-14874 regression: non-greedy output must match with and without CUDA graphs.
+
+    Capture-only sampling state must not leak into cached graph metadata.
+    `build_llm_kwargs(cuda_graph_config)` returns the kwargs for constructing
+    the `LLM` under test for either the graph run (`cuda_graph_config` set) or
+    the eager run (`cuda_graph_config=None`).
+    """
+    raw_prompts = [
+        "Write a short story about a robot who discovers it can dream.",
+        "Explain quantum entanglement as if you were a pirate.",
+        "Compose a haiku about the last byte of memory before a crash.",
+    ]
+    # Not the synthetic capture params (0.7/50/0.9). max_tokens kept
+    # short to avoid unrelated graph-vs-eager fp drift over a long run.
+    sampling_params = SamplingParams(temperature=0.3,
+                                     top_k=10,
+                                     top_p=0.8,
+                                     seed=42,
+                                     max_tokens=32)
+
+    def run(cuda_graph_config):
+        with LLM(**build_llm_kwargs(cuda_graph_config)) as llm:
+            prompts = [
+                llm.tokenizer.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": p
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ) for p in raw_prompts
+            ]
+            return [
+                output.outputs[0].token_ids
+                for output in llm.generate(prompts,
+                                           sampling_params=sampling_params)
+            ]
+
+    graph_token_ids = run(graph_cuda_graph_config or CudaGraphConfig())
+    eager_token_ids = run(None)
+    assert graph_token_ids == eager_token_ids
+
+
 def _run_multinode_accuracy(model_path,
                             model_name,
                             *,
@@ -848,6 +893,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @parametrize_with_ids("spec_dec_algo", ["eagle3", "suffix_automaton"])
+    # Builds two LLM() instances back-to-back; the MPI-pool-reuse test layer
+    # would otherwise hand the second one the first's just-used worker pool.
+    @pytest.mark.private_mpi_session
     def test_one_engine_non_greedy_cuda_graph_matches_eager(
             self, spec_dec_algo):
         """TRTLLM-14874 regression: capture-only sampling state must not leak into cached graph metadata, non-greedy output must match with and without CUDA graphs."""
@@ -870,45 +918,16 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                             free_gpu_memory_fraction=0.8)
 
-        raw_prompts = [
-            "Write a short story about a robot who discovers it can dream.",
-            "Explain quantum entanglement as if you were a pirate.",
-            "Compose a haiku about the last byte of memory before a crash.",
-        ]
-        # Not the synthetic capture params (0.7/50/0.9). max_tokens kept
-        # short to avoid unrelated graph-vs-eager fp drift over a long run.
-        sampling_params = SamplingParams(temperature=0.3,
-                                         top_k=10,
-                                         top_p=0.8,
-                                         seed=42,
-                                         max_tokens=32)
+        def build_llm_kwargs(cuda_graph_config):
+            return dict(model=target_model_dir,
+                        disable_overlap_scheduler=True,
+                        cuda_graph_config=cuda_graph_config,
+                        kv_cache_config=kv_cache_config,
+                        speculative_config=spec_config,
+                        max_batch_size=max_bs)
 
-        def run(cuda_graph_config):
-            with LLM(model=target_model_dir,
-                     disable_overlap_scheduler=True,
-                     cuda_graph_config=cuda_graph_config,
-                     kv_cache_config=kv_cache_config,
-                     speculative_config=spec_config,
-                     max_batch_size=max_bs) as llm:
-                prompts = [
-                    llm.tokenizer.apply_chat_template(
-                        [{
-                            "role": "user",
-                            "content": p
-                        }],
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    ) for p in raw_prompts
-                ]
-                return [
-                    output.outputs[0].token_ids
-                    for output in llm.generate(prompts,
-                                               sampling_params=sampling_params)
-                ]
-
-        graph_token_ids = run(CudaGraphConfig(max_batch_size=max_bs))
-        eager_token_ids = run(None)
-        assert graph_token_ids == eager_token_ids
+        _assert_non_greedy_cuda_graph_matches_eager(
+            build_llm_kwargs, CudaGraphConfig(max_batch_size=max_bs))
 
     @skip_pre_blackwell
     def test_draft_target_dynamic_draft_len(self):
@@ -1825,46 +1844,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                        mtp_eagle_one_model=False,
                                        speculative_model=self.MODEL_PATH)
 
-        raw_prompts = [
-            "Write a short story about a robot who discovers it can dream.",
-            "Explain quantum entanglement as if you were a pirate.",
-            "Compose a haiku about the last byte of memory before a crash.",
-        ]
-        # Not the synthetic capture params (0.7/50/0.9). max_tokens kept
-        # short to avoid unrelated graph-vs-eager fp drift over a long run.
-        sampling_params = SamplingParams(temperature=0.3,
-                                         top_k=10,
-                                         top_p=0.8,
-                                         seed=42,
-                                         max_tokens=32)
+        def build_llm_kwargs(cuda_graph_config):
+            return dict(model=self.MODEL_PATH,
+                        kv_cache_config=kv_cache_config,
+                        enable_chunked_prefill=False,
+                        max_num_tokens=8192,
+                        disable_overlap_scheduler=True,
+                        cuda_graph_config=cuda_graph_config,
+                        speculative_config=mtp_config)
 
-        def run(cuda_graph_config):
-            with LLM(self.MODEL_PATH,
-                     kv_cache_config=kv_cache_config,
-                     enable_chunked_prefill=False,
-                     max_num_tokens=8192,
-                     disable_overlap_scheduler=True,
-                     cuda_graph_config=cuda_graph_config,
-                     speculative_config=mtp_config) as llm:
-                prompts = [
-                    llm.tokenizer.apply_chat_template(
-                        [{
-                            "role": "user",
-                            "content": p
-                        }],
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    ) for p in raw_prompts
-                ]
-                return [
-                    output.outputs[0].token_ids
-                    for output in llm.generate(prompts,
-                                               sampling_params=sampling_params)
-                ]
-
-        graph_token_ids = run(CudaGraphConfig())
-        eager_token_ids = run(None)
-        assert graph_token_ids == eager_token_ids
+        _assert_non_greedy_cuda_graph_matches_eager(build_llm_kwargs)
 
     @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_mtp_sa(self):

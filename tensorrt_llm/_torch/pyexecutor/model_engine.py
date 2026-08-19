@@ -335,6 +335,12 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
 
 _DEEP_GEMM_PDL_CONFIGURED = False
 
+# Arbitrary non-greedy params used to force the advanced-sampling CUDA graph
+# warmup capture path.
+NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(temperature=0.7,
+                                                    top_k=50,
+                                                    top_p=0.9)
+
 
 def _configure_deep_gemm_pdl() -> None:
     global _DEEP_GEMM_PDL_CONFIGURED
@@ -2844,8 +2850,8 @@ class PyTorchModelEngine(ModelEngine):
         force_non_greedy: bool = False,
     ) -> Optional[ScheduledRequests]:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
-        capture_sampling_params = SamplingParams(
-            temperature=0.7, top_k=50, top_p=0.9) if force_non_greedy else None
+        capture_sampling_params = (NON_GREEDY_CAPTURE_SAMPLING_PARAMS
+                                   if force_non_greedy else None)
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         spec_resource_manager = resource_manager.get_resource_manager(

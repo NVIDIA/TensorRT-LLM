@@ -1035,7 +1035,7 @@ class SpecMetadata:
         """Single source of truth for one-engine sampling-param detection.
 
         Scans the batch's sampling configs and sets skip_*/is_all_greedy_sample
-        (honoring the warmup capture override). Returns
+        (honoring the group-synchronized value, see below). Returns
         ``(per_request_normalized, per_request_slot_ids)`` for buffer
         population. Does NOT allocate or fill GPU buffers, so it is safe to call
         before the CUDA graph key is built.
@@ -1139,11 +1139,10 @@ class SpecMetadata:
         # unset), so this cannot be derived from which filters are in use.
         self.is_all_greedy_sample = not has_non_greedy_requests
 
-        # Apply the group-synchronized override last (semantics: see the
-        # ``group_all_greedy_sample`` field comment). Local contract: the
-        # synced value already incorporates any capture override, and rescans
-        # (e.g. populate after the graph key) must converge to it rather than
-        # resurrect the local value.
+        # Apply the group-synchronized value last (semantics: see the
+        # ``group_all_greedy_sample`` field comment). Local contract: rescans
+        # (e.g. populate after the graph key) must converge to the synced
+        # value rather than resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
         return per_request_normalized, per_request_slot_ids
