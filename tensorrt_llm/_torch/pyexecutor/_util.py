@@ -531,6 +531,12 @@ def _derive_draft_max_attention_window(
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
+    # Byte budgets that back an offload tier reserved in full at manager
+    # construction: the host tier is prefaulted and page-locked, the disk tier
+    # is preallocated. Every live manager reserves its own, so these budgets
+    # must be divided rather than handed out whole.
+    _OFFLOAD_TIER_BUDGET_ATTRS = ("host_cache_size", "disk_cache_size")
+
     def __init__(
         self,
         *,
@@ -1908,18 +1914,26 @@ class KvCacheCreator:
             max_seq_len, kv_cache_config)
         return uses_vswa_kv_cache_layout(draft_windows)
 
-    @staticmethod
-    def _drop_explicit_host_cache_size(
-            kv_cache_config: Optional[KvCacheConfig]
+    @classmethod
+    def _drop_explicit_offload_tier_budgets(
+            cls, kv_cache_config: Optional[KvCacheConfig]
     ) -> Optional[KvCacheConfig]:
-        """Return a copy of the config with any explicit host_cache_size unset.
+        """Return a copy of the config with explicit offload budgets unset.
 
-        Sizing then falls to the V2 auto host tier policy, which matches the
-        tier to the manager's own device quota.
+        Host sizing then falls to the V2 auto host tier policy, which matches
+        the tier to the manager's own device quota. The disk tier has no auto
+        policy, so dropping its budget leaves the tier out.
         """
-        if kv_cache_config is None or not kv_cache_config.host_cache_size:
+        if kv_cache_config is None:
             return kv_cache_config
-        return kv_cache_config.model_copy(update={"host_cache_size": None})
+        dropped = {
+            attr: None
+            for attr in cls._OFFLOAD_TIER_BUDGET_ATTRS
+            if getattr(kv_cache_config, attr)
+        }
+        if not dropped:
+            return kv_cache_config
+        return kv_cache_config.model_copy(update=dropped)
 
     def build_managers(self,
                        resources: Dict,
@@ -1940,13 +1954,12 @@ class KvCacheCreator:
             )
 
         # Estimation managers are throwaway probes whose pools only hold dummy
-        # requests. An explicit host tier is prefaulted and page-locked at
-        # construction, so a probe would pin the whole configured budget to back
-        # a cache it cannot fill.
+        # requests, so an explicit offload tier would reserve capacity the probe
+        # cannot fill.
         if estimating_kv_cache:
-            self_kv_cache_config = self._drop_explicit_host_cache_size(
+            self_kv_cache_config = self._drop_explicit_offload_tier_budgets(
                 self_kv_cache_config)
-            cross_kv_cache_config = self._drop_explicit_host_cache_size(
+            cross_kv_cache_config = self._drop_explicit_offload_tier_budgets(
                 cross_kv_cache_config)
 
         # Split combined KV cache budgets before creating managers.
@@ -1970,13 +1983,11 @@ class KvCacheCreator:
             v2_two_model = (self._is_kv_cache_manager_v2
                             and self._draft_model_engine is not None)
             if not v2_two_model:
-                # Target and draft are alive together and each sizes its host
-                # pool from host_cache_size directly, so they must divide the
-                # configured budget.
-                self_kv_cache_config, draft_kv_cache_config = (
-                    self._split_kv_cache_budget_for_draft(
-                        "host_cache_size", self_kv_cache_config,
-                        draft_kv_cache_config))
+                for budget_attr in self._OFFLOAD_TIER_BUDGET_ATTRS:
+                    self_kv_cache_config, draft_kv_cache_config = (
+                        self._split_kv_cache_budget_for_draft(
+                            budget_attr, self_kv_cache_config,
+                            draft_kv_cache_config))
 
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,

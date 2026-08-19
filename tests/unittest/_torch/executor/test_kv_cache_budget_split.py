@@ -29,10 +29,15 @@ pytestmark = pytest.mark.cpu_only
 
 GB = 1 << 30
 
+# Budgets that back an offload tier reserved in full at manager construction.
+OFFLOAD_TIER_BUDGET_ATTRS = ("host_cache_size", "disk_cache_size")
+
 
 def _make_creator(
     max_gpu_total_bytes: int,
     host_cache_size=None,
+    disk_cache_size=None,
+    disk_cache_path=None,
     total_kv_per_token: int = 100,
     target_kv_per_token: int = 80,
     total_kv_intercept: int = 0,
@@ -50,6 +55,8 @@ def _make_creator(
     c._kv_cache_config = KvCacheConfig(
         max_gpu_total_bytes=max_gpu_total_bytes,
         host_cache_size=host_cache_size,
+        disk_cache_size=disk_cache_size,
+        disk_cache_path=disk_cache_path,
     )
     c._tokens_per_block = 64
     c._max_seq_len = 1024
@@ -414,6 +421,35 @@ class TestSplitHostCacheBudgetForDraft:
         assert c._kv_cache_config.host_cache_size == total_host
 
 
+class TestSplitDiskCacheBudgetForDraft:
+    def test_disk_budget_split_proportionally(self, tmp_path):
+        total_disk = 20 * GB
+        c = _make_creator(
+            max_gpu_total_bytes=10 * GB,
+            disk_cache_size=total_disk,
+            disk_cache_path=str(tmp_path),
+            total_kv_per_token=100,
+            target_kv_per_token=80,
+        )
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("disk_cache_size")
+
+        assert draft_config is not None
+        assert target_config.disk_cache_size == 16 * GB
+        assert draft_config.disk_cache_size == 4 * GB
+        # Both managers write into the same folder; only the quota differs.
+        assert draft_config.disk_cache_path == str(tmp_path)
+        assert c._kv_cache_config.disk_cache_size == total_disk
+
+    def test_no_disk_cache_leaves_none(self):
+        c = _make_creator(max_gpu_total_bytes=10 * GB)
+
+        target_config, draft_config = c._split_kv_cache_budget_for_draft("disk_cache_size")
+
+        assert target_config is c._kv_cache_config
+        assert draft_config is None
+
+
 class TestHostSplitIgnoresGpuFixedCost:
     """The fixed cost models GPU-resident state and is not host memory."""
 
@@ -501,10 +537,13 @@ class TestBuildManagersBudgetGates:
     """Which splits build_managers applies, as opposed to how they divide."""
 
     @staticmethod
-    def _make_build_creator(total_host: int, total_gpu: int) -> KvCacheCreator:
+    def _make_build_creator(total_offload: int, total_gpu: int, disk_path=None) -> KvCacheCreator:
+        """Creator whose host and disk tiers both carry total_offload."""
         c = _make_creator(
             max_gpu_total_bytes=total_gpu,
-            host_cache_size=total_host,
+            host_cache_size=total_offload,
+            disk_cache_size=total_offload,
+            disk_cache_path=disk_path,
             total_kv_per_token=100,
             target_kv_per_token=80,
         )
@@ -528,45 +567,52 @@ class TestBuildManagersBudgetGates:
             c._create_one_model_draft_kv_cache_manager.call_args.kwargs["kv_cache_config_override"],
         )
 
+    @pytest.mark.parametrize("budget_attr", OFFLOAD_TIER_BUDGET_ATTRS)
     @pytest.mark.parametrize("estimating_kv_cache", [False, True])
-    def test_no_manager_receives_the_full_host_budget(self, estimating_kv_cache):
-        """No manager may be handed the whole host tier, estimating or not.
+    def test_no_manager_receives_a_full_offload_budget(
+        self, budget_attr, estimating_kv_cache, tmp_path
+    ):
+        """No manager may be handed a whole offload tier, estimating or not.
 
-        Each one pins what it is given, so two full-budget managers make a run
-        need twice the configured host memory.
+        Each one reserves what it is given, so two full-budget managers make a
+        run need twice the configured host memory or disk space.
         """
-        total_host = 20 * GB
-        c = self._make_build_creator(total_host, total_gpu=10 * GB)
+        total_offload = 20 * GB
+        c = self._make_build_creator(total_offload, total_gpu=10 * GB, disk_path=str(tmp_path))
 
         c.build_managers({}, estimating_kv_cache=estimating_kv_cache)
 
         target_config, draft_config = self._configs_passed_to_managers(c)
-        assert target_config.host_cache_size != total_host
-        assert draft_config.host_cache_size != total_host
+        assert getattr(target_config, budget_attr) != total_offload
+        assert getattr(draft_config, budget_attr) != total_offload
 
-    def test_host_budget_is_split_between_target_and_draft(self):
-        total_host = 20 * GB
-        c = self._make_build_creator(total_host, total_gpu=10 * GB)
+    @pytest.mark.parametrize("budget_attr", OFFLOAD_TIER_BUDGET_ATTRS)
+    def test_offload_budget_is_split_between_target_and_draft(self, budget_attr, tmp_path):
+        total_offload = 20 * GB
+        c = self._make_build_creator(total_offload, total_gpu=10 * GB, disk_path=str(tmp_path))
 
         c.build_managers({}, estimating_kv_cache=False)
 
         target_config, draft_config = self._configs_passed_to_managers(c)
-        assert target_config.host_cache_size + draft_config.host_cache_size == total_host
-        assert draft_config.host_cache_size < total_host
+        target_share = getattr(target_config, budget_attr)
+        draft_share = getattr(draft_config, budget_attr)
+        assert target_share + draft_share == total_offload
+        assert draft_share < total_offload
 
-    def test_estimation_managers_fall_back_to_the_auto_host_tier(self):
-        """An explicit host tier only pins memory a probe cannot use."""
-        c = self._make_build_creator(20 * GB, total_gpu=10 * GB)
+    @pytest.mark.parametrize("budget_attr", OFFLOAD_TIER_BUDGET_ATTRS)
+    def test_estimation_managers_drop_explicit_offload_tiers(self, budget_attr, tmp_path):
+        """An explicit offload tier would reserve capacity a probe cannot fill."""
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
 
         c.build_managers({}, estimating_kv_cache=True)
 
         target_config, draft_config = self._configs_passed_to_managers(c)
-        assert target_config.host_cache_size is None
-        assert draft_config.host_cache_size is None
+        assert getattr(target_config, budget_attr) is None
+        assert getattr(draft_config, budget_attr) is None
 
-    def test_gpu_budget_split_stays_skipped_during_estimation(self):
+    def test_gpu_budget_split_stays_skipped_during_estimation(self, tmp_path):
         """Estimation sizes GPU pools from max_tokens, so it keeps the budget whole."""
-        c = self._make_build_creator(20 * GB, total_gpu=10 * GB)
+        c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
 
         c.build_managers({}, estimating_kv_cache=True)
 
