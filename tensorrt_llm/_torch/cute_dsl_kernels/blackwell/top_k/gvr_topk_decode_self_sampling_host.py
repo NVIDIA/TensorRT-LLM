@@ -1406,3 +1406,54 @@ __all__ = [
     "validate_run_ws",
     "kernel_view",
 ]
+
+
+# --------------------------------------------------------------------------
+# warmup: pre-compile the varlen engine for an engine envelope so no live
+# request pays the first-touch DSL JIT (mirrors warmup_heuristic_topk_decode
+# and warmup_cute_dsl_radix_topk). Idempotent per (device, geometry) key.
+# CUDA-graph capture warmup naturally compiles the captured batch sizes;
+# this covers the eager/first-touch path (num_rows defaults to (1,)).
+_VARLEN_WARMUP_DONE: set = set()
+_VARLEN_WARMUP_LOCK = threading.Lock()
+
+
+def warmup_varlen(top_k, max_seq_len, compress_ratio=1, next_n=1, num_rows_list=(1,)):
+    """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
+
+    One tiny real launch per requested ``num_rows`` (compile keys do not
+    depend on tensor contents). Uses the current CUDA device.
+    """
+    dev = torch.cuda.current_device()
+    key = (
+        dev,
+        int(top_k),
+        int(max_seq_len),
+        int(compress_ratio),
+        int(next_n),
+        tuple(int(r) for r in num_rows_list),
+    )
+    with _VARLEN_WARMUP_LOCK:
+        if key in _VARLEN_WARMUP_DONE:
+            return
+        _VARLEN_WARMUP_DONE.add(key)
+    n_env = max(1, int(max_seq_len) // int(compress_ratio))
+    npad = (n_env + 63) // 64 * 64
+    for rows in key[5]:
+        rows = max(int(next_n), rows - rows % int(next_n) or int(next_n))
+        batch = rows // int(next_n)
+        logits = torch.zeros((rows, npad), dtype=torch.float32, device=dev)
+        kv_lens = torch.full((batch,), int(max_seq_len), dtype=torch.int32, device=dev)
+        pre_idx = torch.zeros((batch, int(top_k)), dtype=torch.int32, device=dev)
+        out = torch.empty((rows, int(top_k)), dtype=torch.int32, device=dev)
+        run_varlen(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            next_n=int(next_n),
+            compress_ratio=int(compress_ratio),
+            max_seq_len=int(max_seq_len),
+        )
+        del logits, kv_lens, pre_idx, out
+    torch.cuda.synchronize()
