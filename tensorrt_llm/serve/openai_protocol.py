@@ -1907,8 +1907,13 @@ class VideoJob(OpenAIBaseModel):
         default=None,
         description="Progress of the video generation job (0-100)")
     prompt: str = Field(description="The prompt used to generate the video")
-    status: Literal["queued", "in_progress", "completed", "failed"] = Field(
-        description="Current status of the video generation job")
+    status: Literal["queued", "generating", "encoding", "completed",
+                    "failed"] = Field(description=(
+                        "Current status of the video generation job. "
+                        "``generating`` (model inference) becomes ``encoding`` "
+                        "(writing the video file) when inference finishes, "
+                        "then ``completed`` once downloadable via "
+                        "``/content``."))
 
     # Video properties
     duration: Optional[float] = Field(default=None,
