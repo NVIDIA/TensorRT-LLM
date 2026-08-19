@@ -138,7 +138,7 @@ outcome. Missing terminal events remain unknown; they are not confirmed crashes.
 | `exitCode` | PositiveInt | Exit code, or `0` when unknown. |
 | `signalNumber` | PositiveInt | Signal number, or `0` when not applicable or unknown. |
 | `terminationKind` | enum | `clean`, `exception`, `signal`, `worker_failure`, `timeout`, or `unknown`. |
-| `lifecyclePhase` | enum | `cli_parsing`, `config_validation`, `model_initialization`, `serving`, `shutdown`, or `unknown`. |
+| `lifecyclePhase` | enum | Last known phase reached before termination: `cli_parsing`, `config_validation`, `model_initialization`, `serving`, `shutdown`, or `unknown`. |
 | `component` | enum | `llm`, `server`, `engine_worker`, `disagg_worker`, or `unknown`. |
 | `reportingSource` | enum | `self`, `supervisor`, or `executor_proxy`. |
 | `ingressPoint` | ShortString | Entry point copied onto the terminal event so terminal-only early failures remain attributable. |

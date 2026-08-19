@@ -412,7 +412,7 @@ class TestSerializedTerminationKinds:
                     "exitCodeKnown": True,
                     "exitCode": 0,
                     "signalNumber": 0,
-                    "lifecyclePhase": "shutdown",
+                    "lifecyclePhase": "config_validation",
                     "llmInitializationAttempts": 2,
                 },
                 id="clean-multiple-llms",
