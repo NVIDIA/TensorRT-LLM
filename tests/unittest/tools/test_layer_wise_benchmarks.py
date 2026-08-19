@@ -244,9 +244,10 @@ def test_deepseek_v32_ctx_dep(llm_root, world_size):
 
 # The pinned DeepSeek FP4 checkpoint requires SM100+.
 @pytest.mark.skip(
-    reason="--scaled-from rewrites WideEPMoE.select_alltoall_method_type, which is "
-    "the only alltoall-selection hook it patches. The WIDEEP backend is deprecated, "
-    "so weak scaling has no equivalent backend until the hook is generalized."
+    reason="--scaled-from makes the CTX prefill pack come out all-NaN, independently of "
+    "the MoE backend: on 4x B200 every combination of gen backend (CUTEDSL, CUTLASS) and "
+    "prefill backend (CUTLASS, DEEPGEMM) fails the NaN check, while the same command "
+    "without --scaled-from passes. Re-enable once weak scaling yields finite activations."
 )
 @skip_pre_blackwell
 @pytest.mark.parametrize("world_size", [4])
@@ -264,7 +265,7 @@ def test_deepseek_r1_gen_scaled_from_16_dep(llm_root, world_size):
             model_root / "DeepSeek-R1" / "DeepSeek-R1-0528-FP4-v2",
             "--layer-indices=5,6",
             "--scaled-from=16",
-            "--moe-backend=WIDEEP",
+            "--moe-backend=CUTEDSL",
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={

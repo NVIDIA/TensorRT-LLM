@@ -237,15 +237,16 @@ public:
 
     // Phase 2 (fence): PT symm-mem barrier on the current CUDA stream.
     // Any allocated slot's handle works — they all belong to the same group.
-    void emitBarrier()
+    void emitBarrier(int64_t timeoutMs)
     {
         TLLM_CHECK_WITH_INFO(
             mCanonicalHandle, "emitBarrier: no slot allocated yet — _prepare must precede the first _async barrier.");
-        // 10s timeout: on hang, the kernel traps with rank+channel diagnostic instead of spinning silently
-        // until SLURM wall-clock kills. Generous enough to absorb first-touch IPC + first cuda_graph
-        // capture jitter. channel=0: V/Q/K issues all run on the same per-device side stream so
-        // they FIFO-serialize; channel multiplexing only matters across distinct streams.
-        mCanonicalHandle->barrier(/*channel=*/0, /*timeout_ms=*/10000);
+        // barrier() takes MILLISECONDS (its "microseconds" timeout-error text is mislabeled).
+        // Default 60 s absorbs the one-time first-touch warmup barrier stall (~10-20 s on
+        // 16-GPU cfg2xuly8) and still traps a real hang with a rank+channel diagnostic before
+        // the SLURM wall-clock. channel=0: V/Q/K issues share one per-device side stream and
+        // FIFO-serialize, so channel multiplexing (needed only across distinct streams) is moot.
+        mCanonicalHandle->barrier(/*channel=*/0, /*timeout_ms=*/timeoutMs);
     }
 
 private:
@@ -475,10 +476,10 @@ void ulysses_a2a_async_push(
 // Step 2b (caller's comm stream): emit a symm-mem barrier on channel 0.
 // Pairs with `ulysses_a2a_async_push`; one call per deferred push (e.g.
 // V/Q/K -> 3 barriers at join).
-void ulysses_a2a_async_barrier(c10::intrusive_ptr<c10d::ProcessGroup> const& pg)
+void ulysses_a2a_async_barrier(c10::intrusive_ptr<c10d::ProcessGroup> const& pg, int64_t timeout_ms)
 {
     auto op = getOrCreateOp(pg);
-    op->emitBarrier();
+    op->emitBarrier(timeout_ms);
 }
 
 } // namespace
@@ -500,7 +501,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "ulysses_a2a_async_push(__torch__.torch.classes.trtllm.SendHandle send_h, "
         "__torch__.torch.classes.c10d.ProcessGroup pg) -> ()");
-    m.def("ulysses_a2a_async_barrier(__torch__.torch.classes.c10d.ProcessGroup pg) -> ()");
+    m.def("ulysses_a2a_async_barrier(__torch__.torch.classes.c10d.ProcessGroup pg, int timeout_ms=60000) -> ()");
 }
 
 // Both ops take/return a custom-class handle, not tensors, so the dispatcher

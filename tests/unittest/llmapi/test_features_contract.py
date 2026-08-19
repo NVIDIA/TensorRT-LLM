@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tensorrt_llm import lora_helper
+from tensorrt_llm._torch.peft.lora import config as lora_helper
 from tensorrt_llm.llmapi import llm_args
 from tensorrt_llm.usage import usage_lib
 

@@ -3,15 +3,10 @@
 
 import base64
 import gc
-import importlib.util
 import json
-import multiprocessing
 import os
 import pickle
 import re
-import subprocess
-import sys
-import traceback
 from typing import Callable, List, Optional, Tuple
 
 import pytest
@@ -34,12 +29,12 @@ from utils.torch_ref import RefHFModel
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import LLM
-from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
     _dequantize_nvfp4,
     _quantize_nvfp4,
 )
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, SamplingParams
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
@@ -1127,75 +1122,37 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         compare_logits(llm_logits, ref_logits, threshold=0.8)
 
 
-@pytest.fixture
-def mamba_deps():
-    """Install mamba-ssm and causal-conv1d for the duration of the test, then
-    restore the full pip environment. Uses a pip-freeze diff so transitive
-    dependencies (e.g. quack-kernels pinning nvidia-cutlass-dsl==4.6.0.dev0,
-    which breaks tensorrt-llm's pin of 4.5.0) are also reverted."""
+@pytest.mark.part4
+@skip_pre_hopper
+def test_llm_update_weights_nemotron_h():
+    """Weight update on Nemotron-H, a hybrid model mixing mamba, MoE and
+    attention layers.
 
-    def _freeze():
-        out = subprocess.check_output(
-            [sys.executable, "-m", "pip", "freeze", "--disable-pip-version-check"],
-            text=True,
-        )
-        result = {}
-        for line in out.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or " @ " in line:
-                continue
-            if "==" in line:
-                name, ver = line.split("==", 1)
-                result[name.lower()] = ver
-        return result
-
-    pkgs = ["mamba-ssm", "causal-conv1d"]
-    mod_names = {"mamba-ssm": "mamba_ssm", "causal-conv1d": "causal_conv1d"}
-    need_install = [p for p in pkgs if importlib.util.find_spec(mod_names[p]) is None]
-
-    before = _freeze() if need_install else None
+    Requires mamba-ssm and causal-conv1d to be importable: without them HF
+    falls back to the naive Python selective_scan path, which OOMs on
+    Nemotron-H and produces unmatched logits. The Ray CI stage installs both
+    next to ray -- see jenkins/scripts/slurm_install.sh."""
     try:
-        if need_install:
-            # --no-deps: avoid pulling in optional kernel deps (quack-kernels,
-            # tilelang) that upgrade nvidia-cutlass-dsl and break tensorrt-llm.
-            # The container already provides torch/einops/etc.
-            subprocess.check_call(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--no-build-isolation",
-                    "--no-deps",
-                    *need_install,
-                ]
-            )
-            importlib.invalidate_caches()
-        yield
-    finally:
-        if before is None:
-            return
-        after = _freeze()
-        new_pkgs = [p for p in after if p not in before]
-        changed = [(p, before[p]) for p in after if p in before and after[p] != before[p]]
-        if new_pkgs:
-            subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "-y", *new_pkgs])
-        if changed:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", *[f"{p}=={v}" for p, v in changed]]
-            )
-
-
-def _nemotron_h_body():
-    """Body of test_llm_update_weights_nemotron_h. Executed in a fresh
-    subprocess via spawn so HF transformers re-imports cleanly and the
-    mamba-ssm / causal-conv1d fast path (installed by the mamba_deps
-    fixture) is picked up. Running this in-process would let the parent
-    pytest's already-resolved negative caches force the naive Python
-    selective_scan path, which OOMs on Nemotron-H and produces unmatched logits."""
+        import causal_conv1d  # noqa: F401
+        import mamba_ssm  # noqa: F401
+    except ImportError as e:
+        # Fail loudly here rather than let the naive fallback OOM further in,
+        # which is a much harder failure to read.
+        pytest.fail(
+            f"{e.name} is not installed, so the mamba fast path is unavailable. "
+            "The Ray CI stage installs mamba-ssm and causal-conv1d alongside ray; "
+            "see jenkins/scripts/slurm_install.sh."
+        )
     model_dir = str(llm_models_root() / "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
     num_hidden_layers = 7
-    hf_model = RefHFModelWithIPCHandles(model_dir, num_hidden_layers=num_hidden_layers)
+    # NemotronHConfig derives num_hidden_layers from ``layers_block_type``
+    # and silently ignores direct assignment, so truncation must go through
+    # the layer-type list. The first 7 entries of the checkpoint's pattern
+    # ("MEMEM*E") keep all three layer types: mamba, MoE and attention.
+    layers_block_type = AutoConfig.from_pretrained(model_dir).layers_block_type[:num_hidden_layers]
+    hf_model = RefHFModelWithIPCHandles(
+        model_dir, num_hidden_layers=num_hidden_layers, layers_block_type=layers_block_type
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     # Nemotron-H's Mamba state dominates the cache budget; 0.25 of free memory
     # leaves enough room for HF (resident on cuda:0 + replicas on cuda:1..3)
@@ -1216,7 +1173,7 @@ def _nemotron_h_body():
         kv_cache_config=kv_cache_config,
         moe_config=moe_config,
         max_batch_size=4,
-        model_kwargs={"num_hidden_layers": num_hidden_layers},
+        model_kwargs={"layers_block_type": layers_block_type},
     ) as llm:
         prompts_texts = [
             "Hello, my name is",
@@ -1261,30 +1218,13 @@ def _nemotron_h_body():
         llm._collective_rpc("update_weights", (None,))
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-        compare_logits(llm_logits, ref_logits)
+        # Looser threshold: Nemotron-H logits are compared against a BF16
+        # reference and the mamba SSM / selective-scan path introduces small
+        # numerical differences. Measured over 5 runs x 4 prompts (GB200, TP=4,
+        # BF16): mean top-20 overlap 0.891, overall range 0.867-0.928. The
+        # spread is dominated by which prompt it is, not by run-to-run noise --
+        # the weakest prompt stays in 0.867-0.875 across all 5 runs, so 0.85
+        # clears the worst observation by ~0.017 while 0.88 would already flake.
+        compare_logits(llm_logits, ref_logits, threshold=0.85)
 
-
-def _nemotron_h_subprocess_entry(result_queue):
-    try:
-        _nemotron_h_body()
-        result_queue.put(None)
-    except BaseException:
-        result_queue.put(traceback.format_exc())
-
-
-@pytest.mark.part4
-@skip_pre_hopper
-def test_llm_update_weights_nemotron_h(mamba_deps):
-    """Runs _nemotron_h_body in a spawned subprocess so HF transformers
-    sees the mamba-ssm / causal-conv1d fast path installed by the
-    mamba_deps fixture. See _nemotron_h_body docstring for why."""
-    ctx = multiprocessing.get_context("spawn")
-    queue = ctx.Queue()
-    proc = ctx.Process(target=_nemotron_h_subprocess_entry, args=(queue,))
-    proc.start()
-    proc.join()
-    err = queue.get() if not queue.empty() else None
-    if proc.exitcode != 0:
-        pytest.fail(f"Subprocess exited with code {proc.exitcode}\n{err or ''}")
-    if err is not None:
-        pytest.fail(err)
+    del hf_model

@@ -176,6 +176,16 @@ class MessageType:
     CANCEL_SESSION = b"CANCEL_SESSION"
 
 
+class PeerIncompatibleError(ValueError):
+    """A context peer failed the KV/recurrent-state layout compatibility check.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers still
+    match, while letting dispatch_task catch peer incompatibility narrowly and
+    fail only the requests targeting that peer instead of crashing the
+    executor loop.
+    """
+
+
 class TaskStatus(Enum):
     INIT = "INIT"
     TRANSFERRING = "TRANSFERRING"
@@ -1586,6 +1596,11 @@ class Receiver(ReceiverBase):
         self._bounce = bounce
         self._dealers = {}
         self._sender_ep_instance_map = {}
+        # info_endpoint -> diagnostic message for peers that failed the
+        # compatibility check. Requests targeting such a peer fail fast
+        # without re-validating. Executor-thread-only access, no lock (same
+        # discipline as _sender_ep_instance_map).
+        self._incompatible_peers: dict[str, str] = {}
 
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._sessions = {}  # unique_rid -> RxSession
@@ -1711,7 +1726,26 @@ class Receiver(ReceiverBase):
         )
         receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
-        peer_infos: RankInfo = self._get_sender_info(params)
+        try:
+            peer_infos: RankInfo = self._get_sender_info(params)
+        except PeerIncompatibleError as e:
+            # Fail only this request via the normal transfer-error path
+            # (task ERROR -> session ERROR -> WaitResult.FAILED ->
+            # DISAGG_TRANS_ERROR), so one incompatible context peer does not
+            # take down the whole generation worker. The async path's
+            # cross-rank consensus unions failed rids, so the request fails
+            # globally once any rank fails here — ranks whose page table has
+            # no recurrent layers (e.g. a hybrid-model PP stage) pass
+            # validation and may still run a transfer that is then
+            # discarded. The task is already in the session's _kv_tasks, no
+            # bounce reservation exists yet, and session._sender_endpoints
+            # is still empty, so no cleanup is needed here.
+            logger.error(
+                "dispatch_task: context peer incompatible, failing request "
+                f"unique_rid={task._unique_rid}: {e}"
+            )
+            task.fail(e)
+            return
 
         if sender_dp_rank is not None:
             # Normal path: ctx_dp_rank is known, send to overlapping ranks.
@@ -1817,6 +1851,10 @@ class Receiver(ReceiverBase):
 
     def _get_sender_info(self, params: DisaggregatedParams) -> RankInfo:
         info_endpoint = self._extract_info_endpoint(params)
+        if info_endpoint in self._incompatible_peers:
+            # Known-incompatible peer: fail fast without another
+            # REQUEST_INSTANCE_INFO round-trip or re-validation.
+            raise PeerIncompatibleError(self._incompatible_peers[info_endpoint])
         if self._should_register_peer(params):
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
@@ -1830,15 +1868,28 @@ class Receiver(ReceiverBase):
             # Recurrent-state (Mamba/KDA) layout gate on the receiver side.
             # The sender-side check (PeerRegistrar.register) runs in the
             # sender's listener thread, where exceptions are only logged, so
-            # reject here — before REGISTER_RANK_INFO is even sent — to fail
-            # the first gen request loudly instead of hanging on a transfer
-            # the sender will never serve.
-            MambaPolicy.validate_peer_compatible(
-                self._registrar.self_rank_info,
-                sender_info,
-                self._registrar.self_extractor.page_table,
-                sender_info.page_table,
-            )
+            # reject here — before REGISTER_RANK_INFO is even sent, so no
+            # dealers are connected and no partial registration happens for
+            # the bad peer. The failure is converted to PeerIncompatibleError
+            # (handled in dispatch_task) so only requests targeting this peer
+            # fail, and cached so later requests fail fast.
+            try:
+                MambaPolicy.validate_peer_compatible(
+                    self._registrar.self_rank_info,
+                    sender_info,
+                    self._registrar.self_extractor.page_table,
+                    sender_info.page_table,
+                )
+            except ValueError as e:
+                msg = (
+                    f"context peer at '{info_endpoint}' is incompatible: {e} "
+                    "(cached: all further requests to this context peer fail "
+                    "fast; restart this generation worker to re-validate, "
+                    "e.g. after redeploying a compatible server on the same "
+                    "endpoint)"
+                )
+                self._incompatible_peers[info_endpoint] = msg
+                raise PeerIncompatibleError(msg) from e
 
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 BackendKind = Literal["claude-code", "codex"]
 SessionMode = Literal["stateless", "persistent"]
 
-CLAUDE_CODE_DEFAULT_MODEL = os.environ.get("CLAUDE_CODE_DEFAULT_MODEL", "fable")
-CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.5")
+CLAUDE_CODE_DEFAULT_MODEL = os.environ.get("CLAUDE_CODE_DEFAULT_MODEL", "claude-opus-5")
+CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.6-sol")
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,15 @@ class BackendConfig:
     # ``{"Glean": {"type": "http", "url": "..."}}``. Other backends
     # accept and ignore the field.
     extra_mcp_servers: dict[str, Any] | None = None
+    # Working directory the backend runs the agent in. Forwarded to the
+    # SDK as the session ``cwd`` (Claude Code's
+    # ``ClaudeAgentOptions.cwd`` / Codex's ``ThreadStartParams.cwd``).
+    # ``None`` keeps the launching process's ``Path.cwd()``. Set this when
+    # an agent must operate on a repo other than the one the orchestrator
+    # runs from — e.g. cwd-bound slash commands like ``/code-review`` that
+    # diff the session cwd's git HEAD and must target the task's repo,
+    # not the framework repo.
+    cwd: Path | None = None
 
 
 @dataclass(frozen=True)

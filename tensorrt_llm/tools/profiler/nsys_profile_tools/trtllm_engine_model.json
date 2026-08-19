@@ -40,9 +40,9 @@
     },
     "gpt-oss": {
       "block_fp8|gemm_fp8_blockwise": "block_fp8_gemm",
-      "fused_moe_kernel|_group_gemm|GroupProblemShape|GemmUniversal|bmm_|matmul_ogs_|_topk_forward|_combined_routing|_sum_bitmatrix_rows|_compute_writeback_idx": "moe_gemm",
+      "fused_moe_kernel|_group_gemm|GroupProblemShape|GemmUniversal|bmm_|matmul_ogs_|_matmul|_topk_forward|_combined_routing|_sum_bitmatrix_rows|_compute_writeback_idx|_bitmatrix_metadata_compute|_ragged_tensor_metadata": "moe_gemm",
       "gemm|matmul|nvjet": "gemm",
-      "moe|sigmoid|expert|splitKreduce|Moe": "moe",
+      "moe|sigmoid|expert|splitKreduce|Moe|_reduce_forward": "moe",
       "CatArrayBatched": "prepare_next",
       "ncclDevKernel|cross_device_reduce|AllReduce": "nccl_and_custom_ar",
       "Norm|_norm_": "norm",

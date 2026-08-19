@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,47 +12,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import functools
-from contextlib import contextmanager
-from typing import Callable, Optional
+"""Compatibility shim for ``tensorrt_llm._ray_utils``.
 
-try:
-    import ray
-except ImportError:
-    import tensorrt_llm.ray_stub as ray
+Will be removed once all usages are migrated to
+``tensorrt_llm.executor.ray.utils``.
 
+DO NOT ADD ANYTHING TO THIS FILE.
+"""
 
-@contextmanager
-def unwrap_ray_errors():
-    try:
-        yield
-    except ray.exceptions.RayTaskError as e:
-        raise e.as_instanceof_cause() from e
+import warnings
 
+from tensorrt_llm.executor.ray.utils import (  # noqa: F401
+    control_action_decorator,
+    unwrap_ray_errors,
+)
 
-def control_action_decorator(func: Optional[Callable] = None,
-                             *,
-                             drain: bool = True) -> Callable:
-    """Wrap a method in the ``control_action`` context manager.
+warnings.warn(
+    "tensorrt_llm._ray_utils has moved to tensorrt_llm.executor.ray.utils "
+    "and will be removed in a future release.",
+    FutureWarning,
+    stacklevel=2,
+)
 
-    Supports both bare and parameterized forms::
-
-        @control_action_decorator                  # drain=True (default)
-        def shutdown(self): ...
-
-        @control_action_decorator(drain=False)     # non-draining variant
-        def update_weights_via_ipc_zmq(self): ...
-    """
-
-    def decorator(f: Callable) -> Callable:
-
-        @functools.wraps(f)
-        def wrapper(self, *args, **kwargs):
-            with self.engine.control_action(drain=drain):
-                return f(self, *args, **kwargs)
-
-        return wrapper
-
-    if func is None:
-        return decorator
-    return decorator(func)
+__all__ = [
+    "control_action_decorator",
+    "unwrap_ray_errors",
+]

@@ -76,6 +76,7 @@ environment:
   trtllm_repo: "<trtllm_repo>"  # Path to TensorRT-LLM repository
   build_wheel: false  # Set true to build TensorRT-LLM from source
   trtllm_wheel_path: ""  # Path to pre-built wheel (if not building from source)
+  server_health_timeout: 1800  # Seconds to wait for the server to become healthy
   work_dir: "<full_path_to_work_dir>"  # Working directory for outputs
   worker_env_var: "TLLM_LOG_LEVEL=INFO ..."  # Environment variables for workers
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"  # Environment variables for server

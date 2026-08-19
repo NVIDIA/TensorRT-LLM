@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 
 import torch
 import triton
@@ -21,15 +21,17 @@ import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
-from .impl_contract import (MoEInputRequirement, MoERunContext,
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
+                            MoEProblem, MoERejectReason, MoERunContext,
                             MoEStaticCapability)
+from .interface import _reject
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
@@ -737,64 +739,42 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         return False
 
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        Check if DeepGemmFusedMoE can implement the given quantization algorithm.
-
-        DeepGemmFusedMoE supports:
-        - FP8_BLOCK_SCALES: SM in {100, 103}
-
-        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
-        Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation input data type. Supported types are
-                float32, bfloat16, and float16 (required by moe_permute_op kernel).
-                Note: Output dtype is always bfloat16 regardless of input dtype.
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                DeepGemmFusedMoE does NOT support swiglu_gptoss_style.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-        """
-        from .interface import _warn_and_return
-
-        sm_version = get_sm_version()
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """DeepGEMM grouped GEMM: FP8 block scales on SM100/SM103."""
+        sm_version = d.env.sm
+        quant_algo = p.quant_algo
 
         if sm_version not in {100, 103}:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
                 f"DeepGemmFusedMoE requires SM100 or SM103, got SM{sm_version}")
 
-        # Check dtype_activation: moe_permute_op only supports float32, bfloat16, float16
-        if dtype_activation not in {
-                torch.float32, torch.bfloat16, torch.float16
-        }:
-            return _warn_and_return(
+        # moe_permute_op only supports float32, bfloat16, float16
+        if p.dtype_act not in {torch.float32, torch.bfloat16, torch.float16}:
+            return _reject(
+                MoERejectReason.DTYPE_UNSUPPORTED,
                 f"DeepGemmFusedMoE requires float32, bfloat16, or float16 activation, "
-                f"got {dtype_activation}")
+                f"got {p.dtype_act}")
 
         # DeepGemmFusedMoE does NOT support unquantized mode
         if quant_algo is None:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.QUANT_UNSUPPORTED,
                 "DeepGemmFusedMoE does not support unquantized mode")
 
         # DeepGemmFusedMoE does NOT support swiglu_gptoss_style
-        if swiglu_gptoss_style:
-            return _warn_and_return(
+        if p.swiglu_gptoss_style:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
                 "DeepGemmFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
         # Only FP8_BLOCK_SCALES is supported
         if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
-            return True, None
+            return MoEEligibility.ok()
 
-        return _warn_and_return(
+        return _reject(
+            MoERejectReason.QUANT_UNSUPPORTED,
             f"DeepGemmFusedMoE does not support quant_algo={quant_algo}")
 
     # To reuse pytorch memory segments allocated during graph capture.

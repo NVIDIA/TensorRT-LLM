@@ -21,7 +21,6 @@ git lfs install
 ```bash
 git clone https://github.com/NVIDIA/TensorRT-LLM.git
 cd TensorRT-LLM
-git submodule update --init --recursive
 git lfs pull
 ```
 

@@ -21,8 +21,8 @@ from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.models.modeling_multimodal_encoder import (
-    _ENCODER_FALLBACK_MAX_NUM_REQUESTS, MultimodalEncoderMixin)
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
+    MultimodalEncoderMixin
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
     MultimodalEncoderGraphRunner)
@@ -759,8 +759,7 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # 8192 requests, `model_config.max_num_tokens`) so the CUDA-graph runner
         # / metadata provider can read `self.attn_metadata` before the engine
         # re-sizes it via `setup_attn_metadata`.
-        self.setup_attn_metadata(max_num_requests=8192,
-                                 max_num_tokens=model_config.max_num_tokens)
+        self.setup_attn_metadata(max_num_tokens=model_config.max_num_tokens)
 
         # CUDA-graph runner for the block stack. None means graphs are off and
         # the eager path is always taken; the caller opts in via
@@ -769,20 +768,18 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # order.
         self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
-    def setup_attn_metadata(self, max_num_requests: int,
-                            max_num_tokens: int) -> None:
+    def setup_attn_metadata(self, max_num_tokens: int) -> None:
         # Override the default to add `kv_layout="NHD"` for FlashInfer.
         # FlashInfer's original default is "NHD"; TRT-LLM switched the default
         # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
         # (kv_cache_manager=None) computes k/v directly from input, which is
         # always in NHD format ([tokens, heads, dim]).
         # Floor the request capacity at the same legacy fallback as the mixin
-        # default: one attention segment per image, which can exceed the
-        # LLM-side `max_batch_size` that `encoder_max_batch_size` falls back to.
-        max_num_requests = max(max_num_requests,
-                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        # default while allowing one attention segment per encoder token.
+        capacities = self.get_encoder_attention_metadata_capacity(
+            max_num_tokens)
         metadata_kwargs = dict(
-            max_num_requests=max_num_requests,
+            max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )

@@ -120,6 +120,7 @@ def test_qwen_image_layered_default_params_match_runtime_inputs():
     assert pipeline.default_generation_params["height"] is None
     assert pipeline.default_generation_params["width"] is None
     assert pipeline.extra_param_specs["resolution"].range is None
+    assert pipeline.extra_param_specs["save_layers_to_grid"].default is False
     assert pipeline.default_warmup_num_frames == [1]
     assert pipeline.warmup_cache_key(None, None, num_frames=1) == (640, 640)
     assert pipeline.warmup_cache_key(512, 768, num_frames=1) == (512, 768)
@@ -167,12 +168,32 @@ def test_qwen_image_layered_layer_stack_to_image_grid():
     grid = QwenImageLayeredPipeline._layer_stack_to_image_grid(layer_stack)
 
     assert grid.shape == (1, 4, 4, 1)
+    assert torch.equal(QwenImageLayeredPipeline._format_layer_output(layer_stack, True), grid)
     assert grid[0, :, :, 0].tolist() == [
         [0, 1, 4, 5],
         [2, 3, 6, 7],
         [8, 9, 0, 0],
         [10, 11, 0, 0],
     ]
+
+
+def test_qwen_image_layered_formats_multiple_layer_images_by_default():
+    """Layer stacks can be returned as one image per generated layer."""
+    layer_stack = torch.arange(24, dtype=torch.uint8).view(2, 3, 2, 2, 1)
+
+    separate = QwenImageLayeredPipeline._format_layer_output(layer_stack, False)
+
+    assert separate.shape == (6, 2, 2, 1)
+    assert torch.equal(separate[0], layer_stack[0, 0])
+    assert torch.equal(separate[3], layer_stack[1, 0])
+
+
+def test_qwen_image_layered_rejects_non_bool_save_layers_to_grid():
+    """Invalid output packing values fail before saving or serving the image."""
+    layer_stack = torch.zeros(1, 1, 2, 2, 1, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="save_layers_to_grid"):
+        QwenImageLayeredPipeline._format_layer_output(layer_stack, "true")
 
 
 def test_transformer_constructs_with_layered_config():

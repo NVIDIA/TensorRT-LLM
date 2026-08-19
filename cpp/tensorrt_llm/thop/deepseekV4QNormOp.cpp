@@ -63,7 +63,9 @@ torch::Tensor deepseekV4QNorm(torch::Tensor q, int64_t numHeads, int64_t headDim
 // `applyMLARopeAndAssignQKVKernelOptContext` will fill the rope slot of, or
 // `numHeads * nopeDim` for a packed nope-only layout).
 void deepseekV4QNormFusedFp8(torch::Tensor q, torch::Tensor quantQOut, torch::Tensor qPeOut, int64_t numHeads,
-    int64_t headDim, int64_t nopeDim, double eps, torch::optional<torch::Tensor> quantScaleQkv)
+    int64_t headDim, int64_t nopeDim, double eps, torch::optional<torch::Tensor> quantScaleQkv,
+    torch::optional<torch::Tensor> rotaryCosSin, torch::optional<torch::Tensor> cacheSeqLens, int64_t seqLen,
+    torch::optional<torch::Tensor> cuQSeqLens)
 {
     TORCH_CHECK(q.is_cuda(), "deepseek_v4_q_norm_fused_fp8 expects a CUDA tensor");
     TORCH_CHECK(q.is_contiguous(), "deepseek_v4_q_norm_fused_fp8 expects a contiguous tensor");
@@ -112,11 +114,46 @@ void deepseekV4QNormFusedFp8(torch::Tensor q, torch::Tensor quantQOut, torch::Te
 
     int const quantQNopeRowStrideBytes = static_cast<int>(quantQStridePerHead);
 
+    // Fusing the Q RoPE writes into this row's rope slots, so it needs the
+    // interleaved layout and a position per row.
+    void const* cosSinPtr = nullptr;
+    int const* cacheSeqLensPtr = nullptr;
+    int const* cuQSeqLensPtr = nullptr;
+    int numSeqs = 0;
+    if (rotaryCosSin.has_value() && rotaryCosSin->defined() && cacheSeqLens.has_value() && cacheSeqLens->defined())
+    {
+        TORCH_CHECK(rotaryCosSin->is_cuda(), "rotary_cos_sin must be on CUDA");
+        TORCH_CHECK(rotaryCosSin->scalar_type() == torch::kFloat32,
+            "rotary_cos_sin must be float32 (the kernel reads it as float2), got ", rotaryCosSin->scalar_type());
+        TORCH_CHECK(cacheSeqLens->is_cuda(), "cache_seq_lens must be on CUDA");
+        TORCH_CHECK(quantQStridePerHead == headDim,
+            "fused Q RoPE needs the interleaved quant_q_out layout (per-head stride == head_dim)");
+        TORCH_CHECK(cacheSeqLens->scalar_type() == torch::kInt32, "cache_seq_lens must be int32");
+        cosSinPtr = rotaryCosSin->data_ptr();
+        cacheSeqLensPtr = cacheSeqLens->data_ptr<int>();
+        if (cuQSeqLens.has_value() && cuQSeqLens->defined())
+        {
+            // Ragged context form: positions come from cu_q_seqlens (in tokens).
+            TORCH_CHECK(cuQSeqLens->is_cuda(), "cu_q_seqlens must be on CUDA");
+            TORCH_CHECK(cuQSeqLens->scalar_type() == torch::kInt32, "cu_q_seqlens must be int32");
+            TORCH_CHECK(cuQSeqLens->numel() >= 2, "cu_q_seqlens must hold num_seqs + 1 entries");
+            cuQSeqLensPtr = cuQSeqLens->data_ptr<int>();
+            numSeqs = static_cast<int>(cuQSeqLens->numel()) - 1;
+            TORCH_CHECK(cacheSeqLens->numel() >= numSeqs, "cache_seq_lens holds ", cacheSeqLens->numel(),
+                " entries but cu_q_seqlens implies ", numSeqs, " sequences");
+        }
+        else
+        {
+            TORCH_CHECK(seqLen > 0, "fused Q RoPE needs a positive seq_len without cu_q_seqlens");
+        }
+    }
+
     auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
     bool const isBfloat16 = (q.scalar_type() == torch::kBFloat16);
     tensorrt_llm::kernels::invokeDeepseekV4QNormFusedFp8(q.data_ptr(), quantQOut.data_ptr(), qPeOut.data_ptr(),
         quantScalePtr, totalRows, static_cast<int>(headDim), static_cast<int>(nopeDim), quantQNopeRowStrideBytes,
-        isBfloat16, static_cast<float>(eps), stream);
+        isBfloat16, static_cast<float>(eps), cosSinPtr, cacheSeqLensPtr, static_cast<int>(numHeads),
+        static_cast<int>(seqLen), cuQSeqLensPtr, numSeqs, stream);
 }
 
 } // namespace torch_ext
@@ -128,7 +165,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("deepseek_v4_q_norm(Tensor q, int num_heads, int head_dim, float eps) -> Tensor");
     m.def(
         "deepseek_v4_q_norm_fused_fp8(Tensor q, Tensor(a!) quant_q_out, Tensor(b!) q_pe_out, "
-        "int num_heads, int head_dim, int nope_dim, float eps, Tensor? quant_scale_qkv) -> ()");
+        "int num_heads, int head_dim, int nope_dim, float eps, Tensor? quant_scale_qkv, "
+        "Tensor? rotary_cos_sin=None, Tensor? cache_seq_lens=None, int seq_len=0, "
+        "Tensor? cu_q_seqlens=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

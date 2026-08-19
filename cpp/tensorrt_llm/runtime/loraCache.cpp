@@ -514,6 +514,26 @@ LoraCache::LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelC
 void LoraCache::setDataType(tensorrt_llm::DataType dataType)
 {
     std::scoped_lock lock(mPagesMutex, mCacheMutex);
+    setDataTypeLocked(dataType);
+}
+
+void LoraCache::setDataTypeCoordinated(LoraCache& other, tensorrt_llm::DataType dataType)
+{
+    if (&other == this)
+    {
+        // Locking mPagesMutex/mCacheMutex twice via the same std::scoped_lock call below would
+        // be undefined behavior (self-deadlock) for a non-recursive std::mutex.
+        setDataType(dataType);
+        return;
+    }
+
+    std::scoped_lock lock(mPagesMutex, mCacheMutex, other.mPagesMutex, other.mCacheMutex);
+    setDataTypeLocked(dataType);
+    other.setDataTypeLocked(dataType);
+}
+
+void LoraCache::setDataTypeLocked(tensorrt_llm::DataType dataType)
+{
     TLLM_CHECK_WITH_INFO(mCacheMap.empty(), "Cannot change LoRA cache dtype after a task has been inserted");
     if (mPageManagerConfig.getDataType() == dataType)
     {
@@ -828,9 +848,12 @@ void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDon
     // TaskValue* otherTaskValuePtr = copyTaskGetOtherTaskValue(taskId, taskValue, deviceCache, markDone);
     std::optional<TaskValuePtr> optOtherTaskValuePtr = [&]() -> std::optional<TaskValuePtr>
     {
-        std::lock_guard<std::mutex> deviceCacheLock(deviceCache.mCacheMutex);
-        // setDataType also holds mCacheMutex, so the check and target task
-        // insertion are atomic with respect to cache reconfiguration.
+        // Lock both caches' mCacheMutex (this=host, deviceCache=device): setDataTypeCoordinated
+        // holds both caches' mCacheMutex for the full duration of a host+device dtype swap, so
+        // locking both here too makes this dtype check and the following task-map insertion
+        // atomic with respect to cache reconfiguration. Locking deviceCache.mCacheMutex alone is
+        // not sufficient since mPageManagerConfig on the host side (this) is read here too.
+        std::scoped_lock cacheLock(mCacheMutex, deviceCache.mCacheMutex);
         TLLM_CHECK_WITH_INFO(mPageManagerConfig.getDataType() == deviceCache.mPageManagerConfig.getDataType(),
             "LoRA host and device cache dtypes must match");
         auto otherStatus = deviceCache.getStatus(taskId);
@@ -902,7 +925,9 @@ void LoraCache::copyTask(TaskIdType taskId, LoraCache& deviceCache, bool markDon
 
     bool otherIsDone;
     {
-        std::lock_guard<std::mutex> lk(mCacheMutex);
+        // otherTaskValue belongs to deviceCache's mCacheMap, so it must be guarded by
+        // deviceCache's mCacheMutex, not this (host) cache's mCacheMutex.
+        std::lock_guard<std::mutex> lk(deviceCache.mCacheMutex);
         otherIsDone = otherTaskValue->done;
         otherTaskValue->loadInProgress = false;
         otherTaskValue->loaded = true;

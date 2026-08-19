@@ -147,6 +147,15 @@ def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> No
         pytest.skip("CUDA required for MegaMoE tests")
     if dist.is_initialized():
         return
+    if world_size == 1:
+        torch.cuda.set_device(rank)
+        dist.init_process_group(
+            backend="nccl",
+            store=dist.HashStore(),
+            rank=rank,
+            world_size=world_size,
+        )
+        return
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29561")
     os.environ["RANK"] = str(rank)
@@ -264,7 +273,7 @@ def _create_model_config(
     # CUTE_DSL_B12X is an internal-only MoeBackendType — it has no
     # corresponding user-facing MoeConfig.backend literal. Route through
     # "CUTEDSL" so the test exercises the cuteDSL-family selection path that
-    # users hit on SM120/121 + NVFP4 (where get_moe_cls returns the hybrid
+    # users hit on SM120/121 + NVFP4 (where resolve_moe_impl picks the hybrid
     # CuteDslB12xFusedMoE backend when flashinfer is importable).
     if moe_backend == MoeBackendType.CUTE_DSL_B12X.value:
         moe_backend = MoeBackendType.CUTEDSL.value
@@ -1270,6 +1279,7 @@ def generate_multi_gpu_test_params(
                         model_config=model_config,
                         moe_tp_size=moe_tp_size,
                         dtype=dtype,
+                        swiglu_gptoss_style=swiglu_gptoss_style,
                     ),
                     should_skip_cutedsl(
                         backend_type,

@@ -1551,13 +1551,19 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
     SizeType32 candidateMatchedTokens{0};
     SizeType32 latestMissingAnchorEndToken{0};
 
+    // Record only the safe-prefix boundary here and materialize result.matches once after the
+    // walk. The original code assigned `result.matches = candidateMatches` inside this lambda,
+    // which is invoked once per matched block -> O(matched_blocks^2) copies of the (growing)
+    // match vector. SWA gating semantics are preserved exactly.
+    std::size_t safeMatchCount{0};
+    SizeType32 safeMatchedTokens{0};
     auto updateSafePrefix = [&]()
     {
         if (!mIsSWA || latestMissingAnchorEndToken == 0
             || candidateMatchedTokens >= latestMissingAnchorEndToken + mWindowSize)
         {
-            result.matches = candidateMatches;
-            result.totalMatchedTokens = candidateMatchedTokens;
+            safeMatchCount = candidateMatches.size();
+            safeMatchedTokens = candidateMatchedTokens;
         }
     };
 
@@ -1628,6 +1634,13 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
         }
         break;
     }
+
+    // Publish the safe prefix once instead of copying the growing match vector on every matched
+    // block (the per-block assignment removed from updateSafePrefix above). Truncate the unsafe
+    // SWA tail (a no-op for non-SWA, where every matched block is safe), then transfer by move.
+    candidateMatches.resize(safeMatchCount);
+    result.matches = std::move(candidateMatches);
+    result.totalMatchedTokens = safeMatchedTokens;
 
     if (result.matches.size() < blockKeys.size())
     {

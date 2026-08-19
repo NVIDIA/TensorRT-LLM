@@ -18,6 +18,7 @@ from tensorrt_llm._torch.speculative.utils import (
     get_num_extra_kv_tokens,
     get_num_spec_layers,
     update_spec_config_from_model_config,
+    uses_mtp_head_checkpoint,
 )
 from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
 
@@ -1741,27 +1742,28 @@ class TestMTPPrepareDrafterInputs(unittest.TestCase):
         torch.testing.assert_close(draft_inputs["hidden_states"], ref_previous_hidden_states)
 
 
-@pytest.mark.parametrize(
-    ("architecture", "expected"),
-    [
-        ("Gemma4ForCausalLM", True),
-        ("LlamaForCausalLM", False),
-    ],
-)
-def test_mtp_shared_kv_config(architecture, expected):
+@pytest.mark.parametrize("uses_external_draft_model", [True, False])
+def test_mtp_checkpoint_type_config(uses_external_draft_model):
+    class TargetModel:
+        if uses_external_draft_model:
+            build_mtp_draft_model_from_config = True
+
     spec_config = MTPDecodingConfig(
         max_draft_len=3,
         speculative_model="/tmp/assistant",
     )
     model_config = SimpleNamespace(
-        architectures=[architecture],
+        architectures=["Gemma4ForCausalLM" if uses_external_draft_model else "TargetModel"],
         num_nextn_predict_layers=1,
     )
 
-    update_spec_config_from_model_config(spec_config, model_config)
+    update_spec_config_from_model_config(spec_config, model_config, TargetModel)
 
-    assert spec_config._use_shared_kv_cache is expected
-    if expected:
+    assert spec_config._use_shared_kv_cache is uses_external_draft_model
+    assert spec_config.uses_external_draft_model is uses_external_draft_model
+    assert uses_mtp_head_checkpoint(spec_config) is not uses_external_draft_model
+    assert spec_config.needs_separate_draft_weights
+    if uses_external_draft_model:
         assert get_num_spec_layers(spec_config) == 0
         assert get_num_extra_kv_tokens(spec_config) == 0
         assert not should_use_separate_draft_kv_cache(spec_config)

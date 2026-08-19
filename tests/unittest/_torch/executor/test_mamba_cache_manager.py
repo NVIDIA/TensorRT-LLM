@@ -830,6 +830,64 @@ def test_kimi_without_v2_preference_uses_mixed_manager(
     )
 
 
+def test_kimi_preferred_transceiver_runtime() -> None:
+    """K3 must resolve transceiver_runtime='auto' to the Python transceiver:
+    only KvCacheTransceiverV2 can move the KDA recurrent state."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+
+    assert KimiLinearForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
+
+
+@pytest.mark.parametrize(
+    "cache_transceiver_config",
+    [
+        None,
+        CacheTransceiverConfig(backend="NIXL"),  # runtime left at 'auto'
+        CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP"),
+        CacheTransceiverConfig(backend="UCX", transceiver_runtime="CPP"),
+        CacheTransceiverConfig(backend="UCX", transceiver_runtime="PYTHON"),
+    ],
+    ids=["no_config", "auto_unresolved", "explicit_cpp", "ucx_cpp", "ucx_python"],
+)
+def test_kimi_disagg_rejects_non_python_transceiver_route(
+    monkeypatch: pytest.MonkeyPatch, cache_transceiver_config
+) -> None:
+    """Any K3 disagg route that does not reach the Python NIXL transceiver
+    must fail loudly instead of returning a manager the C++ transceiver
+    would drive without KDA state transfer (silent wrong results). The
+    'auto_unresolved' case covers paths that skip model-default resolution
+    (e.g. AutoDeploy), where 'auto' falls back to the C++ runtime."""
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    with pytest.raises(ValueError, match="Kimi K3 disaggregated serving requires"):
+        get_kv_cache_manager_cls(
+            _kimi_model_config(),
+            KvCacheConfig(enable_block_reuse=False),
+            is_disagg=True,
+            cache_transceiver_config=cache_transceiver_config,
+        )
+
+
+def test_kimi_disagg_python_nixl_routes_to_mixed_manager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+
+    assert (
+        get_kv_cache_manager_cls(
+            _kimi_model_config(),
+            KvCacheConfig(enable_block_reuse=False),
+            is_disagg=True,
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"
+            ),
+        )
+        is MixedMambaHybridCacheManager
+    )
+
+
 def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     manager = object.__new__(MambaHybridCacheManagerV2)
     manager.local_num_mamba_layers = 0

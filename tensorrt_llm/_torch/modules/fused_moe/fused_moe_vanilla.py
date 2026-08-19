@@ -13,11 +13,75 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, is_gated_activation, relu2
 from ..gated_mlp import GatedMLP
 from ..mlp import MLP
-from .interface import MoEWeightLoadingMode
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
+                            MoERejectReason, MoEStaticCapability)
+from .interface import MoEWeightLoadingMode, _reject
 from .routing import BaseMoeRoutingMethod
 
 
 class VanillaMoE(nn.ModuleList):
+
+    #: Declared explicitly because the resolver may return this ModuleList.
+    capabilities = MoEStaticCapability()
+
+    #: Quantization labels supported by the Linear dispatcher.
+    _SUPPORTED_QUANT_LABELS = frozenset({
+        "FP8",
+        "FP8_PER_CHANNEL_PER_TOKEN",
+        "FP8_BLOCK_SCALES",
+        "NVFP4",
+        "W4A16_NVFP4",
+        "W4A8_NVFP4_FP8",
+        "W4A8_MXFP4_FP8",
+        "W4A8_MXFP4_MXFP8",
+        "MXFP8",
+        "W8A16",
+        "W4A16",
+        "W4A16_AWQ",
+        "W4A8_AWQ",
+    })
+
+    @classmethod
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """Check whether the PyTorch reference path has the required plumbing."""
+        if p.quant is not None and p.quant not in cls._SUPPORTED_QUANT_LABELS:
+            return _reject(
+                MoERejectReason.QUANT_UNSUPPORTED,
+                f"VanillaMoE dequantizes through Linear, which has no "
+                f"quant method for {p.quant}")
+        if p.swiglu_gptoss_style:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "VanillaMoE has no bias / swiglu alpha-beta-limit parameters")
+        activation = p.activation_type
+        if (not is_gated_activation(activation)
+                and activation != ActivationType.Relu2):
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                f"VanillaMoE builds non-gated experts as MLP, whose only "
+                f"non-gated activation is Relu2 (got {p.activation})")
+        if d.eplb_enabled:
+            return _reject(
+                MoERejectReason.EPLB_UNSUPPORTED,
+                "VanillaMoE holds expert weights as plain submodules and "
+                "cannot expose them as migratable EPLB slots")
+        if d.smart_router:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"VanillaMoE has no smart-router path (moe_cluster_size="
+                f"{d.cluster_size})")
+        # Uniform partitioning only. ``MoE._compute_ep_partition`` would hand a
+        # non-divisible count a ceil/floor split that this backend's local
+        # expert range does not implement, so it would produce wrong ranges
+        # rather than fail.
+        if (p.num_experts is not None and d.ep_size > 0
+                and p.num_experts % d.ep_size != 0):
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"VanillaMoE partitions experts uniformly, so num_experts "
+                f"({p.num_experts}) must be divisible by ep_size "
+                f"({d.ep_size})")
+        return MoEEligibility.ok()
 
     def __init__(
         self,
@@ -49,16 +113,13 @@ class VanillaMoE(nn.ModuleList):
 
         self.activation_type = activation_type
         self.is_gated_activation = is_gated_activation(activation_type)
-        # Limit support for VanillaMoE to non-gated activations for now.
-        if not self.is_gated_activation:
-            if pack_weights:
-                raise ValueError(
-                    "pack_weights must be False for non-gated activations. Otherwise please update `create_weights`."
-                )
-            if self.activation_type != ActivationType.Relu2:
-                raise ValueError(
-                    f"Unsupported activation type: {self.activation_type} for non-gated activations. Only Relu2 is supported."
-                )
+        # Activation eligibility (gated vs Relu2-only non-gated) is owned by
+        # ``can_implement``. ``pack_weights`` is a construction option that is
+        # not part of the problem/deployment question, so keep it here.
+        if not self.is_gated_activation and pack_weights:
+            raise ValueError(
+                "pack_weights must be False for non-gated activations. Otherwise please update `create_weights`."
+            )
 
         self.dtype = dtype
         self.reduce_results = reduce_results
@@ -69,9 +130,8 @@ class VanillaMoE(nn.ModuleList):
         self.cluster_rank = model_config.mapping.moe_cluster_rank
         self.cluster_size = model_config.mapping.moe_cluster_size
         self.smart_router = True if self.cluster_size > 1 else False
-        assert not self.smart_router, (
-            "Smart router is not supported in vanilla MoE, "
-            "please set moe_cluster_size to 1.")
+        # Smart-router / non-divisible EP eligibility is owned by
+        # ``can_implement``.
 
         self.rank = model_config.mapping.rank
 
@@ -91,16 +151,6 @@ class VanillaMoE(nn.ModuleList):
                                     strategy=model_config.allreduce_strategy)
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
-
-        # VanillaMoE uses uniform expert partitioning; non-divisible EP would require
-        # ceil/floor distribution (see MoE._compute_ep_partition in interface.py).
-        # Reject explicitly rather than silently producing wrong local-expert ranges.
-        if num_experts % self.ep_size != 0:
-            raise ValueError(
-                f"VanillaMoE does not support non-divisible EP: "
-                f"num_experts ({num_experts}) must be divisible by ep_size ({self.ep_size}). "
-                f"Use CutlassFusedMoE / TRTLLMGenFusedMoE with NVLINK_ONE_SIDED comm for non-divisible EP."
-            )
 
         self.expert_size_per_partition = num_experts // self.ep_size
         self.expert_start = self.ep_rank * self.expert_size_per_partition

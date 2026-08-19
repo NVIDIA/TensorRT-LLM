@@ -1,6 +1,6 @@
 import copy
 import dataclasses
-from typing import List, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
 
 import torch
 from transformers import (AutoProcessor, AutoTokenizer, Gemma3Config,
@@ -176,6 +176,22 @@ class Gemma3MultiModalProjector(torch.nn.Module):
         content_format=ContentFormat.STRING,
     ))
 class Gemma3VLM(PreTrainedModel):
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: Any = None
+                                               ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 — same VSWA rationale as
+        Gemma3ForCausalLM (the wrapped text model)."""
+        return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls,
+        pretrained_config: Any = None,
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Prefer the Python transceiver so disaggregated serving over NIXL keeps V2."""
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[Gemma3Config]):
         if _is_mm_disagg():

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/routing/RoutingCustomSelection.h"
 #include "tests/unit_tests/kernels/routing/routingTest.h"
 
 #include <vector>
@@ -293,6 +294,186 @@ TYPED_TEST(RoutingCustomKernelTest, BlockLevelParallelizationWithExpertParalleli
                      .withTileTokensDim(192)
                      .build();
     this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, BlockLevelClassicBoundaryE512K16)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(4)
+                     .withNumExperts(512)
+                     .withTopK(16)
+                     .withTileTokensDim(256)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, BlockLevelCooperativeBoundaryE576K8)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(4)
+                     .withNumExperts(576)
+                     .withTopK(8)
+                     .withTileTokensDim(256)
+                     .build();
+    this->runTest(param);
+};
+
+// Tier 512 is the only tier whose launcher changes with the token count: one token keeps
+// the cooperative kernel, two and up take the classic one. These two straddle that flip.
+// Tier 576 has no such flip -- it is cooperative across the whole one-to-four range -- so
+// it is covered once, above, at four tokens.
+TYPED_TEST(RoutingCustomKernelTest, BlockLevelCooperativeBoundaryE512K16SingleToken)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(1)
+                     .withNumExperts(512)
+                     .withTopK(16)
+                     .withTileTokensDim(256)
+                     .build();
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingCustomKernelTest, BlockLevelClassicBoundaryE512K16TwoTokens)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::Renormalize)
+                     .withNumTokens(2)
+                     .withNumExperts(512)
+                     .withTopK(16)
+                     .withTileTokensDim(256)
+                     .build();
+    this->runTest(param);
+};
+
+// SigmoidBias keeps the cooperative kernel at every tier, including the ones Renormalize
+// gives up. Four tokens is already covered by DeepSeekNoGroupBlockLevel and
+// MiniMax2BlockLevel; one token is not covered anywhere else in this file, and it is where
+// the cooperative kernel has the least work to amortise its one-thread-per-expert shape.
+TYPED_TEST(RoutingCustomKernelTest, BlockLevelSigmoidBiasBoundaryE512K16SingleToken)
+{
+    auto param = RoutingKernelTestParam()
+                     .withRoutingMethod(RoutingMethodType::MiniMax2)
+                     .withNumTokens(1)
+                     .withNumExperts(512)
+                     .withTopK(16)
+                     .withTileTokensDim(256)
+                     .withRoutedScalingFactor(2.5f)
+                     .build();
+    this->runTest(param);
+};
+
+// The boundary tests above validate outputs, which both launchers produce identically,
+// so they cannot detect a change in which launcher is selected. This one pins the selection
+// table itself. Tiers are the compile-time values queryDispatchedMaxExperts() returns, not
+// raw expert counts.
+TEST(RoutingCustomSelectionTest, CoopBlockKernelSelectionTable)
+{
+    using moe::dev::routing::RoutingPostprocessType;
+    using moe::dev::routing::RoutingPreprocessType;
+    using moe::dev::routing::routingCustom::prefersCoopBlockKernel;
+
+    auto const renormalize = [](int32_t numTokens, int32_t tier)
+    { return prefersCoopBlockKernel(RoutingPreprocessType::None, RoutingPostprocessType::Softmax, numTokens, tier); };
+
+    // The tiers below are exactly the ones each policy's PolicyTraits::Pairs can produce,
+    // so every cell here is a combination that queryDispatchedMaxExperts() can actually
+    // return. Renormalize: 128, 160, 256, 512, 576, 2048.
+    //
+    // Classic through the 512 tier, cooperative from 576 up.
+    for (int32_t numTokens : {2, 3, 4})
+    {
+        for (int32_t tier : {128, 160, 256, 512})
+        {
+            EXPECT_FALSE(renormalize(numTokens, tier)) << "tier " << tier << ", " << numTokens << " tokens";
+        }
+        EXPECT_TRUE(renormalize(numTokens, 576)) << numTokens << " tokens";
+    }
+
+    // At a single token the boundary moves down one tier: 512 stays cooperative.
+    EXPECT_FALSE(renormalize(1, 128));
+    EXPECT_FALSE(renormalize(1, 160));
+    EXPECT_FALSE(renormalize(1, 256));
+    EXPECT_TRUE(renormalize(1, 512));
+    EXPECT_TRUE(renormalize(1, 576));
+
+    // Per-expert preprocessing spills registers in the classic kernel well below 512
+    // experts, so the lower bound must not apply to it. SigmoidBias tiers: 128, 256, 384,
+    // 512, 1024. Sigmoid has a single tier.
+    for (int32_t tier : {128, 256, 384, 512, 1024})
+    {
+        EXPECT_TRUE(prefersCoopBlockKernel(
+            RoutingPreprocessType::SigmoidBias, RoutingPostprocessType::ScaledSumNormalize, 4, tier))
+            << "tier " << tier;
+    }
+    EXPECT_TRUE(prefersCoopBlockKernel(RoutingPreprocessType::Sigmoid, RoutingPostprocessType::SumNormalize, 4, 128));
+
+    // The None + None fallback shares a preprocess with Renormalize but was never measured,
+    // so it keeps the cooperative kernel that the parent selected.
+    EXPECT_TRUE(prefersCoopBlockKernel(RoutingPreprocessType::None, RoutingPostprocessType::None, 4, 128));
+
+    // Above one CUDA block of experts the cooperative kernel cannot run at all.
+    EXPECT_FALSE(renormalize(1, 2048));
+    EXPECT_FALSE(prefersCoopBlockKernel(
+        RoutingPreprocessType::SigmoidBias, RoutingPostprocessType::ScaledSumNormalize, 1, 2048));
+
+    // Softmax-over-experts is not elementwise, so it never uses the cooperative kernel.
+    EXPECT_FALSE(prefersCoopBlockKernel(RoutingPreprocessType::Softmax, RoutingPostprocessType::None, 1, 576));
+
+    // The whole path is gated on the static-block token limit.
+    EXPECT_TRUE(
+        prefersCoopBlockKernel(RoutingPreprocessType::SigmoidBias, RoutingPostprocessType::ScaledSumNormalize, 4, 512));
+    EXPECT_FALSE(
+        prefersCoopBlockKernel(RoutingPreprocessType::SigmoidBias, RoutingPostprocessType::ScaledSumNormalize, 5, 512));
+};
+
+// TLLM_ROUTING_COOP_BLOCK_MIN_EXPERTS reaches the predicate as an argument, so the two
+// directions of the escape hatch are asserted here rather than through the environment.
+TEST(RoutingCustomSelectionTest, CoopBlockKernelMinNumExpertsOverride)
+{
+    using moe::dev::routing::RoutingPostprocessType;
+    using moe::dev::routing::RoutingPreprocessType;
+    using moe::dev::routing::routingCustom::prefersCoopBlockKernel;
+
+    auto const renormalize = [](int32_t numTokens, int32_t tier, int32_t override)
+    {
+        return prefersCoopBlockKernel(
+            RoutingPreprocessType::None, RoutingPostprocessType::Softmax, numTokens, tier, override);
+    };
+
+    // 0 restores the parent selection: every Renormalize tier the cooperative kernel can
+    // run at all takes it again, at every token count in the static-block range.
+    for (int32_t numTokens : {1, 2, 3, 4})
+    {
+        for (int32_t tier : {128, 160, 256, 512, 576})
+        {
+            EXPECT_TRUE(renormalize(numTokens, tier, 0)) << "tier " << tier << ", " << numTokens << " tokens";
+        }
+    }
+
+    // A bound above every tier forces the classic kernel across the range.
+    for (int32_t numTokens : {1, 2, 3, 4})
+    {
+        for (int32_t tier : {128, 160, 256, 512, 576})
+        {
+            EXPECT_FALSE(renormalize(numTokens, tier, 4096)) << "tier " << tier << ", " << numTokens << " tokens";
+        }
+    }
+
+    // A negative value means unset and leaves the built-in bounds in place.
+    EXPECT_FALSE(renormalize(4, 512, -1));
+    EXPECT_TRUE(renormalize(1, 512, -1));
+
+    // The hard constraints are not negotiable: the override cannot put more than one CUDA
+    // block of experts, or more than four tokens, on the cooperative kernel.
+    EXPECT_FALSE(renormalize(1, 2048, 0));
+    EXPECT_FALSE(renormalize(5, 512, 0));
+
+    // Policies outside the bound are untouched in both directions.
+    EXPECT_TRUE(prefersCoopBlockKernel(
+        RoutingPreprocessType::SigmoidBias, RoutingPostprocessType::ScaledSumNormalize, 4, 512, 4096));
 };
 
 TYPED_TEST(RoutingCustomKernelTest, BlockLevelParallelizationWithInvalidTopKInput)

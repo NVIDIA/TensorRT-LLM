@@ -60,6 +60,7 @@ from tensorrt_llm.serve.disagg_coordinator import (
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
+    ConversationParams,
     DisaggregatedParams,
 )
 from tensorrt_llm.serve.router import (
@@ -535,10 +536,10 @@ def test_conversation_coordinator_sticky_by_conv_id():
                 return CompletionRequest(
                     model="m",
                     prompt="hi",
+                    conversation_params=ConversationParams(conversation_id=conv_id),
                     disaggregated_params=DisaggregatedParams(
                         request_type="generation_only",
                         ctx_request_id=request_id,
-                        conversation_id=conv_id,
                     ),
                 )
 
@@ -583,11 +584,11 @@ def test_worker_generates_disagg_request_id_before_generation_routing():
                 request = CompletionRequest(
                     model="m",
                     prompt="hello",
+                    conversation_params=ConversationParams(conversation_id="conv-A"),
                     disaggregated_params=DisaggregatedParams(
                         request_type="generation_only",
                         ctx_request_id=assigned_id,
                         disagg_request_id=None,
-                        conversation_id="conv-A",
                     ),
                 )
                 await remote.gen_router.get_next_server(request)

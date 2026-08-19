@@ -58,6 +58,12 @@ When diagnosing performance issues, classify the primary bottleneck:
 | **Communication-bound** | Significant time in collective operations | Limited by inter-GPU or inter-node communication |
 | **Sync-bound** | Excessive CPU-GPU synchronization points | Stalls from unnecessary synchronization |
 
+After classifying, consult the **perf-optimization-casebook** skill for
+candidate optimizations (decision precedents) matching the bottleneck class,
+model, and hardware. Use it to populate the Recommendations section with
+proven, adapted approaches rather than inventing them — but report only
+measured numbers, never a case's expected effect as an achieved result.
+
 ## Delegation Guidelines
 
 When delegating to specialists, describe the **desired outcome** -- not the

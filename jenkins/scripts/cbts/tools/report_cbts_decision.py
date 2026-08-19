@@ -76,6 +76,15 @@ def _case_counts(
         return 0, 0
 
 
+def _fmt_reason(r) -> str:
+    """Render a structured reason dict as one human line: `[source] k=v, ...`."""
+    if not isinstance(r, dict):
+        return str(r)
+    src = r.get("source", "?")
+    rest = ", ".join(f"{k}={v}" for k, v in r.items() if k != "source")
+    return f"[{src}] {rest}" if rest else f"[{src}]"
+
+
 def build_document(
     decision: dict,
     status: str,
@@ -89,7 +98,7 @@ def build_document(
     affected = sorted(decision.get("affected_stages") or [])
     # deferred has no decision; fall back to --reason.
     if not reason:
-        reason = " | ".join(decision.get("reasons") or [])
+        reason = " | ".join(_fmt_reason(r) for r in decision.get("reasons") or [])
 
     case_skip_rate = (1 - cbts_cases / total_cases) if total_cases else 0.0
 
@@ -104,6 +113,23 @@ def build_document(
         "l_hit_stages": len(affected),
         "l_total_cases": total_cases,
         "l_cbts_cases": cbts_cases,
+        # Post-merge build of the consulted touch DB; 0 when no DB was used.
+        "l_coverage_db_build": int(decision.get("coverage_db_build") or 0),
+        "s_coverage_db_commit": decision.get("coverage_db_commit") or "",
+        # Residual files whose patch the forge API omitted (binary / rename / oversized).
+        "l_coverage_no_diff_files": int(decision.get("coverage_no_diff_files") or 0),
+        # Commits main gained since that DB was collected; -1 when unmeasurable.
+        "l_coverage_db_lag": int(
+            decision["coverage_db_lag"] if decision.get("coverage_db_lag") is not None else -1
+        ),
+        # Commits between that DB and the PR's base — what the gate decides on; -1 when unmeasurable.
+        "s_coverage_db_base_commit": decision.get("coverage_db_base_commit") or "",
+        "l_coverage_db_drift": int(
+            decision["coverage_db_drift"] if decision.get("coverage_db_drift") is not None else -1
+        ),
+        "s_coverage_db_drift_status": decision.get("coverage_db_drift_status") or "",
+        # Freshness-gate verdict on that drift: ok / stale / unknown; empty when no DB was consulted.
+        "s_coverage_freshness": decision.get("coverage_freshness") or "",
         "d_case_skip_rate": round(case_skip_rate, 4),
         "flat_detail": {
             "hit_stages": affected,

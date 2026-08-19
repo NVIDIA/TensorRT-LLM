@@ -20,7 +20,10 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    MultimodalModelMixin,
+    _assemble_multimodal_encoder_embeddings,
+)
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
@@ -598,12 +601,23 @@ def test_assemble_full_embedding_preserves_item_order():
         2: torch.tensor([[2.0]]),
     }
     torch.testing.assert_close(
-        MultimodalModelMixin.assemble_full_embedding(per_item, 3),
+        _assemble_multimodal_encoder_embeddings(per_item, 3),
         torch.tensor([[0.0], [1.0], [1.5], [2.0]]),
     )
-    # Single-item fast path returns the item tensor without an extra copy.
+    # Even a single item is copied into request-owned storage. The sources here
+    # are cache entries, which `TensorLRUCache.get` returns as aliases of
+    # cache-owned tensors; handing one straight to a request would leave the two
+    # sharing storage and the cache's byte accounting short by an entry it can
+    # no longer actually free.
     single = per_item[1]
-    assert MultimodalModelMixin.assemble_full_embedding({0: single}, 1) is single
+    assembled = _assemble_multimodal_encoder_embeddings({0: single}, 1)
+    assert assembled is not single
+    torch.testing.assert_close(assembled, single)
+
+
+def test_assemble_full_embedding_rejects_incompatible_items():
+    with pytest.raises(ValueError, match="matching output shape, dtype, and device"):
+        _assemble_multimodal_encoder_embeddings({0: torch.ones(1, 2), 1: torch.ones(1, 3)}, 2)
 
 
 def test_build_multimodal_encoder_input_slices_packed_grid_thw():
@@ -717,7 +731,7 @@ def test_build_multimodal_encoder_input_slices_audio_input_features():
     "mm_data, expected_match",
     [
         # `_encoder_cache_modality` returns None -> single-modality guard fires.
-        ({}, "only supports single-modality"),
+        ({}, "cannot infer the modality"),
         # Modality present but layout is neither pattern A (image_sizes) nor pattern B
         # (grid_thw); default has nothing to dispatch on.
         ({"image": {"pixel_values": torch.zeros(2)}}, "cannot slice image layout"),

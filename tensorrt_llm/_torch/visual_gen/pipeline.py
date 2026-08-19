@@ -70,6 +70,8 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
+    supports_image_edit: bool = False
+
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.

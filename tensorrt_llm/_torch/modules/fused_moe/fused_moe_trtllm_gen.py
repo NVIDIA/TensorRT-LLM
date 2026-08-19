@@ -16,7 +16,7 @@
 import inspect
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from torch import nn
@@ -29,10 +29,14 @@ from ...custom_ops.trtllm_gen_custom_ops import \
     fp4_block_scale_fake_output_without_finalize
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, ActType_TrtllmGen, AuxStreamType,
-                      Fp4QuantizedTensor)
+                      Fp4QuantizedTensor, MxFp8QuantizedTensor)
 from ..gated_mlp import GatedMLP
-from .impl_contract import MoEInputRequirement, MoERunContext, require_comm_plan
-from .interface import FORCE_SEPARATED_ROUTING, MoE, MoEWeightLoadingMode
+from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
+                            MoEProblem, MoERejectReason, MoERunContext,
+                            require_comm_plan)
+from .impl_environment import MoEDep
+from .interface import (FORCE_SEPARATED_ROUTING, MoE, MoEWeightLoadingMode,
+                        _reject)
 from .moe_op_backend import MoEOpBackend, TRTLLMOpBackend, get_op_backend
 
 # isort: off
@@ -126,75 +130,93 @@ class TRTLLMGenFusedMoE(MoE):
     }
 
     @classmethod
-    def can_implement(
-        cls,
-        quant_algo: Optional[QuantAlgo],
-        dtype_activation: torch.dtype = torch.bfloat16,
-        swiglu_gptoss_style: bool = False,
-    ) -> Tuple[bool, Optional[str]]:
+    def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
+        """TRTLLM-Gen kernels: SM100/SM103, bfloat16 activations.
+
+        Quantized coverage is ``_SUPPORTED_QUANT_ALGOS``. The unquantized BF16
+        path is served by a FlashInfer kernel, so it is available only where
+        that wheel exposes ``trtllm_bf16_moe``.
         """
-        Check if TRTLLMGenFusedMoE can implement the given quantization algorithm.
-
-        TRTLLMGenFusedMoE only supports SM in {100, 103} and the following quantizations:
-        - NVFP4
-        - FP8_BLOCK_SCALES
-        - W4A8_NVFP4_FP8
-        - W4A16_MXFP4
-        - W4A8_MXFP4_FP8
-        - W4A8_MXFP4_MXFP8
-
-        Unquantized BF16 path is supported only with FlashInfer fused MoE backend.
-        Output dtype is hardcoded to bfloat16.
-
-        Args:
-            quant_algo: The quantization algorithm to check (None for unquantized)
-            dtype_activation: The activation input data type. Only bfloat16 is supported.
-                See: forward_impl() assert x.dtype == torch.bfloat16 (line 722).
-            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                Only supported for nvfp4 and mxfp4 variants.
-
-        Returns:
-            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
-        """
-        from .interface import _warn_and_return
-
-        sm_version = get_sm_version()
+        sm_version = d.env.sm
+        quant_algo = p.quant_algo
 
         # TRTLLMGenFusedMoE requires SM in {100, 103}
         if sm_version not in {100, 103}:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.SM_UNSUPPORTED,
                 f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
             )
 
-        # Check dtype_activation: only bfloat16 is supported
-        if dtype_activation != torch.bfloat16:
-            return _warn_and_return(
-                f"TRTLLMGenFusedMoE only supports bfloat16 activation, got {dtype_activation}"
+        # forward_impl asserts x.dtype == torch.bfloat16
+        if p.dtype_act != torch.bfloat16:
+            return _reject(
+                MoERejectReason.DTYPE_UNSUPPORTED,
+                f"TRTLLMGenFusedMoE only supports bfloat16 activation, got {p.dtype_act}"
             )
 
+        if d.smart_router:
+            return _reject(
+                MoERejectReason.TOPOLOGY_UNSUPPORTED,
+                f"TRTLLMGenFusedMoE has no smart-router path (moe_cluster_size="
+                f"{d.cluster_size})")
+
         if quant_algo is None:
-            if swiglu_gptoss_style:
-                return _warn_and_return(
+            if p.swiglu_gptoss_style:
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
                     "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
                 )
-            if not cls._is_flashinfer_fused_moe_available():
-                return _warn_and_return(
+            # Same set _check_configs asserts on, so the verdict and the
+            # constructor agree instead of failing later at create_weights.
+            if p.activation_type not in cls._BF16_SUPPORTED_ACTIVATIONS:
+                supported = ", ".join(
+                    sorted(activation.name
+                           for activation in cls._BF16_SUPPORTED_ACTIVATIONS))
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    f"TRTLLMGenFusedMoE BF16 path only supports {supported} "
+                    f"activations, got {p.activation}")
+            if not d.env.has_dep(MoEDep.FLASHINFER_BF16_MOE):
+                return _reject(
+                    MoERejectReason.DEP_MISSING,
                     "TRTLLMGenFusedMoE unquantized BF16 path requires FlashInfer fused MoE "
                     "with trtllm_bf16_moe support.")
-            return True, None
+            # FlashInfer BF16 kernels require the per-rank intermediate size
+            # to be a multiple of 128.
+            if p.intermediate_size is not None:
+                inter = p.intermediate_size
+                if d.tp_size > 1:
+                    if inter % d.tp_size != 0:
+                        return _reject(
+                            MoERejectReason.SHAPE_UNALIGNED,
+                            "TRTLLMGenFusedMoE BF16 FlashInfer path requires "
+                            f"intermediate_size ({inter}) divisible by "
+                            f"moe_tp_size ({d.tp_size})")
+                    inter = inter // d.tp_size
+                if inter % 128 != 0:
+                    return _reject(
+                        MoERejectReason.SHAPE_UNALIGNED,
+                        "TRTLLMGenFusedMoE BF16 FlashInfer path requires "
+                        "intermediate_size_per_partition % 128 == 0; "
+                        f"got {inter} "
+                        f"(full intermediate_size={p.intermediate_size}, "
+                        f"moe_tp_size={d.tp_size})")
+            return MoEEligibility.ok()
 
         # Check if quant_algo is supported
         if quant_algo not in cls._SUPPORTED_QUANT_ALGOS:
-            return _warn_and_return(
+            return _reject(
+                MoERejectReason.QUANT_UNSUPPORTED,
                 f"TRTLLMGenFusedMoE does not support quant_algo={quant_algo}")
 
-        # Check swiglu_gptoss_style support: only supported for nvfp4 and mxfp4 variants
-        if swiglu_gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
-            return _warn_and_return(
+        # swiglu_gptoss_style is only supported for nvfp4 and mxfp4 variants
+        if p.swiglu_gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
                 f"TRTLLMGenFusedMoE supports swiglu_gptoss_style (bias/swiglu) only for nvfp4 and mxfp4 variants, "
                 f"got quant_algo={quant_algo}")
 
-        return True, None
+        return MoEEligibility.ok()
 
     def __init__(
         self,
@@ -253,21 +275,9 @@ class TRTLLMGenFusedMoE(MoE):
         # tune_max_num_tokens to the MoE op).
         self.max_num_tokens = model_config.max_num_tokens
 
-        sm_version = get_sm_version()
-        if sm_version >= 120:
-            raise NotImplementedError(
-                "TRTLLMGenFusedMoE does not support SM120 and above.")
-
-        assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
-
+        # Eligibility (SM / smart_router / BF16 FlashInfer dep) is owned by
+        # ``can_implement``. Keep only the provider selection for the op.
         self.use_flashinfer = self._check_flashinfer_backend_support()
-        if (self.quant_config is None
-                or not self.quant_config.layer_quant_mode.has_any_quant(
-                    exclude_kv_cache=True)) and not self.use_flashinfer:
-            raise NotImplementedError(
-                "TRTLLMGenFusedMoE BF16 path requires FlashInfer fused MoE. "
-                "Please install a FlashInfer build with trtllm_bf16_moe support."
-            )
         backend_name = "flashinfer" if self.use_flashinfer else "trtllm"
         self.op_backend: MoEOpBackend = get_op_backend(backend_name)
 
@@ -663,6 +673,45 @@ class TRTLLMGenFusedMoE(MoE):
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
 
+    def try_fused_kimi_route_quant(
+        self,
+        x: Union[torch.Tensor, MxFp8QuantizedTensor],
+        router_logits: torch.Tensor,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                        torch.Tensor]]:
+        """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
+
+        This launch-overhead optimization is deliberately specialized to the
+        K3 decode shape. Returning ``None`` keeps every other model, shape,
+        architecture, and op backend on the existing unfused path.
+        """
+        if (os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1"
+                or isinstance(x, MxFp8QuantizedTensor)):
+            return None
+
+        sm_version = get_sm_version()
+        if (not 100 <= sm_version < 110 or not self.has_w4a8_mxfp4_mxfp8
+                or not isinstance(self.op_backend, TRTLLMOpBackend)
+                or not isinstance(self.routing_method,
+                                  DeepSeekV3MoeRoutingMethod)):
+            return None
+
+        routing = self.routing_method.routing_impl
+        bias = self.routing_method.e_score_correction_bias
+        if (not routing.is_fused or routing.n_group != 1
+                or routing.topk_group != 1 or routing.top_k != 16
+                or router_logits.ndim != 2 or router_logits.shape[1] != 896
+                or router_logits.dtype != torch.float32
+                or not router_logits.is_contiguous()
+                or bias.dtype != torch.float32 or not bias.is_contiguous()
+                or x.ndim != 2 or x.shape != (router_logits.shape[0], 3584)
+                or not 0 < x.shape[0] <= 64 or x.dtype != torch.bfloat16
+                or not x.is_contiguous()):
+            return None
+
+        return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+            router_logits, bias, x, routing.routed_scaling_factor)
+
     def quantize_input(self, x, post_quant_comm: bool = True):
         """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.
 
@@ -696,6 +745,10 @@ class TRTLLMGenFusedMoE(MoE):
                 assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                 x_row = x.shape[0]
                 x, x_sf = x.fp4_tensor, x.scaling_factor
+            elif isinstance(x, MxFp8QuantizedTensor):
+                assert not x.is_sf_swizzled, "MxFp8QuantizedTensor should not be swizzled before communication"
+                x_row = x.shape[0]
+                x, x_sf = x.fp8_tensor, x.scaling_factor
             else:
                 # Apply pre_quant_scale if it exists (for NVFP4_AWQ)
                 # fc31_act_scale shape: (1, hidden_size)

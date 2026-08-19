@@ -19,6 +19,10 @@ google/gemma-4-26B-A4B-it:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 54.0
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 54.0
 google/gemma-3-12b-it:
   - accuracy: 50.44
   - quant_algo: FP8
@@ -58,8 +62,6 @@ nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4:
   - quant_algo: MIXED_PRECISION
     kv_cache_quant_algo: FP8
     accuracy: 38.0
-microsoft/Phi-4-multimodal-instruct:
-  - accuracy: 53.67
 Qwen/Qwen3-VL-30B-A3B-Instruct:
   - accuracy: 55.33
 mistral/Mistral-Large-3-675B:

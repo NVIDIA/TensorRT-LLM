@@ -479,8 +479,8 @@ def test_model_param_discovery(monkeypatch):
     # (a name under LLM_MODELS_ROOT, or an absolute path) — discovered
     # without any test-file changes.
     monkeypatch.setenv("LLM_MODELS_ROOT", "/models-root")
-    item = _FakeItem(params={"model_folder": "Nemotron-H-8B-Base-8K"})
-    assert session_prefetcher._model_dir_of(item) == "/models-root/Nemotron-H-8B-Base-8K"
+    item = _FakeItem(params={"model_folder": "NVIDIA-Nemotron-Nano-9B-v2"})
+    assert session_prefetcher._model_dir_of(item) == "/models-root/NVIDIA-Nemotron-Nano-9B-v2"
     item = _FakeItem(params={"model_dir": "/abs/path/model"})
     assert session_prefetcher._model_dir_of(item) == "/abs/path/model"
     # Non-model params never produce a guess.

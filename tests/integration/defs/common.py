@@ -21,15 +21,15 @@ import socket
 import tempfile
 import time
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 from packaging import version
 
 from tensorrt_llm import LLM as LLM_torch
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.executor.request import LoRARequest
-from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .trt_test_alternative import (check_call, check_output, print_info,
@@ -671,13 +671,145 @@ def wait_for_server(host, port, timeout_seconds=180):
     return False
 
 
+def wait_for_reported_addr(addr_path: str,
+                           timeout: float,
+                           process=None) -> tuple[str, int]:
+    """Read the address a server reported to its --report_addr file.
+
+    The file only appears once trtllm-serve has bound its socket, and that
+    socket stays bound from then on, so the address cannot be stolen between
+    this read and its use -- unlike a port reserved before the server starts.
+
+    Args:
+        addr_path: Path passed to the server's --report_addr.
+        timeout: Seconds to wait for the file to appear.
+        process: Optional Popen of the server, polled so that a crash fails
+            fast instead of burning the whole timeout.
+
+    Returns:
+        tuple[str, int]: The host and port the server bound.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"server exited with code {process.returncode} before "
+                f"reporting its address to {addr_path}")
+        try:
+            with open(addr_path) as f:
+                reported = f.read().strip()
+        except FileNotFoundError:
+            reported = ""
+        if reported:
+            host, _, port = reported.rpartition(":")
+            return host, int(port)
+        time.sleep(0.5)
+    raise TimeoutError(f"server did not report its address to {addr_path} "
+                       f"within {timeout}s")
+
+
 PORTS_IN_USE = set()
 
+# Size of the window carved out just below the kernel's ephemeral range, used
+# when CONTAINER_PORT_START is unset (e.g. the SLURM multi-node path).
+STATIC_PORT_RANGE_SIZE = 4096
 
-def get_free_port_in_ci(max_attempts=100):
+
+def get_ephemeral_port_range() -> Optional[tuple[int, int]]:
+    """Return the kernel's ephemeral port range as (low, high), or None.
+
+    These are the ports bind(('', 0)) hands out. None means the range could
+    not be read.
     """
-    Get a free port in the range [CONTAINER_PORT_START, CONTAINER_PORT_START + CONTAINER_PORT_NUM - 1]
-    If CONTAINER_PORT_START and CONTAINER_PORT_NUM are not set or all ports are already in use, fallback to get_free_port
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            low, high = (int(value) for value in f.read().split())
+    except (OSError, ValueError) as e:
+        print_info(f"[get_free_port_in_ci] could not read the ephemeral port "
+                   f"range ({e}); assuming none is reserved.")
+        return None
+    # Nonsense bounds would make get_static_port_range() hand out ports outside
+    # 1-65535, and bind() raises OverflowError (not OSError) for those, so
+    # reserve_port_from_range would propagate it instead of trying another port.
+    if not 1 <= low <= high <= 65535:
+        print_warning(f"[get_free_port_in_ci] ignoring implausible ephemeral "
+                      f"port range ({low}, {high}).")
+        return None
+    return low, high
+
+
+def get_static_port_range() -> Optional[tuple[int, int]]:
+    """Return a (low, high) window just below the kernel's ephemeral range.
+
+    None is returned if the ephemeral range cannot be determined.
+
+    Ports here are never handed out by bind(('', 0)), so a port reserved from
+    this window cannot be stolen by a sibling process launched with --port 0 --
+    which is how a reserved disaggregated server port was lost to the test's
+    own worker.
+    """
+    ephemeral_range = get_ephemeral_port_range()
+    if ephemeral_range is None:
+        return None
+    high = ephemeral_range[0] - 1
+    low = max(1024, high - STATIC_PORT_RANGE_SIZE + 1)
+    if low > high:
+        return None
+    return low, high
+
+
+def reserve_port_from_range(port_range: tuple[int, int],
+                            source: str) -> Optional[int]:
+    """Probe-bind random ports from an inclusive (low, high) window.
+
+    The first port found free is recorded in PORTS_IN_USE and returned;
+    None is returned once every candidate in the window is taken.
+    """
+    global PORTS_IN_USE
+
+    pid = os.getpid()
+    low, high = port_range
+    available_ports = [
+        port for port in range(low, high + 1) if port not in PORTS_IN_USE
+    ]
+    num_candidates = len(available_ports)
+
+    for attempt in range(1, num_candidates + 1):
+        # Get a random port from the available ports
+        port = random.choice(available_ports)
+
+        # Check if the port is free
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("localhost", port))
+                PORTS_IN_USE.add(port)
+                print_info(
+                    f"[get_free_port_in_ci] pid={pid} allocated port={port} "
+                    f"from {source} range {port_range} after {attempt} "
+                    f"attempt(s); {len(PORTS_IN_USE)} reserved in-process. The "
+                    f"probe socket is now closed, so another process may take "
+                    f"the port before the caller rebinds it (TOCTOU).")
+                return port
+            except OSError as e:
+                print_info(
+                    f"[get_free_port_in_ci] pid={pid} candidate port={port} "
+                    f"in {source} range {port_range} is busy ({e}); trying "
+                    f"another.")
+                available_ports.remove(port)
+                continue
+
+    print_warning(
+        f"[get_free_port_in_ci] pid={pid} exhausted all {num_candidates} "
+        f"candidate ports in {source} range {port_range}.")
+    return None
+
+
+def get_free_port_in_ci(max_attempts: int = 100) -> int:
+    """Get a free port from the CI-assigned container port range.
+
+    The range is [CONTAINER_PORT_START, CONTAINER_PORT_START + CONTAINER_PORT_NUM - 1].
+    If those are unset, or every port in the range is already in use, fall back to
+    a port just below the kernel's ephemeral range, and only then to get_free_port.
     """
     global PORTS_IN_USE
 
@@ -685,45 +817,23 @@ def get_free_port_in_ci(max_attempts=100):
     container_port_start = int(os.environ.get("CONTAINER_PORT_START", -1))
     container_port_num = int(os.environ.get("CONTAINER_PORT_NUM", -1))
     if container_port_start != -1 and container_port_num != -1:
-        port_range = (container_port_start,
-                      container_port_start + container_port_num - 1)
-        available_ports = [
-            port for port in range(container_port_start, container_port_start +
-                                   container_port_num)
-            if port not in PORTS_IN_USE
-        ]
-        num_candidates = len(available_ports)
+        port = reserve_port_from_range(
+            (container_port_start,
+             container_port_start + container_port_num - 1), "CI")
+        if port is not None:
+            return port
 
-        for attempt in range(1, num_candidates + 1):
-            # Get a random port from the available ports
-            port = random.choice(available_ports)
+    # No CI range configured, or every port in it is taken. Prefer a port below
+    # the ephemeral range over a system-assigned one: the latter is drawn from
+    # the same pool that trtllm-serve's own --port 0 workers bind from, so a
+    # sibling worker can take it before the caller rebinds it.
+    static_port_range = get_static_port_range()
+    if static_port_range is not None:
+        port = reserve_port_from_range(static_port_range, "static")
+        if port is not None:
+            return port
 
-            # Check if the port is free
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                try:
-                    s.bind(("localhost", port))
-                    PORTS_IN_USE.add(port)
-                    print_info(
-                        f"[get_free_port_in_ci] pid={pid} allocated port={port} "
-                        f"from CI range {port_range} after {attempt} attempt(s); "
-                        f"{len(PORTS_IN_USE)} reserved in-process. The probe "
-                        f"socket is now closed, so another process may take the "
-                        f"port before the caller rebinds it (TOCTOU).")
-                    return port
-                except OSError as e:
-                    print_info(
-                        f"[get_free_port_in_ci] pid={pid} candidate port={port} "
-                        f"in CI range {port_range} is busy ({e}); trying another."
-                    )
-                    available_ports.remove(port)
-                    continue
-
-        print_warning(
-            f"[get_free_port_in_ci] pid={pid} exhausted all {num_candidates} "
-            f"candidate ports in CI range {port_range}; falling back to a "
-            f"system-assigned ephemeral port.")
-
-    # No port found in the range, try to get a random free port from the system
+    # Last resort: a system-assigned ephemeral port.
     for _ in range(max_attempts):
         port = get_free_port()
         if port not in PORTS_IN_USE:
