@@ -1697,6 +1697,8 @@ class PyTorchModelEngine(ModelEngine):
         if isinstance(attn_meta, DSAtrtllmAttentionMetadata):
             next_n = 1 + self.original_max_draft_len
             attn_meta.warmup_cute_dsl_radix_topk(next_n)
+            if hasattr(attn_meta, "warmup_selfsampling_topk"):
+                attn_meta.warmup_selfsampling_topk(next_n)
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):

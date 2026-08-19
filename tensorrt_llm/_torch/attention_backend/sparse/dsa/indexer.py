@@ -697,8 +697,10 @@ class Indexer(nn.Module):
         # kv_lens, request-level raw prev-top-K hints, per-row MTP window,
         # in-kernel n <= topK short path); tuning is frozen from
         # indexer_max_seq_len at capture time, so the launch is
-        # CUDA-graph-replay safe. Contract violations raise loudly rather
-        # than silently falling back — this flag is an explicit experiment.
+        # CUDA-graph-replay safe. Two guard mechanisms coexist: the
+        # dispatch-site hardware-format gate falls through to the in-tree
+        # path (with a one-time warning), while contract violations inside
+        # the engine raise loudly — this flag is an explicit experiment.
         self._use_self_sampling_topk = (
             os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") == "1"
             and IS_CUTLASS_DSL_AVAILABLE

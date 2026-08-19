@@ -1225,6 +1225,12 @@ def run_varlen(
     ``kv_lens.max()`` host read (documented sync, refused under capture).
     ``engine="reference"`` keeps the b=1 host-loop reference implementation —
     the differential oracle the in-kernel engine is validated against.
+
+    KNOWN LIMITATION: on rows containing NaN logits the selected index SET
+    can differ from ``heuristicTopKDecode.cu`` (both kernels order NaNs
+    implementation-specifically; inherited from the translation campaign's
+    probe battery). Finite inputs — including +/-inf and denormals — are
+    tie-aware exact.
     """
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")

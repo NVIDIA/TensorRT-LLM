@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
@@ -275,6 +276,40 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             next_n=next_n,
             dtype=_INDEXER_LOGITS_DTYPE,
             num_sms=self.num_sms,
+        )
+
+    def warmup_selfsampling_topk(self, next_n: int) -> None:
+        """Pre-compile the self-sampling GVR varlen engine during warmup.
+
+        Mirrors ``warmup_cute_dsl_radix_topk``: captured geometries compile in
+        the warmup-step forwards; this covers the eager first-touch (bs=1)
+        tuple so a live request never pays the DSL JIT. No-op unless the
+        opt-in gate (TRTLLM_GVR_SELF_SAMPLING=1) selects the engine.
+        """
+        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING", "0") != "1":
+            return
+        if not self.enable_heuristic_topk or self.kv_cache_manager is None:
+            return
+        top_k = getattr(self.sparse_metadata_params, "index_topk", None)
+        if not top_k or int(top_k) not in (512, 1024, 2048):
+            return
+        cr = int(self._indexer_compress_ratio) if self._indexer_compress_ratio else 1
+        if cr not in (1, 4):
+            return
+        try:
+            from ....cute_dsl_kernels.blackwell.top_k import (
+                gvr_topk_decode_self_sampling_host as _ss_host,
+            )
+        except ImportError:
+            return
+        # helper takes max_seq_len in kv-token space (get_indexer_max_seq_len
+        # is compressed — same multiply-back as the dispatch seam)
+        _ss_host.warmup_varlen(
+            int(top_k),
+            int(self.get_indexer_max_seq_len()) * cr,
+            compress_ratio=cr,
+            next_n=int(next_n),
+            num_rows_list=(int(next_n),),
         )
 
     def on_update_kv_lens(self):
