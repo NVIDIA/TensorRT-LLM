@@ -2400,11 +2400,22 @@ class KVCacheManagerV2(BaseResourceManager):
                     kv_cache.num_committed_tokens, self.tokens_per_block
                 )
 
+            # Connector phase 1: ask what the connector can serve past the local
+            # match and advance the context position over it, before residency
+            # is decided. The capacity/history bump this implies has to wait for
+            # the resume below, because `resize` requires an ACTIVE cache and a
+            # freshly created one is suspended.
+            position = self._connector_prefix_position(req, kv_cache)
+
             if req.is_disagg_generation_init_state:
                 # Disagg generation receives prompt KV from the context worker;
                 # scratch blocks are only valid for local prefill chunks.
                 kv_cache.enable_swa_scratch_reuse = False
-            return self._resume_and_restore(req.py_request_id, kv_cache)
+            if not self._resume_and_restore(req.py_request_id, kv_cache):
+                return False
+            if position is not None:
+                self._reserve_connector_prefix(req, kv_cache, position)
+            return True
         else:
             # Subsequent chunk: cache must exist from first chunk.
             # It may be suspended (e.g., evicted between chunks), so
@@ -2414,6 +2425,161 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"KV cache missing for non-first context chunk, request {req.py_request_id}"
             )
             return self._resume_and_restore(req.py_request_id, kv_cache)
+
+    # ---- KV connector prefix (see docs/source/features/kv-cache-connector.md) ----
+    #
+    # V2 splits "match and take ownership" from "become resident on GPU", and the
+    # connector gets the same decomposition:
+    #
+    #   phase 1  _connector_prefix_position   ask, and advance the context position
+    #   phase 2  _reserve_connector_prefix    cover the offer with pages
+    #   phase 3  _deliver_connector_prefix    tell the connector what to transfer
+    #
+    # Phases 1 and 2 run in the scheduling pass, which is speculative: a request
+    # can still be dropped afterwards at the token budget, `resize_context`,
+    # multimodal alignment or cross attention. Phase 3 runs on the final batch.
+
+    def _connector_may_serve(self, req: LlmRequest) -> bool:
+        if req.is_dummy:
+            # Mirrors V1, which skips the query for dummy requests entirely.
+            return False
+        if req.is_generation_only_request:
+            # The connector API rejects these outright; a disagg generation
+            # server gets its prompt KV from the context worker.
+            return False
+        return not req.is_disagg_generation_init_state
+
+    def _connector_prefix_position(self, req: LlmRequest, kv_cache) -> Optional[int]:
+        """Phase 1. Position through which KV is valid before the forward pass.
+
+        That is ``max(locally committed, connector offer end)``, or None when no
+        connector prefix applies to this request. The connector is queried at
+        most once per request: a deferred request re-derives its position here
+        from the memoised offer end and the *current* local match, without
+        asking again.
+        """
+        if self.kv_connector_manager is None or self.is_draft:
+            return None
+
+        if req.py_connector_prefix_end is None:
+            if not self._connector_may_serve(req):
+                return None
+            local_end = kv_cache.num_committed_tokens
+            num_tokens, load_async = self.kv_connector_manager.query_num_new_matched_tokens(
+                req, local_end
+            )
+            # The last prompt position must be computed locally whatever the
+            # connector holds, because the first generation step consumes its
+            # activations. A connector that offers the whole prompt therefore
+            # loses at most one token, which the forward recomputes.
+            req.py_connector_prefix_start = local_end
+            req.py_connector_prefix_end = min(local_end + num_tokens, req.prompt_len - 1)
+            # Deliberately not conditioned on the clamp above: if the connector
+            # said it would transfer asynchronously it has already started, and
+            # the request must be held out of the batch until it reports done.
+            req.py_connector_load_async = load_async
+
+        # Not `py_connector_prefix_end` on its own: while the request waited,
+        # another request may have committed blocks that grew the local match
+        # past the offer.
+        return max(kv_cache.num_committed_tokens, req.py_connector_prefix_end)
+
+    def _reserve_connector_prefix(self, req: LlmRequest, kv_cache, position: int) -> None:
+        """Phase 2. Give the offered prefix capacity, history and pages.
+
+        Runs after ``_resume_and_restore`` because ``resize`` asserts the cache
+        is ACTIVE. Capacity and history move together in one call: after a reuse
+        match they are both equal to the local match, so raising history alone
+        would trip "History length cannot be greater than capacity".
+
+        Raising history is what keeps a served prefix from allocating a page per
+        block in a sliding-window layer group -- ``history_length`` is the sole
+        input to the stale-range computation.
+        """
+        local_end = kv_cache.num_committed_tokens
+        if position <= local_end:
+            # Nothing offered, or the local match has caught up with the offer.
+            return
+
+        # SWA scratch slots are transient prefill storage; a connector writes
+        # real cache content into these blocks. Same reason the disagg
+        # generation path above opts out.
+        kv_cache.enable_swa_scratch_reuse = False
+
+        if kv_cache.resize(max(kv_cache.capacity, position), position):
+            req.context_current_position = position
+            req.set_prepopulated_prompt_len(position, self.tokens_per_block)
+            return
+
+        # Out of pages. Run local-only rather than leaving the offered range
+        # unallocated, and hand the offer back instead of silently dropping it.
+        logger.debug(
+            "req %s: could not reserve connector prefix up to %d, falling back to "
+            "the local match at %d",
+            req.py_request_id,
+            position,
+            local_end,
+        )
+        self.kv_connector_manager.cancel_load(req, req.py_connector_prefix_start, position)
+        req.py_connector_prefix_start = local_end
+        req.py_connector_prefix_end = local_end
+        req.py_connector_load_async = False
+
+    def _deliver_connector_prefix(self, req: LlmRequest) -> None:
+        """Phase 3. Resolve the offer against ownership as it stands now.
+
+        The connector was told it could serve ``[start, end)``. Anything below
+        the current commit boundary is now locally owned -- shared
+        ``CommittedPage`` s that this request is not the only writer to -- so it
+        is handed back rather than transferred, and only ``[committed, end)``
+        is reported as an external load.
+        """
+        end = req.py_connector_prefix_end
+        if end is None:
+            return
+        start = req.py_connector_prefix_start
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        # Never past `end`: the offer bounds what there is to hand back.
+        committed = min(kv_cache.num_committed_tokens, end) if kv_cache is not None else start
+        if committed > start:
+            self.kv_connector_manager.cancel_load(req, start, committed)
+        recorded = end - committed
+        # The one place phases 2 and 3 have to agree. The runtime reports
+        # `context_current_position - recorded` to the connector as the range it
+        # computed locally, and nothing downstream validates that: the
+        # subtraction is unguarded (kv_cache_connector.py:480) and connectors
+        # divide the result into block ordinals rather than checking it (see
+        # `computed_position // block_size` in
+        # examples/llm-api/llm_kv_cache_connector.py). So a `recorded` the
+        # position was never advanced over does not fail here -- it silently
+        # points the connector at the wrong offset, inside its own code. Fail
+        # loudly and locally instead.
+        assert 0 <= recorded <= req.context_current_position, (
+            f"req {req.py_request_id}: connector prefix [{start}, {end}) "
+            f"records {recorded} externally loaded tokens, but the context "
+            f"position is only {req.context_current_position} -- phase 2 did "
+            f"not reserve what phase 1 offered"
+        )
+        self.kv_connector_manager.commit_new_matched_tokens(
+            req, recorded, req.py_connector_load_async
+        )
+
+    def _release_undelivered_connector_prefix(self, req: LlmRequest) -> None:
+        """Hand back an offer for a request that died before it was delivered.
+
+        Phase 1 is speculative, so a request can be asked and then cancelled,
+        time out, or fail before it ever reaches a batch. The connector took
+        ownership of remote blocks in the query and would otherwise hold them
+        for the rest of the process's life.
+        """
+        if self.kv_connector_manager is None or req.py_connector_delivered:
+            return
+        end = req.py_connector_prefix_end
+        start = req.py_connector_prefix_start
+        if end is None or end <= start:
+            return
+        self.kv_connector_manager.cancel_load(req, start, end)
+        req.py_connector_prefix_end = start
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
@@ -2587,6 +2753,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # the sequence is added -- that is the first context chunk.
             if not request.is_first_context_chunk:
                 continue
+            # A request that was loaded asynchronously re-enters this batch still
+            # on its first context chunk, with the same pages and nothing left to
+            # load. Reporting it again would re-record an external load and fire
+            # a second `update_state_after_alloc` for one allocation.
+            if request.py_connector_delivered:
+                continue
+            self._deliver_connector_prefix(request)
+            request.py_connector_delivered = True
             # Connectors that do not reason about layer groups see the single
             # group's indices; with several groups there is no correct flat
             # list, so report none and leave them to the layer-group-aware
@@ -3367,6 +3541,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        self._release_undelivered_connector_prefix(request)
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
