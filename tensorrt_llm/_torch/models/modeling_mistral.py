@@ -716,6 +716,155 @@ class MistralNativeInputProcessor(BaseMultimodalInputProcessor,
             self.processor.image_end_token_id,
         ])
 
+    # ------------------------------------------------------------------
+    # Vision geometry helpers for MM encoder profiling.
+    #
+    # Native (mistral-common) VLM checkpoints share the same Pixtral vision
+    # encoder geometry as HF checkpoints, but the geometry lives in the
+    # mistral-common processor rather than an HF vision_config.  These
+    # helpers implement the BaseMultimodalDummyInputsBuilder contract so the
+    # native path participates in KV-cache encoder profiling identically to
+    # MistralHFInputProcessor.
+    # ------------------------------------------------------------------
+
+    def _vision_geometry(self) -> Tuple[int, int, int, int]:
+        """``(patch_size, spatial_merge_size, num_channels, max_image_size)``.
+
+        Reads ``patch_size`` and ``max_image_size`` from the native
+        ``MistralCommonImageProcessor``; tries several config locations for
+        ``spatial_merge_size`` and falls back to the Pixtral standard of 2.
+        """
+        proc = self._processor
+        patch = proc.patch_size
+        max_size = proc.image_size
+        # spatial_merge_size may sit at the top level, inside text_config, or
+        # inside vision_config depending on which params.json layout was used.
+        merge = (getattr(self._config, "spatial_merge_size", None)
+                 or getattr(getattr(self._config, "text_config", None),
+                            "spatial_merge_size", None)
+                 or getattr(getattr(self._config, "vision_config", None),
+                            "spatial_merge_size", None)
+                 or 2)  # Pixtral standard default
+        return int(patch), int(merge), 3, int(max_size)
+
+    @staticmethod
+    def _vit_tokens(*, width: int, height: int, patch: int) -> int:
+        """ViT attention-sequence length (pre-merge patches) for an image."""
+        return (height // patch) * (width // patch)
+
+    def get_size_for_max_tokens(self, *, max_tokens: int) -> Dict[str, int]:
+        """Largest square Pixtral image (aligned to ``patch * merge``) whose
+        ViT patch count is ``<= max_tokens``.
+
+        Raises ``ValueError`` if even the smallest aligned image
+        (``unit × unit``) exceeds ``max_tokens``.
+        """
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+        patch, merge, _, max_size = self._vision_geometry()
+        unit = patch * merge
+        edge = (max_size // unit) * unit
+        while edge > 0 and self._vit_tokens(
+                width=edge, height=edge, patch=patch) > max_tokens:
+            edge -= unit
+        if edge == 0:
+            min_tokens = self._vit_tokens(width=unit, height=unit, patch=patch)
+            raise ValueError(
+                f"No merge-aligned image fits within {max_tokens} ViT tokens "
+                f"(minimum is {min_tokens} tokens for a {unit}x{unit} image).")
+        return {"width": edge, "height": edge, "num_frames": 1}
+
+    def get_mm_max_tokens_per_item(
+        self,
+        max_num_encoder_tokens: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Largest single image's ViT patch count, optionally capped to
+        ``max_num_encoder_tokens`` (the startup encoder token budget)."""
+        patch, merge, _, max_size = self._vision_geometry()
+        unit = patch * merge
+        edge = max((max_size // unit) * unit, unit)
+        max_image_tokens = self._vit_tokens(width=edge,
+                                            height=edge,
+                                            patch=patch)
+        token_budget = (max_num_encoder_tokens if max_num_encoder_tokens
+                        is not None else max_image_tokens)
+        try:
+            size = self.get_size_for_max_tokens(max_tokens=token_budget)
+        except ValueError:
+            return {}
+        encoder_tokens = self._vit_tokens(width=size["width"],
+                                          height=size["height"],
+                                          patch=patch)
+        return {"image": encoder_tokens}
+
+    def get_max_mm_encoder_output_embeddings(
+            self, max_num_encoder_tokens: int) -> int:
+        """Bound post-merger embeddings from one Pixtral encoder iteration.
+
+        Pixtral's spatial merger reduces ``merge × merge`` ViT patches to one
+        embedding, so the output count is ``max_num_encoder_tokens // merge²``.
+        """
+        _, merge, _, _ = self._vision_geometry()
+        return max_num_encoder_tokens // (merge * merge)
+
+    def get_mm_encoder_attention_metadata_capacity(
+            self, max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Bound Pixtral contexts by the physical-token budget."""
+        _, merge, _, _ = self._vision_geometry()
+        min_tokens_per_image = merge * merge
+        return {"attention": max(1, max_num_tokens // min_tokens_per_image)}
+
+    def get_dummy_mm_data_for_tokens(
+        self,
+        *,
+        max_tokens_per_modality: Dict[str, int],
+        dtype: Optional[torch.dtype] = None,
+    ) -> Dict[str, Any]:
+        """Build dummy encoder inputs sized to the per-modality token budget.
+
+        Enumerates all merge-aligned square image sizes and selects the
+        ``(size, count)`` pair whose total ViT tokens is maximised without
+        exceeding ``budget``, so the dummy saturates the encoder allocation
+        even when a smaller image repeated many times beats one large image.
+        """
+        budget = max_tokens_per_modality.get("image")
+        if not budget:
+            return {}
+        patch, merge, channels, max_size = self._vision_geometry()
+        unit = patch * merge
+        max_edge = (max_size // unit) * unit
+
+        # Find the (size, count) pair that maximises total ViT tokens ≤ budget.
+        best_edge, best_total = 0, 0
+        edge = unit
+        while edge <= max_edge:
+            t = self._vit_tokens(width=edge, height=edge, patch=patch)
+            if t <= budget:
+                total = t * (budget // t)
+                if total > best_total:
+                    best_total = total
+                    best_edge = edge
+            edge += unit
+
+        if best_edge == 0:
+            return {}  # budget too small for even the minimum aligned image
+
+        tokens_per_image = self._vit_tokens(width=best_edge,
+                                            height=best_edge,
+                                            patch=patch)
+        num_images = max(1, budget // tokens_per_image)
+        pixel_values = torch.zeros(
+            (num_images, channels, best_edge, best_edge),
+            dtype=dtype or torch.float32,
+        )
+        image_sizes = [[best_edge, best_edge]] * num_images
+        return {
+            "image": {
+                "pixel_values": pixel_values,
+                "image_sizes": image_sizes
+            }
+        }
+
     @torch.inference_mode()
     def call_with_text_prompt(
         self, inputs: TextPrompt, sampling_params: SamplingParams
