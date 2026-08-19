@@ -249,7 +249,11 @@ def _generate_cosmos3_feature_image(case, output_path):
         model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
         _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
-        with _lpips_deterministic_algorithms(), _fixed_nvfp4_quantization_backend(case.features):
+        with (
+            _lpips_deterministic_algorithms(),
+            _lpips_pinned_fp32_matmul_precision(),
+            _fixed_nvfp4_quantization_backend(case.features),
+        ):
             args = _build_single_device_feature_args(
                 model_path,
                 case.features,
