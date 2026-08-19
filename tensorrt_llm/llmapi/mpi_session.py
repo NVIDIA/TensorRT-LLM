@@ -470,9 +470,18 @@ class MpiPoolSession(MpiSession):
         identify (with the pid-recycling guard). Workers we never identified
         exit with the MPI runtime teardown; if one is truly wedged it leaks
         until job end — the same bounded leak class as any wedged pool.
+
+        That leak must not extend to the parent: a bootstrap that never
+        reported an identity is precisely the "worker world died abruptly"
+        case, so the pool's manager thread can stay blocked in MPI forever
+        and both mpi4py's exit hook and CPython's non-daemon join would then
+        hang interpreter exit long after the caller gave up. Release those
+        joins first — once ``mpi_pool`` is dropped below there is no pool
+        left for a later ``release_exit_joins()`` to abandon.
         """
         import signal
 
+        self.release_exit_joins()
         try:
             self.mpi_pool.shutdown(wait=False)
         except Exception:

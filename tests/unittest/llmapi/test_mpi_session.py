@@ -232,7 +232,8 @@ def _collect_identities(monkeypatch,
                         results,
                         pending=0,
                         n_workers=2,
-                        observed_timeouts=None):
+                        observed_timeouts=None,
+                        sink=None):
     """Drive _collect_worker_identities on an inert stand-in (no MPI spawn)."""
     import types
     from concurrent.futures import Future
@@ -261,7 +262,12 @@ def _collect_identities(monkeypatch,
                                        shutdown=lambda wait=True: None),
         _teardown_unidentified_pool=lambda ids: MpiPoolSession.
         _teardown_unidentified_pool(stand_in, ids),
+        # Real method: teardown must go through it, so exercise it here
+        # rather than stubbing the behavior under test away.
+        release_exit_joins=lambda: MpiPoolSession.release_exit_joins(stand_in),
     )
+    if sink is not None:  # let callers assert on post-teardown state
+        sink.append(stand_in)
     result = MpiPoolSession._collect_worker_identities(stand_in)
     return result, killed
 
@@ -296,6 +302,65 @@ def test_identity_collection_fails_closed_on_duplicate_pids(monkeypatch):
     me = (os.getpid(), _process_start_time(os.getpid()))
     with _pytest.raises(RuntimeError, match="incomplete"):
         _collect_identities(monkeypatch, [me, me])  # one worker answered twice
+
+
+def test_teardown_unidentified_pool_releases_exit_joins():
+    """A failed bootstrap must not hang the parent's interpreter exit.
+
+    NVBug 6608389: a fabric fault stopped the worker before it could report
+    its identity, so teardown had no PID to SIGKILL while the pool's manager
+    thread stayed blocked in MPI. Dropping ``mpi_pool`` without abandoning
+    that thread first left mpi4py's exit hook and CPython's non-daemon join
+    holding the process open long after the caller had given up, and made
+    a later ``release_exit_joins()`` a no-op (it guards on ``mpi_pool``).
+    """
+    import types
+
+    release = threading.Event()
+    wedged = threading.Thread(target=release.wait, name="fake_pool_manager")
+    wedged.daemon = False
+    wedged.start()
+    try:
+        fake_mod = types.ModuleType("mpi4py.futures._lib")
+        fake_mod.THREADS_QUEUES = {wedged: object()}
+        prev = sys.modules.get("mpi4py.futures._lib")
+        sys.modules["mpi4py.futures._lib"] = fake_mod
+        try:
+            pool = types.SimpleNamespace(
+                _pool=types.SimpleNamespace(thread=wedged),
+                shutdown=lambda wait=True: None)
+            stand_in = types.SimpleNamespace(mpi_pool=pool)
+            stand_in.release_exit_joins = (
+                lambda: MpiPoolSession.release_exit_joins(stand_in))
+
+            # Nothing was identified, so the SIGKILL path has no target:
+            # abandoning the manager thread is the only bound on exit.
+            MpiPoolSession._teardown_unidentified_pool(stand_in, ())
+
+            assert wedged not in fake_mod.THREADS_QUEUES
+            shutdown_locks = getattr(threading, "_shutdown_locks", None)
+            if shutdown_locks is not None:  # CPython 3.9-3.12 only
+                assert wedged._tstate_lock not in shutdown_locks
+            assert stand_in._pool_dead is True  # never joinable again
+            assert stand_in.mpi_pool is None
+        finally:
+            if prev is None:
+                del sys.modules["mpi4py.futures._lib"]
+            else:
+                sys.modules["mpi4py.futures._lib"] = prev
+    finally:
+        release.set()
+        wedged.join(timeout=5)
+
+
+def test_identity_collection_timeout_releases_exit_joins(monkeypatch):
+    """End to end: 0/N identities still releases the interpreter exit joins."""
+    sink = []
+    with pytest.raises(RuntimeError, match="incomplete"):
+        _collect_identities(monkeypatch, [], pending=1, n_workers=1, sink=sink)
+    stand_in, = sink
+    assert stand_in._pool_dead is True
+    assert stand_in.mpi_pool is None
 
 
 def test_identity_collection_uses_configured_timeout(monkeypatch):
