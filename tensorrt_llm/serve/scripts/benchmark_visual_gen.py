@@ -38,14 +38,18 @@ import json
 import math
 import os
 import random
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from argparse import ArgumentParser as FlexibleArgumentParser
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, BinaryIO, Optional
 
 import aiohttp
 import numpy as np
@@ -76,14 +80,17 @@ class VisualGenRequestInput:
     prompt: str
     api_url: str
     model: str
-    size: str = "auto"
-    seconds: float = 4.0
-    fps: int = 24
+    size: Optional[str] = None
+    seconds: Optional[float] = None
+    fps: Optional[int] = None
+    num_frames: Optional[int] = None
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     negative_prompt: Optional[str] = None
     seed: Optional[int] = None
     extra_body: Optional[dict] = None
+    input_reference: Optional[str] = None
+    validate_audio: bool = False
 
 
 def _build_payload_common(request_input: VisualGenRequestInput) -> dict:
@@ -91,8 +98,9 @@ def _build_payload_common(request_input: VisualGenRequestInput) -> dict:
     payload: dict[str, Any] = {
         "model": request_input.model,
         "prompt": request_input.prompt,
-        "size": request_input.size,
     }
+    if request_input.size is not None:
+        payload["size"] = request_input.size
     if request_input.num_inference_steps is not None:
         payload["num_inference_steps"] = request_input.num_inference_steps
     if request_input.guidance_scale is not None:
@@ -106,11 +114,99 @@ def _build_payload_common(request_input: VisualGenRequestInput) -> dict:
     return payload
 
 
-def _get_headers() -> dict[str, str]:
-    return {
-        "Content-Type": "application/json",
+def _build_image_payload(request_input: VisualGenRequestInput) -> dict[str, Any]:
+    """Build the JSON payload for ``/v1/images/generations``."""
+    payload = _build_payload_common(request_input)
+    payload["response_format"] = "b64_json"
+    payload["n"] = 1
+    return payload
+
+
+def _build_video_payload(request_input: VisualGenRequestInput) -> dict[str, Any]:
+    """Build the JSON or multipart fields for ``/v1/videos/generations``."""
+    payload = _build_payload_common(request_input)
+    if request_input.seconds is not None:
+        payload["seconds"] = request_input.seconds
+    if request_input.fps is not None:
+        payload["fps"] = request_input.fps
+    if request_input.num_frames is not None:
+        payload["num_frames"] = request_input.num_frames
+    return payload
+
+
+def _get_headers(*, json_content: bool) -> dict[str, str]:
+    headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'unused')}",
     }
+    if json_content:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _build_multipart_form(
+    payload: dict[str, Any], input_reference: str, media_file: BinaryIO
+) -> aiohttp.FormData:
+    """Build a multipart request, leaving Content-Type generation to aiohttp."""
+    form = aiohttp.FormData()
+    for key, value in payload.items():
+        if value is None:
+            continue
+        if key == "extra_params":
+            if not isinstance(value, dict):
+                raise ValueError("extra_params must be a JSON object")
+            field_value = json.dumps(value)
+        elif isinstance(value, (dict, list, bool)):
+            field_value = json.dumps(value)
+        else:
+            field_value = str(value)
+        form.add_field(key, field_value)
+    form.add_field(
+        "input_reference",
+        media_file,
+        filename=Path(input_reference).name,
+        content_type="application/octet-stream",
+    )
+    return form
+
+
+def _validate_audio_response(response_body: bytes) -> None:
+    """Require at least one audio stream in a generated MP4 response."""
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        raise RuntimeError("ffprobe is required to validate audio benchmark responses")
+
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
+            temp_file.write(response_body)
+            temp_path = temp_file.name
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                temp_path,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise ValueError(
+                "ffprobe could not inspect the generated video response: "
+                f"{completed.stderr.strip()}"
+            )
+        if "audio" not in completed.stdout.split():
+            raise ValueError("Generated video response does not contain an audio stream")
+    finally:
+        if temp_path:
+            Path(temp_path).unlink(missing_ok=True)
 
 
 def _parse_server_timing_header(headers: Any) -> dict[str, float]:
@@ -164,13 +260,13 @@ async def _do_post(
     output = VisualGenRequestOutput()
     st = time.perf_counter()
     try:
-        async with request_session.post(
-            url=request_input.api_url, json=payload, headers=_get_headers()
-        ) as response:
+
+        async def _consume_response(response: aiohttp.ClientResponse) -> None:
             if response.status == 200:
-                await response.read()
-                output.success = True
+                response_body = await response.read()
                 output.latency = time.perf_counter() - st
+                if request_input.validate_audio:
+                    await asyncio.to_thread(_validate_audio_response, response_body)
                 server_timings = _parse_server_timing_header(response.headers)
                 output.generation = _get_server_timing_metric(
                     server_timings,
@@ -182,10 +278,28 @@ async def _do_post(
                     VISUAL_GEN_DENOISE_TIMING,
                     require_positive=False,
                 )
+                output.success = True
             else:
                 body = await response.text()
                 output.error = f"HTTP {response.status}: {body}"
                 output.success = False
+
+        if request_input.input_reference is None:
+            async with request_session.post(
+                url=request_input.api_url,
+                json=payload,
+                headers=_get_headers(json_content=True),
+            ) as response:
+                await _consume_response(response)
+        else:
+            with open(request_input.input_reference, "rb") as media_file:
+                form = _build_multipart_form(payload, request_input.input_reference, media_file)
+                async with request_session.post(
+                    url=request_input.api_url,
+                    data=form,
+                    headers=_get_headers(json_content=False),
+                ) as response:
+                    await _consume_response(response)
     except Exception as e:
         output.success = False
         exc_info = sys.exc_info()
@@ -206,9 +320,7 @@ async def async_request_image_generation(
     session: Optional[aiohttp.ClientSession] = None,
 ) -> VisualGenRequestOutput:
     """POST /v1/images/generations and measure E2E latency."""
-    payload = _build_payload_common(request_input)
-    payload["response_format"] = "b64_json"
-    payload["n"] = 1
+    payload = _build_image_payload(request_input)
     return await _do_post(request_input, payload, pbar, session)
 
 
@@ -218,9 +330,7 @@ async def async_request_video_generation(
     session: Optional[aiohttp.ClientSession] = None,
 ) -> VisualGenRequestOutput:
     """POST /v1/videos/sync (sync endpoint) and measure E2E latency."""
-    payload = _build_payload_common(request_input)
-    payload["seconds"] = request_input.seconds
-    payload["fps"] = request_input.fps
+    payload = _build_video_payload(request_input)
     return await _do_post(request_input, payload, pbar, session)
 
 
@@ -258,6 +368,8 @@ async def benchmark(
     max_concurrency: Optional[int],
     gen_params: dict[str, Any],
     extra_body: Optional[dict],
+    input_reference: Optional[str] = None,
+    require_audio: bool = False,
     no_test_input: bool = False,
     request_timeout: float = 6 * 60 * 60,
     num_gpus: int = 1,
@@ -274,14 +386,17 @@ async def benchmark(
             prompt=prompt,
             api_url=api_url,
             model=model_id,
-            size=gen_params.get("size", "auto"),
-            seconds=gen_params.get("seconds", 4.0),
-            fps=gen_params.get("fps", 24),
+            size=gen_params.get("size"),
+            seconds=gen_params.get("seconds"),
+            fps=gen_params.get("fps"),
+            num_frames=gen_params.get("num_frames"),
             num_inference_steps=gen_params.get("num_inference_steps"),
             guidance_scale=gen_params.get("guidance_scale"),
             negative_prompt=gen_params.get("negative_prompt"),
             seed=gen_params.get("seed"),
             extra_body=extra_body,
+            input_reference=input_reference,
+            validate_audio=require_audio,
         )
 
     if not no_test_input:
@@ -354,13 +469,124 @@ async def benchmark(
         outputs=outputs,
         gen_params=gen_params,
     )
+    denoises = [output.denoise for output in outputs if output.success]
+    result.update(_summarize_metric("denoise", denoises, selected_percentiles))
+    result["denoises"] = denoises
+
+    num_inference_steps = gen_params.get("num_inference_steps")
+    if num_inference_steps is not None:
+        seconds_per_step = [denoise / num_inference_steps for denoise in denoises]
+        result.update(
+            _summarize_metric(
+                "seconds_per_denoising_step",
+                seconds_per_step,
+                selected_percentiles,
+            )
+        )
+        result["seconds_per_denoising_step"] = seconds_per_step
+    result["audio_validated"] = require_audio
+
+    _print_trtllm_measurements(result)
 
     return result
+
+
+def _summarize_metric(
+    name: str, values: list[float], selected_percentiles: list[float]
+) -> dict[str, Any]:
+    """Return the standard aggregate fields for one request timing."""
+    percentiles = {
+        f"p{int(percentile) if int(percentile) == percentile else percentile}": (
+            float(np.percentile(values, percentile)) if values else 0.0
+        )
+        for percentile in selected_percentiles
+    }
+    return {
+        f"mean_{name}": float(np.mean(values)) if values else 0.0,
+        f"median_{name}": float(np.median(values)) if values else 0.0,
+        f"std_{name}": float(np.std(values)) if values else 0.0,
+        f"min_{name}": float(np.min(values)) if values else 0.0,
+        f"max_{name}": float(np.max(values)) if values else 0.0,
+        f"percentiles_{name}": percentiles,
+    }
+
+
+def _print_trtllm_measurements(result: dict[str, Any]) -> None:
+    """Print the benchmark measurements used by the VisualGen perf schema."""
+    print("{s:{c}^{n}}".format(s=" TRT-LLM Measurements ", n=60, c="="))
+    print(f"{'Avg. Diffusion Time (s):':<40} {result['mean_denoise']:<10.4f}")
+    print(f"{'Avg. Generation Time (s):':<40} {result['mean_generation']:<10.4f}")
+    if "mean_seconds_per_denoising_step" in result:
+        print(
+            f"{'Avg. Seconds per Denoising Step (s/it):':<40} "
+            f"{result['mean_seconds_per_denoising_step']:<10.4f}"
+        )
+    print(f"{'Request Latency (s):':<40} {result['mean_latency']:<10.4f}")
+    print("=" * 60)
 
 
 def load_prompts(args: argparse.Namespace) -> list[VisualGenSampleRequest]:
     """Load prompts from --prompt or --prompt-file (delegates to shared util)."""
     return load_visual_gen_prompts(args.prompt, args.prompt_file, args.num_prompts)
+
+
+def _parse_extra_body(raw_value: Optional[str]) -> Optional[dict[str, Any]]:
+    """Parse and validate the optional top-level request-body object."""
+    if raw_value is None or raw_value == "":
+        return None
+    try:
+        extra_body = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in --extra-body: {exc}") from exc
+    if not isinstance(extra_body, dict):
+        raise ValueError("--extra-body must be a JSON object")
+    extra_params = extra_body.get("extra_params")
+    if extra_params is not None and not isinstance(extra_params, dict):
+        raise ValueError("--extra-body.extra_params must be a JSON object")
+    return extra_body
+
+
+def _validate_input_reference(path_value: Optional[str]) -> Optional[str]:
+    """Validate the conditioning-media path before any benchmark request."""
+    if path_value is None:
+        return None
+    path = Path(path_value).expanduser()
+    if not path.is_file():
+        raise ValueError(f"Input reference file does not exist: {path_value}")
+    return str(path.resolve())
+
+
+def _validate_request_configuration(
+    *,
+    backend: str,
+    model_id: str,
+    input_reference: Optional[str],
+    extra_body: Optional[dict[str, Any]],
+    require_audio: bool,
+) -> None:
+    """Reject incompatible client request combinations before benchmarking."""
+    if input_reference is not None and backend != "openai-videos":
+        raise ValueError("--input-reference is supported only by the openai-videos backend")
+    if input_reference is not None and extra_body and "input_reference" in extra_body:
+        raise ValueError(
+            "Specify conditioning media with --input-reference, not both "
+            "--input-reference and --extra-body.input_reference"
+        )
+    if not require_audio:
+        return
+    if backend != "openai-videos":
+        raise ValueError("--require-audio is supported only by the openai-videos backend")
+    if "cosmos3-edge" in model_id.lower():
+        raise ValueError("Cosmos3-Edge has no audio tower and cannot run an audio benchmark")
+    extra_params = (extra_body or {}).get("extra_params")
+    if not isinstance(extra_params, dict) or extra_params.get("enable_audio") is not True:
+        raise ValueError(
+            "--require-audio requires --extra-body with extra_params.enable_audio=true"
+        )
+    if (extra_body or {}).get("format") != "mp4":
+        raise ValueError("--require-audio requires MP4 output (set --extra-body.format='mp4')")
+    if shutil.which("ffprobe") is None:
+        raise ValueError("--require-audio needs ffprobe to verify the generated audio stream")
 
 
 def _resolve_num_gpus(args: argparse.Namespace) -> int:
@@ -407,16 +633,15 @@ def main(args: argparse.Namespace):
 
     input_requests = load_prompts(args)
 
-    seconds = args.seconds
+    gen_params: dict[str, Any] = {}
+    if args.size is not None:
+        gen_params["size"] = args.size
+    if args.seconds is not None:
+        gen_params["seconds"] = args.seconds
+    if args.fps is not None:
+        gen_params["fps"] = args.fps
     if args.num_frames is not None:
-        seconds = args.num_frames / args.fps
-        print(f"Computed seconds={seconds:.3f} from num_frames={args.num_frames} / fps={args.fps}")
-
-    gen_params: dict[str, Any] = {
-        "size": args.size,
-        "seconds": seconds,
-        "fps": args.fps,
-    }
+        gen_params["num_frames"] = args.num_frames
     if args.num_inference_steps is not None:
         gen_params["num_inference_steps"] = args.num_inference_steps
     if args.guidance_scale is not None:
@@ -426,12 +651,15 @@ def main(args: argparse.Namespace):
     if args.seed is not None:
         gen_params["seed"] = args.seed
 
-    extra_body = None
-    if args.extra_body:
-        try:
-            extra_body = json.loads(args.extra_body)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Invalid JSON in --extra-body: {e}") from e
+    extra_body = _parse_extra_body(args.extra_body)
+    input_reference = _validate_input_reference(args.input_reference)
+    _validate_request_configuration(
+        backend=backend,
+        model_id=model_id,
+        input_reference=input_reference,
+        extra_body=extra_body,
+        require_audio=args.require_audio,
+    )
 
     num_gpus = _resolve_num_gpus(args)
 
@@ -450,6 +678,8 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             gen_params=gen_params,
             extra_body=extra_body,
+            input_reference=input_reference,
+            require_audio=args.require_audio,
             no_test_input=args.no_test_input,
             request_timeout=args.request_timeout,
             num_gpus=num_gpus,
@@ -464,6 +694,8 @@ def main(args: argparse.Namespace):
         result_json["backend"] = backend
         result_json["model_id"] = model_id
         result_json["num_prompts"] = args.num_prompts
+        if input_reference is not None:
+            result_json["input_reference"] = Path(input_reference).name
 
         if args.metadata:
             for item in args.metadata:
@@ -476,7 +708,13 @@ def main(args: argparse.Namespace):
         result_json = {**result_json, **benchmark_result}
 
         if not args.save_detailed:
-            for field_name in ["e2e_latencies", "errors"]:
+            for field_name in [
+                "latencies",
+                "generations",
+                "denoises",
+                "seconds_per_denoising_step",
+                "errors",
+            ]:
                 result_json.pop(field_name, None)
 
         result_json["request_rate"] = (
@@ -485,6 +723,7 @@ def main(args: argparse.Namespace):
         result_json["burstiness"] = args.burstiness
         result_json["max_concurrency"] = args.max_concurrency
         result_json["num_gpus"] = num_gpus
+        result_json["audio_validated"] = benchmark_result["audio_validated"]
 
         base_model_id = model_id.split("/")[-1]
         max_concurrency_str = (
@@ -559,16 +798,29 @@ if __name__ == "__main__":
     gen_group.add_argument(
         "--size",
         type=str,
-        default="auto",
-        help="Output resolution in WxH format (e.g. 480x832) or 'auto'.",
+        default=None,
+        help=(
+            "Output resolution in WxH format (e.g. 480x832) or 'auto'. "
+            "Omitted uses the checkpoint default."
+        ),
     )
-    gen_group.add_argument("--seconds", type=float, default=4.0, help="Video duration in seconds.")
-    gen_group.add_argument("--fps", type=int, default=16, help="Frames per second.")
+    gen_group.add_argument(
+        "--seconds",
+        type=float,
+        default=None,
+        help="Video duration in seconds. Omitted uses the checkpoint default.",
+    )
+    gen_group.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Frames per second. Omitted uses the checkpoint default.",
+    )
     gen_group.add_argument(
         "--num-frames",
         type=int,
         default=None,
-        help="Total frames to generate. Overrides --seconds (computed as num_frames / fps).",
+        help="Total frames to generate. Overrides --seconds at the server.",
     )
     gen_group.add_argument(
         "--num-inference-steps", type=int, default=None, help="Number of diffusion denoising steps."
@@ -586,7 +838,21 @@ if __name__ == "__main__":
         "--extra-body",
         type=str,
         default=None,
-        help="JSON string of extra request body parameters (e.g. '{\"guidance_rescale\": 0.7}').",
+        help=(
+            "JSON object of extra top-level request fields. Model-specific fields "
+            "belong in the nested extra_params object."
+        ),
+    )
+    gen_group.add_argument(
+        "--input-reference",
+        type=str,
+        default=None,
+        help="Image or video conditioning file for multipart video requests.",
+    )
+    gen_group.add_argument(
+        "--require-audio",
+        action="store_true",
+        help="Validate that every MP4 video response contains an audio stream with ffprobe.",
     )
 
     traffic_group = parser.add_argument_group("Traffic Control")

@@ -10,6 +10,8 @@ These examples show how to interact with the visual generation server using both
 - **Video Generation**:
   - Text-to-video generation (T2V) - generate videos from text prompts only
   - Text+Image-to-video generation (TI2V) - generate videos from text + reference image
+  - Video-to-video generation (V2V) - generate videos from a reference video
+  - Cosmos3 video generation with synchronized audio (T2AV/TI2AV)
   - Both synchronous and asynchronous modes supported
   - Multipart/form-data support for file uploads
 - **Video Management**: Retrieving and deleting generated videos
@@ -51,6 +53,116 @@ Before running these examples, ensure you have:
    ```
    For LTX-2, you need to provide a proper text_encoder_path in `./configs/ltx2.yml`.
 
+## Benchmark Cosmos3 online serving
+
+`benchmark_visual_gen.sh` is the portable single-node entry point for Cosmos3
+online-serving benchmarks. It starts `trtllm-serve`, waits for `/health`, runs
+the synchronous image or video endpoint, validates the saved result, and stops
+the server. Acquire the node before running the script; `trtllm-serve` starts
+all workers required by the VisualGen config.
+
+| `MODE` | Endpoint | Request encoding | Required conditioning | Required `extra_params` |
+|--------|----------|------------------|-----------------------|-------------------------|
+| `t2i` | `/v1/images/generations` | JSON | None | `output_type: image` |
+| `t2v` | `/v1/videos/generations` | JSON | None | None |
+| `i2v` | `/v1/videos/generations` | Multipart | Image `INPUT_REFERENCE` | None |
+| `v2v` | `/v1/videos/generations` | Multipart | Video `INPUT_REFERENCE` | Optional V2V conditioning fields |
+| `t2av` | `/v1/videos/generations` | JSON | None | `enable_audio: true` |
+| `ti2av` | `/v1/videos/generations` | Multipart | Image `INPUT_REFERENCE` | `enable_audio: true` |
+
+The server classifies `INPUT_REFERENCE` from its bytes, not its filename
+extension. `EXTRA_PARAMS` is a JSON object containing model-specific fields;
+the wrapper places it under the request's top-level `extra_params` field. The
+wrapper supplies the required `output_type` and `enable_audio` values for the
+selected mode and rejects conflicting values.
+
+```bash
+# Text to image
+MODE=t2i MODEL=nvidia/Cosmos3-Super-Text2Image \
+SERVER_CONFIG=examples/visual_gen/configs/cosmos3-t2i-1gpu.yaml \
+./examples/visual_gen/serve/benchmark_visual_gen.sh
+
+# Text to video
+MODE=t2v MODEL=nvidia/Cosmos3-Nano \
+SERVER_CONFIG=examples/visual_gen/configs/cosmos3-nano-1gpu.yaml \
+./examples/visual_gen/serve/benchmark_visual_gen.sh
+
+# Image-conditioned video. I2V and TI2V use the same wire request.
+MODE=i2v MODEL=nvidia/Cosmos3-Super-Image2Video-4Step SERVER_CONFIG= \
+INPUT_REFERENCE='/data/conditioning image.jpg' \
+./examples/visual_gen/serve/benchmark_visual_gen.sh
+
+# Video-conditioned video
+MODE=v2v MODEL=nvidia/Cosmos3-Super \
+SERVER_CONFIG=examples/visual_gen/configs/cosmos3-nano-1gpu.yaml \
+INPUT_REFERENCE=/data/reference.mp4 \
+EXTRA_PARAMS='{"condition_video_latent_indexes":[0,1],"condition_video_keep":"first"}' \
+./examples/visual_gen/serve/benchmark_visual_gen.sh
+
+# Text to video with synchronized audio
+MODE=t2av MODEL=nvidia/Cosmos3-Nano \
+SERVER_CONFIG=examples/visual_gen/configs/cosmos3-nano-1gpu.yaml \
+./examples/visual_gen/serve/benchmark_visual_gen.sh
+
+# Image-conditioned video with synchronized audio
+MODE=ti2av MODEL=nvidia/Cosmos3-Super \
+SERVER_CONFIG=examples/visual_gen/configs/cosmos3-nano-1gpu.yaml \
+INPUT_REFERENCE='/data/conditioning image.jpg' \
+./examples/visual_gen/serve/benchmark_visual_gen.sh
+```
+
+Cosmos3-Nano and Cosmos3-Super are audio-capable. Cosmos3-Edge has no
+audio tower and is rejected for `t2av`/`ti2av`. Audio modes force MP4 output,
+require FFmpeg for audio muxing, and use `ffprobe` to confirm that every
+response contains an audio stream. The pure-Python AVI fallback drops audio,
+so a returned video alone is not considered a successful audio benchmark.
+These modes generate video with an audio track; they do not provide standalone
+audio-only generation.
+
+### Multi-GPU configs
+
+Use the normal server command on a single node. No external launcher is needed:
+
+```bash
+# Four workers: tp_size=2 x ulysses_size=2
+MODE=t2v MODEL=nvidia/Cosmos3-Super \
+SERVER_CONFIG=examples/visual_gen/configs/cosmos3-super-4gpu.yaml \
+./examples/visual_gen/serve/benchmark_visual_gen.sh
+
+# Eight workers: use the eight-GPU config supplied with the checkout
+MODE=t2v MODEL=nvidia/Cosmos3-Super \
+SERVER_CONFIG=examples/visual_gen/configs/cosmos3-super-8gpu.yaml \
+./examples/visual_gen/serve/benchmark_visual_gen.sh
+```
+
+The wrapper passes the same config to the benchmark client through
+`--visual-gen-args`, so per-GPU throughput uses the worker count resolved from
+`parallel_config`. Set `SERVER_CONFIG=` intentionally for checkpoints whose
+metadata supplies the complete configuration, such as Cosmos3-Edge and
+Cosmos3-Super-Image2Video-4Step. `NUM_GPUS` can explicitly describe such a
+deployment when it uses more than one worker.
+
+Generation controls (`SIZE`, `SECONDS_TO_GENERATE`, `FPS`, `NUM_FRAMES`,
+`NUM_INFERENCE_STEPS`, `GUIDANCE_SCALE`, `SEED`, and `NEGATIVE_PROMPT`) are sent
+only when explicitly set. In particular, leaving `NUM_INFERENCE_STEPS` unset
+preserves the fixed checkpoint schedule of distilled 4-step models.
+
+Traffic controls are `NUM_PROMPTS`, `REQUEST_RATE`, `BURSTINESS`,
+`MAX_CONCURRENCY`, and `REQUEST_TIMEOUT`. Each run uses a timestamped result
+directory by default and retains:
+
+- `server.log`, including model-only timings such as `Total pipeline time`
+- `benchmark.log`, the client console output
+- `result.json`, validated to have all requests complete and the expected GPU count
+- `metadata.json`, including model, config, mode, worker count, traffic settings,
+  and conditioning-media basename (never the media bytes)
+
+The result reports average diffusion (`mean_denoise`), generation
+(`mean_generation`), request latency (`mean_latency`), seconds per denoising
+step when the resolved step count is known, and Cosmos3 vision-decode time when
+the server log exposes it. `Total pipeline time` has no exact benchmark-schema
+equivalent and remains only in `server.log`.
+
 ## Examples
 
 Current supported & tested models:
@@ -60,6 +172,8 @@ Current supported & tested models:
 3. FLUX.2 for image generation (t2i)
 4. LTX-2 for video generation with audio (t2v, ti2v)
 5. Qwen-Image for image generation (t2i)
+6. Cosmos3 for image, video, image/video-conditioned video, and synchronized
+   audio-video generation as supported by the selected checkpoint
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
@@ -429,8 +543,8 @@ curl -X DELETE "http://localhost:8000/v1/videos/{video_id}"
 
 | Endpoint | Method | Mode | Content-Type | Purpose |
 |----------|--------|------|--------------|---------|
-| `/v1/videos` | POST | Async | JSON or Multipart | Create video job (T2V/TI2V) |
-| `/v1/videos/sync` | POST | Sync | JSON or Multipart | Generate video sync (T2V/TI2V) |
+| `/v1/videos` | POST | Async | JSON or Multipart | Create video job (T2V/I2V/V2V/T2AV/TI2AV) |
+| `/v1/videos/sync` | POST | Sync | JSON or Multipart | Generate video sync (T2V/I2V/V2V/T2AV/TI2AV) |
 | `/v1/videos/{id}` | GET | - | - | Get video status/metadata |
 | `/v1/videos/{id}/content` | GET | - | - | Download video file |
 | `/v1/videos/{id}` | DELETE | - | - | Delete video |
@@ -439,7 +553,8 @@ curl -X DELETE "http://localhost:8000/v1/videos/{video_id}"
 
 **Note:** Both `/v1/videos` (async) and `/v1/videos/sync` (sync) support:
 - **JSON**: Standard text-to-video (T2V)
-- **Multipart/Form-Data**: Text+image-to-video (TI2V) with file upload
+- **Multipart/Form-Data**: Image- or video-conditioned generation with file upload
+- **Cosmos3 audio-video**: `extra_params.enable_audio=true` on a Nano or Super checkpoint
 
 ## Error Handling
 
