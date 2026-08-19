@@ -18,12 +18,36 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <limits>
 #include <torch/extension.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
+
+namespace
+{
+
+void checkInt32Dim(char const* name, int64_t value)
+{
+    TORCH_CHECK(value <= std::numeric_limits<int>::max(), name, " must fit in int32, got ", value);
+}
+
+void checkInt32Product(char const* name, int64_t lhs, int64_t rhs)
+{
+    TORCH_CHECK(lhs == 0 || rhs <= std::numeric_limits<int>::max() / lhs, name, " must fit in int32, got ", lhs, "*",
+        rhs);
+}
+
+void checkInt32SumProduct(char const* name, int64_t lhs, int64_t a, int64_t b, int64_t c)
+{
+    TORCH_CHECK(a <= std::numeric_limits<int64_t>::max() - b && a + b <= std::numeric_limits<int64_t>::max() - c,
+        name, " sum overflows int64");
+    checkInt32Product(name, lhs, a + b + c);
+}
+
+} // namespace
 
 // Post-Ulysses A2A unscatter: take Q/K/V tensors of shape [P, B, Sp, H, D]
 // (output of the head-dim -> seq-dim all-to-all) and produce SDPA-ready Q/K/V.
@@ -61,6 +85,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     int64_t const Sp_q = q_in.size(2), H_q = q_in.size(3);
     int64_t const Sp_k = k_in.size(2), H_k = k_in.size(3);
     int64_t const Sp_v = v_in.size(2), H_v = v_in.size(3);
+    checkInt32Dim("P", P);
+    checkInt32Dim("B", B);
+    checkInt32Dim("D", D);
+    checkInt32Dim("Sp_q", Sp_q);
+    checkInt32Dim("H_q", H_q);
+    checkInt32Dim("Sp_k", Sp_k);
+    checkInt32Dim("H_k", H_k);
+    checkInt32Dim("Sp_v", Sp_v);
+    checkInt32Dim("H_v", H_v);
+    checkInt32Product("P*Sp_q", P, Sp_q);
+    checkInt32Product("P*Sp_k", P, Sp_k);
+    checkInt32Product("P*Sp_v", P, Sp_v);
+    checkInt32SumProduct("P*(Sp_q+Sp_k+Sp_v)", P, Sp_q, Sp_k, Sp_v);
 
     bool const is_hnd = (layout == 0);
     auto opts = q_in.options();
@@ -115,6 +152,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_packed_qkv_post_
     int64_t const H = qkv_in.size(4);
     int64_t const D = qkv_in.size(5);
     TORCH_CHECK(D % 8 == 0, "D (last dim) must be divisible by 8 (bf16 vec=8)");
+    checkInt32Dim("P", P);
+    checkInt32Dim("B", B);
+    checkInt32Dim("Sp", Sp);
+    checkInt32Dim("H", H);
+    checkInt32Dim("D", D);
+    checkInt32Product("P*Sp", P, Sp);
+    checkInt32Product("3*P*Sp", 3, P * Sp);
 
     bool const is_hnd = (layout == 0);
     auto opts = qkv_in.options();

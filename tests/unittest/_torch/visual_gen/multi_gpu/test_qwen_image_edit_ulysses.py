@@ -30,6 +30,7 @@ from _visual_gen_dist_utils import spawn_with_retry
 
 # The unit test creates its own torch.distributed NCCL process group. Disable the
 # TRT-LLM MPI bootstrap path so importing tensorrt_llm does not initialize MPI.
+_OLD_TLLM_DISABLE_MPI = os.environ.get("TLLM_DISABLE_MPI")
 os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -63,6 +64,15 @@ def _cleanup_distributed_env() -> Generator[None, None, None]:
         dist.destroy_process_group()
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_mpi_env() -> Generator[None, None, None]:
+    yield
+    if _OLD_TLLM_DISABLE_MPI is None:
+        os.environ.pop("TLLM_DISABLE_MPI", None)
+    else:
+        os.environ["TLLM_DISABLE_MPI"] = _OLD_TLLM_DISABLE_MPI
+
+
 def _distributed_worker(
     rank: int,
     world_size: int,
@@ -89,6 +99,8 @@ def _distributed_worker(
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, **kwargs) -> None:
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     spawn_with_retry(
         lambda port: mp.spawn(
             _distributed_worker,
@@ -249,5 +261,6 @@ def _test_qwen_image_edit_ulysses_attention(rank: int, world_size: int) -> None:
     dist.barrier()
 
 
+@pytest.mark.gpu2
 def test_qwen_image_edit_ulysses_attention_2gpu() -> None:
     run_test_in_distributed(2, _test_qwen_image_edit_ulysses_attention)
