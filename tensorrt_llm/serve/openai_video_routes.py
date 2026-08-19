@@ -400,6 +400,10 @@ class _VideoRoutesMixin:
         """Background task to generate video and save to storage."""
         try:
             background_start = time.perf_counter()
+            job = await VIDEO_STORE.get(video_id)
+            if job:
+                job.status = "generating"
+                await VIDEO_STORE.upsert(video_id, job)
             future = self.generator.generate_async(inputs=request.prompt, params=params)
             output = await future
 
@@ -412,6 +416,13 @@ class _VideoRoutesMixin:
                     job.error = "Video generation failed: output.video is None"
                     await VIDEO_STORE.upsert(video_id, job)
                 return
+
+            # Generation finished, encoding starts: expose the transition so
+            # clients can measure pure generation time on their side.
+            job = await VIDEO_STORE.get(video_id)
+            if job:
+                job.status = "encoding"
+                await VIDEO_STORE.upsert(video_id, job)
 
             if is_tensor_format(request.format):
                 # One tensor file per batch item, mirroring the encoder
@@ -427,11 +438,19 @@ class _VideoRoutesMixin:
                 resolved_fmt, _ = resolve_video_format(request.format)
                 batch_size = output.video.shape[0] if output.video.dim() == 5 else 1
                 paths_in = [self.media_storage_path / f"{video_id}_{i}" for i in range(batch_size)]
-                saved_paths = output.save(
-                    paths_in,
+                _save_kwargs = dict(
                     format=resolved_fmt,
                     frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
                 )
+                if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
+                    # Offload the blocking encode to a thread so the event loop
+                    # stays responsive during ``encoding`` — pollers can observe
+                    # the state and other requests progress while it encodes.
+                    saved_paths = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: output.save(paths_in, **_save_kwargs)
+                    )
+                else:
+                    saved_paths = output.save(paths_in, **_save_kwargs)
             latency = time.perf_counter() - background_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0

@@ -378,6 +378,8 @@ curl -X POST "http://localhost:8000/v1/videos" \
 curl -X GET "http://localhost:8000/v1/videos/{video_id}"
 ```
 
+The async job's `status` advances `queued` → `generating` (model inference) → `encoding` (writing the file) → `completed`. Poll for the `encoding` transition to measure generation time before encoding starts, and for `completed` to download via `/content`.
+
 ### Download Video
 ```bash
 # The server returns either MP4 (with ffmpeg) or AVI (without ffmpeg)

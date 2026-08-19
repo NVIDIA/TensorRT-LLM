@@ -23,7 +23,9 @@ from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
 
+import httpx
 import pytest
+import pytest_asyncio
 import torch
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -130,6 +132,21 @@ def _drive_job_to_completion(client, video_id, timeout: float = 5.0):
         if status in ("completed", "failed"):
             return status
         time.sleep(0.05)
+    return None
+
+
+async def _adrive_job_to_completion(client, video_id, timeout: float = 10.0):
+    """Async counterpart of :func:`_drive_job_to_completion` for the httpx
+    ``AsyncClient`` — awaits polls on the live loop so the background task's
+    offloaded encode can progress to a terminal state.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = await client.get(f"/v1/videos/{video_id}")
+        status = resp.json().get("status")
+        if status in ("completed", "failed"):
+            return status
+        await asyncio.sleep(0.05)
     return None
 
 
@@ -364,6 +381,34 @@ def _create_server(
     return client
 
 
+def _create_async_client(generator: MockVisualGen, model_name: str = "test-model"):
+    """Build the VISUAL_GEN server and return an ``httpx.AsyncClient`` over its
+    ASGI app.
+
+    The sync ``TestClient`` drives each request through a portal and does not run
+    the event loop between requests, so a detached ``/v1/videos`` background task
+    (and its offloaded encode) never progresses. Exercising the app on the
+    caller's live loop lets the background task run to completion.
+    """
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
+        server = OpenAIServer(
+            generator=generator,
+            model=model_name,
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+        )
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server.app), base_url="http://testserver"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -387,6 +432,21 @@ def video_client(tmp_path):
     client = _create_server(gen)
     yield client
     os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+
+@pytest_asyncio.fixture()
+async def async_video_client(tmp_path):
+    """Async httpx client over the video server — drives the async
+    ``/v1/videos`` background task (incl. its offloaded encode) on a live loop.
+    """
+    gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+    os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+    client = _create_async_client(gen)
+    try:
+        yield client
+    finally:
+        await client.aclose()
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
 
 
 @pytest.fixture()
@@ -1579,6 +1639,81 @@ class TestVideoGenerationAsync:
         assert data["fps"] == 12
         assert data["size"] == "64x64"
 
+    @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
+    @pytest.mark.asyncio
+    async def test_async_video_status_transitions_generating_then_encoding(
+        self, async_video_client, monkeypatch
+    ):
+        """queued -> generating -> encoding -> completed, in order, so clients
+        can detect when generation finishes before encoding starts."""
+        seen = []
+        original_upsert = VIDEO_STORE.upsert
+
+        async def _spy_upsert(video_id, job):
+            seen.append(job.status)
+            return await original_upsert(video_id, job)
+
+        monkeypatch.setattr(VIDEO_STORE, "upsert", _spy_upsert)
+
+        resp = await async_video_client.post(
+            "/v1/videos",
+            json={"prompt": "lifecycle", "size": "32x32", "seconds": 1.0, "fps": 8},
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+
+        status = await _adrive_job_to_completion(async_video_client, video_id)
+        assert status == "completed"
+
+        assert "generating" in seen and "encoding" in seen
+        assert seen.index("generating") < seen.index("encoding") < seen.index("completed")
+
+    @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
+    @pytest.mark.asyncio
+    async def test_async_encoding_state_observable_during_encode(
+        self, async_video_client, monkeypatch
+    ):
+        """The encode is offloaded to a thread, so the event loop stays
+        responsive and a poll observes ``encoding`` while the file is written —
+        not just ``generating`` then ``completed``."""
+        import threading
+
+        release = threading.Event()
+        original_save = VisualGenOutput.save
+
+        def _blocking_save(self, *args, **kwargs):
+            # Runs in the executor thread; hold until the test sees ``encoding``.
+            release.wait(timeout=5)
+            return original_save(self, *args, **kwargs)
+
+        monkeypatch.setattr(VisualGenOutput, "save", _blocking_save)
+
+        resp = await async_video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "observe encoding",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "auto",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+
+        observed = None
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            poll = await async_video_client.get(f"/v1/videos/{video_id}")
+            observed = poll.json().get("status")
+            if observed in ("encoding", "completed", "failed"):
+                break
+            await asyncio.sleep(0.02)
+        release.set()  # never leave the encoder blocked
+        assert observed == "encoding", f"GET never observed 'encoding' (saw {observed!r})"
+
     def test_async_video_multipart(self, video_client, tmp_path):
         """Multipart async request with a real ``input_reference`` file."""
         ref_path = tmp_path / "ref.png"
@@ -1734,8 +1869,10 @@ class TestListVideos:
 
 
 class TestGetVideoMetadata:
-    def test_get_video_metadata_success(self, video_client):
-        create_resp = video_client.post(
+    @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
+    @pytest.mark.asyncio
+    async def test_get_video_metadata_success(self, async_video_client):
+        create_resp = await async_video_client.post(
             "/v1/videos",
             json={"prompt": "Space walk", "size": "64x64", "seconds": 1.0, "fps": 8},
             headers={"content-type": "application/json"},
@@ -1744,9 +1881,9 @@ class TestGetVideoMetadata:
 
         # Drive to completion so output_path/output_paths are populated on the
         # job, then confirm the status endpoint returns status only (no leak).
-        _drive_job_to_completion(video_client, video_id)
+        await _adrive_job_to_completion(async_video_client, video_id)
 
-        resp = video_client.get(f"/v1/videos/{video_id}")
+        resp = await async_video_client.get(f"/v1/videos/{video_id}")
         assert resp.status_code == 200
         data = resp.json()
         assert data["id"] == video_id
@@ -1808,6 +1945,20 @@ class TestGetVideoContent:
 
         video_id = "video_notready"
         self._insert_video_job(video_id, status="queued")
+
+        resp = client.get(f"/v1/videos/{video_id}/content")
+        assert resp.status_code == 400
+        os.environ.pop("TRTLLM_MEDIA_STORAGE_PATH", None)
+
+    @pytest.mark.parametrize("status", ["generating", "encoding"])
+    def test_get_video_content_not_ready_in_flight(self, tmp_path, status):
+        """A generating/encoding job is not downloadable yet → 400."""
+        gen = MockVisualGen(video_output=_make_dummy_video_tensor())
+        os.environ["TRTLLM_MEDIA_STORAGE_PATH"] = str(tmp_path)
+        client = _create_server(gen)
+
+        video_id = f"video_{status}"
+        self._insert_video_job(video_id, status=status)
 
         resp = client.get(f"/v1/videos/{video_id}/content")
         assert resp.status_code == 400
@@ -2658,8 +2809,9 @@ class TestAsyncVideoTransport:
     ``file`` (or unset) returns a ``FileResponse`` download;
     ``path`` returns a JSON envelope with the server-side output path(s)."""
 
-    def test_async_path_returned_at_get_content(self, video_client):
-        resp = video_client.post(
+    @pytest.mark.asyncio
+    async def test_async_path_returned_at_get_content(self, async_video_client):
+        resp = await async_video_client.post(
             "/v1/videos",
             json={
                 "prompt": "async path",
@@ -2675,10 +2827,10 @@ class TestAsyncVideoTransport:
         job = resp.json()
         assert job["response_format"] == "path"
 
-        status = _drive_job_to_completion(video_client, job["id"])
+        status = await _adrive_job_to_completion(async_video_client, job["id"])
         assert status == "completed"
 
-        content = video_client.get(f"/v1/videos/{job['id']}/content")
+        content = await async_video_client.get(f"/v1/videos/{job['id']}/content")
         assert content.status_code == 200
         body = content.json()
         assert set(body) >= {"id", "output_path"}
@@ -2687,10 +2839,11 @@ class TestAsyncVideoTransport:
         assert os.path.exists(body["output_path"])
         assert os.path.getsize(body["output_path"]) > 0
 
-    def test_async_file_still_returns_file_response(self, video_client):
+    @pytest.mark.asyncio
+    async def test_async_file_still_returns_file_response(self, async_video_client):
         """Default and explicit ``response_format='file'`` keep the
         existing ``FileResponse`` behavior."""
-        resp = video_client.post(
+        resp = await async_video_client.post(
             "/v1/videos",
             json={
                 "prompt": "async file",
@@ -2706,8 +2859,8 @@ class TestAsyncVideoTransport:
         job = resp.json()
         assert job["response_format"] == "file"
 
-        _drive_job_to_completion(video_client, job["id"])
-        content = video_client.get(f"/v1/videos/{job['id']}/content")
+        await _adrive_job_to_completion(async_video_client, job["id"])
+        content = await async_video_client.get(f"/v1/videos/{job['id']}/content")
         assert content.status_code == 200
         # AVI FileResponse carries ``video/x-msvideo``; the path
         # branch would have set ``application/json``.
