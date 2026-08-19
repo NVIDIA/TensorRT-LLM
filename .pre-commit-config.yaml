@@ -204,7 +204,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/models/modeling_bert.py |
         tensorrt_llm/_torch/models/modeling_clip.py |
         tensorrt_llm/_torch/models/modeling_deepseekv3.py |
-        tensorrt_llm/_torch/models/modeling_dflash.py |
         tensorrt_llm/_torch/models/modeling_exaone4.py |
         tensorrt_llm/_torch/models/modeling_gemma3.py |
         tensorrt_llm/_torch/models/modeling_gemma3vl.py |
@@ -974,7 +973,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/models/modeling_bert.py |
         tensorrt_llm/_torch/models/modeling_clip.py |
         tensorrt_llm/_torch/models/modeling_deepseekv3.py |
-        tensorrt_llm/_torch/models/modeling_dflash.py |
         tensorrt_llm/_torch/models/modeling_exaone4.py |
         tensorrt_llm/_torch/models/modeling_gemma3.py |
         tensorrt_llm/_torch/models/modeling_gemma3vl.py |
