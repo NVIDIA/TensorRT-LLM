@@ -1141,7 +1141,7 @@ class Sender(SenderBase):
             )
         except Exception as e:
             logger.warning(
-                f"_deliver_kv_to_agent: failed to abort receiver slice for "
+                f"_abort_receiver_slice: failed to abort receiver slice for "
                 f"rid={write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
             )
 
