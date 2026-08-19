@@ -311,13 +311,40 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     args.output = output.data_ptr();
     args.output_scale = nullptr;
 
-    tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner moe_runner(
-        args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim);
+    // No autotuner: tile_tokens_dim selects the tile, then prefer the fine-grained runner when it has
+    // a valid config for this shape.
+    using MoeRunner = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
+    bool const useFineGrained = tensorrt_llm::common::getEnvUseFineGrainedSync();
 
-    auto const moeConfigIndex = moe_runner.getDefaultValidConfigIndex(
-        args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens);
+    MoeRunner nlRunner(args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim, /* useFineGrained */ false);
 
-    auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
+    MoeRunner* moe_runner = nullptr;
+    int64_t moeConfigIndex = 0;
+    std::unique_ptr<MoeRunner> fineGrainedRunner;
+    if (useFineGrained)
+    {
+        try
+        {
+            fineGrainedRunner = std::make_unique<MoeRunner>(args.mDtypeElt, args.mUseDeepSeekFp8, tile_tokens_dim,
+                /* useFineGrained */ true);
+            moeConfigIndex = fineGrainedRunner->getDefaultValidConfigIndex(
+                args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens);
+            moe_runner = fineGrainedRunner.get();
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_DEBUG("No valid FineGrained fp8 per-tensor config for tileN=%d: %s", (int) tile_tokens_dim, e.what());
+            moe_runner = nullptr;
+        }
+    }
+    if (moe_runner == nullptr)
+    {
+        moeConfigIndex = nlRunner.getDefaultValidConfigIndex(
+            args.top_k, args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens);
+        moe_runner = &nlRunner;
+    }
+
+    auto workspace_sizes = moe_runner->getWorkspaceSizeInBytes(args, moeConfigIndex);
     at::Tensor workspace_fc1 = at::detail::empty_cuda(
         {std::get<0>(workspace_sizes)}, at::ScalarType::Char, hidden_states.device(), std::nullopt);
     at::Tensor workspace_fc2 = at::detail::empty_cuda(

@@ -506,39 +506,70 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 // use with the torch workflow autotuner class.
 class FP4BlockScaleMoeRunner : public torch::CustomClassHolder
 {
+private:
+    using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
+
 public:
     explicit FP4BlockScaleMoeRunner(int64_t actType)
         // Update this as new cubins come in
+        // Non-FineGrained cubins (sm100f, run on SM100/SM107) are tuned over these tiles. FineGrained
+        // (sm107a) cubins exist for a subset; availability is discovered per tile at runtime.
         : mSupportedTileN{8, 16, 32, 64, 128, 256}
+        , mActType{actType}
     {
-        for (int tileN : mSupportedTileN)
-        {
-            mRunners.emplace(tileN,
-                std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, tileN,
-                    static_cast<tensorrt_llm::kernels::ActType>(actType)));
-        }
     }
 
-    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(
-        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+    // Returns nullptr (cached) when no cubin exists for that (tileN, useFineGrained).
+    RunnerType* getRunnerOrNull(int32_t tileN, bool useFineGrained)
     {
-        // returns (tileN, config)
-        std::vector<std::vector<int64_t>> tactics;
-        for (auto& [tileN, runner] : mRunners)
+        auto key = std::make_tuple(tileN, useFineGrained);
+        auto it = mRunners.find(key);
+        if (it == mRunners.end())
         {
-            auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, topK, numLocalExperts);
-            if (chosen.find(tileN) == chosen.end())
+            std::unique_ptr<RunnerType> runner;
+            try
             {
-                continue;
+                runner = std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, tileN,
+                    static_cast<tensorrt_llm::kernels::ActType>(mActType), useFineGrained);
             }
-            auto config_indices_per_runner
-                = runner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
-            for (auto cfg : config_indices_per_runner)
+            catch (std::exception const& e)
             {
-                tactics.push_back({tileN, cfg});
+                TLLM_LOG_DEBUG("No %s FP4BlockScaleMoe runner for tileN=%d: %s", useFineGrained ? "FineGrained" : "non-FineGrained",
+                    tileN, e.what());
             }
+            it = mRunners.emplace(std::move(key), std::move(runner)).first;
         }
-        return tactics;
+        return it->second.get();
+    }
+
+    RunnerType& getRunner(int32_t tileN, bool useFineGrained)
+    {
+        auto* runner = getRunnerOrNull(tileN, useFineGrained);
+        TLLM_CHECK_WITH_INFO(runner != nullptr, "No %s FP4BlockScaleMoe runner available for tileN=%d",
+            useFineGrained ? "FineGrained" : "non-FineGrained", tileN);
+        return *runner;
+    }
+
+    // Tuned over the non-fine-grained tile set only: the fine-grained kernels are never profiled,
+    // so they reuse the tuned tile with their own default config.
+    [[nodiscard]] std::vector<std::vector<int64_t>> getValidConfigs(
+        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens)
+    {
+        auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, topK, numLocalExperts);
+
+        std::vector<std::vector<int64_t>> result;
+        for (int32_t tileN : mSupportedTileN)
+        {
+            if (chosen.find(tileN) == chosen.end())
+                continue;
+            auto* nlRunner = getRunnerOrNull(tileN, /* useFineGrained */ false);
+            if (nlRunner == nullptr)
+                continue;
+            for (auto cfg :
+                nlRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens))
+                result.push_back({static_cast<int64_t>(tileN), cfg});
+        }
+        return result;
     }
 
     [[nodiscard]] std::vector<torch::Tensor> run(torch::optional<torch::Tensor> const& routing_logits,
@@ -556,36 +587,62 @@ public:
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
         torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
     {
-        // moeConfigIndex corresponds to pair (tileN, config)
-        auto [tileN, config] = std::tie(moeConfigIndex[0], moeConfigIndex[1]);
-        // Autotuner has requested a default or 'fallback' config index
+        int64_t tileN = moeConfigIndex[0];
+        int64_t config = moeConfigIndex[1];
+        bool const useFineGrained = tensorrt_llm::common::getEnvUseFineGrainedSync();
+
+        auto const num_tokens = hidden_states.sizes()[0];
+        // 2x FP4 per byte element
+        auto const hidden_size = 2 * hidden_states.sizes()[1];
+
+        // No autotuner: select the tile and its default config from the full set.
         if (tileN == -1 || config == -1)
         {
-            auto const num_tokens = hidden_states.sizes()[0];
-
-            // 2x FP4 per byte element
-            auto const hidden_size = 2 * hidden_states.sizes()[1];
-
             float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / local_num_experts;
             tileN = std::clamp(nextPowerOfTwo(avg_tokens_per_expert), mSupportedTileN.front(), mSupportedTileN.back());
-
-            config = mRunners[tileN]->getDefaultValidConfigIndex(
-                top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+            config
+                = getRunner(tileN, /* useFineGrained */ false)
+                      .getDefaultValidConfigIndex(top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
         }
 
+        // Prefer the fine-grained runner for the tuned tile when it has a valid config for this shape.
+        RunnerType* runner = nullptr;
+        int64_t configToRun = config;
+        if (useFineGrained)
+        {
+            auto* fineGrainedRunner = getRunnerOrNull(tileN, /* useFineGrained */ true);
+            if (fineGrainedRunner != nullptr)
+            {
+                try
+                {
+                    configToRun = fineGrainedRunner->getDefaultValidConfigIndex(
+                        top_k, hidden_size, intermediate_size, local_num_experts, num_tokens);
+                    runner = fineGrainedRunner;
+                }
+                catch (std::exception const&)
+                {
+                    runner = nullptr; // no valid config for this shape; fall back to the tuned tactic
+                }
+            }
+        }
+        if (runner == nullptr)
+        {
+            runner = &getRunner(tileN, /* useFineGrained */ false);
+            configToRun = config;
+        }
         return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
-            routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *mRunners[tileN], config,
+            routed_scaling_factor, tileN, routing_method_type, do_finalize, mDtypeElt, *runner, configToRun,
             topk_weights, topk_ids, output);
     }
 
 private:
-    using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
-
     std::vector<int32_t> const mSupportedTileN;
-    std::unordered_map<int32_t, std::unique_ptr<RunnerType>> mRunners;
+    int64_t mActType;
+    // Keyed on (tileN, useFineGrained); a null value means "no cubin for that combination".
+    std::map<std::tuple<int32_t, bool>, std::unique_ptr<RunnerType>> mRunners;
 
     btg::Dtype mDtypeElt{btg::Dtype::E2m1};
     btg::Dtype mDtypeAct{btg::Dtype::E2m1};
@@ -684,6 +741,12 @@ torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
     return torch::index_select(matrix, 0, permuteIndices);
 }
 
+// See common::setFineGrainedSyncDisabledOverride.
+void setFineGrainedSyncDisabledOverride(bool disabled)
+{
+    tensorrt_llm::common::setFineGrainedSyncDisabledOverride(disabled);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -698,6 +761,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         .def(torch::init<int64_t>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &tensorrt_llm::torch_ext::FP8FP4BlockScaleMoeRunner::run);
+    m.def("set_fine_grained_sync_disabled_override(bool disabled) -> ()",
+        &tensorrt_llm::torch_ext::setFineGrainedSyncDisabledOverride);
 }
 
 // Accepts both CPU and CUDA tensors
