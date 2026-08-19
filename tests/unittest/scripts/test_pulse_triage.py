@@ -61,6 +61,20 @@ def test_extract_ticket_refs_rejects_dictionary_value():
         )
 
 
+def test_extract_ticket_refs_accepts_known_agent_prefix(capsys):
+    response_value = (
+        "All dependency actions have been submitted. Now I'll produce the final JSON output.\n\n"
+        '{"license_correction_ticket": null, "version_bump_tickets": []}'
+    )
+
+    refs = extract_ticket_refs({"value": response_value})
+
+    assert refs == {"vulnerability": []}
+    error_log = capsys.readouterr().err
+    assert "[Triage agent response prefix workaround]" in error_log
+    assert repr(response_value) in error_log
+
+
 def test_extract_ticket_refs_rejects_explanation_before_json(capsys):
     response_value = (
         'Triage completed.\n{"license_correction_ticket": null, "version_bump_tickets": []}'
