@@ -55,7 +55,15 @@ def _is_sm100f() -> bool:
 # --------------------------------------------------------------------------
 
 
-def _create_manager(tp_size: int, sparse_layers: List[int], num_layers: int = 4):
+def _create_manager(
+    tp_size: int,
+    sparse_layers: List[int],
+    num_layers: int = 4,
+    *,
+    tokens_per_block: int = PAGE_SIZE,
+    dtype=None,
+    num_one_model_draft_layers: int = 0,
+):
     from tensorrt_llm import Mapping
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
     from tensorrt_llm.bindings import DataType
@@ -63,27 +71,29 @@ def _create_manager(tp_size: int, sparse_layers: List[int], num_layers: int = 4)
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
     max_num_tokens = 2048
+    dtype = DataType.BF16 if dtype is None else dtype
     return MiniMaxM3KVCacheManagerV2(
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=max_num_tokens,
             event_buffer_max_size=0,
-            dtype="auto",
+            dtype="nvfp4" if dtype == DataType.NVFP4 else "auto",
         ),
         kv_cache_type=CacheTypeCpp.SELF,
         num_layers=num_layers,
         num_kv_heads=2,
         head_dim=HEAD_DIM,
-        tokens_per_block=PAGE_SIZE,
+        tokens_per_block=tokens_per_block,
         max_seq_len=512,
         max_batch_size=4,
         mapping=Mapping(world_size=tp_size, rank=0, tp_size=tp_size, pp_size=1),
-        dtype=DataType.BF16,
+        dtype=dtype,
         vocab_size=1024,
         max_num_tokens=max_num_tokens,
         sparse_layer_ids=list(sparse_layers),
         disable_index_value_layer_ids=list(sparse_layers),
         sparse_index_dim=HEAD_DIM,
+        num_one_model_draft_layers=num_one_model_draft_layers,
     )
 
 
@@ -136,6 +146,76 @@ def test_subpage_pool_stops_at_the_last_slots_v():
         manager.shutdown()
 
 
+def test_hybrid_target_dense_pool_stays_fp8_p128_while_sparse_is_nvfp4_p128():
+    from tensorrt_llm.bindings import DataType
+
+    manager = _create_manager(
+        2,
+        [3],
+        dtype=DataType.NVFP4,
+        tokens_per_block=128,
+    )
+    try:
+        buffers = manager.get_buffers(0, "HND")
+        k, v = buffers[:, 0], buffers[:, 1]
+        data_pool, slot_stride, pages_per_role = manager.get_dense_kv_subpage_pool(0)
+        assert pages_per_role == 1
+        assert data_pool.dtype == torch.float8_e4m3fn
+        assert data_pool.shape[2:] == (128, HEAD_DIM)
+        for slot in (0, int(k.shape[0]) - 1):
+            assert data_pool[slot * slot_stride].data_ptr() == k[slot].data_ptr()
+            assert data_pool[slot * slot_stride + 1].data_ptr() == v[slot].data_ptr()
+        with pytest.raises(RuntimeError, match="has no NVFP4 block-scale pool"):
+            manager.get_dense_kv_scale_subpage_pool(0)
+
+        dense_buffers = manager.kv_cache_manager_py_config.layers[0].buffers
+        assert {buffer.role for buffer in dense_buffers} == {
+            manager._get_pool_roles(0)[0],
+            manager._get_pool_roles(0)[1],
+        }
+        assert all(buffer.tokens_per_block_override is None for buffer in dense_buffers)
+        sparse = manager.get_buffers(3, "HND")
+        sparse_scales = manager.get_block_scale_buffers(3, "HND")
+        assert sparse.dtype == torch.int8
+        assert sparse.shape[3:] == (128, HEAD_DIM // 2)
+        assert sparse_scales.shape[3:] == (128, HEAD_DIM // 16)
+    finally:
+        manager.shutdown()
+
+
+def test_hybrid_shared_eagle_view_points_at_the_fp8_p32_pool():
+    from tensorrt_llm.bindings import DataType
+
+    manager = _create_manager(
+        2,
+        [3],
+        num_layers=5,
+        dtype=DataType.NVFP4,
+        tokens_per_block=128,
+        num_one_model_draft_layers=1,
+    )
+    try:
+        draft_layer = 4
+        view = manager.get_draft_subpage_view()
+        assert view is not None
+        assert view.tokens_per_block == 32
+        assert view.dtype == DataType.FP8
+        k, _v = manager.get_fp8_dense_buffers(draft_layer)
+        assert int(view.kv_cache_pool_pointers[0, 0]) == k.data_ptr()
+        assert int(view.kv_cache_pool_pointers[0, 1]) == 0
+        assert view._source_pool_id == int(
+            manager.kv_cache_pool_mapping[manager.layer_offsets[draft_layer], 0]
+        )
+        assert view.kv_cache_pool_mapping[manager.layer_offsets[draft_layer]].tolist() == [0, 0]
+        draft_buffers = manager.kv_cache_manager_py_config.layers[
+            manager.layer_offsets[draft_layer]
+        ].buffers
+        assert len(draft_buffers) == 2
+        assert all(buffer.tokens_per_block_override == 32 for buffer in draft_buffers)
+    finally:
+        manager.shutdown()
+
+
 # --------------------------------------------------------------------------
 # Block-table expansion
 # --------------------------------------------------------------------------
@@ -149,6 +229,15 @@ def test_subpage_block_table_splits_k_and_v_rows():
     assert table.dtype == torch.int32
     assert table[:, 0].tolist() == [[0, 27, 63], [18, 45, 99]]
     assert table[:, 1].tolist() == [[1, 28, 64], [19, 46, 100]]
+
+
+def test_subpage_block_table_expands_logical_p128_to_physical_p32():
+    slots = torch.tensor([[0, 3]], device="cuda", dtype=torch.int32)
+    table = subpage_block_table(slots, subpages_per_slot=36, pages_per_role=4)
+
+    assert table.shape == (1, 2, 8)
+    assert table[0, 0].tolist() == [0, 1, 2, 3, 108, 109, 110, 111]
+    assert table[0, 1].tolist() == [4, 5, 6, 7, 112, 113, 114, 115]
 
 
 def test_subpage_block_table_reuses_one_buffer():
