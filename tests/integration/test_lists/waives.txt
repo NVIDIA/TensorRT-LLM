@@ -312,7 +312,6 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::Tes
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8 SKIP (https://nvbugs/6273850)
 full:sm100/unittest/bindings SKIP (Disable for Blackwell)
 kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill SKIP (https://nvbugs/6428002)
-kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill_eviction_block_reuse SKIP (https://nvbugs/6607481)
 kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction[cuda_graph] SKIP (https://nvbugs/6600098)
 kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction_with_block_reuse SKIP (https://nvbugs/6462303)
 kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_overlap_scheduler[non_overlap] SKIP (https://nvbugs/6600098)
