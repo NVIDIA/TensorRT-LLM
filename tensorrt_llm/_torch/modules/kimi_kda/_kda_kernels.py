@@ -28,6 +28,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from ..fla.index import prepare_chunk_indices
+from ..fla.l2norm import l2norm_fwd
 from . import _kda_decode
 
 try:
@@ -99,10 +101,6 @@ def is_intree_prefill_available() -> bool:
         return True
     except Exception:
         return False
-
-
-def _load_fla_chunk_kda() -> ModuleType:
-    return importlib.import_module("fla.ops.kda")
 
 
 # ---------------------------------------------------------------------------
@@ -209,16 +207,6 @@ class KDAKernelDispatch:
                     f"verify={self.verify_kernel_path}"
                 )
 
-    def get_prefill_source(self) -> str:
-        if self.prefill_kernel_path == "optimized":
-            return _load_prefill_module().__file__ or "<custom_ops.cute_dsl_kimi_k3>"
-        return _load_fla_chunk_kda().__file__ or "<fla.ops.kda>"
-
-    def get_decode_source(self) -> str:
-        if self.decode_kernel_path == "optimized":
-            return _kda_decode.__file__ or "<kimi_kda._kda_decode>"
-        return _load_fla_chunk_kda().__file__ or "<fla.ops.kda>"
-
     def mtp_verify(self, **kwargs) -> torch.Tensor:
         """Run the fused KDA multi-token verify kernel.
 
@@ -255,11 +243,8 @@ class KDAKernelDispatch:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run KDA chunked prefill.
 
-        On the optimized path this replays the preprocessing that FLA's
-        ``ChunkKDAFunction.forward`` performs when the caller enables
-        ``use_qk_l2norm_in_kernel``, ``use_beta_sigmoid_in_kernel``,
-        ``use_gate_in_kernel``, and ``state_v_first``; then dispatches to
-        the in-tree ``trtllm::kda_prefill`` CuTe DSL op.
+        On the optimized path, beta sigmoid runs inside the in-tree CuTe DSL
+        op. Q/K L2 normalization uses the in-tree Triton kernels.
 
         On the FLA path it calls ``fla.ops.kda.chunk_kda`` directly with the
         matching flags so the semantics are byte-equivalent.
@@ -275,8 +260,6 @@ class KDAKernelDispatch:
         use_optimized = self.prefill_kernel_path == "optimized"
         chunk_indices = None
         if use_optimized and cu_seqlens is not None:
-            from fla.ops.utils.index import prepare_chunk_indices
-
             chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
             # The persistent K123 scheduler needs at least 4 total chunks
             # (cgs_per_head = NT // 4 cooperative groups per head). The
@@ -285,19 +268,16 @@ class KDAKernelDispatch:
             # batches (short-prompt contexts, NT < 4) launch with a
             # zero-size grid -> DSLCudaRuntimeError. Route them to the FLA
             # reference path (negligible perf impact at these sizes). The
-            # check must happen HERE, before the l2norm/beta-sigmoid
-            # pre-transforms below: the FLA path applies both in-kernel.
+            # check must happen before dispatch: the FLA fallback applies
+            # Q/K normalization and beta sigmoid in its own kernels.
             if chunk_indices.shape[0] < 4:
                 use_optimized = False
 
         if use_optimized:
             import torch.nn.functional as F
-            from fla.modules.l2norm import l2norm_fwd
-            from fla.ops.common.gate import fused_beta_sigmoid
 
-            q, _ = l2norm_fwd(q)
-            k, _ = l2norm_fwd(k)
-            beta = fused_beta_sigmoid(beta, scale=1.0).to(torch.bfloat16)
+            q = l2norm_fwd(q)
+            k = l2norm_fwd(k)
 
             real_T = q.shape[1]
             if cu_seqlens is not None:
@@ -339,6 +319,7 @@ class KDAKernelDispatch:
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
                 use_gate_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
                 A_log=A_log_kernel,
                 dt_bias=dt_bias_kernel,
             )
@@ -354,7 +335,7 @@ class KDAKernelDispatch:
 
         from fla.ops.kda import chunk_kda
 
-        o, final_state = chunk_kda(
+        return chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -373,7 +354,6 @@ class KDAKernelDispatch:
             state_v_first=True,
             cu_seqlens=cu_seqlens,
         )
-        return o, final_state
 
     def decode_kda(self, **kwargs) -> torch.Tensor:
         """Run the fused KDA single-token decode kernel.
