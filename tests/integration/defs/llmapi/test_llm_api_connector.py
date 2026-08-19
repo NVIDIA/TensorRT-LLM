@@ -596,9 +596,17 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
-    assert len(
-        scheduler.update_state_after_alloc.call_args.args[1]) == math.ceil(
-            CHUNK_SIZE * 2 / BLOCK_SIZE)
+    # V1 allocates for the whole prompt when the sequence is added, so every
+    # block exists on the first chunk. V2 allocates per chunk, which is the
+    # lower-peak-memory behaviour and the one to keep; the remaining blocks
+    # arrive as append-deltas in `new_block_ids` on the next chunk, so no
+    # information is lost. The expectation is split rather than V2 changed.
+    total_blocks = math.ceil(CHUNK_SIZE * 2 / BLOCK_SIZE)
+    first_chunk_blocks = (math.ceil(CHUNK_SIZE / BLOCK_SIZE)
+                          if use_kv_cache_manager_v2 else total_blocks)
+
+    assert len(scheduler.update_state_after_alloc.call_args.args[1]
+               ) == first_chunk_blocks
 
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         sched_output = call.args[0]
@@ -613,18 +621,18 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
             req = sched_output.cached_requests[0]
 
         if i == 0:
-            # The first prefill chunk.
-            # All of the prefill tokens and all the blocks should be provided upfront.
+            # The first prefill chunk. All of the prefill tokens are provided
+            # upfront on both managers; the blocks are whatever has been
+            # allocated so far.
             assert req.computed_position == 0
             assert len(req.new_tokens) == CHUNK_SIZE * 2
-            assert len(req.new_block_ids) == math.ceil(CHUNK_SIZE * 2 /
-                                                       BLOCK_SIZE)
+            assert len(req.new_block_ids) == first_chunk_blocks
             assert req.num_scheduled_tokens == CHUNK_SIZE
         elif i == 1:
             # The second prefill chunk.
             assert req.computed_position == CHUNK_SIZE
             assert len(req.new_tokens) == 0
-            assert len(req.new_block_ids) == 0
+            assert len(req.new_block_ids) == total_blocks - first_chunk_blocks
             assert req.num_scheduled_tokens == CHUNK_SIZE
         elif i == 2 and use_overlap_scheduler:
             assert len(req.new_tokens) == 0
@@ -634,6 +642,30 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
             assert req.num_scheduled_tokens == 1
     assert len(scheduler.request_finished.call_args.args[1]) == math.ceil(
         (CHUNK_SIZE * 2 + BLOCK_SIZE) / BLOCK_SIZE)
+
+
+# The mock scheduler answers every query with the same offer; these helpers
+# record what it was asked and when, so a test can assert the connector was
+# consulted exactly once per request rather than assuming it.
+def record_connector_queries(scheduler, num_matched, load_async=False):
+    """Answer every query with `num_matched`, recording when each one arrived.
+
+    The third element of each record is `build_connector_meta.call_count` at
+    query time -- the number of iterations whose connector hooks had already
+    run. Phase 1 runs during scheduling, before those hooks, so a request asked
+    in the first scheduling pass records 0. That is how the tests below *prove*
+    a request was asked before the iteration it eventually ran in, rather than
+    assuming the scheduler deferred anything.
+    """
+    queries = []
+
+    def side_effect(request, num_computed_tokens):
+        queries.append((request.request_id, num_computed_tokens,
+                        scheduler.build_connector_meta.call_count))
+        return num_matched, load_async
+
+    scheduler.get_num_new_matched_tokens.side_effect = side_effect
+    return queries
 
 
 # Sliding-window coverage. `KvCacheConfig.max_attention_window` is repeated
@@ -710,6 +742,81 @@ def test_connector_uniform_sliding_window(enforce_single_worker,
 # Half the prompt, and well past the window, so the pages the offer does *not*
 # need are a large enough fraction to assert on.
 SWA_OFFER_TOKENS = 128
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                         ids=["kv_cache_manager_v2"],
+                         indirect=True)
+def test_connector_sliding_window_prefix_is_backed_by_history(
+        enforce_single_worker, model_with_connector, use_kv_cache_manager_v2):
+    """Phase 2 raises `history_length`, not just capacity -- observably.
+
+    Under full attention the two are indistinguishable from outside: capacity is
+    `prompt_len` whether or not a prefix was served, so the page count says
+    nothing. Under a sliding window it does. `history_length` is the sole input
+    to the stale-range computation, so raising it to the offer end tells V2 that
+    the blocks the window has already left need no pages -- and raising capacity
+    alone would allocate one for every block of the served prefix.
+
+    So this is the test that would fail if `_reserve_connector_prefix` called
+    `resize(capacity, None)`; `test_connector_uniform_sliding_window` above
+    cannot, because it offers nothing.
+    """
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True,
+                     max_seq_len=SWA_MAX_SEQ_LEN,
+                     kv_cache_config=KvCacheConfig(
+                         free_gpu_memory_fraction=0.1,
+                         max_attention_window=[SWA_WINDOW]))
+
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
+
+    record_connector_queries(scheduler, SWA_OFFER_TOKENS)
+    worker.get_finished.return_value = [], []
+
+    generate_and_wait(model, scheduler, worker, [0] * SWA_NUM_INPUT_TOKENS,
+                      SamplingParams(max_tokens=4, ignore_eos=True))
+
+    # Anti-vacuity, as in the test above: one layer group with a live window,
+    # otherwise the page count below is being read off full attention.
+    layout = worker.register_kv_cache_layout.call_args.args[0]
+    assert len(layout.groups) == 1
+    assert layout.groups[0].window_size == SWA_WINDOW
+
+    req = scheduler.build_connector_meta.call_args_list[0].args[0].new_requests[
+        0]
+
+    # The offer was materialized: the position advanced over it, and the
+    # runtime rolled the reported position back to the local match.
+    assert req.computed_position == 0
+    assert req.num_scheduled_tokens == SWA_NUM_INPUT_TOKENS - SWA_OFFER_TOKENS
+
+    all_blocks = math.ceil(SWA_NUM_INPUT_TOKENS / 32)
+    page_indices = scheduler.update_state_after_alloc.call_args.args[1]
+    assert page_indices == req.new_block_ids
+    # One entry per block ordinal either way -- a block with no page reads back
+    # as BAD_PAGE_INDEX in place rather than shortening the list, so that block
+    # ordinals stay aligned to token ranges (kv_cache_manager_v2.py:2628-2636).
+    # The page count is therefore not the signal; *which* entries are bad is.
+    assert len(page_indices) == all_blocks
+
+    # With history at the offer end, every block that lies entirely below the
+    # window got no page. Without the bump history would still be at the local
+    # match, nothing would be stale, and all 8 blocks would be backed.
+    stale_blocks = (SWA_OFFER_TOKENS - SWA_WINDOW) // 32
+    assert stale_blocks > 0, "test sizes no longer put any block out of window"
+    assert page_indices[:stale_blocks] == [BAD_PAGE_INDEX] * stale_blocks, (
+        f"expected the first {stale_blocks} blocks of a {SWA_OFFER_TOKENS}-token "
+        f"served prefix to fall outside a {SWA_WINDOW}-token window and hold no "
+        f"page, got {page_indices}. History was not raised to the offer end.")
+
+    live = page_indices[stale_blocks:]
+    assert all(index != BAD_PAGE_INDEX for index in live), (
+        f"a block inside the window has no page: {page_indices}")
+    assert len(set(live)) == len(live), (
+        f"page slots reported to the connector are not distinct: {live}")
 
 
 @pytest.mark.threadleak(enabled=False)

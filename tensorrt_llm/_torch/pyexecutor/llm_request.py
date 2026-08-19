@@ -812,6 +812,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_connector_matched_tokens = 0
 
+        # KV connector query state, used by KVCacheManagerV2 (V1 answers the
+        # query under the block manager's tree mutex and needs no state).
+        # UNASKED (`py_connector_prefix_end is None`) -> ASKED -> DELIVERED.
+        # `py_connector_prefix_end` is the absolute prompt position one past
+        # the last token the connector offered to serve, deliberately not the
+        # returned delta: the request may be deferred and re-derive a larger
+        # locally-matched prefix, against which a delta would overshoot.
+        self.py_connector_prefix_start: Optional[int] = None
+        self.py_connector_prefix_end: Optional[int] = None
+        self.py_connector_load_async = False
+        self.py_connector_delivered = False
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,
