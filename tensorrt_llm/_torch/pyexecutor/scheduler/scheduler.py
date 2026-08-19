@@ -75,12 +75,9 @@ SchedulerOutput = namedtuple(
         "paused_requests",
         "fitting_disagg_gen_init_requests",
         "num_fitting_requests",
-        # request id -> prompt-ordered indices of its MM items selected for
-        # encoder execution this iteration
+        # Multimodal encoder scheduling outputs.
         "scheduled_mm_encoder_items",
-        # requests excluded from LLM scheduling by MM output readiness
         "mm_encoder_blocked_request_ids",
-        # cache entries removed before running the selected encoder items
         "mm_encoder_cache_removals",
     ],
     defaults=[None, None, None],
