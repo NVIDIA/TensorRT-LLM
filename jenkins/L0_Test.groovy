@@ -1391,6 +1391,23 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         boolean slurmFailureClassified = false
         def classifySlurmFailure = { Throwable err ->
             slurmFailureClassified = true
+            // A completed-pytest deterministic failure (tests ran, were re-run via
+            // --reruns, and still failed) is a real test failure, not lost-contact
+            // infra. On the agent path the SLURM allocation outlives pytest, so the
+            // job is still RUNNING here even though pytest already finished -- do NOT
+            // let the job state below relabel it as slurm-job-still-running and retry
+            // it (which masks the failure whenever the retry happens to pass). Key
+            // off the propagated rerun-failure error: it is raised only when reruns
+            // genuinely failed and takes precedence over the timeout path. Do not key
+            // off failed_results.xml -- generateRerunReport writes it from the first
+            // run whenever any rerun occurred, even when the rerun passed or the job
+            // timed out, so it would wrongly suppress a legitimate infra retry. Defer
+            // so the base classifier treats it as a UserFailure (no retry); a monitor-
+            // lost-contact cut raises "terminated unexpectedly" instead and retries.
+            if ((err?.toString() ?: "").contains("still failed after rerun attempts")) {
+                echo "[INFRA-RETRY] ${stageName}: pytest reported deterministic test failure(s); not an infra retry."
+                return err
+            }
             // Measure elapsed from when the job was first observed RUNNING; fall back
             // to executeStartMs if the RUNNING stamp was never set.
             long timeoutBaselineMs = (jobRunningStartMs ?: executeStartMs) as long
@@ -4443,9 +4460,13 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
                 sh "cd ${priorDir} && tar -xzf ${tarName}"
                 // results.xml may live at ${stageName}/results.xml inside the
                 // tar, or at the tar's root depending on how it was packaged.
-                // Scan both.
+                // Scan both. Also match superseded-results*.xml: a suppressed
+                // intermediate attempt renames its result XMLs with that prefix
+                // (so the build-level junit does not re-ingest the superseded
+                // attempt), but its PASSED tests are still valid to reuse here --
+                // extract_passed_tests only pulls the passing subset.
                 def xmlFiles = sh(returnStdout: true,
-                                  script: "find ${priorDir} -maxdepth 4 -name 'results*.xml' 2>/dev/null | tr '\\n' ',' | sed 's/,\$//'").trim()
+                                  script: "find ${priorDir} -maxdepth 4 \\( -name 'results*.xml' -o -name 'superseded-results*.xml' \\) 2>/dev/null | tr '\\n' ',' | sed 's/,\$//'").trim()
                 if (xmlFiles) {
                     priorXmls += xmlFiles.split(',') as List
                 }
