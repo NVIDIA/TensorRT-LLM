@@ -42,6 +42,19 @@ These methods run on the leader process and drive the connector's behavior.
 
 * **`update_state_after_alloc(self, request: LlmRequest, block_ids: list[int])`**
   * **Description**: a callback to update internal state after KV cache blocks have been allocated for the prefill.
+  * **Note**: on `KVCacheManagerV2` with chunked prefill, `block_ids` covers only the blocks allocated for the first chunk, because V2 allocates per chunk rather than for the whole prompt. The remaining blocks arrive as append-deltas in `RequestData.new_block_ids` on subsequent chunks. A connector that treats this callback as its only source of block ids will under-plan; drive off `build_connector_meta` instead.
+  * **Note**: on `KVCacheManagerV2` under sliding-window attention, a block that the window has already passed holds no page, and is reported as `-1` (`BAD_PAGE_INDEX`) **in place** rather than being dropped from the list. This keeps each entry aligned with its block ordinal, so entry `i` always describes prompt tokens `[i * tokens_per_block, (i+1) * tokens_per_block)` and an append-delta over successive calls stays valid. Connectors must skip `-1` entries rather than treating them as page slots. The same applies to `RequestData.new_block_ids` and to `cache_block_ids` in `request_finished`.
+
+* **`cancel_load(self, request: LlmRequest, start: int, end: int)`**
+  * **Description**: Optional, with a no-op default. Tells the connector that the runtime will not consume KV it offered from `get_num_new_matched_tokens` for prompt tokens `[start, end)`, so any ownership taken for that range can be released. Offsets are absolute prompt positions, on the same scale as `num_computed_tokens`.
+  * **When it fires**: only on `KVCacheManagerV2`, which asks during a speculative scheduling pass and resolves the answer later. Two things can happen in between, and both are reported here: the runtime may fail to allocate pages to cover the offer, in which case the request falls back to computing the prefix locally; or the request may be cancelled, time out or fail before it ever reaches a batch, in which case the whole offer is released. A third case -- the local cache overtaking part of the offer because another request committed the same prefix -- is handled by the same callback but cannot arise today, since a request's local match is fixed when its cache is created and only its own completed forward passes extend it.
+  * **Caveat**: best-effort. For a synchronous load nothing has been transferred yet, so cancelling is exact. For `is_async=True` the transfer necessarily started inside `get_num_new_matched_tokens`, so it may already be in flight.
+
+##### Serving a prefix on `KVCacheManagerV2`
+
+V1 answers `get_num_new_matched_tokens` from C++ while the block manager holds its radix-tree mutex, so the local match and the query are atomic and the answer is consumed immediately. V2 has no such mutex, and its scheduling pass is speculative -- a prepared request can still be dropped at the token budget, at resize, at multimodal alignment or at cross attention, and retried in a later iteration.
+
+The contract for connectors is unchanged, and in particular `get_num_new_matched_tokens` is still called **exactly once per request** on both managers -- a request that is asked and then deferred is not asked again when it comes back. What differs is that on V2 the runtime may resolve the answer in a later iteration than the one it asked in, and may by then be unable to honour part or all of it. That is what `cancel_load` reports.
 
 #### 2. Worker Interface (`KvCacheConnectorWorker`)
 
