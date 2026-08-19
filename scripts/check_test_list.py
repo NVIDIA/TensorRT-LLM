@@ -16,6 +16,11 @@ Options:
 --qa:       Check only the QA tests under $LLM_ROOT/tests/integration/test_list/*.txt.
 --waive:    Check only the tests in $LLM_ROOT/tests/integration/test_list/waives.txt.
 --validate: Run AST-based validation of test list entries against source files.
+--report-unverifiable [PATH]: With --validate, write the list of active entries
+            whose parametrize IDs cannot be checked statically (runtime-computed
+            argvalues/ids) to PATH (default: stdout). Use to sweep them.
+--strict-param-ids: With --validate, fail if any active entry has an
+            unverifiable parametrize ID. Off by default (sweep, then gate).
 
 Note:
 All the perf tests will be excluded since they are generated dynamically.
@@ -105,7 +110,54 @@ def _ast_constant_str(node) -> str | None:
     return None
 
 
-def _get_parametrize_with_ids_ids(call: ast.Call) -> list[str] | None:
+def _argnames_list(node) -> list[str] | None:
+    """Return the list of parametrize argnames, or None if not a static literal.
+
+    Handles both the "a,b" comma-string form and the ["a", "b"] list/tuple form.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [n.strip() for n in node.value.split(",")]
+    if isinstance(node, (ast.List, ast.Tuple)):
+        names = []
+        for elt in node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                names.append(elt.value.strip())
+            else:
+                return None
+        return names
+    return None
+
+
+def _resolve_const_node(node, module_consts, _depth: int = 0):
+    """Follow a Name to the module-level literal it is bound to.
+
+    Returns the resolved node (or the input node unchanged if it is not a Name
+    or cannot be resolved). Only names bound exactly once at module scope are in
+    ``module_consts`` (see build_ast_index), so this is sound. Bounded depth
+    guards against reference cycles.
+    """
+    while (isinstance(node, ast.Name) and module_consts and _depth < 10
+           and node.id in module_consts):
+        node = module_consts[node.id]
+        _depth += 1
+    return node
+
+
+def _argvalues_elts(node, module_consts) -> list | None:
+    """Return the element nodes of an argvalues expression, or None.
+
+    Resolves a List/Tuple literal directly, or a Name transitively bound to
+    one. Anything else (a call result, comprehension, imported name, ...) is
+    not statically resolvable and yields None.
+    """
+    node = _resolve_const_node(node, module_consts)
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return list(node.elts)
+    return None
+
+
+def _get_parametrize_with_ids_ids(call: ast.Call,
+                                  module_consts=None) -> list[str] | None:
     """Extract IDs from a parametrize_with_ids(argnames, argvalues) call.
 
     parametrize_with_ids generates IDs like "argname=value" joined with "-".
@@ -114,24 +166,16 @@ def _get_parametrize_with_ids_ids(call: ast.Call) -> list[str] | None:
         return None
     argnames_node, argvalues_node = call.args[0], call.args[1]
 
-    if isinstance(argnames_node, ast.Constant) and isinstance(
-            argnames_node.value, str):
-        argname_list = [n.strip() for n in argnames_node.value.split(",")]
-    elif isinstance(argnames_node, (ast.List, ast.Tuple)):
-        argname_list = []
-        for elt in argnames_node.elts:
-            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                argname_list.append(elt.value.strip())
-            else:
-                return None
-    else:
+    argname_list = _argnames_list(argnames_node)
+    if argname_list is None:
         return None
 
-    if not isinstance(argvalues_node, ast.List):
+    elts = _argvalues_elts(argvalues_node, module_consts)
+    if elts is None:
         return None
 
     ids = []
-    for elt in argvalues_node.elts:
+    for elt in elts:
         val_str = _ast_constant_str(elt)
         if val_str is not None:
             if len(argname_list) != 1:
@@ -152,16 +196,18 @@ def _get_parametrize_with_ids_ids(call: ast.Call) -> list[str] | None:
     return ids
 
 
-def _get_parametrize_ids(call: ast.Call) -> list[str] | None:
+def _get_parametrize_ids(call: ast.Call,
+                         module_consts=None) -> list[str] | None:
     """Extract the list of IDs from a parametrize call.
 
     Handles both pytest.mark.parametrize and parametrize_with_ids.
-    Tries ids= kwarg first, then falls back to string/int literal argvalues.
+    Tries ids= kwarg first, then falls back to string/int literal argvalues
+    (a module-level ``NAME = [...]`` reference is resolved via module_consts).
     Returns None if IDs cannot be determined statically.
     """
     func = call.func
     if isinstance(func, ast.Name) and func.id == "parametrize_with_ids":
-        return _get_parametrize_with_ids_ids(call)
+        return _get_parametrize_with_ids_ids(call, module_consts)
 
     for kw in call.keywords:
         if kw.arg == "ids":
@@ -178,22 +224,36 @@ def _get_parametrize_ids(call: ast.Call) -> list[str] | None:
     # No ids= — use string/int literal argvalues (or pytest.param(...))
     if len(call.args) < 2:
         return None
-    argvalues = call.args[1]
-    if isinstance(argvalues, ast.List):
-        ids = []
-        for elt in argvalues.elts:
-            val = _ast_constant_str(elt)
-            if val is not None:
-                ids.append(val)
-            elif isinstance(elt, ast.Call) and _is_pytest_param(elt):
-                inner = _pytest_param_id(elt)
-                if inner is None:
-                    return None
-                ids.append(inner)
-            else:
+    argnames = _argnames_list(call.args[0])
+    elts = _argvalues_elts(call.args[1], module_consts)
+    if elts is None:
+        return None
+    ids = []
+    for elt in elts:
+        val = _ast_constant_str(elt)
+        if val is not None:
+            ids.append(val)
+        elif isinstance(elt, ast.Call) and _is_pytest_param(elt):
+            inner = _pytest_param_id(elt)
+            if inner is None:
                 return None
-        return ids
-    return None
+            ids.append(inner)
+        elif isinstance(elt, (ast.Tuple, ast.List)):
+            # A multi-argument row: pytest joins each argument's scalar ID with
+            # "-". This is only sound when there are >1 argnames matching the
+            # row length and every value is a by-value scalar; a tuple bound to
+            # a single argname gets a positional "<argname><index>" ID instead,
+            # which we cannot reproduce statically.
+            if (argnames is None or len(argnames) < 2
+                    or len(elt.elts) != len(argnames)):
+                return None
+            parts = [_ast_constant_str(v) for v in elt.elts]
+            if any(p is None for p in parts):
+                return None
+            ids.append("-".join(parts))
+        else:
+            return None
+    return ids
 
 
 def _is_pytest_param(node) -> bool:
@@ -224,7 +284,8 @@ def _pytest_param_id(call: ast.Call) -> str | None:
 
 
 def _compute_valid_param_ids(func_node,
-                             class_decorators=None) -> set[str] | None:
+                             class_decorators=None,
+                             module_consts=None) -> set[str] | None:
     """Return the set of valid parametrize IDs for a function node.
 
     Iterates method-level parametrize decorators in reverse source order
@@ -236,34 +297,82 @@ def _compute_valid_param_ids(func_node,
     for decorator in reversed(func_node.decorator_list):
         if not _is_parametrize_call(decorator):
             continue
-        ids = _get_parametrize_ids(decorator)
+        ids = _get_parametrize_ids(decorator, module_consts)
         if ids is None:
             return None
         groups.append(ids)
     for decorator in reversed(class_decorators or []):
         if not _is_parametrize_call(decorator):
             continue
-        ids = _get_parametrize_ids(decorator)
+        ids = _get_parametrize_ids(decorator, module_consts)
         if ids is None:
             return None
         groups.append(ids)
     if not groups:
         return set()
-    return {"-".join(combo) for combo in product(*groups)}
+    # Build the cartesian product as a list so we can detect collisions: when
+    # two combinations yield the same ID, pytest disambiguates by appending
+    # "0"/"1"/... — an ID we cannot reproduce here — so treat the whole set as
+    # indeterminate rather than silently accepting the collapsed value.
+    combos = ["-".join(combo) for combo in product(*groups)]
+    if len(set(combos)) != len(combos):
+        return None
+    return set(combos)
+
+
+def _classify_unverifiable(func_node, class_decorators, module_consts) -> str:
+    """Return a short reason code for why a param ID cannot be verified.
+
+    Report-only; used to bucket unverifiable entries so they can be swept.
+    """
+    decs = [
+        d for d in list(func_node.decorator_list) + list(class_decorators or [])
+        if _is_parametrize_call(d)
+    ]
+    if not decs:
+        return "no-static-parametrize-decorator"
+    for d in decs:
+        if _get_parametrize_ids(d, module_consts) is not None:
+            continue
+        for kw in d.keywords:
+            if kw.arg == "ids" and not isinstance(kw.value, ast.List):
+                return "ids=callable-or-nonliteral"
+        argvalues = d.args[1] if len(d.args) >= 2 else None
+        if argvalues is None:
+            return "missing-argvalues"
+        resolved = _resolve_const_node(argvalues, module_consts)
+        if isinstance(resolved, ast.Name):
+            return f"argvalues=Name-unresolved:{resolved.id}"
+        if isinstance(resolved, (ast.ListComp, ast.GeneratorExp, ast.SetComp)):
+            return "argvalues=comprehension"
+        if isinstance(resolved, ast.Call):
+            return "argvalues=call-result"
+        if isinstance(resolved, (ast.List, ast.Tuple)):
+            return "argvalues-elements-non-literal"
+        return f"argvalues={type(resolved).__name__}"
+    # Every decorator resolved individually — the product had an ID collision.
+    return "param-id-collision"
 
 
 def build_ast_index(filepath: str):
-    """Return (classes, top_level_funcs, top_level_nodes, class_method_nodes).
+    """Return the AST index tuple for a single test source file.
+
+    Tuple layout: (classes, top_level_funcs, top_level_nodes,
+    class_method_nodes, module_consts).
 
     classes: {class_name: {'methods': set[str], 'bases': list[str],
                             'decorators': list[ast.Call]}}
-    Returns (None, None, None, None) on error.
+    module_consts: {name: value_node} for module-level ``NAME = <expr>``
+        bindings, kept only when NAME is assigned exactly once at top level (so
+        a later reassignment or augmented assignment cannot make a statically
+        resolved value wrong).
+    Returns (None, None, None, None, None) on error.
     """
     try:
         source = Path(filepath).read_text(encoding="utf-8")
         tree = ast.parse(source, filename=filepath)
     except (OSError, SyntaxError):
-        return None, None, None, None
+        return None, None, None, None, None
 
     classes = {}
     class_method_nodes = {}
@@ -295,7 +404,27 @@ def build_ast_index(filepath: str):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     top_level_funcs = set(top_level_nodes)
-    return classes, top_level_funcs, top_level_nodes, class_method_nodes
+
+    # Module-level literal bindings, kept only when assigned exactly once at top
+    # level so a later reassignment / augmented assignment can't invalidate the
+    # value we resolve parametrize argvalues against.
+    assign_counts = defaultdict(int)
+    module_consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    assign_counts[tgt.id] += 1
+                    module_consts[tgt.id] = node.value
+        elif isinstance(node, ast.AugAssign) and isinstance(
+                node.target, ast.Name):
+            assign_counts[node.target.id] += 1
+    module_consts = {
+        name: val
+        for name, val in module_consts.items() if assign_counts[name] == 1
+    }
+    return (classes, top_level_funcs, top_level_nodes, class_method_nodes,
+            module_consts)
 
 
 def _matches_parameterized(func_name: str, methods: set) -> bool:
@@ -315,7 +444,7 @@ def _has_method(class_name: str, method_name: str, ast_cache: dict,
         return False
     visited.add(class_name)
 
-    for classes, _, _, _ in ast_cache.values():
+    for classes, _, _, _, _ in ast_cache.values():
         if not classes or class_name not in classes:
             continue
         info = classes[class_name]
@@ -393,6 +522,11 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
 
     ast_cache = {}
     errors = []
+    # Active entries whose parametrize ID cannot be checked statically (runtime-
+    # computed argvalues/ids). Collected for reporting/sweeping, not fatal by
+    # default. Each item: (rel_path, class_name, func_name, param_id, reason,
+    # refs).
+    unverifiable = []
 
     active_malformed_set = set(active_malformed)
     for ref in active_malformed + [
@@ -447,7 +581,7 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
         if abs_path not in ast_cache:
             ast_cache[abs_path] = build_ast_index(abs_path)
 
-        classes, top_level, top_level_nodes, class_method_nodes = (
+        classes, top_level, top_level_nodes, class_method_nodes, module_consts = (
             ast_cache[abs_path])
         if classes is None:
             errors.append(f"PARSE ERROR: {rel_path}")
@@ -495,7 +629,8 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
         if param_id and func_node:
             class_decs = (classes[class_name]["decorators"]
                           if class_name and class_name in classes else None)
-            valid_ids = _compute_valid_param_ids(func_node, class_decs)
+            valid_ids = _compute_valid_param_ids(func_node, class_decs,
+                                                 module_consts)
             if valid_ids is not None and len(valid_ids) > 0:
                 if param_id not in valid_ids:
                     errors.append("INVALID PARAMETRIZE ID: {}{}::{}\n"
@@ -507,6 +642,14 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
                                       sorted(valid_ids)[:8],
                                       "\n".join(f"  -> {r}" for r in refs[:3]),
                                   ))
+            elif not is_waive_only:
+                # Active entry whose ID we could not resolve statically. Record
+                # it for the sweep/gate rather than silently passing it (which
+                # is the coverage the runtime `pytest --co` stage uniquely had).
+                reason = _classify_unverifiable(func_node, class_decs,
+                                                module_consts)
+                unverifiable.append(
+                    (rel_path, class_name, func_name, param_id, reason, refs))
 
         if is_waive_only and not rel_path.startswith("unittest/"):
             param_suffix = f"[{param_id}]" if param_id else ""
@@ -519,7 +662,40 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
                     "\n".join(f"  -> {r}" for r in refs[:3]),
                 ))
 
-    return errors
+    return errors, unverifiable
+
+
+def _format_unverifiable(unverifiable) -> list[str]:
+    """Render unverifiable entries as sorted, one-per-line report strings."""
+    lines = []
+    for rel_path, class_name, func_name, param_id, reason, refs in sorted(
+            unverifiable, key=lambda x: (x[4], x[0], x[1] or "", x[2])):
+        cls = f"::{class_name}" if class_name else ""
+        ref = refs[0] if refs else "?"
+        lines.append(
+            f"{rel_path}{cls}::{func_name}[{param_id}]  # {reason}  ({ref})")
+    return lines
+
+
+def write_unverifiable_report(unverifiable, dest) -> None:
+    """Write the unverifiable-param-id report to ``dest`` ('-' means stdout)."""
+    lines = _format_unverifiable(unverifiable)
+    # Group counts by reason for a quick triage summary at the top.
+    by_reason = defaultdict(int)
+    for *_, reason, _refs in unverifiable:
+        by_reason[reason] += 1
+    header = [f"# {len(unverifiable)} unverifiable param IDs by reason:"]
+    header += [
+        f"#   {count:5d}  {reason}"
+        for reason, count in sorted(by_reason.items(), key=lambda x: -x[1])
+    ]
+    body = "\n".join(header + [""] + lines) + "\n"
+    if dest == "-":
+        print(body)
+    else:
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(body)
+        print(f"Wrote {len(unverifiable)} unverifiable entries to {dest}")
 
 
 # =============================================================================
@@ -761,6 +937,21 @@ def main():
         help=
         f"Base directory for test source files for --validate (default: {_DEFAULT_TEST_BASE_DIR})",
     )
+    parser.add_argument(
+        "--report-unverifiable",
+        nargs="?",
+        const="-",
+        default=None,
+        metavar="PATH",
+        help="With --validate: write active entries whose parametrize IDs "
+        "cannot be checked statically to PATH (default: stdout). For sweeping.",
+    )
+    parser.add_argument(
+        "--strict-param-ids",
+        action="store_true",
+        help="With --validate: fail if any active entry has an unverifiable "
+        "parametrize ID. Off by default (sweep first, then gate).",
+    )
     args = parser.parse_args()
     script_dir = os.path.dirname(os.path.realpath(__file__))
     llm_src = os.path.abspath(os.path.join(script_dir, "../"))
@@ -807,7 +998,8 @@ def main():
     if args.validate:
         print("-----------Starting AST test list validation...-----------",
               flush=True)
-        errors = validate_test_lists(args.test_lists_dir, args.test_base_dir)
+        errors, unverifiable = validate_test_lists(args.test_lists_dir,
+                                                   args.test_base_dir)
         if errors:
             print(f"Found {len(errors)} validation error(s):\n",
                   file=sys.stderr)
@@ -818,6 +1010,28 @@ def main():
         else:
             entries, _ = collect_entries(args.test_lists_dir)
             print(f"OK: {len(entries)} unique test entries validated.")
+
+        # Instrumentation: active entries whose parametrize IDs cannot be
+        # checked statically. Informational (non-fatal) unless --strict-param-ids.
+        if unverifiable:
+            print(
+                f"UNVERIFIABLE: {len(unverifiable)} active entr"
+                f"{'y has' if len(unverifiable) == 1 else 'ies have'} "
+                f"parametrize IDs that cannot be checked statically "
+                f"(runtime-computed argvalues/ids).",
+                file=sys.stderr)
+            if args.report_unverifiable is not None:
+                write_unverifiable_report(unverifiable,
+                                          args.report_unverifiable)
+            else:
+                print("  Re-run with --report-unverifiable to list them.",
+                      file=sys.stderr)
+            if args.strict_param_ids:
+                print(
+                    "  --strict-param-ids is set: treating unverifiable "
+                    "entries as errors.",
+                    file=sys.stderr)
+                pass_flag = False
 
     invalid_json_file = os.path.join(llm_src, "invalid_tests.json")
     if os.path.isfile(invalid_json_file) and os.path.getsize(
