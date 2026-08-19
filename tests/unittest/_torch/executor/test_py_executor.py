@@ -1219,6 +1219,89 @@ class TestDisaggTransferIdleProgress:
         executor.dist.tp_cp_allgather.assert_called_once_with(0)
 
 
+class TestContextKvTransferTimeoutClock:
+    """The context transfer deadline must measure the transfer, not the peer wait."""
+
+    TIMEOUT_MS = 60000
+
+    @classmethod
+    def _make_executor(cls, waiting_for_peer, elapsed_s, peer_wait_elapsed_s=None):
+        executor = object.__new__(PyExecutor)
+        started = time.monotonic() - elapsed_s
+        peer_wait_start = (
+            started if peer_wait_elapsed_s is None else time.monotonic() - peer_wait_elapsed_s
+        )
+        req = types.SimpleNamespace(
+            py_request_id=7,
+            py_kv_transfer_start_time=started,
+            py_kv_transfer_peer_wait_start=peer_wait_start,
+            py_kv_transfer_timed_out=False,
+            is_disagg_generation_transmission_in_progress=False,
+        )
+        executor.kv_cache_transceiver = Mock(
+            kv_transfer_timeout_ms=cls.TIMEOUT_MS,
+            **{"context_transfer_is_waiting_for_peer.return_value": waiting_for_peer},
+        )
+        executor.async_transfer_manager = Mock(**{"requests_in_transfer.return_value": {7: req}})
+        executor.active_requests = []
+        executor._is_disagg_inflight_cancel_active = Mock(return_value=False)
+        return executor, req
+
+    def test_peer_wait_does_not_trip_the_deadline(self):
+        executor, req = self._make_executor(waiting_for_peer=True, elapsed_s=120)
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert not req.py_kv_transfer_timed_out
+        # Rebased, so the next check starts from the moment the write can begin.
+        assert (time.monotonic() - req.py_kv_transfer_start_time) < 1
+
+    def test_stalled_transfer_still_trips_the_deadline(self):
+        """Rebasing must not become a way to never time out."""
+        executor, req = self._make_executor(waiting_for_peer=False, elapsed_s=120)
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert req.py_kv_transfer_timed_out
+
+    def test_transfer_inside_budget_is_not_flagged(self):
+        executor, req = self._make_executor(waiting_for_peer=False, elapsed_s=5)
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert not req.py_kv_transfer_timed_out
+
+    def test_peer_that_never_asks_eventually_times_out(self):
+        """A peer that never sends REQUEST_DATA must stay reclaimable.
+
+        This deadline is the only path that ends such a transfer, so an
+        unbounded rebase would pin its KV pages for the process lifetime.
+        """
+        ceiling_ms = self.TIMEOUT_MS * PyExecutor._CTX_PEER_WAIT_TIMEOUT_MULTIPLIER
+        executor, req = self._make_executor(
+            waiting_for_peer=True,
+            elapsed_s=120,
+            peer_wait_elapsed_s=ceiling_ms / 1000 + 1,
+        )
+
+        PyExecutor._check_kv_transfer_timeout(executor)
+
+        assert req.py_kv_transfer_timed_out
+
+    def test_peer_wait_rebases_repeatedly_below_the_ceiling(self):
+        """Repeated checks while waiting must not accumulate toward the deadline."""
+        executor, req = self._make_executor(
+            waiting_for_peer=True, elapsed_s=120, peer_wait_elapsed_s=30
+        )
+
+        for _ in range(5):
+            PyExecutor._check_kv_transfer_timeout(executor)
+            assert not req.py_kv_transfer_timed_out
+
+        # The peer-wait origin is never rebased, so the ceiling still applies.
+        assert (time.monotonic() - req.py_kv_transfer_peer_wait_start) >= 30
+
+
 @pytest.mark.usefixtures("_clear_disagg_transfer_mode_env")
 class TestDisaggTransferAdmissionPP:
     def test_pp_schedule_applies_gate_before_serializing(self):
