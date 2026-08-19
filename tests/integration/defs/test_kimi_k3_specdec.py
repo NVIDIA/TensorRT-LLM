@@ -13,10 +13,11 @@ Requirements: 4 GPUs and the Kimi K3 checkpoint (env KIMI_K3_CKPT or
 <LLM_MODELS_ROOT>/Kimi-K3). Fails — deliberately does not skip — when the
 checkpoint is absent: the test is CI-listed (GB300 post-merge), and a
 checkpoint that vanishes from the runners' models mount must surface as a
-regression rather than an indistinguishable green skip. The MoE backend
-defaults to VANILLA (the reference dequant path — the bit-parity oracle;
-slow but fine at 4 layers) so the test has no fused-kernel dependency and
-runs on any arch.
+regression rather than an indistinguishable green skip. The MoE backend is
+routed to TRTLLM by KimiK3MoERuntime regardless of any
+KIMI_K3_MOE_BACKEND / moe_config.backend override (see the comment on the
+env block below); parity holds because the baseline and spec runs share
+the same backend.
 """
 
 import os
