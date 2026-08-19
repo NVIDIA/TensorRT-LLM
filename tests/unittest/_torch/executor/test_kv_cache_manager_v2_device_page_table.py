@@ -344,7 +344,7 @@ def test_native_materializer_rejects_non_cuda_destination():
         )
 
 
-@requires_native_page_table_kernel
+@requires_cuda
 @pytest.mark.parametrize(
     "cuda_sources",
     list(product((False, True), repeat=4)),
@@ -355,10 +355,14 @@ def test_native_materializer_accepts_each_gpu_readable_source_independently(cuda
         copy_batch_block_offsets_to_device,
     )
 
-    host_table = _make_host_table(pin=True)
-    copy_idx = torch.tensor([3, 0, 1], dtype=torch.int32, pin_memory=True)
-    index_scales = torch.tensor([2, 3], dtype=torch.int32, pin_memory=True)
-    kv_offset = torch.tensor([100, 200], dtype=torch.int32, pin_memory=True)
+    requires_host_mapping = not all(cuda_sources)
+    if requires_host_mapping and not prefer_pinned():
+        pytest.skip("host source tensors are not GPU-addressable")
+
+    host_table = _make_host_table(pin=requires_host_mapping)
+    copy_idx = torch.tensor([3, 0, 1], dtype=torch.int32, pin_memory=requires_host_mapping)
+    index_scales = torch.tensor([2, 3], dtype=torch.int32, pin_memory=requires_host_mapping)
+    kv_offset = torch.tensor([100, 200], dtype=torch.int32, pin_memory=requires_host_mapping)
     host_sources = (host_table, copy_idx, index_scales, kv_offset)
     sources = [
         source.cuda() if on_cuda else source for source, on_cuda in zip(host_sources, cuda_sources)
@@ -803,7 +807,9 @@ def test_forced_device_page_table_matches_non_cc_swa(monkeypatch):
         try:
             assert manager.enable_swa_scratch_reuse
             assert manager._device_kv_cache_block_offsets_input.ndim == 4
+            assert manager._page_table_materializer.uses_device_expansion is (setting == "1")
             if setting == "1":
+                # Device staging is allocated lazily on the first copy.
                 assert manager._page_table_materializer._device_base_page_rows is None
             assert (
                 manager.add_dummy_requests(
