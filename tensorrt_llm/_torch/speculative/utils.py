@@ -333,6 +333,29 @@ def get_spec_metadata(spec_config,
                       is_draft_model=False,
                       max_seq_len=262144,
                       num_seq_slots=None):
+    metadata = _build_spec_metadata(spec_config,
+                                    model_config,
+                                    max_num_requests,
+                                    max_num_tokens,
+                                    spec_resource_manager=spec_resource_manager,
+                                    is_draft_model=is_draft_model,
+                                    max_seq_len=max_seq_len,
+                                    num_seq_slots=num_seq_slots)
+    # Set here rather than in each branch below: every one-model mode needs it and
+    # the per-mode constructors are easy to miss one of.
+    if metadata is not None:
+        metadata.enable_penalty = getattr(spec_config, "enable_penalty", False)
+    return metadata
+
+
+def _build_spec_metadata(spec_config,
+                         model_config,
+                         max_num_requests,
+                         max_num_tokens,
+                         spec_resource_manager=None,
+                         is_draft_model=False,
+                         max_seq_len=262144,
+                         num_seq_slots=None):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
     # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool;
@@ -659,7 +682,17 @@ def get_spec_decoder(
         accepted_path_len = None
         if getattr(spec_config, "eagle_choices", None):
             accepted_path_len = sampler_args.max_total_draft_tokens + 1
-        return SpecSampler(sampler_args, accepted_path_len=accepted_path_len)
+        # Occurrence penalties assume the linear row layout: one logits row per
+        # speculative position, so a position's prefix is the positions before it.
+        # A tree's rows are nodes whose prefix is their root path instead, and
+        # sibling branches must not penalize each other -- so tree modes are not
+        # supported yet and are rejected at admission rather than mispenalized.
+        penalty_supported = not (getattr(spec_config, "eagle_choices", None)
+                                 or _is_effective_dynamic_tree(spec_config))
+        return SpecSampler(sampler_args,
+                           accepted_path_len=accepted_path_len,
+                           enable_penalty=spec_config.enable_penalty,
+                           penalty_supported=penalty_supported)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 

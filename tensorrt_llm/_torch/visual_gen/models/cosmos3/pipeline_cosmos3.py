@@ -1399,8 +1399,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             torch.distributed.broadcast(text_blocked, src=0)
 
         if text_blocked.item():
-            timer.mark_end()
-            return timer.fill(PipelineOutput())
+            return PipelineOutput()
 
         if transfer_config is not None:
             return self._forward_transfer(
