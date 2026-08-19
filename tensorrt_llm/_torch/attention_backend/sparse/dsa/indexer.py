@@ -1833,19 +1833,38 @@ class Indexer(nn.Module):
                     if not metadata.use_cute_dsl_topk:
                         heuristic_scratch = metadata.heuristic_scratch_values[:num_gen_tokens]
 
-                if (
+                _ss_ready = (
                     self._use_self_sampling_topk
                     and self._enable_heuristic_topk
                     and pre_idx is not None
+                )
+                if _ss_ready and not (
                     # engine hardware-format gate (falls through otherwise):
-                    # row-major logits with a float4-aligned row stride and a
-                    # 16B-aligned base (the DSL paged-MQA arena view — column-
-                    # sliced from a 256-aligned buffer — satisfies this; odd
-                    # max_seq_len DeepGEMM layouts do not)
+                    # fp32 row-major logits with a float4-aligned row stride
+                    # and a 16B-aligned base (the DSL paged-MQA arena view —
+                    # column-sliced from a 256-aligned buffer — satisfies
+                    # this; odd max_seq_len DeepGEMM layouts do not)
+                    logits_decode.dtype == torch.float32
                     and logits_decode.stride(1) == 1
                     and logits_decode.stride(0) % 4 == 0
                     and logits_decode.data_ptr() % 16 == 0
                 ):
+                    logger.warning_once(
+                        "TRTLLM_GVR_SELF_SAMPLING=1 but the decode logits do "
+                        "not satisfy the engine's hardware-format gate "
+                        f"(dtype={logits_decode.dtype}, "
+                        f"strides={tuple(logits_decode.stride())}); falling "
+                        "through to the in-tree top-K path.",
+                        key="selfsampling_topk_fallthrough",
+                    )
+                    _ss_ready = False
+                if _ss_ready:
+                    logger.info_once(
+                        "self-sampling GVR top-K engaged "
+                        f"(K={self.index_topk}, cr={self.compress_ratio}, "
+                        f"next_n={next_n}).",
+                        key="selfsampling_topk_engaged",
+                    )
                     # Self-sampling GVR varlen engine (TRTLLM_GVR_SELF_SAMPLING=1):
                     # one launch for the batch; per-row n from device kv_lens,
                     # capture-stable tuning from the max-seq-len engine

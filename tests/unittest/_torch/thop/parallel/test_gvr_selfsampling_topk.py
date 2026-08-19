@@ -184,7 +184,9 @@ def test_selfsampling_topk_values_short_path():
     assert bool((indices[:, n_valid:] == -1).all())
 
 
-@pytest.mark.parametrize("hint_kind", ["all_zero", "all_same", "all_max", "half_dup"])
+@pytest.mark.parametrize(
+    "hint_kind", ["all_zero", "all_same", "all_max", "half_dup", "minus_one_tail", "all_minus_one"]
+)
 @pytest.mark.parametrize(
     "top_k,n_valid", [(512, 8192), (2048, 131075)], ids=["k512_n8192", "k2048_n131075"]
 )
@@ -200,6 +202,16 @@ def test_selfsampling_topk_degenerate_hints(hint_kind, top_k, n_valid):
         pre_idx = torch.full((2, top_k), 1234, dtype=torch.int32, device=_DEV)
     elif hint_kind == "all_max":
         pre_idx = torch.full((2, top_k), n_valid - 1, dtype=torch.int32, device=_DEV)
+    elif hint_kind == "minus_one_tail":
+        # production short-row pad convention writes -1 tails into prev_topk;
+        # the next step feeds them back as hints — must stay in-bounds
+        gen = torch.Generator(device=_DEV).manual_seed(2)
+        pre_idx = torch.randint(
+            0, n_valid, (2, top_k), generator=gen, dtype=torch.int32, device=_DEV
+        )
+        pre_idx[:, top_k // 3 :] = -1
+    elif hint_kind == "all_minus_one":
+        pre_idx = torch.full((2, top_k), -1, dtype=torch.int32, device=_DEV)
     else:
         gen = torch.Generator(device=_DEV).manual_seed(1)
         pre_idx = torch.randint(
@@ -502,6 +514,18 @@ def test_selfsampling_topk_guards():
         ss_host.run(logits, pre_idx, -1, indices)
     with pytest.raises(RuntimeError, match="batch dims"):
         ss_host.run(logits, pre_idx[:0], 8192, indices)
+
+
+def test_selfsampling_route_large_batch_domain():
+    """Production num_rows = max_batch_size * next_n can exceed the bench
+    grid's b<=1024 envelope (e.g. 1024 * 4 = 4096 rows). route() is a pure
+    function — assert the full domain stays well-formed up to 8192 rows."""
+    for k in (512, 1024, 2048):
+        for n in (k + 1, 4096, 65536, 262144):
+            npad = (n + 63) // 64 * 64
+            for b in (1536, 2048, 4096, 8192):
+                r = ss_host.route(b, n, npad, k)
+                assert r is not None and len(r) >= 2, (b, n, k, r)
 
 
 def test_selfsampling_route_factorization():
