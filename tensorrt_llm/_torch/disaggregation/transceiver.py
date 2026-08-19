@@ -61,7 +61,11 @@ from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
 _NON_DRAINED_TRANSCEIVERS: set["KvCacheTransceiverV2"] = set()
+_PHYSICAL_OWNERSHIP_ENV = "TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP"
+_DISAGG_NO_RETRY_ENV = "TRTLLM_DISAGG_NO_RETRY"
 _ADMISSION_CANCELLED_ATTR = "_py_kv_transfer_admission_cancelled"
+_MIN_PHASE1_GLOBAL_REQUEST_ID = 1 << 40
+_MAX_PHASE1_GLOBAL_REQUEST_ID = 1 << 63
 
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
@@ -80,6 +84,9 @@ def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
 class KvCacheTransceiverV2(KvCacheTransceiver):
     @property
     def requires_physical_drain_before_request_release(self) -> bool:
+        enabled = getattr(self, "_physical_ownership_enabled", None)
+        if enabled is not None:
+            return bool(enabled)
         worker = getattr(self, "_transfer_worker", None)
         config = getattr(worker, "_config", None)
         return bool(getattr(config, "enforce_physical_ownership", False))
@@ -98,6 +105,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        mamba_cache_manager: Optional[object] = None,
     ):
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
@@ -109,6 +117,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
+        self._physical_ownership_enabled = self._supports_phase1_physical_ownership(
+            mapping,
+            kv_cache_manager,
+            cache_transceiver_config,
+            mamba_cache_manager,
+        )
+        if self._physical_ownership_enabled:
+            logger.info("Phase 1 KV transfer physical ownership enabled")
         transfer_timeout_s = self.kv_transfer_timeout_ms / 1000.0
         sender_wait_slice_s = (
             self._sender_future_timeout_ms / 1000.0
@@ -148,6 +164,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # env: TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
                 # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads).
                 bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
+                enforce_physical_ownership=self._physical_ownership_enabled,
             )
         )
         logger.info(
@@ -179,6 +196,66 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # per-iter tp_allgather when this transceiver never sends/receives.
         self._ever_had_send_session: bool = False
         self._ever_had_recv_session: bool = False
+
+    @staticmethod
+    def _supports_phase1_physical_ownership(
+        mapping: Mapping,
+        kv_cache_manager: KVCacheManager,
+        cache_transceiver_config: CacheTransceiverConfig,
+        mamba_cache_manager: Optional[object] = None,
+    ) -> bool:
+        """Validate the disabled-by-default Phase 1 runtime cell."""
+        if os.getenv(_PHYSICAL_OWNERSHIP_ENV, "0") != "1":
+            return False
+
+        unsupported = []
+        if os.getenv(_DISAGG_NO_RETRY_ENV, "0") != "1":
+            unsupported.append(f"{_DISAGG_NO_RETRY_ENV}!=1")
+        if mapping.tp_size != 1:
+            unsupported.append(f"tp_size={mapping.tp_size}")
+        if mapping.pp_size != 1:
+            unsupported.append(f"pp_size={mapping.pp_size}")
+        if mapping.cp_size != 1:
+            unsupported.append(f"cp_size={mapping.cp_size}")
+        if mapping.dp_size != 1:
+            unsupported.append(f"dp_size={mapping.dp_size}")
+        if mapping.enable_attention_dp:
+            unsupported.append("attention_dp")
+        if getattr(mapping, "dwdp_enabled", False):
+            unsupported.append(f"dwdp_size={mapping.dwdp_size}")
+        if cache_transceiver_config.kv_cache_bounce_size_mb != 0:
+            unsupported.append(
+                f"kv_cache_bounce_size_mb={cache_transceiver_config.kv_cache_bounce_size_mb}"
+            )
+        if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
+            unsupported.append("synchronous_transfer")
+        if os.getenv("TRTLLM_DISAGG_LAYERWISE") == "1":
+            unsupported.append("layerwise_transfer")
+        if not isinstance(kv_cache_manager, KVCacheManager):
+            unsupported.append(f"kv_cache_manager={type(kv_cache_manager).__name__} (requires V1)")
+        if isinstance(kv_cache_manager, MambaHybridCacheManager):
+            unsupported.append(type(kv_cache_manager).__name__)
+        if mamba_cache_manager is not None:
+            unsupported.append(type(mamba_cache_manager).__name__)
+        if getattr(kv_cache_manager, "is_linear_attention", False):
+            unsupported.append("linear_attention")
+        if (
+            getattr(kv_cache_manager, "is_draft", False)
+            or int(getattr(kv_cache_manager, "max_draft_len", 0) or 0) > 0
+        ):
+            unsupported.append("draft_tokens")
+        if getattr(kv_cache_manager, "kv_connector_manager", None) is not None:
+            unsupported.append("kv_connector_manager")
+        blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", {})
+        if any(secondary > 0 for _, secondary in blocks_per_window.values()):
+            unsupported.append("host_kv_cache_offload")
+        if unsupported:
+            raise ValueError(
+                f"{_PHYSICAL_OWNERSHIP_ENV}=1 supports only the Phase 1 "
+                "asynchronous context-first TP1/PP1/CP1/DP1 V1 runtime cell; unsupported: "
+                + ", ".join(unsupported)
+            )
+        return True
 
     def _broadcast_instance_name(self) -> str:
         if self._dist.rank == 0:
@@ -530,6 +607,30 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
+    def _validate_phase1_request(
+        self,
+        req: LlmRequest,
+        *,
+        synchronous: bool = False,
+    ) -> None:
+        if not getattr(self, "_physical_ownership_enabled", False):
+            return
+        if synchronous:
+            raise ValueError("Phase 1 physical ownership does not support synchronous KV transfer")
+        params = req.py_disaggregated_params
+        if params is None or params.schedule_style != DisaggScheduleStyle.CONTEXT_FIRST:
+            raise ValueError("Phase 1 physical ownership supports context-first transfers only")
+        rid = params.disagg_request_id
+        if (
+            isinstance(rid, bool)
+            or not isinstance(rid, int)
+            or not (_MIN_PHASE1_GLOBAL_REQUEST_ID <= rid < _MAX_PHASE1_GLOBAL_REQUEST_ID)
+        ):
+            raise ValueError(
+                "Phase 1 physical ownership requires a global-shaped, non-boolean "
+                "disagg_request_id in the positive int64 global-ID range"
+            )
+
     def _ctx_consensus(self, local_ids: list) -> list:
         # TP consensus: ensure all TP ranks have peer info
         sync_size = self._dist.tp_size if self._ctx_need_tp_sync else 1
@@ -763,6 +864,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
+        self._validate_phase1_request(req)
         if self.requires_physical_drain_before_request_release:
             with self._lifecycle_lock:
                 if self._shutdown_started:
@@ -797,6 +899,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
+        self._validate_phase1_request(req, synchronous=True)
         rid = get_unique_rid(req)
         if rid in self._recv_sessions:
             logger.warning(
@@ -833,6 +936,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
+        self._validate_phase1_request(req)
         if self.requires_physical_drain_before_request_release:
             with self._lifecycle_lock:
                 if self._shutdown_started:

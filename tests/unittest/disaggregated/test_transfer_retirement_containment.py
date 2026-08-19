@@ -42,6 +42,7 @@ from tensorrt_llm._torch.disaggregation.transceiver import (
     _NON_DRAINED_TRANSCEIVERS,
     KvCacheTransceiverV2,
 )
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 
@@ -566,3 +567,89 @@ def test_executor_shutdown_proves_transfer_drain_before_freeing_memory() -> None
     PyExecutor._shutdown_resource_managers(executor)
 
     assert order == ["transfer", "manager"]
+
+
+@pytest.mark.cpu_only
+def test_failed_executor_drain_refuses_resource_manager_shutdown() -> None:
+    transceiver = SimpleNamespace(
+        requires_physical_drain_before_request_release=True,
+        shutdown=Mock(return_value=False),
+    )
+    manager = SimpleNamespace(shutdown=Mock())
+    executor = SimpleNamespace(
+        kv_cache_transceiver=transceiver,
+        resource_manager=SimpleNamespace(resource_managers={"kv": manager}),
+    )
+
+    with pytest.raises(RuntimeError, match="still owns physical accessors"):
+        PyExecutor._shutdown_resource_managers(executor)
+
+    transceiver.shutdown.assert_called_once_with()
+    manager.shutdown.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "local_fault",
+    [RuntimeError("local transfer evidence lost"), None],
+    ids=["local", "remote-only"],
+)
+def test_all_rank_ownership_fault_vote_stops_local_and_remote_fault(
+    local_fault: BaseException | None,
+) -> None:
+    allreduce = Mock(return_value=1)
+    transceiver = SimpleNamespace(
+        requires_physical_drain_before_request_release=True,
+        get_physical_ownership_fault=Mock(return_value=local_fault),
+    )
+    executor = SimpleNamespace(
+        kv_cache_transceiver=transceiver,
+        dist=SimpleNamespace(world_size=2, allreduce=allreduce),
+    )
+
+    with pytest.raises(RuntimeError, match="completion is IN_DOUBT"):
+        PyExecutor._handle_disagg_cache_errors_synced(executor)
+
+    allreduce.assert_called_once()
+    assert allreduce.call_args.args[0] == int(local_fault is not None)
+    assert allreduce.call_args.kwargs["op"] == ReduceOp.MAX
+
+
+@pytest.mark.cpu_only
+def test_ownership_enabled_synchronous_receive_rejected_before_session_creation() -> None:
+    worker = SimpleNamespace(
+        _config=SimpleNamespace(enforce_physical_ownership=True),
+        create_rx_session=Mock(),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._physical_ownership_enabled = True
+    transceiver._transfer_worker = worker
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
+
+    with pytest.raises(ValueError, match="does not support synchronous KV transfer"):
+        transceiver.request_and_receive_sync(SimpleNamespace())
+
+    worker.create_rx_session.assert_not_called()
+    assert transceiver._recv_sessions == {}
+    assert transceiver._recv_reqs == {}
+
+
+@pytest.mark.cpu_only
+def test_terminate_request_refuses_resource_release_while_accessor_is_active() -> None:
+    transceiver = SimpleNamespace(
+        requires_physical_drain_before_request_release=True,
+        cancel_request=Mock(return_value=False),
+    )
+    free_resources = Mock()
+    executor = SimpleNamespace(
+        kv_cache_transceiver=transceiver,
+        resource_manager=SimpleNamespace(free_resources=free_resources),
+    )
+    request = SimpleNamespace(py_request_id=411)
+
+    with pytest.raises(RuntimeError, match="still owns physical accessors"):
+        PyExecutor._do_terminate_request(executor, request)
+
+    transceiver.cancel_request.assert_called_once_with(request)
+    free_resources.assert_not_called()

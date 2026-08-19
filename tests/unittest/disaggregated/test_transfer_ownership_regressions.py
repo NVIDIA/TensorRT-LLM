@@ -38,8 +38,11 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RecvReqInfo,
     RxSession,
     Sender,
+    TransferWorker,
+    TransferWorkerConfig,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 
 
 class _BounceProbe:
@@ -845,3 +848,109 @@ def test_sender_protocol_mismatch_stops_before_agent_registration(
 
     sender._registrar.register.assert_not_called()
     sender._agent.load_remote_agent.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("schedule_style", "request_id", "error_match"),
+    [
+        (DisaggScheduleStyle.GENERATION_FIRST, 1 << 40, "context-first"),
+        (None, 1 << 40, "context-first"),
+        (DisaggScheduleStyle.CONTEXT_FIRST, 17, "global-shaped"),
+        (DisaggScheduleStyle.CONTEXT_FIRST, True, "global-shaped"),
+        (DisaggScheduleStyle.CONTEXT_FIRST, 1 << 63, "global-shaped"),
+    ],
+)
+def test_phase1_rejects_unqualified_request_before_session_creation(
+    schedule_style: DisaggScheduleStyle | None,
+    request_id: int | bool,
+    error_match: str,
+) -> None:
+    request = SimpleNamespace(
+        py_disaggregated_params=DisaggregatedParams(
+            disagg_request_id=request_id,
+            schedule_style=schedule_style,
+        )
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._physical_ownership_enabled = True
+    transceiver._transfer_worker = SimpleNamespace(create_rx_session=Mock())
+
+    with pytest.raises(ValueError, match=error_match):
+        transceiver.request_and_receive_async(request)
+
+    transceiver._transfer_worker.create_rx_session.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_phase1_accepts_context_first_global_shaped_request() -> None:
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._physical_ownership_enabled = True
+    request = SimpleNamespace(
+        py_disaggregated_params=DisaggregatedParams(
+            disagg_request_id=1 << 40,
+            schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+        )
+    )
+
+    transceiver._validate_phase1_request(request)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("peer_overrides", "ctx_dp_rank", "error_match"),
+    [
+        ({"tp_size": 2}, 0, "tp_size=2"),
+        ({"pp_size": 2}, 0, "pp_size=2"),
+        ({"cp_size": 2}, 0, "cp_size=2"),
+        ({"dp_size": 2}, 0, "dp_size=2"),
+        ({"attention": SimpleNamespace(enable_attention_dp=True)}, 0, "attention_dp"),
+        ({}, None, "ctx_dp_rank=None"),
+        ({}, True, "ctx_dp_rank=True"),
+    ],
+)
+def test_phase1_rejects_remote_topology_before_destination_publication(
+    peer_overrides: dict[str, object],
+    ctx_dp_rank: object,
+    error_match: str,
+) -> None:
+    peer_info = _make_rank_info(1)
+    for name, value in peer_overrides.items():
+        setattr(peer_info, name, value)
+
+    with pytest.raises(ValueError, match=error_match):
+        transfer_mod._validate_phase1_remote_topology(True, peer_info, ctx_dp_rank)
+
+
+@pytest.mark.cpu_only
+def test_legacy_remote_topology_path_remains_ungated() -> None:
+    peer_info = _make_rank_info(0)
+    peer_info.tp_size = 8
+
+    transfer_mod._validate_phase1_remote_topology(False, peer_info, None)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True], ids=["legacy", "phase1"])
+def test_transfer_worker_advertises_only_enabled_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+) -> None:
+    rank_info = _make_rank_info(0)
+    monkeypatch.setattr(
+        transfer_mod.RankInfo,
+        "from_kv_cache_manager",
+        Mock(return_value=rank_info),
+    )
+    monkeypatch.setattr(TransferWorker, "_setup_peer_infrastructure", lambda _self, _kvm: None)
+    monkeypatch.setattr(TransferWorker, "_setup_transfer_engine", lambda _self: None)
+    worker = TransferWorker(
+        TransferWorkerConfig(
+            kv_cache_manager=SimpleNamespace(),
+            device_id=0,
+            instance_name="worker",
+            enforce_physical_ownership=enabled,
+        )
+    )
+
+    assert worker._rank_info.physical_ownership_protocol == int(enabled)

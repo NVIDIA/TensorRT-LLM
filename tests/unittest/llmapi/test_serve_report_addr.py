@@ -26,12 +26,14 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+from unittest.mock import Mock
 
 import click
 import pytest
 import yaml
 from click.testing import CliRunner
 
+import tensorrt_llm.commands.serve as serve_mod
 from tensorrt_llm.commands.serve import _publish_bound_address, disaggregated, launch_server
 
 # The reader half lives with the integration helpers, so both halves of the
@@ -227,3 +229,58 @@ def test_disaggregated_rejects_a_worker_fleet(
 
     assert result.exit_code != 0
     assert "single self-contained disaggregated server" in result.output
+
+
+@pytest.mark.parametrize(
+    ("num_workers", "coordinator_url", "error"),
+    [
+        (2, None, "num_workers=2"),
+        (1, "http://coordinator:8332", "external_coordinator"),
+    ],
+)
+def test_physical_ownership_cli_rejects_fleet_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    num_workers: int,
+    coordinator_url: Optional[str],
+    error: str,
+) -> None:
+    monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP", "1")
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    monkeypatch.setattr(serve_mod, "set_prometheus_multiproc_dir", Mock())
+    fleet = Mock()
+    coordinator_and_fleet = Mock()
+    monkeypatch.setattr(serve_mod, "_serve_disagg_fleet", fleet)
+    monkeypatch.setattr(serve_mod, "_serve_coordinator_and_fleet", coordinator_and_fleet)
+
+    worker = {
+        "num_instances": 1,
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "context_parallel_size": 1,
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_cache_bounce_size_mb": 0,
+        },
+        "kv_cache_config": {"use_kv_cache_manager_v2": False},
+    }
+    config_data = {
+        "hostname": "localhost",
+        "port": 8000,
+        "backend": "pytorch",
+        "num_workers": num_workers,
+        "context_servers": {**worker, "urls": ["localhost:8001"]},
+        "generation_servers": {**worker, "urls": ["localhost:8002"]},
+    }
+    if coordinator_url is not None:
+        config_data["disagg_coordinator_url"] = coordinator_url
+    config = tmp_path / "disagg.yaml"
+    config.write_text(yaml.safe_dump(config_data))
+
+    result = CliRunner().invoke(disaggregated, ["-c", str(config)])
+
+    assert result.exit_code != 0
+    assert error in result.output
+    fleet.assert_not_called()
+    coordinator_and_fleet.assert_not_called()

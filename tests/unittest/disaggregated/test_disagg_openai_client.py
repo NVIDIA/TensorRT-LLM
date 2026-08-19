@@ -635,7 +635,7 @@ class TestSelectiveTransientTcpRetry:
         r.__aexit__ = AsyncMock()
         return r
 
-    def _make_client(self, session, max_retries=1):
+    def _make_client(self, session, max_retries=1, **kwargs):
         from prometheus_client.registry import REGISTRY
 
         REGISTRY._names_to_collectors = {}
@@ -651,6 +651,7 @@ class TestSelectiveTransientTcpRetry:
             max_retries=max_retries,
             retry_interval_sec=0,
             session=session,
+            **kwargs,
         )
 
     def _make_request(self):
@@ -748,3 +749,28 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            aiohttp.ClientError("client error"),
+            aiohttp.ServerDisconnectedError(),
+            ConnectionResetError(),
+        ],
+    )
+    async def test_no_retry_executes_once_without_id_remint(self, monkeypatch, error):
+        monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = error
+        next_id = AsyncMock(return_value=2)
+        client = self._make_client(session, max_retries=5, disagg_id_generator=next_id)
+        request = self._make_request()
+
+        with pytest.raises(type(error)):
+            await client.send_request(request)
+
+        assert client._max_retries == 0
+        assert session.post.call_count == 1
+        assert request.disaggregated_params.disagg_request_id == 1
+        next_id.assert_not_awaited()

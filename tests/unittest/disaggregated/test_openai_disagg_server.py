@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -18,9 +19,16 @@ import pytest
 from fastapi import Request
 from starlette.datastructures import Headers
 
-from tensorrt_llm.llmapi.disagg_utils import ServerRole, extract_disagg_cfg
+from tensorrt_llm.llmapi.disagg_utils import (
+    ServerRole,
+    extract_disagg_cfg,
+    parse_disagg_config_file,
+)
 from tensorrt_llm.serve import openai_disagg_server
-from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_disagg_server import (
+    OpenAIDisaggServer,
+    _validate_physical_ownership_preflight,
+)
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     ConversationParams,
@@ -32,6 +40,181 @@ pytestmark = pytest.mark.cpu_only
 
 def _raw_request(headers: dict[str, str]):
     return SimpleNamespace(headers=Headers(headers=headers))
+
+
+def _qualified_physical_ownership_config():
+    worker = {
+        "num_instances": 1,
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 1,
+        "context_parallel_size": 1,
+        "enable_attention_dp": False,
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_cache_bounce_size_mb": 0,
+        },
+        "kv_cache_config": {"use_kv_cache_manager_v2": False},
+    }
+    return extract_disagg_cfg(
+        backend="pytorch",
+        context_servers=worker.copy(),
+        generation_servers=worker.copy(),
+        schedule_style="context_first",
+    )
+
+
+def _enable_physical_ownership(monkeypatch):
+    monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP", "1")
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_LAYERWISE", raising=False)
+
+
+@pytest.mark.parametrize(
+    ("ownership", "no_retry", "qualified", "error"),
+    [
+        ("0", "0", False, None),
+        ("0", "1", False, None),
+        ("1", "0", True, "requires TRTLLM_DISAGG_NO_RETRY=1"),
+        ("1", "1", True, None),
+    ],
+)
+def test_physical_ownership_preflight_flag_matrix(
+    monkeypatch, ownership, no_retry, qualified, error
+):
+    monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP", ownership)
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", no_retry)
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_LAYERWISE", raising=False)
+    config = (
+        _qualified_physical_ownership_config()
+        if qualified
+        else extract_disagg_cfg(
+            context_servers={"num_instances": 0},
+            generation_servers={"num_instances": 0},
+        )
+    )
+
+    if error is None:
+        _validate_physical_ownership_preflight(config)
+    else:
+        with pytest.raises(ValueError, match=error):
+            _validate_physical_ownership_preflight(config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("backend", "tensorrt", "backend"),
+        ("tensor_parallel_size", 2, "tensor_parallel_size"),
+        ("pipeline_parallel_size", 2, "pipeline_parallel_size"),
+        ("context_parallel_size", 2, "context_parallel_size"),
+        ("enable_attention_dp", True, "attention_dp"),
+        ("dwdp_config", {"dwdp_size": 2}, "dwdp"),
+    ],
+)
+def test_physical_ownership_preflight_rejects_worker_config(monkeypatch, field, value, error):
+    _enable_physical_ownership(monkeypatch)
+    config = _qualified_physical_ownership_config()
+    config.server_configs[0].other_args[field] = value
+
+    with pytest.raises(ValueError, match=error):
+        _validate_physical_ownership_preflight(config)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "error"),
+    [
+        ("cache_transceiver_config", "backend", "UCX", "cache_transceiver_backend"),
+        ("cache_transceiver_config", "transceiver_runtime", "CPP", "transceiver_runtime"),
+        ("cache_transceiver_config", "kv_cache_bounce_size_mb", 64, "bounce"),
+        ("kv_cache_config", "use_kv_cache_manager_v2", True, "use_kv_cache_manager_v2"),
+    ],
+)
+def test_physical_ownership_preflight_rejects_transfer_config(
+    monkeypatch, section, field, value, error
+):
+    _enable_physical_ownership(monkeypatch)
+    config = _qualified_physical_ownership_config()
+    config.server_configs[0].other_args[section][field] = value
+
+    with pytest.raises(ValueError, match=error):
+        _validate_physical_ownership_preflight(config)
+
+
+@pytest.mark.parametrize(
+    ("env_name", "config_field", "value", "error"),
+    [
+        ("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", None, None, "synchronous_transfer"),
+        ("TRTLLM_DISAGG_LAYERWISE", None, None, "layerwise_transfer"),
+        (None, "schedule_style", "generation_first", "schedule_style"),
+        (None, "conditional_disagg_config", SimpleNamespace(), "conditional_disagg"),
+        (None, "disagg_cluster_config", SimpleNamespace(), "autoscaling"),
+        (None, "num_workers", 2, "num_workers=2"),
+        (None, "disagg_coordinator_url", "http://coordinator:8332", "external_coordinator"),
+    ],
+)
+def test_physical_ownership_preflight_rejects_deployment_mode(
+    monkeypatch, env_name, config_field, value, error
+):
+    _enable_physical_ownership(monkeypatch)
+    config = _qualified_physical_ownership_config()
+    if env_name is not None:
+        monkeypatch.setenv(env_name, "1")
+    else:
+        setattr(config, config_field, value)
+
+    with pytest.raises(ValueError, match=error):
+        _validate_physical_ownership_preflight(config)
+
+
+def test_physical_ownership_preflight_rejects_non_one_to_one_topology(monkeypatch):
+    _enable_physical_ownership(monkeypatch)
+    config = _qualified_physical_ownership_config()
+    config.server_configs.append(config.server_configs[0])
+
+    with pytest.raises(ValueError, match="worker_topology=CTX2/GEN1"):
+        _validate_physical_ownership_preflight(config)
+
+
+def test_physical_ownership_preflight_runs_before_coordinator_start(monkeypatch):
+    monkeypatch.setenv("TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP", "1")
+    monkeypatch.delenv("TRTLLM_DISAGG_NO_RETRY", raising=False)
+    config = _qualified_physical_ownership_config()
+
+    with patch.object(openai_disagg_server, "DisaggCoordinatorService") as coordinator:
+        with pytest.raises(ValueError, match="requires TRTLLM_DISAGG_NO_RETRY=1"):
+            OpenAIDisaggServer(config)
+
+    coordinator.assert_not_called()
+
+
+def test_physical_ownership_rejects_constructor_coordinator_before_client_start(monkeypatch):
+    _enable_physical_ownership(monkeypatch)
+    config = _qualified_physical_ownership_config()
+
+    with patch.object(openai_disagg_server, "CoordinatorClient") as coordinator:
+        with pytest.raises(ValueError, match="external_coordinator"):
+            OpenAIDisaggServer(config, coordinator_url="http://coordinator:8332")
+
+    coordinator.assert_not_called()
+
+
+def test_phase1_static_canary_config_passes_preflight(monkeypatch):
+    _enable_physical_ownership(monkeypatch)
+    config_path = (
+        Path(__file__).parents[2]
+        / "integration"
+        / "defs"
+        / "disaggregated"
+        / "test_configs"
+        / "disagg_config_physical_ownership_phase1.yaml"
+    )
+
+    config = parse_disagg_config_file(str(config_path))
+
+    _validate_physical_ownership_preflight(config)
 
 
 @pytest.mark.asyncio

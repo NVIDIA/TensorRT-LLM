@@ -218,6 +218,30 @@ def _validate_physical_ownership_protocol(
         )
 
 
+def _validate_phase1_remote_topology(
+    enforce_physical_ownership: bool,
+    peer_info: RankInfo,
+    ctx_dp_rank: object,
+) -> None:
+    if not enforce_physical_ownership:
+        return
+
+    unsupported = []
+    for name in ("tp_size", "pp_size", "cp_size", "dp_size"):
+        value = getattr(peer_info, name, None)
+        if isinstance(value, bool) or value != 1:
+            unsupported.append(f"{name}={value!r}")
+    if peer_info.attention is not None and peer_info.attention.enable_attention_dp:
+        unsupported.append("attention_dp")
+    if isinstance(ctx_dp_rank, bool) or ctx_dp_rank != 0:
+        unsupported.append(f"ctx_dp_rank={ctx_dp_rank!r}")
+    if unsupported:
+        raise ValueError(
+            "Phase 1 physical ownership rejected unsupported remote topology "
+            "before destination publication: " + ", ".join(unsupported)
+        )
+
+
 def _validate_owner_generation(owner_generation: object, boundary: str) -> int:
     if (
         isinstance(owner_generation, bool)
@@ -2835,6 +2859,11 @@ class Receiver(ReceiverBase):
             getattr(peer_infos, "physical_ownership_protocol", 0),
             "before destination publication",
         )
+        _validate_phase1_remote_topology(
+            self._enforce_physical_ownership,
+            peer_infos,
+            sender_dp_rank,
+        )
         if sender_dp_rank is not None:
             # Normal path: ctx_dp_rank is known, send to overlapping ranks.
             peer_overlap = self._registrar.get_peer_overlap(peer_infos, sender_dp_rank)
@@ -3833,6 +3862,9 @@ class TransferWorker:
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
+        )
+        self._rank_info.physical_ownership_protocol = (
+            _PHYSICAL_OWNERSHIP_PROTOCOL_VERSION if config.enforce_physical_ownership else 0
         )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()

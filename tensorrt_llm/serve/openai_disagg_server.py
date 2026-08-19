@@ -15,6 +15,7 @@
 
 # yapf: disable
 import asyncio
+import os
 import signal
 import socket
 import traceback
@@ -59,6 +60,101 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+
+_PHYSICAL_OWNERSHIP_ENV = "TRTLLM_ENABLE_KV_TRANSFER_PHYSICAL_OWNERSHIP"
+_DISAGG_NO_RETRY_ENV = "TRTLLM_DISAGG_NO_RETRY"
+_DISABLE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"
+_DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
+
+
+def _validate_physical_ownership_preflight(
+        config: DisaggServerConfig,
+        coordinator_url: Optional[str] = None) -> None:
+    """Reject unqualified Phase 1 ownership deployments before workers start."""
+    if os.getenv(_PHYSICAL_OWNERSHIP_ENV, "0") != "1":
+        return
+    if os.getenv(_DISAGG_NO_RETRY_ENV, "0") != "1":
+        raise ValueError(
+            f"{_PHYSICAL_OWNERSHIP_ENV}=1 requires {_DISAGG_NO_RETRY_ENV}=1"
+        )
+
+    unsupported = []
+    if config.disagg_cluster_config is not None:
+        unsupported.append("dynamic workers/autoscaling")
+    if config.num_workers != 1:
+        unsupported.append(f"num_workers={config.num_workers}")
+    if config.disagg_coordinator_url is not None or coordinator_url is not None:
+        unsupported.append("external_coordinator")
+    if config.schedule_style != "context_first":
+        unsupported.append(f"schedule_style={config.schedule_style!r}")
+    if config.conditional_disagg_config is not None:
+        unsupported.append("conditional_disagg")
+    if os.getenv(_DISABLE_TRANSFER_OVERLAP_ENV) == "1":
+        unsupported.append("synchronous_transfer")
+    if os.getenv(_DISAGG_LAYERWISE_ENV) == "1":
+        unsupported.append("layerwise_transfer")
+
+    ctx_configs = [cfg for cfg in config.server_configs if cfg.type == "ctx"]
+    gen_configs = [cfg for cfg in config.server_configs if cfg.type == "gen"]
+    if len(ctx_configs) != 1 or len(gen_configs) != 1:
+        unsupported.append(
+            f"worker_topology=CTX{len(ctx_configs)}/GEN{len(gen_configs)}"
+        )
+
+    for worker in ctx_configs + gen_configs:
+        args = worker.other_args
+        role = "CTX" if worker.type == "ctx" else "GEN"
+        if args.get("backend") != "pytorch":
+            unsupported.append(f"{role}.backend={args.get('backend')!r}")
+        for name in (
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "context_parallel_size",
+        ):
+            if args.get(name, 1) != 1:
+                unsupported.append(f"{role}.{name}={args.get(name)!r}")
+        if args.get("enable_attention_dp", False):
+            unsupported.append(f"{role}.attention_dp")
+        if args.get("dwdp_config") is not None:
+            unsupported.append(f"{role}.dwdp")
+
+        transceiver = args.get("cache_transceiver_config") or {}
+        if not isinstance(transceiver, dict):
+            unsupported.append(
+                f"{role}.cache_transceiver_config={type(transceiver).__name__}")
+            transceiver = {}
+        if transceiver.get("backend") != "NIXL":
+            unsupported.append(
+                f"{role}.cache_transceiver_backend={transceiver.get('backend')!r}"
+            )
+        if transceiver.get("transceiver_runtime") != "PYTHON":
+            unsupported.append(
+                f"{role}.transceiver_runtime={transceiver.get('transceiver_runtime')!r}"
+            )
+        if transceiver.get("kv_cache_bounce_size_mb", 0) != 0:
+            unsupported.append(
+                f"{role}.kv_cache_bounce_size_mb="
+                f"{transceiver.get('kv_cache_bounce_size_mb')!r}"
+            )
+
+        kv_cache = args.get("kv_cache_config") or {}
+        if not isinstance(kv_cache, dict):
+            unsupported.append(
+                f"{role}.kv_cache_config={type(kv_cache).__name__}")
+            kv_cache = {}
+        if kv_cache.get("use_kv_cache_manager_v2", "auto") is not False:
+            unsupported.append(
+                f"{role}.use_kv_cache_manager_v2="
+                f"{kv_cache.get('use_kv_cache_manager_v2', 'auto')!r}"
+            )
+
+    if unsupported:
+        raise ValueError(
+            f"{_PHYSICAL_OWNERSHIP_ENV}=1 supports only the Phase 1 "
+            "context-first 1-CTX/1-GEN Python/NIXL/V1 canary; unsupported: "
+            + ", ".join(unsupported)
+        )
+
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, queue_latency_metric,
@@ -144,6 +240,7 @@ class OpenAIDisaggServer:
                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
                  metrics_interval_secs: int = 0,
                  coordinator_url: Optional[str] = None):
+        _validate_physical_ownership_preflight(config, coordinator_url)
         self._config = config
         self._req_timeout_secs = req_timeout_secs
         self._server_start_timeout_secs = server_start_timeout_secs
