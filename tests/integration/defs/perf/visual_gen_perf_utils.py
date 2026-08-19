@@ -105,8 +105,22 @@ def _infer_generation_mode(client_config: dict[str, Any]) -> str:
         except json.JSONDecodeError:
             extra_body = None
 
+    audio_enabled = (
+        isinstance(extra_body, dict)
+        and isinstance(extra_body.get("extra_params"), dict)
+        and extra_body["extra_params"].get("enable_audio") is True
+    )
+    if client_config.get("input_reference") is not None and audio_enabled:
+        return "ti2av"
+
+    if client_config.get("input_reference") is not None:
+        return "i2v"
+
     if isinstance(extra_body, dict) and "input_reference" in extra_body:
         return "i2v"
+
+    if audio_enabled:
+        return "t2av"
 
     if backend == "openai-videos":
         return "t2v"

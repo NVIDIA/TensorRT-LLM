@@ -487,6 +487,16 @@ class VisualGenPerfSanityTestConfig:
             extra_body_json = extra_body if isinstance(extra_body, str) else json.dumps(extra_body)
             command.extend(["--extra-body", extra_body_json])
 
+        input_reference = client_config.get("input_reference")
+        if input_reference is not None:
+            input_reference_path = Path(input_reference)
+            if not input_reference_path.is_absolute():
+                input_reference_path = Path(get_llm_root()) / input_reference_path
+            command.extend(["--input-reference", str(input_reference_path)])
+
+        if client_config.get("require_audio", False):
+            command.append("--require-audio")
+
         if client_config.get("save_detailed", False):
             command.append("--save-detailed")
         if client_config.get("no_test_input", False):
@@ -523,6 +533,7 @@ class VisualGenPerfSanityTestConfig:
             "mean_generation",
             "median_generation",
             "percentiles_generation",
+            "mean_denoise",
         ]
         missing_keys = [key for key in required_keys if key not in result_data]
         if missing_keys:

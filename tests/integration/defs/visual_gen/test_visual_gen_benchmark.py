@@ -257,6 +257,8 @@ def test_online_benchmark(
     assert data["completed"] >= 1
     assert "mean_latency" in data
     assert "mean_generation" in data
+    assert data["mean_denoise"] > 0
+    assert data["mean_seconds_per_denoising_step"] > 0
 
 
 # ===========================================================================
