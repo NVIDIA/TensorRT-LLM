@@ -24,6 +24,23 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 GB = 1 << 30
 
 
+def test_one_model_draft_dtype_override_is_copy_on_write():
+    creator = object.__new__(KvCacheCreator)
+
+    class _HybridTargetManager:
+        draft_manager_kv_cache_dtype = "fp8"
+
+    creator._kv_cache_manager_cls = _HybridTargetManager
+    target = KvCacheConfig(dtype="nvfp4", tokens_per_block=128)
+
+    draft = creator._get_one_model_draft_kv_cache_config(target)
+
+    assert target.dtype == "nvfp4"
+    assert target.tokens_per_block == 128
+    assert draft.dtype == "fp8"
+    assert draft.tokens_per_block == 128
+
+
 def _make_creator(
     max_gpu_total_bytes: int,
     host_cache_size=None,

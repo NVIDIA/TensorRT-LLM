@@ -117,6 +117,8 @@ def run_msa_paged_gqa(
     *,
     kv_block_indexes: Optional[torch.Tensor],
     plan: Optional[tuple],
+    kv_scale_orig_quant: Optional[torch.Tensor] = None,
+    kv_scale_quant_orig: Optional[torch.Tensor] = None,
 ) -> None:
     """Write the new-token main K/V, then run paged GQA into output in place.
 
@@ -163,7 +165,6 @@ def run_msa_paged_gqa(
     # output is freshly allocated and contiguous; view keeps out_view aliasing it
     # so the kernel's in-place write lands in the caller's buffer.
     out_view = output.view(num_tokens, attn.num_heads, head_dim)
-    k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
     sm_scale = (head_dim**-0.5) / float(attn.q_scaling)
 
     # Query tokens [gen_tok0, gen_tok1) and batch rows [gen_row0, gen_row1) the
@@ -172,6 +173,54 @@ def run_msa_paged_gqa(
     gen_tok0, gen_tok1, gen_row0, gen_row1, decode_query_len = msa_decode_span_bounds(
         metadata, num_tokens
     )
+    nvfp4_predicate = getattr(kv_cache_manager, "is_nvfp4_layer", None)
+    layer_uses_nvfp4 = (
+        bool(nvfp4_predicate(layer_idx))
+        if nvfp4_predicate is not None
+        else bool(getattr(metadata, "_msa_main_kv_is_nvfp4", lambda: False)())
+    )
+    if layer_uses_nvfp4:
+        if kv_scale_orig_quant is None or kv_scale_quant_orig is None:
+            raise RuntimeError(
+                "MiniMax-M3 NVFP4 attention requires K/V quantization and dequantization scales"
+            )
+        if kv_block_indexes is None:
+            raise RuntimeError(
+                f"MiniMax-M3 layer {layer_idx} has NVFP4 sparse storage but no sparse indexes"
+            )
+        k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
+        k_global_scale, v_global_scale = _aligned_nvfp4_dequant_scales(attn, kv_scale_quant_orig)
+        run_msa_nvfp4_sparse_gqa(
+            q_view,
+            k_paged,
+            v_paged,
+            kv_cache_manager.get_block_scale_buffers(layer_idx, "HND"),
+            kv_block_indexes,
+            metadata,
+            sm_scale=sm_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            out=out_view,
+        )
+        return
+
+    if getattr(kv_cache_manager, "is_fp8_subpaged_layer", lambda _layer_idx: False)(layer_idx):
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.trtllm_gen_dense_decode import (
+            minimax_m3_trtllm_gen_dense_attention,
+        )
+
+        minimax_m3_trtllm_gen_dense_attention(
+            q_view,
+            kv_cache_manager,
+            layer_idx,
+            metadata,
+            sm_scale=sm_scale,
+            output=out_view,
+        )
+        return
+
+    k_paged, v_paged = msa_paged_kv(kv_cache_manager, layer_idx)
+
     # Leading query tokens fmha_sm100 must still run: the whole batch until a
     # ported kernel takes the generation slice, then the context prefix alone.
     fmha_tokens = num_tokens
@@ -327,6 +376,140 @@ def run_msa_paged_gqa(
     )
 
 
+def _aligned_nvfp4_dequant_scales(
+    attn: "TrtllmAttention", kv_scale_quant_orig: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return stable, separately 16-byte-aligned K/V dequant scales.
+
+    M3 checkpoints expose the Q/K/V scales as one contiguous three-float
+    tensor.  Slicing elements 1 and 2 leaves addresses four and eight bytes
+    past the allocation base, while CuTe DSL requires every tensor argument
+    to start on a 16-byte boundary.  Keep one padded two-row buffer per
+    layer-attention object.  It is populated during eager warmup and then
+    reused unchanged by CUDA-graph capture and replay.
+    """
+    if kv_scale_quant_orig.dtype != torch.float32 or kv_scale_quant_orig.numel() < 3:
+        raise ValueError("MiniMax-M3 NVFP4 dequantization scales must be FP32 [Q, K, V]")
+
+    cache = getattr(attn, "_msa_nvfp4_dequant_scales", None)
+    source_ptr = int(kv_scale_quant_orig.data_ptr())
+    if cache is None or getattr(attn, "_msa_nvfp4_dequant_scale_source_ptr", None) != source_ptr:
+        if kv_scale_quant_orig.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MiniMax-M3 NVFP4 scale alignment buffer must be initialized during eager warmup"
+            )
+        cache = torch.empty((2, 4), dtype=torch.float32, device=kv_scale_quant_orig.device)
+        cache[:, 0].copy_(kv_scale_quant_orig[1:3])
+        attn._msa_nvfp4_dequant_scales = cache
+        attn._msa_nvfp4_dequant_scale_source_ptr = source_ptr
+
+    k_global_scale = cache[0, :1]
+    v_global_scale = cache[1, :1]
+    assert k_global_scale.data_ptr() % 16 == 0
+    assert v_global_scale.data_ptr() % 16 == 0
+    return k_global_scale, v_global_scale
+
+
+def run_msa_nvfp4_sparse_gqa(
+    q: torch.Tensor,
+    k_paged: torch.Tensor,
+    v_paged: torch.Tensor,
+    scale_buffers: torch.Tensor,
+    kv_block_indexes: torch.Tensor,
+    metadata: "TrtllmAttentionMetadata",
+    *,
+    sm_scale: float,
+    k_global_scale: torch.Tensor,
+    v_global_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Run Fan's MSA CSR kernel directly over M3's packed NVFP4 cache.
+
+    Unlike the FP8 M3 path, every sparse phase uses this one implementation:
+    prefill, ordinary decode, mixed batches, and Eagle target verification.
+    That is deliberate—falling through to the Triton sparse-decode kernel
+    would reinterpret packed E2M1 bytes as scalar K/V values.
+    """
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        MSA_REQUIRED_TOPK,
+        require_msa_module,
+    )
+
+    fmha_sm100 = require_msa_module()
+    sparse = getattr(fmha_sm100, "sparse", None)
+    if sparse is None:
+        try:
+            from fmha_sm100 import sparse
+        except ImportError as exc:
+            raise RuntimeError("MiniMax-M3 NVFP4 KV cache requires the Fan MSA sparse API") from exc
+    if not hasattr(sparse, "build_k2q_csr") or not hasattr(sparse, "sparse_atten_nvfp4_kv_func"):
+        raise RuntimeError(
+            "The loaded MSA build lacks build_k2q_csr or "
+            "sparse_atten_nvfp4_kv_func; use the NVFP4-capable Fan revision"
+        )
+
+    for name, scale in (("K", k_global_scale), ("V", v_global_scale)):
+        if scale.dtype != torch.float32 or scale.numel() != 1:
+            raise ValueError(f"MiniMax-M3 NVFP4 {name} dequantization scale must be one FP32 value")
+        if scale.data_ptr() % 16 != 0:
+            raise ValueError(
+                f"MiniMax-M3 NVFP4 {name} dequantization scale must be 16-byte aligned"
+            )
+    if scale_buffers.shape[:2] != k_paged.shape[:1] + (2,):
+        raise ValueError(
+            "MiniMax-M3 NVFP4 scale buffers must be [pages, 2, heads, page, D/16]; "
+            f"got {tuple(scale_buffers.shape)} for K {tuple(k_paged.shape)}"
+        )
+
+    batch = int(getattr(metadata, "_msa_live_batch", 0))
+    if batch <= 0:
+        raise RuntimeError("MiniMax-M3 NVFP4 sparse attention metadata was not prepared")
+    cu_q = metadata.msa_cu_q_lens[: batch + 1]
+    cu_kv = metadata.msa_cu_kv_lens[: batch + 1]
+    q2k = kv_block_indexes.permute(1, 0, 2).contiguous()
+    topk = int(q2k.shape[-1])
+    if topk != MSA_REQUIRED_TOPK:
+        raise ValueError(f"MiniMax-M3 MSA NVFP4 requires topK={MSA_REQUIRED_TOPK}, got {topk}")
+
+    k2q_row_ptr, k2q_q_indices, schedule = sparse.build_k2q_csr(
+        q2k,
+        cu_q,
+        cu_kv,
+        int(k_paged.shape[2]),
+        total_k=int(metadata._msa_total_k),
+        max_seqlen_k=int(metadata._msa_max_kv_len_all),
+        max_seqlen_q=int(metadata._msa_max_q_len),
+        total_rows=int(metadata._msa_total_k_rows),
+        qhead_per_kv=int(q.shape[1]) // int(k_paged.shape[1]),
+        return_schedule=True,
+    )
+    result = sparse.sparse_atten_nvfp4_kv_func(
+        q,
+        k_paged.view(torch.uint8),
+        v_paged.view(torch.uint8),
+        scale_buffers[:, 0].view(torch.uint8),
+        scale_buffers[:, 1].view(torch.uint8),
+        k_global_scale,
+        v_global_scale,
+        k2q_row_ptr,
+        k2q_q_indices,
+        topk,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_kv,
+        max_seqlen_q=int(metadata._msa_max_q_len),
+        max_seqlen_k=int(metadata._msa_max_kv_len_all),
+        blk_kv=int(k_paged.shape[2]),
+        causal=True,
+        softmax_scale=sm_scale,
+        partial_dtype=torch.bfloat16,
+        return_softmax_lse=False,
+        page_table=metadata.msa_block_table[:batch],
+        seqused_k=metadata.msa_seq_lens_cuda[:batch],
+        schedule=schedule,
+    )
+    out.copy_(result)
+
+
 class MsaSparseGqaFmha(Fmha):
     """SM100 paged GQA FMHA powered by MSA's fmha_sm100 kernel.
 
@@ -395,6 +578,8 @@ class MsaSparseGqaFmha(Fmha):
             output,
             kv_block_indexes=kv_block_indexes,
             plan=plan,
+            kv_scale_orig_quant=forward_args.kv_scale_orig_quant,
+            kv_scale_quant_orig=forward_args.kv_scale_quant_orig,
         )
 
 

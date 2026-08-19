@@ -29,6 +29,7 @@ from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.cache_manager impor
     MiniMaxM3KVCacheManagerV2,
     derive_shared_draft_layout,
 )
+from tensorrt_llm.bindings import DataType
 
 DRAFT_LAYER = 60
 SCALE = 178  # sub-pages per mega-slot, in units of the drafter's 128-tok page
@@ -59,6 +60,36 @@ class _FakeManager:
         return self.slot_rows[: len(request_ids)]
 
 
+class _FakeHybridManager(_FakeManager):
+    dtype = DataType.NVFP4
+    nvfp4_dense_tokens_per_block = 32
+    num_pools = 2
+
+    def __init__(self):
+        super().__init__()
+        self.kv_cache_pool_mapping[DRAFT_LAYER] = torch.tensor([1, 7], dtype=torch.int32)
+
+    def is_fp8_subpaged_layer(self, layer_idx):
+        assert layer_idx == DRAFT_LAYER
+        return True
+
+    def _fp8_dense_data_buffers(self, layer_idx):
+        assert layer_idx == DRAFT_LAYER
+
+        class _Pointer:
+            shape = (1024, SCALE * 4, 16, 32, 128)
+
+            @staticmethod
+            def data_ptr():
+                return ADDR
+
+        return _Pointer(), None, SCALE * 4, 4
+
+    def _get_batch_cache_indices_by_pool_id(self, request_ids, *, pool_id):
+        assert pool_id == 1
+        return self.slot_rows[: len(request_ids)]
+
+
 def _make_view():
     return MiniMaxM3DraftSubpageView(_FakeManager(), [DRAFT_LAYER], 32)
 
@@ -78,6 +109,48 @@ def test_view_geometry():
     # the last slot's V pages, not delegate the target manager's 128-token
     # page bound.
     assert view.blocks_in_primary_pool == (1024 - 1) * SCALE * 4 + 8
+
+
+def test_hybrid_view_publishes_an_fp8_pool_pointer_from_the_draft_pool():
+    view = MiniMaxM3DraftSubpageView(_FakeHybridManager(), [DRAFT_LAYER], 32)
+    expected = [[ADDR, 0]]
+    assert view.kv_cache_pool_pointers.tolist() == expected
+    assert view.host_kv_cache_pool_pointers.tolist() == expected
+    assert view.dtype == DataType.FP8
+    assert view._source_pool_id == 1
+    assert view.blocks_in_primary_pool == (1024 - 1) * SCALE * 4 + 8
+
+    dst = torch.full((1, 1, 2, view.max_blocks_per_seq), -7, dtype=torch.int32)
+    view.copy_batch_block_offsets(dst, request_ids=[123], beam_width=1, num_contexts=1, num_seqs=1)
+    unit = SCALE * 4
+    expected_k = [5 * unit + j for j in range(4)] + [7 * unit + j for j in range(4)]
+    assert dst[0, 0, 0, :8].tolist() == expected_k
+    assert dst[0, 0, 1, :8].tolist() == [page + 4 for page in expected_k]
+
+
+def test_hybrid_view_rejects_non_p32_draft_pages():
+    try:
+        MiniMaxM3DraftSubpageView(_FakeHybridManager(), [DRAFT_LAYER], 128)
+    except AssertionError as error:
+        assert "physical dense-cache page size P32" in str(error)
+    else:
+        raise AssertionError("expected NVFP4 Eagle draft view to require P32 pages")
+
+
+def test_nvfp4_manager_rejects_dynamic_tree_eagle_before_allocation():
+    class _DynamicTreeConfig:
+        use_dynamic_tree = True
+
+    try:
+        MiniMaxM3KVCacheManagerV2(
+            dtype=DataType.NVFP4,
+            spec_config=_DynamicTreeConfig(),
+        )
+    except NotImplementedError as error:
+        assert "supports linear Eagle3" in str(error)
+        assert "block scales" in str(error)
+    else:
+        raise AssertionError("expected NVFP4 dynamic-tree Eagle to be rejected")
 
 
 def test_block_table_expansion():
@@ -168,15 +241,13 @@ def test_manager_accessor_builds_and_caches_view():
     assert get_view(manager_draft) is None
 
 
-def test_view_rejects_draft_layer_outside_pool_zero():
-    manager = _FakeManager()
-    manager.kv_cache_pool_mapping[DRAFT_LAYER] = torch.tensor([1, 0], dtype=torch.int32)
-    try:
-        MiniMaxM3DraftSubpageView(manager, [DRAFT_LAYER], 32)
-    except AssertionError as e:
-        assert "pool 0" in str(e)
-    else:
-        raise AssertionError("expected the pool-0 sanity check to fire")
+def test_view_sources_slots_from_the_draft_layers_actual_pool():
+    manager = _FakeHybridManager()
+    view = MiniMaxM3DraftSubpageView(manager, [DRAFT_LAYER], 32)
+    assert view._source_pool_id == 1
+    dst = torch.zeros((1, 1, 2, view.max_blocks_per_seq), dtype=torch.int32)
+    view.copy_batch_block_offsets(dst, [1], 1, 1, 1)
+    assert dst[0, 0, 0, :4].tolist() == [5 * SCALE * 4 + i for i in range(4)]
 
 
 def test_draft_layout_target_only_num_layers():

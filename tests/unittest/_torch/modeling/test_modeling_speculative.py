@@ -15,12 +15,35 @@
 
 """Unit tests for Eagle3ForCausalLM.apply_eagle3_fc fc_norm branch."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
+from tensorrt_llm._torch.models.modeling_speculative import (
+    Eagle3ForCausalLM,
+    _set_draft_kv_cache_quant_algo,
+)
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+
+def test_draft_kv_cache_quant_algo_override_updates_all_layers():
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        extra_attrs={"draft_kv_cache_quant_algo_override": QuantAlgo.FP8},
+    )
+    layer_quant = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        quant_config_dict={"model.layers.0": layer_quant},
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    assert draft.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert layer_quant.kv_cache_quant_algo == QuantAlgo.FP8
 
 
 class _FakeDraftModel(nn.Module):

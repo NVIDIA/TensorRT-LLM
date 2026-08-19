@@ -34,6 +34,7 @@ from tensorrt_llm._utils import nvtx_range_debug
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
@@ -970,6 +971,11 @@ class MiniMaxM3Attention(Attention):
             quant_config is not None
             and quant_config.quant_mode is not None
             and quant_config.quant_mode.has_fp8_kv_cache()
+        )
+        self.main_kv_is_nvfp4 = bool(
+            quant_config is not None
+            and quant_config.quant_mode is not None
+            and quant_config.quant_mode.has_fp4_kv_cache()
         )
         self.enable_fused_main_kv_write = os.environ.get(_FUSED_MAIN_KV_WRITE_ENV, "0") == "1"
 
@@ -1976,6 +1982,16 @@ class MiniMaxM3Attention(Attention):
         """
         prewritten_main_kv = k is None or v is None
         assert (k is None) == (v is None)
+        kv_scale_orig_quant = (
+            getattr(self.qkv_proj, "inv_kv_scales", None) if self.main_kv_is_nvfp4 else None
+        )
+        kv_scale_quant_orig = (
+            getattr(self.qkv_proj, "kv_scales", None) if self.main_kv_is_nvfp4 else None
+        )
+        if self.main_kv_is_nvfp4 and (kv_scale_orig_quant is None or kv_scale_quant_orig is None):
+            raise RuntimeError(
+                "MiniMax-M3 NVFP4 KV cache requires qkv_proj.inv_kv_scales and kv_scales"
+            )
         if prewritten_main_kv:
             # Captured cache writes replay without replaying Python-side state.
             # Re-publish the marker in this eager boundary before the paged-GQA
@@ -1987,7 +2003,13 @@ class MiniMaxM3Attention(Attention):
             if not prewritten_main_kv:
                 # General #16755 path: one Triton launch writes this layer's
                 # K/V and, on the BF16 path, index-K.
-                attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v, idx_k)
+                attn_metadata.msa_write_layer_caches(
+                    self.attn.layer_idx,
+                    k,
+                    v,
+                    idx_k,
+                    kv_scale_orig_quant=kv_scale_orig_quant,
+                )
             # Publish the selected blocks so the FMHA runs the sparse path.
             kv_block_indexes = self.attn.run_indexer(
                 idx_q,
@@ -1995,14 +2017,28 @@ class MiniMaxM3Attention(Attention):
                 attn_metadata,
                 idx_k_prewritten=(not prewritten_main_kv or idx_k is None),
             )
-            forward_args = AttentionForwardArgs(output=output, topk_indices=kv_block_indexes)
+            forward_args = AttentionForwardArgs(
+                output=output,
+                topk_indices=kv_block_indexes,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
+            )
         else:
             assert idx_q is None and idx_k is None
             if not prewritten_main_kv:
                 # Dense layers retain the same general #16755 K/V scatter.
-                attn_metadata.msa_write_layer_caches(self.attn.layer_idx, k, v)
+                attn_metadata.msa_write_layer_caches(
+                    self.attn.layer_idx,
+                    k,
+                    v,
+                    kv_scale_orig_quant=kv_scale_orig_quant,
+                )
             # No top-k selection means the FMHA attends the full page table.
-            forward_args = AttentionForwardArgs(output=output)
+            forward_args = AttentionForwardArgs(
+                output=output,
+                kv_scale_orig_quant=kv_scale_orig_quant,
+                kv_scale_quant_orig=kv_scale_quant_orig,
+            )
         if prewritten_main_kv:
             self.attn.forward_prepopulated_kv(q, attn_metadata, forward_args)
         else:
@@ -2762,6 +2798,12 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         raw_pretrained = model_config.pretrained_config
         if is_minimax_m3_vl_config(raw_pretrained):
             model_config = get_text_model_config(model_config)
+        if model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4:
+            # M3's 57 sparse target layers have an MSA NVFP4 consumer, but the
+            # one-model Eagle layer has no shipped P32 NVFP4 decode cubin.
+            # Keep its modules and separate cache on their established FP8
+            # representation while the target remains NVFP4.
+            model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
 
     def load_weights(
