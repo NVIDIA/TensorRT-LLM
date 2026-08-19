@@ -462,11 +462,16 @@ class ModelLoader:
         if llm_args.speculative_config is not None:
             from tensorrt_llm._torch.speculative import \
                 update_spec_config_from_model_config
+            from tensorrt_llm._torch.speculative.utils import \
+                resolve_mtp_checkpoint_source
 
-            # Model defaults reconstruct nested Pydantic configs and drop
-            # init=False runtime fields such as num_nextn_predict_layers.
+            # Model defaults reconstruct nested Pydantic configs and drop private / runtime fields,
+            # so resolve the checkpoint source again before restoring derived MTP state.
+            resolve_mtp_checkpoint_source(llm_args.speculative_config,
+                                          checkpoint_dir)
             update_spec_config_from_model_config(llm_args.speculative_config,
-                                                 config.pretrained_config)
+                                                 config.pretrained_config,
+                                                 preference_cls)
 
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
@@ -1377,8 +1382,8 @@ class ModelLoader:
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
         from tensorrt_llm._torch.speculative.utils import (
-            loads_mtp_from_speculative_model, resolve_mtp_checkpoint_source,
-            update_spec_config_from_model_config)
+            resolve_mtp_checkpoint_source, update_spec_config_from_model_config,
+            uses_mtp_head_checkpoint)
 
         resolve_mtp_checkpoint_source(self.spec_config, checkpoint_dir)
 
@@ -1426,7 +1431,7 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
 
-        if loads_mtp_from_speculative_model(self.spec_config):
+        if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a
             # config object it then discards. The MTP heads' structure fields
             # (head count, block pattern) come from `speculative_model` and
