@@ -20,6 +20,7 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
+import os
 from itertools import count
 from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
 from weakref import WeakValueDictionary
@@ -330,6 +331,10 @@ def post_permute_5d_to_4d(out_5d, P):
     return out_5d.permute(1, 0, 2, 3, 4).contiguous().view(Bt, _P * Spt, HpP, Dt)
 
 
+def _disable_ulysses_post_unscatter_op() -> bool:
+    return os.environ.get("TRTLLM_DISABLE_ULYSSES_POST_UNSCATTER_OP", "0") == "1"
+
+
 def _ulysses_post_unscatter(q_5d, k_5d, v_5d, *, is_hnd):
     """One-launch fused replacement for the post-A2A 5D -> 4D chain.
 
@@ -475,6 +480,8 @@ class UlyssesAttention(AttentionBackend):
         v: torch.Tensor,
         kwargs: Dict,
     ) -> bool:
+        if self.world_size <= 1 or _disable_ulysses_post_unscatter_op():
+            return False
         if self.inner_backend.preferred_layout not in (
             AttentionTensorLayout.HND,
             AttentionTensorLayout.NHD,
@@ -790,7 +797,11 @@ class UlyssesAttention(AttentionBackend):
         # only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
-        use_fused_post_unscatter = q_5d.dtype == torch.bfloat16
+        use_fused_post_unscatter = (
+            self.world_size > 1
+            and q_5d.dtype == torch.bfloat16
+            and not _disable_ulysses_post_unscatter_op()
+        )
         if use_fused_post_unscatter:
             q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
             B = B_q
