@@ -3856,6 +3856,16 @@ class BlockReuseConfig(StrictBaseModel):
         "`policy` is 'per_conversation'.")
 
 
+# Attention backends that can address a scratch block. TRTLLM consumes
+# copy_batch_block_offsets, which carries separate K and V page indices;
+# FlashInfer builds a flat page table and uses the PER_LAYER addressing path.
+# Every other backend reads raw base page indices, where a scratch block --
+# which owns no per-block page -- appears as an invalid page. Defined here so
+# the 'auto' resolver in llm_utils and validate_swa_scratch_reuse below cannot
+# drift apart when a backend gains scratch-page addressing.
+SWA_SCRATCH_CAPABLE_ATTN_BACKENDS = ("TRTLLM", "FLASHINFER")
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -6304,7 +6314,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if kv_cache_config.enable_swa_scratch_reuse is not True:
             return self
 
-        if self.attn_backend not in ("TRTLLM", "FLASHINFER"):
+        if self.attn_backend not in SWA_SCRATCH_CAPABLE_ATTN_BACKENDS:
             raise ValueError(
                 "kv_cache_config.enable_swa_scratch_reuse is not supported with "
                 f"attn_backend={self.attn_backend!r}. Only 'TRTLLM' (via "

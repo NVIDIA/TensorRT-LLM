@@ -961,16 +961,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             mgr = self.kv_cache_manager
             get_scale = getattr(mgr, 'get_layer_page_index_scale', None)
             layer_space: Dict[int, int] = {}
+            # With SWA scratch reuse the page index is genuinely per-layer:
+            # a scratch block's sub-page rotates with block position, so it
+            # cannot be folded into a per-layer base pointer the way a fixed
+            # layer offset can. Give every layer its own index space; the
+            # per-space buffers and the per-layer swap below then work
+            # unchanged, just with more spaces. Bound outside the guard: it is
+            # read again below, where only `layer_space` being empty currently
+            # short-circuits the read.
+            per_layer_spaces = getattr(mgr, 'enable_swa_scratch_reuse', False)
             if hasattr(mgr, 'layer_to_pool_mapping_dict') and get_scale:
                 space_ids = {}
-                # With SWA scratch reuse the page index is genuinely per-layer:
-                # a scratch block's sub-page rotates with block position, so it
-                # cannot be folded into a per-layer base pointer the way a fixed
-                # layer offset can. Give every layer its own index space; the
-                # per-space buffers and the per-layer swap below then work
-                # unchanged, just with more spaces.
-                per_layer_spaces = getattr(mgr, 'enable_swa_scratch_reuse',
-                                           False)
                 for layer_idx in getattr(mgr, 'layer_offsets', {}):
                     layer_offset = mgr.layer_offsets[layer_idx]
                     key = layer_idx if per_layer_spaces else (

@@ -2327,11 +2327,18 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if self._per_layer_flat_validated:
             return
+        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+            # kv_factor == 1 under SELFKONLY: one sub-page per block, so there
+            # is no K/V pairing to preserve and every index divides through
+            # unchanged. Every other layout has to be checked.
+            self._check_per_layer_kv_adjacency()
+        # Latched only on success: memoizing a raise as "validated" would let a
+        # later call return silently and build a flat page table on a layout
+        # already proven unsupported.
         self._per_layer_flat_validated = True
-        if self.kv_cache_type == CacheTypeCpp.SELFKONLY:
-            # kv_factor == 1: one sub-page per block, so there is no K/V pairing
-            # to preserve and every index divides through unchanged.
-            return
+
+    def _check_per_layer_kv_adjacency(self) -> None:
+        """Raise if any layer's converter breaks a flat page table's assumptions."""
         for local_layer_idx in range(self.num_local_layers):
             layer_id = LayerId(local_layer_idx)
             conv_k = self.impl.get_page_index_converter(layer_id, Role.KEY)
