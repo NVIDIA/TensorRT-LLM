@@ -36,7 +36,6 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import MoeConfig
-from tensorrt_llm.lora_helper import LoraConfig
 
 from ..conftest import llm_models_root
 
