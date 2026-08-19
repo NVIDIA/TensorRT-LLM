@@ -20,12 +20,6 @@
 # trtllm-serve spawns the 8 workers itself — do not wrap it in torchrun/mpirun.
 #
 # GPU layout: cfg_size=2 (positive | negative) x ulysses_size=4 (sequence split).
-# Measured on 8xB300 at 1280x720 x 189 frames; keep this split unless a new
-# measurement says otherwise:
-#   cfg_size=1, ulysses_size=8      +4.5% slower  (CFG is worth two ranks)
-#   ring_size                        unsupported  (Cosmos3 cross-attention)
-# For reference, the 4-GPU config reaches 28.7 s on the same shape, so this
-# scales 1.90x on 2x the GPUs.
 attention_config:
   backend: VANILLA
 parallel_config:
