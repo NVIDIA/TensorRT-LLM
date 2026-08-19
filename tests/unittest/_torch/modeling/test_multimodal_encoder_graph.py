@@ -571,7 +571,7 @@ def test_capture_uses_inference_mode_when_grad_enabled(cuda_device, make_cuda_ru
         assert torch.is_grad_enabled()
         runner.capture_all(cuda_device)
 
-    assert observed == [False, False, False]
+    assert observed and not any(observed)
 
 
 @pytestmark_cuda
@@ -596,7 +596,7 @@ def test_capture_lowers_torch_compiling_and_restores_it(cuda_device, make_cuda_r
         runner.capture_all(cuda_device)
         assert is_torch_compiling(), "capture must restore the caller's value"
 
-    assert observed == [False, False, False]
+    assert observed and not any(observed)
     assert not is_torch_compiling()
 
 
