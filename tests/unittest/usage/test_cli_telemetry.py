@@ -300,6 +300,26 @@ class TestTelemetryGroup:
         assert outcome.exit_code == expected_code
         assert outcome.termination_kind == expected_kind
 
+    def test_out_of_contract_system_exit_is_not_clean(self, terminal_mocks):
+        """An unrepresentable exit code must not become a clean exit."""
+
+        def terminate():
+            raise SystemExit(-1)
+
+        cli = _make_cli(terminate)
+        with pytest.raises(SystemExit) as raised:
+            cli.main(args=["run"], prog_name="test-cli")
+
+        assert raised.value.code == -1
+        outcome = terminal_mocks.report_exit.call_args.args[0]
+        assert outcome.exit_code_known is False
+        assert outcome.exit_code == 0
+        assert outcome.termination_kind == "exception"
+        assert all(
+            call.args != ("shutdown",)
+            for call in terminal_mocks.set_phase.call_args_list
+        )
+
     def test_no_telemetry_is_honored_before_parsing(self, terminal_mocks):
         """The early local session sees the CLI opt-out flag."""
         cli = _make_cli()
