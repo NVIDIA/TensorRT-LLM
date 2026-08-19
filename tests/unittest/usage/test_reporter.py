@@ -28,7 +28,8 @@ from pydantic import BaseModel, Field
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.config import UsageContext
 
-pytestmark = pytest.mark.cpu_only
+
+
 @pytest.fixture(autouse=True)
 def _reset_process_telemetry_state():
     """Keep process-scoped telemetry state isolated between unit tests."""
@@ -48,6 +49,15 @@ def _reset_process_telemetry_state():
     usage_lib._REPORTER_STARTED = False
     usage_lib._REPORTER_ACTIVE = False
     usage_lib._PENDING_TERMINAL = None
+
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture
+def reporter_session(enable_telemetry):
+    """Create the session required by the background reporter."""
+    assert usage_lib.apply_usage_session_config()
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +365,7 @@ class TestIngressPointReporter:
 class TestClampStrIntegration:
     """Verify _background_reporter() clamps long strings to schema limits."""
 
-    def test_background_reporter_clamps_long_platform_string(self):
+    def test_background_reporter_clamps_long_platform_string(self, reporter_session):
         """Long platform string does not cause ValidationError; len <= 256."""
         long_platform = "x" * 300
 
@@ -396,7 +406,7 @@ class TestClampStrIntegration:
 class TestDisaggMetadata:
     """Verify _background_reporter() reads disagg env vars into initial report."""
 
-    def test_disagg_env_vars_appear_in_payload(self, monkeypatch):
+    def test_disagg_env_vars_appear_in_payload(self, monkeypatch, reporter_session):
         """Disagg env vars appear as disaggRole and deploymentId in payload."""
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
         monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "abc123")
@@ -420,7 +430,7 @@ class TestDisaggMetadata:
         assert params["disaggRole"] == "context"
         assert params["deploymentId"] == "abc123"
 
-    def test_disagg_payload_includes_llm_api_config_json(self, monkeypatch):
+    def test_disagg_payload_includes_llm_api_config_json(self, monkeypatch, reporter_session):
         """Disagg payloads retain sanitized LLM API config JSON fields."""
 
         class _DisaggTelemetryArgs(BaseModel):
@@ -458,7 +468,7 @@ class TestDisaggMetadata:
 class TestDisaggMetadataEmpty:
     """Verify empty defaults when disagg env vars are unset (non-disagg mode)."""
 
-    def test_disagg_fields_empty_when_unset(self, monkeypatch):
+    def test_disagg_fields_empty_when_unset(self, monkeypatch, reporter_session):
         """Without disagg env vars, disaggRole and deploymentId are empty strings."""
         monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
         monkeypatch.delenv("TRTLLM_DISAGG_DEPLOYMENT_ID", raising=False)
@@ -523,6 +533,26 @@ class TestRankGuard:
             thread_cls.assert_called_once()
             mock_thread.start.assert_called_once()
 
+    def test_pre_split_session_reports_after_becoming_subgroup_rank_zero(
+        self, monkeypatch, enable_telemetry
+    ):
+        """Session setup before a communicator split does not fix its rank."""
+        self._setup_reporter(monkeypatch)
+
+        with patch.object(usage_lib, "_is_reporting_rank", return_value=False):
+            assert not usage_lib._is_reporting_rank()
+            assert usage_lib.apply_usage_session_config()
+
+        mock_thread = MagicMock()
+        with (
+            patch.object(usage_lib, "_is_reporting_rank", return_value=True),
+            patch.object(usage_lib.threading, "Thread", return_value=mock_thread) as thread_cls,
+        ):
+            usage_lib.report_usage()
+
+        thread_cls.assert_called_once()
+        mock_thread.start.assert_called_once()
+
     def test_rank_import_fails_proceeds(self, monkeypatch, enable_telemetry):
         """report_usage() proceeds (fail-open) when mpi_rank import fails."""
         self._setup_reporter(monkeypatch)
@@ -562,7 +592,7 @@ class TestRankGuard:
 class TestReporterShutdown:
     """Verify _REPORTER_STOP event exits the heartbeat loop."""
 
-    def test_reporter_stop_event_exits_heartbeat_loop(self):
+    def test_reporter_stop_event_exits_heartbeat_loop(self, reporter_session):
         """Setting _REPORTER_STOP causes the heartbeat loop to exit."""
         send_count = {"n": 0}
 
@@ -620,7 +650,7 @@ class TestReporterShutdown:
 class TestHeartbeatFailSilent:
     """Verify transient heartbeat failure doesn't kill the loop."""
 
-    def test_heartbeat_continues_after_transient_failure(self):
+    def test_heartbeat_continues_after_transient_failure(self, reporter_session):
         """OSError on one heartbeat doesn't prevent subsequent heartbeats."""
         calls = []
 
@@ -646,6 +676,18 @@ class TestHeartbeatFailSilent:
         assert len(calls) >= 3, (
             f"Expected >=3 _send_to_gxt calls (loop should continue after failure), got {len(calls)}"
         )
+
+
+class TestBackgroundReporterOptOut:
+    def test_late_opt_out_prevents_initial_event(self, enable_telemetry):
+        """A reporter waking after session deactivation sends nothing."""
+        assert usage_lib.apply_usage_session_config()
+        usage_lib._deactivate_usage_session()
+
+        with patch.object(usage_lib, "_send_to_gxt") as send:
+            usage_lib._background_reporter(None, None, "")
+
+        send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

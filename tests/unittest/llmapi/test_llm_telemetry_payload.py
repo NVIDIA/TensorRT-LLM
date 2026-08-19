@@ -66,11 +66,13 @@ class TestPayloadVerification:
     def _setup(self):
         self.model_path = _get_model_path()
 
-    def test_payload_parameters_match_ground_truth(self):
+    def test_payload_parameters_match_ground_truth(self, monkeypatch):
         """Load real model, build payload, verify every parameter is accurate."""
         import torch
 
         import tensorrt_llm.usage.usage_lib as usage_lib
+
+        monkeypatch.setenv("TRTLLM_USAGE_FORCE_ENABLED", "1")
 
         # Step 1: Load real model, capture report_usage kwargs
         captured, spy = _make_spy()
