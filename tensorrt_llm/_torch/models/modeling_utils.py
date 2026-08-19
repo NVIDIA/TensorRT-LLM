@@ -1006,7 +1006,7 @@ def register_draft_model(mode):
             num_stages = count_dspark_stages(
                 model_config.spec_config.speculative_model)
             validate_dspark_eplb_layer_base(model_config, draft_config)
-            return DSparkForCausalLM(
+            return DSv4DSparkForCausalLM(
                 draft_config,
                 getattr(model, "aux_stream_dict", None),
                 num_stages=num_stages,

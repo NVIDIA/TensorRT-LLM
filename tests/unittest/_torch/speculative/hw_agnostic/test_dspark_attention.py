@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 import tensorrt_llm._torch.models.modeling_dspark as modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import (
-    DSparkDraftModel,
+    DSv4DSparkDraftModel,
     apply_dspark_rotary,
     dspark_attention_forward,
     dspark_sparse_attn,
@@ -122,8 +122,8 @@ def test_rope_table_is_cached_once_per_device():
         _freqs_table_cache={},
     )
 
-    first = DSparkDraftModel._dspark_freqs_table(model, torch.device("cpu"))
-    second = DSparkDraftModel._dspark_freqs_table(model, torch.device("cpu"))
+    first = DSv4DSparkDraftModel._dspark_freqs_table(model, torch.device("cpu"))
+    second = DSv4DSparkDraftModel._dspark_freqs_table(model, torch.device("cpu"))
 
     assert first.data_ptr() == second.data_ptr()
     assert len(model._freqs_table_cache) == 1
@@ -166,7 +166,7 @@ def test_dspark_block_uses_stage_id_as_attention_layer_idx(monkeypatch):
         spec_config=None,
     )
 
-    block = modeling_dspark.DSparkBlock(
+    block = modeling_dspark.DSv4DSparkBlock(
         model_config,
         layer_idx=10,
         aux_stream_dict={},
@@ -248,7 +248,7 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
         ),
     )
 
-    actual = DSparkDraftModel._forward_stage(
+    actual = DSv4DSparkDraftModel._forward_stage(
         model,
         stage,
         h,

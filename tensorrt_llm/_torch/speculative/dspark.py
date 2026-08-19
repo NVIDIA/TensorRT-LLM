@@ -17,7 +17,7 @@
 # hidden states, accept the previous block with standard verification, draft a
 # new block in one backbone forward), adapted to DSpark's draft model which
 # produces the whole block (and its confidence-truncated length) inside a single
-# ``DSparkDraftModel.forward`` rather than via mask-token cross-attention.
+# ``DSv4DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
 from collections import deque
 from dataclasses import dataclass
@@ -44,7 +44,7 @@ class DSparkSpecMetadata(SpecMetadata):
     the target forward pass. DSpark captures the *mean over the multi-head
     (mHC) residual streams* at each captured layer (handled by the target-side
     capture hook), concatenated across layers, and feeds them to the draft
-    model's ``main_proj`` + ``main_norm`` (inside ``DSparkDraftModel.forward``)
+    model's ``main_proj`` + ``main_norm`` (inside ``DSv4DSparkDraftModel.forward``)
     as the captured-context attention input (``main_x``).
 
     Mirrors :class:`DFlashSpecMetadata`; the only DSpark-specific detail is that
@@ -188,7 +188,7 @@ class DSparkWorker(SpecWorkerBase):
     """Worker for DSpark speculative decoding.
 
     DSpark drafts a whole block of ``block_size`` tokens in one backbone forward
-    (``DSparkDraftModel.forward``): it projects the captured target-layer hidden
+    (``DSv4DSparkDraftModel.forward``): it projects the captured target-layer hidden
     states (``main_proj`` + ``main_norm``) into the draft's captured-context
     attention, runs the ``num_stages`` DSpark blocks over a rolling captured
     window, refines the per-position logits with the Markov head, and predicts a
@@ -205,7 +205,7 @@ class DSparkWorker(SpecWorkerBase):
     The rolling window is kept consistent across the whole decode: it is seeded
     from the prompt's captured context at prefill and back-filled with the
     intermediate accepted tokens of a multi-accept step (both via
-    ``DSparkDraftModel.write_context_windows``), in addition to the per-step bonus
+    ``DSv4DSparkDraftModel.write_context_windows``), in addition to the per-step bonus
     write done by the generation path. These affect draft acceptance rate only,
     not correctness, which the standard target verify guarantees.
 
@@ -245,7 +245,7 @@ class DSparkWorker(SpecWorkerBase):
         self._scratch_slot = 0
 
         # The generation draft path is the batched, host-sync-free
-        # ``_draft_gen_block_batched`` + ``DSparkDraftModel.forward_batched`` +
+        # ``_draft_gen_block_batched`` + ``DSv4DSparkDraftModel.forward_batched`` +
         # ``dspark_attention_forward_batched``: it is correct in eager mode AND safe
         # to capture into the target's CUDA graph (DSpark is a one-engine drafter —
         # its worker forward runs inside that graph, so the draft path MUST be
@@ -414,7 +414,7 @@ class DSparkWorker(SpecWorkerBase):
         (``nacc``, the bonus, ``main_hidden``, ``start_pos``, the multi-accept
         back-fill) are gathered as tensors, slots come from the host-built
         ``_batch_to_slot`` mirror, and the backbone runs once via
-        ``DSparkDraftModel.forward_batched``. Returns the per-position corrected
+        ``DSv4DSparkDraftModel.forward_batched``. Returns the per-position corrected
         block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
         draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
         Confidence truncation stays disabled — the full block is proposed.

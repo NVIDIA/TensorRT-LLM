@@ -835,7 +835,7 @@ def count_dspark_stages(ckpt_dir: str) -> Optional[int]:
 
 
 def _rename_dspark_stage_subkey(rest: str, routed_scale: str) -> str:
-    """Map a per-stage checkpoint subkey to the ``DSparkBlock`` param subkey."""
+    """Map a per-stage checkpoint subkey to the ``DSv4DSparkBlock`` param subkey."""
     if rest == "attn_norm.weight":
         return "input_layernorm.weight"
     if rest == "ffn_norm.weight":
@@ -855,7 +855,7 @@ def _rename_dspark_stage_subkey(rest: str, routed_scale: str) -> str:
     if rest.startswith("ffn."):
         return f"mlp.{_rename_deepseek_v4_ffn_subkey(rest[len('ffn.') :], routed_scale)}"
     # main_proj.weight, main_norm.weight, norm.weight, markov_head.*,
-    # confidence_head.* map 1:1 onto the DSparkBlock submodules.
+    # confidence_head.* map 1:1 onto the DSv4DSparkBlock submodules.
     return rest
 
 
@@ -892,7 +892,7 @@ def remap_dspark_draft_keys(weights: Dict, num_stages: int) -> Dict:
 # dequantize ``wo_a`` (cos 1.0 vs ``wo_a_fp8 * scale``). Always dequantize now.
 
 
-class DSparkBlock(DeepseekV4DecoderLayer):
+class DSv4DSparkBlock(DeepseekV4DecoderLayer):
     """One DSpark draft stage = a DeepSeek-V4 decoder block + DSpark extras.
 
     ``stage_id`` in ``[0, num_stages)``; only stage 0 owns the capture projection
@@ -984,7 +984,7 @@ class DSparkBlock(DeepseekV4DecoderLayer):
         return self.stage_id == self.num_stages - 1
 
 
-class DSparkDraftModel(nn.Module):
+class DSv4DSparkDraftModel(nn.Module):
     """The ``n_mtp_layers``-stage DSpark draft stacked on a DeepSeek-V4 target.
 
     Shares ``embed_tokens`` / ``lm_head`` with the target model. ``forward_embed``
@@ -1061,7 +1061,7 @@ class DSparkDraftModel(nn.Module):
         draft_model_config = self._derive_draft_model_config(model_config, base, self.num_stages)
         self.mtp_layers = nn.ModuleList(
             [
-                DSparkBlock(
+                DSv4DSparkBlock(
                     draft_model_config,
                     base + s,
                     aux_stream_dict,
@@ -1199,7 +1199,7 @@ class DSparkDraftModel(nn.Module):
     def cache_attn_weights_from_state_dict(self, weights: Dict) -> None:
         """Populate ``_dspark_attn`` from an already-loaded in-memory ``weights`` dict
         (no extra disk I/O); used on the one-engine load path
-        (``DSparkForCausalLM.load_weights``). Delegates to :meth:`_cache_attn_weights`.
+        (``DSv4DSparkForCausalLM.load_weights``). Delegates to :meth:`_cache_attn_weights`.
         """
         self._cache_attn_weights(weights)
 
@@ -1463,7 +1463,7 @@ class DSparkDraftModel(nn.Module):
 
     def _forward_stage(
         self,
-        stage: "DSparkBlock",
+        stage: "DSv4DSparkBlock",
         h: torch.Tensor,
         main_x: torch.Tensor,
         start_pos,
@@ -1798,10 +1798,10 @@ class DSparkDraftModel(nn.Module):
         )
 
 
-class DSparkForCausalLM(nn.Module):
+class DSv4DSparkForCausalLM(nn.Module):
     """One-engine draft wrapper for DSpark (mirrors ``DFlashForCausalLM``).
 
-    Wraps :class:`DSparkDraftModel` (the ``n_mtp_layers``-stage ``mtp.*`` backbone)
+    Wraps :class:`DSv4DSparkDraftModel` (the ``n_mtp_layers``-stage ``mtp.*`` backbone)
     for the single-engine external-drafter flow: created by ``get_draft_model``,
     appended to the target's epilogue, and driven by ``DSparkWorker``.
 
@@ -1815,7 +1815,7 @@ class DSparkForCausalLM(nn.Module):
 
     def __init__(self, draft_config, aux_stream_dict=None, num_stages=None, block_size=None):
         super().__init__()
-        self.dspark_model = DSparkDraftModel(
+        self.dspark_model = DSv4DSparkDraftModel(
             draft_config,
             aux_stream_dict,
             num_stages=num_stages,
@@ -1902,11 +1902,11 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
         model: the target model, whose aux streams the draft stages reuse.
 
     Returns:
-        The ``DSparkForCausalLM`` draft module.
+        The ``DSv4DSparkForCausalLM`` draft module.
     """
     num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
     validate_dspark_eplb_layer_base(model_config, draft_config)
-    return DSparkForCausalLM(
+    return DSv4DSparkForCausalLM(
         draft_config,
         getattr(model, "aux_stream_dict", None),
         num_stages=num_stages,
@@ -1915,9 +1915,9 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
 
 
 __all__ = [
-    "DSparkBlock",
-    "DSparkDraftModel",
-    "DSparkForCausalLM",
+    "DSv4DSparkBlock",
+    "DSv4DSparkDraftModel",
+    "DSv4DSparkForCausalLM",
     "validate_dspark_eplb_layer_base",
     "validate_dspark_eplb_stage_layers",
     # Captured-context attention primitives.
