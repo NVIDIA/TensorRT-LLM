@@ -335,9 +335,11 @@ To disable telemetry data collection, use any of the following methods:
 - **CLI flag**: Use `--no-telemetry` on `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`
 
 CLI terminal telemetry may report that an argument or YAML configuration was
-invalid. It reports categorical termination and lifecycle metadata, never the
-argument text or configuration content. The environment-variable, file-based,
-and CLI-flag opt-outs are all applied before CLI and YAML validation.
+invalid. The terminal event records only categorical termination and lifecycle
+metadata, never the raw argument or YAML text. Other telemetry events collect
+the selected, sanitized configuration fields listed above. The
+environment-variable, file-based, and CLI-flag opt-outs are all applied before
+CLI and YAML validation.
 
 The telemetry collection code is fully open source and auditable at
 [`tensorrt_llm/usage/`](./tensorrt_llm/usage/). For a detailed field-by-field
