@@ -360,6 +360,7 @@ class ClaudeCodeBackend(Backend):
         hooks: dict | None = None,
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        cwd: Path | None = None,
     ) -> AsyncIterator[BackendClient]:
         # External MCP server configs (e.g. ``{"Glean": {"type": "http",
         # "url": ...}}``) are layered alongside the in-process
@@ -392,7 +393,7 @@ class ClaudeCodeBackend(Backend):
             mcp_servers=mcp_servers,
             model=model,
             effort=_REASONING_EFFORT,
-            cwd=Path.cwd(),
+            cwd=cwd or Path.cwd(),
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
             can_use_tool=_approve_tool,
