@@ -1335,6 +1335,17 @@ def report_exit(
             return False
         snapshot, outcome = terminal
         claimed = True
+
+        # Ignore successful CLI invocations that ended before model startup,
+        # such as help, version, and shell-completion probes. The claimed slot
+        # keeps the atexit fallback from replacing suppression with "unknown".
+        if (
+            outcome.termination_kind == "clean"
+            and snapshot["lifecyclePhase"] in ("cli_parsing", "config_validation")
+            and snapshot["llmInitializationAttempts"] == 0
+        ):
+            return True
+
         _show_usage_notification()
 
         exit_code_known = outcome.exit_code_known is True
@@ -1348,12 +1359,16 @@ def report_exit(
         if not isinstance(signal_number, int) or not 0 <= signal_number <= schema._UINT32_MAX:
             signal_number = 0
 
+        event_lifecycle_phase = lifecycle_phase or snapshot["lifecyclePhase"]
+        if outcome.termination_kind == "clean":
+            event_lifecycle_phase = "shutdown"
+
         event = schema.TrtllmExitReport(
             exitCodeKnown=exit_code_known,
             exitCode=exit_code,
             signalNumber=signal_number,
             terminationKind=outcome.termination_kind,
-            lifecyclePhase=lifecycle_phase or snapshot["lifecyclePhase"],
+            lifecyclePhase=event_lifecycle_phase,
             component=outcome.component or snapshot["component"],
             reportingSource=outcome.reporting_source,
             **_session_event_fields(snapshot),

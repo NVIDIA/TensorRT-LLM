@@ -200,7 +200,6 @@ def run_with_terminal_reporting(
             termination_kind = "signal"
         elif exit_code_known and exit_code == 0:
             termination_kind = "clean"
-            usage.set_lifecycle_phase("shutdown")
         else:
             termination_kind = "exception"
         report(
@@ -240,7 +239,6 @@ def run_with_terminal_reporting(
             termination_kind = "signal"
         else:
             termination_kind = "clean"
-            usage.set_lifecycle_phase("shutdown")
         report(
             usage.TerminalOutcome(
                 termination_kind=termination_kind,

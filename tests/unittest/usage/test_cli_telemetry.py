@@ -384,6 +384,24 @@ class TestTelemetryGroup:
 class TestSerializedTerminationKinds:
     """Exercise non-signal terminal kinds through the real payload builder."""
 
+    @pytest.mark.parametrize("args", [["--help"], ["run", "--help"]])
+    def test_help_does_not_serialize_terminal_event(
+        self,
+        captured_exit_payloads,
+        args,
+    ):
+        """Clean help exits consume the terminal slot without telemetry."""
+        cli = _make_cli()
+
+        with pytest.raises(SystemExit) as raised:
+            cli.main(args=args, prog_name="test-cli")
+
+        assert raised.value.code == 0
+        assert captured_exit_payloads == []
+
+        usage_lib._report_process_exit()
+        assert captured_exit_payloads == []
+
     @pytest.mark.parametrize(
         ("args", "expected"),
         [
@@ -395,8 +413,9 @@ class TestSerializedTerminationKinds:
                     "exitCode": 0,
                     "signalNumber": 0,
                     "lifecyclePhase": "shutdown",
+                    "llmInitializationAttempts": 2,
                 },
-                id="clean",
+                id="clean-multiple-llms",
             ),
             pytest.param(
                 ["--invalid-option"],
@@ -413,7 +432,18 @@ class TestSerializedTerminationKinds:
     )
     def test_system_exit_serialization(self, captured_exit_payloads, args, expected):
         """Clean and Click-error paths serialize their complete status."""
-        cli = _make_cli()
+
+        def run_multiple_llms_with_stale_phase():
+            for _ in range(2):
+                assert usage_lib.record_llm_initialization_attempt(
+                    default_usage_context=UsageContext.CLI_SERVE.value
+                )
+                assert usage_lib.record_llm_initialized()
+                usage_lib.record_llm_shutdown()
+            usage_lib.set_lifecycle_phase("config_validation")
+
+        callback = run_multiple_llms_with_stale_phase if args == ["run"] else None
+        cli = _make_cli(callback)
 
         with pytest.raises(SystemExit) as raised:
             cli.main(args=args, prog_name="test-cli")
