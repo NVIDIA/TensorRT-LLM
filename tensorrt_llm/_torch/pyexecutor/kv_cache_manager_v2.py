@@ -2653,6 +2653,40 @@ class KVCacheManagerV2(BaseResourceManager):
     # ---- prepare_resources ----
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
+    def get_page_indices_by_layer_group(self, request: LlmRequest) -> Dict[int, List[int]]:
+        """Per-layer-group page slot indices for ``request``, by block ordinal.
+
+        ``valid_only=False`` is deliberate: the positionally-aligned form yields
+        one entry per block ordinal, which is what preserves the ordinal-to-token
+        -range mapping a connector needs. A block with no page in a given layer
+        group -- the sliding-window case -- reads back as ``BAD_PAGE_INDEX`` in
+        place rather than shortening the list, so ordinals stay stable and an
+        append-delta over successive calls remains valid.
+        """
+        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        if kv_cache is None:
+            return {}
+        return {
+            layer_group_id: list(
+                kv_cache.get_aggregated_page_indices(layer_group_id, valid_only=False)
+            )
+            for layer_group_id in range(len(self.impl.layer_grouping))
+        }
+
+    def get_connector_page_indices(self, request: LlmRequest) -> List[int]:
+        """Flat page slot indices for ``request``, for connectors.
+
+        A page index is scoped to a layer group, so there is no correct way to
+        flatten indices from several groups into one list. With a single group
+        -- every non-VSWA, non-hybrid model -- that group's indices are the flat
+        list; with several, connectors must read
+        ``new_block_ids_by_layer_group`` off the scheduler output instead.
+        """
+        indices_by_group = self.get_page_indices_by_layer_group(request)
+        if len(indices_by_group) != 1:
+            return []
+        return next(iter(indices_by_group.values()))
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         if self.is_draft:
             # Draft V2 manager: mirror the main manager by creating/resizing
@@ -2660,6 +2694,31 @@ class KVCacheManagerV2(BaseResourceManager):
             # know about the draft manager).
             self._prepare_draft_resources(scheduled_batch)
             return
+
+        # V2 allocates in KVCacheV2Scheduler (prepare_context / resize_context)
+        # rather than here, so by this point every scheduled request already has
+        # its pages. This is the same point in the iteration at which the V1
+        # manager drives the connector's scheduler-side hooks, and page indices
+        # are available, so the connector is driven from here.
+        if self.kv_connector_manager is not None:
+            self._run_kv_connector_hooks(scheduled_batch)
+
+    def _run_kv_connector_hooks(self, scheduled_batch: ScheduledRequests) -> None:
+        """Report freshly allocated pages, then build the connector metadata."""
+        for request in scheduled_batch.context_requests:
+            # Mirror V1, which reports allocation once per sequence, right after
+            # the sequence is added -- that is the first context chunk.
+            if not request.is_first_context_chunk:
+                continue
+            # Connectors that do not reason about layer groups see the single
+            # group's indices; with several groups there is no correct flat
+            # list, so report none and leave them to the layer-group-aware
+            # metadata carried on RequestData.
+            self.kv_connector_manager.update_state_after_alloc(
+                request, self.get_connector_page_indices(request)
+            )
+
+        self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.

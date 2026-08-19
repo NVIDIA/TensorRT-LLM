@@ -86,6 +86,11 @@ class RequestData:
     # remote object id) MUST mix cache_salt into their identifiers,
     # otherwise blocks from a different salt could be incorrectly reused.
     cache_salt: Optional[str] = None
+    # New page slot indices keyed by layer group, populated under
+    # KVCacheManagerV2. Blocks with no page in a group -- the sliding-window
+    # case -- appear as BAD_PAGE_INDEX in place, keeping ordinals stable.
+    # Empty under the V1 manager, whose block IDs are a single flat space.
+    new_block_ids_by_layer_group: Dict[int, List[int]] = field(default_factory=dict)
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -341,21 +346,49 @@ class AsyncRequests:
 class KvCacheConnectorSchedulerOutputRequest:
     def __init__(self):
         self.block_ids = []
+        self.block_ids_by_layer_group: Dict[int, List[int]] = {}
         self.tokens = []
 
     def update_and_build_data(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
-        block_ids = kv_cache_manager.get_cache_indices(req)
+        from ..kv_cache_manager_v2 import KVCacheManagerV2
+
+        is_v2 = isinstance(kv_cache_manager, KVCacheManagerV2)
         tokens = req.get_tokens(0)
 
-        # Commit hashes for any blocks that have become full since the last call
-        # and read back the full cumulative chain. The C++ side sets each block's
-        # mBlockKey/mHash on first call, so subsequent calls become pure lookups.
-        block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
+        new_block_ids_by_layer_group: Dict[int, List[int]] = {}
+        if is_v2:
+            # Block hashes and retention priorities have no V2 accessor yet, so
+            # they are reported empty rather than guessed at.
+            block_hashes = []
+            indices_by_group = kv_cache_manager.get_page_indices_by_layer_group(req)
+            for layer_group_id, indices in indices_by_group.items():
+                seen = self.block_ids_by_layer_group.setdefault(layer_group_id, [])
+                new_ids = indices[len(seen) :]
+                seen.extend(new_ids)
+                new_block_ids_by_layer_group[layer_group_id] = new_ids
+            # With a single layer group -- every non-VSWA, non-hybrid model --
+            # ``new_block_ids`` carries that group's indices so connectors that
+            # do not reason about layer groups keep working. With several groups
+            # it is left empty and ``new_block_ids_by_layer_group`` is the only
+            # correct source.
+            new_block_ids = (
+                next(iter(new_block_ids_by_layer_group.values()))
+                if len(new_block_ids_by_layer_group) == 1
+                else []
+            )
+            self.block_ids.extend(new_block_ids)
+        else:
+            block_ids = kv_cache_manager.get_cache_indices(req)
 
-        new_block_ids = block_ids[len(self.block_ids) :]
+            # Commit hashes for any blocks that have become full since the last call
+            # and read back the full cumulative chain. The C++ side sets each block's
+            # mBlockKey/mHash on first call, so subsequent calls become pure lookups.
+            block_hashes = kv_cache_manager.commit_and_get_block_hashes(req)
+
+            new_block_ids = block_ids[len(self.block_ids) :]
+            self.block_ids.extend(new_block_ids)
+
         new_tokens = tokens[len(self.tokens) :]
-
-        self.block_ids.extend(new_block_ids)
         self.tokens.extend(new_tokens)
 
         if req.state in (
@@ -371,9 +404,13 @@ class KvCacheConnectorSchedulerOutputRequest:
             )  # Specdec with draft tokens is not supported yet.
 
         # Get retention priority for each new block only if retention config is provided
-        # (for priority-based offload filtering)
+        # (for priority-based offload filtering). Priorities stay None on
+        # KVCacheManagerV2: it does not implement `KvCacheRetentionConfig` at
+        # all -- its per-page priority comes from `custom_priority_callback`,
+        # which KVCacheManagerV2 never overrides -- so every page carries the
+        # default and reporting it would misdescribe what the user asked for.
         priorities = None
-        if req.kv_cache_retention_config is not None:
+        if not is_v2 and req.kv_cache_retention_config is not None:
             priorities = [
                 kv_cache_manager.get_priority_by_block_id(block_id) for block_id in new_block_ids
             ]
@@ -387,6 +424,7 @@ class KvCacheConnectorSchedulerOutputRequest:
             block_hashes=block_hashes,
             priorities=priorities,
             cache_salt=req.cache_salt,
+            new_block_ids_by_layer_group=new_block_ids_by_layer_group,
         )
 
 

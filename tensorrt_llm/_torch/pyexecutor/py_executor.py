@@ -7469,7 +7469,17 @@ class PyExecutor:
 
         def kv_connector_request_finished(req: LlmRequest):
             try:
-                cache_block_ids = self.kv_cache_manager.get_cache_indices(req)
+                # KVCacheManagerV2 has no primary-pool block list; its page
+                # indices are scoped to a layer group. Without this the lookup
+                # below raises, the warning path swallows it, and
+                # `request_finished` is never called at all on V2 -- so a
+                # connector is never told to save anything.
+                if isinstance(self.kv_cache_manager, KVCacheManagerV2):
+                    cache_block_ids = self.kv_cache_manager.get_connector_page_indices(
+                        req)
+                else:
+                    cache_block_ids = self.kv_cache_manager.get_cache_indices(
+                        req)
             except Exception as e:
                 logger.warning(
                     f"Unable to get cache blocks for request {req.py_request_id}. Skipping asynchronous saving: {e}"
