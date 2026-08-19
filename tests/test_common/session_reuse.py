@@ -112,20 +112,47 @@ def _worker_start_time(pid: int) -> bytes | None:
 
 
 def _kill_recorded_workers(real: _PoolSession) -> int:
-    """SIGKILL this pool's recorded workers, guarded against PID reuse."""
+    """SIGKILL this pool's recorded workers, guarded against PID reuse.
+
+    Where the kernel supports it, the signal goes through a pidfd. Opening the
+    pidfd binds this loop to one exact process, so the start-time recheck below
+    it can no longer be invalidated by the PID being recycled before the signal
+    lands. Without pidfd the start-time recheck alone still guards the kill: that
+    leaves a microsecond-wide window, but this is the path that reaps wedged
+    workers, so refusing to signal at all would strand them on exactly the
+    platforms the reaper exists for.
+    """
     import signal
+
+    send_via_pidfd = getattr(signal, "pidfd_send_signal", None)
+    open_pidfd = getattr(os, "pidfd_open", None)
 
     killed = 0
     for pid, start_time in getattr(real, "_reuse_worker_pids", ()):
-        # Guard against PID recycling: only kill if the process at this PID
-        # is still the worker we recorded at spawn.
-        if start_time is None or _worker_start_time(pid) != start_time:
+        if start_time is None:
             continue
+        handle = None
+        if send_via_pidfd is not None and open_pidfd is not None:
+            try:
+                handle = open_pidfd(pid)
+            except (OSError, ValueError):
+                handle = None
         try:
-            os.kill(pid, signal.SIGKILL)
-            killed += 1
-        except (ProcessLookupError, PermissionError):
-            pass
+            # Recheck identity AFTER pinning the handle: only kill if the
+            # process at this PID is still the worker recorded at spawn.
+            if _worker_start_time(pid) != start_time:
+                continue
+            try:
+                if handle is not None:
+                    send_via_pidfd(handle, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        finally:
+            if handle is not None:
+                os.close(handle)
     return killed
 
 

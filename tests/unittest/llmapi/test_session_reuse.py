@@ -397,6 +397,55 @@ def test_kill_recorded_workers_skips_recycled_pid(
     assert kills == []
 
 
+def test_kill_recorded_workers_signals_through_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pidfd handle is pinned before the identity recheck, and closed after."""
+    pool = _FakePool(1)
+    pool._reuse_worker_pids = ((123, b"owned"),)
+    opened, signalled, closed = [], [], []
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"owned")
+    monkeypatch.setattr(
+        session_reuse.os, "pidfd_open", lambda pid: opened.append(pid) or 77, raising=False
+    )
+    monkeypatch.setattr(session_reuse.os, "close", lambda fd: closed.append(fd))
+    monkeypatch.setattr(
+        session_reuse.os,
+        "kill",
+        lambda pid, sig: pytest.fail("os.kill used while pidfd was available"),
+    )
+    import signal as _signal
+
+    monkeypatch.setattr(
+        _signal,
+        "pidfd_send_signal",
+        lambda fd, sig: signalled.append((fd, sig)),
+        raising=False,
+    )
+
+    assert session_reuse._kill_recorded_workers(pool) == 1
+    assert opened == [123]
+    assert signalled == [(77, _signal.SIGKILL)]
+    assert closed == [77]
+
+
+def test_kill_recorded_workers_falls_back_without_pidfd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pidfd support must still reap: the wedged worker is the whole point."""
+    pool = _FakePool(1)
+    pool._reuse_worker_pids = ((123, b"owned"),)
+    kills = []
+    monkeypatch.setattr(session_reuse, "_worker_start_time", lambda _pid: b"owned")
+    monkeypatch.delattr(session_reuse.os, "pidfd_open", raising=False)
+    monkeypatch.setattr(session_reuse.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    import signal as _signal
+
+    assert session_reuse._kill_recorded_workers(pool) == 1
+    assert kills == [(123, _signal.SIGKILL)]
+
+
 def test_autodeploy_nodeids_are_private():
     from test_common.session_reuse_hooks import _is_private_nodeid
 
