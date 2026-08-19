@@ -26,7 +26,7 @@ import sys
 import traceback
 import zipfile
 from dataclasses import dataclass
-from typing import Collection, Literal
+from typing import Collection, Iterator, Literal
 
 import pytest
 import torch
@@ -410,7 +410,7 @@ def _cleanup_cuda():
 
 
 @contextlib.contextmanager
-def _lpips_pinned_fp32_matmul_precision():
+def _lpips_pinned_fp32_matmul_precision() -> Iterator[None]:
     """Pin fp32-matmul arithmetic so LPIPS goldens are portable across hosts.
 
     NGC PyTorch containers default matmul TF32 on (``float32_matmul_precision
