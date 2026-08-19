@@ -109,7 +109,7 @@ def _captured_terminal_parameters(payloads):
     """Return the parameters from one fully serialized terminal event."""
     assert len(payloads) == 1
     payload = payloads[0]
-    assert payload["eventSchemaVer"] == "0.7"
+    assert payload["eventSchemaVer"] == "0.8"
     assert len(payload["events"]) == 1
     event = payload["events"][0]
     assert event["name"] == "trtllm_exit_report"
@@ -315,10 +315,7 @@ class TestTelemetryGroup:
         assert outcome.exit_code_known is False
         assert outcome.exit_code == 0
         assert outcome.termination_kind == "exception"
-        assert all(
-            call.args != ("shutdown",)
-            for call in terminal_mocks.set_phase.call_args_list
-        )
+        terminal_mocks.set_phase.assert_called_once_with("config_validation")
 
     def test_no_telemetry_is_honored_before_parsing(self, terminal_mocks):
         """The early local session sees the CLI opt-out flag."""

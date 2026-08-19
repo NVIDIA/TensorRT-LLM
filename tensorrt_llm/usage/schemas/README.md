@@ -1,6 +1,6 @@
 # TRT-LLM Telemetry Schema Reference
 
-Schema version: **0.7** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
+Schema version: **0.8** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
 
 ## Overview
 
@@ -31,7 +31,7 @@ these top-level fields in Kibana alongside the event parameters.
 | `clientType` | string | Always `"Native"`. |
 | `clientVer` | string | TRT-LLM version, e.g. `"1.3.0rc9"`. |
 | `eventProtocol` | string | Always `"1.6"`. |
-| `eventSchemaVer` | string | Schema version, currently `"0.7"`. |
+| `eventSchemaVer` | string | Schema version, currently `"0.8"`. |
 | `eventSysVer` | string | Always `"trtllm-telemetry/1.0"`. |
 | `sessionId` | string | Unique hex UUID per telemetry session. Use this to correlate initial, heartbeat, and terminal events. |
 | `sentTs` | string | ISO 8601 UTC timestamp of when the payload was sent. |
@@ -138,7 +138,7 @@ outcome. Missing terminal events remain unknown; they are not confirmed crashes.
 | `exitCode` | PositiveInt | Exit code, or `0` when unknown. |
 | `signalNumber` | PositiveInt | Signal number, or `0` when not applicable or unknown. |
 | `terminationKind` | enum | `clean`, `exception`, `signal`, `worker_failure`, `timeout`, or `unknown`. |
-| `lifecyclePhase` | enum | Last known phase reached before termination: `cli_parsing`, `config_validation`, `model_initialization`, `serving`, `shutdown`, or `unknown`. |
+| `lifecyclePhase` | enum | Last known phase reached before termination: `cli_parsing`, `config_validation`, `model_initialization`, `serving`, or `unknown`. |
 | `component` | enum | `llm`, `server`, `engine_worker`, `disagg_worker`, or `unknown`. |
 | `reportingSource` | enum | `self`, `supervisor`, or `executor_proxy`. |
 | `ingressPoint` | ShortString | Entry point copied onto the terminal event so terminal-only early failures remain attributable. |

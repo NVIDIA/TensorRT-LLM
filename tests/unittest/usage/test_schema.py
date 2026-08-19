@@ -251,7 +251,7 @@ class TestSchemaConstants:
         [
             ("CLIENT_ID", "616561816355034"),
             ("EVENT_PROTOCOL", "1.6"),
-            ("EVENT_SCHEMA_VER", "0.7"),
+            ("EVENT_SCHEMA_VER", "0.8"),
             ("EVENT_SYS_VER", "trtllm-telemetry/1.0"),
         ],
     )
@@ -691,6 +691,27 @@ class TestSchemaCompliance:
         exit_schema["definitions"] = sms_schema["definitions"]
         jsonschema.validate(instance=payload, schema=exit_schema)
 
+    def test_json_schema_rejects_removed_shutdown_phase(self):
+        """SMS schema 0.8 excludes the superseded shutdown phase."""
+        import jsonschema
+
+        sms_schema = json.loads(schemas.SMS_SCHEMA_PATH.read_text())
+        report = schema.TrtllmExitReport(
+            exitCodeKnown=True,
+            exitCode=0,
+            signalNumber=0,
+            terminationKind="clean",
+            lifecyclePhase="serving",
+            component="server",
+            reportingSource="self",
+        ).model_dump(by_alias=True)
+        report["lifecyclePhase"] = "shutdown"
+        exit_schema = sms_schema["definitions"]["events"]["trtllm_exit_report"].copy()
+        exit_schema["definitions"] = sms_schema["definitions"]
+
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(instance=report, schema=exit_schema)
+
 
 # ---------------------------------------------------------------------------
 # Pydantic field constraint validation tests
@@ -734,6 +755,20 @@ class TestPydanticValidation:
                 signalNumber=0,
                 terminationKind="out_of_memory",
                 lifecyclePhase="serving",
+                component="server",
+                reportingSource="self",
+                ingressPoint="cli_serve",
+            )
+
+    def test_exit_report_rejects_removed_shutdown_phase(self):
+        """Terminal events retain the last meaningful pre-exit phase."""
+        with pytest.raises(ValidationError):
+            schema.TrtllmExitReport(
+                exitCodeKnown=True,
+                exitCode=0,
+                signalNumber=0,
+                terminationKind="clean",
+                lifecyclePhase="shutdown",
                 component="server",
                 reportingSource="self",
                 ingressPoint="cli_serve",

@@ -39,7 +39,7 @@ _LONG_STR = 256  # NvTelemetry "LongString" maxLength
 
 CLIENT_ID = "616561816355034"
 EVENT_PROTOCOL = "1.6"
-EVENT_SCHEMA_VER = "0.7"
+EVENT_SCHEMA_VER = "0.8"
 EVENT_SYS_VER = "trtllm-telemetry/1.0"
 CLIENT_TYPE = "Native"
 CLIENT_VARIANT = "Release"
@@ -182,7 +182,6 @@ LifecyclePhase = Literal[
     "config_validation",
     "model_initialization",
     "serving",
-    "shutdown",
     "unknown",
 ]
 TerminationComponent = Literal[
