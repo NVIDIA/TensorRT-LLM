@@ -6298,8 +6298,24 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+        if getattr(self, "_is_kv_manager_v2", False):
+            # Overlap schedules the next batch before consuming the previous
+            # batch's sampled tokens. Those requests must remain schedulable,
+            # but their cache cannot be evicted or released until the sample
+            # update reaches its safe boundary.
+            previous_batch = getattr(self, "previous_batch", None)
+            eviction_protected_request_ids = ({
+                request.request_id
+                for request in previous_batch.scheduled_requests.all_requests()
+            } if previous_batch is not None else set())
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests,
+                self.inflight_req_ids,
+                eviction_protected_request_ids=eviction_protected_request_ids,
+            )
+        else:
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder

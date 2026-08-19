@@ -425,7 +425,7 @@ void StorageManager::forceEvict(
     {
         goals[lvl].resize(numPoolGroups(), 0);
     }
-    CacheLevel nextLvl = level + 1;
+    CacheLevel const nextLvl = level + 1;
 
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> fallen(numPoolGroups());
     for (PoolGroupIndex pgIdx{0}; pgIdx < fallen.size(); ++pgIdx)
@@ -548,7 +548,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             "held_pages must be empty at non-last level");
 
         auto const evictedAtThisLevel = evicted;
-        CacheLevel nextLvl = lvlId + 1;
+        CacheLevel const nextLvl = lvlId + 1;
         for (PoolGroupIndex pgIdx{0}; pgIdx < evicted.size(); ++pgIdx)
         {
             auto& ev = evicted.at(pgIdx);

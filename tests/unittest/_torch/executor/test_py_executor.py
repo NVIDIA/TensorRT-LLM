@@ -1331,6 +1331,43 @@ def test_schedule_prepares_snapshot_points_before_scheduling():
     ]
 
 
+def test_v2_schedule_protects_overlap_previous_batch_from_eviction():
+    class StopSchedule(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    active_request = Mock(request_id=1)
+    previous_request = Mock(request_id=7)
+    previous_requests = Mock()
+    previous_requests.all_requests.return_value = [previous_request]
+    executor.previous_batch = types.SimpleNamespace(scheduled_requests=previous_requests)
+    executor._is_kv_manager_v2 = True
+    executor.active_requests = [active_request, previous_request]
+    executor.inflight_req_ids = set()
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+
+    def stop_after_schedule(
+        requests,
+        inflight_req_ids,
+        *,
+        eviction_protected_request_ids,
+    ):
+        assert requests == executor.active_requests
+        assert inflight_req_ids == executor.inflight_req_ids
+        assert eviction_protected_request_ids == {previous_request.request_id}
+        raise StopSchedule
+
+    executor.scheduler.schedule_request.side_effect = stop_after_schedule
+
+    with pytest.raises(StopSchedule):
+        PyExecutor._schedule(executor)
+
+    executor.kv_cache_manager.prepare_expect_snapshot_points.assert_called_once_with(
+        executor.active_requests
+    )
+
+
 class TestComputeScheduledTokens:
     """Tests for PyExecutor._compute_scheduled_tokens.
 
@@ -2855,20 +2892,21 @@ class TestPendingTransferResponseFlush:
         assert executor._flush_pending_transfer_responses.call_count == 2
 
     def test_overlap_v2_recompute_pause_waits_for_sample_update(self, monkeypatch):
-        """Consume the sampled token before resetting a request for recomputation."""
+        """Consume prior samples before resetting a distinct eviction victim."""
         executor = self._make_executor_loop_stub()
         executor._is_kv_manager_v2 = True
         executor._can_pause_for_rebalance = Mock(return_value=False)
         executor._wait_for_model_engine_input_copy = Mock()
         paused_request = Mock(py_request_id=7)
+        previous_request = Mock(py_request_id=8)
         previous_requests = Mock()
-        previous_requests.all_requests.return_value = [paused_request]
+        previous_requests.all_requests.return_value = [previous_request]
         previous_sample_state = Mock()
         executor.previous_batch = types.SimpleNamespace(
             sample_state=previous_sample_state,
             scheduled_requests=previous_requests,
         )
-        executor.active_requests = [paused_request]
+        executor.active_requests = [previous_request, paused_request]
         scheduled_batch = types.SimpleNamespace(
             encoder_requests=[],
             paused_requests=[],

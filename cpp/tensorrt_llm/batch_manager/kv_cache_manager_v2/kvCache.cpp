@@ -198,6 +198,23 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
     return result;
 }
 
+void KvCache::_releaseActivePageLocks()
+{
+    // The caller owns a recordEventScope so every unlocked page observes all
+    // prior work on this cache's CUDA stream.
+    auto const ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    for (auto const& activePage : _activePages())
+    {
+        auto& blockPage = (activePage.lcId != ssmLcId)
+            ? mBlocks[activePage.ordinal].pages[activePage.beamIdx][activePage.lcId]
+            : mSsmBlocks[activePage.beamIdx][activePage.lcId];
+        auto& lock = std::get<SharedPageLock>(blockPage);
+        auto holder = lock.page()->hold();
+        lock.unlock();
+        blockPage = std::move(holder);
+    }
+}
+
 SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const
 {
     bool const isSsm = ordinal == kBadBlockOrdinal;
@@ -405,8 +422,19 @@ bool KvCache::resume(std::optional<CUstream> stream)
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (deferredSlots[lc].has_value())
+            {
                 storageMgr.releaseSlot(lc, kGpuLevel, std::move(*deferredSlots[lc]));
+                deferredSlots[lc].reset();
+            }
         }
+    };
+    auto rollbackPreallocatedSlots = [&]()
+    {
+        {
+            auto scope = recordEventScope();
+            _freeScratchSlots();
+        }
+        releaseDeferredSlots();
     };
 
     try
@@ -415,15 +443,14 @@ bool KvCache::resume(std::optional<CUstream> stream)
     }
     catch (OutOfPagesError const&)
     {
-        // Release pre-allocated deferred slots on failure.
-        releaseDeferredSlots();
-        // Scratch slots stay in mScratchSlots — they'll be freed by close() inside
-        // a recordEventScope, matching Python behavior.
+        rollbackPreallocatedSlots();
+        TLLM_CHECK_DEBUG(_checkSanity());
         return false;
     }
     catch (OutOfMemoryError const&)
     {
-        releaseDeferredSlots();
+        rollbackPreallocatedSlots();
+        TLLM_CHECK_DEBUG(_checkSanity());
         return false;
     }
 
@@ -435,59 +462,103 @@ bool KvCache::resume(std::optional<CUstream> stream)
         auto const lastOrdinal = BlockOrdinal{mBlocks.empty() ? 0 : (numCommittedTokens() - 1) / mTokensPerBlock};
         CUstream cudaStr = cudaStream();
 
-        // Wait for all new slots to be ready (deduplicated).
-        {
-            std::vector<CachedCudaEvent const*> slotEvents;
-            for (auto& optSlot : deferredSlots)
-            {
-                if (optSlot.has_value())
-                    slotEvents.push_back(&optSlot->readyEvent);
-            }
-            streamWaitEvents(reinterpret_cast<CudaStream>(cudaStr), slotEvents);
-        }
-
         // Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.
         std::vector<SharedPageLock*> srcLocks;
-        for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
+        std::vector<std::pair<LifeCycleId, bool>> copyStats;
+        bool deferredSlotsReady = false;
+        auto rollbackDeferredCopy = [&]()
         {
-            if (!deferredSlots[lcIdx].has_value())
-                continue;
-            auto& newSlot = *deferredSlots[lcIdx];
-
-            BlockPage* sourcePage = nullptr;
-            if (ssmLcId.has_value() && lcIdx == *ssmLcId)
+            auto scope = recordEventScope();
+            _releaseActivePageLocks();
+            _freeScratchSlots();
+            if (deferredSlotsReady)
             {
-                if (numCommittedTokens() == 0)
-                    continue; // fresh SSM — no source to copy from
-                sourcePage = &mSsmBlocks[beamIdx][lcIdx];
-            }
-            else
-            {
-                sourcePage = &mBlocks[lastOrdinal].pages[beamIdx][lcIdx];
-            }
-            auto* lock = std::get_if<SharedPageLock>(sourcePage);
-            TLLM_CHECK_DEBUG(lock && lock->isValid());
-            bool const hasPartialReuseSource = _hasReuseSource(*sourcePage);
-            srcLocks.push_back(lock);
-
-            PoolGroupIndex pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
-            copySlotData(storageMgr, kGpuLevel, kGpuLevel, pgIdx, newSlot.slotId(), lock->page()->slotId(), cudaStr);
-            if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && _shouldRecordStats())
-            {
-                bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
-                    /*beamWidth=*/1, /*countAsMissed=*/!hasPartialReuseSource);
-                if (changed)
+                for (auto& deferredSlot : deferredSlots)
                 {
-                    mManager->markStatsDirty(id);
+                    if (deferredSlot.has_value())
+                        deferredSlot->readyEvent = finishEvent();
                 }
             }
-            KVCacheIterationStatsDelta iterationStats;
-            iterationStats.iterIntraDeviceCopyBlocks = 1;
-            for (size_t const size : storageMgr.slotSize(pgIdx))
+            releaseDeferredSlots();
+        };
+        try
+        {
             {
-                iterationStats.iterIntraDeviceCopyBytes += static_cast<int64_t>(size);
+                // Wait before overwriting any recycled slot. Once this
+                // returns, one event on this stream can safely cover every
+                // deferred slot if a later copy fails.
+                std::vector<CachedCudaEvent const*> slotEvents;
+                for (auto& optSlot : deferredSlots)
+                {
+                    if (optSlot.has_value())
+                        slotEvents.push_back(&optSlot->readyEvent);
+                }
+                streamWaitEvents(reinterpret_cast<CudaStream>(cudaStr), slotEvents);
+                deferredSlotsReady = true;
             }
-            _recordDirectIterationStats(lcIdx, iterationStats);
+
+            for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
+            {
+                if (!deferredSlots[lcIdx].has_value())
+                    continue;
+                auto& newSlot = *deferredSlots[lcIdx];
+
+                BlockPage* sourcePage = nullptr;
+                if (ssmLcId.has_value() && lcIdx == *ssmLcId)
+                {
+                    if (numCommittedTokens() == 0)
+                        continue; // fresh SSM — no source to copy from
+                    sourcePage = &mSsmBlocks[beamIdx][lcIdx];
+                }
+                else
+                {
+                    sourcePage = &mBlocks[lastOrdinal].pages[beamIdx][lcIdx];
+                }
+                auto* lock = std::get_if<SharedPageLock>(sourcePage);
+                TLLM_CHECK_DEBUG(lock && lock->isValid());
+                bool const hasPartialReuseSource = _hasReuseSource(*sourcePage);
+                srcLocks.push_back(lock);
+
+                PoolGroupIndex const pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
+                copySlotData(
+                    storageMgr, kGpuLevel, kGpuLevel, pgIdx, newSlot.slotId(), lock->page()->slotId(), cudaStr);
+                copyStats.emplace_back(lcIdx, hasPartialReuseSource);
+            }
+
+            // Do not expose successful allocation/copy telemetry until every
+            // deferred copy has been queued successfully.
+            for (auto const& [lcIdx, hasPartialReuseSource] : copyStats)
+            {
+                if ((!ssmLcId.has_value() || lcIdx != *ssmLcId) && _shouldRecordStats())
+                {
+                    bool const changed = mPendingStats.recordAllocationRange(lcIdx, lastOrdinal, lastOrdinal + 1,
+                        /*beamWidth=*/1, /*countAsMissed=*/!hasPartialReuseSource);
+                    if (changed)
+                    {
+                        mManager->markStatsDirty(id);
+                    }
+                }
+                PoolGroupIndex const pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
+                KVCacheIterationStatsDelta iterationStats;
+                iterationStats.iterIntraDeviceCopyBlocks = 1;
+                for (size_t const size : storageMgr.slotSize(pgIdx))
+                {
+                    iterationStats.iterIntraDeviceCopyBytes += static_cast<int64_t>(size);
+                }
+                _recordDirectIterationStats(lcIdx, iterationStats);
+            }
+        }
+        catch (OutOfPagesError const&)
+        {
+            rollbackDeferredCopy();
+            TLLM_CHECK_DEBUG(_checkSanity());
+            return false;
+        }
+        catch (OutOfMemoryError const&)
+        {
+            rollbackDeferredCopy();
+            TLLM_CHECK_DEBUG(_checkSanity());
+            return false;
         }
 
         // Unlock source pages — recordEventScope captures all prior CUDA work
@@ -523,6 +594,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
             newPage->setSlot(newSlot);
             auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
             *targetBp = std::move(newLock);
+            deferredSlots[lcIdx].reset();
         }
 
         // Clear treeBlock for partial last block (mirrors Python: partial block is uncommitted).
@@ -589,21 +661,10 @@ void KvCache::suspend()
     // SharedPageLock destructors inside the scope use finishEvent() to synchronize.
     {
         auto scope = recordEventScope();
-        auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
-
-        // Convert SharedPageLocks → PageHolders for active (non-stale) pages only.
         // Releasing the final lock registers held pages with StorageManager's
         // eviction controller. StorageManager alone decides whether pressure
         // requires migrating them to the next cache tier.
-        for (auto const& ap : _activePages())
-        {
-            auto& bp = (ap.lcId != ssmLcId) ? mBlocks[ap.ordinal].pages[ap.beamIdx][ap.lcId]
-                                            : mSsmBlocks[ap.beamIdx][ap.lcId];
-            // expect_type(_SharedPageLock, beam_block[lc_idx]) → std::get raises on wrong type
-            auto& lock = std::get<SharedPageLock>(bp);
-            auto holder = lock.page()->hold();
-            bp = std::move(holder); // ~SharedPageLock calls unlock() → notifyFinish(finishEvent())
-        }
+        _releaseActivePageLocks();
         // Free scratch slots inside scope — unlock() needs finishEvent().
         // Mirrors Python: _free_scratch_slots() inside `with self._record_event()`.
         _freeScratchSlots();

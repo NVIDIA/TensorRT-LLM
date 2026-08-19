@@ -478,6 +478,7 @@ private:
     };
 
     std::vector<ActivePage> _activePages() const;
+    void _releaseActivePageLocks();
     SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
 
     bool _shortcutSetCapacity(int capacity);

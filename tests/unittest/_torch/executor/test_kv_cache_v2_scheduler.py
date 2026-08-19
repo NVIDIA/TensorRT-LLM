@@ -176,8 +176,7 @@ def make_kv_cache_manager(
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
 
     def suspend_request(req):
-        if can_evict:
-            mgr.kv_cache_map[req.py_request_id].is_active = False
+        mgr.kv_cache_map[req.py_request_id].is_active = False
 
     mgr.suspend_request.side_effect = suspend_request
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
@@ -479,6 +478,9 @@ class TestKVCacheFailuresGen:
         assert len(out.generation_requests) == 1
         assert out.generation_requests[0].request_id == 0
         assert ids(out.paused_requests) == [1]
+        assert out.recompute_paused_requests == []
+        mgr.suspend_request.assert_called_once_with(reqs[1])
+        mgr.free_resources.assert_not_called()
 
     def test_gen_alloc_fails_preserved_eviction_succeeds(self):
         """A tail request is evicted without being released for recomputation."""
@@ -501,30 +503,36 @@ class TestKVCacheFailuresGen:
         assert out.recompute_paused_requests == []
         mgr.suspend_request.assert_called_once_with(victim)
 
-    def test_gen_alloc_fails_preserved_eviction_falls_back_to_release(self):
-        """If preserving cache is insufficient, release one evicted request."""
+    @pytest.mark.parametrize("can_evict", [False, True])
+    def test_gen_alloc_fails_preserved_eviction_falls_back_to_release(self, can_evict):
+        """Release preserved caches without inspecting physical tier topology."""
         call_count = [0]
 
         def alloc_fn(req):
             call_count[0] += 1
             return call_count[0] <= 1  # only first succeeds
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn,
+            can_evict=can_evict,
+        )
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), make_gen_request(1), victim]
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0]
-        # The manager first gets a chance to move victim 99 to the secondary
-        # tier. Because admission still fails, only that victim is then
-        # released for recomputation; gen1 remains ordinarily evicted.
+        # Both requests first pass through manager-owned suspension. The tail
+        # victim has already failed its preserved retry and is released. The
+        # blocked request remains evicted for one pass so its own cache gets
+        # the same offload/resume opportunity before any destructive fallback.
         assert ids(out.paused_requests) == [1]
         assert ids(out.recompute_paused_requests) == [99]
         mgr.suspend_request.assert_has_calls([call(victim), call(reqs[1])])
         mgr.free_resources.assert_called_once_with(victim)
 
-    def test_secondary_tier_recompute_pause_retries_immediately(self):
-        """Full teardown is retried without conservatively waiting one pass."""
+    @pytest.mark.parametrize("can_evict", [False, True])
+    def test_recompute_pause_retries_immediately_without_tier_knowledge(self, can_evict):
+        """Full teardown is retried in the same pass for every tier layout."""
         call_count = [0]
 
         def alloc_fn(req):
@@ -533,7 +541,10 @@ class TestKVCacheFailuresGen:
             # after its ordinary victim is upgraded to full recompute teardown.
             return call_count[0] in (1, 4)
 
-        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn,
+            can_evict=can_evict,
+        )
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), make_gen_request(1), victim]
@@ -588,12 +599,19 @@ class TestKVCacheFailuresGen:
         victim.py_multimodal_data = {}
         mgr.kv_cache_map[victim.py_request_id].is_active = False
 
-        out = sched.schedule_request([current, victim], set())
+        first = sched.schedule_request([current, victim], set())
 
-        assert out.generation_requests == []
-        assert ids(out.paused_requests) == [0]
-        assert out.recompute_paused_requests == []
-        mgr.free_resources.assert_not_called()
+        assert first.generation_requests == []
+        assert ids(first.paused_requests) == [0]
+        assert first.recompute_paused_requests == []
+        assert freed_request_ids == set()
+
+        second = sched.schedule_request([current, victim], set())
+        assert second.generation_requests == []
+        assert second.paused_requests == []
+        assert ids(second.recompute_paused_requests) == [0]
+        assert freed_request_ids == {0}
+        mgr.free_resources.assert_called_once_with(current)
 
     def test_recompute_pause_skips_generation_to_complete_victim(self):
         """A finalizing request defers eviction until its cache is released."""
@@ -651,40 +669,38 @@ class TestKVCacheFailuresGen:
         mgr.suspend_request.assert_called_once_with(active_victim)
         mgr.free_resources.assert_called_once_with(suspended_tail)
 
-    def test_recompute_frontier_falls_back_to_evicted_victim(self):
-        """Secondary-tier fallback sees an evicted victim outside the frontier."""
-        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import _RecomputePauseState
-
-        victim = make_gen_request(0)
-        current = make_gen_request(1)
-        mgr = make_kv_cache_manager(
-            try_allocate_generation_fn=lambda req: True,
-            can_evict=True,
-        )
+    def test_recompute_search_is_independent_of_ordinary_eviction_frontier(self):
+        """A shrunk scheduling range cannot hide a younger preserved victim."""
+        current = make_gen_request(0)
+        victim = make_gen_request(1)
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: True)
+        cross_mgr = make_kv_cache_manager()
         mgr.kv_cache_map[victim.py_request_id].is_active = False
-        sched = make_scheduler(mgr, max_num_tokens=100)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100,
+            cross_kv_cache_manager=cross_mgr,
+        )
         evicted = [victim]
         recompute_paused = []
-        recompute_pause_state = _RecomputePauseState(frontier=1)
+        released_request_indices = set()
 
-        req_it_end, success = sched._try_recompute_pause_for_gen(
+        success = sched._try_release_for_gen(
             current,
-            [victim, current],
-            req_it=1,
-            req_it_end=1,
-            recompute_pause_state=recompute_pause_state,
+            [current, victim],
+            req_it=0,
+            released_request_indices=released_request_indices,
             evicted=evicted,
             recompute_paused=recompute_paused,
-            inflight_request_ids=set(),
+            protected_request_ids=set(),
         )
 
         assert success
-        assert req_it_end == 1
         assert evicted == []
         assert recompute_paused == [victim]
-        assert recompute_pause_state.frontier == 0
-        assert recompute_pause_state.victim_indices == {0}
+        assert released_request_indices == {1}
         mgr.free_resources.assert_called_once_with(victim)
+        cross_mgr.free_resources.assert_called_once_with(victim)
         mgr.try_allocate_generation.assert_called_once_with(current)
 
     def test_recompute_pause_does_not_shrink_scheduling_range(self):
@@ -769,8 +785,8 @@ class TestKVCacheFailuresGen:
         reqs = [make_gen_request(0), make_gen_request(1), victim]
         out = sched.schedule_request(reqs, set())
         # gen0 succeeds and gen1 cannot reclaim GPU capacity by suspending an
-        # already-suspended victim, so the victim is released for recomputation
-        # while gen1 is ordinarily evicted.
+        # already-suspended victim. Release that victim first, then preserve
+        # gen1's cache for its own resume attempt on the next pass.
         assert ids(out.generation_requests) == [0]
         assert ids(out.paused_requests) == [1]
         assert ids(out.recompute_paused_requests) == [99]
@@ -800,8 +816,8 @@ class TestKVCacheFailuresGen:
         mgr.suspend_request.assert_not_called()
         mgr.free_resources.assert_called_once_with(resumable)
 
-    def test_inflight_request_prevents_false_deadlock(self):
-        """An inflight batch can release pages after an empty schedule."""
+    def test_inflight_owner_is_protected_while_waiting_cache_can_be_released(self):
+        """Protection applies only to the request that owns inflight work."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
         )
@@ -814,8 +830,11 @@ class TestKVCacheFailuresGen:
 
         assert ids(out.generation_requests) == []
         assert ids(out.paused_requests) == []
+        assert ids(out.recompute_paused_requests) == [waiting.request_id]
+        mgr.suspend_request.assert_not_called()
+        mgr.free_resources.assert_called_once_with(waiting)
 
-    def test_inflight_tail_is_not_evicted_or_released(self):
+    def test_inflight_tail_is_not_selected_as_eviction_or_release_victim(self):
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
         )
@@ -826,8 +845,106 @@ class TestKVCacheFailuresGen:
         out = sched.schedule_request([waiting, inflight], {inflight.request_id})
 
         assert ids(out.generation_requests) == []
-        assert ids(out.paused_requests) == []
+        assert ids(out.paused_requests) == [waiting.request_id]
+        assert out.recompute_paused_requests == []
+        mgr.suspend_request.assert_called_once_with(waiting)
+        mgr.free_resources.assert_not_called()
+
+    def test_overlap_previous_batch_request_is_not_evicted_or_released(self):
+        """Sampling owners stay schedulable but cannot be pressure victims."""
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        protected = make_gen_request(0)
+
+        out = sched.schedule_request(
+            [protected],
+            set(),
+            eviction_protected_request_ids={protected.request_id},
+        )
+
+        assert out.generation_requests == []
+        assert out.paused_requests == []
+        assert out.recompute_paused_requests == []
         mgr.suspend_request.assert_not_called()
+        mgr.free_resources.assert_not_called()
+
+    def test_overlap_previous_batch_tail_does_not_block_safe_self_eviction(self):
+        """Protection is victim-specific rather than a global eviction gate."""
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        waiting = make_gen_request(0)
+        protected_tail = make_gen_request(1)
+
+        out = sched.schedule_request(
+            [waiting, protected_tail],
+            set(),
+            eviction_protected_request_ids={protected_tail.request_id},
+        )
+
+        assert out.generation_requests == []
+        assert ids(out.paused_requests) == [waiting.request_id]
+        assert out.recompute_paused_requests == []
+        mgr.suspend_request.assert_called_once_with(waiting)
+        mgr.free_resources.assert_not_called()
+
+    def test_overlap_previous_batch_only_protects_actual_owner(self):
+        """An unrelated safe cache can still provide V1-style progress."""
+        freed_request_ids = set()
+
+        def allocate_after_release(req):
+            return 1 in freed_request_ids
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=allocate_after_release)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        waiting = make_gen_request(0)
+        preserved = make_gen_request(1)
+        protected_tail = make_gen_request(2)
+        mgr.kv_cache_map[waiting.py_request_id].is_active = False
+        mgr.kv_cache_map[preserved.py_request_id].is_active = False
+
+        out = sched.schedule_request(
+            [waiting, preserved, protected_tail],
+            set(),
+            eviction_protected_request_ids={protected_tail.request_id},
+        )
+
+        assert ids(out.generation_requests) == [waiting.request_id, protected_tail.request_id]
+        assert out.paused_requests == []
+        assert ids(out.recompute_paused_requests) == [preserved.request_id]
+        mgr.suspend_request.assert_not_called()
+        mgr.free_resources.assert_called_once_with(preserved)
+
+    def test_overlap_eviction_protection_expires_after_sample_update(self):
+        """A former overlap owner follows offload then release once safe."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        protected = make_gen_request(0)
+
+        first = sched.schedule_request(
+            [protected],
+            set(),
+            eviction_protected_request_ids={protected.request_id},
+        )
+        assert first.generation_requests == []
+        assert first.paused_requests == []
+        assert first.recompute_paused_requests == []
+
+        second = sched.schedule_request([protected], set())
+        assert second.generation_requests == []
+        assert ids(second.paused_requests) == [protected.request_id]
+        assert second.recompute_paused_requests == []
+
+        third = sched.schedule_request([protected], set())
+        assert third.generation_requests == []
+        assert third.paused_requests == []
+        assert ids(third.recompute_paused_requests) == [protected.request_id]
+        mgr.suspend_request.assert_called_once_with(protected)
+        mgr.free_resources.assert_called_once_with(protected)
 
     def test_pending_completion_prevents_false_deadlock(self):
         """A completing request releases its cache without eviction churn."""
@@ -1057,7 +1174,8 @@ class TestEviction:
         reqs = [make_gen_request(0), victim]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
-        # gen0 is ordinarily evicted; the first context chunk is not a victim.
+        # The first context chunk is not a victim. The blocked generation
+        # request is evicted while preserving its cache for a later resume.
         assert ids(out.paused_requests) == [0]
         assert out.recompute_paused_requests == []
         assert len(out.context_requests) == 0
@@ -1085,11 +1203,17 @@ class TestEviction:
             return call_count[0] != 1
 
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
-        sched = make_scheduler(mgr, max_num_tokens=100)
+        cross_mgr = make_kv_cache_manager()
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=100,
+            cross_kv_cache_manager=cross_mgr,
+        )
         victim = make_gen_request(99)
         reqs = [make_gen_request(0), victim]
         sched.schedule_request(reqs, set())
         mgr.suspend_request.assert_called_once_with(victim)
+        cross_mgr.suspend_request.assert_called_once_with(victim)
 
     def test_eviction_clears_request_runtime_state(self):
         mgr = make_kv_cache_manager(
@@ -1103,9 +1227,10 @@ class TestEviction:
         assert out.recompute_paused_requests == []
         assert req.py_batch_idx is None
         mgr.suspend_request.assert_called_once_with(req)
+        mgr.free_resources.assert_not_called()
 
     def test_unknown_state_not_evictable(self):
-        """UNKNOWN state at tail is not evictable; gen0 is released."""
+        """UNKNOWN state at tail is not evictable; gen0 is evicted."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
         )
@@ -1116,6 +1241,7 @@ class TestEviction:
         assert len(out.generation_requests) == 0
         # UNKNOWN-state tail is neither paused nor scheduled.
         assert ids(out.paused_requests) == [0]
+        assert out.recompute_paused_requests == []
 
     def test_multiple_preserved_evictions_order(self):
         """The youngest tail request is evicted first."""
@@ -1156,19 +1282,27 @@ class TestEviction:
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0]
         assert ids(out.paused_requests) == [5]
+        assert out.context_requests == []
 
     def test_self_eviction_on_alloc_fail(self):
-        """Evict the blocked generation request when no victim exists."""
+        """Evict first; release only after a later resume still cannot fit."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
         )
         sched = make_scheduler(mgr, max_num_tokens=100)
-        # The first pass preserves the request state under manager ownership.
         reqs = [make_gen_request(0)]
-        out = sched.schedule_request(reqs, set())
-        assert len(out.generation_requests) == 0
-        assert ids(out.paused_requests) == [0]
-        assert out.recompute_paused_requests == []
+        first = sched.schedule_request(reqs, set())
+        assert len(first.generation_requests) == 0
+        assert ids(first.paused_requests) == [0]
+        assert first.recompute_paused_requests == []
+        mgr.suspend_request.assert_called_once_with(reqs[0])
+        mgr.free_resources.assert_not_called()
+
+        second = sched.schedule_request(reqs, set())
+        assert len(second.generation_requests) == 0
+        assert second.paused_requests == []
+        assert ids(second.recompute_paused_requests) == [0]
+        mgr.free_resources.assert_called_once_with(reqs[0])
 
     def test_self_eviction_with_no_started_tail_request(self):
         """First-chunk context requests cannot be eviction victims."""
@@ -1183,7 +1317,8 @@ class TestEviction:
         ]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
-        # gen0 is evicted; the loop stops before ctx1 and ctx2.
+        # gen0 is evicted while preserving its cache; the loop stops before
+        # ctx1 and ctx2.
         assert ids(out.paused_requests) == [0]
         assert out.recompute_paused_requests == []
         assert len(out.context_requests) == 0
@@ -1500,6 +1635,7 @@ class TestEncoder:
 
         assert out.context_requests == []
         self_mgr.suspend_request.assert_called_once_with(ctx_req)
+        cross_mgr.suspend_request.assert_called_once_with(ctx_req)
         assert ctx_req.py_batch_idx is None
 
     def test_later_context_chunk_reuses_cross_pool_without_resizing(self):
@@ -2416,12 +2552,7 @@ class TestMixedOrdering:
         assert ids(out.generation_requests) == [1]
 
     def test_multiple_gen_after_gen_fail(self):
-        """Gen failure ordinarily evicts the tail and then the blocked request.
-
-        With no secondary tier, the first pass only makes all three caches
-        evictable under manager ownership. A later pass can recompute-release
-        a request if admission still cannot make progress.
-        """
+        """Preserve every cache first, then release only proven victims."""
 
         def selective_gen_alloc(req):
             # req0 always fails, req1 and req2 succeed
@@ -2434,16 +2565,20 @@ class TestMixedOrdering:
         reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(2)]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
-        assert ids(out.paused_requests) == [2, 1, 0]
-        assert out.recompute_paused_requests == []
+        assert ids(out.paused_requests) == [0]
+        assert ids(out.recompute_paused_requests) == [2, 1]
         assert mgr.suspend_request.call_args_list == [
             call(reqs[2]),
             call(reqs[1]),
             call(reqs[0]),
         ]
+        assert mgr.free_resources.call_args_list == [
+            call(reqs[2]),
+            call(reqs[1]),
+        ]
 
-    def test_secondary_tier_recompute_pause_multiple_victims(self):
-        """Evicted victims are recompute-paused before self-evict when eviction is supported."""
+    def test_tier_topology_does_not_change_recompute_fallback(self):
+        """Scheduler fallback is identical when the manager has a colder tier."""
 
         def selective_gen_alloc(req):
             return req.request_id != 0
@@ -2454,7 +2589,7 @@ class TestMixedOrdering:
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
         assert ids(out.paused_requests) == [0]
-        assert set(ids(out.recompute_paused_requests)) == {1, 2}
+        assert ids(out.recompute_paused_requests) == [2, 1]
 
 
 # ===========================================================================
