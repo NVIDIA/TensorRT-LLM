@@ -24,7 +24,7 @@ from _torch.helpers import (
     per_block_cast_to_fp8_e8m0,
     per_token_cast_to_fp8_e8m0,
 )
-from _torch.modules.moe.moe_test_utils import skip_if_insufficient_gpu_memory
+from _torch.moe.moe_test_utils import skip_if_insufficient_gpu_memory
 from utils.util import check_accuracy
 
 from tensorrt_llm._torch.model_config import ModelConfig

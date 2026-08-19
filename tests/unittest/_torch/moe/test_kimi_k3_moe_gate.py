@@ -6,7 +6,7 @@ import dataclasses
 
 import pytest
 import torch
-from _torch.modules.moe.kimi_k3_ref_moe.kimi_k3_moe_block import KimiK3ReferenceMoEGate
+from _torch.moe.kimi_k3_ref_moe.kimi_k3_moe_block import KimiK3ReferenceMoEGate
 
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate
 

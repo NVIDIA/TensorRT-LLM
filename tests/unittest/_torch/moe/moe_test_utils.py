@@ -259,7 +259,7 @@ def should_skip_trtllm(
     #      tritondevel container (single GPU is sufficient).
     #   2. cd tests/unittest && \
     #      python3 -m pytest -v -s \
-    #          _torch/modules/moe/test_moe_backend.py::test_moe_backend \
+    #          _torch/moe/test_moe_backend.py::test_moe_backend \
     #          -k "TRTLLM" -p no:randomly
     #   3. Expect:
     #        FAILED ...alpha=1.702_beta=1.0_limit=7.0-e128_k4_h2880_i2880
@@ -540,7 +540,7 @@ def should_skip_trtllm(
     # The remaining failure surface is
     # W4A8_MXFP4_FP8 + TRTLLM-Gen + ``swiglu_gptoss_style=True`` (any top_k,
     # any model shape, single- or multi-GPU). The element-wise reproducer at
-    # ``tests/unittest/_torch/modules/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``
+    # ``tests/unittest/_torch/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``
     # holds the model config / weights / input identical and only toggles
     # the SwiGLU shape; on ``e60_k4_h2048_i1408 seq=1`` it shows:
     #   * default SwiGLU (alpha=1, beta=0, limit=inf):

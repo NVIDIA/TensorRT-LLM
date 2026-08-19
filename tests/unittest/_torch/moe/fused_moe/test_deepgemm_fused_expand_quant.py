@@ -28,7 +28,7 @@ token_id``, k_rank slow), so the test directly guards it against the real maps.
 
 Run as::
 
-    pytest tests/unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py -v
+    pytest tests/unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py -v
 """
 
 from __future__ import annotations

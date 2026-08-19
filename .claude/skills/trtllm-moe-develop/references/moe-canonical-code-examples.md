@@ -213,7 +213,7 @@ Use these examples when touching dynamic expert migration or slot routing:
 - Current forward-execution code
   - EPLB wait/update/route hook order, per-chunk first/last behavior,
     statistics gathering, and allreduce bypass semantics.
-- `tests/unittest/_torch/modules/moe/test_moe_module.py`
+- `tests/unittest/_torch/moe/test_moe_module.py`
   - `_create_moe_load_balancer`, `_run_eplb_test`, `_should_skip_EPLB`,
     `generate_eplb_test_params`, and backend-specific EPLB param generators
     when present.
@@ -342,7 +342,7 @@ Use these examples when changing dispatch/combine behavior:
   - Dispatch-time statistics/workspace pattern.
 - `communication/deep_ep.py` and `communication/deep_ep_low_latency.py`
   - DeepEP pre/post quant dispatch constraints.
-- `tests/unittest/_torch/modules/moe/test_moe_comm.py`
+- `tests/unittest/_torch/moe/test_moe_comm.py`
   - Focused communication behavior tests.
 
 Good uses:
@@ -369,9 +369,9 @@ Use these examples when wrapper forward policy grows complicated:
 - Backend forward paths
   - Useful only for legacy compatibility context or for identifying policy that
     should move into the scheduler.
-- `tests/unittest/_torch/modules/moe/test_moe_module.py`
+- `tests/unittest/_torch/moe/test_moe_module.py`
   - Module-level multi-GPU, chunking, routing, and EPLB cases.
-- `tests/unittest/_torch/multi_gpu/test_moe_a2a.py`
+- `tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py`
   - Multi-GPU all-to-all behavior when relevant.
 
 Good uses:
@@ -395,7 +395,7 @@ Use these examples when changing model-to-backend selection or routing output:
 - `tensorrt_llm/_torch/moe/fused_moe/create_moe.py`
   - `get_moe_cls`, `create_moe_backend`, `create_moe`, backend fallback, and
     quantization-specific selection.
-- `tests/unittest/_torch/modules/moe/moe_test_utils.py`
+- `tests/unittest/_torch/moe/moe_test_utils.py`
   - Backend enum, class map, quick skip reason, CI/local matrix generation.
 
 Good uses:
@@ -412,18 +412,18 @@ Red flags:
 
 Use these examples before adding backend, quantization, routing, or EPLB tests:
 
-- `tests/unittest/_torch/modules/moe/moe_test_utils.py`
+- `tests/unittest/_torch/moe/moe_test_utils.py`
   - `MoeBackendType`, `get_backend_class`, backend-specific `should_skip_*`,
     `get_quick_skip_reason`, `supports_autotuner_capture`,
     `iter_base_test_configs`, and CI acceleration logic.
-- `tests/unittest/_torch/modules/moe/quantize_utils.py`
+- `tests/unittest/_torch/moe/quantize_utils.py`
   - Quantized test weight generation, reference module selection, backend-aware
     weight preparation.
-- `tests/unittest/_torch/modules/moe/test_moe_backend.py`
+- `tests/unittest/_torch/moe/test_moe_backend.py`
   - Backend-level `quantize_input` and `run_moe` contracts.
-- `tests/unittest/_torch/modules/moe/test_moe_module.py`
+- `tests/unittest/_torch/moe/test_moe_module.py`
   - ConfigurableMoE integration matrix, multi-GPU, and EPLB coverage.
-- `tests/unittest/_torch/modules/moe/test_moe_comm.py`
+- `tests/unittest/_torch/moe/test_moe_comm.py`
   - Communication strategy tests.
 
 Good uses:

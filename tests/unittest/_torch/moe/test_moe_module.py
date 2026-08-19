@@ -42,7 +42,7 @@ import cloudpickle
 import pytest
 import torch
 import torch.distributed as dist
-from _torch.modules.moe.moe_test_utils import (
+from _torch.moe.moe_test_utils import (
     IS_CI_MODE,
     MoeBackendType,
     MoeModelConfig,
@@ -64,7 +64,7 @@ from _torch.modules.moe.moe_test_utils import (
     skip_trtllm_bf16_on_sm103,
     supports_autotuner_capture,
 )
-from _torch.modules.moe.quantize_utils import get_test_quant_params
+from _torch.moe.quantize_utils import get_test_quant_params
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig

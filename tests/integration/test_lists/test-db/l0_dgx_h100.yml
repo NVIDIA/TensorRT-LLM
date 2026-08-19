@@ -18,6 +18,7 @@ l0_dgx_h100:
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
+  - unittest/_torch/moe/multi_gpu -m "not post_merge" TIMEOUT (90)
   - unittest/_torch/modeling/test_modeling_pixtral.py::test_tensor_parallelism
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph_tp2[v1]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph_tp2[v2]
@@ -163,14 +164,14 @@ l0_dgx_h100:
   # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
   # Only CUTLASS and MARLIN backends run on H100 (SM90). TRTLLM/CUTEDSL/DEEPGEMM require SM100+.
   # --- CUTLASS ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8_BLOCK_SCALES"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A16_MXFP4"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8_BLOCK_SCALES"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A16_MXFP4"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_AWQ"
   # --- MARLIN (SM90-only; focused DEP + ALLGATHER x NVFP4 matrix) ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MARLIN"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "MARLIN"
   # ------------- MoE: test_multi_gpu_eplb ---------------
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
 - condition:
     ranges:
       system_gpu_count:
@@ -399,7 +400,7 @@ l0_dgx_h100:
       orchestrator: mpi
   tests:
   # ---- FP8 per-tensor (QDQ) moved to post-merge; block-scale stays in pre ----
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES"
+  - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not FP8_BLOCK_SCALES"
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off-python_mamba_cache]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off-cpp_mamba_cache]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_on-python_mamba_cache]

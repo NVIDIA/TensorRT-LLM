@@ -48,18 +48,18 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 import torch
-from _torch.modules.moe.kimi_k3_ref_moe._moe_kernels import (
+from _torch.moe.kimi_k3_ref_moe._moe_kernels import (
     assert_native_situ_supported,
     invoke_native_situ_moe,
     make_situ_alpha_beta,
     pack_routed_expert_weights,
 )
-from _torch.modules.moe.kimi_k3_ref_moe._mxfp4 import (
+from _torch.moe.kimi_k3_ref_moe._mxfp4 import (
     DEFAULT_GROUP_SIZE,
     dequantize_last_dim_mxfp4,
     quantize_last_dim_mxfp4,
 )
-from _torch.modules.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP, NonSituActivation
+from _torch.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP, NonSituActivation
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoEGate, KimiK3RMSNorm

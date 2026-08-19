@@ -211,6 +211,6 @@ class TestHostMoeTensorSharer(unittest.TestCase):
 
 if __name__ == "__main__":
     # This file should be run with mpirun, for example:
-    # mpirun -np 2 python -m unittest tests/unittest/_torch/modules/test_moe_host_sharer.py
+    # mpirun -np 2 python -m unittest tests/unittest/_torch/moe/test_moe_host_sharer.py
     # Run tests using unittest
     unittest.main()

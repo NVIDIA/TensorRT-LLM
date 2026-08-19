@@ -361,13 +361,7 @@
 /tests/microbenchmarks/compare_moe_comm.py @NVIDIA/trt-llm-moe-devs
 /tests/scripts/cute_dsl_kernels/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
 /tests/scripts/cute_dsl_kernels/moe_workload_generator.py @NVIDIA/trt-llm-moe-devs
-/tests/unittest/_torch/modules/dwdp/test_dwdp_fixup_moe_backends.py @NVIDIA/trt-llm-moe-devs
-/tests/unittest/_torch/modules/fused_moe @NVIDIA/trt-llm-moe-devs
-/tests/unittest/_torch/modules/moe @NVIDIA/trt-llm-moe-devs
-/tests/unittest/_torch/modules/test_fused_moe.py @NVIDIA/trt-llm-moe-devs
-/tests/unittest/_torch/modules/test_fused_shared_expert.py @NVIDIA/trt-llm-moe-devs
-/tests/unittest/_torch/modules/test_moe_*.py @NVIDIA/trt-llm-moe-devs
-/tests/unittest/_torch/multi_gpu/test_moe_a2a.py @NVIDIA/trt-llm-moe-devs
+/tests/unittest/_torch/moe @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/thop/parallel/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/_torch/thop/serial/*moe* @NVIDIA/trt-llm-moe-devs
 /tests/unittest/bindings/test_bindings_moe.py @NVIDIA/trt-llm-moe-devs

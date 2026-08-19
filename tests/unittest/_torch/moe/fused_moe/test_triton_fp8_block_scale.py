@@ -4,7 +4,7 @@
 Unit tests for ``run_triton_fp8_block_scale_moe``.
 
 Run as a pytest:
-    pytest tests/unittest/_torch/modules/fused_moe/test_triton_fp8_block_scale.py -v
+    pytest tests/unittest/_torch/moe/fused_moe/test_triton_fp8_block_scale.py -v
 """
 
 from __future__ import annotations

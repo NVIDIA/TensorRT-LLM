@@ -16,7 +16,7 @@ Checks the fused SiTU activation op against the eager fp32
 
 import pytest
 import torch
-from _torch.modules.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP
+from _torch.moe.kimi_k3_ref_moe.kimi_k3_mlp_test_utils import KimiK3MLP
 
 from tensorrt_llm._torch.modules.situ import SituAndMul
 

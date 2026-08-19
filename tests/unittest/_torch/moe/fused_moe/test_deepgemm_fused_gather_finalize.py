@@ -24,7 +24,7 @@ the test additionally reports whether the result happened to be bitwise equal.
 
 Run as::
 
-    pytest tests/unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py -v
+    pytest tests/unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py -v
 """
 
 from __future__ import annotations

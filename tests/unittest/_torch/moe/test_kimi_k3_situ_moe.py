@@ -27,12 +27,12 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 import torch.distributed as dist
-from _torch.modules.moe.kimi_k3_ref_moe._moe_kernels import (
+from _torch.moe.kimi_k3_ref_moe._moe_kernels import (
     is_native_situ_supported,
     make_situ_alpha_beta,
     padded_fused_shapes,
 )
-from _torch.modules.moe.kimi_k3_ref_moe.kimi_k3_moe_block import KimiK3SparseMoeBlock
+from _torch.moe.kimi_k3_ref_moe.kimi_k3_moe_block import KimiK3SparseMoeBlock
 from utils.util import check_accuracy
 
 import tensorrt_llm._torch.models.modeling_kimi_linear as modeling_kimi_linear
@@ -356,7 +356,7 @@ def test_fc1_swap_mutation_breaks_accuracy():
     fused, ref = _make_block_pair(config, device)
 
     # Rebuild the fused buffers with w1/w3 swapped.
-    from _torch.modules.moe.kimi_k3_ref_moe._moe_kernels import pack_routed_expert_weights
+    from _torch.moe.kimi_k3_ref_moe._moe_kernels import pack_routed_expert_weights
 
     swapped = pack_routed_expert_weights(
         w1_packed=fused.expert_bank.w3_packed,
@@ -385,7 +385,7 @@ def test_swiglu_act_mutation_breaks_accuracy():
     config = _K3Config()
     fused, ref = _make_block_pair(config, device)
 
-    import _torch.modules.moe.kimi_k3_ref_moe._moe_kernels as mk
+    import _torch.moe.kimi_k3_ref_moe._moe_kernels as mk
 
     torch.manual_seed(17)
     x = torch.randn(1, 64, config.hidden_size, dtype=torch.bfloat16, device=device) * 0.5
@@ -396,7 +396,7 @@ def test_swiglu_act_mutation_breaks_accuracy():
         kwargs["act_type"] = int(ActType_TrtllmGen.SwiGlu)
         return orig(**kwargs)
 
-    from _torch.modules.moe.kimi_k3_ref_moe import kimi_k3_moe_block
+    from _torch.moe.kimi_k3_ref_moe import kimi_k3_moe_block
 
     kimi_k3_moe_block.invoke_native_situ_moe = swiglu_invoke
     try:
