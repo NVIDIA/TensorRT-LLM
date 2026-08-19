@@ -178,15 +178,16 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         {
             TLLM_CHECK_WITH_INFO(input.device().is_cpu(), "input must be a CPU tensor");
             TLLM_CHECK_WITH_INFO(output.device().is_cuda(), "output must be a CUDA tensor");
+            c10::cuda::CUDAGuard const deviceGuard(output.device());
             TLLM_CHECK_WITH_INFO(input.scalar_type() == at::kInt && output.scalar_type() == at::kInt,
                 "input and output must contain int32 values");
             TLLM_CHECK_WITH_INFO(
                 input.is_contiguous() && output.is_contiguous(), "input and output must be contiguous");
-            auto _input = from_torch(input);
-            auto _output = from_torch(output);
-            TLLM_CHECK_WITH_INFO(_input.has_value() && _output.has_value(), "Invalid page-table tensor.");
+            auto inputTensor = from_torch(input);
+            auto outputTensor = from_torch(output);
+            TLLM_CHECK_WITH_INFO(inputTensor.has_value() && outputTensor.has_value(), "Invalid page-table tensor.");
             copyBasePageRowsToDevice(
-                *(_input.value()), *(_output.value()), numRows, reinterpret_cast<CUstream>(stream));
+                *(inputTensor.value()), *(outputTensor.value()), numRows, reinterpret_cast<CUstream>(stream));
         },
         nb::arg("input"), nb::arg("output"), nb::arg("num_rows"), nb::arg("stream"),
         nb::call_guard<nb::gil_scoped_release>(), "Copy dense V2 base-page rows into a 4-D device table");

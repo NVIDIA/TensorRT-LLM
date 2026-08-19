@@ -634,9 +634,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
         if self._page_table_materializer.uses_device_staging:
             # Device staging uploads only the active rows, but the DSV4 op uses
-            # a capacity-sized identity index. Initialize the inactive tail so
+            # a capacity-sized identity index. Mark the inactive tail invalid so
             # it is defined even though no attention consumer reads its output.
-            self._device_kv_cache_block_offsets_input.zero_()
+            self._device_kv_cache_block_offsets_input.fill_(BAD_PAGE_INDEX)
         self._precomputed_sliding_block_tables = torch.empty(
             (
                 self.num_local_layers,

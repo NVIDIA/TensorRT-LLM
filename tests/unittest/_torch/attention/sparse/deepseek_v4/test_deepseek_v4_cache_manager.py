@@ -1548,7 +1548,7 @@ class TestDeepseekV4CacheManager:
                     # is not consumed, but it must remain defined for initcheck.
                     assert torch.all(
                         cache_manager._device_kv_cache_block_offsets_input[:, len(request_ids) :]
-                        == 0
+                        == BAD_PAGE_INDEX
                     )
                 return cache_manager._precomputed_sliding_block_tables[
                     :, :, : len(request_ids)
