@@ -405,8 +405,11 @@ void PeftCacheManager::configureDataType(tensorrt_llm::DataType dataType)
         return;
     }
 
-    mHostLoraCache->setDataType(dataType);
-    mDeviceLoraCache->setDataType(dataType);
+    // Reconfigure host and device caches to the new dtype atomically: LoraCache::copyTask
+    // locks both caches' mCacheMutex to verify they agree on dtype before copying a task, so
+    // reconfiguring them one at a time here would let a concurrent copyTask observe one cache
+    // already switched to the new dtype while the other still holds the old one.
+    mHostLoraCache->setDataTypeCoordinated(*mDeviceLoraCache, dataType);
     mDataType = dataType;
 }
 

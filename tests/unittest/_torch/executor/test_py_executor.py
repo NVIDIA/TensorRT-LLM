@@ -49,6 +49,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -2807,13 +2808,16 @@ class TestPendingTransferResponseFlush:
     def test_idle_pass_processes_eviction_release_and_has_one_flush(
         self, monkeypatch, is_kv_manager_v2
     ):
-        """Both cache-manager generations use the executor pause lifecycle."""
+        """Only destructive eviction uses the executor pause lifecycle in V2."""
         executor = self._make_executor_loop_stub()
         executor._is_kv_manager_v2 = is_kv_manager_v2
         executor._can_pause_for_rebalance = Mock(return_value=False)
         paused_request = Mock()
         scheduled_batch = types.SimpleNamespace(
-            encoder_requests=[], paused_requests=[paused_request], generation_requests=[]
+            encoder_requests=[],
+            paused_requests=[] if is_kv_manager_v2 else [paused_request],
+            recompute_paused_requests=[paused_request] if is_kv_manager_v2 else [],
+            generation_requests=[],
         )
         executor._prepare_and_schedule_batch = Mock(
             side_effect=[(scheduled_batch, None), (None, None)]
@@ -2821,6 +2825,8 @@ class TestPendingTransferResponseFlush:
         executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
         executor._terminate_requests = Mock()
         executor._pause_requests = Mock()
+        executor._terminate_recompute_paused_requests = Mock()
+        executor._pause_recompute_paused_requests = Mock()
         executor._can_queue = Mock(return_value=(False, None))
         executor.kv_connector_manager = None
         executor._revert_gen_alloc = Mock()
@@ -2834,14 +2840,22 @@ class TestPendingTransferResponseFlush:
 
         PyExecutor._executor_loop(executor)
 
-        executor._terminate_requests.assert_called_once_with([paused_request])
-        executor._pause_requests.assert_called_once_with([paused_request])
+        if is_kv_manager_v2:
+            executor._terminate_requests.assert_not_called()
+            executor._pause_requests.assert_not_called()
+            executor._terminate_recompute_paused_requests.assert_called_once_with(scheduled_batch)
+            executor._pause_recompute_paused_requests.assert_called_once_with(scheduled_batch)
+        else:
+            executor._terminate_requests.assert_called_once_with([paused_request])
+            executor._pause_requests.assert_called_once_with([paused_request])
+            executor._terminate_recompute_paused_requests.assert_not_called()
+            executor._pause_recompute_paused_requests.assert_not_called()
         # One completed idle pass plus the clean-exit drain, not two flushes
         # during the idle pass itself.
         assert executor._flush_pending_transfer_responses.call_count == 2
 
-    def test_overlap_v2_eviction_release_waits_for_previous_batch(self, monkeypatch):
-        """Consume the sampled token before discarding its request resources."""
+    def test_overlap_v2_recompute_pause_waits_for_sample_update(self, monkeypatch):
+        """Consume the sampled token before resetting a request for recomputation."""
         executor = self._make_executor_loop_stub()
         executor._is_kv_manager_v2 = True
         executor._can_pause_for_rebalance = Mock(return_value=False)
@@ -2856,7 +2870,10 @@ class TestPendingTransferResponseFlush:
         )
         executor.active_requests = [paused_request]
         scheduled_batch = types.SimpleNamespace(
-            encoder_requests=[], paused_requests=[paused_request], generation_requests=[]
+            encoder_requests=[],
+            paused_requests=[],
+            recompute_paused_requests=[paused_request],
+            generation_requests=[],
         )
         executor._prepare_and_schedule_batch = Mock(
             side_effect=[(scheduled_batch, None), (None, None)]
@@ -2865,8 +2882,8 @@ class TestPendingTransferResponseFlush:
         lifecycle = Mock()
         executor._update_requests = lifecycle.update_requests
         executor._process_previous_batch = lifecycle.process_previous_batch
-        executor._terminate_requests = lifecycle.terminate
-        executor._pause_requests = lifecycle.pause
+        executor._terminate_recompute_paused_requests = lifecycle.terminate_recompute
+        executor._pause_recompute_paused_requests = lifecycle.pause_recompute
         executor._can_queue = Mock(return_value=(False, False))
         executor.kv_connector_manager = None
         executor._revert_gen_alloc = Mock()
@@ -2888,10 +2905,10 @@ class TestPendingTransferResponseFlush:
         PyExecutor._executor_loop_overlap(executor)
 
         assert lifecycle.mock_calls == [
+            call.terminate_recompute(scheduled_batch),
             call.update_requests(previous_sample_state),
+            call.pause_recompute(scheduled_batch),
             call.process_previous_batch(),
-            call.terminate([paused_request]),
-            call.pause([paused_request]),
         ]
 
     def test_overlap_flushes_before_clean_scheduler_shutdown(self, monkeypatch):
@@ -2938,12 +2955,17 @@ class TestOneModelMTPDraftTokenScheduling:
     forward then builds a uniform ``1 + runtime_draft_len`` per gen request and
     overshoots ``max_num_tokens`` (``total_num_tokens > max_num_tokens``).
 
-    The fix populates ``request.draft_tokens = [0] * max_total_draft_tokens``
-    on every in-progress generation request so scheduling reserves the correct
-    token budget. This test drives ``_prepare_and_schedule_batch`` for a
-    one-model-MTP executor and asserts generation requests get
-    ``num_draft_tokens == max_total_draft_tokens`` while context requests are
-    left untouched.
+    The fix populates both the Python and C++ draft-token representations on
+    every in-progress generation request so both schedulers reserve the
+    correct token budget. This test drives ``_prepare_and_schedule_batch`` for
+    a one-model-MTP executor and asserts generation requests get the full
+    draft-token budget while context requests are left untouched.
+
+    The Python-side fill is placeholder-only: with the overlap scheduler
+    disabled, ``_prepare_tp_inputs`` sources a generation request's draft
+    tokens from ``py_draft_tokens``, which the one-model spec sampler wrote at
+    the end of the previous iteration. Overwriting a populated list here would
+    feed zeros to the target model and collapse the acceptance rate.
 
     NOTE: Like ``test_fetch_called_once_even_in_benchmark_disagg`` in
     ``test_benchmark_disagg.py``, this uses ``object.__new__(PyExecutor)`` to
@@ -2970,7 +2992,11 @@ class TestOneModelMTPDraftTokenScheduling:
         return req
 
     @classmethod
-    def _make_one_model_mtp_executor(cls, active_requests):
+    def _make_one_model_mtp_executor(
+        cls,
+        active_requests: list[LlmRequest],
+        use_rejection_sampling: bool = False,
+    ) -> PyExecutor:
         """Construct a partially-initialised one-model-MTP PyExecutor.
 
         drafter is None (one-model MTP has no separate drafter) and
@@ -2983,11 +3009,23 @@ class TestOneModelMTPDraftTokenScheduling:
         ex = object.__new__(PyExecutor)
         ex.drafter = None
         ex.max_total_draft_tokens = cls.MAX_TOTAL_DRAFT_TOKENS
-        ex.model_engine = Mock(is_spec_decode=True)
+        spec_config = MTPDecodingConfig(
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            mtp_eagle_one_model=True,
+            use_rejection_sampling=use_rejection_sampling,
+            draft_len_schedule={1: cls.MAX_TOTAL_DRAFT_TOKENS},
+        )
+        ex.model_engine = Mock(
+            is_spec_decode=True,
+            spec_config=spec_config,
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            max_total_draft_tokens=cls.MAX_TOTAL_DRAFT_TOKENS,
+        )
         ex.kv_cache_transceiver = None
         ex.is_shutdown = False
         ex.enable_iter_perf_stats = False
         ex.enable_attention_dp = False
+        ex.speculation_permanently_disabled = False
         ex.active_requests = active_requests
         ex.waiting_queue = []
 
@@ -3020,6 +3058,8 @@ class TestOneModelMTPDraftTokenScheduling:
         # Precondition: no draft tokens reserved yet on either gen request.
         assert gen.num_draft_tokens == 0
         assert disagg_gen.num_draft_tokens == 0
+        assert gen.py_draft_tokens == []
+        assert disagg_gen.py_draft_tokens == []
 
         ex = self._make_one_model_mtp_executor([gen, disagg_gen, ctx])
         scheduled_batch, _ = ex._prepare_and_schedule_batch()
@@ -3029,7 +3069,39 @@ class TestOneModelMTPDraftTokenScheduling:
         # full draft-token budget so the micro-batch scheduler reserves
         # beam + max_total_draft_tokens.
         assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
         # Disaggregated case: decode-worker request awaiting KV also normalized.
         assert disagg_gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert disagg_gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
         # Context requests are not generation requests and must be left alone.
         assert ctx.num_draft_tokens == 0
+        assert ctx.py_draft_tokens == []
+
+    def test_one_model_mtp_preserves_zero_proposal_signal_for_rejection(self) -> None:
+        gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
+        ex = self._make_one_model_mtp_executor([gen], use_rejection_sampling=True)
+
+        ex._prepare_and_schedule_batch()
+
+        assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_needs_onehot_draft_probs
+
+        batch = ScheduledRequests()
+        batch.append_generation_request(gen)
+        ex._handle_dynamic_draft_len(batch)
+
+        assert ex.model_engine.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_needs_onehot_draft_probs
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
+
+    def test_one_model_mtp_preserves_sampler_draft_tokens(self) -> None:
+        sampler_drafts = [7, 8]
+        gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
+        gen.py_draft_tokens = list(sampler_drafts)
+
+        ex = self._make_one_model_mtp_executor([gen])
+        ex._prepare_and_schedule_batch()
+
+        assert gen.py_draft_tokens == sampler_drafts
+        assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
