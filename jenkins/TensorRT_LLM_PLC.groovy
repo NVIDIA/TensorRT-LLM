@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['trtllm-jenkins-shared-lib@main']) _
+@Library(['trtllm-jenkins-shared-lib@user/brnguyen/infra-fs-loss-signatures']) _
 import groovy.json.JsonSlurper
 
 def createKubernetesPodConfig()
