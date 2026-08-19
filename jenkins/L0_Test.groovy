@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/brnguyen/fs-loss-probe']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -2728,6 +2728,39 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       }
 
       rememberAvoidedSlurmNodeLists(avoidedSlurmNodeListsByCluster, attemptPlacementContext.lastSlurmClusterName, attemptPlacementContext.lastSlurmNodeList, stageName)
+
+      // Filesystem-loss confirmation probe. When the classification is an
+      // agent filesystem-loss / durable-task launch fault (the /tmp scratch
+      // mount vanished under the running job), confirm the loss from THIS
+      // surviving executor -- not the suspect SLURM agent -- and surface a
+      // recommended `scontrol ... state=drain` so an operator can quarantine
+      // the bad node before the next job lands on it. Gated to the fs-loss
+      // signatures only, diagnostic-only (never executes the drain), and
+      // wrapped so it can never disturb the retry/cleanup path below. The node
+      // name comes from placementContext.lastSlurmNodeList, captured while the
+      // agent was still online (hostname -f / sacct NodeList).
+      String fsLossPattern = (c.detectedPattern ?: "") as String
+      boolean fsLossSuspected =
+          fsLossPattern.startsWith("<typed:durable-") ||
+          fsLossPattern == "NoSuchFileException: /tmp" ||
+          (fsLossPattern.contains('Cannot run program "nohup"') && fsLossPattern.contains("error=2"))
+      if (fsLossSuspected) {
+        try {
+          def fsProbe = confirmFilesystemLoss(pipeline, [
+            nodeName: attemptPlacementContext.lastSlurmNodeList,
+            buildTag: env.BUILD_TAG,
+          ])
+          echo "[FS-LOSS-PROBE] ${stageName}: classification='${fsLossPattern}' -> " +
+               "recommendation=${fsProbe.recommendation} confirmed=${fsProbe.confirmed} node=${fsProbe.nodeName}"
+          fsProbe.evidence.each { echo "[FS-LOSS-PROBE] ${stageName}: ${it}" }
+          if (fsProbe.recommendation == 'drain' && fsProbe.drainCommand) {
+            echo "[FS-LOSS-PROBE] ${stageName}: RECOMMENDED (NOT executed) node quarantine: ${fsProbe.drainCommand}"
+          }
+        } catch (Throwable probeEx) {
+          // Diagnostic-only: a probe failure must never change retry behavior.
+          echo "[FS-LOSS-PROBE] ${stageName}: probe skipped due to error: ${probeEx}"
+        }
+      }
 
       def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? Math.min(1, slurmInfraRetryMax) : slurmInfraRetryMax
 
