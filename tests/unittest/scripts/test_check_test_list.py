@@ -335,3 +335,101 @@ def test_load_collectable_entries_reads_both_lists(mod, tmp_path):
 
 def test_load_collectable_entries_missing_returns_none(mod, tmp_path):
     assert mod.load_collectable_entries(str(tmp_path)) is None
+
+
+# --------------------------------------------------------------------------
+# module-const soundness against in-place mutation / rebinding
+# --------------------------------------------------------------------------
+
+
+def test_subscript_mutated_name_punts(mod, tmp_path):
+    # NAME[i] = ... mutates in place without rebinding; must not be resolved.
+    src = (
+        "import pytest\n"
+        'PARAMS = ["a", "b"]\n'
+        'PARAMS[0] = "z"\n'
+        '@pytest.mark.parametrize("x", PARAMS)\n'
+        "def test_f(x): pass\n"
+    )
+    assert _valid_ids(mod, tmp_path, src) is None
+
+
+def test_method_mutated_name_punts(mod, tmp_path):
+    # NAME.append(...) may mutate in place; conservatively unresolved.
+    src = (
+        "import pytest\n"
+        'PARAMS = ["a"]\n'
+        'PARAMS.append("b")\n'
+        '@pytest.mark.parametrize("x", PARAMS)\n'
+        "def test_f(x): pass\n"
+    )
+    assert _valid_ids(mod, tmp_path, src) is None
+
+
+def test_attribute_store_mutated_name_punts(mod, tmp_path):
+    src = (
+        "import pytest\n"
+        "PARAMS = obj\n"
+        "PARAMS.attr = 1\n"
+        '@pytest.mark.parametrize("x", PARAMS)\n'
+        "def test_f(x): pass\n"
+    )
+    assert _valid_ids(mod, tmp_path, src) is None
+
+
+def test_for_rebound_name_punts(mod, tmp_path):
+    src = (
+        "import pytest\n"
+        'PARAMS = ["a"]\n'
+        "for PARAMS in other:\n    pass\n"
+        '@pytest.mark.parametrize("x", PARAMS)\n'
+        "def test_f(x): pass\n"
+    )
+    assert _valid_ids(mod, tmp_path, src) is None
+
+
+def test_mutated_or_rebound_names_helper(mod, tmp_path):
+    import ast
+
+    src = (
+        "import os\n"
+        "import numpy as np\n"
+        "A = [1]\n"
+        "B = [1]\nB[0] = 2\n"
+        "C = [1]\nC.append(2)\n"
+        "D = 0\nD += 1\n"
+        "for E in x:\n    pass\n"
+        "with ctx() as F:\n    pass\n"
+        "(G := 5)\n"
+    )
+    unsafe = mod._mutated_or_rebound_names(ast.parse(src))
+    # Rebound / mutated / imported names are unsafe; the clean const A is not.
+    assert {"B", "C", "D", "E", "F", "G", "os", "np"} <= unsafe
+    assert "A" not in unsafe
+
+
+def test_validate_mutated_name_is_unverifiable_not_error(mod, tmp_path):
+    # The soundness payoff: a mutated argvalues const must NOT produce a false
+    # INVALID PARAMETRIZE ID; it becomes unverifiable instead.
+    source = (
+        "import pytest\n"
+        'PARAMS = ["a"]\n'
+        'PARAMS.append("b")\n'
+        '@pytest.mark.parametrize("x", PARAMS)\n'
+        "def test_f(x): pass\n"
+    )
+    lists_dir, base = _make_layout(tmp_path, source, ["test_sample.py::test_f[b]"])
+    errors, unverifiable, accepted, rejected = mod.validate_test_lists(lists_dir, base)
+    assert errors == []
+    assert rejected == []
+    assert len(unverifiable) == 1
+    assert unverifiable[0][:4] == ("test_sample.py", None, "test_f", "b")
+
+
+def test_write_unverifiable_report_empty(mod, tmp_path):
+    # --report-unverifiable must produce a file even with an empty result, so
+    # automation can tell "empty" from "not run".
+    out = tmp_path / "report.txt"
+    mod.write_unverifiable_report([], str(out))
+    assert out.exists()
+    assert "0 unverifiable" in out.read_text(encoding="utf-8")

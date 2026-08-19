@@ -49,6 +49,11 @@ _DEFAULT_TEST_BASE_DIR = "tests/integration/defs"
 # Paths whose tests are generated dynamically — skip AST validation
 _EXCLUDED_PATH_PREFIXES = ("perf/", )
 
+# A parsed test-list entry: (rel_path, class_name|None, func_name, param_id|None).
+_EntryTuple = tuple[str, str | None, str, str | None]
+# Map of module-level constant name -> its bound value node.
+_ModuleConsts = dict[str, ast.expr]
+
 # =============================================================================
 # AST-based test list validation
 # =============================================================================
@@ -106,7 +111,7 @@ def _is_parametrize_call(node) -> bool:
     return False
 
 
-def _ast_constant_str(node) -> str | None:
+def _ast_constant_str(node: ast.expr) -> str | None:
     """Return str() of an AST constant node, or None if not a simple literal."""
     if isinstance(node, ast.Constant) and isinstance(
             node.value, (str, int, float, bool, type(None))):
@@ -114,7 +119,7 @@ def _ast_constant_str(node) -> str | None:
     return None
 
 
-def _argnames_list(node) -> list[str] | None:
+def _argnames_list(node: ast.expr) -> list[str] | None:
     """Return the list of parametrize argnames, or None if not a static literal.
 
     Handles both the "a,b" comma-string form and the ["a", "b"] list/tuple form.
@@ -132,7 +137,9 @@ def _argnames_list(node) -> list[str] | None:
     return None
 
 
-def _resolve_const_node(node, module_consts, _depth: int = 0):
+def _resolve_const_node(node: ast.expr,
+                        module_consts: _ModuleConsts | None,
+                        _depth: int = 0) -> ast.expr:
     """Follow a Name to the module-level literal it is bound to.
 
     Returns the resolved node (or the input node unchanged if it is not a Name
@@ -147,7 +154,9 @@ def _resolve_const_node(node, module_consts, _depth: int = 0):
     return node
 
 
-def _argvalues_elts(node, module_consts) -> list | None:
+def _argvalues_elts(
+        node: ast.expr,
+        module_consts: _ModuleConsts | None) -> list[ast.expr] | None:
     """Return the element nodes of an argvalues expression, or None.
 
     Resolves a List/Tuple literal directly, or a Name transitively bound to
@@ -160,8 +169,9 @@ def _argvalues_elts(node, module_consts) -> list | None:
     return None
 
 
-def _get_parametrize_with_ids_ids(call: ast.Call,
-                                  module_consts=None) -> list[str] | None:
+def _get_parametrize_with_ids_ids(
+        call: ast.Call,
+        module_consts: _ModuleConsts | None = None) -> list[str] | None:
     """Extract IDs from a parametrize_with_ids(argnames, argvalues) call.
 
     parametrize_with_ids generates IDs like "argname=value" joined with "-".
@@ -287,9 +297,10 @@ def _pytest_param_id(call: ast.Call) -> str | None:
     return "-".join(parts) if parts else None
 
 
-def _compute_valid_param_ids(func_node,
-                             class_decorators=None,
-                             module_consts=None) -> set[str] | None:
+def _compute_valid_param_ids(
+        func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+        class_decorators: list[ast.expr] | None = None,
+        module_consts: _ModuleConsts | None = None) -> set[str] | None:
     """Return the set of valid parametrize IDs for a function node.
 
     Iterates method-level parametrize decorators in reverse source order
@@ -324,7 +335,9 @@ def _compute_valid_param_ids(func_node,
     return set(combos)
 
 
-def _classify_unverifiable(func_node, class_decorators, module_consts) -> str:
+def _classify_unverifiable(func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+                           class_decorators: list[ast.expr] | None,
+                           module_consts: _ModuleConsts | None) -> str:
     """Return a short reason code for why a param ID cannot be verified.
 
     Report-only; used to bucket unverifiable entries so they can be swept.
@@ -358,6 +371,77 @@ def _classify_unverifiable(func_node, class_decorators, module_consts) -> str:
     return "param-id-collision"
 
 
+def _iter_target_names(target: ast.expr) -> list[str]:
+    """Return the Name ids bound by an assignment/for/with target.
+
+    Recurses into tuple/list/starred targets so unpacking binds are all caught.
+    """
+    names: list[str] = []
+    if isinstance(target, ast.Name):
+        names.append(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            names.extend(_iter_target_names(elt))
+    elif isinstance(target, ast.Starred):
+        names.extend(_iter_target_names(target.value))
+    return names
+
+
+def _mutated_or_rebound_names(tree: ast.AST) -> set[str]:
+    """Return names that are rebound or mutated anywhere in ``tree``.
+
+    Conservative (over-approximating) soundness guard for module_consts: a name
+    that is augmented-assigned, mutated in place (``NAME[i] = ...``,
+    ``NAME.attr = ...``, ``NAME.method(...)``), or rebound by a non-Assign
+    statement (for/with target, import alias, walrus) cannot be trusted to still
+    equal its initial literal, so it must not be resolved as a constant. The AST
+    walk is scope-insensitive, so this may also drop a name that is only shadowed
+    in a nested scope -- that costs resolver coverage, never soundness (an
+    unresolved name becomes unverifiable, not a wrong INVALID error).
+    """
+    unsafe: set[str] = set()
+
+    def _flag_inplace_target(target: ast.expr) -> None:
+        # A Subscript/Attribute store (NAME[i] = / NAME.attr =) mutates the base
+        # Name in place without rebinding it.
+        if not isinstance(target, (ast.Subscript, ast.Attribute)):
+            return
+        base: ast.expr = target
+        while isinstance(base, (ast.Subscript, ast.Attribute)):
+            base = base.value
+        if isinstance(base, ast.Name):
+            unsafe.add(base.id)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AugAssign):
+            _flag_inplace_target(node.target)
+            if isinstance(node.target, ast.Name):
+                unsafe.add(node.target.id)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                _flag_inplace_target(tgt)
+        elif isinstance(node, ast.AnnAssign):
+            _flag_inplace_target(node.target)
+        elif isinstance(node, ast.NamedExpr) and isinstance(
+                node.target, ast.Name):
+            unsafe.add(node.target.id)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            unsafe.update(_iter_target_names(node.target))
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    unsafe.update(_iter_target_names(item.optional_vars))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                unsafe.add(alias.asname or alias.name.split(".")[0])
+        elif (isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Attribute)
+              and isinstance(node.func.value, ast.Name)):
+            # NAME.method(...) may mutate NAME in place (append/extend/...).
+            unsafe.add(node.func.value.id)
+    return unsafe
+
+
 def build_ast_index(filepath: str):
     """Return the AST index tuple for a single test source file.
 
@@ -367,9 +451,10 @@ def build_ast_index(filepath: str):
     classes: {class_name: {'methods': set[str], 'bases': list[str],
                             'decorators': list[ast.Call]}}
     module_consts: {name: value_node} for module-level ``NAME = <expr>``
-        bindings, kept only when NAME is assigned exactly once at top level (so
-        a later reassignment or augmented assignment cannot make a statically
-        resolved value wrong).
+        bindings, kept only when NAME is assigned exactly once at top level and
+        is never otherwise rebound or mutated anywhere in the module (see
+        _mutated_or_rebound_names), so a statically resolved value cannot be
+        wrong.
     Returns (None, None, None, None, None) on error.
     """
     try:
@@ -409,9 +494,11 @@ def build_ast_index(filepath: str):
     }
     top_level_funcs = set(top_level_nodes)
 
-    # Module-level literal bindings, kept only when assigned exactly once at top
-    # level so a later reassignment / augmented assignment can't invalidate the
-    # value we resolve parametrize argvalues against.
+    # Module-level literal bindings, kept only when a name is assigned exactly
+    # once via a plain top-level ``NAME = <expr>`` AND is never otherwise rebound
+    # or mutated (augmented assign, NAME[i]=/NAME.attr= store, NAME.method(...),
+    # for/with target, import alias, walrus). Otherwise the value we resolve
+    # parametrize argvalues against could be stale.
     assign_counts = defaultdict(int)
     module_consts = {}
     for node in tree.body:
@@ -420,12 +507,11 @@ def build_ast_index(filepath: str):
                 if isinstance(tgt, ast.Name):
                     assign_counts[tgt.id] += 1
                     module_consts[tgt.id] = node.value
-        elif isinstance(node, ast.AugAssign) and isinstance(
-                node.target, ast.Name):
-            assign_counts[node.target.id] += 1
+    unsafe_names = _mutated_or_rebound_names(tree)
     module_consts = {
         name: val
-        for name, val in module_consts.items() if assign_counts[name] == 1
+        for name, val in module_consts.items()
+        if assign_counts[name] == 1 and name not in unsafe_names
     }
     return (classes, top_level_funcs, top_level_nodes, class_method_nodes,
             module_consts)
@@ -509,8 +595,18 @@ def _ensure_dir_indexed(abs_path: str, ast_cache: dict) -> None:
             ast_cache[sibling] = build_ast_index(sibling)
 
 
-def validate_test_lists(test_lists_dir: str, test_base_dir: str):
-    """Return list of error strings from AST-based validation."""
+def validate_test_lists(
+    test_lists_dir: str, test_base_dir: str
+) -> tuple[list[str], list[tuple], list[_EntryTuple], list[_EntryTuple]]:
+    """Return (errors, unverifiable, accepted_param, rejected_param).
+
+    errors: fatal validation problems (missing file/class/method, invalid or
+        truncated parametrize ID, waive not in active lists).
+    unverifiable: active entries whose parametrize ID cannot be checked
+        statically -- (rel_path, class, func, param_id, reason, refs) tuples.
+    accepted_param / rejected_param: active entries whose parametrize ID the
+        static resolver positively verified / rejected, for the parity check.
+    """
     active_entries, active_malformed = collect_entries(test_lists_dir,
                                                        include_waives=False)
     waive_entries, waive_malformed = collect_entries(test_lists_dir,
@@ -681,7 +777,7 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
     return errors, unverifiable, accepted_param, rejected_param
 
 
-def _format_unverifiable(unverifiable) -> list[str]:
+def _format_unverifiable(unverifiable: list[tuple]) -> list[str]:
     """Render unverifiable entries as sorted, one-per-line report strings."""
     lines = []
     for rel_path, class_name, func_name, param_id, reason, refs in sorted(
@@ -693,7 +789,7 @@ def _format_unverifiable(unverifiable) -> list[str]:
     return lines
 
 
-def write_unverifiable_report(unverifiable, dest) -> None:
+def write_unverifiable_report(unverifiable: list[tuple], dest: str) -> None:
     """Write the unverifiable-param-id report to ``dest`` ('-' means stdout)."""
     lines = _format_unverifiable(unverifiable)
     # Group counts by reason for a quick triage summary at the top.
@@ -719,7 +815,7 @@ def write_unverifiable_report(unverifiable, dest) -> None:
 # =============================================================================
 
 
-def _format_entry_tuple(entry) -> str:
+def _format_entry_tuple(entry: _EntryTuple) -> str:
     """Render an (rel_path, class, func, param_id) tuple as a test node id."""
     rel_path, class_name, func_name, param_id = entry
     cls = f"::{class_name}" if class_name else ""
@@ -727,12 +823,12 @@ def _format_entry_tuple(entry) -> str:
     return f"{rel_path}{cls}::{func_name}{param}"
 
 
-def _entry_sort_key(entry):
+def _entry_sort_key(entry: _EntryTuple) -> tuple[str, str, str, str]:
     rel_path, class_name, func_name, param_id = entry
     return (rel_path, class_name or "", func_name, param_id or "")
 
 
-def load_collectable_entries(llm_src):
+def load_collectable_entries(llm_src: str) -> set[_EntryTuple] | None:
     """Return the entry tuples the runtime stage proved collectable, or None.
 
     Reads the l0_test.txt / qa_test.txt lists written by verify_l0_test_lists /
@@ -760,7 +856,11 @@ def load_collectable_entries(llm_src):
     return collectable if found_any else None
 
 
-def compute_parity(accepted, rejected, collectable):
+def compute_parity(
+    accepted: list[_EntryTuple],
+    rejected: list[_EntryTuple],
+    collectable: set[_EntryTuple],
+) -> tuple[list[_EntryTuple], list[_EntryTuple]]:
     """Pure set logic for the validate <-> collection parity check.
 
     Args:
@@ -1114,6 +1214,11 @@ def main():
 
         # Instrumentation: active entries whose parametrize IDs cannot be
         # checked statically. Informational (non-fatal) unless --strict-param-ids.
+        # Write the report whenever requested, even when empty, so automation
+        # can tell an empty result from a missing report file.
+        if args.report_unverifiable is not None:
+            write_unverifiable_report(unverifiable, args.report_unverifiable)
+
         if unverifiable:
             print(
                 f"UNVERIFIABLE: {len(unverifiable)} active entr"
@@ -1121,10 +1226,7 @@ def main():
                 f"parametrize IDs that cannot be checked statically "
                 f"(runtime-computed argvalues/ids).",
                 file=sys.stderr)
-            if args.report_unverifiable is not None:
-                write_unverifiable_report(unverifiable,
-                                          args.report_unverifiable)
-            else:
+            if args.report_unverifiable is None:
                 print("  Re-run with --report-unverifiable to list them.",
                       file=sys.stderr)
             if args.strict_param_ids:
