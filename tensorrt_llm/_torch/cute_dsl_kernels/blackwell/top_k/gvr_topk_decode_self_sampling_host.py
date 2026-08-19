@@ -1161,7 +1161,11 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
 # exports (main.cpp:98-124)
 # ---------------------------------------------------------------------------
 def run(logits, pre_idx, n_valid, indices, values=None):
-    """Fast 4-arg form: signature-identical to the original candidate.
+    """TESTING/BENCH ONLY — production callers must use ``run_varlen`` (per-request
+    device kv_lens; this entry assumes one batch-uniform host ``n_valid``,
+    which real serving batches do not satisfy).
+
+    Fast 4-arg form: signature-identical to the original candidate.
     ``values`` (optional DPS output, default None = OFF) mirrors the
     production values writeback; see _run_impl.
     Default per-device slab workspace resolved FIRST (main.cpp:99-102 --
@@ -1178,7 +1182,9 @@ def run(logits, pre_idx, n_valid, indices, values=None):
 
 
 def run_ws(logits, pre_idx, n_valid, indices, workspace, values=None):
-    """Explicit-workspace form for multi-stream callers (main.cpp:105-116)."""
+    """TESTING/BENCH ONLY — production callers must use ``run_varlen(workspace=...)``.
+
+    Explicit-workspace form for multi-stream callers (main.cpp:105-116)."""
     validate_run_ws(workspace, logits)
     _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values)
 
