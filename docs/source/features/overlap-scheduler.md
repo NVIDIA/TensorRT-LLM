@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
 # Overlap Scheduler
 
 To maximize GPU utilization, the scheduler overlaps CPU tasks (e.g., checking sampling stop criteria, updating responses, scheduling the next batch) with GPU computation.
@@ -8,6 +12,8 @@ At step *n*, the system launches GPU computation for step *n+1* without waiting 
 
 - CPU work (step *n*) and GPU computation (step *n+1*) to run concurrently.
 - Better GPU occupancy by reducing idle time.
+
+![Overlap Scheduler Pipeline](../media/overlap_scheduler_pipeline.png)
 
 This concurrent execution pipeline is illustrated in the `PyExecutor`'s logic:
 
