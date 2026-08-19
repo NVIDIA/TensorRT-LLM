@@ -27,6 +27,7 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
+from tensorrt_llm.bindings.internal import userbuffers as userbuffers_bindings
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -79,7 +80,7 @@ QUANT_FUSION_OPS = (
 
 def _shutdown_userbuffers_manager(_):
     gc.collect()
-    ub.shutdown_userbuffers_manager()
+    userbuffers_bindings.shutdown_userbuffers_manager()
     return True
 
 
