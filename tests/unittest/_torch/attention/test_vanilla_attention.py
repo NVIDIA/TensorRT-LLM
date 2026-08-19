@@ -23,6 +23,18 @@ from tensorrt_llm.mapping import Mapping
 
 class TestVanillaAttention(unittest.TestCase):
 
+    @staticmethod
+    def _make_metadata(manager: MagicMock) -> VanillaAttentionMetadata:
+        return VanillaAttentionMetadata(
+            max_num_requests=1,
+            max_num_tokens=1,
+            kv_cache_manager=manager,
+            seq_lens=None,
+            num_contexts=0,
+            seq_lens_kv=None,
+            request_ids=[11],
+        )
+
     def test_kv_cache_manager_v2_sliding_window_eviction(self):
         device = torch.device("cuda")
         dtype = torch.bfloat16
@@ -96,11 +108,8 @@ class TestVanillaAttention(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    @patch(
-        "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
-    )
     def test_prepare_defers_cache_indices_for_layer_specific_pools(
-            self, mock_prepare: MagicMock) -> None:
+            self) -> None:
         for manager_attributes in ({
                 "is_vswa": True
         }, {
@@ -115,31 +124,24 @@ class TestVanillaAttention(unittest.TestCase):
                 manager.num_pools = 1
                 for name, value in manager_attributes.items():
                     setattr(manager, name, value)
-                metadata = object.__new__(VanillaAttentionMetadata)
-                metadata.kv_cache_manager = manager
-                metadata.request_ids = [11]
+                metadata = self._make_metadata(manager)
 
                 metadata.prepare()
 
                 self.assertIsNone(metadata.block_ids_per_seq)
                 manager.get_batch_cache_indices.assert_not_called()
-        self.assertEqual(mock_prepare.call_count, 3)
 
-    @patch(
-        "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
-    )
     def test_prepare_defers_cache_indices_for_layer_specific_scales(
-            self, mock_prepare: MagicMock) -> None:
+            self) -> None:
         manager = MagicMock()
         manager.is_vswa = False
         manager.is_linear_attention = False
         manager.num_pools = 1
         manager.layer_offsets = {0: 0, 1: 1}
+        manager.num_kv_heads_per_layer = [1, 1]
         manager.get_layer_page_index_scale = MagicMock(
             side_effect=lambda layer_idx: layer_idx + 1)
-        metadata = object.__new__(VanillaAttentionMetadata)
-        metadata.kv_cache_manager = manager
-        metadata.request_ids = [11]
+        metadata = self._make_metadata(manager)
 
         metadata.prepare()
         metadata.prepare()
@@ -147,44 +149,81 @@ class TestVanillaAttention(unittest.TestCase):
         self.assertIsNone(metadata.block_ids_per_seq)
         manager.get_batch_cache_indices.assert_not_called()
         self.assertEqual(manager.get_layer_page_index_scale.call_count, 2)
-        self.assertEqual(mock_prepare.call_count, 2)
 
-    @patch(
-        "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
-    )
-    def test_prepare_keeps_fast_path_for_uniform_layer_scales(
-            self, mock_prepare: MagicMock) -> None:
+    def test_prepare_keeps_fast_path_for_uniform_layer_scales(self) -> None:
         manager = MagicMock()
         manager.is_vswa = False
         manager.is_linear_attention = False
         manager.num_pools = 1
         manager.layer_offsets = {0: 0, 1: 1}
+        manager.num_kv_heads_per_layer = [1, 1]
         manager.get_layer_page_index_scale = MagicMock(return_value=1)
         manager.get_batch_cache_indices.return_value = [[7]]
-        metadata = object.__new__(VanillaAttentionMetadata)
-        metadata.kv_cache_manager = manager
-        metadata.request_ids = [11]
+        metadata = self._make_metadata(manager)
 
         metadata.prepare()
 
         self.assertEqual(metadata.block_ids_per_seq, [[7]])
         manager.get_batch_cache_indices.assert_called_once_with([11])
-        mock_prepare.assert_called_once_with()
 
-    @patch(
-        "tensorrt_llm._torch.attention_backend.interface.AttentionMetadata.prepare"
-    )
-    def test_single_pool_cache_indices_remain_prepared_once(
-            self, mock_prepare: MagicMock) -> None:
+    def test_prepare_ignores_non_attention_layer_scales(self) -> None:
+        manager = MagicMock()
+        manager.is_vswa = False
+        manager.is_linear_attention = False
+        manager.num_pools = 1
+        manager.layer_offsets = {0: 0, 1: 1, 2: 2}
+        manager.num_kv_heads_per_layer = [1, 0, 1]
+        manager.get_layer_page_index_scale = MagicMock(
+            side_effect=lambda layer_idx: 2 if layer_idx == 1 else 1)
+        manager.get_batch_cache_indices.return_value = [[7]]
+        metadata = self._make_metadata(manager)
+
+        metadata.prepare()
+
+        self.assertEqual(metadata.block_ids_per_seq, [[7]])
+        self.assertEqual(manager.get_layer_page_index_scale.call_args_list, [
+            unittest.mock.call(0),
+            unittest.mock.call(2),
+        ])
+
+    def test_prepare_recomputes_cache_indices_after_manager_change(
+            self) -> None:
+        uniform_manager = MagicMock()
+        uniform_manager.is_vswa = False
+        uniform_manager.is_linear_attention = False
+        uniform_manager.num_pools = 1
+        uniform_manager.layer_offsets = {0: 0, 1: 1}
+        uniform_manager.num_kv_heads_per_layer = [1, 1]
+        uniform_manager.get_layer_page_index_scale = MagicMock(return_value=1)
+        uniform_manager.get_batch_cache_indices.return_value = [[7]]
+        layer_specific_manager = MagicMock()
+        layer_specific_manager.is_vswa = False
+        layer_specific_manager.is_linear_attention = False
+        layer_specific_manager.num_pools = 1
+        layer_specific_manager.layer_offsets = {0: 0, 1: 1}
+        layer_specific_manager.num_kv_heads_per_layer = [1, 1]
+        layer_specific_manager.get_layer_page_index_scale = MagicMock(
+            side_effect=lambda layer_idx: layer_idx + 1)
+        metadata = self._make_metadata(uniform_manager)
+
+        metadata.prepare()
+        metadata.kv_cache_manager = layer_specific_manager
+        metadata.prepare()
+
+        self.assertIsNone(metadata.block_ids_per_seq)
+        uniform_manager.get_batch_cache_indices.assert_called_once_with([11])
+        layer_specific_manager.get_batch_cache_indices.assert_not_called()
+        self.assertEqual(
+            layer_specific_manager.get_layer_page_index_scale.call_count, 2)
+
+    def test_single_pool_cache_indices_remain_prepared_once(self) -> None:
         manager = MagicMock()
         manager.is_vswa = False
         manager.is_linear_attention = False
         manager.num_pools = 1
         manager.get_layer_page_index_scale = None
         manager.get_batch_cache_indices.return_value = [[7]]
-        metadata = object.__new__(VanillaAttentionMetadata)
-        metadata.kv_cache_manager = manager
-        metadata.request_ids = [11]
+        metadata = self._make_metadata(manager)
 
         metadata.prepare()
         attention = VanillaAttention(layer_idx=3,
@@ -194,7 +233,6 @@ class TestVanillaAttention(unittest.TestCase):
 
         self.assertEqual(attention._get_block_ids_per_seq(metadata), [[7]])
         manager.get_batch_cache_indices.assert_called_once_with([11])
-        mock_prepare.assert_called_once_with()
 
     def test_layer_specific_cache_indices_follow_attention_layer(self) -> None:
         events = []
