@@ -108,11 +108,32 @@ def launch_multimodal_encoder_pd_llm(
     """Launch separate encoder and combined prefill/decode llmapi instances."""
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "1"}))
-        thread_pool = stack.enter_context(MyThreadPoolExecutor(max_workers=max_workers))
         encoder = MultimodalEncoder(model=model_name, **encoder_llm_config)
         pd_llm = LLM(model=model_name, **pd_llm_config)
-        with encoder, pd_llm:
-            yield _MultimodalEncoderPDAdapter(encoder, pd_llm, thread_pool)
+
+        # Teardown order matters here (nvbugs/6327718). Everything goes on the
+        # one ExitStack, entered LLMs-first and pool-last, so unwinding runs:
+        #     thread_pool -> pd_llm -> encoder -> env patch
+        # i.e. the pool is fully drained before either proxy shuts down.
+        #
+        # The previous form entered the pool on the stack but wrapped the LLMs
+        # in a nested `with encoder, pd_llm:`. Being inner, that nested block
+        # always unwound FIRST, so the pool outlived both LLMs. When a worker
+        # died mid-run, generate_async().result() raised, the nested `with`
+        # tore down each proxy, and proxy.shutdown() -> ZeroMqQueue.close() ran
+        # socket.close()/context.term() while this pool's threads were still
+        # inside proxy.submit() -> ipc.py _send_data() -> socket.send() on those
+        # same sockets. Destroying a ZMQ socket under a live sender trips
+        # libzmq's signaler.cpp assert -> abort(), which CI reports as the
+        # opaque "Test terminated unexpectedly".
+        #
+        # MyThreadPoolExecutor.__exit__ cancels rather than waits on the
+        # exception path, so draining first cannot deadlock on futures blocked
+        # against an already-dead engine.
+        stack.enter_context(encoder)
+        stack.enter_context(pd_llm)
+        thread_pool = stack.enter_context(MyThreadPoolExecutor(max_workers=max_workers))
+        yield _MultimodalEncoderPDAdapter(encoder, pd_llm, thread_pool)
 
 
 @dataclass(frozen=True)
@@ -225,6 +246,12 @@ class EPDVariant:
             ),
             max_batch_size=128,
             expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+            # A/B arm 2 (nvbugs/6327718): arm 1 was the teardown-ordering fix
+            # alone at the default 128 workers, which measured 1 failure in 482
+            # reps (build 54455). This adds the same cap nano_omni_fp8 carries,
+            # to see whether the residual - a hang from the dispatcher thread
+            # proxy.py leaks, which the test cannot reach - also drops.
+            max_workers=16,
         )
 
 
@@ -269,6 +296,13 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(80000)
+    # TEMPORARY (NVBUG-6327718): repetition parameter used only to measure the
+    # `Test terminated unexpectedly` rate against the proxy-shutdown fix in this
+    # branch. Sized for statistical power: the pre-fix nvfp4 rate is ~1.24%
+    # (14 native aborts / 1133 runs over 14 days in OpenSearch), so ~250 reps
+    # give p<0.05 and 500 give p<0.01 for a "zero aborts" result. Revert before
+    # merge; the reps carry no functional coverage of their own.
+    @pytest.mark.parametrize("_repeat", range(560, 1060), ids=lambda i: f"rep{i:02d}")
     @pytest.mark.parametrize(
         "variant",
         [
@@ -287,7 +321,7 @@ class TestVideoMMEEPD(LlmapiAccuracyTestHarness):
     )
     # `torch.compile` uses a thread pool to compile and it's used in audio pre-processing.
     @pytest.mark.threadleak(enabled=False)
-    def test_disaggregated_videomme(self, variant: EPDVariant) -> None:
+    def test_disaggregated_videomme(self, variant: EPDVariant, _repeat: int) -> None:
         """Run VideoMME shard through a model-specific llmapi E/PD config."""
         with self._launch_epd(variant) as llm:
             self._run_videomme(llm, variant)
