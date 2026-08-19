@@ -26,6 +26,7 @@ from tensorrt_llm._torch.auto_deploy.llm_args import \
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
@@ -65,7 +66,6 @@ from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 
 from .test_llm import llama_model_path
@@ -266,45 +266,17 @@ model_kwargs:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
 class TestEncoderRuntimeSizes:
-    """Cover encoder runtime size fields and fallback to LLM limits.
+    """Cover encoder runtime size fields.
 
-    `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
-    knobs that size multimodal encoder AttentionMetadata; when unset they
-    fall back to the LLM-side `max_batch_size` / `max_num_tokens`. They are
-    PyTorch-backend only (the multimodal encoder profiling path), so they
-    live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
+    `encoder_max_num_tokens` is the user-facing multimodal encoder scheduling
+    and AttentionMetadata budget. It is PyTorch-backend only, so it lives on
+    `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
     """
 
     def test_defaults_are_none(self, llm_args_cls):
         llm_args = llm_args_cls(model=llama_model_path)
         assert llm_args.encoder_max_batch_size is None
         assert llm_args.encoder_max_num_tokens is None
-
-    @pytest.mark.parametrize(
-        "kwargs, expected_runtime_sizes",
-        [
-            # Neither encoder knob set -- falls back to LLM limits.
-            (dict(max_batch_size=64, max_num_tokens=2048), (64, 2048)),
-            # Only encoder_max_batch_size overrides.
-            (dict(max_batch_size=64,
-                  max_num_tokens=2048,
-                  encoder_max_batch_size=512), (512, 2048)),
-            # Only encoder_max_num_tokens overrides.
-            (dict(max_batch_size=64,
-                  max_num_tokens=2048,
-                  encoder_max_num_tokens=32768), (64, 32768)),
-            # Both encoder knobs override.
-            (dict(max_batch_size=64,
-                  max_num_tokens=2048,
-                  encoder_max_batch_size=512,
-                  encoder_max_num_tokens=32768), (512, 32768)),
-        ],
-        ids=["fallback", "only_batch", "only_tokens", "both"],
-    )
-    def test_get_encoder_runtime_sizes(self, llm_args_cls, kwargs,
-                                       expected_runtime_sizes):
-        llm_args = llm_args_cls(model=llama_model_path, **kwargs)
-        assert llm_args.get_encoder_runtime_sizes() == expected_runtime_sizes
 
     @pytest.mark.parametrize(
         "field_name, invalid_value",
@@ -319,6 +291,19 @@ class TestEncoderRuntimeSizes:
                                   invalid_value):
         with pytest.raises(ValidationError):
             llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
+
+
+class TestEagerEncoderSchedulingCompatibility:
+    """Args parsing defers capability-dependent EAGER checks until model load."""
+
+    def test_eager_feature_combinations_are_deferred_until_model_load(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            enable_attention_dp=True,
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+            multimodal_config=MultimodalConfig(
+                encoder_scheduling_policy="EAGER"))
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
 
 
 @pytest.mark.cpu_only
@@ -719,11 +704,68 @@ class TestKvCacheManagerV2AutoResolution:
             "Qwen3_5ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
         )
         for architecture in architectures:
             model_cls = get_registered_model_class(architecture)
             assert model_cls is not None
             assert model_cls.get_preferred_kv_cache_manager_version() == "V2"
+
+    def test_registered_models_keep_v2_on_nixl(self):
+        """Models preferring V2 and the Python transceiver keep V2 on NIXL.
+
+        Both sentinels start at 'auto'; production resolves the transceiver
+        runtime first, then the KV cache manager. MiniMax-M2 is absent from
+        this list: it silently resolves to V1 on this route (its
+        disaggregated serving is unvalidated -- the missing preference is
+        deliberate).
+        """
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+
+        architectures = (
+            "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "GptOssForCausalLM",
+            "KimiK25ForConditionalGeneration",
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "DeepseekV4ForCausalLM",
+            "MiniMaxM3SparseForCausalLM",
+            "MiniMaxM3SparseForConditionalGeneration",
+            "Gemma3ForCausalLM",
+            "Gemma3ForConditionalGeneration",
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+            "Gemma4UnifiedForConditionalGeneration",
+        )
+        for architecture in architectures:
+            model_cls = get_registered_model_class(architecture)
+            assert model_cls is not None, architecture
+
+            llm_args = TorchLlmArgs(
+                model="/tmp/dummy_model",
+                cache_transceiver_config=CacheTransceiverConfig(
+                    backend="NIXL", transceiver_runtime="auto"),
+            )
+            _resolve_transceiver_runtime_auto(llm_args, model_cls)
+            assert _resolve_kv_cache_manager_v2_auto(
+                llm_args, model_cls) is True, architecture
+            assert (llm_args.cache_transceiver_config.transceiver_runtime ==
+                    "PYTHON"), architecture
 
 
 @pytest.mark.cpu_only
@@ -1040,6 +1082,7 @@ class TestMultimodalConfig:
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
+        assert MultimodalConfig().encoder_scheduling_policy == "DEFAULT"
         assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
@@ -1048,6 +1091,7 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
+        assert args.multimodal_config.encoder_scheduling_policy == "DEFAULT"
         assert args.multimodal_config.video_pruning_rate is None
 
     @pytest.mark.parametrize(
@@ -1077,6 +1121,12 @@ class TestMultimodalConfig:
                                 encoder_side_stream_max_ahead=2, ))
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
+
+    def test_torch_llm_args_with_eager_encoder_scheduling(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            multimodal_config=MultimodalConfig(
+                                encoder_scheduling_policy="EAGER"))
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
         args = TorchLlmArgs(
@@ -1116,10 +1166,12 @@ class TestMultimodalConfig:
             multimodal_config={
                 "encoder_side_stream_max_ahead": 2,
                 "encoder_cache_max_bytes": 0,
+                "encoder_scheduling_policy": "EAGER",
                 "video_pruning_rate": 0.5,
             },
         )
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+        assert args.multimodal_config.encoder_scheduling_policy == "EAGER"
         assert args.multimodal_config.video_pruning_rate == 0.5
 
     def test_encoder_cuda_graph_and_side_stream_max_ahead_are_exclusive(self):
