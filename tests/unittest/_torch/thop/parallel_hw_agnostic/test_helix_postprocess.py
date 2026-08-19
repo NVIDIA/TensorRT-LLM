@@ -20,7 +20,7 @@ import torch
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._torch.modules.attention import _helix_sanitize_empty_kv, _helix_zero_kv_mask
+from tensorrt_llm._torch.attention.attention import _helix_sanitize_empty_kv, _helix_zero_kv_mask
 
 
 class _FakeAttnMetadata:

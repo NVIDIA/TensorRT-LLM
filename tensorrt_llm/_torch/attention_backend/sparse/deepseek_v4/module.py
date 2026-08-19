@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType, AttentionMetadata
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.multi_stream_utils import (
@@ -17,7 +18,6 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
     maybe_execute_in_parallel,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
@@ -26,8 +26,8 @@ from ..params import SparseBackendForwardArgs
 from .flash_mla import DeepSeekV4FlashMLA
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention.mla import MLA
     from tensorrt_llm._torch.distributed import AllReduceParams
-    from tensorrt_llm._torch.modules.mla import MLA
 
 _q_b_proj_cute_dsl_import_ok: Optional[bool] = None
 
@@ -355,7 +355,7 @@ def project_sparse_attn_output(
             o_lora.transpose(0, 1),
         )
     elif self.o_a_proj.dtype == torch.float8_e4m3fn:
-        from tensorrt_llm._torch.modules.mla import fp8_block_scaling_bmm_out
+        from tensorrt_llm._torch.attention.mla import fp8_block_scaling_bmm_out
 
         fp8_block_scaling_bmm_out(
             attn_output_tensor.view(num_tokens, self.n_local_groups, -1),

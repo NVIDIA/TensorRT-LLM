@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
@@ -41,7 +42,6 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa.module import \
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
                                  torch_dtype_to_str)
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils

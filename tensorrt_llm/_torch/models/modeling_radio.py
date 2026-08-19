@@ -16,6 +16,7 @@ from einops import rearrange
 from transformers import PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch import model_config as model_config_lib
+from tensorrt_llm._torch.attention import attention as trtllm_attention
 from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
@@ -26,7 +27,6 @@ from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
     MultimodalEncoderGraphRunner)
-from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 from tensorrt_llm._torch.utils import torch_compiling
 from tensorrt_llm._utils import prefer_pinned

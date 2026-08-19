@@ -395,7 +395,7 @@ accuracy_dict = {
 @pytest.mark.cpu_only
 def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
                                             monkeypatch):
-    import tensorrt_llm._torch.modules.mla as mla_module
+    import tensorrt_llm._torch.attention.mla as mla_module
 
     class FakeTrtllmAttention:
 

@@ -8,17 +8,17 @@ from transformers import Qwen3Config
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 
+from ..attention.attention import (maybe_allgather_for_helix_cp,
+                                   maybe_slice_for_helix_cp)
+from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.attention import (maybe_allgather_for_helix_cp,
-                                 maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
-from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from .modeling_speculative import SpecDecOneEngineForCausalLM

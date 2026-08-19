@@ -24,7 +24,7 @@ from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSABackendForwardArgs
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.modules.mla import MLA
+    from tensorrt_llm._torch.attention.mla import MLA
 
 try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
@@ -517,7 +517,7 @@ def forward_sparse_mla_kvcache_bf16(
         # [num_heads, num_tokens, self.kv_lora_rank]
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        from tensorrt_llm._torch.modules.mla import fp8_block_scaling_bmm_out
+        from tensorrt_llm._torch.attention.mla import fp8_block_scaling_bmm_out
 
         fp8_block_scaling_bmm_out(
             q_nope,
@@ -586,7 +586,7 @@ def forward_sparse_mla_kvcache_bf16(
             attn_output.transpose(0, 1),
         )
     elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-        from tensorrt_llm._torch.modules.mla import fp8_block_scaling_bmm_out
+        from tensorrt_llm._torch.attention.mla import fp8_block_scaling_bmm_out
 
         fp8_block_scaling_bmm_out(
             attn_out_latent,

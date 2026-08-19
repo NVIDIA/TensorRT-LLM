@@ -52,7 +52,7 @@ from torch import nn
 from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
-from tensorrt_llm._torch.modules.attention import Attention
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 
 from configuration_mymodel import MyConfig
@@ -104,7 +104,7 @@ class MyModelForCausalLM(DecoderModelForCausalLM[MyModel, MyConfig]):
                          vocab_size=model_config.pretrained_config.vocab_size)
 ```
 
-Note that `MyAttention` inherits from our `Attention` module (in `tensorrt_llm/_torch/modules/attention.py`), so that the attention computation is compatible with our PyTorch runtime. Related to this, module inputs should also be adapted:
+Note that `MyAttention` inherits from our `Attention` module (in `tensorrt_llm/_torch/attention/attention.py`), so that the attention computation is compatible with our PyTorch runtime. Related to this, module inputs should also be adapted:
 
 - The `attn_metadata` stores the metadata from the batched input and KV cache for the attention backend. It is created by and passed from the runtime, and model developers need to ensure that `attn_metadata` is correctly passed to the attention module.
 - The input tensors (i.e., `input_ids`, `position_ids`, `hidden_states`) are in the packed mode. The first dimension corresponds to the number of tokens in a batch.
@@ -114,7 +114,7 @@ Additionally, `MyDecoderLayer`, `MyModel`, and `MyModelForCausalLM` are subclass
 Optionally, you may replace the native PyTorch modules with our implementations to enable features or achieve higher performance:
 - `Linear` (in `tensorrt_llm/_torch/modules/linear.py`): Enables tensor parallelism and quantization.
 - `Embedding` (in `tensorrt_llm/_torch/modules/embedding.py`): Enables tensor parallelism for embedding.
-- `RotaryEmbedding` (in `tensorrt_llm/_torch/modules/rotary_embedding.py`): Enables performant rotary embedding.
+- `RotaryEmbedding` (in `tensorrt_llm/_torch/attention/rotary_embedding.py`): Enables performant rotary embedding.
 - `RMSNorm` (in `tensorrt_llm/_torch/modules/rms_norm.py`): Enables performant RMS norm.
 
 For a concrete reference, check out `tensorrt_llm/_torch/models/modeling_llama.py`.

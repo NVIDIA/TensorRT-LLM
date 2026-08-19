@@ -4,8 +4,8 @@
 
 This guide covers the TRT-LLM PyTorch attention stack:
 
-- `tensorrt_llm/_torch/modules/attention.py`
-- `tensorrt_llm/_torch/modules/mla.py`
+- `tensorrt_llm/_torch/attention/attention.py`
+- `tensorrt_llm/_torch/attention/mla.py`
 - `tensorrt_llm/_torch/attention_backend/`
 - `tensorrt_llm/_torch/attention_backend/sparse/`
 
@@ -475,8 +475,8 @@ Working rules:
 
 | File | Role |
 |------|------|
-| `tensorrt_llm/_torch/modules/attention.py` | Standard attention module logic and shared Helix CP helpers |
-| `tensorrt_llm/_torch/modules/mla.py` | MLA module logic, MLA custom ops, and MLA-specific dispatch |
+| `tensorrt_llm/_torch/attention/attention.py` | Standard attention module logic and shared Helix CP helpers |
+| `tensorrt_llm/_torch/attention/mla.py` | MLA module logic, MLA custom ops, and MLA-specific dispatch |
 | `tensorrt_llm/_torch/attention_backend/interface.py` | Backend contract, base metadata, capability hooks |
 | `tensorrt_llm/_torch/attention_backend/utils.py` | Backend and sparse-backend selection |
 | `tensorrt_llm/_torch/attention_backend/trtllm.py` | TRTLLM backend execution and metadata |

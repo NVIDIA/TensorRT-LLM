@@ -7,9 +7,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.flashinfer_utils import get_sparse_mla_op
-from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 

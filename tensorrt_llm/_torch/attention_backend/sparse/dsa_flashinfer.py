@@ -7,7 +7,7 @@ import math
 
 import torch
 
-from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
+from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 
 from ..interface import AttentionForwardArgs, AttentionInputType
 from . import inline_scale_kv

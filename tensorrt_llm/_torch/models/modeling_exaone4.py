@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from transformers import Exaone4Config
 
-from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
+from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.quantization import QuantAlgo
 

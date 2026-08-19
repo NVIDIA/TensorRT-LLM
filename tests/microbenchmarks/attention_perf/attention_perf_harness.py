@@ -400,7 +400,7 @@ def _make_qkv(case: AttnCase, device: torch.device):
 
     TrtllmAttention's context path requires fused QKV (separate q/k/v is only
     allowed with SageAttention; see attentionOp.cpp). This mirrors
-    modules/attention.py's ``torch.concat([q, k, v], dim=-1)``; k/v are passed
+    attention/attention.py's ``torch.concat([q, k, v], dim=-1)``; k/v are passed
     as None and forward splits the fused tensor internally.
     """
     torch.manual_seed(case.seed)
@@ -640,7 +640,7 @@ def _build_dsa_mla_module(case: AttnCase, model_config, device: torch.device):
     Random-normal weights (std 0.02) are fine: the microbench measures kernel
     structure/time, not numerical correctness.
     """
-    from tensorrt_llm._torch.modules.mla import MLA
+    from tensorrt_llm._torch.attention.mla import MLA
 
     pos_embd_params, _ = _mla_pos_embd_and_scaling(case)
     mla = MLA(

@@ -19,6 +19,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
     Qwen2VisionTransformerPretrainedModel
 
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
@@ -26,7 +27,6 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -67,8 +67,8 @@ except ImportError:
 
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
+from ..attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from ..modules.gated_mlp import GatedMLP
-from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin

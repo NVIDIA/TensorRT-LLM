@@ -41,12 +41,12 @@ from transformers import T5Config
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 
+from ..attention.attention import Attention
+from ..attention.cross_attention import CrossAttention
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, PredefinedAttentionMask
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
-from ..modules.cross_attention import CrossAttention
 from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode

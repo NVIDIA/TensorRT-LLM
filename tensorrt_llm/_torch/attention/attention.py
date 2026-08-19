@@ -22,14 +22,15 @@ from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
+from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
+                              WeightsLoadingConfig,
+                              is_static_nvfp4_input_eligible)
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..pyexecutor.breakable_cuda_graph import (eager_on_graph,
                                                is_in_breakable_cuda_graph)
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling)
-from .linear import (Linear, TensorParallelMode, WeightMode,
-                     WeightsLoadingConfig, is_static_nvfp4_input_eligible)
-from .multi_stream_utils import maybe_execute_in_parallel
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
 

@@ -72,7 +72,7 @@ grep -r "TrtllmAttention\|create_attention\|scaled_dot_product" tensorrt_llm/_to
 grep -r "maybe_compile\|maybe_compiled_" tensorrt_llm/_torch/utils.py
 
 # Before writing a custom RoPE
-grep -r "RotaryEmbedding\|rotary_emb\|rope" tensorrt_llm/_torch/modules/
+grep -r "RotaryEmbedding\|rotary_emb\|rope" tensorrt_llm/_torch/attention/ tensorrt_llm/_torch/modules/
 
 # Before writing a new cache management pattern
 grep -r "mla_rope_append_paged_kv\|append_paged_kv" tensorrt_llm/_torch/
@@ -82,7 +82,7 @@ grep -r "mla_rope_append_paged_kv\|append_paged_kv" tensorrt_llm/_torch/
 
 ```
 # Find all forward methods in a class
-grep -n "def forward" tensorrt_llm/_torch/modules/attention.py
+grep -n "def forward" tensorrt_llm/_torch/attention/attention.py
 # Then READ each one to understand what it does
 ```
 
