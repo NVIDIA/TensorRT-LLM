@@ -689,6 +689,67 @@ class TestBackgroundReporterOptOut:
 
         send.assert_not_called()
 
+    def test_opt_out_after_initial_claim_cancels_delivery(
+        self, monkeypatch, enable_telemetry
+    ):
+        """Opt-out between claiming and sending the initial event wins."""
+        assert usage_lib.apply_usage_session_config()
+        session = usage_lib._SESSION
+        claimed = threading.Event()
+        resume = threading.Event()
+        original_claim = session.claim_initial
+
+        def claim_then_pause():
+            result = original_claim()
+            claimed.set()
+            resume.wait(timeout=5)
+            return result
+
+        monkeypatch.setattr(session, "claim_initial", claim_then_pause)
+        with patch.object(usage_lib, "_send_to_gxt") as send:
+            reporter = threading.Thread(
+                target=usage_lib._background_reporter,
+                args=(None, None, ""),
+            )
+            reporter.start()
+            assert claimed.wait(timeout=5)
+            usage_lib._deactivate_usage_session()
+            resume.set()
+            reporter.join(timeout=5)
+
+        assert not reporter.is_alive()
+        send.assert_not_called()
+
+    def test_opt_out_before_heartbeat_cancels_delivery(self, enable_telemetry):
+        """A heartbeat prepared before late opt-out is not delivered afterward."""
+        assert usage_lib.apply_usage_session_config()
+
+        class _OptOutBeforeHeartbeat:
+            def __init__(self):
+                self.wait_count = 0
+
+            def wait(self, timeout):
+                del timeout
+                self.wait_count += 1
+                if self.wait_count == 1:
+                    usage_lib._deactivate_usage_session()
+                    return False
+                return True
+
+            def set(self):
+                pass
+
+        sent = []
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib, "_REPORTER_STOP", _OptOutBeforeHeartbeat()),
+        ):
+            usage_lib._background_reporter(None, None, "")
+
+        assert [payload["events"][0]["name"] for payload in sent] == [
+            "trtllm_initial_report"
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Concurrent reporter start test
@@ -999,7 +1060,7 @@ class TestProcessTelemetrySession:
                 telemetry_config=telemetry_config,
             )
 
-        payload = thread_cls.call_args.kwargs["args"][0]
+        _, payload, _ = thread_cls.call_args.kwargs["args"]
         event = payload["events"][0]
         assert payload["sessionId"] == session_id
         assert event["name"] == "trtllm_exit_report"
@@ -1157,6 +1218,34 @@ class TestProcessTelemetrySession:
         assert len(sent) == 1
         assert usage_lib._PENDING_TERMINAL is None
         assert usage_lib._REPORTER_ACTIVE is False
+
+    def test_opt_out_cancels_queued_terminal_and_releases_waiter(
+        self, monkeypatch, enable_telemetry
+    ):
+        """Late opt-out clears queued terminal work and wakes its waiter."""
+        self._reset_session(monkeypatch)
+        monkeypatch.setattr(usage_lib, "_TERMINAL_FLUSH_TIMEOUT", 0)
+        assert usage_lib.apply_usage_session_config()
+        usage_lib._REPORTER_ACTIVE = True
+
+        with patch.object(usage_lib, "_send_to_gxt") as send:
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    exit_code_known=True,
+                    exit_code=1,
+                )
+            )
+            pending = usage_lib._PENDING_TERMINAL
+            assert pending is not None
+            assert not pending.completion.is_set()
+
+            usage_lib._deactivate_usage_session()
+            assert pending.completion.is_set()
+            assert usage_lib._PENDING_TERMINAL is None
+            usage_lib._finish_background_reporter()
+
+        send.assert_not_called()
 
     def test_concurrent_terminal_calls_send_once(self, monkeypatch, enable_telemetry):
         """Racing shutdown paths still produce one terminal event."""
