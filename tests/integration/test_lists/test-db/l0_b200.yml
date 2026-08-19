@@ -130,6 +130,9 @@ l0_b200:
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/modules/fused_moe/test_deepgemm_fused_expand_quant.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/modules/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
   - unittest/_torch/modules/moe/test_megamoe_streaming_load.py
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/modules/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
