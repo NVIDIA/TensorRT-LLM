@@ -376,14 +376,11 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(MULTI_GPU_FILE_CHANGED)] = false
         testFilter[(ONLY_ONE_GROUP_CHANGED)] = ""
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = []
+        pipeline.echo("CBTS is skipped for the infrastructure dry run.")
     } else {
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-    }
-    if (testFilter[INFRA_DRY_RUN]) {
-        pipeline.echo("CBTS is skipped for the infrastructure dry run.")
-    } else {
         testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
         // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
         testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
