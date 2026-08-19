@@ -270,6 +270,7 @@ the mode but the request itself:
 | V2V — video-conditioned video | same | `input_reference` whose content is a video |
 | T2AV — video with synchronized audio | same | `extra_params: {"enable_audio": true}` |
 | T2I — text-to-image | `/v1/images/generations` | `extra_params: {"output_type": "image"}` |
+| Reasoner — chat | `/v1/chat/completions` | starting the server **without** `--visual_gen_args` |
 
 `input_reference` is classified by content, not by filename or field — image
 bytes route to I2V, video bytes to V2V. This section is the served analogue of
@@ -285,9 +286,9 @@ are shared with the offline examples:
 # 1 GPU (Nano or Super)
 trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
-# 4 GPU (Super): cfg_size=2 x ulysses_size=2 + parallel VAE.
-# trtllm-serve spawns the workers itself; do not wrap it in torchrun/mpirun.
+# 4 GPU / 8 GPU (Super): trtllm-serve spawns the workers itself, no torchrun/mpirun
 trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-4gpu.yaml
+trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-8gpu.yaml
 
 # 1 GPU text-to-image deployment: warms the 1024x1024 single-frame shape
 # instead of the omni video shape
@@ -421,6 +422,29 @@ curl -s -X POST "http://localhost:8000/v1/images/generations" \
 
 With the default `"response_format": "url"` the response carries a
 `/v1/images/{image_id}/content` URL to download instead.
+
+**Reasoner — chat**
+
+A Cosmos3 checkpoint holds two models: the **Reasoner** (a Qwen3-VL-based VLM)
+and the **Generator** (video / image diffusion). `--visual_gen_args` selects
+which one `trtllm-serve` loads — omit it to serve the Reasoner:
+
+```bash
+trtllm-serve nvidia/Cosmos3-Nano --port 8000
+```
+
+```bash
+curl -X POST "http://localhost:8000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Cosmos3-Nano",
+    "messages": [{"role": "user", "content": "Describe what a robot arm does."}],
+    "max_tokens": 60
+  }'
+```
+
+The two are mutually exclusive: a Reasoner server returns 404 on `/v1/videos/*`
+and `/v1/images/*`, and a generation server has no `/v1/chat/completions`.
 
 ### Notes
 
