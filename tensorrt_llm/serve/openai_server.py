@@ -6,7 +6,6 @@ import functools
 import json
 import os
 import re
-import secrets
 import signal
 import socket
 import sys
@@ -28,7 +27,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
 from fastapi.routing import APIRoute
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
@@ -104,6 +102,7 @@ from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
+from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -133,8 +132,6 @@ def _is_visual_gen_instance(obj) -> bool:
     return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 # yapf: enable
-
-_RL_CONTROL_BEARER = HTTPBearer(auto_error=False)
 
 # msgspec msgpack is an opt-in transport for the disagg orchestrator->worker
 # request body: the large agentic chat body otherwise blocks the serving event
@@ -1175,23 +1172,14 @@ class OpenAIServer(_VideoRoutesMixin):
                                self.openai_mm_encoder,
                                methods=["POST"])
 
-    async def _require_rl_control_auth(
-        self,
-        credentials: Annotated[Optional[HTTPAuthorizationCredentials],
-                               Depends(_RL_CONTROL_BEARER)],
-    ) -> None:
-        valid = (credentials is not None
-                 and credentials.scheme.lower() == "bearer"
-                 and self._rl_control_api_key is not None
-                 and secrets.compare_digest(
-                     credentials.credentials.encode("utf-8"),
-                     self._rl_control_api_key.encode("utf-8")))
-        if not valid:
-            raise HTTPException(
-                status_code=HTTPStatus.UNAUTHORIZED,
-                detail="Invalid RL control credentials",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+    async def _require_rl_control_auth(self, raw_request: Request) -> None:
+        body = await raw_request.body()
+        try:
+            validate_rl_control_request(self._rl_control_api_key, body,
+                                        raw_request.headers)
+        except ValueError as e:
+            raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED,
+                                detail=str(e)) from e
 
     def _register_rl_control_routes(self) -> None:
         if not self._enable_rl_control_endpoints:
