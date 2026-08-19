@@ -238,6 +238,7 @@ def create_test_backend(
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
     activation_type: ActivationType = ActivationType.Swiglu,
     n_shared_experts: int = 0,
+    use_fine_grained_sync: bool = False,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
@@ -264,6 +265,7 @@ def create_test_backend(
         quant_config=quant_config,
         mapping=mapping,
         moe_backend=moe_backend_value,
+        use_fine_grained_sync=use_fine_grained_sync,
     )
     if n_shared_experts > 0:
         # The shared-expert-fusion gate runs after the eager create_weights()
@@ -2072,3 +2074,97 @@ def test_trtllm_fp8_block_scales_fuse_shared_expert_layout(monkeypatch: pytest.M
                 backend.w2_weight_scaling_factor.data[slot],
                 down.weight_scale.data[:, scale_rows],
             )
+
+
+
+
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+def test_moe_backend_trtllm_nvfp4_fine_grained(num_tokens: int):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    sm_version = get_sm_version()
+    if sm_version != 107:
+        pytest.skip(f"fine-grained sync requires SM107, got SM{sm_version}")
+
+    dtype_activation = torch.bfloat16
+    backend_type = MoeBackendType.TRTLLM
+    quant_algo = QuantAlgo.NVFP4
+    activation_type = ActivationType.Relu2
+
+    num_experts = 2048
+    top_k = 32
+    hidden_size = 1024
+    intermediate_size = 1024
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype_activation, device="cuda")
+        router_logits = torch.randn(
+            (num_tokens, num_experts), dtype=dtype_activation, device="cuda"
+        )
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype_activation,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            activation_type=activation_type,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype_activation,
+            quant_config=quant_config,
+            mapping=mapping,
+            activation_type=activation_type,
+            use_fine_grained_sync=True,
+        )
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            output = run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype_activation,
+                router_logits,
+            )
+
+            ref_fused_moe.check_accuracy(output, ref_output)

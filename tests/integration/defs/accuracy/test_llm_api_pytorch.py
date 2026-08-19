@@ -2768,6 +2768,47 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_rubin
+    @parametrize_with_ids("torch_compile", [False])
+    @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, False, False, False),
+                           (True, False, True, True), (True, True, True, True)])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("moe_backend", ["TRTLLM"])
+    @parametrize_with_ids("enable_autotuner", [False, True])
+    def test_nvfp4_fine_grained_sync(self, fp8kv, attention_dp, cuda_graph,
+                                overlap_scheduler, torch_compile, mtp_nextn,
+                                moe_backend, nvfp4_gemm_backend,
+                                enable_autotuner):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        torch_compile_config = _get_default_torch_compile_config(torch_compile)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            torch_compile_config=torch_compile_config,
+            moe_config=MoeConfig(backend=moe_backend))
+        if nvfp4_gemm_backend is not None:
+            pytorch_config['nvfp4_gemm_config'] = Nvfp4GemmConfig(
+                allowed_backends=[nvfp4_gemm_backend])
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        with LLM(f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 enable_autotuner=enable_autotuner,
+                 use_fine_grained_sync=True,
+                 speculative_config=mtp_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @parametrize_with_ids(
         "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
         [(False, False, False, False),
@@ -5378,6 +5419,57 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_rubin
+    @pytest.mark.parametrize("enable_autotuner", [False, True],
+                             ids=["no_autotuner", "autotuner"])
+    @pytest.mark.parametrize("activation_dtype", ["mxfp8"], ids=["mxfp8"])
+    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
+        (False, False),
+        (True, True),
+    ])
+    def test_w4a8_mxfp4_fine_grained_sync(self, enable_autotuner, activation_dtype,
+                                     cuda_graph, overlap_scheduler):
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend="TRTLLM"))
+
+        with LLM(
+                f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a8_mxfp4_{activation_dtype}_kv_none_hf_moeonly",
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                moe_expert_parallel_size=1,
+                **pytorch_config,
+                enable_autotuner=enable_autotuner,
+                use_fine_grained_sync=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_rubin
+    @pytest.mark.parametrize("enable_autotuner", [False, True],
+                             ids=["no_autotuner", "autotuner"])
+    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
+        (False, False),
+        (True, True),
+    ])
+    def test_w4a16_mxfp4_fine_grained_sync(self, enable_autotuner, cuda_graph,
+                                      overlap_scheduler):
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend="TRTLLM"))
+
+        with LLM(
+                f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a16_mxfp4_kv_none_hf_moeonly",
+                tensor_parallel_size=1,
+                pipeline_parallel_size=1,
+                moe_expert_parallel_size=1,
+                **pytorch_config,
+                enable_autotuner=enable_autotuner,
+                use_fine_grained_sync=True) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-235B-A22B"
@@ -5977,6 +6069,39 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "a preempted request lost prompt content that it recalls "
             f"uncontended: {missing_con} -- possible KV corruption across "
             f"suspend/resume; common_prefix_tokens={prefixes}")
+    @skip_pre_rubin
+    @pytest.mark.parametrize("enable_autotuner", [False, True],
+                             ids=["no_autotuner", "autotuner"])
+    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
+        (False, False),
+        (True, True),
+    ])
+    def test_w4_1gpu_fine_grained_sync(self, enable_autotuner, cuda_graph,
+                                  overlap_scheduler, mocker):
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend="TRTLLM"))
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=1,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=720,
+                 **pytorch_config,
+                 enable_autotuner=enable_autotuner,
+                 use_fine_grained_sync=True) as llm:
+            model_name = "GPT-OSS/20B-MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
     def test_dummy_load_format(self):
         llm = LLM(
