@@ -2549,6 +2549,56 @@ def cbtsResizeSplits(configs) {
     return resized
 }
 
+// CBTS Layer 2: replace the normal stage set with the selector's affected
+// stages while retaining the baseline sanity and multi-GPU gates.
+def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter) {
+    def cbts = testFilter[(CBTS_RESULT)]
+    if (cbts == null) {
+        return parallelJobsFiltered
+    }
+
+    // cbtsResizeSplits renames only narrowed stages (those in
+    // affected_stage_split_counts) to `-cbts`; affected-but-not-narrowed
+    // stages keep their original name, so match each per its actual key.
+    def stageSuffix = cbts.cbts_test_db_artifact_path ? CBTS_STAGE_SUFFIX : ""
+    def narrowed = (cbts.affected_stage_split_counts ?: [:]).keySet()
+    def affectedSet = (cbts.affected_stages ?: []).collect {
+        (stageSuffix && narrowed.contains(it)) ? (it + stageSuffix) : it
+    } as Set
+    def needsSanity = cbts.sanity_required
+    def needsPerfSanity = cbts.perfsanity_required
+    def filtered = parallelJobs.findAll { key, _ ->
+        if (key.contains("-OnDemand-")) {
+            return false
+        }
+        if (key =~ /Post-Merge/) return affectedSet.contains(key)
+        return affectedSet.contains(key) ||
+               (needsSanity && key =~ /PackageSanityCheck/) ||
+               (needsPerfSanity && key =~ /PerfSanity/)
+    }
+    if (affectedSet.isEmpty()) {
+        if (filtered.isEmpty()) {
+            echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
+        } else {
+            echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
+                 "${filtered.size()} force-kept stage(s) only"
+        }
+    } else if (filtered) {
+        echo "CBTS [${cbts.scope}]: limiting to ${filtered.size()} stages " +
+             "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
+    } else {
+        echo "CBTS [${cbts.scope}]: empty stage set after filtering"
+    }
+
+    // The coverage tier omits multi-GPU; re-add it under the baseline gate.
+    if (cbts.enable_multi_gpu && testFilter[(MULTI_GPU_FILE_CHANGED)]) {
+        filtered += multiGpuJobs
+        echo "CBTS [${cbts.scope}]: multi-GPU file changed → running " +
+             "${multiGpuJobs.size()} multi-GPU stage(s) at baseline"
+    }
+    return filtered
+}
+
 // True when an exception indicates the K8s dispatcher pod this SLURM stage runs
 // inside died mid-run -- kubelet eviction, container termination, or the JNLP
 // agent otherwise going offline. Retrying inside such a pod is futile (every
@@ -6539,41 +6589,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         checkStageNameSet(testFilter[(EXTRA_STAGE_LIST)], fullSet, EXTRA_STAGE_LIST)
     }
 
-    // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
-    // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
-    // perfsanity_required). Pure -Perf- stages run only when CBTS selects them
-    // (present in affected_stages). Post-Merge stages are never force-kept;
-    // they only run when explicitly listed in affected_stages.
-    def cbts = testFilter[(CBTS_RESULT)]
-    if (cbts != null) {
-        // Match the -cbts rename cbtsResizeSplits applies to narrowed stages.
-        def stageSuffix = cbts.cbts_test_db_artifact_path ? CBTS_STAGE_SUFFIX : ""
-        def affectedSet = (cbts.affected_stages ?: []).collect { it + stageSuffix } as Set
-        def needsSanity = cbts.sanity_required
-        def needsPerfSanity = cbts.perfsanity_required
-        parallelJobsFiltered = parallelJobs.findAll { key, _ ->
-            if (key.contains("-OnDemand-")) {
-                return false
-            }
-            if (key =~ /Post-Merge/) return affectedSet.contains(key)
-            return affectedSet.contains(key) ||
-                   (needsSanity && key =~ /PackageSanityCheck/) ||
-                   (needsPerfSanity && key =~ /PerfSanity/)
-        }
-        if (affectedSet.isEmpty()) {
-            if (parallelJobsFiltered.isEmpty()) {
-                echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
-            } else {
-                echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
-                     "${parallelJobsFiltered.size()} force-kept stage(s) only"
-            }
-        } else if (parallelJobsFiltered) {
-            echo "CBTS [${cbts.scope}]: limiting to ${parallelJobsFiltered.size()} stages " +
-                 "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
-        } else {
-            echo "CBTS [${cbts.scope}]: empty stage set after filtering"
-        }
-    }
+    parallelJobsFiltered = filterCbtsStageJobs(
+        parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
 
     if (globalVars[RUN_MODE] == "nightly_release") {
         parallelJobsFiltered = sanityCheckJobs

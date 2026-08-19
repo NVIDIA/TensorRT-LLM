@@ -7,7 +7,6 @@ from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
-from .fused_moe_wide_ep import WideEPMoE
 from .impl_base import MoEImplBase
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import (MoeLoadBalancer,
@@ -61,5 +60,4 @@ __all__ = [
     "TritonFusedMoE",
     "TRTLLMGenFusedMoE",
     "VanillaMoE",
-    "WideEPMoE",
 ]
