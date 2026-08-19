@@ -21,6 +21,7 @@ except ImportError:
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import get_dflash_flash_attention, get_dflash_trtllm_gen_ops
 from ..speculative.interface import SpeculativeDecodingMode
+from .modeling_speculative import dspark_markov_chain_logits
 from .modeling_utils import get_model_architecture, register_draft_model
 
 
@@ -49,69 +50,6 @@ def dspark_layer_window_size(
     ):
         return (-1, -1)
     return (swa_window - 1, swa_window - 1)
-
-
-def dspark_markov_step_bias(
-    prev_tokens: torch.Tensor, markov_w1: torch.Tensor, markov_w2: torch.Tensor
-) -> torch.Tensor:
-    """Vanilla Markov head logit bias for one intra-block draft step.
-
-    Reference: DeepSpec ``VanillaMarkov`` (deepspec/modeling/dspark/
-    markov_head.py): ``bias = markov_w2(markov_w1(prev_token))`` where
-    markov_w1 is nn.Embedding(vocab, rank) and markov_w2 is
-    nn.Linear(rank, vocab, bias=False). With both weights stored
-    [vocab, rank] this is ``markov_w1[prev] @ markov_w2.T``.
-
-    Args:
-        prev_tokens: [B] long, previous token per request (draft vocab).
-        markov_w1: [vocab, rank].
-        markov_w2: [vocab_or_shard, rank] (rows may be a TP vocab shard).
-    Returns:
-        [B, vocab_or_shard] bias in the markov weights' dtype.
-    """
-    return F.linear(F.embedding(prev_tokens, markov_w1), markov_w2)
-
-
-def dspark_markov_chain_logits(
-    base_logits: torch.Tensor,
-    first_prev_tokens: torch.Tensor,
-    markov_w1: torch.Tensor,
-    markov_w2: torch.Tensor,
-    argmax_fn=None,
-) -> torch.Tensor:
-    """Apply the vanilla Markov intra-block bias across a drafted block.
-
-    Reference: DeepSpec ``VanillaMarkov.sample_block_tokens`` at
-    temperature 0: for step i, ``logits_i += bias(prev_i)`` with
-    ``prev_0`` = the anchor token (last accepted token, block slot 0) and
-    ``prev_{i>0}`` = the greedy token from step i-1's *biased* logits.
-    llama.cpp PR #25173 implements the same greedy chain.
-
-    Args:
-        base_logits: [B, K, vocab_or_shard] shared-lm_head logits.
-        first_prev_tokens: [B] long, anchor token ids (draft vocab).
-        markov_w1 / markov_w2: see :func:`dspark_markov_step_bias`.
-        argmax_fn: callable([B, vocab_or_shard]) -> [B] token ids in the
-            full draft vocab; defaults to plain argmax. Workers pass a
-            TP-aware argmax when the draft logits are vocab-sharded.
-    Returns:
-        [B, K, vocab_or_shard] biased logits. Greedy per-position argmax of
-        the result reproduces the reference sampled chain exactly.
-    """
-    K = base_logits.shape[1]
-    if K == 0:
-        return base_logits
-    prev = first_prev_tokens.long()
-    steps = []
-    for i in range(K):
-        bias = dspark_markov_step_bias(prev, markov_w1, markov_w2)
-        step_logits = base_logits[:, i] + bias.to(base_logits.dtype)
-        steps.append(step_logits)
-        if argmax_fn is not None:
-            prev = argmax_fn(step_logits).long()
-        else:
-            prev = torch.argmax(step_logits, dim=-1)
-    return torch.stack(steps, dim=1)
 
 
 class DFlashForCausalLM(nn.Module):
@@ -393,7 +331,7 @@ class DFlashForCausalLM(nn.Module):
         """Apply the dspark vanilla-Markov intra-block bias to block logits.
 
         No-op (returns ``base_logits`` unchanged) for non-dspark drafters.
-        See :func:`dspark_markov_chain_logits` for the semantics; when
+        See :func:`dspark_markov_chain` for the semantics; when
         ``base_logits`` is a TP vocab shard, the caller must pass this
         rank's ``vocab_slice`` (to shard the markov_w2 rows identically)
         and an ``argmax_fn`` returning full-vocab token ids — DFlashWorker
