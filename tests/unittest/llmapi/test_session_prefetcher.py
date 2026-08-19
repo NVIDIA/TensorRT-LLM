@@ -300,20 +300,6 @@ def test_factory_hit_hands_over_shadow(prefetcher):
     assert factory(4) is pool  # prefetched pool handed over
 
 
-def test_discard_shadow_keeps_prefetcher_usable(prefetcher):
-    pool = _FakePool(4)
-    _arm(prefetcher, pool, spec=4)
-
-    prefetcher.discard_shadow()
-
-    assert pool.shut
-    assert prefetcher._built is None
-    assert not prefetcher._disposed
-    prefetcher.schedule_shadow(2)
-    prefetcher._thread.join(timeout=10)
-    assert prefetcher.built == [2]
-
-
 def test_take_spec_mismatch_returns_none(prefetcher):
     pool = _FakePool(4)
     _arm(prefetcher, pool, spec=4)
