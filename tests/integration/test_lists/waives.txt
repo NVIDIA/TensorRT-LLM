@@ -334,7 +334,6 @@ perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-fp4_8
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] SKIP (https://nvbugs/6581075)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6601537)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_gpt-oss-120b-fp4_8k1k_con1024_ctx1_tp1_gen1_tp4_eplb0_mtp0_ccb-NIXL] SKIP (https://nvbugs/6581075)
-perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con180_ctx3_dep4_gen1_dep32_eplb384_mtp3_ccb-NIXL] SKIP (https://nvbugs/6601537)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con4301_ctx12_dep4_gen1_dep8_eplb384_mtp1_ccb-NIXL] SKIP (https://nvbugs/6581075)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con666_ctx6_dep4_gen1_dep16_eplb384_mtp3_ccb-NIXL] SKIP (https://nvbugs/6581075)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_deepseek-v4-pro-fp4_8k1k_con8_ctx1_dep4_gen4_tep8_eplb0_mtp3_ccb-NIXL] SKIP (https://nvbugs/6601537)
