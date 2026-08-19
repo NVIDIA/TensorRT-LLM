@@ -32,6 +32,7 @@ import shutil
 import stat
 import time
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -207,7 +208,9 @@ def test_warm_noop_is_stable(sync_tree, tmp_path):
     assert_trees_equal(new_dir, old_dir)
 
 
-def test_rewrite_without_mtime_change_is_not_skipped(sync_tree, cold_backend, tmp_path):
+def test_rewrite_without_mtime_change_is_not_skipped(
+    sync_tree: Callable[..., None], cold_backend: str, tmp_path: Path
+) -> None:
     """A same-size rewrite that leaves the source mtime untouched must copy.
 
     Inode timestamps come from a coarse clock, so a file rewritten shortly
@@ -231,7 +234,9 @@ def test_rewrite_without_mtime_change_is_not_skipped(sync_tree, cold_backend, tm
     assert (new_dir / "mod.py").read_bytes() == b"def f():\n    return 99\n"
 
 
-def test_settled_file_is_not_recopied(sync_tree, cold_backend, tmp_path):
+def test_settled_file_is_not_recopied(
+    sync_tree: Callable[..., None], cold_backend: str, tmp_path: Path
+) -> None:
     """A file whose mtime has aged out of the race window is left alone.
 
     Pins the incremental behaviour itself: the destination is diverged behind

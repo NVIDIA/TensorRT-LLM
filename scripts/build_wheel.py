@@ -626,7 +626,8 @@ def _tar_pipe_copy(src: Path, dst: Path) -> bool:
 _MTIME_RACE_WINDOW = 2.0
 
 
-def _demote_racy_mtime(dst_file, src_stat, now):
+def _demote_racy_mtime(dst_file: Path, src_stat: Optional[os.stat_result],
+                       now: float) -> None:
     """Break the mtime match for a copy whose source was just written.
 
     A copy normally records the source's mtime so the next sync can skip it.
@@ -645,7 +646,7 @@ def _demote_racy_mtime(dst_file, src_stat, now):
         pass
 
 
-def sync_tree(src, dst, exclude: Sequence[str] = ()):
+def sync_tree(src: Path, dst: Path, exclude: Sequence[str] = ()) -> None:
     """Mirror the src directory into dst, touching only what changed.
 
     Replaces the rmtree+copytree pattern for artifact copy-back: files are
@@ -665,10 +666,10 @@ def sync_tree(src, dst, exclude: Sequence[str] = ()):
     dst = Path(dst)
     now = time.time()
 
-    def excluded(name):
+    def excluded(name: str) -> bool:
         return any(fnmatch.fnmatch(name, pat) for pat in exclude)
 
-    def demote_racy_mtimes():
+    def demote_racy_mtimes() -> None:
         # A cold populate (tar or copytree) copies source mtimes verbatim, so
         # apply the same guard the incremental path applies per file. Walk the
         # source rather than the freshly written destination: the source is
