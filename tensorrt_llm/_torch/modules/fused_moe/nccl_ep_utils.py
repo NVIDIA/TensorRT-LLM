@@ -94,8 +94,23 @@ def _nccl_ep_supports_int32_topk_idx() -> bool:
     return True
 
 
+def _env_selects_high_throughput() -> bool:
+    """Read TRTLLM_NCCL_EP_ALGO and report whether it selects HIGH_THROUGHPUT.
+
+    This is the single reader of the env var. It is consulted once per context
+    creation (in :func:`get_nccl_ep_context`, which also folds the result into
+    the cache key); dispatch/combine branch on the context's stored algorithm,
+    never on the environment, so a mid-run env change cannot desynchronize
+    call-time behavior from the buffers the context allocated.
+    """
+    return os.environ.get("TRTLLM_NCCL_EP_ALGO", "LOW_LATENCY").upper() in (
+        "HIGH_THROUGHPUT",
+        "HT",
+    )
+
+
 # Singleton EP context keyed by (ep_size, ep_rank, max_tokens, num_experts,
-# hidden, max_top_k, layout).
+# hidden, max_top_k, layout, algorithm).
 _ep_group_cache: dict = {}
 _ep_group_refcounts: dict = {}
 
@@ -138,15 +153,27 @@ class NcclEpContext:
         # is the working tuple there. TRTLLM_NCCL_EP_ALGO selects the algorithm
         # (default LOW_LATENCY = unchanged behavior); when it is HIGH_THROUGHPUT
         # and no explicit layout was requested, default the layout to FLAT (HT
-        # asserts on RANK_MAJOR).
+        # asserts on RANK_MAJOR). The env var is read once here; all later
+        # dispatch/combine decisions branch on this stored value.
         self._ep_algorithm = (
-            Algorithm.HIGH_THROUGHPUT
-            if os.environ.get("TRTLLM_NCCL_EP_ALGO", "LOW_LATENCY").upper()
-            in ("HIGH_THROUGHPUT", "HT")
-            else Algorithm.LOW_LATENCY
+            Algorithm.HIGH_THROUGHPUT if _env_selects_high_throughput() else Algorithm.LOW_LATENCY
         )
+        # Env-independent algorithm flag for call-time branching in
+        # dispatch/combine (avoids re-reading TRTLLM_NCCL_EP_ALGO after the
+        # buffers below are already shaped by this value).
+        self.is_high_throughput = self._ep_algorithm == Algorithm.HIGH_THROUGHPUT
         if layout is not None:
             self.layout = Layout(layout)
+            # HT allocates 2D FLAT token buffers; an explicit non-FLAT layout
+            # would hand the group a rank-major config over those buffers
+            # (the HT kernel asserts on RANK_MAJOR). Reject the combination
+            # before any group/buffer is created rather than faulting later.
+            if self._ep_algorithm == Algorithm.HIGH_THROUGHPUT and self.layout != Layout.FLAT:
+                raise ValueError(
+                    f"TRTLLM_NCCL_EP_ALGO=HIGH_THROUGHPUT requires Layout.FLAT; "
+                    f"got explicit layout={self.layout.name}. Drop the explicit "
+                    f"layout (FLAT is the HT default) or use LOW_LATENCY."
+                )
         elif self._ep_algorithm == Algorithm.HIGH_THROUGHPUT:
             self.layout = Layout.FLAT
         else:
@@ -401,15 +428,15 @@ def get_nccl_ep_context(
     """Get or create a singleton :class:`NcclEpContext` for the given configuration."""
     from nccl.ep import Layout
 
+    # Sample the algorithm gate once; it participates in the cache key so
+    # contexts created under different TRTLLM_NCCL_EP_ALGO values can never
+    # collide on one cached context (HT and LL allocate different buffer
+    # shapes/dtypes).
+    high_throughput = _env_selects_high_throughput()
     if layout is None:
         # Respect the TRTLLM_NCCL_EP_ALGO gate: forcing RANK_MAJOR here would
         # override NcclEpContext's HT-aware default and re-break EFA.
-        layout = (
-            Layout.FLAT
-            if os.environ.get("TRTLLM_NCCL_EP_ALGO", "LOW_LATENCY").upper()
-            in ("HIGH_THROUGHPUT", "HT")
-            else Layout.RANK_MAJOR
-        )
+        layout = Layout.FLAT if high_throughput else Layout.RANK_MAJOR
     key = (
         mapping.moe_ep_size,
         mapping.moe_ep_rank,
@@ -418,6 +445,7 @@ def get_nccl_ep_context(
         hidden_size,
         max_top_k,
         int(layout),
+        high_throughput,
     )
     if key not in _ep_group_cache:
         _ep_group_cache[key] = NcclEpContext(

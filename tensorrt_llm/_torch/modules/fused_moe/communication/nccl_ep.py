@@ -34,7 +34,6 @@ subsequent dispatches call ``handle.update(topk_idx, ...)`` to rebind routing.
 CUDA-graph capture is supported once the handle exists.
 """
 
-import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -137,7 +136,6 @@ class NcclEP(Communication):
                     "NcclEP context must be initialized before CUDA graph capture. "
                     "Run an eager warmup forward before enabling or capturing CUDA graphs."
                 )
-            from nccl.ep import Layout
 
             from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import get_nccl_ep_context
 
@@ -246,8 +244,12 @@ class NcclEP(Communication):
         )
         # Shipped V1 nccl_ep.h: "For HT mode [layout_info] should be NULL, the
         # counter information is available through ncclEpUpdateHandle".
-        # src_rank_counters is an LL-rank-major-only field.
-        _ht = os.environ.get("TRTLLM_NCCL_EP_ALGO", "LOW_LATENCY").upper() in ("HIGH_THROUGHPUT", "HT")
+        # src_rank_counters is an LL-rank-major-only field. Branch on the
+        # context's stored algorithm (fixed at context creation, part of the
+        # context cache key), not the environment: the buffers this call uses
+        # were shaped by that stored value, and a re-read could disagree with
+        # them if the env changed after context creation.
+        _ht = ctx.is_high_throughput
         layout_info = None if _ht else LayoutInfo(
             src_rank_counters=ctx.recv_rank_counter_nd
         )
@@ -348,7 +350,9 @@ class NcclEP(Communication):
                     f"combine input shape={tuple(final_hidden_states.shape)} "
                     f"expected={expected_shape}"
                 )
-            if not os.environ.get("TRTLLM_NCCL_EP_ALGO", "LOW_LATENCY").upper() in ("HIGH_THROUGHPUT", "HT"):
+            # Same rule as dispatch: the algorithm comes from the context, not
+            # a fresh env read (E713-clean and stable across env changes).
+            if not ctx.is_high_throughput:
                 final_hidden_states = final_hidden_states.view(
                     self.ep_size,
                     self.max_tokens_per_rank,
