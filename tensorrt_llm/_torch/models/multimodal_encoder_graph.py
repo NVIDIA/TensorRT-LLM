@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from typing import (
     TYPE_CHECKING,
-    Any,
     Callable,
     Dict,
     List,
@@ -39,6 +38,7 @@ from typing import (
 import torch
 
 from ...logger import logger
+from ..nccl_window_graph import nccl_window_graph_capture
 from ..utils import make_weak_ref
 
 if TYPE_CHECKING:
@@ -378,17 +378,14 @@ class MultimodalEncoderGraphRunner:
         metadata = self._metadata_provider.build(key)
         self._metadata_provider.refresh_in_place(metadata, padded_seq_lengths)
 
-        capture_kwargs: Dict[str, Any] = {}
-        if self._memory_pool is not None:
-            capture_kwargs["pool"] = self._memory_pool
-
         graph = torch.cuda.CUDAGraph()
+        graph_pool = self._memory_pool or torch.cuda.graph_pool_handle()
         with torch.inference_mode():
             for _ in range(self._config.warmup_steps):
                 self._encoder_fn(static_inputs, metadata)
             torch.cuda.synchronize()
 
-            with torch.cuda.graph(graph, **capture_kwargs):
+            with nccl_window_graph_capture(graph, graph_pool):
                 outputs = self._encoder_fn(static_inputs, metadata)
 
         captured_outputs = {name: make_weak_ref(tensor) for name, tensor in outputs.items()}
@@ -403,7 +400,7 @@ class MultimodalEncoderGraphRunner:
         )
         # Adopt the pool from the first captured graph so subsequent captures share it and reuse
         # memory.
-        self._memory_pool = graph.pool()
+        self._memory_pool = graph_pool
 
     @staticmethod
     def _snapshot_metadata_tensor_ptrs(

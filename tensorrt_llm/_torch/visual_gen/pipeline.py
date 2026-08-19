@@ -31,6 +31,7 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..nccl_window_graph import release_nccl_window_graph_owner
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
@@ -1253,6 +1254,13 @@ class BasePipeline(nn.Module):
         """Call before dist.destroy_process_group()."""
         self._profiler.close_window()
 
+        graph_pools = {
+            runner._get_pool()
+            for runner in self._cuda_graph_runners.values()
+            if runner._get_pool() is not None
+        }
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()
+        for graph_pool in graph_pools:
+            release_nccl_window_graph_owner(graph_pool)

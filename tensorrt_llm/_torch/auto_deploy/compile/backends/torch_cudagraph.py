@@ -45,6 +45,7 @@ except ModuleNotFoundError:
         yield  # no-op in standalone mode
 
 
+from ..._compat import nccl_window_graph_capture
 from ...utils.cuda_graph import CudaGraphWarmUpPhase, cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.multi_stream_utils import disable_multi_stream
@@ -254,9 +255,10 @@ class CapturedGraph(nn.Module):
         # capture graph now
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
+        graph_pool = self._cuda_graph_mem_pool or torch.cuda.graph_pool_handle()
         od = self._output_dynamic_dim
         output_extents = []
-        with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
+        with nccl_window_graph_capture(graph, graph_pool):
             # compute output
             out = self.model(*args, **kwargs)
             # write out into output buffer up to out batch size
@@ -270,7 +272,7 @@ class CapturedGraph(nn.Module):
                 o_buffer.narrow(od, 0, output_extent).copy_(o)
                 output_extents.append(output_extent)
         torch.cuda.synchronize()
-        self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
+        self._cuda_graph_mem_pool = graph_pool
         return graph, tuple(output_extents)
 
     def capture_graph(self, get_args_kwargs: GetArgsKwargsForBatchSize, batch_sizes: List[int]):

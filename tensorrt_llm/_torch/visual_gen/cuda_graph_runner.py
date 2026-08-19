@@ -7,6 +7,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ..nccl_window_graph import nccl_window_graph_capture
 from ..utils import make_weak_ref
 
 # One named graph-key component, e.g. ("hidden_states", (1, 4096, 3072)).
@@ -150,14 +151,15 @@ class CUDAGraphRunner:
             gc.collect()
             torch.cuda.empty_cache()
 
-        with torch.cuda.graph(graph, pool=self._get_pool()):
+        graph_pool = self._get_pool() or torch.cuda.graph_pool_handle()
+        with nccl_window_graph_capture(graph, graph_pool):
             output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)
         self._graph_output_refs[key] = output
         self.graph_outputs[key] = make_weak_ref(output)
-        self.memory_pool = graph.pool()
+        self.memory_pool = graph_pool
 
         # Publish pool so other runners sharing the same SharedGraphPool can reuse it
         if self._shared_pool is not None and self._shared_pool.handle is None:
