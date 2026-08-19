@@ -13,22 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# 4-GPU Cosmos3-Super with (CFG + Ulysses + parallel VAE).
+# 4-GPU Cosmos3-Super with (tensor parallel + Ulysses + parallel VAE).
 # Model: nvidia/Cosmos3-Super
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 #
 # trtllm-serve spawns the 4 workers itself — do not wrap it in torchrun/mpirun.
 #
-# GPU layout: cfg_size=2 (positive | negative) x ulysses_size=2 (sequence split).
-# This split was measured against the alternatives on 4xB300; keep it unless a
-# new measurement says otherwise:
-#   cfg_size=1, ulysses_size=4     +3.4% slower  (CFG is worth two ranks)
-#   parallel_vae_size=1           +14.6% slower  (parallel VAE is load-bearing)
-#   ring_size=2                    unsupported   (Cosmos3 cross-attention)
+# GPU layout: tp_size=2 (weight shards) x ulysses_size=2 (sequence split).
 attention_config:
   backend: VANILLA
 parallel_config:
-  cfg_size: 2
+  cfg_size: 1
+  tp_size: 2
   ulysses_size: 2
   async_ulysses: true
   parallel_vae_size: 4
