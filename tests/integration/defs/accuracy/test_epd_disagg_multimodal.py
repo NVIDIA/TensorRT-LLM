@@ -246,6 +246,12 @@ class EPDVariant:
             ),
             max_batch_size=128,
             expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+            # A/B arm 2 (nvbugs/6327718): arm 1 was the teardown-ordering fix
+            # alone at the default 128 workers, which measured 1 failure in 482
+            # reps (build 54455). This adds the same cap nano_omni_fp8 carries,
+            # to see whether the residual - a hang from the dispatcher thread
+            # proxy.py leaks, which the test cannot reach - also drops.
+            max_workers=16,
         )
 
 
