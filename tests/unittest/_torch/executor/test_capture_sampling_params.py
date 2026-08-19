@@ -26,14 +26,16 @@ import unittest
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.model_engine import NON_GREEDY_CAPTURE_SAMPLING_PARAMS
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import SamplingParams
 
 # The synthetic params the refactored capture path warms up with.
-CAPTURE_TEMPERATURE, CAPTURE_TOP_K, CAPTURE_TOP_P = 0.7, 50, 0.9
+CAPTURE_TEMPERATURE = NON_GREEDY_CAPTURE_SAMPLING_PARAMS.temperature
+CAPTURE_TOP_K = NON_GREEDY_CAPTURE_SAMPLING_PARAMS.top_k
+CAPTURE_TOP_P = NON_GREEDY_CAPTURE_SAMPLING_PARAMS.top_p
 
 
 class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
@@ -60,9 +62,7 @@ class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
             requests = kv_cache_manager.add_dummy_requests(
                 [0],
                 token_nums=[8],
-                capture_sampling_params=SamplingParams(
-                    temperature=CAPTURE_TEMPERATURE, top_k=CAPTURE_TOP_K, top_p=CAPTURE_TOP_P
-                ),
+                capture_sampling_params=NON_GREEDY_CAPTURE_SAMPLING_PARAMS,
             )
             self.assertEqual(len(requests), 1)
             sampling_config = requests[0].sampling_config
