@@ -389,10 +389,25 @@ class TestKimiExtensionMapping:
 
 
 class TestKimiParamPolicy:
+    @pytest.fixture(autouse=True)
+    def _enable_policy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The policy is opt-in (off by default); these tests exercise its
+        # enabled semantics as a KVV certification run would.
+        monkeypatch.setenv("TRTLLM_KIMI_PARAM_POLICY", "1")
+
     def enforce(self, **kwargs) -> ChatCompletionRequest:
         req = make_request(**kwargs)
         _enforce_kimi_param_policy(req)
         return req
+
+    def test_policy_disabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TRTLLM_KIMI_PARAM_POLICY", raising=False)
+        req = self.enforce(top_p=0.8, temperature=2.0, n=2)
+        # Existing deployments keep today's behavior: no rejection, no
+        # coercion, unless a certification run opts in with =1.
+        assert req.top_p == 0.8
+        assert req.temperature == 2.0
+        assert req.n == 2
 
     def test_top_p_none_coerced(self) -> None:
         assert self.enforce().top_p == 0.95

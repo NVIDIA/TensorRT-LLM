@@ -212,10 +212,12 @@ def _enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
     Kimi's API pins top_p, the penalties, and n, and bounds temperature to
     [0, 1]; out-of-policy values must fail fast with HTTP 400 rather than
     generate. top_p unset or the OpenAI-default 1.0 is coerced to the pinned
-    0.95 instead of rejected. Set TRTLLM_KIMI_PARAM_POLICY=0 to serve fully
-    unconstrained (no coercion, no rejection).
+    0.95 instead of rejected. Off by default so existing K3 deployments keep
+    accepting the requests they accept today (review feedback); a Kimi
+    Vendor Verifier certification run must opt in with
+    TRTLLM_KIMI_PARAM_POLICY=1.
     """
-    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "1") == "0":
+    if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") != "1":
         return
     if request.top_p is None or request.top_p == 1.0:
         # Kimi pins top_p at 0.95. None would fall back to 1.0 in
