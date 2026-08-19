@@ -5010,8 +5010,8 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
-                # Hard pause discards every request-owned resource. In the
-                # overlap loop, a selected victim may still belong to
+                # Eviction with release discards every request-owned resource.
+                # In the overlap loop, a selected victim may still belong to
                 # ``previous_batch`` and therefore have an unconsumed sampled
                 # token. Finalize that batch first so recomputation includes
                 # the token and every resource manager has observed the
@@ -5023,12 +5023,12 @@ class PyExecutor:
                         req.py_request_id
                         for req in self.active_requests
                     }
-                    hard_paused_requests = [
+                    evicted_requests = [
                         req for req in scheduled_batch.paused_requests
                         if req.py_request_id in active_request_ids
                     ]
-                    self._terminate_requests(hard_paused_requests)
-                    self._pause_requests(hard_paused_requests)
+                    self._terminate_requests(evicted_requests)
+                    self._pause_requests(evicted_requests)
 
                 # Drain buffers from the (per-rank-divergent)
                 # _process_previous_batch above; rank-symmetric companion to

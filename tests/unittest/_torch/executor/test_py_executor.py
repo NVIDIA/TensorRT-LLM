@@ -2804,7 +2804,9 @@ class TestPendingTransferResponseFlush:
         assert executor._flush_pending_transfer_responses.call_count == 2
 
     @pytest.mark.parametrize("is_kv_manager_v2", [False, True])
-    def test_idle_pass_processes_hard_pause_and_has_one_flush(self, monkeypatch, is_kv_manager_v2):
+    def test_idle_pass_processes_eviction_release_and_has_one_flush(
+        self, monkeypatch, is_kv_manager_v2
+    ):
         """Both cache-manager generations use the executor pause lifecycle."""
         executor = self._make_executor_loop_stub()
         executor._is_kv_manager_v2 = is_kv_manager_v2
@@ -2838,7 +2840,7 @@ class TestPendingTransferResponseFlush:
         # during the idle pass itself.
         assert executor._flush_pending_transfer_responses.call_count == 2
 
-    def test_overlap_v2_hard_pause_waits_for_previous_batch(self, monkeypatch):
+    def test_overlap_v2_eviction_release_waits_for_previous_batch(self, monkeypatch):
         """Consume the sampled token before discarding its request resources."""
         executor = self._make_executor_loop_stub()
         executor._is_kv_manager_v2 = True

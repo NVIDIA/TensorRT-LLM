@@ -236,7 +236,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             scheduled_encoder,
             scheduled_ctx,
             scheduled_gen,
-            hard_paused,
+            evicted,
             disagg_candidates,
             has_chunking,
         ) = self._schedule_loop(active_requests, inflight_request_ids)
@@ -249,7 +249,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             encoder_requests=scheduled_encoder,
             context_requests=scheduled_ctx,
             generation_requests=scheduled_gen,
-            paused_requests=hard_paused,
+            paused_requests=evicted,
             fitting_disagg_gen_init_requests=disagg_candidates,
             num_fitting_requests=(len(scheduled_encoder) + len(scheduled_ctx) + len(scheduled_gen)),
         )
@@ -260,7 +260,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         scheduled_ctx: RequestList = []
         scheduled_encoder: RequestList = []
         scheduled_gen: RequestList = []
-        hard_paused: RequestList = []
+        # Same output contract as V1: only evictions that must release cache
+        # and recompute are returned to the executor. Manager-preserved
+        # evictions remain active and are retried on a later pass.
+        evicted: RequestList = []
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
@@ -279,7 +282,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Requires a read-only radix tree probe API.
 
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
-        # preemption can shrink the range from the tail.
+        # eviction can shrink the range from the tail.
         requests_list = list(active_requests)
 
         # Opt-in: prioritize disagg-gen first-token requests (see __init__).
@@ -399,7 +402,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     requests_list,
                     req_it,
                     req_it_end,
-                    hard_paused,
+                    evicted,
                     scheduled_beam_width,
                     inflight_request_ids,
                     has_pending_completions,
@@ -442,7 +445,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             scheduled_encoder,
             scheduled_ctx,
             scheduled_gen,
-            hard_paused,
+            evicted,
             disagg_candidates,
             has_chunking,
         )
@@ -623,7 +626,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             # TODO: consider suspending first-chunk KVCache to release
             # GPU pages. Currently we skip without suspend to avoid
             # pathological suspend/resume cycles. suspend_request is
-            # only called from generation preemption.
+            # only called from generation eviction.
             return ScheduleAction.SKIP, 0, False
 
         chunk_size = self._align_chunk_to_mm_block(
@@ -924,7 +927,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         requests_list: list,
         req_it: int,
         req_it_end: int,
-        hard_paused: RequestList,
+        evicted: RequestList,
         scheduled_beam_width: int,
         inflight_request_ids: set[int],
         has_pending_completions: bool,
@@ -945,7 +948,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         elif scheduled_beam_width != beam_width:
             return ScheduleAction.SKIP, 0, scheduled_beam_width, req_it_end
 
-        hard_pause_search_end = req_it_end
         success = self.kv_cache_manager.try_allocate_generation(req)
 
         # A completing request is guaranteed to release its resources after
@@ -955,11 +957,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
 
         if not success:
-            req_it_end, success = self._try_soft_suspend_for_gen(
+            req_it_end, success = self._try_evict_for_gen(
                 req,
                 requests_list,
                 req_it,
                 req_it_end,
+                evicted,
                 inflight_request_ids,
             )
 
@@ -971,46 +974,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req_it_end,
             )
 
-        hard_victim = self._find_hard_pause_victim(
-            requests_list,
-            req_it,
-            hard_pause_search_end,
-            inflight_request_ids,
-        )
-        if hard_victim is not None:
-            victim_idx, victim = hard_victim
-            logger.debug(
-                f"[V2Scheduler] Selecting request {victim.py_request_id} "
-                f"(state={victim.state.name}) for hard pause because its "
-                f"cache cannot be preserved while admitting request {req.py_request_id}"
-            )
-            hard_paused.append(victim)
-            req_it_end = min(req_it_end, victim_idx)
-            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
-
-        # Pipeline-parallel work can still own the pages that blocked this
-        # request. Its request cannot be safely paused until the in-flight
-        # microbatch has consumed the cache and returned its sampled token.
-        has_inflight_cache_owner = any(
-            self._is_started_request(candidate) and candidate.request_id in inflight_request_ids
-            for candidate in requests_list
-        )
-        if has_inflight_cache_owner:
-            return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
-
-        # No preserved state can be reclaimed and no in-flight work can make
-        # progress for us. Fall back to V1's recompute semantics: the executor
-        # releases every resource manager and calls request.pause() at a safe
-        # point after any previous overlap batch has produced its token.
-        logger.debug(
-            f"[V2Scheduler] Selecting request {req.py_request_id} "
-            f"(state={req.state.name}) for hard pause because no cache tier "
-            f"can preserve its state"
-        )
-        hard_paused.append(req)
         return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
 
-    # ---- Preemption ----
+    # ---- Eviction ----
 
     @staticmethod
     def _is_started_request(req: LlmRequest) -> bool:
@@ -1021,8 +987,13 @@ class KVCacheV2Scheduler(RequestScheduler):
             req.is_context_init_state and not req.is_first_context_chunk
         ) or req.is_generation_in_progress_state
 
-    def _soft_suspend_request(self, req: LlmRequest) -> None:
-        """Soft-suspend a request in both main and draft KV managers.
+    def _evict_request(self, req: LlmRequest) -> None:
+        """Evict a request while preserving its cache when possible.
+
+        The scheduler does not select a physical cache tier. Suspending the
+        request releases its page locks; the cache manager decides whether
+        allocation pressure leaves those pages on GPU or migrates them to a
+        lower tier.
 
         TODO: Also release PEFT resources (mark_request_done) for the
         suspended request so the C++ PeftCacheManager can evict its
@@ -1038,11 +1009,11 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
 
-    def _is_soft_suspendable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
-        """A started request whose KV cache is still active on GPU.
+    def _is_evictable(self, req: LlmRequest, inflight_request_ids: set[int]) -> bool:
+        """Return whether a started request can be safely evicted.
 
-        Already-suspended requests are not useful eviction victims
-        because suspending them again is a no-op that frees no pages.
+        An already-suspended cache is not useful in the preserve-first phase:
+        suspending it again cannot expose additional pages to reclamation.
         """
         if not self._is_started_request(req):
             return False
@@ -1050,32 +1021,36 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
-    def _try_soft_suspend_for_gen(
+    def _try_evict_for_gen(
         self,
         req: LlmRequest,
         requests_list: RequestList,
         req_it: int,
         req_it_end: int,
+        evicted: RequestList,
         inflight_request_ids: set[int],
     ) -> tuple[int, bool]:
-        """Soft-suspend started tail requests and retry GPU admission.
+        """Evict tail requests until generation admission can make progress.
 
-        Search backwards from req_it_end
-        for suspendable requests (started, not in flight, and KV cache active
-        on GPU), let the cache manager preserve them in another tier when
-        possible, then retry allocation.
+        First suspend safe tail requests and retry allocation after each one.
+        Suspending only releases page locks; cache placement and lower-tier
+        migration remain cache-manager decisions. If no configured tier can
+        preserve enough state, return one safe victim in ``evicted`` so the
+        executor releases its resources and pauses it for later recomputation,
+        matching the V1 scheduler contract.
 
         Victims are always at indices >= req_it (not yet processed by the
         main loop), so they are never in scheduled_ctx/scheduled_gen and
         no token budget reclaim is needed.
 
-        Returns (new_req_it_end, success) tuple. new_req_it_end is always
-        updated to skip soft-suspended victims for this scheduling pass.
+        Returns ``(new_req_it_end, success)``. ``new_req_it_end`` skips every
+        request evicted during this scheduling pass.
         """
+        release_search_end = req_it_end
         while req_it_end > req_it:
             victim_idx = None
             for i in range(req_it_end - 1, req_it, -1):
-                if self._is_soft_suspendable(requests_list[i], inflight_request_ids):
+                if self._is_evictable(requests_list[i], inflight_request_ids):
                     victim_idx = i
                     break
 
@@ -1084,30 +1059,50 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             victim = requests_list[victim_idx]
             logger.debug(
-                f"[V2Scheduler] Soft-suspending request {victim.py_request_id} "
-                f"(state={victim.state.name}) before retrying request {req.py_request_id}"
+                f"[V2Scheduler] Evicting request {victim.py_request_id} "
+                f"(state={victim.state.name}) while preserving its cache before "
+                f"retrying request {req.py_request_id}"
             )
-            self._soft_suspend_request(victim)
+            self._evict_request(victim)
             req_it_end = victim_idx
 
             if self.kv_cache_manager.try_allocate_generation(req):
                 return req_it_end, True
 
-        return req_it_end, False
-
-    def _find_hard_pause_victim(
-        self,
-        requests_list: RequestList,
-        req_it: int,
-        req_it_end: int,
-        inflight_request_ids: set[int],
-    ) -> Optional[tuple[int, LlmRequest]]:
-        """Return the youngest safe tail request whose state may be discarded."""
-        for victim_idx in range(req_it_end - 1, req_it, -1):
+        # Preserving cache state did not free enough space. Select the youngest
+        # safe tail request for V1-style release and recomputation. Search the
+        # original range so a request suspended above can become that victim.
+        for victim_idx in range(release_search_end - 1, req_it, -1):
             victim = requests_list[victim_idx]
             if self._is_started_request(victim) and victim.request_id not in inflight_request_ids:
-                return victim_idx, victim
-        return None
+                logger.debug(
+                    f"[V2Scheduler] Releasing evicted request {victim.py_request_id} "
+                    f"(state={victim.state.name}) because its cache cannot be "
+                    f"preserved while admitting request {req.py_request_id}"
+                )
+                evicted.append(victim)
+                return min(req_it_end, victim_idx), False
+
+        # Pipeline-parallel work can still own the pages that blocked this
+        # request. Its request cannot be safely released until the in-flight
+        # microbatch has consumed the cache and returned its sampled token.
+        has_inflight_cache_owner = any(
+            self._is_started_request(candidate) and candidate.request_id in inflight_request_ids
+            for candidate in requests_list
+        )
+        if has_inflight_cache_owner:
+            return req_it_end, False
+
+        # No tail request can be reclaimed and no in-flight work can make
+        # progress. Evict the blocked request itself. The executor releases
+        # every resource manager and calls request.pause() only after any
+        # previous overlap batch has produced its sampled token.
+        logger.debug(
+            f"[V2Scheduler] Releasing evicted request {req.py_request_id} "
+            f"(state={req.state.name}) because its cache cannot be preserved"
+        )
+        evicted.append(req)
+        return req_it_end, False
 
     # ---- Sorting ----
 
