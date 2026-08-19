@@ -6126,6 +6126,7 @@ class TorchLlmArgs(BaseLlmArgs):
         # loader implementations are known.
         if (self.checkpoint_io_policy == "rank_striped_read_ahead"
                 and self.backend != "pytorch"):
+            self.checkpoint_io_policy = "native"
             logger.warning(
                 "Checkpoint I/O policy resolved before loading: "
                 "requested=rank_striped_read_ahead, selected=native, "

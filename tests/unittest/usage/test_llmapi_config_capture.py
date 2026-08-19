@@ -729,7 +729,7 @@ def test_collect_llm_api_config_captures_gms_load_format():
     assert meta["capture_succeeded"] is True
 
 
-def test_collect_llm_api_config_captures_checkpoint_io_policy():
+def test_collect_llm_api_config_captures_checkpoint_io_policy() -> None:
     for policy in ("auto", "rank_striped_read_ahead"):
         args = TorchLlmArgs(
             model="/customer/private/Llama",

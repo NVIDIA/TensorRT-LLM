@@ -491,13 +491,17 @@ class HfWeightLoader(BaseWeightLoader):
             except Exception as error:
                 status = self._last_checkpoint_io_status
                 status.effective = "none"
-                status.fallback_reason = str(error)
-                self._log_checkpoint_io_status()
                 if body_error is None:
+                    status.fallback_reason = str(error)
+                    self._log_checkpoint_io_status()
                     raise
+                status.fallback_reason = (
+                    "model materialization failed: "
+                    f"{type(body_error).__name__}: {body_error}")
+                self._log_checkpoint_io_status()
                 logger.error(
-                    "Suppressing rank-striped cleanup failure to preserve "
-                    "the model-materialization exception: "
+                    "Rank-striped model materialization failed; preserving "
+                    "the original exception. Coordinated session result: "
                     f"{type(error).__name__}: {error}")
             else:
                 status = self._last_checkpoint_io_status

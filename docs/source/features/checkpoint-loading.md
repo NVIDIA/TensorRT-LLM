@@ -102,7 +102,7 @@ checkpoint bytes reach host memory:
 - `auto` (default) selects rank-striped read-ahead for compatible built-in
   PyTorch/HF loads and selects native I/O for other configurations.
 - `native` always preserves the existing checkpoint loader and its synchronous
-  SafeTensors prefetch.
+  SafeTensors prefetch when the load group is eligible.
 - `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
   Node-local ranks issue disjoint background `pread` requests into the Linux
   page cache while the existing mapping, transformation, and H2D path runs.
