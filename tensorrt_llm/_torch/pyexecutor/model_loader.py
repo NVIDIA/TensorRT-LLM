@@ -12,6 +12,7 @@ import torch
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity, IdentityCheckPolicy,
     PostTransformConfigIdentity, PostTransformFeature, PostTransformProfile,
@@ -27,7 +28,6 @@ from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
@@ -462,11 +462,16 @@ class ModelLoader:
         if llm_args.speculative_config is not None:
             from tensorrt_llm._torch.speculative import \
                 update_spec_config_from_model_config
+            from tensorrt_llm._torch.speculative.utils import \
+                resolve_mtp_checkpoint_source
 
-            # Model defaults reconstruct nested Pydantic configs and drop
-            # init=False runtime fields such as num_nextn_predict_layers.
+            # Model defaults reconstruct nested Pydantic configs and drop private / runtime fields,
+            # so resolve the checkpoint source again before restoring derived MTP state.
+            resolve_mtp_checkpoint_source(llm_args.speculative_config,
+                                          checkpoint_dir)
             update_spec_config_from_model_config(llm_args.speculative_config,
-                                                 config.pretrained_config)
+                                                 config.pretrained_config,
+                                                 preference_cls)
 
         # Resolve "auto" sentinel values after model defaults are applied.
         _resolve_transceiver_runtime_auto(llm_args, preference_cls,
@@ -1377,8 +1382,8 @@ class ModelLoader:
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
         from tensorrt_llm._torch.speculative.utils import (
-            loads_mtp_from_speculative_model, resolve_mtp_checkpoint_source,
-            update_spec_config_from_model_config)
+            resolve_mtp_checkpoint_source, update_spec_config_from_model_config,
+            uses_mtp_head_checkpoint)
 
         resolve_mtp_checkpoint_source(self.spec_config, checkpoint_dir)
 
@@ -1426,7 +1431,7 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
 
-        if loads_mtp_from_speculative_model(self.spec_config):
+        if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a
             # config object it then discards. The MTP heads' structure fields
             # (head count, block pattern) come from `speculative_model` and
