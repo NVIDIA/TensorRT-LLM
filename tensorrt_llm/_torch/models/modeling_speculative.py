@@ -2564,7 +2564,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                     self.draft_config.extra_attrs = model_config.extra_attrs
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
-                    spec_config)
+                    spec_config,
+                    sparse_attention_config=model_config.sparse_attention_config
+                )
 
                 self.draft_model = get_draft_model(model_config,
                                                    self.draft_config,

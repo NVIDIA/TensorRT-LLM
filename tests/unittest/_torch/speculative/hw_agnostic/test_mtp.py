@@ -20,7 +20,12 @@ from tensorrt_llm._torch.speculative.utils import (
     update_spec_config_from_model_config,
     uses_mtp_head_checkpoint,
 )
-from tensorrt_llm.llmapi import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi import (
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+    KvCacheConfig,
+    MTPDecodingConfig,
+)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
@@ -1766,7 +1771,23 @@ def test_mtp_checkpoint_type_config(uses_external_draft_model):
     if uses_external_draft_model:
         assert get_num_spec_layers(spec_config) == 0
         assert get_num_extra_kv_tokens(spec_config) == 0
-        assert not should_use_separate_draft_kv_cache(spec_config)
+        assert not should_use_separate_draft_kv_cache(spec_config, sparse_attention_config=None)
+
+
+def test_mtp_separate_draft_kv_cache_sparse_attention():
+    """DeepSeek-V4 sizes the MTP layers into its own cache manager."""
+    spec_config = MTPDecodingConfig(max_draft_len=3)
+
+    assert should_use_separate_draft_kv_cache(spec_config, sparse_attention_config=None)
+    # DSA inherits the base block-offset copy, so it stays on the separate path.
+    assert should_use_separate_draft_kv_cache(
+        spec_config,
+        sparse_attention_config=DeepSeekSparseAttentionConfig(),
+    )
+    assert not should_use_separate_draft_kv_cache(
+        spec_config,
+        sparse_attention_config=DeepSeekV4SparseAttentionConfig(),
+    )
 
 
 def test_mtp_shared_kv_draft_inputs():

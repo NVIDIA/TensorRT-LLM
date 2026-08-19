@@ -230,6 +230,11 @@ def is_minimax_m3(sparse_attention_config):
     return sparse_attention_config is not None and sparse_attention_config.algorithm == "minimax_m3"
 
 
+def is_deepseek_v4_sparse(sparse_attention_config):
+    """True when the sparse attention config selects the DeepSeek-V4 algorithm."""
+    return sparse_attention_config is not None and sparse_attention_config.algorithm == "deepseek_v4"
+
+
 def is_qwen3_next(config):
     return hasattr(
         config, 'architectures'
