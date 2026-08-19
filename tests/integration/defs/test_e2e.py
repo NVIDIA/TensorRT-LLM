@@ -39,6 +39,18 @@ _MEM_FRACTION_50 = 0.5
 _MEM_FRACTION_80 = 0.8
 _MEM_FRACTION_95 = 0.95
 
+_MINIMAX_M3_EVAL_CONFIG = {
+    # This is required for minimax M3.
+    "sparse_attention_config": {
+        "algorithm": "minimax_m3",
+    },
+    # The below are to prevent OOMs in CI - the model's 1M context length is too large.
+    "kv_cache_config": {
+        "enable_block_reuse": False,
+    },
+    "max_seq_len": 4096,
+}
+
 
 @pytest.mark.parametrize("model_name,model_path", [
     ("Qwen3/Qwen3-0.6B", "Qwen3/Qwen3-0.6B"),
@@ -1782,16 +1794,33 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.parametrize("eval_task", ["mmlu"])
 @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])
-@pytest.mark.parametrize("model_path", [
-    pytest.param('Qwen3/Qwen3-235B-A22B', marks=skip_pre_hopper),
+@pytest.mark.parametrize("model_path,llm_api_config", [
+    pytest.param('Qwen3/Qwen3-235B-A22B',
+                 None,
+                 marks=skip_pre_hopper,
+                 id='Qwen3/Qwen3-235B-A22B'),
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
-                 marks=skip_pre_blackwell),
-    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
-    pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
-    pytest.param('MiniMax-M3', marks=skip_pre_blackwell),
+                 None,
+                 marks=skip_pre_blackwell,
+                 id='Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf'),
+    pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4',
+                 None,
+                 marks=skip_pre_blackwell,
+                 id='DeepSeek-R1/DeepSeek-R1-0528-FP4'),
+    pytest.param('Kimi-K2-Thinking-NVFP4',
+                 None,
+                 marks=skip_pre_blackwell,
+                 id='Kimi-K2-Thinking-NVFP4'),
+    pytest.param('MiniMax-M3',
+                 _MINIMAX_M3_EVAL_CONFIG,
+                 marks=skip_pre_blackwell,
+                 id='MiniMax-M3'),
 ])
-def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
-                          mmlu_dataset_root):
+def test_multi_nodes_eval(model_path: str, llm_api_config: Optional[dict[str,
+                                                                         Any]],
+                          tp_size: int, pp_size: int, ep_size: int,
+                          eval_task: str, tmp_path: Path,
+                          mmlu_dataset_root: str) -> None:
     mmlu_threshold = 81.5
     model_dir = f"{llm_models_root()}/{model_path}"
     run_cmd = [
@@ -1809,6 +1838,11 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
         run_cmd.append("--trust_remote_code")
     else:
         run_cmd.append(f"--tokenizer={model_dir}")
+
+    if llm_api_config is not None:
+        config_path = tmp_path / "llm_api_config.yaml"
+        config_path.write_text(yaml.safe_dump(llm_api_config))
+        run_cmd.append(f"--config={config_path}")
 
     run_cmd.extend([eval_task, f"--dataset_path={mmlu_dataset_root}"])
 

@@ -181,11 +181,11 @@ def skip_modules_for_separate_mtp_checkpoint(weights: dict) -> list[str]:
     return skip
 
 
-def loads_mtp_from_speculative_model(spec_config) -> bool:
-    """True when one-model MTP should load heads from ``speculative_model``."""
+def uses_mtp_head_checkpoint(spec_config) -> bool:
+    """True when `speculative_model` contains replacement MTP heads."""
     if spec_config is None:
         return False
-    return spec_config.loads_mtp_from_separate_checkpoint
+    return spec_config.uses_replacement_heads
 
 
 def _refers_to_same_checkpoint(lhs, rhs) -> bool:
@@ -211,7 +211,8 @@ def resolve_mtp_checkpoint_source(spec_config, checkpoint_dir) -> None:
     keep that behavior instead of switching to the separate-heads load path,
     which the target checkpoint's key layout may not even satisfy.
     """
-    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+    from tensorrt_llm.llmapi.llm_args import (MTPDecodingConfig,
+                                              _MTPDraftCheckpointType)
     if not isinstance(spec_config, MTPDecodingConfig):
         return
     if spec_config.speculative_model is None:
@@ -219,11 +220,12 @@ def resolve_mtp_checkpoint_source(spec_config, checkpoint_dir) -> None:
     if not _refers_to_same_checkpoint(spec_config.speculative_model,
                                       checkpoint_dir):
         return
-    if not spec_config._mtp_heads_in_target_checkpoint:
+    if (spec_config._mtp_draft_checkpoint_type
+            != _MTPDraftCheckpointType.TARGET):
         logger.info(
             "speculative_model points at the target checkpoint "
             f"({checkpoint_dir}); loading MTP heads from the target weights.")
-        spec_config._mtp_heads_in_target_checkpoint = True
+        spec_config._mtp_draft_checkpoint_type = _MTPDraftCheckpointType.TARGET
 
 
 def _load_speculative_model_config_dict(spec_config) -> Optional[dict]:
@@ -794,21 +796,43 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
 
 
-def update_spec_config_from_model_config(spec_config, model_config):
-    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+def update_spec_config_from_model_config(spec_config,
+                                         model_config,
+                                         target_model_cls=None):
+    from tensorrt_llm.llmapi.llm_args import (MTPDecodingConfig,
+                                              _MTPDraftCheckpointType)
     if not isinstance(spec_config, MTPDecodingConfig):
         return
+
     architectures = getattr(model_config, "architectures", None) or ()
     if (architectures
             and architectures[0] in _GEMMA4_SHARED_KV_TARGET_ARCHITECTURES):
         spec_config._use_shared_kv_cache = (
             spec_config.spec_dec_mode.is_mtp_eagle_one_model())
 
+    # The target implementation owns the contract for its MTP drafter. Some one-model MTP
+    # implementations construct `MTPForCausalLM` from the target config, and optionally load a
+    # head replacement checkpoint (e.g. NemotronH).
+    # Other implementations advertise an external assistant architecture, which must be
+    # constructed from the assistant's own config.
+    checkpoint_type = spec_config._mtp_draft_checkpoint_type
+    if spec_config.speculative_model is None:
+        checkpoint_type = _MTPDraftCheckpointType.TARGET
+    elif checkpoint_type != _MTPDraftCheckpointType.TARGET:
+        if target_model_cls is not None:
+            checkpoint_type = (
+                _MTPDraftCheckpointType.EXTERNAL_DRAFT_MODEL if getattr(
+                    target_model_cls, "build_mtp_draft_model_from_config",
+                    False) else _MTPDraftCheckpointType.HEAD_REPLACEMENT)
+        elif checkpoint_type == _MTPDraftCheckpointType.UNRESOLVED:
+            checkpoint_type = _MTPDraftCheckpointType.HEAD_REPLACEMENT
+    spec_config._mtp_draft_checkpoint_type = checkpoint_type
+
     # When MTP heads live in a separate checkpoint, prefer that checkpoint's
     # layer count / pattern over the target model's (which may have no MTP or
     # an older embedded MTP head that will be overridden at weight load).
     draft_nextn = None
-    if loads_mtp_from_speculative_model(spec_config):
+    if uses_mtp_head_checkpoint(spec_config):
         draft_nextn = _merge_mtp_fields_from_speculative_model(
             spec_config, model_config)
 
