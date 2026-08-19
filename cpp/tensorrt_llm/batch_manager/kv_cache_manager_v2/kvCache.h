@@ -492,7 +492,9 @@ private:
     void _recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel);
     void _refreshGenerationAllocReady();
     void _recordResizePendingAllocations(BlockOrdinal blockBegin, BlockOrdinal blockEnd,
-        TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration);
+        TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration,
+        bool excludedIsScratch = false);
+    void _recordScratchIterationStats(LifeCycleId lifeCycle, int64_t numBlocks);
     void _subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
     static bool _hasReuseSource(BlockPage const& page);
     void _increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength);

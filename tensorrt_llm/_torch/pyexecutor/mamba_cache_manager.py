@@ -3533,13 +3533,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 LayerId(local_layer_idx), Role.KEY)
         return 0
 
-    def get_buffers(self,
-                    layer_idx: int,
-                    kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def get_buffers(
+        self,
+        layer_idx: int,
+        kv_layout: str = "NHD",
+        index_mode: PageIndexMode = PageIndexMode.SHARED
+    ) -> Optional[torch.Tensor]:
         local_layer_idx = self.layer_offsets[layer_idx]
         if self._is_local_mamba_layer(local_layer_idx):
             return None
-        return super().get_buffers(layer_idx, kv_layout)
+        return super().get_buffers(layer_idx, kv_layout, index_mode)
 
     def _iter_cache_buffers_for_invalid_check(self) -> Iterable[torch.Tensor]:
         for global_layer_id, local_layer_id in self.layer_offsets.items():

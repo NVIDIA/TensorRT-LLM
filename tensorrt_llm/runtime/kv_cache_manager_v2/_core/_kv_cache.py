@@ -500,6 +500,7 @@ class _KVCache:
         beam_width: BeamIndex,
         excluded_ranges: TypedIndexList[LifeCycleId, HalfOpenRange[BlockOrdinal]],
         count_as_generation: bool,
+        excluded_is_scratch: bool = False,
     ) -> None:
         record_manager_stats = self._should_record_manager_stats()
         record_request_stats = self._should_record_request_stats()
@@ -523,8 +524,33 @@ class _KVCache:
                     record_manager_stats=record_manager_stats,
                     record_request_stats=record_request_stats,
                 )
+            if excluded_is_scratch:
+                # The piece dropped between the two recorded outer ranges is
+                # exactly the scratch block count for this lifecycle.
+                self._record_scratch_iteration_stats(
+                    lc_idx,
+                    len(intersect(excluded_ranges[lc_idx], HalfOpenRange(block_begin, block_end))),
+                )
         if changed:
             self.manager.mark_stats_dirty(self.id)
+
+    def _record_scratch_iteration_stats(self, life_cycle: LifeCycleId, num_blocks: int) -> None:
+        """Attribute scratch-served blocks and the slot occupancy behind them.
+
+        ``iter_scratch_blocks`` is a count and accumulates; ``iter_scratch_slots_in_use``
+        is the current occupancy of this lifecycle's scratch slots and is a gauge.
+        See ``KVCacheIterationStatsDelta`` for the contract -- the two must not be
+        aggregated the same way.
+        """
+        if num_blocks <= 0:
+            return
+        self._record_direct_iteration_stats(
+            life_cycle,
+            KVCacheIterationStatsDelta(
+                iter_scratch_blocks=num_blocks,
+                iter_scratch_slots_in_use=len(self._scratch_slots[life_cycle]),
+            ),
+        )
 
     @staticmethod
     def _has_reuse_source(page: BlockPage) -> bool:
@@ -947,6 +973,7 @@ class _KVCache:
                 beam_width,
                 excluded_ranges,
                 record_generation_alloc_stats,
+                excluded_is_scratch=enable_scratch,
             )
             for ordinal in typed_range(old_num_blocks, new_num_blocks):
                 block = make_typed(

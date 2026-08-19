@@ -4026,11 +4026,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "does not declare one.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    enable_swa_scratch_reuse: bool = Field(
-        default=False,
+    enable_swa_scratch_reuse: bool | Literal["auto"] = Field(
+        default="auto",
         status="prototype",
         description=
-        "Whether KV cache manager v2 uses SWA scratch reuse during prefill.")
+        "Whether KV cache manager v2 uses SWA scratch reuse during prefill. "
+        "'auto' enables it wherever it is supported and can save memory: KV "
+        "cache manager v2, an attention backend that can address scratch "
+        "pages (TRTLLM or FlashInfer), and a model with sliding-window "
+        "layers. It is a no-op everywhere else.")
 
     kv_cache_event_hash_algo: Literal[
         "auto", "v1_block_key", "v2_sha256", "v2_sha256_64"] = Field(
@@ -6302,6 +6306,49 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"The '{field_name}' knob is a '{status}' feature. "
                     "It is not recommended for production use and may change or be removed.",
                 )
+
+        return self
+
+    @model_validator(mode='after')
+    def validate_swa_scratch_reuse(self) -> 'TorchLlmArgs':
+        """Reject or warn on configurations SWA scratch reuse cannot serve.
+
+        Scratch blocks get no per-block KV page; their address is a rotating
+        sub-page inside a shared slot. Backends that consume
+        ``copy_batch_block_offsets`` get that for free. FlashInfer builds its
+        own flat page table and is supported through the PER_LAYER addressing
+        path, which additionally requires K and V to stay adjacent under the
+        rotation -- checked at first use, since only a flat table needs it.
+        Backends that read raw base page indices without either path are
+        rejected here.
+
+        Only an explicit ``True`` is rejected. The default ``'auto'`` resolves
+        to False on those backends instead, so enabling scratch reuse by
+        default never turns a working configuration into an error.
+        """
+        kv_cache_config = self.kv_cache_config
+        if kv_cache_config.enable_swa_scratch_reuse is not True:
+            return self
+
+        if self.attn_backend not in ("TRTLLM", "FLASHINFER"):
+            raise ValueError(
+                "kv_cache_config.enable_swa_scratch_reuse is not supported with "
+                f"attn_backend={self.attn_backend!r}. Only 'TRTLLM' (via "
+                "copy_batch_block_offsets) and 'FLASHINFER' (via PER_LAYER page "
+                "indices) can address scratch blocks; other backends read raw base "
+                "page indices, where scratch blocks appear as invalid pages. Set "
+                "enable_swa_scratch_reuse=False for this backend.")
+
+        if (kv_cache_config.enable_block_reuse and
+                kv_cache_config.block_reuse_config.policy == "all_reusable"):
+            logger.warning(
+                "kv_cache_config.enable_swa_scratch_reuse is enabled together with "
+                "block_reuse_config.policy='all_reusable'. Under 'all_reusable' the "
+                "manager would otherwise commit out-of-window blocks for prefix "
+                "reuse, but scratch blocks use shared storage that is never "
+                "preserved, so only non-scratch blocks stay reusable. Use "
+                "block_reuse_config.policy='per_request' to avoid the reuse loss."
+            )
 
         return self
 

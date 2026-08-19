@@ -28,6 +28,7 @@ from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ModelExpressConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           _resolve_swa_scratch_reuse_auto,
                                            _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.logger import logger
@@ -476,6 +477,7 @@ class ModelLoader:
             # "auto" sentinel so it never leaks past config loading.
             _resolve_transceiver_runtime_auto(llm_args)
             _resolve_kv_cache_manager_v2_auto(llm_args)
+            _resolve_swa_scratch_reuse_auto(llm_args)
             return llm_args
 
         config_kwargs = {
@@ -540,6 +542,11 @@ class ModelLoader:
                                           config.pretrained_config)
         _resolve_kv_cache_manager_v2_auto(llm_args, preference_cls,
                                           config.pretrained_config)
+        # Depends on the resolved manager version, the model's own manager
+        # preference, and the attention backend, which model defaults may have
+        # just set.
+        _resolve_swa_scratch_reuse_auto(llm_args, preference_cls,
+                                        config.pretrained_config)
         _validate_and_adjust_mamba_snapshot_config(config, llm_args)
         if original_kv_cache_manager_setting == "auto":
             logger.info(

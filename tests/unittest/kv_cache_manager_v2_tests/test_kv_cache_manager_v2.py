@@ -3805,6 +3805,107 @@ class TestInitRatioConfig(unittest.TestCase):
             kv.close()
         manager.shutdown()
 
+    # ----- scratch savings on real model-shaped lifecycles -----
+
+    def _slots_for_batch(self, cfg: KVCacheManagerConfig, batch: BatchDesc, scratch: bool):
+        """Per-pool-group slot counts for ``batch``, with and without scratch.
+
+        Uses the same pure ``compute_slots_for_batch`` entry point that the
+        startup counterfactual log reports, so the numbers asserted here are
+        exactly the numbers a user sees at engine init.
+        """
+        manager = KVCacheManager(cfg)
+        try:
+            return _introspection.compute_slots_for_batch(
+                manager,
+                batch,
+                self.TOKENS_PER_BLOCK,
+                SwaScratchReuseConfig() if scratch else None,
+            )
+        finally:
+            manager.shutdown()
+
+    def _expected_prefill_slots(self, capacity: int, num_windowed_layers: int):
+        """(without_scratch, with_scratch) slots for one fresh context request.
+
+        Mirrors compute_scratch_range: scratch = stale_at_capacity INTERSECT
+        input_blocks, and input_blocks is the whole request when history is 0.
+        """
+        tpb = self.TOKENS_PER_BLOCK
+        total_blocks = div_up(capacity, tpb)
+        num_sink_blocks = div_up(self.SINK_TOKENS, tpb)
+        stale_beg = min(total_blocks, num_sink_blocks)
+        stale_end = max(stale_beg, (capacity + 1 - self.WINDOW_SIZE) // tpb)
+        num_scratch = min(stale_end, total_blocks) - stale_beg
+        with_scratch = (total_blocks - num_scratch) + div_up(num_scratch, num_windowed_layers)
+        return total_blocks, with_scratch, num_scratch
+
+    def test_vswa_prefill_scratch_reduces_windowed_slots(self):
+        """GPT-OSS / Gemma3 shape: N windowed layers alternating with N full layers.
+
+        The windowed pool group shrinks by ~frac_max on the prefill batch; the
+        full-attention pool group is untouched.
+        """
+        num_windowed = 12
+        capacity = 8192
+        cfg = self._make_config(
+            gpu_quota=8 << 30,
+            num_windowed_layers=num_windowed,
+            num_full_layers=12,
+        )
+        batch = BatchDesc(kv_caches=[KVCacheDesc(capacity=capacity, history_length=0)])
+        without = self._slots_for_batch(cfg, batch, scratch=False)
+        with_scratch = self._slots_for_batch(cfg, batch, scratch=True)
+
+        exp_without, exp_with, num_scratch = self._expected_prefill_slots(capacity, num_windowed)
+        self.assertGreater(num_scratch, 0, "prefill batch must produce a non-empty scratch range")
+        self.assertEqual(without[0], exp_without)
+        self.assertEqual(with_scratch[0], exp_with)
+        # Full-attention pool group has no window, so scratch is a no-op there.
+        self.assertEqual(with_scratch[1], without[1])
+
+    def test_pure_swa_prefill_scratch_reduces_slots(self):
+        """Mistral shape: every layer windowed, so one lifecycle holds all N.
+
+        frac_max = 1/N is maximal here, so the saving is larger than the VSWA
+        case even though ``is_vswa`` would be False for this model.
+        """
+        num_windowed = 24
+        capacity = 8192
+        cfg = self._make_config(
+            gpu_quota=8 << 30,
+            num_windowed_layers=num_windowed,
+            num_full_layers=0,
+        )
+        batch = BatchDesc(kv_caches=[KVCacheDesc(capacity=capacity, history_length=0)])
+        without = self._slots_for_batch(cfg, batch, scratch=False)
+        with_scratch = self._slots_for_batch(cfg, batch, scratch=True)
+
+        exp_without, exp_with, num_scratch = self._expected_prefill_slots(capacity, num_windowed)
+        self.assertGreater(num_scratch, 0)
+        self.assertEqual(len(without), 1, "pure SWA model has a single pool group")
+        self.assertEqual(without[0], exp_without)
+        self.assertEqual(with_scratch[0], exp_with)
+        # More layers per lifecycle -> smaller frac_max -> bigger saving.
+        self.assertLess(with_scratch[0] / without[0], 0.25)
+
+    def test_decode_shaped_batch_yields_no_scratch(self):
+        """The fallback DECODE BatchDesc has an empty scratch range.
+
+        This is why the chunked-prefill constraint has to be registered
+        unconditionally: without it, StorageManager falls back to this shape
+        and scratch reuse is provably inert.
+        """
+        cfg = self._make_config(
+            gpu_quota=8 << 30,
+            num_windowed_layers=12,
+            num_full_layers=12,
+        )
+        batch = BatchDesc(kv_caches=[KVCacheDesc(capacity=2049, history_length=2048)])
+        without = self._slots_for_batch(cfg, batch, scratch=False)
+        with_scratch = self._slots_for_batch(cfg, batch, scratch=True)
+        self.assertEqual(list(with_scratch), list(without))
+
 
 class TestScratchReuse(TestKVCacheManagerV2):
     """Tests for SWA prefill memory reuse (scratch slots)."""
