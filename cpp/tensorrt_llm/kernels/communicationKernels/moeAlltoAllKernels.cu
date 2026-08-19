@@ -283,40 +283,29 @@ __device__ __forceinline__ void route_dispatch_token(int32_t const* token_select
     DispatchKernelPointers const& ptrs, int local_token_idx, int ep_size, int num_experts, int* topk_target_ranks,
     int* topk_send_indices)
 {
-    uint64_t already_copied[kRankMaskWords] = {};
+    static_assert(TOP_K <= 32, "warp-parallel routing requires TOP_K <= warpSize");
+    uint32_t const lane_mask = (TOP_K == 32) ? ~0U : ((1U << TOP_K) - 1U);
+    int const k = threadIdx.x;
+
     int const ep_base = num_experts / ep_size;
     int const ep_remainder = num_experts - ep_base * ep_size;
+    int const expert_id = token_selected_experts[local_token_idx * TOP_K + k];
+    int const target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
 
-#pragma unroll
-    for (int k = 0; k < TOP_K; k++)
+    uint32_t const same_target = __match_any_sync(lane_mask, target_rank);
+    bool keep = (__ffs(same_target) - 1) == k;
+    if constexpr (ENABLE_RANK_MASK)
     {
-        int const expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-        int const target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
-        int target_rank_to_store = -1;
-        int send_index_to_store = -1;
-
-        // Skip duplicates. In rank-mask mode, also reject inactive route targets with the same
-        // -1 sentinel that combine checks via topk_send_indices[k] < 0. A masked route is not
-        // valid model output; the failed execution epoch must be discarded.
-        int const mask_word = target_rank >> 6;
-        uint64_t const mask_bit = 1ULL << (target_rank & 63);
-        bool skip_target = already_copied[mask_word] & mask_bit;
-        if constexpr (ENABLE_RANK_MASK)
-        {
-            skip_target = skip_target || !is_rank_active(ptrs.active_rank_mask, target_rank);
-        }
-        if (!skip_target)
-        {
-            send_index_to_store = atomicAdd(&ptrs.send_counters[target_rank], 1);
-            target_rank_to_store = target_rank;
-            already_copied[mask_word] |= mask_bit;
-        }
-
-        ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank_to_store;
-        ptrs.topk_send_indices[local_token_idx * TOP_K + k] = send_index_to_store;
-        topk_target_ranks[k] = target_rank_to_store;
-        topk_send_indices[k] = send_index_to_store;
+        keep = keep && is_rank_active(ptrs.active_rank_mask, target_rank);
     }
+
+    int const target_rank_to_store = keep ? target_rank : -1;
+    int const send_index_to_store = keep ? atomicAdd(&ptrs.send_counters[target_rank], 1) : -1;
+
+    ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank_to_store;
+    ptrs.topk_send_indices[local_token_idx * TOP_K + k] = send_index_to_store;
+    topk_target_ranks[k] = target_rank_to_store;
+    topk_send_indices[k] = send_index_to_store;
 }
 
 // ============================================================================
@@ -508,7 +497,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #if TLLM_MOE_A2A_COMPILE_SM90
         cudaGridDependencySynchronize();
 #endif
-        if (thread_idx == 0)
+        if (thread_idx < TOP_K)
         {
             route_dispatch_token<TOP_K, ENABLE_RANK_MASK>(token_selected_experts, ptrs, local_token_idx, ep_size,
                 num_experts, smem_topk_target_ranks, smem_topk_send_indices);
@@ -684,28 +673,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 //   4. Poll metadata + data counters from all peers (no fence.sys needed)
 // ============================================================================
 #if TLLM_MOE_A2A_COMPILE_CFT_DISPATCH
-static constexpr int kCftCpAsyncPayloadBytesLimit = 128;
-
-__device__ __forceinline__ bool use_cft_cp_async_staging(int bytes_per_token)
-{
-    return bytes_per_token <= kCftCpAsyncPayloadBytesLimit;
-}
-
-__device__ __forceinline__ void cp_async_g2s(void* dst, void const* src, int size)
-{
-    // CFT dispatch validates every payload as 16B-multiple before selecting the counted-write path.
-    constexpr int kCopyBytes = 16;
-    uint8_t* dst_bytes = static_cast<uint8_t*>(dst);
-    uint8_t const* src_bytes = static_cast<uint8_t const*>(src);
-    for (int offset = 0; offset < size; offset += kCopyBytes)
-    {
-        asm volatile("cp.async.cg.shared.global [%0], [%1], %2;"
-                     :
-                     : "r"(__as_ptr_smem(dst_bytes + offset)), "l"(__as_ptr_gmem(src_bytes + offset)), "n"(kCopyBytes)
-                     : "memory");
-    }
-}
-
 __device__ __forceinline__ void cft_barrier_wait_parity(__mbarrier_t* barrier, int parity)
 {
     while (!::cuda::ptx::mbarrier_try_wait_parity(::cuda::ptx::sem_relaxed, ::cuda::ptx::scope_cta,
@@ -817,61 +784,32 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
         cudaGridDependencySynchronize();
         parity = round_parity(*ptrs.flag_val);
 
-        // ---- Payload staging: overlaps with routing + self-send ----
-        // Small payloads avoid TMA setup overhead by using cp.async; large payloads
-        // still use TMA so the copy runs on the async engine while routing proceeds.
-        int total_tma_payload_bytes = 0;
-        bool has_cp_async_payload = false;
+        // ---- Payload staging: overlaps with routing ----
+        int total_staged_bytes = 0;
         for (int p = 0; p < num_payloads; p++)
         {
-            int bytes_per_token = ptrs.payload_bytes_per_token[p];
-            if (use_cft_cp_async_staging(bytes_per_token))
-            {
-                has_cp_async_payload = true;
-            }
-            else
-            {
-                total_tma_payload_bytes += bytes_per_token;
-            }
+            total_staged_bytes += ptrs.payload_bytes_per_token[p];
         }
 
         if (threadIdx.x == 0)
         {
-            if (total_tma_payload_bytes > 0)
-            {
-                ::cuda::ptx::mbarrier_init(reinterpret_cast<::cuda::std::uint64_t*>(tma_bar), 1);
-            }
+            ::cuda::ptx::mbarrier_init(reinterpret_cast<::cuda::std::uint64_t*>(tma_bar), 1);
             int smem_offset = 0;
             for (int p = 0; p < num_payloads; p++)
             {
                 uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[p]);
                 int bytes_per_token = ptrs.payload_bytes_per_token[p];
                 uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
-                if (use_cft_cp_async_staging(bytes_per_token))
-                {
-                    cp_async_g2s(smem_staging + smem_offset, src_ptr, bytes_per_token);
-                }
-                else
-                {
-                    cp_async_bulk_g2s(
-                        smem_staging + smem_offset, src_ptr, bytes_per_token, reinterpret_cast<uint64_t*>(tma_bar));
-                }
+                cp_async_bulk_g2s(
+                    smem_staging + smem_offset, src_ptr, bytes_per_token, reinterpret_cast<uint64_t*>(tma_bar));
                 smem_offset += bytes_per_token;
             }
-            if (has_cp_async_payload)
-            {
-                cp_async_commit_group();
-            }
-            if (total_tma_payload_bytes > 0)
-            {
-                // Sets expected tx count and consumes the single arrival.
-                mbarrier_arrive_expect_tx(
-                    reinterpret_cast<uint64_t*>(tma_bar), static_cast<uint32_t>(total_tma_payload_bytes));
-            }
+            // Sets expected tx count and consumes the single arrival.
+            mbarrier_arrive_expect_tx(reinterpret_cast<uint64_t*>(tma_bar), static_cast<uint32_t>(total_staged_bytes));
         }
 
         // ---- Routing: map tokens to target ranks ----
-        if (threadIdx.x == 0)
+        if (threadIdx.x < TOP_K)
         {
             route_dispatch_token<TOP_K, ENABLE_RANK_MASK>(token_selected_experts, ptrs, local_token_idx, ep_size,
                 num_experts, smem_topk_target_ranks, smem_topk_send_indices);
@@ -908,83 +846,76 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
         }
 
         // Wait for all staged payloads before self/fabric sends consume smem_staging.
-        // When has_remote, also initialize tma_bar for the fabric path.
         if (threadIdx.x == 0)
         {
-            if (total_tma_payload_bytes > 0)
-            {
-                cft_barrier_wait_parity(tma_bar, 0);
-            }
-            if (has_cp_async_payload)
-            {
-                cp_async_wait_group<0>();
-            }
-            if (has_remote)
-            {
-                ::cuda::ptx::mbarrier_init(reinterpret_cast<::cuda::std::uint64_t*>(tma_bar), 1);
-            }
+            cft_barrier_wait_parity(tma_bar, 0);
         }
         __syncthreads();
 
-        if (threadIdx.x == 0)
+        // Use a different warp to issue s2g if there are at least 2 warps, so the s2g and the
+        // fabric puts overlap instead of serializing on one thread.
+        int const s2g_issuer = blockDim.x >= 64 ? 32 : 0;
+
+        // Issue self-sends via TMA s2g (smem→gmem).
+        if (threadIdx.x == s2g_issuer && has_self)
         {
-            // Issue self-sends via TMA s2g (smem→gmem).
-            if (has_self)
+            int smem_offset = 0;
+            for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
             {
-                int smem_offset = 0;
-                for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
-                {
-                    int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+                int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
 #pragma unroll
-                    for (int k = 0; k < TOP_K; ++k)
-                    {
-                        int dst_idx_k = topk_send_indices[k];
-                        int target_rank_k = topk_target_ranks[k];
-                        if (dst_idx_k < 0 || target_rank_k != rank_id)
-                            continue;
-                        uint8_t* dst = static_cast<uint8_t*>(ptrs.recv_buffers[rank_id][payload_idx])
-                            + (static_cast<size_t>(rank_id) * max_tokens_per_rank + dst_idx_k)
-                                * static_cast<size_t>(bytes_per_token);
-                        cp_async_bulk_s2g(dst, smem_staging + smem_offset, bytes_per_token);
-                    }
-                    smem_offset += bytes_per_token;
-                }
-                cp_async_bulk_commit_group();
-            }
-
-            // Issue remote-sends via fabric.try_put.counted — runs in parallel with the s2g above.
-            if (has_remote)
-            {
-                uint64_t counter_offset = ptrs.le_counter_base + static_cast<uint64_t>(rank_id) * kCftCounterStride;
-                int smem_offset = 0;
-                for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
+                for (int k = 0; k < TOP_K; ++k)
                 {
-                    int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-#pragma unroll
-                    for (int k = 0; k < TOP_K; ++k)
-                    {
-                        int dst_idx_k = topk_send_indices[k];
-                        int target_rank_k = topk_target_ranks[k];
-                        if (dst_idx_k < 0 || target_rank_k == rank_id)
-                            continue;
-                        uint64_t base_le_offset = ptrs.le_payload_offsets[payload_idx]
-                            + (static_cast<uint64_t>(rank_id) * max_tokens_per_rank + dst_idx_k)
-                                * static_cast<uint64_t>(bytes_per_token);
-                        uint32_t le_id = ptrs.peer_le_ids[target_rank_k];
-                        cft_fabric_try_put_counted(le_id, base_le_offset, counter_offset, smem_staging + smem_offset,
-                            bytes_per_token, tma_bar);
-                    }
-                    smem_offset += bytes_per_token;
+                    int dst_idx_k = topk_send_indices[k];
+                    int target_rank_k = topk_target_ranks[k];
+                    if (dst_idx_k < 0 || target_rank_k != rank_id)
+                        continue;
+                    uint8_t* dst = static_cast<uint8_t*>(ptrs.recv_buffers[rank_id][payload_idx])
+                        + (static_cast<size_t>(rank_id) * max_tokens_per_rank + dst_idx_k)
+                            * static_cast<size_t>(bytes_per_token);
+                    cp_async_bulk_s2g(dst, smem_staging + smem_offset, bytes_per_token);
                 }
-                cft_fabric_submit();
+                smem_offset += bytes_per_token;
             }
-
-            // Wait for both s2g and fabric puts to complete (independent HW, in parallel).
-            if (has_self)
-                cp_async_bulk_wait_group<0>();
-            if (has_remote)
-                cft_fabric_wait_reads();
+            cp_async_bulk_commit_group();
         }
+
+        // Issue remote-sends via fabric.try_put.counted — runs in parallel with the s2g above.
+        if (threadIdx.x == 0 && has_remote)
+        {
+            // Re-arm tma_bar as the put report target. Past the __syncthreads() above this thread
+            // is its only user, so the s2g issuer does not have to wait for it.
+            ::cuda::ptx::mbarrier_init(reinterpret_cast<::cuda::std::uint64_t*>(tma_bar), 1);
+            uint64_t counter_offset = ptrs.le_counter_base + static_cast<uint64_t>(rank_id) * kCftCounterStride;
+            int smem_offset = 0;
+            for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++)
+            {
+                int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+#pragma unroll
+                for (int k = 0; k < TOP_K; ++k)
+                {
+                    int dst_idx_k = topk_send_indices[k];
+                    int target_rank_k = topk_target_ranks[k];
+                    if (dst_idx_k < 0 || target_rank_k == rank_id)
+                        continue;
+                    uint64_t base_le_offset = ptrs.le_payload_offsets[payload_idx]
+                        + (static_cast<uint64_t>(rank_id) * max_tokens_per_rank + dst_idx_k)
+                            * static_cast<uint64_t>(bytes_per_token);
+                    uint32_t le_id = ptrs.peer_le_ids[target_rank_k];
+                    cft_fabric_try_put_counted(
+                        le_id, base_le_offset, counter_offset, smem_staging + smem_offset, bytes_per_token, tma_bar);
+                }
+                smem_offset += bytes_per_token;
+            }
+            cft_fabric_submit();
+        }
+
+        // Wait for both s2g and fabric puts to complete (independent HW, in parallel).
+        if (threadIdx.x == s2g_issuer && has_self)
+            cp_async_bulk_wait_group<0>();
+
+        if (threadIdx.x == 0 && has_remote)
+            cft_fabric_wait_reads();
         __syncthreads();
     }
 
