@@ -148,9 +148,16 @@ def test_indexer_topk_hist_cluster_sanitizer():
         print(result.stdout)
         if result.stderr:
             print(result.stderr)
+        combined = result.stdout + result.stderr
         assert result.returncode == 0, (
             f"compute-sanitizer --tool {tool} reported errors on the cluster path "
             "(barrier divergence / shared-memory hazard) -- a regression of the "
-            "decode-hang fixes in indexerTopKHist.cu. Tail:\n"
-            + (result.stdout + result.stderr)[-4000:]
+            "decode-hang fixes in indexerTopKHist.cu. Tail:\n" + combined[-4000:]
+        )
+        # A clean exit alone does not prove the histogram kernel ran: if dispatch
+        # fell back to the stock path, the sanitizer would pass without ever
+        # checking the intended kernel. Require the arming log to prove it engaged.
+        assert _ARMING_MARKER in combined, (
+            f"arming log not found for compute-sanitizer --tool {tool}; the worker "
+            "may have validated the stock fallback path instead of the ported kernel"
         )
