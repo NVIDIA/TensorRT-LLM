@@ -1182,6 +1182,124 @@ def test_enumerate_megamoe_sm107_candidate_tactics() -> None:
         megamoe_op.validate_megamoe_tactic(tuple(invalid_epi_batch), sm_version=107)
 
 
+def test_megamoe_sm107_dsv4_pro_default_tactics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+
+    tactics = megamoe_op._SM107_DSV4_PRO_DEFAULT_TACTICS
+    assert {
+        unique_id[7]: (tuple(tactic[0]), tactic[3][1], tactic[8], tactic[9])
+        for unique_id, tactic in tactics.items()
+    } == {
+        1024: ((256, 128, 256), 3, 1, (1, 4)),
+        2048: ((256, 256, 256), 3, 1, (1, 4)),
+        4096: ((256, 256, 256), 4, 1, (1, 4)),
+        8192: ((256, 256, 256), 3, 1, (1, 4)),
+        16384: ((256, 256, 256), 3, 1, (1, 4)),
+        32768: ((256, 256, 256), 3, 1, (1, 4)),
+    }
+    assert {unique_id[7] for unique_id in tactics} == {
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+    }
+    for unique_id, tactic in tactics.items():
+        assert tactic[1] == [4, 1, 1]
+        assert tactic[2] == [2, 1, 1]
+        assert (tactic[3][0], *tactic[4:8]) == (
+            "phase_interleave",
+            "atomic_counter",
+            "epi_warps",
+            True,
+            2,
+        )
+        assert unique_id[:7] == (107, 4, 6, 96, 7168, 3072, 6144)
+        assert unique_id[8:] == (
+            str(torch.bfloat16),
+            True,
+            10.0,
+            False,
+            "bf16",
+        )
+        megamoe_op.validate_megamoe_tactic(tactic, sm_version=107)
+
+    exact_key = next(unique_id for unique_id in tactics if unique_id[7] == 4096)
+    assert (100, *exact_key[1:]) not in tactics
+    assert (*exact_key[:7], 256, *exact_key[8:]) not in tactics
+    assert (*exact_key[:4], 4096, *exact_key[5:]) not in tactics
+
+    if not megamoe_op.IS_MEGAMOE_OP_AVAILABLE:
+        return
+
+    runner = megamoe_op.Sm100MegaMoENvfp4Runner.__new__(megamoe_op.Sm100MegaMoENvfp4Runner)
+    (
+        runner.sm_version,
+        runner.world_size,
+        runner.num_topk,
+        runner.num_experts_per_rank,
+        runner.hidden_size,
+        runner.intermediate_size_per_partition,
+        runner.expand_intermediate_size_per_partition,
+        runner.max_tokens_per_rank,
+    ) = exact_key[:8]
+    runner.output_dtype = torch.bfloat16
+    (
+        runner.apply_topk_in_fc1,
+        runner.gate_up_clamp,
+        runner.in_kernel_fc2_reduce,
+        runner.combine_format,
+    ) = exact_key[9:]
+
+    inputs = [torch.empty((exact_key[7], 1))]
+    baseline = megamoe_op.enumerate_megamoe_candidate_tactics(exact_key[7], sm_version=107)
+    candidates = runner.get_valid_tactics(inputs, MagicMock())
+    assert tactics[exact_key] not in baseline
+    assert candidates == baseline + [tactics[exact_key]]
+
+    class TacticSelected(Exception):
+        pass
+
+    selected = []
+
+    def capture_tactic(tactic, *, sm_version=None):
+        selected.append((tactic, sm_version))
+        raise TacticSelected
+
+    monkeypatch.setattr(megamoe_op, "validate_megamoe_tactic", capture_tactic)
+    monkeypatch.setattr(
+        megamoe_op,
+        "default_megamoe_tactic",
+        lambda _num_tokens: pytest.fail("generic fallback unexpectedly selected"),
+    )
+    with pytest.raises(TacticSelected):
+        runner.forward(inputs)
+    assert selected == [(tactics[exact_key], 107)]
+
+    cap_key = next(unique_id for unique_id in tactics if unique_id[7] == 32768)
+    runner.max_tokens_per_rank = cap_key[7]
+    live_inputs = [torch.empty((8192, 1))]
+    with pytest.raises(TacticSelected):
+        runner.forward(live_inputs)
+    assert selected[-1] == (tactics[cap_key], 107)
+
+    fallback_tactic = object()
+    fallback_tokens = []
+    runner.max_tokens_per_rank = 6144
+    monkeypatch.setattr(
+        megamoe_op,
+        "default_megamoe_tactic",
+        lambda num_tokens: (fallback_tokens.append(num_tokens) or fallback_tactic),
+    )
+    with pytest.raises(TacticSelected):
+        runner.forward(live_inputs)
+    assert fallback_tokens == [8192]
+    assert selected[-1] == (fallback_tactic, 107)
+
+
 def test_megamoe_cutedsl_accepts_sm107_with_required_dependencies() -> None:
     verdict = MegaMoECuteDsl.can_implement(
         MoEProblem(

@@ -20,7 +20,8 @@ standard TRT-LLM CuteDSL op pattern used by
   ``run_moe``. ``tactic_autotune=True`` (bench-only, enabled via the
   ``MEGAMOE_TACTIC_AUTOTUNE=1`` env var read by the backend) runs
   ``AutoTuner.choose_one`` per call; the default bypasses the AutoTuner
-  and uses the deterministic token-bucket heuristic tactic.
+  and uses a shape-tuned tactic when available, otherwise the deterministic
+  token-bucket heuristic tactic.
 
 The backend never instantiates :class:`Sm100MegaMoENvfp4Runner`
 directly; this mirrors how ``CuteDslFusedMoE`` only consumes
@@ -233,8 +234,8 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
 
 
 def default_megamoe_tactic(num_tokens: int) -> Tuple:
-    """Deterministic token-bucket fallback tactic (autotune disabled /
-    cache miss / tactic=-1); never profiled by the autotuner."""
+    """Deterministic token-bucket fallback when no shape-tuned default
+    exists; never profiled by the autotuner."""
     if num_tokens <= 1024:
         # decode winner: N128 only helps epi_warps + bulk.
         return (
@@ -275,6 +276,48 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
         8,
         (2, 4),
     )
+
+
+# Static defaults selected from MR38's balanced and power-law winner sets for
+# the SM107 DSv4 Pro EP4 shape. Routing distribution is not a rank-identical
+# runtime input, so each bucket uses one static tactic. The full runner key
+# prevents applying the table beyond the measured shape and codegen modes.
+_SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
+    (
+        107,
+        4,
+        6,
+        96,
+        7168,
+        3072,
+        6144,
+        max_tokens_per_rank,
+        str(torch.bfloat16),
+        True,
+        10.0,
+        False,
+        "bf16",
+    ): (
+        list(mma_tiler),
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", phase_hint),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        2,
+        flag_batch,
+        (1, 4),
+    )
+    for max_tokens_per_rank, (mma_tiler, phase_hint, flag_batch) in {
+        1024: ((256, 128, 256), 3, 1),
+        2048: ((256, 256, 256), 3, 1),
+        4096: ((256, 256, 256), 4, 1),
+        8192: ((256, 256, 256), 3, 1),
+        16384: ((256, 256, 256), 3, 1),
+        32768: ((256, 256, 256), 3, 1),
+    }.items()
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1590,6 +1633,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     for t in candidates
                     if not (_unpack_tactic(t)[6] and _unpack_tactic(t)[5] == "epi_warps")
                 ]
+            default_tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(self.unique_id())
+            if default_tactic is not None and default_tactic not in candidates:
+                candidates.append(default_tactic)
             return candidates
 
         def _autotuner_inputs_pre_hook(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -1852,7 +1898,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 if self.in_kernel_fc2_reduce or self.combine_format != "bf16":
                     tactic_t = _MEGAMOE_NONBULK_STANDALONE_TACTIC
                 else:
-                    tactic_t = default_megamoe_tactic(num_tokens)
+                    tactic_t = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(self.unique_id())
+                    if tactic_t is None:
+                        tactic_t = default_megamoe_tactic(num_tokens)
             elif isinstance(tactic, list):
                 tactic_t = tuple(tactic)
             else:
@@ -2122,9 +2170,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
         Inputs are pre-staged by the caller (the ``MegaMoECuteDsl``
         backend in ``mega_moe_cute_dsl.py``). ``tactic_autotune=True``
         (``MEGAMOE_TACTIC_AUTOTUNE=1`` bench opt-in) picks the tactic via
-        AutoTuner per call. The default uses ``default_megamoe_tactic`` for
-        BF16 form-A and the standalone non-bulk fallback for form-B or a
-        quantized combine format.
+        AutoTuner per call. For BF16 form-A, the default uses a shape-tuned
+        tactic when available and otherwise ``default_megamoe_tactic``. Form-B
+        or a quantized combine format uses the standalone non-bulk fallback.
 
         ``shared_workspace`` MUST be a symmetric-heap tensor for
         ``world_size > 1`` (use :class:`MegaMoeSymmMemProvider`); a
@@ -2190,7 +2238,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # Opt-OUT (default; serving never opts in): skip the AutoTuner.
             # ``choose_one`` is NOT a safe no-op -- in tuning mode a cache miss
             # materializes the multi-GiB scratch and MERGE-sweeps every
-            # candidates. tactic=-1 guarantees the deterministic heuristic
+            # candidates. tactic=-1 guarantees deterministic default selection
             # with no tuning collectives, even inside a global autotune().
             runner(
                 inputs,
@@ -2202,7 +2250,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         tuner = AutoTuner.get()
         # Opt-IN: in tuning mode the MERGE lockstep sweep runs (made safe by
         # the tactic-change fence in forward); outside it choose_one is a pure
-        # cache lookup (tuned tactic, or -1 -> deterministic heuristic).
+        # cache lookup (tuned tactic, or -1 -> deterministic default selection).
         # Profiling must use SYMMETRIC cross-rank buffers (the transient
         # scratch); only single-rank may fall back to the staging buffer.
         prof_scratch = _ACTIVE_MEGAMOE_PROFILING_SCRATCH if world_size > 1 else None
