@@ -119,6 +119,7 @@ def _decode_metadata(layer_cache: SimpleNamespace, slot_indices: torch.Tensor) -
         mamba_metadata=mamba_metadata,
         num_contexts=0,
         num_ctx_tokens=0,
+        num_tokens=batch,
         seq_lens=torch.ones(batch, device=slot_indices.device, dtype=torch.int32),
         kv_cache_manager=cache_manager,
     )
@@ -140,6 +141,7 @@ def _prefill_metadata(
         mamba_metadata=mamba_metadata,
         num_contexts=batch,
         num_ctx_tokens=int(cu_seqlens[-1]),
+        num_tokens=int(cu_seqlens[-1]),
         seq_lens=cu_seqlens[1:] - cu_seqlens[:-1],
         kv_cache_manager=cache_manager,
     )
