@@ -17,6 +17,7 @@
 #include "tensorrt_llm/kernels/kdaDecode/kdaDecode.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -378,6 +379,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
     int const tid = threadIdx.x;
     int const lane = tid & 31;
     int const warp = tid >> 5;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
     int i_n;
     int i_hv;
     int i_h;
@@ -891,6 +895,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_compact_heads_k
             out[out_idx] = bf16_store(s_o[tid]);
         }
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 template <bool kApplyOnorm, bool kUseStaticDecodeLayout = false, int kFixedHeads = 0, int kFixedValueHeads = 0,
@@ -914,6 +921,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
     int const tid = threadIdx.x;
     int const lane = tid & 31;
     int const warp = tid >> 5;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaGridDependencySynchronize();
+#endif
     int i_n;
     int i_hv;
     int i_h;
@@ -1380,6 +1390,9 @@ __global__ __launch_bounds__(kThreads, 2) void kda_decode_fusion_many_heads_kern
             out[out_idx] = bf16_store(s_o[tid]);
         }
     }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 struct KdaDecodeLaunchParams
@@ -1427,23 +1440,20 @@ template <int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm, bool kUpdat
 void launch_kda_decode_compact_heads_raw(KdaDecodeLaunchParams const& p)
 {
     constexpr int kStageDynamicSmemBytes = 3 * 32 * kDimK * static_cast<int>(sizeof(float));
-    TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-        kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, kUseStaticDecodeLayout, kHeads, kHeads, false, false,
-            false, true, false, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, kStageDynamicSmemBytes));
-    kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, kUseStaticDecodeLayout, kHeads, kHeads, false, false,
-        false, true, false, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>
-        <<<dim3(p.B * p.HV), dim3(kThreads), kStageDynamicSmemBytes, p.stream>>>(
-            reinterpret_cast<__nv_bfloat16 const*>(p.x_q), reinterpret_cast<__nv_bfloat16 const*>(p.x_k),
-            reinterpret_cast<__nv_bfloat16 const*>(p.x_v), reinterpret_cast<__nv_bfloat16 const*>(p.w_q_t),
-            reinterpret_cast<__nv_bfloat16 const*>(p.w_k_t), reinterpret_cast<__nv_bfloat16 const*>(p.w_v_t),
-            reinterpret_cast<__nv_bfloat16 const*>(p.bias_q), reinterpret_cast<__nv_bfloat16 const*>(p.bias_k),
-            reinterpret_cast<__nv_bfloat16 const*>(p.bias_v), reinterpret_cast<__nv_bfloat16*>(p.cs_q),
-            reinterpret_cast<__nv_bfloat16*>(p.cs_k), reinterpret_cast<__nv_bfloat16*>(p.cs_v), p.a_log,
-            reinterpret_cast<__nv_bfloat16 const*>(p.g), p.dt_bias, reinterpret_cast<__nv_bfloat16 const*>(p.beta),
-            reinterpret_cast<__nv_bfloat16 const*>(p.onorm_g), p.onorm_weight, p.ssm_state_indices, p.cu_seqlens,
-            p.state, p.state_slot_stride, p.conv_state_slot_stride, reinterpret_cast<__nv_bfloat16*>(p.out), p.B, p.H,
-            p.HV, p.lower_bound, p.scale, p.onorm_eps, p.layout);
+    auto const kernel = kda_decode_fusion_compact_heads_kernel<kApplyOnorm, true, kUseStaticDecodeLayout, kHeads,
+        kHeads, false, false, false, true, false, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>;
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kStageDynamicSmemBytes));
+    common::launchWithPdlWhenEnabled("kdaDecodeCompactHeads", kernel, dim3(p.B * p.HV), dim3(kThreads),
+        kStageDynamicSmemBytes, p.stream, reinterpret_cast<__nv_bfloat16 const*>(p.x_q),
+        reinterpret_cast<__nv_bfloat16 const*>(p.x_k), reinterpret_cast<__nv_bfloat16 const*>(p.x_v),
+        reinterpret_cast<__nv_bfloat16 const*>(p.w_q_t), reinterpret_cast<__nv_bfloat16 const*>(p.w_k_t),
+        reinterpret_cast<__nv_bfloat16 const*>(p.w_v_t), reinterpret_cast<__nv_bfloat16 const*>(p.bias_q),
+        reinterpret_cast<__nv_bfloat16 const*>(p.bias_k), reinterpret_cast<__nv_bfloat16 const*>(p.bias_v),
+        reinterpret_cast<__nv_bfloat16*>(p.cs_q), reinterpret_cast<__nv_bfloat16*>(p.cs_k),
+        reinterpret_cast<__nv_bfloat16*>(p.cs_v), p.a_log, reinterpret_cast<__nv_bfloat16 const*>(p.g), p.dt_bias,
+        reinterpret_cast<__nv_bfloat16 const*>(p.beta), reinterpret_cast<__nv_bfloat16 const*>(p.onorm_g),
+        p.onorm_weight, p.ssm_state_indices, p.cu_seqlens, p.state, p.state_slot_stride, p.conv_state_slot_stride,
+        reinterpret_cast<__nv_bfloat16*>(p.out), p.B, p.H, p.HV, p.lower_bound, p.scale, p.onorm_eps, p.layout);
 }
 
 template <int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm, bool kUpdateConvState, bool kUseLowerBound,
@@ -1452,18 +1462,20 @@ void launch_kda_decode_many_heads_raw(KdaDecodeLaunchParams const& p)
 {
     constexpr bool kUseHeadGrid = kUseStaticDecodeLayout;
     dim3 const grid = kUseStaticDecodeLayout ? dim3(p.B, p.HV) : dim3(p.B * p.HV);
-    kda_decode_fusion_many_heads_kernel<kApplyOnorm, kUseStaticDecodeLayout, kHeads, kHeads, kUseHeadGrid, false, false,
-        false, false, false, true, true, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>
-        <<<grid, dim3(kThreads), 0, p.stream>>>(reinterpret_cast<__nv_bfloat16 const*>(p.x_q),
-            reinterpret_cast<__nv_bfloat16 const*>(p.x_k), reinterpret_cast<__nv_bfloat16 const*>(p.x_v),
-            reinterpret_cast<__nv_bfloat16 const*>(p.w_q_t), reinterpret_cast<__nv_bfloat16 const*>(p.w_k_t),
-            reinterpret_cast<__nv_bfloat16 const*>(p.w_v_t), reinterpret_cast<__nv_bfloat16 const*>(p.bias_q),
-            reinterpret_cast<__nv_bfloat16 const*>(p.bias_k), reinterpret_cast<__nv_bfloat16 const*>(p.bias_v),
-            reinterpret_cast<__nv_bfloat16*>(p.cs_q), reinterpret_cast<__nv_bfloat16*>(p.cs_k),
-            reinterpret_cast<__nv_bfloat16*>(p.cs_v), p.a_log, reinterpret_cast<__nv_bfloat16 const*>(p.g), p.dt_bias,
-            reinterpret_cast<__nv_bfloat16 const*>(p.beta), reinterpret_cast<__nv_bfloat16 const*>(p.onorm_g),
-            p.onorm_weight, p.ssm_state_indices, p.cu_seqlens, p.state, p.state_slot_stride, p.conv_state_slot_stride,
-            reinterpret_cast<__nv_bfloat16*>(p.out), p.B, p.H, p.HV, p.lower_bound, p.scale, p.onorm_eps, p.layout);
+    auto const kernel
+        = kda_decode_fusion_many_heads_kernel<kApplyOnorm, kUseStaticDecodeLayout, kHeads, kHeads, kUseHeadGrid, false,
+            false, false, false, false, true, true, true, kUpdateConvState, kUseLowerBound, kApplyBetaSigmoid>;
+    common::launchWithPdlWhenEnabled("kdaDecodeManyHeads", kernel, grid, dim3(kThreads), 0, p.stream,
+        reinterpret_cast<__nv_bfloat16 const*>(p.x_q), reinterpret_cast<__nv_bfloat16 const*>(p.x_k),
+        reinterpret_cast<__nv_bfloat16 const*>(p.x_v), reinterpret_cast<__nv_bfloat16 const*>(p.w_q_t),
+        reinterpret_cast<__nv_bfloat16 const*>(p.w_k_t), reinterpret_cast<__nv_bfloat16 const*>(p.w_v_t),
+        reinterpret_cast<__nv_bfloat16 const*>(p.bias_q), reinterpret_cast<__nv_bfloat16 const*>(p.bias_k),
+        reinterpret_cast<__nv_bfloat16 const*>(p.bias_v), reinterpret_cast<__nv_bfloat16*>(p.cs_q),
+        reinterpret_cast<__nv_bfloat16*>(p.cs_k), reinterpret_cast<__nv_bfloat16*>(p.cs_v), p.a_log,
+        reinterpret_cast<__nv_bfloat16 const*>(p.g), p.dt_bias, reinterpret_cast<__nv_bfloat16 const*>(p.beta),
+        reinterpret_cast<__nv_bfloat16 const*>(p.onorm_g), p.onorm_weight, p.ssm_state_indices, p.cu_seqlens, p.state,
+        p.state_slot_stride, p.conv_state_slot_stride, reinterpret_cast<__nv_bfloat16*>(p.out), p.B, p.H, p.HV,
+        p.lower_bound, p.scale, p.onorm_eps, p.layout);
 }
 
 template <bool kCompact, int kHeads, bool kUseStaticDecodeLayout, bool kApplyOnorm, bool kUpdateConvState,

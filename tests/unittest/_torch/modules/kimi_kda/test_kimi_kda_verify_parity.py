@@ -213,6 +213,61 @@ def test_kda_qkvg_multistream_decode_matches_separate_projections():
     torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=2e-2, atol=2e-2)
 
 
+@torch.no_grad()
+def test_kda_decode_pdl_module_parity():
+    """Run in separate processes with TRTLLM_ENABLE_PDL=0 and 1."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+
+    torch.manual_seed(0)
+    device = "cuda"
+    cfg = _K3Cfg()
+    lin = cfg.linear_attn_config
+    h = lin["num_heads"]
+    head_dim = lin["head_dim"]
+    d = h * head_dim
+    w = lin["short_conv_kernel_size"]
+
+    runtime = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
+    if get_production_decode_kernel_path(runtime) != "optimized":
+        pytest.skip("needs an SM100/SM103 GPU")
+    for param in runtime.parameters():
+        if param.is_floating_point():
+            torch.nn.init.normal_(param, std=0.02)
+
+    reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
+    reference.load_state_dict(runtime.state_dict())
+    runtime.finalize_decode_weights()
+    assert runtime._qkvg_proj_weight is not None
+    assert runtime._bfa_proj_weight is not None
+
+    batch = 3
+    slots = batch + 2
+    slot_indices = torch.tensor([2, 0, 4], device=device, dtype=torch.long)
+    hidden_states = torch.randn(batch, cfg.hidden_size, device=device, dtype=torch.bfloat16) * 0.05
+    conv_seed = torch.randn(slots, 3 * d, w - 1, device=device, dtype=torch.bfloat16) * 0.02
+    state_seed = (
+        torch.randn(slots, h, head_dim, head_dim, device=device, dtype=torch.float32) * 0.01
+    )
+
+    expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    expected = reference(hidden_states, _decode_metadata(expected_cache, slot_indices))
+
+    actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
+    fused_qkvg_error = AssertionError("fused QKVG decode called a separate projection")
+    with (
+        patch.object(runtime.q_proj, "forward", side_effect=fused_qkvg_error),
+        patch.object(runtime.k_proj, "forward", side_effect=fused_qkvg_error),
+        patch.object(runtime.v_proj, "forward", side_effect=fused_qkvg_error),
+        patch.object(runtime.g_proj, "forward", side_effect=fused_qkvg_error),
+    ):
+        actual = runtime(hidden_states, _decode_metadata(actual_cache, slot_indices))
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(actual_cache.temporal, expected_cache.temporal, rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize("batch", [1, 3])
 @pytest.mark.parametrize("t_steps", [2, 3])
 def test_kda_verify_matches_sequential_decode(batch, t_steps):
