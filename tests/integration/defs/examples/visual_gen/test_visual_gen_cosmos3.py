@@ -15,6 +15,7 @@
 
 """Single-GPU integration and accuracy tests for Cosmos3."""
 
+import contextlib
 import os
 from dataclasses import dataclass
 
@@ -249,9 +250,20 @@ def _generate_cosmos3_feature_image(case, output_path):
         model_path = _lpips_model_path(COSMOS3_NANO_MODEL_SUBPATH)
         _skip_if_missing(model_path, "Cosmos3-Nano checkpoint", is_dir=True)
         _disable_inductor_compile_worker_quiesce()
+        # Pin fp32-matmul arithmetic only for the profiles whose goldens are
+        # re-baselined under it. NVFP4's golden is waived (nvbugs/6572800) and
+        # not re-cut here, so it keeps generating under the host default; pin
+        # it when that golden is re-cut. Note the NVFP4 profile reaches this
+        # same function inside a spawned process, so the guard has to be here
+        # rather than at the call site.
+        precision_context = (
+            contextlib.nullcontext()
+            if case.features.quantization == "NVFP4"
+            else _lpips_pinned_fp32_matmul_precision()
+        )
         with (
             _lpips_deterministic_algorithms(),
-            _lpips_pinned_fp32_matmul_precision(),
+            precision_context,
             _fixed_nvfp4_quantization_backend(case.features),
         ):
             args = _build_single_device_feature_args(
