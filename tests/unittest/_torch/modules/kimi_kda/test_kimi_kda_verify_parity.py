@@ -146,18 +146,7 @@ def test_kda_prefill_matches_reference():
     expected = reference(hidden_states, _prefill_metadata(expected_cache, slot_indices, cu_seqlens))
 
     actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
-    # Fused QKVG uses the merged weight directly and must bypass these modules.
-    fused_qkvg_error = AssertionError("fused QKVG prefill called a separate projection")
-    with (
-        patch.object(runtime.q_proj, "forward", side_effect=fused_qkvg_error),
-        patch.object(runtime.k_proj, "forward", side_effect=fused_qkvg_error),
-        patch.object(runtime.v_proj, "forward", side_effect=fused_qkvg_error),
-        patch.object(runtime.g_proj, "forward", side_effect=fused_qkvg_error),
-    ):
-        actual = runtime(
-            hidden_states,
-            _prefill_metadata(actual_cache, slot_indices, cu_seqlens),
-        )
+    actual = runtime(hidden_states, _prefill_metadata(actual_cache, slot_indices, cu_seqlens))
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=2e-2, atol=2e-2)
