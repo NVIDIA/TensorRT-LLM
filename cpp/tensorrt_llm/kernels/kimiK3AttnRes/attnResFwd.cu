@@ -33,6 +33,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/kimiK3AttnRes/attnResFwd.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
@@ -1703,12 +1704,10 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
     float const rms_eps = params.rmsEps;
 
     int dev = 0;
-    cudaGetDevice(&dev);
+    TLLM_CUDA_CHECK(cudaGetDevice(&dev));
     int num_sm = attn_res_fwd_grid_size(dev);
-    if (num_sm <= 0 || N > N_MAX)
-    {
-        return;
-    }
+    TLLM_CHECK_WITH_INFO(num_sm > 0, "attn_res_fwd: failed to query the SM count of device %d", dev);
+    TLLM_CHECK_WITH_INFO(N <= N_MAX, "attn_res_fwd: unsupported N=%d (max %d)", N, N_MAX);
 
     if (H == 8192)
     {
@@ -1758,7 +1757,7 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
         else if (N == 12 && T == 1024)
         {
             launch_fwd<7168, 4, false, true>(block_residual, layer_residual, res_weight, rms_weight, output, rsigma,
-                probs, logits, N, T, B, rms_eps, num_sm - 1, stream);
+                probs, logits, N, T, B, rms_eps, std::max(1, num_sm - 1), stream);
         }
         else
         {
@@ -1794,6 +1793,10 @@ void invokeAttnResFwd(AttnResFwdParams const& params, cudaStream_t stream)
                 logits, N, T, B, rms_eps, num_sm, stream);
         }
     }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(false, "attn_res_fwd: unsupported hidden size H=%d", H);
+    }
 }
 
 template <int N, bool FUSE_LAYER_ADD>
@@ -1821,6 +1824,14 @@ static void launchAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStrea
 template <bool FUSE_LAYER_ADD>
 static void invokeAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStream_t stream)
 {
+    TLLM_CHECK_WITH_INFO(params.seqLen == 1 && params.batchSize == 1 && params.hiddenSize == 7168,
+        "attn_res decode RMSNorm supports T=B=1, H=7168 only");
+    TLLM_CHECK_WITH_INFO(params.outputRmsWeight != nullptr, "attn_res decode RMSNorm requires outputRmsWeight");
+    if constexpr (FUSE_LAYER_ADD)
+    {
+        TLLM_CHECK_WITH_INFO(params.layerResidualAdd != nullptr && params.updatedLayerResidual != nullptr,
+            "attn_res decode add+RMSNorm requires layerResidualAdd and updatedLayerResidual");
+    }
     switch (params.numCandidates)
     {
     case 1: launchAttnResDecodeRmsNorm<1, FUSE_LAYER_ADD>(params, stream); break;
@@ -1833,7 +1844,9 @@ static void invokeAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStrea
     case 8: launchAttnResDecodeRmsNorm<8, FUSE_LAYER_ADD>(params, stream); break;
     case 9: launchAttnResDecodeRmsNorm<9, FUSE_LAYER_ADD>(params, stream); break;
     case 12: launchAttnResDecodeRmsNorm<12, FUSE_LAYER_ADD>(params, stream); break;
-    default: break;
+    default:
+        TLLM_CHECK_WITH_INFO(false, "attn_res decode RMSNorm: unsupported numCandidates=%d (expected [1, 9] or 12)",
+            params.numCandidates);
     }
 }
 
