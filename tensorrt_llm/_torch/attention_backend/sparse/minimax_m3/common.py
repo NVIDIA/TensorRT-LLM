@@ -11,9 +11,11 @@ slot mapping builder. MSA-only helpers live in :mod:`.msa_utils`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Tuple
 
 import torch
+
+from tensorrt_llm._utils import async_tensor_h2d, maybe_pin_memory
 
 from ..params import SparseMetadataParams, SparseParams
 
@@ -188,6 +190,15 @@ def write_kv_slots(
             cache.index_copy_(0, out_cache_loc.to(torch.long), values.to(cache.dtype))
 
 
+class PagedKvSlotMapping(NamedTuple):
+    """One step's paged-cache slot mapping (see build_paged_kv_slot_mapping)."""
+
+    req_to_token: torch.Tensor
+    slot_ids: torch.Tensor
+    out_cache_loc: torch.Tensor
+    block_ids_cpu: torch.Tensor
+
+
 def build_paged_kv_slot_mapping(
     *,
     kv_cache_manager,
@@ -195,12 +206,11 @@ def build_paged_kv_slot_mapping(
     qo_lens_cpu: torch.Tensor,
     qo_offset_cpu: torch.Tensor,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> PagedKvSlotMapping:
     """Build the backend-neutral paged-cache slot mapping.
 
-    Returns (req_to_token, slot_ids, out_cache_loc), derived only from the paged
-    KV cache manager and the per-request query geometry, with no dependency on
-    any backend-specific metadata.
+    Derived only from the paged KV cache manager and the per-request query
+    geometry, with no dependency on any backend-specific metadata.
 
     req_to_token is the [batch, max_kv_len] int32 map from (request, position)
     to a global slot id, expanded from get_block_ids_per_seq with
@@ -209,21 +219,26 @@ def build_paged_kv_slot_mapping(
     lists the per-new-token slot ids in flattened query order: request b
     contributes positions qo_offset[b] through qo_offset[b] + qo_lens[b] - 1.
     That one formula covers prefill (qo_offset is the prefix length) and decode
-    (qo_offset is kv_len - 1 with qo_len 1).
+    (qo_offset is kv_len - 1 with qo_len 1). block_ids_cpu is the host block-id
+    table every field above derives from, returned so backends can build their
+    own page-indexed views without a second manager query or a device round
+    trip.
 
-    The req_to_token reads that build out_cache_loc sync the host, so call this
-    only from prepare(), never from the forward path.
+    Both out_cache_loc and req_to_token are computed from the host block ids and
+    staged with non-blocking copies, so this neither syncs the host nor reads
+    device memory back. It still allocates per step, so call it from prepare(),
+    never from the forward path.
     """
     tokens_per_block = int(kv_cache_manager.tokens_per_block)
     # block_ids_per_seq is a [batch, max_blocks_per_seq] tensor; row b holds the
     # block ids assigned to request_ids[b] in order.
-    block_ids = kv_cache_manager.get_block_ids_per_seq(list(request_ids))
+    block_ids = maybe_pin_memory(kv_cache_manager.get_block_ids_per_seq(list(request_ids)))
     batch = int(qo_lens_cpu.shape[0])
     max_blocks = int(block_ids.shape[1])
     max_kv_len = max_blocks * tokens_per_block
 
     # Expand block ids -> per-token slot ids.
-    block_ids_dev = block_ids.to(device).to(torch.int64)
+    block_ids_dev = block_ids.to(device, non_blocking=True).to(torch.int64)
     within_block = torch.arange(tokens_per_block, device=device, dtype=torch.int64)
     # Outer product per batch entry: [batch, max_blocks, tokens_per_block]
     slot_grid = block_ids_dev.unsqueeze(-1) * tokens_per_block + within_block
@@ -231,22 +246,37 @@ def build_paged_kv_slot_mapping(
     slot_ids = torch.arange(batch, device=device, dtype=torch.int32)
 
     # out_cache_loc: per-new-token slot ids, in flattened query-token order.
-    req_to_token_cpu = req_to_token.to("cpu")
-    qo_lens_list = qo_lens_cpu.to(torch.long).tolist()
-    qo_offset_list = qo_offset_cpu.to(torch.long).tolist()
-    out_cache_loc_list: List[int] = []
-    for b in range(batch):
-        start = int(qo_offset_list[b])
-        for offset in range(int(qo_lens_list[b])):
-            out_cache_loc_list.append(int(req_to_token_cpu[b, start + offset].item()))
-    out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
-    return req_to_token, slot_ids, out_cache_loc
+    # Expanding the per-request lengths on the host reproduces the same slot
+    # ids as indexing req_to_token, without copying that [batch, max_kv_len]
+    # grid back from the device.
+    qo = qo_lens_cpu.to(torch.long)
+    total_q = int(qo.sum())
+    if total_q == 0:
+        out_cache_loc_cpu = torch.empty(0, dtype=torch.int32)
+    else:
+        row = torch.repeat_interleave(torch.arange(batch, dtype=torch.long), qo)
+        starts = torch.cumsum(qo, 0) - qo
+        pos = qo_offset_cpu.to(torch.long)[row] + (
+            torch.arange(total_q, dtype=torch.long) - starts[row]
+        )
+        # A zero-length CUDA-graph padding row offsets to -1. Its slot is a
+        # placeholder no forward reads, so keep it in the row instead of
+        # indexing off the table.
+        pos.clamp_(min=0, max=max(max_kv_len - 1, 0))
+        block_col = torch.div(pos, tokens_per_block, rounding_mode="floor")
+        out_cache_loc_cpu = (
+            block_ids[row, block_col].to(torch.long) * tokens_per_block
+            + (pos - block_col * tokens_per_block)
+        ).to(torch.int32)
+    out_cache_loc = async_tensor_h2d(out_cache_loc_cpu, torch.int32, device)
+    return PagedKvSlotMapping(req_to_token, slot_ids, out_cache_loc, block_ids)
 
 
 __all__ = [
     "MiniMaxM3SparseConfig",
     "MiniMaxM3SparseMetadataParams",
     "MiniMaxM3SparseParams",
+    "PagedKvSlotMapping",
     "build_paged_kv_slot_mapping",
     "write_kv_slots",
 ]

@@ -1,3 +1,19 @@
+diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
+index b02f747..b69cd8b 100644
+--- a/python/fmha_sm100/api.py
++++ b/python/fmha_sm100/api.py
+@@ -532,9 +532,8 @@ def _fmha_sm100_plan(
+ 
+     if kv_block_num > 0 and (sparse_kernel_mode == 'prefill' or (sparse_kernel_mode == 'auto' and max_qo_len_orig > _prefill_qlen_threshold(True))):
+         # print("Nv-Prefill")
+-        qo_segment_lens = qo_segment_lens.to(device)
+-        kv_segment_lens = kv_segment_lens.to(device)
+-        qo_offset = qo_offset.to(device)
++        # sparse_fmha_plan reads these lengths on the host and stages its own
++        # device copies, so hand them through unchanged.
+         return sparse_fmha_plan(qo_segment_lens=qo_segment_lens, kv_segment_lens=kv_segment_lens,
+                 num_qo_heads=num_qo_heads, causal=causal, qo_offset=qo_offset,
+                 num_kv_splits=num_kv_splits, page_size=page_size, output_maxscore=output_maxscore,
 diff --git a/python/fmha_sm100/cute/interface.py b/python/fmha_sm100/cute/interface.py
 index d72b17a..eca5b8c 100644
 --- a/python/fmha_sm100/cute/interface.py
@@ -224,10 +240,65 @@ index 21c777e..b5f078b 100644
  @pytest.mark.parametrize("causal", [True])
  @pytest.mark.parametrize("batch", [3])
 diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse_fmha_adapter.py
-index 306b416..fd24e7e 100644
+index 306b416..81bf1ff 100644
 --- a/python/fmha_sm100/sparse_fmha_adapter.py
 +++ b/python/fmha_sm100/sparse_fmha_adapter.py
-@@ -228,23 +228,83 @@ def _build_page_table(
+@@ -129,11 +129,19 @@ def sparse_fmha_plan(
+     batch = qo_segment_lens.shape[0]
+     gpu_device = torch.device('cuda')
+ 
++    # Stage the host lengths to the device once, asynchronously, and read every
++    # scalar below from the host copy. Planning runs on the critical path of
++    # input preparation, where a blocking copy or a device .item() would drain
++    # the CUDA queue.
++    qo_lens_gpu = qo_segment_lens.to(torch.int32).to(gpu_device, non_blocking=True)
++    kv_lens_host = kv_segment_lens.to(torch.int32)
++    kv_lens_gpu = kv_lens_host.to(gpu_device, non_blocking=True)
++
+     cu_seqlens_q = torch.zeros(batch + 1, dtype=torch.int32, device=gpu_device)
+-    cu_seqlens_q[1:] = torch.cumsum(qo_segment_lens.to(torch.int32).to(gpu_device), dim=0)
++    cu_seqlens_q[1:] = torch.cumsum(qo_lens_gpu, dim=0)
+ 
+     cu_seqlens_k = torch.zeros(batch + 1, dtype=torch.int32, device=gpu_device)
+-    cu_seqlens_k[1:] = torch.cumsum(kv_segment_lens.to(torch.int32).to(gpu_device), dim=0)
++    cu_seqlens_k[1:] = torch.cumsum(kv_lens_gpu, dim=0)
+ 
+     max_seqlen_q = int(qo_segment_lens.max().item())
+     max_seqlen_k = int(kv_segment_lens.max().item())
+@@ -144,11 +152,12 @@ def sparse_fmha_plan(
+     total_rows = sum((int(kl) + blk_kv - 1) // blk_kv for kl in kv_lens)
+ 
+     if qo_offset is not None:
+-        seqused_k = (qo_segment_lens + qo_offset).to(torch.int32).to(gpu_device)
++        seqused_k = (qo_segment_lens + qo_offset).to(torch.int32).to(gpu_device, non_blocking=True)
+     else:
+-        seqused_k = kv_segment_lens.to(torch.int32).to(gpu_device)
++        seqused_k = kv_lens_gpu.clone()
+ 
+-    total_q = int(cu_seqlens_q[-1].item())
++    # Equals cu_seqlens_q[-1], read on the host.
++    total_q = int(qo_segment_lens.sum())
+     qhead_per_kv = num_qo_heads // num_kv_heads if num_kv_heads > 0 else 1
+ 
+     target_q_per_cta = SPARSE_SCHEDULE_MODEL.balanced_target_q_per_cta(
+@@ -169,11 +178,14 @@ def sparse_fmha_plan(
+     )
+ 
+     return {
+-        "qo_segment_lens": qo_segment_lens,
++        "qo_segment_lens": qo_lens_gpu,
+         "cu_seqlens_q": cu_seqlens_q,
+         "qo_segment_offsets": cu_seqlens_q,
+         "cu_seqlens_k": cu_seqlens_k,
+-        "kv_segment_lens": kv_segment_lens.to(torch.int32).to(gpu_device),
++        # Host tensor: only the page-table builder consumes it, and it reads
++        # per-request page counts on the host. Kernels take the lengths from
++        # cu_seqlens_k and seqused_k.
++        "kv_segment_lens": kv_lens_host,
+         "seqused_k": seqused_k,
+         "max_seqlen_q": max_seqlen_q,
+         "max_seqlen_k": max_seqlen_k,
+@@ -228,23 +240,83 @@ def _build_page_table(
      page_size: int,
      batch: int,
  ) -> torch.Tensor:
@@ -326,7 +397,7 @@ index 306b416..fd24e7e 100644
      return page_table
  
  
-@@ -351,8 +411,8 @@ def sparse_fmha(
+@@ -351,8 +423,8 @@ def sparse_fmha(
      if is_paged:
  
          if kv_indices is not None:
