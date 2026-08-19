@@ -12,6 +12,7 @@ import torch
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.weight_sharing import (
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity, IdentityCheckPolicy,
     PostTransformConfigIdentity, PostTransformFeature, PostTransformProfile,
@@ -27,7 +28,6 @@ from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
