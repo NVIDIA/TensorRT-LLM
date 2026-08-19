@@ -68,15 +68,14 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.fused_moe import (
     CutlassFusedMoE,
     DeepSeekV4MoeRoutingMethod,
-    MoE,
     MoEWeightLoadingMode,
     TritonFusedMoE,
     TRTLLMGenFusedMoE,
     create_moe,
+    is_moe_weight_owner,
     resolve_moe_cls,
 )
 from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -1095,7 +1094,7 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
-                elif names[-1] == "backend" and isinstance(module, MoE):
+                elif names[-1] == "backend" and is_moe_weight_owner(module):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
@@ -1697,7 +1696,6 @@ class DeepseekV4MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **({"alltoall_result_do_sum": False} if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output

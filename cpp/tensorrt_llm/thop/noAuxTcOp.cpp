@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,10 +15,12 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
+#include "tensorrt_llm/thop/thUtils.h"
 
 // #include <c10/cuda/CUDAStream.h>
 // #include <cassert>
@@ -156,6 +158,50 @@ std::tuple<at::Tensor, at::Tensor> noaux_tc_op(th::Tensor const& scores, th::Ten
     return {topk_values, topk_indices};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> kimi_k3_noaux_tc_mxfp8_quant(
+    th::Tensor const& scores, th::Tensor const& bias, th::Tensor const& hiddenStates, double routedScalingFactor)
+{
+    constexpr int64_t numExperts = 896;
+    constexpr int64_t topK = 16;
+    constexpr int64_t hiddenSize = 3584;
+    constexpr int64_t maxNumTokens = 64;
+    constexpr int64_t sfVecSize = 32;
+
+    int const smVersion = tl::common::getSMVersion();
+    TORCH_CHECK(smVersion >= 100 && smVersion < 110, "kimi_k3_noaux_tc_mxfp8_quant requires an SM10x architecture");
+    TORCH_CHECK(scores.is_cuda() && bias.is_cuda() && hiddenStates.is_cuda(), "all inputs must be CUDA tensors");
+    TORCH_CHECK(scores.get_device() == bias.get_device() && scores.get_device() == hiddenStates.get_device(),
+        "all inputs must be on the same device");
+    TORCH_CHECK(scores.scalar_type() == torch::kFloat32 && bias.scalar_type() == torch::kFloat32,
+        "scores and bias must be float32");
+    TORCH_CHECK(hiddenStates.scalar_type() == torch::kBFloat16, "hidden_states must be bfloat16");
+    TORCH_CHECK(scores.is_contiguous() && bias.is_contiguous() && hiddenStates.is_contiguous(),
+        "all inputs must be contiguous");
+    TORCH_CHECK(scores.dim() == 2 && scores.size(1) == numExperts, "scores must have shape [M, 896]");
+    TORCH_CHECK(bias.dim() == 1 && bias.numel() == numExperts, "bias must have shape [896]");
+    TORCH_CHECK(hiddenStates.dim() == 2 && hiddenStates.size(0) == scores.size(0) && hiddenStates.size(1) == hiddenSize,
+        "hidden_states must have shape [M, 3584] with the same M as scores");
+    int64_t const numTokens = scores.size(0);
+    TORCH_CHECK(numTokens > 0 && numTokens <= maxNumTokens, "M must be in [1, 64]");
+
+    auto const device = th::Device(th::kCUDA, scores.get_device());
+    th::Tensor topkValues = th::empty({numTokens, topK}, th::dtype(torch::kBFloat16).device(device));
+    th::Tensor topkIndices = th::empty({numTokens, topK}, th::dtype(torch::kInt32).device(device));
+    th::Tensor quantizedHiddenStates
+        = th::empty({numTokens, hiddenSize}, th::dtype(torch::kFloat8_e4m3fn).device(device));
+    th::Tensor hiddenStatesScale = th::empty({numTokens, hiddenSize / sfVecSize}, th::dtype(SF_DTYPE).device(device));
+
+    auto stream = at::cuda::getCurrentCUDAStream(scores.get_device());
+    tk::invokeKimiK3NoAuxTcMxFp8Quant(reinterpret_cast<float*>(scores.mutable_data_ptr()),
+        reinterpret_cast<float*>(bias.mutable_data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(hiddenStates.mutable_data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(topkValues.mutable_data_ptr()),
+        reinterpret_cast<int32_t*>(topkIndices.mutable_data_ptr()),
+        reinterpret_cast<int64_t*>(quantizedHiddenStates.mutable_data_ptr()),
+        reinterpret_cast<int32_t*>(hiddenStatesScale.mutable_data_ptr()), numTokens, routedScalingFactor, stream);
+    return {topkIndices, topkValues, quantizedHiddenStates, hiddenStatesScale};
+}
+
 } // end namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -165,9 +211,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "noaux_tc_op(Tensor scores, Tensor bias, int n_group, int topk_group, int topk, float "
         "routed_scaling_factor) -> (Tensor, Tensor)");
+    m.def(
+        "kimi_k3_noaux_tc_mxfp8_quant(Tensor scores, Tensor bias, Tensor hidden_states, float "
+        "routed_scaling_factor) -> (Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("noaux_tc_op", &tensorrt_llm::torch_ext::noaux_tc_op);
+    m.impl("kimi_k3_noaux_tc_mxfp8_quant", &tensorrt_llm::torch_ext::kimi_k3_noaux_tc_mxfp8_quant);
 }
