@@ -112,6 +112,23 @@ def test_rl_control_routes_reject_wrong_key(endpoint):
     server.generator.collective_rpc.assert_not_awaited()
 
 
+def test_rl_control_routes_reject_signature_for_different_body():
+    server = _make_server(enabled=True)
+    signed_body = json.dumps({"tags": ["kv_cache"]}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    headers.update(build_rl_control_auth_headers("secret", signed_body))
+
+    with TestClient(server.app) as client:
+        response = client.post(
+            "/release_memory",
+            content=json.dumps({"tags": ["model"]}),
+            headers=headers,
+        )
+
+    assert response.status_code == 401
+    server.generator.collective_rpc.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     ("endpoint", "payload", "rpc_name", "rpc_args"),
     [
