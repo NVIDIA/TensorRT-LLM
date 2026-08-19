@@ -651,15 +651,22 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self, sessions: dict, reqs: dict, failed: list, mark_retired: bool = False
     ):
         for rid in failed:
+            session = sessions.get(rid)
+            if session is None:
+                continue
+            if getattr(session, "_enforce_physical_ownership", False):
+                resources_drained = getattr(session, "resources_drained", None)
+                if resources_drained is None or not resources_drained():
+                    continue
+            if session.close() is False:
+                continue
             req = reqs.pop(rid, None)
             if req is not None:
                 if not mark_retired:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 else:
                     req.py_kv_send_session_retired = True
-            session = sessions.pop(rid, None)
-            if session is not None:
-                session.close()
+            sessions.pop(rid, None)
 
     def _retire_send_session(self, rid: int, req: Optional[LlmRequest] = None) -> None:
         """Close a send session and prevent later chunks from recreating it."""
@@ -976,6 +983,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._recv_sessions[rid]
             result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
+                if getattr(session, "_enforce_physical_ownership", False):
+                    resources_drained = getattr(session, "resources_drained", None)
+                    if resources_drained is None or not resources_drained():
+                        continue
                 # Session cancelled — either by local cancel_request() (user
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
                 # server timeout).  Return the req objects so the caller can
@@ -999,8 +1010,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         cancelled_reqs = []
         for rid in cancelled:
+            session = self._recv_sessions[rid]
+            if session.close() is False:
+                continue
             cancelled_reqs.append(self._recv_reqs[rid])
-            self._recv_sessions[rid].close()
             del self._recv_reqs[rid]
             del self._recv_sessions[rid]
 
