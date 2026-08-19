@@ -1227,7 +1227,7 @@ class EncoderCUDAGraphRunner:
             self._capture_stream = torch.cuda.Stream()
         return self._capture_stream
 
-    def _create_shared_static_tensors(self):
+    def _create_shared_static_tensors(self) -> None:
         """Allocates static tensors sized for the largest supported num_tokens."""
         max_total_tokens = (
             self.config.max_num_tokens if self.is_encoder_decoder else min(

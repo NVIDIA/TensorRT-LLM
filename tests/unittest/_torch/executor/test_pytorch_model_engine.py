@@ -5,6 +5,7 @@ import unittest
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import List, Optional, Tuple
 from unittest.mock import Mock, patch
 
 import torch
@@ -1118,7 +1119,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 class PyTorchModelEngineTestCase(unittest.TestCase):
 
     @staticmethod
-    def _feature_encoder_runner(batch_sizes, fixed_seq_len=1500):
+    def _feature_encoder_runner(
+            batch_sizes: List[int],
+            fixed_seq_len: int = 1500) -> EncoderCUDAGraphRunner:
         """A feature-mode runner with capture disabled, so no CUDA is touched."""
         config = EncoderCUDAGraphRunnerConfig(
             use_cuda_graph=False,
@@ -1159,10 +1162,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          frozenset(runner._capture_sequence_lengths))
 
     @staticmethod
-    def _encoder_spec_engine(encoder_cuda_graph_config,
-                             declares_spec: bool,
-                             tp_size: int = 1,
-                             is_encode_only: bool = False):
+    def _encoder_spec_engine(
+        encoder_cuda_graph_config: Optional[EncodeCudaGraphConfig],
+        declares_spec: bool,
+        tp_size: int = 1,
+        is_encode_only: bool = False
+    ) -> Tuple[PyTorchModelEngine, Tuple[Tuple[int, ...], torch.dtype, int]]:
         """A bare engine carrying only what `_encoder_graph_spec` reads."""
         spec = ((480000, ), torch.float32, 1500)
 
@@ -1171,7 +1176,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
             if declares_spec:
 
-                def encoder_graph_spec(self):
+                def encoder_graph_spec(
+                        self) -> Tuple[Tuple[int, ...], torch.dtype, int]:
                     return spec
 
         engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
