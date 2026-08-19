@@ -965,6 +965,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"_try_schedule_disagg_gen_init."
             )
 
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        # The send session stays in SessionStatus.INIT until every peer rank's
+        # request info has arrived; only then can any KV be written.
+        return not self._transfer_worker.has_all_peer_req_infos_for_send(get_unique_rid(req))
+
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 

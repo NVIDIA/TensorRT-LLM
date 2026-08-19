@@ -263,6 +263,17 @@ class KvCacheTransceiver(ABC):
     def supports_inflight_request_cancellation(self) -> bool:
         return False
 
+    def context_transfer_is_waiting_for_peer(self, req: LlmRequest) -> bool:
+        """Whether a context send is still waiting for its peer to ask for the data.
+
+        respond_and_send_async() only creates the send session; the KV write
+        cannot start until the generation peer requests it. Runtimes that can
+        observe that boundary report it here so the transfer timeout measures
+        the transfer instead of the peer's queueing delay. Default False keeps
+        the timeout unchanged for runtimes that cannot distinguish the two.
+        """
+        return False
+
     def has_poisoned_transfer_buffer(self) -> bool:
         return False
 
