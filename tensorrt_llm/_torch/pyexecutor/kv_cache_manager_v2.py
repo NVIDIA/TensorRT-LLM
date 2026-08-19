@@ -769,9 +769,7 @@ def _copy_swa_block_offsets_with_scratch_compiled(
 class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
-    _cold_pool_group_membership_cache: Optional[
-        tuple[tuple[tuple[int, frozenset[int]], ...], ...]
-    ] = None
+    _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
 
     def __init__(
         self,
@@ -2673,25 +2671,31 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_storage_statistics(self, cache_level: CacheLevel):
         return _introspection.storage_statistics(self.impl, cache_level)
 
-    def _cold_pool_group_membership(self) -> tuple[tuple[tuple[int, frozenset[int]], ...], ...]:
-        """Cached ``(cold pool group id, life cycle ids)`` pairs for each cold cache level.
+    def _cold_pool_group_membership(self) -> tuple[tuple[int, frozenset[int]], ...]:
+        """Cached ``(cold pool group id, life cycle ids)`` pairs shared by all cold levels.
 
         Ordered by cold pool-group id. Cold levels number their pool groups independently of the hot
-        level, so these ids are meaningful only within the cold view. The grouping is fixed at
-        construction, so it is built once.
+        level, so these ids are meaningful only within the cold view. KVCM uses one mapping for every
+        cold level, and the grouping is fixed at construction, so it is queried from level 1 once.
         """
         if self._cold_pool_group_membership_cache is None:
-            membership: list[tuple[tuple[int, frozenset[int]], ...]] = []
-            for level in range(1, len(self.impl.cache_tier_list)):
+            membership: tuple[tuple[int, frozenset[int]], ...] = ()
+            if len(self.impl.cache_tier_list) > 1:
                 grouped: dict[int, set[int]] = defaultdict(set)
-                mapping = _introspection.life_cycle_pool_group_indices(self.impl, CacheLevel(level))
+                mapping = _introspection.life_cycle_pool_group_indices(self.impl, CacheLevel(1))
                 for life_cycle_id, pool_group_id in enumerate(mapping):
                     grouped[pool_group_id].add(life_cycle_id)
-                membership.append(
-                    tuple(sorted((pg, frozenset(lcs)) for pg, lcs in grouped.items()))
-                )
-            self._cold_pool_group_membership_cache = tuple(membership)
+                membership = tuple(sorted((pg, frozenset(lcs)) for pg, lcs in grouped.items()))
+            self._cold_pool_group_membership_cache = membership
         return self._cold_pool_group_membership_cache
+
+    @staticmethod
+    def _stats_slot_sizes(pool_group_stats: object) -> tuple[int, ...]:
+        """Return slot sizes from either the native or pure-Python statistics object."""
+        slot_sizes = getattr(pool_group_stats, "slot_sizes", None)
+        if slot_sizes is None:
+            slot_sizes = getattr(pool_group_stats, "slot_size")
+        return tuple(slot_sizes)
 
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
         # life cycle (== layer group) -> pool group is static structure exposed by
@@ -2939,14 +2943,9 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_group_delta,
     ) -> KVCacheV2PoolGroupIterationStats:
         primary_pool_group_stats = primary_stats[pool_group_id]
-        slot_size = (
-            primary_pool_group_stats.slot_sizes
-            if hasattr(primary_pool_group_stats, "slot_sizes")
-            else primary_pool_group_stats.slot_size
-        )
         return KVCacheV2PoolGroupIterationStats(
             pool_group_id=pool_group_id,
-            slot_size=tuple(slot_size),
+            slot_size=self._stats_slot_sizes(primary_pool_group_stats),
             window_sizes=windows_by_pool_group.get(pool_group_id, ()),
             stats=self._build_iteration_stats(
                 (pool_group_id,),
@@ -2981,29 +2980,17 @@ class KVCacheManagerV2(BaseResourceManager):
         # No cold tiers means nothing to report, and the pool-group mapping need not be queried.
         if not secondary_stats_by_level:
             return {}
-        cold_members_by_level = self._cold_pool_group_membership()
-        if not cold_members_by_level:
+        cold_members = self._cold_pool_group_membership()
+        if not cold_members:
             return {}
+        assert all(
+            len(level_stats) == len(cold_members) for level_stats in secondary_stats_by_level
+        )
 
         report: dict[int, KVCacheV2PoolGroupIterationStats] = {}
-        # All cold levels share one lifecycle-to-cold-pool-group mapping, so the first level enumerates
-        # every cold group; each is then summed over the cold levels that contain it.
-        for cold_pool_group_id, life_cycles in cold_members_by_level[0]:
-            level_ids = [
-                (cold_pool_group_id,) if cold_pool_group_id < len(level_stats) else ()
-                for level_stats in secondary_stats_by_level
-            ]
-            cold_stats = next(
-                (
-                    level_stats[cold_pool_group_id]
-                    for level_stats, ids in zip(secondary_stats_by_level, level_ids)
-                    if ids
-                ),
-                None,
-            )
-            slot_size = ()
-            if cold_stats is not None:
-                slot_size = getattr(cold_stats, "slot_sizes", getattr(cold_stats, "slot_size", ()))
+        for cold_pool_group_id, life_cycles in cold_members:
+            level_ids = [(cold_pool_group_id,) for _ in secondary_stats_by_level]
+            cold_stats = secondary_stats_by_level[0][cold_pool_group_id]
             window_sizes = {
                 life_cycle_metadata[life_cycle_id][1]
                 for life_cycle_id in life_cycles
@@ -3011,7 +2998,7 @@ class KVCacheManagerV2(BaseResourceManager):
             }
             report[cold_pool_group_id] = KVCacheV2PoolGroupIterationStats(
                 pool_group_id=cold_pool_group_id,
-                slot_size=tuple(slot_size),
+                slot_size=self._stats_slot_sizes(cold_stats),
                 window_sizes=tuple(sorted(window_sizes)),
                 stats=self._build_iteration_stats(
                     (),

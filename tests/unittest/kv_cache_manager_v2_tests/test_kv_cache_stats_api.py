@@ -126,6 +126,14 @@ def test_native_cold_page_codec_is_consumed_after_failure() -> None:
         KVCacheManager(_make_config(), cold_page_codec=codec)
 
 
+def test_native_cold_page_codec_rejects_wrong_type() -> None:
+    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
+        pytest.skip("C++ backend only")
+
+    with pytest.raises(TypeError, match="IKvCacheColdPageCodec instance or None"):
+        KVCacheManager(_make_config(), cold_page_codec=5)
+
+
 def test_manager_accepts_uint64_max_request_id() -> None:
     manager = KVCacheManager(_make_config())
     cache = None

@@ -332,6 +332,10 @@ private:
         float maxUtilForResume = 1.0f) const;
     TypedVec<LifeCycleId, float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
         std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const;
+    // Project source-level lifecycle byte weights onto destination pool groups while preserving the implied
+    // lifecycle slot-count proportions.
+    TypedVec<PoolGroupIndex, float> projectPoolGroupRatio(
+        CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const;
     TypedVec<LifeCycleId, size_t> slotsToBytes(
         TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const;
     TypedVec<PoolGroupIndex, size_t> slotsToBytes(

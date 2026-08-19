@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/exceptions.h"
+
 #include <type_traits>
 #include <utility>
 
@@ -24,6 +26,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 //! Generic RAII scope guard that calls a void() callable on destruction.
+//! Callback failure during destruction terminates; explicit run() propagates it.
 //! Movable (moved-from instance is disarmed). Not copyable.
 template <typename F>
 class FuncGuard
@@ -34,9 +37,9 @@ public:
     {
     }
 
-    ~FuncGuard()
+    ~FuncGuard() noexcept
     {
-        run();
+        terminateOnException("FuncGuard callback failed during destruction", [this]() { run(); });
     }
 
     FuncGuard(FuncGuard&& other) noexcept

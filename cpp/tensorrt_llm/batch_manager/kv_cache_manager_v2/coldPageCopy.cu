@@ -42,6 +42,7 @@ constexpr uint32_t kPageIndexCopyThreads = 256;
 
 using PageIndexKernelParams = std::array<PageIndexPair, kPageIndicesPerKernel>;
 static_assert(sizeof(PageIndexKernelParams) == kPageIndexKernelParamBytes);
+static_assert(kPageIndicesPerKernel <= kPageIndexCopyThreads);
 
 #if CUDA_VERSION >= 11070
 #define TLLM_KVCM2_GRID_CONSTANT __grid_constant__

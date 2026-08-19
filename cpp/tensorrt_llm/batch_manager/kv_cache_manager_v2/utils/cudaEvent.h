@@ -219,8 +219,8 @@ public:
     // NULL sentinel: always considered complete, no event in flight.
     static CachedCudaEvent makeNull() noexcept;
 
-    // Normal constructor: gets an event and records it on stream.
-    explicit CachedCudaEvent(CudaStream stream);
+    // Gets an event and records it on stream. Failure terminates because KVCM2 cannot safely operate without events.
+    explicit CachedCudaEvent(CudaStream stream) noexcept;
 
     // Copyable and movable (shared ownership of the underlying CUevent).
     CachedCudaEvent(CachedCudaEvent const&) = default;
@@ -245,7 +245,7 @@ public:
     }
 
     // Release the event back to pool. Visible to ALL copies sharing this event.
-    void close();
+    void close() noexcept;
 
     // Raw CUevent handle. Returns nullptr for NULL/closed events.
     // Also serves as identity key for deduplication.
@@ -330,7 +330,7 @@ public:
         streamWaitEvents(reinterpret_cast<CudaStream>(handle()), events);
     }
 
-    CachedCudaEvent recordEvent();
+    CachedCudaEvent recordEvent() noexcept;
     void synchronize();
 
 private:
@@ -348,7 +348,7 @@ private:
 //   {
 //       auto scope = tempStream.enter();   // __enter__
 //       launchKernel(tempStream.get());
-//   }                                      // ~Scope → __exit__ records finish event
+//   }                                      // scope exit records the event; failure terminates
 //   auto ev = tempStream.takeFinishEvent(); // after with block
 //
 // ---------------------------------------------------------------------------
@@ -361,7 +361,7 @@ public:
     // Begin a scoped block. Destructor records the finish event, including during stack unwinding.
     [[nodiscard]] auto enter()
     {
-        return FuncGuard([this]() { mFinishEvent = mStream.recordEvent(); });
+        return FuncGuard([this]() noexcept { mFinishEvent = mStream.recordEvent(); });
     }
 
     [[nodiscard]] CUstream get() const noexcept

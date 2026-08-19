@@ -139,13 +139,15 @@ TypedVec<CacheLevel, TypedVec<LifeCycleId, PoolGroupIndex>> lifeCycleToPoolGroup
 ```
 
 Memory partitioning is layer-group-based rather than hot-pool-group-based. KVCM first derives one positive, normalized
-cache-tier quota weight per public layer group, whether the source is `initial_pool_ratio`, a typical
-batch, constraints, or runtime sampling. `LayerGroupId` currently maps one-to-one to the internal `LifeCycleId`, so
-the implementation stores and computes these weights by lifecycle. For each cache level, KVCM projects the weights by
-summing all layer-group weights whose internal lifecycles map to the same pool group at that level. This preserves
-the layer-group pool ratio when hot and cold representations use different pool-group mappings. The low-level
-`initial_pool_ratio` and the higher-level `KvCacheConfig.pool_ratio` therefore contain
-exactly one entry per layer group in layer-group ID order, not one per hot pool group.
+hot-tier byte-quota weight per public layer group, whether the source is `initial_pool_ratio`, a typical batch, or
+constraints. `LayerGroupId` currently maps one-to-one to the internal `LifeCycleId`, so the implementation stores and
+computes these weights by lifecycle. Hot initialization sums the lifecycle byte weights that map to each hot pool
+group. Cold initialization first converts each hot byte weight to its implied slot-count weight, then converts that
+weight to cold bytes using the lifecycle's cold-page size and sums it into the cold pool group. This preserves
+layer-group slot-count proportions when hot and cold representations use different page sizes or pool-group mappings.
+Runtime sampling remains level-specific and byte-based. The low-level `initial_pool_ratio` and the higher-level
+`KvCacheConfig.pool_ratio` therefore contain exactly one hot-tier byte ratio per layer group in layer-group ID order,
+not one per hot pool group.
 Hot-level constraints remain feasibility floors and may clamp the resulting hot allocation; they are not projected into
 cold storage. Cold pool groups use only the structural minimum needed by their allocators.
 

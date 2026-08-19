@@ -23,6 +23,8 @@
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 
 #include "tensorrt_llm/common/assert.h"
+
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -90,7 +92,10 @@ static void twoHopTransfer(
 
     while (remaining > 0)
     {
-        StagingBuffer buf = manager.acquire(numBytes, numBytes * remaining, numBytes, 1, stream);
+        size_t const maxSize = remaining > std::numeric_limits<size_t>::max() / numBytes
+            ? std::numeric_limits<size_t>::max()
+            : numBytes * remaining;
+        StagingBuffer buf = manager.acquire(numBytes, maxSize, numBytes, 1, stream);
         MemAddress addr = buf.address();
         size_t n = buf.size() / numBytes;
         TLLM_CHECK_DEBUG(n > 0 && n <= remaining);

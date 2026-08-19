@@ -19,8 +19,11 @@
 #include "kv_cache_manager_v2/coldPageCopy.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 
+#include "tensorrt_llm/common/logger.h"
+
 #include <algorithm>
 #include <cstddef>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <new>
@@ -67,8 +70,14 @@ public:
             configureImpl(gpuDescs, numGpuDescs);
             return true;
         }
+        catch (std::exception const& error)
+        {
+            TLLM_LOG_ERROR("Failed to configure the default cold-page codec: %s", error.what());
+            return false;
+        }
         catch (...)
         {
+            TLLM_LOG_ERROR("Failed to configure the default cold-page codec: unknown error");
             return false;
         }
     }
@@ -97,8 +106,14 @@ public:
         {
             return dispatch<true>(findGroup(layerGroupId), dstBasePtr, nullptr, pageIndices, numBasePages, stream);
         }
+        catch (std::exception const& error)
+        {
+            TLLM_LOG_ERROR("Default cold-page encoding failed: %s", error.what());
+            return false;
+        }
         catch (...)
         {
+            TLLM_LOG_ERROR("Default cold-page encoding failed: unknown error");
             return false;
         }
     }
@@ -110,8 +125,14 @@ public:
         {
             return dispatch<false>(findGroup(layerGroupId), nullptr, srcBasePtr, pageIndices, numBasePages, stream);
         }
+        catch (std::exception const& error)
+        {
+            TLLM_LOG_ERROR("Default cold-page decoding failed: %s", error.what());
+            return false;
+        }
         catch (...)
         {
+            TLLM_LOG_ERROR("Default cold-page decoding failed: unknown error");
             return false;
         }
     }

@@ -30,6 +30,21 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+namespace
+{
+
+int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleId lifeCycle)
+{
+    PoolGroupIndex const poolGroup = storage.getPoolGroupIndex(level, lifeCycle);
+    int64_t pageSize = 0;
+    for (size_t const size : storage.slotSize(level, poolGroup))
+    {
+        pageSize += static_cast<int64_t>(size);
+    }
+    return pageSize;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // KvCache constructor
@@ -629,19 +644,12 @@ void KvCache::_recordMigratedSlots(
         LifeCycleId const lifeCycle = page->lifeCycle;
         bool const isAttention = std::holds_alternative<AttnLifeCycle>(mManager->lifeCycles().getLifeCycle(lifeCycle));
 
-        PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
-        int64_t pageSize = 0;
-        for (size_t const size : mManager->storage().slotSize(poolGroup))
-        {
-            pageSize += static_cast<int64_t>(size);
-        }
-
         KVCacheStatsDelta stats;
         KVCacheIterationStatsDelta iterationStats;
         if (srcLevel == kHotLevel && dstLevel > kHotLevel)
         {
             iterationStats.iterOffloadBlocks = 1;
-            iterationStats.iterOffloadBytes = pageSize;
+            iterationStats.iterOffloadBytes = sumSlotBytes(mManager->storage(), dstLevel, lifeCycle);
         }
         else if (dstLevel == kHotLevel)
         {
@@ -657,12 +665,12 @@ void KvCache::_recordMigratedSlots(
             if (srcLevel > kHotLevel)
             {
                 iterationStats.iterOnboardBlocks = 1;
-                iterationStats.iterOnboardBytes = pageSize;
+                iterationStats.iterOnboardBytes = sumSlotBytes(mManager->storage(), srcLevel, lifeCycle);
             }
             else if (srcLevel == kHotLevel)
             {
                 iterationStats.iterIntraDeviceCopyBlocks = 1;
-                iterationStats.iterIntraDeviceCopyBytes = pageSize;
+                iterationStats.iterIntraDeviceCopyBytes = sumSlotBytes(mManager->storage(), kHotLevel, lifeCycle);
             }
         }
 
@@ -677,7 +685,6 @@ void KvCache::_recordMigratedSlots(
 
 void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
 {
-    (void) cacheLevel;
     if (!_shouldRecordStats())
     {
         return;
@@ -685,15 +692,9 @@ void KvCache::_recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, Cac
     for (auto const& page : pages)
     {
         LifeCycleId const lifeCycle = page->lifeCycle;
-        PoolGroupIndex const poolGroup = mManager->storage().getPoolGroupIndex(lifeCycle);
-        int64_t pageSize = 0;
-        for (size_t const size : mManager->storage().slotSize(poolGroup))
-        {
-            pageSize += static_cast<int64_t>(size);
-        }
         KVCacheIterationStatsDelta iterationStats;
         iterationStats.iterHostDroppedBlocks = 1;
-        iterationStats.iterHostDroppedBytes = pageSize;
+        iterationStats.iterHostDroppedBytes = sumSlotBytes(mManager->storage(), cacheLevel, lifeCycle);
         _recordDirectIterationStats(lifeCycle, iterationStats);
     }
 }

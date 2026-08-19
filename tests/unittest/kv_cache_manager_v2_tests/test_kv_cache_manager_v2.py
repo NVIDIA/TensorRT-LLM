@@ -459,7 +459,11 @@ class TestNoBatching(TestKVCacheManagerV2):
         # print(f"Time taken: {time_taken} seconds")
         return time_taken
 
-    def _run_cold_page_codec_round_trip(self, expected_num_pages: int) -> None:
+    def _run_cold_page_codec_round_trip(
+        self,
+        expected_num_pages: int,
+        expected_cold_pages: dict[LayerGroupId, tuple[int, int, int]],
+    ) -> None:
         """Force one request through cold storage, then validate its promoted KV."""
         requests: list[TestNoBatching.Request] = []
         try:
@@ -475,6 +479,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 [expected_num_pages, 0],
             )
             first.kv_cache.suspend()
+            self.manager.get_and_reset_iteration_stats()
 
             second = self.new_request(1, None, 3 * self.cfg.tokens_per_block, 0)
             requests.append(second)
@@ -490,6 +495,13 @@ class TestNoBatching(TestKVCacheManagerV2):
                 _introspection.active_page_stats(first.kv_cache)[0],
                 [0, expected_num_pages],
             )
+            offload_stats = self.manager.get_and_reset_iteration_stats()
+            for life_cycle_id, (offload_pages, _, page_bytes) in expected_cold_pages.items():
+                self.assertEqual(offload_stats[life_cycle_id].iter_offload_blocks, offload_pages)
+                self.assertEqual(
+                    offload_stats[life_cycle_id].iter_offload_bytes,
+                    offload_pages * page_bytes,
+                )
 
             second.kv_cache.close()
             with TemporaryCudaStream([]) as stream_holder:
@@ -501,6 +513,13 @@ class TestNoBatching(TestKVCacheManagerV2):
                 _introspection.active_page_stats(first.kv_cache)[0],
                 [expected_num_pages, 0],
             )
+            onboard_stats = self.manager.get_and_reset_iteration_stats()
+            for life_cycle_id, (_, onboard_pages, page_bytes) in expected_cold_pages.items():
+                self.assertEqual(onboard_stats[life_cycle_id].iter_onboard_blocks, onboard_pages)
+                self.assertEqual(
+                    onboard_stats[life_cycle_id].iter_onboard_bytes,
+                    onboard_pages * page_bytes,
+                )
         finally:
             for request in requests:
                 if request.kv_cache.status != _KVCache.Status.CLOSED:
@@ -565,7 +584,14 @@ class TestNoBatching(TestKVCacheManagerV2):
         hot_stats = _introspection.storage_statistics(self.manager, 0)
         self.assertEqual(hot_stats[hot_groups[0]].total, 3)
         self.assertEqual(hot_stats[hot_groups[1]].total, 6)
-        self._run_cold_page_codec_round_trip(expected_num_pages=6)
+        self._run_cold_page_codec_round_trip(
+            expected_num_pages=6,
+            expected_cold_pages={
+                full_lc: (3, 3, 4 * unit),
+                short_swa_lc: (3, 1, 4 * unit),
+                long_swa_lc: (3, 2, 2 * unit),
+            },
+        )
 
     @requires_cpp_backend
     def test_cold_codec_splits_lifecycles_from_one_hot_pool_group(self) -> None:
@@ -611,7 +637,10 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         hot_stats = _introspection.storage_statistics(self.manager, 0)
         self.assertEqual(hot_stats[hot_groups[0]].total, 6)
-        self._run_cold_page_codec_round_trip(expected_num_pages=5)
+        self._run_cold_page_codec_round_trip(
+            expected_num_pages=5,
+            expected_cold_pages={full_lc: (3, 3, 2 * unit), swa_lc: (3, 2, 4 * unit)},
+        )
 
     def run_naive(
         self,

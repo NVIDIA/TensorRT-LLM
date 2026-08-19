@@ -213,10 +213,11 @@ class KVCacheManagerConfig:
 
     initial_pool_ratio: list[float] | None = None
     """
-    One positive, normalized cache-tier quota weight per layer group. KVCM projects these
-    weights onto each cache level's pool grouping. When set, this takes precedence
-    over typical_step and constraints for initial ratio selection; constraints remain
-    hot-level feasibility floors.
+    One positive, normalized hot-tier byte-quota weight per layer group. Cold-tier
+    initialization preserves the implied layer-group slot-count proportions while
+    accounting for cold page sizes. When set, this takes precedence over typical_step
+    and constraints for initial ratio selection; constraints remain hot-level feasibility
+    floors.
     """
 
     swa_scratch_reuse: SwaScratchReuseConfig | None = None

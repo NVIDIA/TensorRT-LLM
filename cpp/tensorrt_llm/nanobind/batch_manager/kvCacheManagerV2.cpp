@@ -2169,6 +2169,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::unique_ptr<kv::IKvCacheColdPageCodec> codec;
                 if (!codecObject.is_none())
                 {
+                    if (!nb::isinstance<kv::IKvCacheColdPageCodec>(codecObject))
+                    {
+                        throw nb::type_error("cold_page_codec must be an IKvCacheColdPageCodec instance or None");
+                    }
                     try
                     {
                         codec = nb::cast<std::unique_ptr<kv::IKvCacheColdPageCodec>>(codecObject);
@@ -2180,8 +2184,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         // Report the Python-conventional TypeError instead of letting nb::cast_error (an alias
                         // of std::bad_cast) surface as an opaque RuntimeError.
                         throw nb::type_error(
-                            "cold_page_codec is not a usable IKvCacheColdPageCodec: a codec is consumed by the "
-                            "KVCacheManager construction it is passed to and cannot be supplied again");
+                            "cold_page_codec has already been consumed by a KVCacheManager construction attempt and "
+                            "cannot be supplied again");
                     }
                     if (!codec)
                     {

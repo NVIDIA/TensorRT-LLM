@@ -549,8 +549,14 @@ TEST(KvCacheManagerV2ColdPageTest, ColdGroupingIsIndependentOfHotGrouping)
 
     auto const coldRatio = storage.getRatioList(CacheLevel{1});
     ASSERT_EQ(coldRatio.size(), PoolGroupIndex{2});
-    EXPECT_NEAR(coldRatio[PoolGroupIndex{0}], 0.25F, 0.01F);
-    EXPECT_NEAR(coldRatio[PoolGroupIndex{1}], 0.75F, 0.01F);
+    constexpr float kFirstColdByteRatio = (0.25F * 1024) / (0.25F * 1024 + 0.75F * 2048);
+    EXPECT_NEAR(coldRatio[PoolGroupIndex{0}], kFirstColdByteRatio, 0.01F);
+    EXPECT_NEAR(coldRatio[PoolGroupIndex{1}], 1.0F - kFirstColdByteRatio, 0.01F);
+
+    auto const firstColdSlots = storage.numSlots(PoolGroupIndex{0}, CacheLevel{1});
+    auto const secondColdSlots = storage.numSlots(PoolGroupIndex{1}, CacheLevel{1});
+    EXPECT_NEAR(
+        static_cast<float>(firstColdSlots) / static_cast<float>(firstColdSlots + secondColdSlots), 0.25F, 0.01F);
 
     for (LifeCycleId lifeCycle{0}; lifeCycle < LifeCycleId{2}; ++lifeCycle)
     {
@@ -562,6 +568,63 @@ TEST(KvCacheManagerV2ColdPageTest, ColdGroupingIsIndependentOfHotGrouping)
         size_t const expectedBytes = lifeCycle == LifeCycleId{0} ? 1024 : 2048;
         EXPECT_EQ(coldSlotSizes.at(PoolIndex{0}), expectedBytes);
     }
+}
+
+TEST(KvCacheManagerV2ColdPageTest, MigrationStatsUseColdPageBytes)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    auto config = makeSplitColdGroupingConfig();
+    constexpr size_t kHotPageBytes = 2U << 20U;
+    constexpr size_t kGpuQuota = 12U << 20U;
+    auto& firstLayer = std::get<AttentionLayerConfig>(config.layers[0]);
+    auto& secondLayer = std::get<AttentionLayerConfig>(config.layers[1]);
+    firstLayer.buffers[0].size = kHotPageBytes;
+    firstLayer.slidingWindowSize = std::nullopt;
+    secondLayer.buffers[0].size = kHotPageBytes;
+    secondLayer.slidingWindowSize = 8;
+    config.cacheTiers[0] = GpuCacheTierConfig{kGpuQuota};
+    config.initialPoolRatio = std::vector<float>{0.5F, 0.5F};
+
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::make_unique<SplitColdPageCodec>());
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto streamGuard = FuncGuard([stream]() { cudaStreamDestroy(stream); });
+
+    constexpr int kNumPages = 3;
+    std::vector<TokenIdExt> tokens;
+    for (int token = 0; token < kNumPages * manager->tokensPerBlock(); ++token)
+    {
+        tokens.emplace_back(TokenId{token});
+    }
+
+    auto first = manager->createKvCache();
+    ASSERT_TRUE(first->resume(reinterpret_cast<CUstream>(stream)));
+    EXPECT_TRUE(first->resize(static_cast<int>(tokens.size())));
+    first->commit(toSpan(tokens));
+    first->suspend();
+    manager->getAndResetIterationStats();
+
+    auto second = manager->createKvCache();
+    ASSERT_TRUE(second->resume(reinterpret_cast<CUstream>(stream)));
+    EXPECT_TRUE(second->resize(static_cast<int>(tokens.size())));
+
+    auto offloadStats = manager->getAndResetIterationStats();
+    ASSERT_EQ(offloadStats.size(), 2);
+    EXPECT_EQ(offloadStats.at(LifeCycleId{0}).iterOffloadBlocks, kNumPages);
+    EXPECT_EQ(offloadStats.at(LifeCycleId{0}).iterOffloadBytes, kNumPages * 1024);
+    EXPECT_EQ(offloadStats.at(LifeCycleId{1}).iterOffloadBlocks, kNumPages);
+    EXPECT_EQ(offloadStats.at(LifeCycleId{1}).iterOffloadBytes, kNumPages * 2048);
+
+    second->close();
+    ASSERT_TRUE(first->resume(reinterpret_cast<CUstream>(stream)));
+    auto onboardStats = manager->getAndResetIterationStats();
+    ASSERT_EQ(onboardStats.size(), 2);
+    EXPECT_EQ(onboardStats.at(LifeCycleId{0}).iterOnboardBlocks, kNumPages);
+    EXPECT_EQ(onboardStats.at(LifeCycleId{0}).iterOnboardBytes, kNumPages * 1024);
+    constexpr int kSwaOnboardPages = 2;
+    EXPECT_EQ(onboardStats.at(LifeCycleId{1}).iterOnboardBlocks, kSwaOnboardPages);
+    EXPECT_EQ(onboardStats.at(LifeCycleId{1}).iterOnboardBytes, kSwaOnboardPages * 2048);
+    first->close();
 }
 
 TEST(KvCacheManagerV2ColdPageTest, EvictionRoutesLifecycleQueuesToDifferentColdPoolGroups)

@@ -290,7 +290,8 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     mMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
-    // Derive one lifecycle ratio, then project it onto each level's pool grouping.
+    // Derive hot-tier lifecycle byte weights. Cold initialization preserves the slot-count proportions implied by
+    // those weights while accounting for the cold representation's page sizes.
     TypedVec<LifeCycleId, float> lifeCycleRatio;
     if (initialPoolRatio.has_value())
     {
@@ -430,13 +431,6 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         coldSlotDescList[coldPgIdx].variants.push_back(std::move(variant));
     }
 
-    for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
-    {
-        LayerGroupId const batchingLayerGroupId = mBatchingLayerGroupIds[lifeCycle];
-        TLLM_CHECK_WITH_INFO(coldGrouping[batchingLayerGroupId] == coldGrouping[lifeCycle],
-            "Cold-page codec batching class spans cold pool groups");
-    }
-
     TypedVec<PoolGroupIndex, SlotCount> coldMinSlots(coldSlotDescList.size(), 1);
 
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> coldSlotSizeLists;
@@ -453,7 +447,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     for (CacheLevel level{1}; level < config.cacheTiers.size(); ++level)
     {
         mSlotDescLists[level] = coldSlotDescList;
-        auto const coldRatio = toPoolGroupRatio(level, lifeCycleRatio);
+        auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
         auto slotCounts
             = computeSlotCountForLevel(config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots);
         auto* gpuPhysMemAllocator
@@ -1361,6 +1355,7 @@ void StorageManager::prefetch(
     {
         _batchedMigrate(dstLevel, migrationPath.first, migrationPages, /*updateSrc=*/true);
     }
+    reschedulePagesGuard.run();
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,6 +1691,28 @@ TypedVec<PoolGroupIndex, float> StorageManager::toPoolGroupRatio(
         poolGroupRatio[getPoolGroupIndex(level, lifeCycle)] += lifeCycleRatio[lifeCycle];
     }
     return normalizeToRatio(poolGroupRatio);
+}
+
+TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(
+    CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const
+{
+    TLLM_CHECK_WITH_INFO(
+        srcLifeCycleRatio.size() == numLifeCycles(), "Lifecycle ratio length must match the number of lifecycles");
+    TypedVec<PoolGroupIndex, double> dstPoolGroupWeights(numPoolGroups(dstLevel), 0.0);
+    for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
+    {
+        auto bytesPerSlot = [&](CacheLevel level)
+        {
+            auto const sizes = slotSize(level, getPoolGroupIndex(level, lifeCycle));
+            return std::accumulate(sizes.begin(), sizes.end(), size_t{0});
+        };
+        size_t const srcBytesPerSlot = bytesPerSlot(srcLevel);
+        size_t const dstBytesPerSlot = bytesPerSlot(dstLevel);
+        TLLM_CHECK_WITH_INFO(srcBytesPerSlot > 0 && dstBytesPerSlot > 0, "Cache slot size must be positive");
+        dstPoolGroupWeights[getPoolGroupIndex(dstLevel, lifeCycle)] += static_cast<double>(srcLifeCycleRatio[lifeCycle])
+            * static_cast<double>(dstBytesPerSlot) / static_cast<double>(srcBytesPerSlot);
+    }
+    return normalizeToRatio(dstPoolGroupWeights);
 }
 
 TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
