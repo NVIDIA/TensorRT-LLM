@@ -51,8 +51,9 @@ l0_gb300_multi_gpus:
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
   # Kimi K3 truncated-model (first 4 layers) e2e SA spec-dec logits parity;
-  # resolves <LLM_MODELS_ROOT>/Kimi-K3 and skips cleanly when the checkpoint
-  # is not staged.
+  # resolves <LLM_MODELS_ROOT>/Kimi-K3 and FAILS if the checkpoint is not
+  # staged (deliberate: a skipped post-merge entry is indistinguishable
+  # from a pass, so a vanished checkpoint must be a visible regression).
   - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (40)
   - unittest/_torch/multi_gpu_modeling -k "deepseek"
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]

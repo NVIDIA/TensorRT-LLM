@@ -10,10 +10,13 @@ on drift — the state-bug signature), while non-tie divergences only warn
 logits; see the harness docstring).
 
 Requirements: 4 GPUs and the Kimi K3 checkpoint (env KIMI_K3_CKPT or
-<LLM_MODELS_ROOT>/Kimi-K3). Skips cleanly when the
-checkpoint is absent. The MoE backend defaults to VANILLA (the reference
-dequant path — the bit-parity oracle; slow but fine at 4 layers) so the
-test has no fused-kernel dependency and runs on any arch.
+<LLM_MODELS_ROOT>/Kimi-K3). Fails — deliberately does not skip — when the
+checkpoint is absent: the test is CI-listed (GB300 post-merge), and a
+checkpoint that vanishes from the runners' models mount must surface as a
+regression rather than an indistinguishable green skip. The MoE backend
+defaults to VANILLA (the reference dequant path — the bit-parity oracle;
+slow but fine at 4 layers) so the test has no fused-kernel dependency and
+runs on any arch.
 """
 
 import os
@@ -41,10 +44,12 @@ def _find_checkpoint():
 @pytest.mark.skip_less_device(4)
 def test_kimi_k3_sa_specdec_logits_parity():
     ckpt = _find_checkpoint()
-    if ckpt is None:
-        pytest.skip(
-            "Kimi K3 checkpoint not available (set KIMI_K3_CKPT or stage under LLM_MODELS_ROOT)"
-        )
+    # Hard failure, not a skip: on the post-merge stage a skip is
+    # indistinguishable from a pass, so a checkpoint dropped from the
+    # runners' models mount would silently end this coverage.
+    assert ckpt is not None, (
+        "Kimi K3 checkpoint not found (set KIMI_K3_CKPT or stage under LLM_MODELS_ROOT)"
+    )
 
     env = os.environ.copy()
     env.update(
