@@ -48,7 +48,7 @@ class TEAttention(AttentionBackend):
     No KV cache: diffusion models recompute attention each denoising step.
     For BF16 attention use ``VANILLA``.
 
-    Supports ``forward_with_lse`` via ``return_softmax_stats=True``, enabling
+    Supports ``forward_with_lse`` (LSE computed from BF16 Q/K scores), enabling
     use with Attention2DAttention for x72 context parallelism.
     """
 
@@ -101,10 +101,17 @@ class TEAttention(AttentionBackend):
     ) -> Tuple[Optional[int], str]:
         if key_padding_mask is not None:
             raise NotImplementedError("TE attention backend does not yet support key_padding_mask.")
-        is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
+        if attention_mask == PredefinedAttentionMask.CAUSAL:
+            attn_mask_type = "causal"
+        elif attention_mask == PredefinedAttentionMask.FULL:
+            attn_mask_type = "no_mask"
+        else:
+            raise NotImplementedError(
+                f"TE attention backend does not support attention_mask={attention_mask!r}. "
+                "Only PredefinedAttentionMask.FULL and CAUSAL are supported."
+            )
         enable_gqa = self.num_heads != self.num_kv_heads
         num_gqa_groups = k.shape[-2] if enable_gqa else None
-        attn_mask_type = "causal" if is_causal else "no_mask"
         return num_gqa_groups, attn_mask_type
 
     @torch.compiler.disable
@@ -143,6 +150,9 @@ class TEAttention(AttentionBackend):
         computed separately from BF16 Q/K scores. This is numerically accurate
         and satisfies the partition property Attention2D relies on.
 
+        Note: allocates an O(S^2) float32 score matrix [B, H, S, S] for the
+        LSE pass. For CP use cases S is the local shard length per rank.
+
         Returns:
             output: [B, S, H, D]
             lse:    [B, H, S] float32 -- log-sum-exp per query position
@@ -156,11 +166,13 @@ class TEAttention(AttentionBackend):
         out = out.unflatten(-1, (self.num_heads, self.head_dim))
 
         # Compute LSE from BF16 scores: [B, H, S, S] -> [B, H, S]
-        # q/k: [B, S, H, D] -> [B, H, S, D]
-        scores = torch.matmul(
-            q.transpose(1, 2).float(),
-            k.transpose(1, 2).float().transpose(-1, -2),
-        ) * self.scale
+        # q: [B, S, H, D] -> [B, H, S, D]
+        # k: [B, S, Hkv, D] -> [B, H, S, D] (expand KV heads for GQA)
+        q_f = q.transpose(1, 2).float()
+        k_f = k.transpose(1, 2).float()
+        if self.num_heads != self.num_kv_heads:
+            k_f = k_f.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+        scores = torch.matmul(q_f, k_f.transpose(-1, -2)) * self.scale
         if attn_mask_type == "causal":
             causal_mask = torch.ones(S, S, device=q.device, dtype=torch.bool).triu(diagonal=1)
             scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
