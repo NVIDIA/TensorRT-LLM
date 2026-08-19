@@ -27,7 +27,12 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import Optional, TextIO
+from typing import Dict, List, Optional, TextIO
+
+# How long to let signalled descendant processes flush their stack dumps before
+# the harness tears the process tree down. Bounded on purpose: this runs on a
+# watchdog thread for a test that is already over its timeout.
+_WORKER_DUMP_GRACE_S = 2.0
 
 try:
     from _pytest.config import Config
@@ -431,6 +436,66 @@ class PeriodicJUnitXML:
         except (TypeError, ValueError):
             return None
 
+    def _descendant_pids(self) -> List[int]:
+        """Every descendant pid of this process, read from /proc.
+
+        Deliberately dependency-free (no psutil): this runs inside a watchdog
+        on a process that is already in trouble.
+        """
+        children: Dict[int, List[int]] = {}
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return []
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", encoding="utf-8") as stat_file:
+                    # comm may contain spaces/parens, so split after ") ".
+                    ppid = int(stat_file.read().split(") ", 1)[1].split()[1])
+            except (OSError, IndexError, ValueError):
+                continue
+            children.setdefault(ppid, []).append(int(entry))
+
+        found: List[int] = []
+        stack = [os.getpid()]
+        while stack:
+            for child in children.get(stack.pop(), []):
+                found.append(child)
+                stack.append(child)
+        return found
+
+    def _request_worker_stack_dumps(self) -> None:
+        """Ask descendant processes to dump their own stacks.
+
+        ``faulthandler`` only ever dumps the calling process, but the executor
+        worker that owns the model runs in a separate MPI-spawned process --
+        which is why a hang report from here alone shows the client blocked on
+        a queue and nothing about why the worker went quiet. TensorRT-LLM
+        registers a SIGUSR1 stack dumper at import time, so signalling
+        descendants makes each one write its stacks to its own stderr, which
+        the stage log captures.
+        """
+        pids = self._descendant_pids()
+        if not pids:
+            return
+        signalled = 0
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGUSR1)
+                signalled += 1
+            except OSError:
+                # Process exited, or is not ours to signal; either is fine.
+                continue
+        if signalled:
+            # Give the dumps a bounded moment to reach the log before the
+            # harness tears the process tree down.
+            time.sleep(_WORKER_DUMP_GRACE_S)
+            self._log_info(
+                f"Requested stack dumps from {signalled} descendant process(es)"
+            )
+
     def _dump_hang(self, nodeid: str) -> None:
         """Write every thread's stack to the sidecar file (called from the timer)."""
         if self._hang_file is None:
@@ -442,6 +507,9 @@ class PeriodicJUnitXML:
             self._hang_file.flush()
         except (OSError, RuntimeError, ValueError):
             pass
+        # Best-effort and always attempted, even if the sidecar write failed:
+        # on a multi-process hang the worker stacks are the useful half.
+        self._request_worker_stack_dumps()
 
     def _cancel_hang_timer(self) -> None:
         """Cancel the pending watchdog timer, if any."""
