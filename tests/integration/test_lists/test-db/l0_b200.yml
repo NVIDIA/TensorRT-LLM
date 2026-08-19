@@ -187,6 +187,7 @@ l0_b200:
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
   - unittest/tools/test_layer_wise_benchmarks.py::test_deepseek_r1_ctx_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_nemotron_gen_dep[1]
+  - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests
   # ------------- KV Cache V2 Scheduler IT ---------------
@@ -324,6 +325,7 @@ l0_b200:
   - unittest/_torch/misc
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[fp8-latency]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_w4a8_mxfp4[mxfp8-latency]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1_block_reuse-cutlass]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
