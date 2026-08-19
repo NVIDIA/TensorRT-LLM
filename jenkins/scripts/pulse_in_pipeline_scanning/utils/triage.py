@@ -31,6 +31,9 @@ TRIAGE_AGENT_TIMEOUT = int(os.environ.get("TRTLLM_TRIAGE_AGENT_TIMEOUT", "1800")
 # Cap items sent to avoid overwhelming the agent on large scans
 MAX_TRIAGE_ITEMS = int(os.environ.get("TRTLLM_TRIAGE_MAX_ITEMS", "20"))
 _TICKET_RESPONSE_KEYS = frozenset({"license_correction_ticket", "version_bump_tickets"})
+_KNOWN_AGENT_RESPONSE_PREFIX = (
+    "All dependency actions have been submitted. Now I'll produce the final JSON output."
+)
 
 
 def _vuln_doc_to_agent_item(doc: dict) -> dict:
@@ -122,6 +125,11 @@ def _parse_agent_response_value(value: object) -> dict:
     """Validate and parse the agent's strict JSON-string response contract."""
     if not isinstance(value, str):
         raise TypeError("Triage agent response value must be a JSON string")
+
+    # Temporary compatibility for the deployed agent's known preamble.
+    if value.startswith(_KNOWN_AGENT_RESPONSE_PREFIX):
+        print(f"[Triage agent response prefix workaround] {value!r}", file=sys.stderr)
+        value = value.removeprefix(_KNOWN_AGENT_RESPONSE_PREFIX).lstrip()
 
     try:
         parsed_value = json.loads(value)
