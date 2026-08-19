@@ -266,6 +266,7 @@ full:RTX_6000D/accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8 SKIP (
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False] SKIP (https://nvbugs/6616033)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True] SKIP (https://nvbugs/6616033)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=False] SKIP (https://nvbugs/6616033)
+full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True] SKIP (https://nvbugs/6451323)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0] SKIP (https://nvbugs/6616033)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=2] SKIP (https://nvbugs/6451323)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False] SKIP (https://nvbugs/6567731)
