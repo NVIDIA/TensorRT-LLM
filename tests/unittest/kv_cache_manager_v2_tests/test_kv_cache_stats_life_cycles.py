@@ -57,7 +57,7 @@ def _make_recorder():
         commit_stats=lambda stats, by_life_cycle: committed.append((stats, by_life_cycle)),
     )
     recorder = SimpleNamespace(manager=manager)
-    recorder._should_record_stats = lambda: True
+    recorder._should_record_manager_stats = lambda: True
     for name in (
         "_is_attention_life_cycle",
         "_record_direct_iteration_stats",
