@@ -25,6 +25,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
+    KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, KvCacheConfig,
@@ -47,30 +49,34 @@ FALLBACK_WARNING_FRAGMENT = "Falling back to KVCacheManager"
 # V1 `KVCacheManager` methods reached on the KV connector path proper. Each is
 # defined in tensorrt_llm/_torch/pyexecutor/resource_manager.py and wraps a
 # nanobind method on the C++ manager. `KVCacheManagerV2` implements none of
-# them - `test_connector_v1_method_contract_gap` pins that, and the list is the
-# Phase 2 worklist.
-CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS = (
-    # Connector bring-up: registers the KV tensor with the worker.
-    # py_executor.py:1070. This is the first hard stop under V2.
+# them and is not meant to: each assumes a single flat block-id space over one
+# primary pool, which cannot describe memory whose page indices are scoped to a
+# layer group. V2's connector contract is `register_kv_cache_layout` plus
+# `get_page_indices_by_layer_group` / `get_connector_page_indices` instead.
+CONNECTOR_V1_ONLY_KV_CACHE_MANAGER_METHODS = (
+    # Connector bring-up: hands the worker the single primary pool tensor.
+    # `PyExecutor._maybe_init_kv_connector_manager`.
     "get_unique_primary_pool",
-    # kv_cache_connector.py:322 and py_executor.py:6173.
+    # `KvCacheConnectorSchedulerOutputRequest.update_and_build_data` and
+    # `PyExecutor.kv_connector_request_finished`.
     "get_cache_indices",
-    # kv_cache_connector.py:328 (sole caller).
+    # `update_and_build_data`, for `RequestData.block_hashes`.
     "commit_and_get_block_hashes",
-    # kv_cache_connector.py:353, only when a retention config is set.
+    # `update_and_build_data`, for `RequestData.priorities`.
     "get_priority_by_block_id",
 )
 
 # Reached only when the connector coexists with disaggregated serving
 # (`test_connector_disagg_prefill`), via AsyncTransferManager and the V1 cache
-# reuse adapter - not from `KvCacheConnectorManager` itself. Tracked separately
-# because V2 already has its own answer for some of them (`try_commit_blocks`
-# at kv_cache_manager_v2.py:3201, page refcounts instead of explicit pinning),
-# so they do not necessarily belong in a connector port.
+# reuse adapter - not from `KvCacheConnectorManager` itself. None of them is a
+# gap for V2, because V2 does not traverse those paths:
+# `enable_partial_reuse_for_disagg` excludes V2, so AsyncTransferManager never
+# reaches the pin/unpin pair, and the Python transceiver (the only one V2 can
+# be driven by) resolves block ids through `_CacheReuseAdapterV2`.
 DISAGG_PATH_KV_CACHE_MANAGER_METHODS = (
-    "store_blocks_for_reuse",  # py_executor.py:455
-    "unpin_blocks_by_id",  # py_executor.py:489
-    "get_memory_pool_block_indices",  # disaggregation/resource/cache_reuse.py:121
+    "store_blocks_for_reuse",
+    "unpin_blocks_by_id",
+    "get_memory_pool_block_indices",
     "pin_blocks",  # no Python caller today
 )
 
@@ -212,34 +218,54 @@ def generate_and_wait(model, scheduler, worker, *args, **kwargs):
     return outputs
 
 
-def test_connector_v1_method_contract_gap():
-    """Pin exactly which V1 KV-cache-manager methods `KVCacheManagerV2` lacks.
+def test_v2_connector_contract_does_not_reuse_the_v1_methods():
+    """The V2 connector path implements none of the V1 accessors, by design.
 
-    This is a static contract check rather than an end-to-end run on purpose:
-    under V2 the connector dies at the *first* missing method
-    (`get_unique_primary_pool`, py_executor.py:1070), so no e2e run can ever
-    report more than one gap. Phase 2 should remove entries from
-    `CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS` as it implements them.
+    Something depends on that, and it does not ask: `update_and_build_data`
+    reports `block_hashes` and `priorities` empty on V2 by branching on
+    `isinstance(manager, KVCacheManagerV2)`, not on `hasattr`. Those
+    short-circuits are only correct while V2 genuinely has no such accessor -
+    the day one is added (retention priorities are a known gap; see
+    `test_connector_priorities`) the branch keeps reporting nothing while the
+    data exists, and this is what says so.
+
+    A static check rather than an end-to-end run: under V2 the connector would
+    die at the *first* method it reached, so no run can report more than one at
+    a time.
 
     Needs no GPU.
     """
     stale = [
-        name for name in CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS +
+        name for name in CONNECTOR_V1_ONLY_KV_CACHE_MANAGER_METHODS +
         DISAGG_PATH_KV_CACHE_MANAGER_METHODS
         if not hasattr(KVCacheManager, name)
     ]
     assert stale == [], (
         f"{stale} are not defined on the V1 KVCacheManager either, so this "
-        "test is measuring a stale method list rather than a real V2 gap.")
+        "test is measuring a stale method list rather than a real difference.")
 
     implemented = [
-        name for name in CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS
+        name for name in CONNECTOR_V1_ONLY_KV_CACHE_MANAGER_METHODS
         if hasattr(KVCacheManagerV2, name)
     ]
     assert implemented == [], (
-        f"KVCacheManagerV2 now implements {implemented}. Drop them from "
-        "CONNECTOR_REQUIRED_KV_CACHE_MANAGER_METHODS and re-check whether the "
-        "corresponding connector tests can be un-skipped.")
+        f"KVCacheManagerV2 now implements {implemented}. A V1-shaped accessor "
+        "on V2 is not automatically the right answer - a flat block-id list "
+        "cannot describe more than one layer group - but if it is, revisit the "
+        "`is_v2` short-circuits in "
+        "`KvCacheConnectorSchedulerOutputRequest.update_and_build_data`, which "
+        "report nothing on the strength of these methods being absent.")
+
+    # The other half of the contract: what V2 offers instead.
+    for name in ("get_page_indices_by_layer_group",
+                 "get_connector_page_indices"):
+        assert hasattr(KVCacheManagerV2, name), (
+            f"KVCacheManagerV2.{name} is the V2 replacement for the V1 "
+            "block-id accessors and every connector path on V2 goes through "
+            "it.")
+    assert hasattr(KvCacheConnectorWorker, "register_kv_cache_layout"), (
+        "The worker ABC must keep a default `register_kv_cache_layout`, or "
+        "every existing connector becomes abstract and fails to instantiate.")
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -1002,8 +1028,19 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
-                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [
+    pytest.param(False, id="kv_cache_manager_v1"),
+    pytest.param(
+        True,
+        id="kv_cache_manager_v2",
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason=
+            "KvCacheRetentionConfig does not reach KVCacheManagerV2 at all "
+            "(per-page priority comes from custom_priority_callback, which "
+            "V2 never overrides), so the connector reports priorities=None."),
+    ),
+],
                          indirect=True)
 def test_connector_priorities(enforce_single_worker, model_with_connector):
     """Test that retention priorities flow through the connector correctly.
@@ -1012,15 +1049,17 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     the RequestData.priorities field is populated with the correct
     per-block priorities based on the token ranges.
 
-    KNOWN GAP -- this fails on `kv_cache_manager_v2`, deliberately left failing.
+    KNOWN GAP -- `xfail(strict=True)` on `kv_cache_manager_v2`.
     `KvCacheRetentionConfig` does not reach KVCacheManagerV2 at all: V2's
     per-page priority comes from `custom_priority_callback`
     (kv_cache_manager_v2/_core/_kv_cache_manager.py), which KVCacheManagerV2
     never overrides, so every page carries the default priority and the
     connector reports `priorities=None`. A user who sets a retention config on
     V2 silently gets none of it -- not only through the connector. The
-    assertions below are the correct expectation for both managers and are kept
-    that way so the gap stays visible rather than being asserted away.
+    assertions below stay the correct expectation for both managers rather than
+    being relaxed per manager, so wiring retention into V2 turns this green
+    instead of needing the test rewritten; `strict=True` is what makes it fail
+    loudly on that day rather than passing silently.
     """
     BLOCK_SIZE = 32
     NUM_INPUT_TOKENS = 64  # 2 blocks
@@ -1121,21 +1160,32 @@ def test_connector_priorities_default(enforce_single_worker,
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize(
-    "llm_kwargs,match",
+    "llm_kwargs,match_v1,match_v2",
     [
+        # The two managers refuse offloading for the same reason -- a page that
+        # leaves GPU has its slot reassigned, invalidating what the connector
+        # registered -- but say so differently, and V2 names the resolved tier
+        # rather than the config field so it also catches the disk tier. Match
+        # the manager-specific wording: both messages contain the bare word
+        # "host", so matching that would still pass if a silent fallback to V1
+        # ever crept back in, which is the one thing this parametrization
+        # exists to rule out.
         pytest.param(
             dict(kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
                                                host_cache_size=1024**3)),
-            "host",
+            "host offloading",
+            "cache tiers below GPU",
             id="host_offloading",
         ),
         pytest.param(
             dict(max_beam_width=2),
             "beam",
+            "beam",
             id="beam_search",
         ),
         pytest.param(
             dict(enable_attention_dp=True),
+            "attention data parallelism",
             "attention data parallelism",
             id="attention_dp",
         ),
@@ -1145,12 +1195,14 @@ def test_connector_priorities_default(enforce_single_worker,
                          ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
                          indirect=True)
 def test_connector_rejects_unsupported_config(enforce_single_worker,
-                                              model_with_connector, llm_kwargs,
-                                              match):
+                                              model_with_connector,
+                                              use_kv_cache_manager_v2,
+                                              llm_kwargs, match_v1, match_v2):
     # Configurations the connector cannot handle today must fail loudly at
     # construction time rather than silently miscompute. This pins the set of
     # constructor-time exclusions in `_maybe_init_kv_connector_manager`.
     model_fn, _, _ = model_with_connector
+    match = match_v2 if use_kv_cache_manager_v2 else match_v1
 
     with pytest.raises(NotImplementedError, match=match):
         model_fn(**llm_kwargs)
