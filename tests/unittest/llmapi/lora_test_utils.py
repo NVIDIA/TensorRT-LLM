@@ -26,7 +26,6 @@ from utils.llm_data import llm_models_root
 from utils.util import similar, skip_fp8_pre_ada
 
 from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_params import \
     CudaGraphLoraParams
 from tensorrt_llm._torch.peft.lora.layer import (GroupedGemmParamsInput,
