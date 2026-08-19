@@ -691,6 +691,7 @@ class TestSchemaCompliance:
         exit_schema["definitions"] = sms_schema["definitions"]
         jsonschema.validate(instance=payload, schema=exit_schema)
 
+
 # ---------------------------------------------------------------------------
 # Pydantic field constraint validation tests
 # ---------------------------------------------------------------------------
