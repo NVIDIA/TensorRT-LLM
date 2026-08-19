@@ -29,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionSta
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
+    MessageType,
     Receiver,
     RxSession,
 )
@@ -250,6 +251,75 @@ def test_pre_cancelled_rx_session_never_publishes_destination(
     assert (len(session._kv_tasks), receiver.dispatch_task.call_count) == (0, 0), (
         "a pre-cancelled receive session created and published a destination task"
     )
+
+
+@pytest.mark.cpu_only
+def test_remote_cancel_resolves_strong_owned_session() -> None:
+    rid = 77
+    receiver = object.__new__(Receiver)
+    receiver._sessions_lock = threading.Lock()
+    receiver._sessions = {}
+    receiver._pre_cancelled_rids = set()
+    receiver._bounce = _BounceProbe()
+    receiver._enforce_physical_ownership = True
+    receiver.send_cancel_to_senders = Mock()
+    session = _make_rx_session(receiver, rid)
+
+    assert receiver._sessions[rid] is session
+    receiver._handle_cancel_session([MessageType.CANCEL_SESSION, str(rid).encode("ascii")])
+
+    assert session.status == SessionStatus.CANCELLED
+    receiver.send_cancel_to_senders.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_remote_cancelled_session_is_retained_until_writers_drain() -> None:
+    rid = 78
+    request = SimpleNamespace(request_id=rid)
+    session = SimpleNamespace(
+        _enforce_physical_ownership=True,
+        status=SessionStatus.CANCELLED,
+        is_completed=Mock(return_value=False),
+        has_failed=Mock(return_value=True),
+        wait_complete=Mock(return_value=None),
+        resources_drained=Mock(return_value=False),
+        close=Mock(return_value=False),
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_recv_session = True
+    transceiver._gen_need_sync = False
+    transceiver._mapping = SimpleNamespace(
+        pp_size=1,
+        enable_attention_dp=False,
+        world_size=1,
+    )
+    transceiver._gen_allgather = Mock()
+    transceiver._recv_sessions = {rid: session}
+    transceiver._recv_reqs = {rid: request}
+
+    completed, failed, cancelled = transceiver.check_gen_transfer_status(0)
+
+    assert (completed, failed, cancelled) == ([], [], [])
+    assert transceiver._recv_sessions[rid] is session
+    assert transceiver._recv_reqs[rid] is request
+    session.close.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_non_terminal_writer_result_does_not_authorize_reuse() -> None:
+    receiver = _ReceiverProbe()
+    session = _make_rx_session(receiver, rid=80)
+    session.receive(KVSlice(is_last_slice=True))
+
+    session.process_kv_agent_result(
+        peer_rank=0,
+        sender_slice_id=0,
+        is_last_slice=False,
+        status=AgentResult.SUCCESS,
+    )
+
+    assert session.status == SessionStatus.TRANSFERRING
+    assert not session.resources_drained()
 
 
 @pytest.mark.cpu_only
