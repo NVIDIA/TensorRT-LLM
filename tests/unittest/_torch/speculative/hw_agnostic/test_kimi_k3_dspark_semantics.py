@@ -23,7 +23,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.models.modeling_speculative import (
+from tensorrt_llm._torch.models.modeling_dflash import (
     DFlashForCausalLM,
     dspark_layer_window_size,
     dspark_markov_chain_logits,
