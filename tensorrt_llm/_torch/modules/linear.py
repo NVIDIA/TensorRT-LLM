@@ -381,30 +381,9 @@ class LinearMethodBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              *args,
-              out: Optional[torch.Tensor] = None,
-              **kwargs):
-        """Compute the linear projection.
-
-        ``out``: optional preallocated output buffer (zero-copy write, e.g. a
-        row-slice of a larger packed buffer). Only UnquantizedLinearMethod
-        implements it on the plain torch addmm/mm path; every other method
-        (and the cublas_mm / cute-dsl backends) must raise NotImplementedError
-        via ``_raise_if_out_requested`` rather than silently ignore it.
-        """
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor], *args, **kwargs):
         raise NotImplementedError
-
-    def _raise_if_out_requested(self, out: Optional[torch.Tensor]) -> None:
-        """Reject out= for methods without zero-copy output support."""
-        if out is not None:
-            raise NotImplementedError(
-                f"out= is not supported by {type(self).__name__}; only "
-                "UnquantizedLinearMethod supports zero-copy output currently "
-                "-- see upstreaming/10 rework notes")
 
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
@@ -562,37 +541,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        if out is not None:
-            if type(self) is not UnquantizedLinearMethod:
-                # Subclasses (FP8 methods) override apply; a super().apply()
-                # delegation must not silently take the unquantized path.
-                self._raise_if_out_requested(out)
-            if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
-                    and module.weight.dtype == torch.bfloat16):
-                raise NotImplementedError(
-                    "out= is not supported with the cute_dsl_bf16_gemm "
-                    "backend; only the plain torch addmm/mm path supports "
-                    "zero-copy output.")
-            if module.use_custom_cublas_mm:
-                raise NotImplementedError(
-                    "out= is not supported with the custom cublas_mm "
-                    "backend; only the plain torch addmm/mm path supports "
-                    "zero-copy output.")
-            # True zero-copy: the GEMM epilogue writes straight into the
-            # caller-provided buffer (out.view enforces viewability, so a
-            # non-viewable out fails loudly instead of silently copying).
-            input_2d = input.reshape(-1, input.shape[-1])
-            out_2d = out if out.dim() == 2 else out.view(-1, out.shape[-1])
-            if bias is not None:
-                torch.addmm(bias, input_2d, module.weight.t(), out=out_2d)
-            else:
-                torch.mm(input_2d, module.weight.t(), out=out_2d)
-            return out
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         # CuTe DSL BF16 GEMM path for Blackwell
         if (module.use_cute_dsl_bf16_gemm and is_sm_100f()
                 and module.weight.dtype == torch.bfloat16):
@@ -734,12 +684,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
@@ -1057,12 +1003,8 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         # FP8 tensor inputs are from attention. Directly use ones as scale.
         if input.dtype == torch.float8_e4m3fn:
             qinput = input
@@ -1207,12 +1149,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         # fp8_block_scaling_gemm does not support writing into an NCCL window
         # buffer; supports_nccl_symmetric_memory_window_output is False so the window path is bypassed.
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
@@ -1540,12 +1478,8 @@ class NVFP4LinearMethod(LinearMethodBase):
                     input, input_scale, module.scaling_vector_size, False)
             return act_fp4, act_sf, alpha
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # GEMM requires 2D. Fp4QuantizedTensor from fused LayerNorm paths may
         # arrive as 3D [B, S, D/8] — flatten fp4_tensor and restore after.
@@ -2141,12 +2075,8 @@ class W4A16NVFP4LinearMethod(NVFP4LinearMethod):
             output = output + bias
         return output
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         input, original_shape = self._prepare_input(module, input)
         from tensorrt_llm._torch.modules.fused_moe.triton_dequant_nvfp4 import \
             dequant_nvfp4_2d_triton
@@ -2288,12 +2218,8 @@ class MarlinNVFP4LinearMethod(W4A16NVFP4LinearMethod):
         module._marlin_size_k = fp4_utils.pad_up(module.in_features, 64)
         module._marlin_size_n = fp4_utils.pad_up(module.out_features, 128)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         input, original_shape = self._prepare_input(module, input)
         size_k = module.in_features
         size_n = module.out_features
@@ -2375,12 +2301,8 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         alpha = module.alpha
         if input.dtype != torch.float8_e4m3fn:
             if module.input_scale is not None and not module.force_dynamic_quantization:
@@ -2565,12 +2487,8 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         fp8_input, input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
             input)
         input_scale = input_scale.to(torch.float32)
@@ -2685,12 +2603,8 @@ class WeightOnlyQuantLinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None) -> torch.Tensor:
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
 
         weight_dtype, _ = get_weight_dtype_and_id(module)
         bias = bias.contiguous() if bias is not None else None
@@ -2815,12 +2729,8 @@ class W4A16_AWQ_LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None) -> torch.Tensor:
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
 
         if module.pre_quant_scale is not None:
             input = input * module.pre_quant_scale
@@ -2972,12 +2882,8 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         """
         modelopt flow for w4a8_awq:
          1. multiply pre_quant_scale to input
@@ -3187,12 +3093,8 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
         super().create_weights(module, in_features, out_features, bias, dtype)
         module.scale_one = torch.tensor([1.0], dtype=torch.float32).cuda()
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         # requires the swizzled block scales.
         fp8_input, input_scales = torch.ops.trtllm.mxfp8_quantize(input, True)
         output = torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(fp8_input, module.weight,
@@ -3273,12 +3175,8 @@ class MXFP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self,
-              module: Linear,
-              input: torch.Tensor,
-              bias: Optional[torch.Tensor],
-              out: Optional[torch.Tensor] = None):
-        self._raise_if_out_requested(out)
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
@@ -4008,37 +3906,6 @@ class Linear(nn.Module):
             self.quant_method, "pre_reload_weights"
         ), "pre_reload_weights is not supported for this quant method"
         self.quant_method.pre_reload_weights(self)
-
-
-def linear_into(module: Linear, input: torch.Tensor,
-                out: torch.Tensor) -> torch.Tensor:
-    """Zero-copy linear: write ``module``'s projection into ``out``.
-
-    Deliberately a free function that dispatches straight to
-    ``module.quant_method.apply(..., out=...)`` — ``Linear.forward`` is left
-    byte-identical to the base so its signature stays fusion-inert for
-    inductor partitioning at every compiled Linear call site (the v1
-    forward(out=) threading measurably repartitioned unrelated compiled
-    regions). Only UnquantizedLinearMethod implements out=; every other
-    method raises NotImplementedError. Paths where a collective or LoRA owns
-    the output are rejected here.
-    """
-    if module.tp_mode == TensorParallelMode.ROW and module.reduce_output:
-        raise NotImplementedError(
-            "linear_into: ROW-parallel with reduce_output=True is not "
-            "supported (allreduce owns the output buffer).")
-    if module.gather_output:
-        raise NotImplementedError(
-            "linear_into: gather_output=True is not supported (allgather "
-            "owns the output buffer).")
-    if module.lora is not None:
-        raise NotImplementedError(
-            "linear_into: LoRA is not supported (the LoRA delta is added "
-            "out-of-place).")
-    bias = module.bias
-    if module.tp_mode == TensorParallelMode.ROW and module.tp_rank > 0:
-        bias = None
-    return module.quant_method.apply(module, input, bias, out=out)
 
 
 def is_static_nvfp4_input_eligible(linear) -> bool:
