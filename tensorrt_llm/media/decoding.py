@@ -25,10 +25,17 @@ PyNvVideoCodec is imported function-locally: ``import tensorrt_llm`` on a
 CPU-only host must never load the driver-linked extension.
 """
 
+import base64
 import functools
 import math
+from abc import ABC
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
 
 import torch
+
+from tensorrt_llm.inputs.media_io import BaseMediaIO, _normalize_file_uri
 
 
 @functools.lru_cache(maxsize=32)
@@ -107,40 +114,64 @@ def resize_center_crop_uint8(frames: torch.Tensor, target_h: int, target_w: int)
     return x.round_().clamp_(0, 255).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
 
 
-def decode_video_reference_window(
+class FrameSelector(ABC):
+    """Which decoded frames a decode call retains.
+
+    Selection is always stated explicitly — there is no default policy — so a
+    caller cannot silently inherit one model's frame convention. ``Window`` is
+    the only strategy implemented; fps / whole-clip / explicit-index selection
+    are the obvious extensions and are added when a consumer needs one.
+    """
+
+
+@dataclass(frozen=True)
+class WindowSelector(FrameSelector):
+    """A contiguous inclusive range of frames.
+
+    Indices are Python-style: non-negative counts from the start, negative
+    from the end, so ``-1`` is the last frame and ``(-8, -1)`` the final
+    eight. Both ends must count from the same end.
+    """
+
+    first: int
+    last: int
+
+    def __post_init__(self) -> None:
+        if (self.first < 0) != (self.last < 0):
+            raise ValueError(
+                f"first and last must both count from the start or both from "
+                f"the end, got ({self.first}, {self.last})."
+            )
+        if self.first > self.last:
+            raise ValueError(f"first must not exceed last, got ({self.first}, {self.last}).")
+
+
+def _nvdec_decode(
     data: bytes,
     *,
-    first_frame: int,
-    last_frame: int,
-    target_h: int,
-    target_w: int,
+    selector: FrameSelector,
     device: torch.device,
+    target_hw: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
-    """Decode frames ``[first_frame, last_frame]`` of a reference on device.
+    """Decode the frames named by ``selector`` on device, via NVDEC.
 
-    Returns uint8 ``[T, target_h, target_w, 3]``. Indices are Python-style:
-    non-negative counts from the start, negative from the end, so ``-1`` is
-    the last frame and ``(-8, -1)`` the final eight. Both ends are inclusive.
+    Returns uint8 ``[T, H, W, 3]``, at ``target_hw`` when given and at the
+    source resolution otherwise. Resizing happens *before* a frame is
+    retained, so a high-resolution source never dominates memory: at any
+    instant only one source-resolution frame is alive.
 
     A negative index costs a decode to EOS — the memory-buffer demuxer is a
     forward-only feeder, seeking is not assumed — so the caller pays for the
     whole clip when asking from the end. Non-negative ranges stop as soon as
-    the range is filled. Frames are resized to the target resolution before
-    retention, so a high-resolution source never dominates memory. Clips
-    shorter than the range return what exists; the caller pads.
+    the range is filled. Clips shorter than the range return what exists; the
+    caller pads.
 
     This decodes what it is asked for and imposes no policy of its own: any
     bound on range size belongs to the model that knows what it can use.
     """
-    if (first_frame < 0) != (last_frame < 0):
-        raise ValueError(
-            f"first_frame and last_frame must both count from the start or "
-            f"both from the end, got ({first_frame}, {last_frame})."
-        )
-    if first_frame > last_frame:
-        raise ValueError(
-            f"first_frame must not exceed last_frame, got ({first_frame}, {last_frame})."
-        )
+    if not isinstance(selector, WindowSelector):
+        raise NotImplementedError(f"{type(selector).__name__} is not implemented.")
+    first_frame, last_frame = selector.first, selector.last
     window = last_frame - first_frame + 1
     from_end = first_frame < 0
     try:
@@ -196,7 +227,14 @@ def decode_video_reference_window(
         # is filled once; negative ranges cannot know the length up front, so
         # it wraps and holds the trailing `tail` frames until EOS.
         tail = -first_frame if from_end else window
-        ring = torch.empty(tail, target_h, target_w, 3, dtype=torch.uint8, device=device)
+        # With a target the ring is sized up front, so a range that matches no
+        # frame still yields a correctly shaped empty result. Without one, the
+        # frame size is unknown until the stream yields a frame.
+        ring = (
+            torch.empty(tail, *target_hw, 3, dtype=torch.uint8, device=device)
+            if target_hw is not None
+            else None
+        )
         count = 0  # frames decoded so far, i.e. the index of the next frame
         kept = 0  # frames written into the ring
         try:
@@ -208,19 +246,29 @@ def decode_video_reference_window(
                         break
                     if from_end or count >= first_frame:
                         decoded = torch.from_dlpack(frame)
-                        # Ownership copy off the NVDEC surface (recycled by
-                        # the decoder) and resize-before-retain in one step.
-                        ring[kept % tail].copy_(
-                            resize_center_crop_uint8(decoded.unsqueeze(0), target_h, target_w)[0]
+                        # Resize before retaining, so only one frame is ever
+                        # alive at the source resolution.
+                        retained = (
+                            resize_center_crop_uint8(decoded.unsqueeze(0), *target_hw)[0]
+                            if target_hw is not None
+                            else decoded
                         )
+                        if ring is None:
+                            ring = torch.empty(
+                                tail, *retained.shape, dtype=torch.uint8, device=device
+                            )
+                        # Ownership copy off the NVDEC surface, which the
+                        # decoder recycles.
+                        ring[kept % tail].copy_(retained)
                         kept += 1
                     count += 1
                 if done:
                     break
         except torch.cuda.OutOfMemoryError as exc:
+            at = f" @ {target_hw[1]}x{target_hw[0]}" if target_hw is not None else ""
             raise MemoryError(
                 f"Out of device memory while decoding the video reference "
-                f"({window} frames @ {target_w}x{target_h} retained): {exc}"
+                f"({window} frames{at} retained): {exc}"
             ) from exc
         except nvc.PyNvVCException as exc:
             raise ValueError(
@@ -233,6 +281,11 @@ def decode_video_reference_window(
                 "Video reference contains no decodable frames; the payload "
                 "may be corrupt or use an unsupported codec."
             )
+        if ring is None:
+            # Reachable only without a target when the range matched no frame:
+            # there is no source size to report, so the empty result carries
+            # zero spatial dims.
+            return torch.empty(0, 0, 0, 3, dtype=torch.uint8, device=device)
         if kept < tail:
             frames = ring[:kept]
         else:
@@ -244,3 +297,62 @@ def decode_video_reference_window(
     finally:
         del decoder
         del demuxer
+
+
+class NvdecVideoMediaIO(BaseMediaIO[torch.Tensor]):
+    """NVDEC-backed video I/O returning frames on device.
+
+    A sibling of :class:`~tensorrt_llm.inputs.media_io.VideoMediaIO` rather than
+    a subclass: that one decodes with cv2 on the CPU and returns ``VideoData``,
+    a contract its VLM callers depend on. This one returns a device tensor, so
+    it shares the base class and nothing else.
+
+    ``selector`` is required — see :class:`FrameSelector` for why there is no
+    default. ``target_hw`` is optional; frames are resized before retention
+    when it is given, and kept at the source resolution when it is not.
+    """
+
+    def __init__(
+        self,
+        *,
+        selector: FrameSelector,
+        device: torch.device,
+        target_hw: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        self._selector = selector
+        self._device = device
+        self._target_hw = target_hw
+
+    def load_bytes(self, data: bytes) -> torch.Tensor:
+        return _nvdec_decode(
+            data, selector=self._selector, device=self._device, target_hw=self._target_hw
+        )
+
+    def load_base64(self, media_type: str, data: str) -> torch.Tensor:
+        return self.load_bytes(base64.b64decode(data))
+
+    def load_file(self, url: str) -> torch.Tensor:
+        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
+
+
+def decode_video_reference_window(
+    data: bytes,
+    *,
+    first_frame: int,
+    last_frame: int,
+    target_h: int,
+    target_w: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Decode frames ``[first_frame, last_frame]`` of a reference on device.
+
+    Returns uint8 ``[T, target_h, target_w, 3]``. A thin spelling of
+    :func:`_nvdec_decode` with a :class:`WindowSelector`, kept because it reads
+    better at a call site that only ever wants a window.
+    """
+    return _nvdec_decode(
+        data,
+        selector=WindowSelector(first_frame, last_frame),
+        device=device,
+        target_hw=(target_h, target_w),
+    )
