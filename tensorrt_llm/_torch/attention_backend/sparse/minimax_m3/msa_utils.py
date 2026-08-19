@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import types
 from typing import Optional, Tuple
@@ -19,8 +20,14 @@ MSA_REQUIRED_TOPK = 16
 MSA_REQUIRED_HEAD_DIM = 128
 
 
+@functools.lru_cache(maxsize=1)
 def msa_package_available() -> bool:
-    """Return whether the packaged fmha_sm100 module can be imported."""
+    """Return whether the packaged fmha_sm100 module can be imported.
+
+    Cached: each call scans sys.path until fmha_sm100 is first imported, and
+    create_fmha_libs asks once per attention layer. Whether the package is
+    installed cannot change within a process.
+    """
     return importlib.util.find_spec("fmha_sm100") is not None
 
 

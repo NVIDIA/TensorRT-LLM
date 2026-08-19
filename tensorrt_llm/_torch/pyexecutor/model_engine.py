@@ -18,6 +18,8 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.utils import torch_multi_arange
 from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
@@ -42,8 +44,6 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           SeqLenAwareSparseAttentionConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
-from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend.interface import (AttentionMetadata,
@@ -675,21 +675,6 @@ class PyTorchModelEngine(ModelEngine):
                 "for cuda_graph_config and configure encoder graphs through "
                 "encoder_cuda_graph_config. Decoder CUDA graphs will be "
                 "disabled.")
-            self.cuda_graph_config = None
-
-        if (self.cuda_graph_config is not None and self.dtype == torch.float32
-                and self._is_encoder_decoder_model()):
-            # fp32 enc-dec runs unfused cross-attention, whose thop workspace
-            # size query hardcodes cross_kv_length=0 (attentionOp.cpp,
-            # Runner::getWorkspaceSize) and undersizes the workspace. The
-            # graph-capture warmup runs cross_attn in isolation, so the carve
-            # overruns the allocation (surfaces as cublas EXECUTION_FAILED).
-            # Keep eager until the upstream size query is fixed.
-            logger.warning(
-                "Decoder CUDA graphs are not supported for float32 "
-                "encoder-decoder models. Decoder CUDA graphs will be disabled; "
-                "use a half-precision checkpoint or "
-                "model_kwargs={'torch_dtype': ...} to enable them.")
             self.cuda_graph_config = None
 
         cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
@@ -5701,6 +5686,7 @@ class PyTorchModelEngine(ModelEngine):
                     input_ids.append(
                         request.get_tokens(0)[request.context_current_position])
                     past_seen_token_num = request.context_current_position
+                    request_has_previous_tensor = False
                 # The request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
@@ -5722,17 +5708,34 @@ class PyTorchModelEngine(ModelEngine):
                             else:
                                 input_ids.append(request.get_last_tokens(beam))
                     past_seen_token_num = request.max_beam_num_tokens - 1
+                    request_has_previous_tensor = False
                 else:
                     # the request has previous tensor
                     # previous_batch_indices is per-request, not per-beam
                     previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
+                    request_has_previous_tensor = True
 
                 position_id = past_seen_token_num
                 if _has_cp_helix:
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                    if request_has_previous_tensor:
+                        # With the overlap scheduler this batch is prepared
+                        # before the previous iteration's _update_requests has
+                        # advanced py_decoding_iter, so the counter is one
+                        # behind. Compensate exactly like the non-helix path
+                        # above, which uses max_beam_num_tokens *without* the
+                        # -1 in this case. Without this, the position repeats
+                        # once (L, L, L+1, ...) and the new token's K is roped
+                        # at the wrong position before being written to the KV
+                        # cache, corrupting every later step.
+                        # TODO: revisit for helix x speculative decoding -
+                        # the base formula and this +1 both assume exactly
+                        # one new token per step (draft-token modes are
+                        # currently rejected under helix).
+                        position_id += 1
                     if request.py_helix_is_inactive_rank:
                         past_seen_token_num = request.seqlen_this_rank_cp
                     else:
