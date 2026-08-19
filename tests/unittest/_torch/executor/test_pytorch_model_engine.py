@@ -268,7 +268,14 @@ def _make_forward_only_engine(
     engine.cuda_graph_runner = runner
 
     resource_manager = Mock()
-    resource_manager.get_resource_manager.return_value = object()
+    peft_cache_manager = Mock(data_type=torch.bfloat16)
+
+    def get_resource_manager(resource_type):
+        if resource_type == ResourceManagerType.PEFT_CACHE_MANAGER:
+            return peft_cache_manager
+        return object()
+
+    resource_manager.get_resource_manager.side_effect = get_resource_manager
     return engine, runner, resource_manager, semantic_attn_metadata, outputs
 
 
@@ -1129,6 +1136,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         self.assertTrue(
             runner.maybe_get_cuda_graph.call_args.kwargs["use_lora_graph"])
+        self.assertEqual(
+            runner.maybe_get_cuda_graph.call_args.
+            kwargs["peft_cache_data_type"], torch.bfloat16)
         self.assertTrue(
             engine._prepare_inputs.call_args.kwargs["use_lora_graph"])
 
