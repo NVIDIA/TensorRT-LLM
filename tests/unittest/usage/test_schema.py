@@ -308,7 +308,7 @@ class TestIngressPoint:
 
     @pytest.mark.parametrize(
         "value",
-        ["", "cli_serve", "llm_class", "cli_bench", "cli_eval"],
+        ["", "cli_serve", "llm_class", "cli_bench", "cli_eval", "disaggregated"],
     )
     def test_ingress_point_values(self, value):
         """IngressPoint defaults to empty and accepts known ingress values."""

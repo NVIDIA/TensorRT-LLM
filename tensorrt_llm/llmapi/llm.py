@@ -1745,7 +1745,7 @@ class BaseLLM:
 
             _usage.record_llm_shutdown()
         except Exception as exc:
-            logger.debug("Usage telemetry shutdown tracking failed: %s", exc)
+            logger.debug(f"Usage telemetry shutdown tracking failed: {exc}")
 
     def _check_health(self) -> bool:
         """Check if the LLM is healthy.
@@ -1820,8 +1820,8 @@ class _TorchLLM(BaseLLM):
                 default_usage_context=_usage.UsageContext.LLM_CLASS.value,
             )
         except Exception as exc:
-            logger.debug("Usage telemetry initialization tracking failed: %s",
-                         exc)
+            logger.debug(
+                f"Usage telemetry initialization tracking failed: {exc}")
 
         backend = kwargs.pop("backend", "pytorch")
 
@@ -1855,7 +1855,7 @@ class _TorchLLM(BaseLLM):
             if usage_attempt_tracked:
                 self._usage_lifecycle_active = _usage.record_llm_initialized()
         except Exception as exc:
-            logger.debug("Usage telemetry completion tracking failed: %s", exc)
+            logger.debug(f"Usage telemetry completion tracking failed: {exc}")
 
         self._start_usage_reporting()
 

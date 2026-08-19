@@ -334,9 +334,10 @@ To disable telemetry data collection, use any of the following methods:
 - **Python API**: Pass `TelemetryConfig(disabled=True)` to `LLM()`
 - **CLI flag**: Use `--no-telemetry` on `trtllm-serve`, `trtllm-bench`, or `trtllm-eval`
 
-CLI terminal telemetry may report an invalid argument or YAML configuration.
-The environment-variable, file-based, and CLI-flag opt-outs are all applied
-before CLI and YAML validation.
+CLI terminal telemetry may report that an argument or YAML configuration was
+invalid. It reports categorical termination and lifecycle metadata, never the
+argument text or configuration content. The environment-variable, file-based,
+and CLI-flag opt-outs are all applied before CLI and YAML validation.
 
 The telemetry collection code is fully open source and auditable at
 [`tensorrt_llm/usage/`](./tensorrt_llm/usage/). For a detailed field-by-field

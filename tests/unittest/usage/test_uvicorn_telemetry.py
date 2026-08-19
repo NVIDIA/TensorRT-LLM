@@ -245,23 +245,25 @@ def _run_incompatible_uvicorn_child() -> None:
     assert type(server) is uvicorn.Server
 
 
+@pytest.mark.parametrize("signal_to_send", [signal.SIGTERM, signal.SIGINT])
 @pytest.mark.parametrize("signal_count", [1, 2])
-def test_sigterm_reports_before_uvicorn_reraises(
+def test_signal_reports_before_uvicorn_reraises(
     tmp_path: Path,
+    signal_to_send: signal.Signals,
     signal_count: int,
 ) -> None:
-    """SIGTERM reports once and retains Uvicorn's signal exit semantics."""
+    """Handled signals report once and retain Uvicorn's exit semantics."""
     returncode, event, stdout, stderr = _run_uvicorn_case(
         tmp_path,
-        signal_to_send=signal.SIGTERM,
+        signal_to_send=signal_to_send,
         signal_count=signal_count,
     )
-    assert returncode == -signal.SIGTERM, (stdout, stderr)
+    assert returncode == -signal_to_send, (stdout, stderr)
     assert event["name"] == "trtllm_exit_report"
     assert event["parameters"]["terminationKind"] == "signal"
-    assert event["parameters"]["signalNumber"] == signal.SIGTERM
+    assert event["parameters"]["signalNumber"] == signal_to_send
     assert event["parameters"]["exitCodeKnown"] is True
-    assert event["parameters"]["exitCode"] == 128 + signal.SIGTERM
+    assert event["parameters"]["exitCode"] == 128 + signal_to_send
 
 
 def test_uvicorn_preserves_worker_failure_observation(tmp_path: Path) -> None:
@@ -273,6 +275,7 @@ def test_uvicorn_preserves_worker_failure_observation(tmp_path: Path) -> None:
     assert parameters["component"] == "disagg_worker"
     assert parameters["reportingSource"] == "supervisor"
     assert parameters["exitCodeKnown"] is False
+    assert parameters["signalNumber"] == signal.SIGINT
 
 
 def test_signal_handler_unwinds_before_recording(tmp_path: Path) -> None:

@@ -97,8 +97,12 @@ def _disagg_yaml_disables_telemetry(config_file: Optional[str]) -> bool:
     """Read only explicit disaggregated YAML opt-outs before validation."""
     if config_file is None:
         return False
-    with Path(config_file).open(encoding="utf-8") as config_stream:
-        config = yaml.safe_load(config_stream)
+    try:
+        with Path(config_file).open(encoding="utf-8") as config_stream:
+            config = yaml.safe_load(config_stream)
+    except (OSError, yaml.YAMLError):
+        # The authoritative parser reports configuration errors later.
+        return False
     if not isinstance(config, Mapping):
         return False
 
