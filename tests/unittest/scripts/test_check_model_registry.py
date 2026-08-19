@@ -120,3 +120,59 @@ def test_validate_models_rejects_same_model_same_yaml_extra_different_config_id(
     assert "identical yaml_extra" in errors[0]
     assert "'cfg_a'" in errors[0]
     assert "'cfg_b'" in errors[0]
+
+
+@pytest.mark.parametrize("name", [" model", "model "])
+def test_validate_models_rejects_padded_name(mod, name):
+    errors = mod.validate_models([{"name": name, "yaml_extra": ["config.yaml"]}])
+
+    assert "models[1]: 'name' must not have leading or trailing whitespace." in errors
+
+
+@pytest.mark.parametrize("config_id", [" default", "default "])
+def test_validate_models_rejects_padded_config_id(mod, config_id):
+    errors = mod.validate_models(
+        [{"name": "model", "yaml_extra": ["config.yaml"], "config_id": config_id}]
+    )
+
+    assert "models[1]: 'config_id' must not have leading or trailing whitespace." in errors
+
+
+def test_invalid_padded_name_is_excluded_from_duplicate_tracking(mod):
+    errors = mod.validate_models(
+        [
+            {"name": "model ", "yaml_extra": ["config.yaml"]},
+            {"name": "model ", "yaml_extra": ["config.yaml"]},
+        ]
+    )
+
+    assert errors.count("models[1]: 'name' must not have leading or trailing whitespace.") == 1
+    assert errors.count("models[2]: 'name' must not have leading or trailing whitespace.") == 1
+    assert not any("Duplicate model/config pair" in error for error in errors)
+    assert not any("identical yaml_extra" in error for error in errors)
+
+
+def test_invalid_padded_config_id_is_excluded_from_duplicate_tracking(mod):
+    errors = mod.validate_models(
+        [
+            {
+                "name": "model",
+                "yaml_extra": ["config.yaml"],
+                "config_id": "default ",
+            },
+            {
+                "name": "model",
+                "yaml_extra": ["config.yaml"],
+                "config_id": "default ",
+            },
+        ]
+    )
+
+    assert errors.count(
+        "models[1]: 'config_id' must not have leading or trailing whitespace."
+    ) == 1
+    assert errors.count(
+        "models[2]: 'config_id' must not have leading or trailing whitespace."
+    ) == 1
+    assert not any("Duplicate model/config pair" in error for error in errors)
+    assert not any("identical yaml_extra" in error for error in errors)
