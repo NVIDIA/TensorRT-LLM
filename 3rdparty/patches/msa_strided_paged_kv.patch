@@ -1,5 +1,5 @@
 diff --git a/python/fmha_sm100/api.py b/python/fmha_sm100/api.py
-index b02f747..b69cd8b 100644
+index b02f747..d9d0a41 100644
 --- a/python/fmha_sm100/api.py
 +++ b/python/fmha_sm100/api.py
 @@ -532,9 +532,8 @@ def _fmha_sm100_plan(
@@ -14,8 +14,227 @@ index b02f747..b69cd8b 100644
          return sparse_fmha_plan(qo_segment_lens=qo_segment_lens, kv_segment_lens=kv_segment_lens,
                  num_qo_heads=num_qo_heads, causal=causal, qo_offset=qo_offset,
                  num_kv_splits=num_kv_splits, page_size=page_size, output_maxscore=output_maxscore,
+@@ -941,6 +940,62 @@ def _fmha_sm100(
+     return out, max_score
+ 
+ 
++def _mixed_batch_split(qo_segment_lens, split_threshold, *, enable, sparse):
++    """Row index splitting a mixed prefill/decode batch, or 0 for no split.
++
++    Returns ``split`` such that rows ``[0, split)`` and ``[split, batch)`` are
++    each uniformly prefill or uniformly decode. Both halves must be contiguous
++    row ranges because that is all the run path can slice.
++
++    Returns 0 when the batch is uniform, when the two classes interleave, or
++    when splitting is disabled.
++
++    Both orderings are recognised:
++
++    * **Decode-first** (prefill rows form a suffix) is this module's original
++      convention and is honoured for every plan flavour, so existing callers
++      keep their exact behaviour.
++    * **Prefill-first** (prefill rows form a prefix), which is what
++      TensorRT-LLM produces, is honoured only for ``sparse`` plans. The dense
++      flavour already handles a mixed batch in one call, whereas the sparse
++      MM-SA-Nv prefill kernel has no mixed path and would otherwise drag every
++      decode row through it. Confining it to sparse plans also leaves the proxy
++      and dense plans byte-identical to their pre-split behaviour, which
++      matters because the proxy's max-score output drives top-k block
++      selection.
++    """
++    batch_size = int(qo_segment_lens.shape[0])
++    if not enable or batch_size < 2:
++        return 0
++    is_prefill = qo_segment_lens > split_threshold
++    n_prefill = int(is_prefill.sum())
++    if n_prefill == 0 or n_prefill == batch_size:
++        return 0
++    if bool(is_prefill[batch_size - n_prefill:].all()):
++        return batch_size - n_prefill
++    if sparse and bool(is_prefill[:n_prefill].all()):
++        return n_prefill
++    # Interleaved: neither half would be uniform, so plan the batch as one.
++    return 0
++
++
++def _cache_split_boundaries(sub_lo):
++    """Precompute the boundaries the run path slices a split batch at.
++
++    Both are properties of the low sub-plan alone, so they are constant for the
++    whole step. Reading them at plan time keeps the device-to-host read off the
++    per-layer path, where a sparse model would otherwise repeat it once per
++    layer.
++    """
++    offsets = sub_lo.get("qo_segment_offsets")
++    if offsets is not None:
++        sub_lo["_split_nnz"] = int(offsets[-1].item()) // sub_lo.get("pack_factor", 1)
++    if "kv_page_indptr" in sub_lo:
++        sub_lo["_split_kv_pages"] = int(sub_lo["kv_page_indptr"][-1].item())
++    elif "total_rows" in sub_lo:
++        sub_lo["_split_kv_pages"] = int(sub_lo["total_rows"])
++
++
+ def fmha_sm100_plan(
+     qo_segment_lens: torch.Tensor,
+     kv_segment_lens: torch.Tensor,
+@@ -973,9 +1028,11 @@ def fmha_sm100_plan(
+         ``kv_segment_lens - qo_segment_lens`` for bottom-right causal masking.
+         A tensor must have shape ``[batch_size]``.
+     split_prefill_decode : bool, optional
+-        If True, a mixed batch ordered as decode requests followed by prefill
+-        requests is split into two sub-plans.  The original order must already
+-        group short decode sequences before long prefill sequences.
++        If True, a mixed batch whose decode and prefill requests form two
++        contiguous groups is split into two sub-plans.  Either group may come
++        first; see ``_mixed_batch_split`` for which orderings apply to which
++        plan flavours.  A batch that interleaves the two classes is planned as
++        one.
+     **kwargs
+         Planner options forwarded to ``_fmha_sm100_plan``.  Common options are
+         ``num_kv_heads``, ``num_kv_splits``, ``page_size``,
+@@ -985,8 +1042,13 @@ def fmha_sm100_plan(
+     Returns
+     -------
+     tuple
+-        ``(has_mixed_prefill, split, batch_size, decode_plan, prefill_plan)``.
+-        Pass this tuple unchanged as ``plan_info`` to ``fmha_sm100``.
++        ``(has_mixed_prefill, split, batch_size, sub_plan_lo, sub_plan_hi)``,
++        where ``sub_plan_lo`` describes batch rows ``[0, split)`` and
++        ``sub_plan_hi`` describes rows ``[split, batch_size)``.  Which of the
++        two is the prefill half depends on the caller's ordering, so consumers
++        must test a sub-plan's own tags rather than its position.
++        ``sub_plan_hi`` is None when the batch was not split.  Pass this tuple
++        unchanged as ``plan_info`` to ``fmha_sm100``.
+     """
+ 
+     # assert qo_segment_lens.device.type == 'cpu' \
+@@ -999,27 +1061,19 @@ def fmha_sm100_plan(
+         qo_offset = torch.full_like(qo_segment_lens, qo_offset)
+     
+     batch_size = qo_segment_lens.shape[0]
+-    has_mixed_prefill = False
+-    qmax = qo_segment_lens.max().item()
+     sparse = kwargs.get("kv_block_num", -1) > 0
+     split_threshold = _prefill_qlen_threshold(sparse)
+-    if split_prefill_decode and qmax > split_threshold:
+-        split = (qo_segment_lens > split_threshold).nonzero(as_tuple=False)[0, 0].item()
+-        has_mixed_prefill = split > 0
+-    if has_mixed_prefill:
+-        # print(f"Split into 2 parts at index {split}")
+-        decode_qo_segment_lens = qo_segment_lens[:split]
+-        decode_kv_segment_lens = kv_segment_lens[:split]
+-        decode_qo_offset = qo_offset[:split]
+-        decode = _fmha_sm100_plan(decode_qo_segment_lens, decode_kv_segment_lens, *args,
+-                                    qo_offset=decode_qo_offset, **kwargs)
+-        decode = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in decode.items()}
+-        prefill_qo_segment_lens = qo_segment_lens[split:]
+-        prefill_kv_segment_lens = kv_segment_lens[split:]
+-        prefill_qo_offset = qo_offset[split:]
+-        prefill = _fmha_sm100_plan(prefill_qo_segment_lens, prefill_kv_segment_lens, *args,
+-                                    qo_offset=prefill_qo_offset, **kwargs)
+-        return (True, split, batch_size, decode, prefill)
++    split = _mixed_batch_split(
++        qo_segment_lens, split_threshold, enable=split_prefill_decode, sparse=sparse
++    )
++    if split > 0:
++        sub_lo = _fmha_sm100_plan(qo_segment_lens[:split], kv_segment_lens[:split], *args,
++                                    qo_offset=qo_offset[:split], **kwargs)
++        sub_lo = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in sub_lo.items()}
++        sub_hi = _fmha_sm100_plan(qo_segment_lens[split:], kv_segment_lens[split:], *args,
++                                    qo_offset=qo_offset[split:], **kwargs)
++        _cache_split_boundaries(sub_lo)
++        return (True, split, batch_size, sub_lo, sub_hi)
+     else:
+         plan = _fmha_sm100_plan(qo_segment_lens, kv_segment_lens, *args, 
+                                     qo_offset=qo_offset, **kwargs)
+@@ -1081,16 +1135,23 @@ def fmha_sm100(
+     -------
+     tuple[torch.Tensor | None, torch.Tensor | None]
+         ``(out, max_score)``.  Either item may be ``None`` if the corresponding
+-        output was disabled.  When both decode and prefill sub-plans are used,
+-        outputs are concatenated back into the original batch order.
++        output was disabled.  When the plan was split into two sub-plans, each
++        half writes its own rows of ``out`` directly; if no ``out`` was supplied
++        the halves are concatenated back into the original batch order instead.
+     """
+     has_mixed_prefill, split, batch_size, decode, prefill = plan_info
+     if not has_mixed_prefill:
+         return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score, kv_indices=kv_indices,kv_block_indexes=kv_block_indexes, q_offset_override=q_offset_override, **kwargs)
+     else:
+-
+-        decode_pack = decode.get("pack_factor", 1)
+-        decode_nnz = decode["qo_segment_offsets"][-1].item() // decode_pack
++        # The `decode` / `prefill` names are historical: these are really the
++        # sub-plans for batch rows [0, split) and [split, batch_size), and which
++        # one holds the prefill requests depends on the caller's ordering. None
++        # of the slicing below needs to know, because every boundary is derived
++        # from the low sub-plan's own offsets.
++        decode_nnz = decode.get("_split_nnz")
++        if decode_nnz is None:
++            decode_pack = decode.get("pack_factor", 1)
++            decode_nnz = decode["qo_segment_offsets"][-1].item() // decode_pack
+         is_paged = kv_indices is not None
+         nnz_qo = q.shape[0]
+         num_qo_heads = q.shape[1]
+@@ -1101,10 +1162,12 @@ def fmha_sm100(
+         if is_paged:
+             k_decode, v_decode = k, v
+             k_prefill, v_prefill = k, v
+-            if "kv_page_indptr" in decode:
+-                kv_page_split = decode["kv_page_indptr"][-1].item()
+-            else:
+-                kv_page_split = decode["total_rows"]
++            kv_page_split = decode.get("_split_kv_pages")
++            if kv_page_split is None:
++                if "kv_page_indptr" in decode:
++                    kv_page_split = decode["kv_page_indptr"][-1].item()
++                else:
++                    kv_page_split = decode["total_rows"]
+             decode_kv_indices = kv_indices[:kv_page_split]
+             prefill_kv_indices = kv_indices[kv_page_split:]
+         else:
+@@ -1129,27 +1192,35 @@ def fmha_sm100(
+             decode_qo_offset = None
+             prefill_qo_offset = None
+ 
++        # Let each half write straight into its own rows of the caller's buffer.
++        # Row views of a contiguous [nnz, H, D] output are themselves
++        # contiguous, which is what the kernels require, so this removes a
++        # full-size concatenate plus copy from every call.
++        write_in_place = out is not None and out.is_contiguous()
++
+         # ---- Run kernels ----
+         decode_out, decode_ms = _fmha_sm100(
+             q_decode, k_decode, v_decode, decode,
+-            out=None, max_score=None,
++            out=out[:decode_nnz] if write_in_place else None, max_score=None,
+             kv_indices=decode_kv_indices, kv_block_indexes=decode_block_idx,
+             q_offset_override=decode_qo_offset,
+             **kwargs)
+         prefill_out, prefill_ms = _fmha_sm100(
+             q_prefill, k_prefill, v_prefill, prefill,
+-            out=None, max_score=None,
++            out=out[decode_nnz:] if write_in_place else None, max_score=None,
+             kv_indices=prefill_kv_indices, kv_block_indexes=prefill_block_idx,
+             q_offset_override=prefill_qo_offset,
+             **kwargs)
+ 
+         # ---- Merge out ----
+-        if decode_out is not None and prefill_out is not None:
++        if write_in_place:
++            combined_out = out
++        elif decode_out is not None and prefill_out is not None:
+             combined_out = torch.cat([decode_out, prefill_out], dim=0)
+         else:
+             combined_out = None
+         
+-        if out is not None and combined_out is not None:
++        if out is not None and combined_out is not None and combined_out is not out:
+             out.copy_(combined_out)
+ 
+         # ---- Merge max_score ----
 diff --git a/python/fmha_sm100/cute/interface.py b/python/fmha_sm100/cute/interface.py
-index d72b17a..eca5b8c 100644
+index d72b17a..e09014f 100644
 --- a/python/fmha_sm100/cute/interface.py
 +++ b/python/fmha_sm100/cute/interface.py
 @@ -136,6 +136,35 @@ def _prepare_paged_kv_for_tma(k, v, blk_kv: int):
@@ -54,7 +273,26 @@ index d72b17a..eca5b8c 100644
  def _validate_cu_seqlens(
      cu_seqlens: torch.Tensor,
      *,
-@@ -736,10 +765,21 @@ def sparse_atten_func(
+@@ -622,6 +651,7 @@ def sparse_atten_func(
+     usable_SM_count: int = -1,
+     qk_dtype: Optional[torch.dtype] = None,
+     pv_dtype: Optional[torch.dtype] = None,
++    out: Optional[torch.Tensor] = None,
+ ):
+     """Run SM100 CSR block-sparse varlen attention.
+ 
+@@ -691,6 +721,10 @@ def sparse_atten_func(
+     pv_dtype : torch.dtype, optional
+         Compile-time MMA operand dtype for PV.  Defaults to V storage dtype,
+         except supported FP8 K/V cache staging modes.
++    out : torch.Tensor, optional
++        Destination for the attention output, written in place by the reduction
++        instead of being allocated here.  Must be contiguous BF16 of shape
++        ``[total_q, Hq, 128]`` on the same device as ``q``.
+ 
+     Returns
+     -------
+@@ -736,10 +770,21 @@ def sparse_atten_func(
      max_seqlen_q = int(max_seqlen_q)
      max_seqlen_k = int(max_seqlen_k)
 
@@ -78,6 +316,48 @@ index d72b17a..eca5b8c 100644
          k2q_row_ptr.contiguous(),
          k2q_q_indices.contiguous(),
          int(topK),
+@@ -762,6 +807,7 @@ def sparse_atten_func(
+         int(max_seqlen_k),
+         qk_dtype,
+         pv_dtype,
++        out=out,
+     )
+ 
+ 
+@@ -1449,6 +1495,7 @@ def _sparse_atten_csr_varlen_forward(
+     max_seqlen_k: int,
+     qk_dtype: torch.dtype,
+     pv_dtype: torch.dtype,
++    out: Optional[torch.Tensor] = None,
+ ):
+     total_q, head_q, dim = q.shape
+     if head_q % head_kv != 0:
+@@ -1478,7 +1525,24 @@ def _sparse_atten_csr_varlen_forward(
+         if kernel_return_temperature_lse
+         else None
+     )
+-    O_out = torch.empty(total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
++    if out is None:
++        O_out = torch.empty(total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
++    else:
++        # `combine` writes its output with a plain contiguous layout, so a
++        # caller that already owns a matching buffer can have it written
++        # directly instead of copying the result afterwards.
++        if tuple(out.shape) != (total_q, head_q, dim):
++            raise ValueError(
++                f"out must have shape {(total_q, head_q, dim)}, "
++                f"got {tuple(out.shape)}"
++            )
++        if out.dtype != torch.bfloat16:
++            raise TypeError(f"out must be torch.bfloat16, got {out.dtype}")
++        if out.device != q.device:
++            raise ValueError("out must be on the same device as q")
++        if not out.is_contiguous():
++            raise ValueError("out must be contiguous")
++        O_out = out
+     LSE_out = torch.empty(total_q, head_q, dtype=torch.float32, device=q.device)
+     LSE_temperature_out = (
+         torch.empty_like(LSE_out) if kernel_return_temperature_lse else None
 diff --git a/python/fmha_sm100/cute/test_sparse_atten.py b/python/fmha_sm100/cute/test_sparse_atten.py
 index 21c777e..b5f078b 100644
 --- a/python/fmha_sm100/cute/test_sparse_atten.py
@@ -240,7 +520,7 @@ index 21c777e..b5f078b 100644
  @pytest.mark.parametrize("causal", [True])
  @pytest.mark.parametrize("batch", [3])
 diff --git a/python/fmha_sm100/sparse_fmha_adapter.py b/python/fmha_sm100/sparse_fmha_adapter.py
-index 306b416..81bf1ff 100644
+index 306b416..a564d47 100644
 --- a/python/fmha_sm100/sparse_fmha_adapter.py
 +++ b/python/fmha_sm100/sparse_fmha_adapter.py
 @@ -129,11 +129,19 @@ def sparse_fmha_plan(
@@ -408,3 +688,33 @@ index 306b416..81bf1ff 100644
              )
  
      # build_k2q_csr(return_schedule=True) builds schedule using hardware SM count internally
+@@ -382,6 +454,17 @@ def sparse_fmha(
+ 
+     softmax_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
+ 
++    # Hand the caller's buffer to the kernel when its layout already matches
++    # what `combine` produces, so the result does not have to be copied into
++    # place afterwards. Anything else falls back to allocate-then-copy.
++    writable_out = (
++        out is not None
++        and out.is_contiguous()
++        and out.dtype == torch.bfloat16
++        and out.device == q.device
++        and tuple(out.shape) == tuple(q.shape)
++    )
++
+     # print(q.shape, k.shape)
+     result = sparse_atten_func(
+         q, k, v,
+@@ -398,9 +481,10 @@ def sparse_fmha(
+         seqused_k=seqused_k,
+         schedule=schedule,
+         usable_SM_count=usable_SM_count,
++        out=out if writable_out else None,
+     )
+ 
+-    if out is not None:
++    if out is not None and not writable_out:
+         out.copy_(result)
+         return out, None
+     return result, None
