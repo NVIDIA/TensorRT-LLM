@@ -67,7 +67,7 @@ The core idea of MLA is the low-rank joint compression for the attention keys an
 
 For the decoding phase, the weights absorb significantly reduces the math FLOPS needed to up project the K and V, since the FLOPs needed for these up projections of KV are linear to the KV cache length, while length of Q vector is always 1 in the decoding phase. The longer the KV cache history is, the more FLOPs are needed, and the up projections are repeated for every decoded token since only the projected KV latent were saved, which further increases the FLOPs needed.
 For the prefill phase, the weights absorbed version changes the dimensions of Q and KV thus increasing the number of FLOPs for attention. Based on roofline analysis, non absorbed version is beneficial for the prefill phase with input length 256 or larger
-The TensorRT LLM MLA implementation chooses different highly optimized kernels for prefill and decoding, see [MLA](../../../../tensorrt_llm/_torch/modules/attention.py).
+The TensorRT LLM MLA implementation chooses different highly optimized kernels for prefill and decoding, see [MLA](../../../../tensorrt_llm/_torch/attention/attention.py).
 
 ### Data Parallel for Attention module (ADP)
 

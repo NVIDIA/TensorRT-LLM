@@ -20,6 +20,7 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
     _create_dsv4_epilogue_buffers,
@@ -28,7 +29,6 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
     project_sparse_attn_output,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm.functional import PositionEmbeddingType
 
 
@@ -73,7 +73,7 @@ def test_duplicate_layer_ids_preserve_all_mla_registrations() -> None:
     next_config.extra_attrs = target_config.extra_attrs
 
     with patch(
-        "tensorrt_llm._torch.modules.mla.create_attention",
+        "tensorrt_llm._torch.attention.mla.create_attention",
         side_effect=lambda *args, **kwargs: _FakeAttention(),
     ):
         target_mla = _make_mla(target_config)

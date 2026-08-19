@@ -14,6 +14,7 @@ from transformers import (AutoProcessor, AutoTokenizer, Mistral3Config,
                           MistralConfig, PretrainedConfig, PreTrainedModel)
 from transformers.activations import ACT2FN
 
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention_backend import AttentionMetadata
 from tensorrt_llm._torch.attention_backend.interface import (
     PositionalEmbeddingParams, RopeParams)
@@ -34,7 +35,6 @@ from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
                                                        _load_weights_impl,
                                                        filter_weights,
                                                        register_auto_model)
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP

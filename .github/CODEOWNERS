@@ -311,14 +311,9 @@
 /cpp/tests/unit_tests/kernels/mla* @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tests/unit_tests/kernels/ropeTest.cu @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tests/unit_tests/kernels/sparseAttentionKernelsTest.cpp @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention_backend @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/modules/cross_attention.py @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/modules/mla.py @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/modules/qk_norm_attention.py @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/modules/rotary_embedding.py @NVIDIA/trt-llm-torch-attention-devs
 /tests/scripts/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/custom_ops/test_deepseek_v4_q_norm.py @NVIDIA/trt-llm-torch-attention-devs
@@ -412,8 +407,8 @@
 /tests/integration/defs/accuracy/test_llm_api_autodeploy.py @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-qa-function
 
 ## TensorRT-LLM Pytorch - Attention
+/tensorrt_llm/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention_backend @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners

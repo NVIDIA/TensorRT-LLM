@@ -1475,7 +1475,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # kernel always receives a valid pointer, since several non-MLA
         # XQA kernels (cpp/kernels/xqa/mha.cu, mha_sm90.cu) deref
         # `kvCacheScale[0]` whenever `isKVCacheQuantized` is true and
-        # do not check for nullptr. `modules/attention.py` only assigns
+        # do not check for nullptr. `attention/attention.py` only assigns
         # `forward_args.kv_scale_*` for fp4 KV cache, so without this
         # fallback the kernel takes nullptr on fp8-KV models → illegal
         # memory access.
@@ -2009,7 +2009,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # (kernel reads a single `out_scale` and interprets it as the SF
         # quant scale when `output_sf` is allocated). `output_sf` is
         # populated by `create_output` in `forward` above, so the
-        # decision is correct only here, not at the modules/attention.py
+        # decision is correct only here, not at the attention/attention.py
         # call site where `output_sf` is always `None`.
         if (not forward_args.enable_dsv4_epilogue_fusion
                 and forward_args.output_sf is not None
@@ -2017,7 +2017,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             forward_args.out_scale = forward_args.out_scale_sf
 
         # Default `forward_args.kv_scale_*` to the layer-level mirrors when
-        # the caller didn't populate them. `modules/attention.py` only sets
+        # the caller didn't populate them. `attention/attention.py` only sets
         # these for fp4 KV cache; fp8-KV models leave them `None`. Several
         # XQA kernels (mha.cu, mha_sm90.cu) deref `kvCacheScale[0]` when
         # `isKVCacheQuantized` is true and don't check for nullptr, so

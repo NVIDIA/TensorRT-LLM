@@ -35,6 +35,7 @@ from _torch.modules.helix_test_utils import (
 from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.attention_backend.interface import (
     KVCacheParams,
     PositionalEmbeddingParams,
@@ -44,7 +45,6 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.distributed.ops import cp_allgather
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import CpType, Mapping

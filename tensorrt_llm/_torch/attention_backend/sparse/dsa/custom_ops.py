@@ -14,7 +14,7 @@ from .module import _forward_dsa_attn, forward_dsa_proj
 
 
 def _extract_extra_attrs(layer_idx: str):
-    from tensorrt_llm._torch.modules.attention import extract_extra_attrs
+    from tensorrt_llm._torch.attention.attention import extract_extra_attrs
 
     return extract_extra_attrs(layer_idx, "mla")
 

@@ -72,7 +72,7 @@ python3 -m pip install -r requirements-dev.txt
 
 The test requires at least two Blackwell GPUs; pytest skips it on unsupported hardware.
 
-The simplest correctness test validates the [MLA attention module](../../../tensorrt_llm/_torch/modules/attention.py) with Helix enabled:
+The simplest correctness test validates the [MLA attention module](../../../tensorrt_llm/_torch/attention/attention.py) with Helix enabled:
 
 ```bash
 # Run the MLA Helix unit test

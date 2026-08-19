@@ -1,10 +1,10 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.rotary_embedding import (MRotaryEmbedding,
+                                                            RotaryEmbedding)
 from tensorrt_llm._torch.attention_backend.interface import (RopeParams,
                                                              RotaryScalingType)
-from tensorrt_llm._torch.modules.rotary_embedding import (MRotaryEmbedding,
-                                                          RotaryEmbedding)
 from tensorrt_llm.functional import RopeEmbeddingUtils
 
 
@@ -254,10 +254,10 @@ class TestUnfusedRopeOwnership:
     made the attention kernel rotate a second time (double RoPE)."""
 
     def test_unfused_yarn_rope_is_applied_exactly_once(self):
+        from tensorrt_llm._torch.attention.attention import Attention
         from tensorrt_llm._torch.attention_backend.interface import \
             PositionalEmbeddingParams
         from tensorrt_llm._torch.model_config import ModelConfig
-        from tensorrt_llm._torch.modules.attention import Attention
         from tensorrt_llm.functional import PositionEmbeddingType
 
         yarn_params = PositionalEmbeddingParams(

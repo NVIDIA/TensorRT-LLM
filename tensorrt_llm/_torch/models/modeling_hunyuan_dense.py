@@ -10,18 +10,18 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
 from tensorrt_llm.functional import PositionEmbeddingType
 
+from ..attention.attention import Attention
+from ..attention.rotary_embedding import RotaryEmbedding
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..modules.rotary_embedding import RotaryEmbedding
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              duplicate_kv_weight, register_auto_model)

@@ -34,6 +34,7 @@ from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..attention.attention import Attention
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
     AttentionForwardArgs,
@@ -48,7 +49,6 @@ from ..attention_backend.sparse.minimax_m3 import (
 )
 from ..attention_backend.sparse.params import SparseBackendForwardArgs
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe

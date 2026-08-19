@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.attention.rotary_embedding import RopeParams
 from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams,
     PositionalEmbeddingParams,
@@ -43,7 +44,6 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
 )
-from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import get_sm_version

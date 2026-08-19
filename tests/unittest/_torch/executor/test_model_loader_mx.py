@@ -21,13 +21,13 @@ from utils.post_transform_qualification import (
 
 import tensorrt_llm.mapping as mapping_mod
 from tensorrt_llm._torch import distributed as distributed_mod
+from tensorrt_llm._torch.attention import mla as mla_mod
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_llama as modeling_llama_mod
 from tensorrt_llm._torch.models import modeling_qwen as modeling_qwen_mod
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
-from tensorrt_llm._torch.modules import mla as mla_mod
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
