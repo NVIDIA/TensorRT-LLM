@@ -59,6 +59,32 @@ _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 
 
+def _teardown_kv_cache_estimation_pass(
+    py_executor: PyExecutor,
+    kv_cache_creator: KvCacheCreator,
+    resources: dict,
+    model_engines: list[Optional[PyTorchModelEngine]],
+) -> None:
+    """Release every executor- and manager-owned resource from a profile pass."""
+    # NIXL-registered GPU memory must be deregistered before its cache manager
+    # is destroyed; otherwise the allocation remains pinned into the next
+    # profiling/final-manager construction.
+    try:
+        kv_cache_transceiver = getattr(py_executor, "kv_cache_transceiver",
+                                       None)
+        if kv_cache_transceiver is not None:
+            kv_cache_transceiver.shutdown()
+    finally:
+        kv_cache_creator.teardown_managers(resources)
+
+    # configure_kv_cache_capacity already shut down the executor and released
+    # its CUDA graphs. Only profiling metadata owned by the model engines
+    # remains.
+    for engine in model_engines:
+        if engine is not None:
+            engine.attn_metadata = None
+
+
 class _ExecutorMemoryMonitor:
     """Currently this focuses on tracking memory usage and related errors."""
 
@@ -1033,29 +1059,20 @@ def create_py_executor(
         run_sequence_count_estimation = (
             kv_cache_creator.try_prepare_sequence_count_estimation())
 
-        # Shut down the transceiver before tearing down KV cache managers so
-        # that NIXL-registered (pinned) GPU memory is deregistered first;
-        # otherwise the old KV cache memory stays pinned and the subsequent
-        # KV cache allocation will OOM.
-        try:
-            if hasattr(py_executor, 'kv_cache_transceiver'
-                       ) and py_executor.kv_cache_transceiver is not None:
-                py_executor.kv_cache_transceiver.shutdown()
-        finally:
-            kv_cache_creator.teardown_managers(resources)
-
-        # configure_kv_cache_capacity shuts down the Phase-1 executor, which
-        # releases its CUDA graphs before its resource managers. Only the
-        # profiling attention metadata remains to be discarded here.
-        for eng in [model_engine, draft_model_engine]:
-            if eng is not None:
-                eng.attn_metadata = None
+        _teardown_kv_cache_estimation_pass(
+            py_executor,
+            kv_cache_creator,
+            resources,
+            [model_engine, draft_model_engine],
+        )
 
         del py_executor  # free before constructing new
         gc.collect()
         torch.cuda.empty_cache()
 
-        if run_sequence_count_estimation:
+        def run_sequence_count_profile_pass() -> None:
+            nonlocal max_seq_len, peft_cache_config
+
             # The minimal first-pass manager cannot admit the wide context
             # shape. Rebuild the same throwaway resources with its measured
             # byte quota, then let the second pass account for any additional
@@ -1070,7 +1087,7 @@ def create_py_executor(
 
             with allocation_scope(ExecutorMemoryType.INIT_EXTRA_RESOURCES):
                 gc.collect()
-                py_executor = create_py_executor_instance(
+                sequence_profile_executor = create_py_executor_instance(
                     dist=dist,
                     resources=resources,
                     mapping=mapping,
@@ -1097,25 +1114,24 @@ def create_py_executor(
                     execution_stream=execution_stream,
                     max_num_sequences=max_num_seq_slots,
                 )
-                peft_cache_config = py_executor.peft_cache_config
+                peft_cache_config = sequence_profile_executor.peft_cache_config
 
             with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
-                kv_cache_creator.configure_kv_cache_capacity(py_executor)
+                kv_cache_creator.configure_kv_cache_capacity(
+                    sequence_profile_executor)
 
-            try:
-                if (hasattr(py_executor, 'kv_cache_transceiver')
-                        and py_executor.kv_cache_transceiver is not None):
-                    py_executor.kv_cache_transceiver.shutdown()
-            finally:
-                kv_cache_creator.teardown_managers(resources)
-
-            for eng in [model_engine, draft_model_engine]:
-                if eng is not None:
-                    eng.attn_metadata = None
-
-            del py_executor
+            _teardown_kv_cache_estimation_pass(
+                sequence_profile_executor,
+                kv_cache_creator,
+                resources,
+                [model_engine, draft_model_engine],
+            )
+            del sequence_profile_executor
             gc.collect()
             torch.cuda.empty_cache()
+
+        if run_sequence_count_estimation:
+            run_sequence_count_profile_pass()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using

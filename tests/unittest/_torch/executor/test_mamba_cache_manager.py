@@ -1536,7 +1536,7 @@ def test_hybrid_mtp_layout_honors_explicit_base_partition():
                 kv_cache_config=KvCacheConfig(enable_block_reuse=False),
                 spec_config=spec_config,
             )
-            expected_intercept = 2400 if manager_cls is CppMambaHybridCacheManager else 1600
+            expected_intercept = 2400
             assert cache_cost == (64 * (rank + 1), expected_intercept)
 
 
@@ -1562,7 +1562,7 @@ def test_hybrid_separate_mtp_draft_estimator_has_no_mamba_state():
             spec_config=spec_config,
             use_separate_draft_kv_cache=True,
         )
-        assert target_cost == (64, 1600)
+        assert target_cost == (64, 2400)
 
         _, local_mamba_layers, local_attention_layers = _get_local_mamba_cache_layout(
             model_config,
@@ -1790,6 +1790,63 @@ def test_v2_hybrid_mamba_free_rank_preserves_base_cache_config():
     config = mgr._build_cache_config(base_config)
 
     assert config == base_config
+
+
+def test_v2_hybrid_pp_mamba_rank_preserves_first_rank_working_set():
+    """An attention-only first PP rank cannot over-admit a Mamba rank."""
+    max_batch_size = 4
+    pp_size = 2
+
+    first_rank = object.__new__(MambaHybridCacheManagerV2)
+    first_rank.local_num_mamba_layers = 0
+    first_rank.max_batch_size = max_batch_size
+    first_rank.mapping = Mapping(world_size=pp_size, rank=0, tp_size=1, pp_size=pp_size)
+    assert first_rank._minimum_gpu_resident_sequences() == 0
+
+    mamba_rank = object.__new__(MambaHybridCacheManagerV2)
+    mamba_rank.local_num_mamba_layers = 1
+    mamba_rank.max_batch_size = max_batch_size
+    mamba_rank.mapping = Mapping(world_size=pp_size, rank=1, tp_size=1, pp_size=pp_size)
+    mamba_rank.kv_cache_type = CacheTypeCpp.SELF
+    mamba_rank.head_dim_per_layer = [64, 64]
+    mamba_rank.pp_layers = [0, 1]
+    mamba_rank._mamba_layer_mask = [True, False]
+    mamba_rank.ssm_bytes = 64
+    mamba_rank.conv_bytes = 32
+    mamba_rank.max_attention_window_vec = [128, 128]
+    mamba_rank.max_seq_len = 128
+    mamba_rank.max_num_tokens = 128
+    mamba_rank.tokens_per_block = 32
+    mamba_rank.num_local_layers = 2
+    mamba_rank._num_reserved_dummy_slots = 0
+    mamba_rank.dtype = DataType.HALF
+    mamba_rank.enable_swa_scratch_reuse = False
+    mamba_rank.enable_stats = False
+    mamba_rank.num_extra_kv_tokens = 0
+    mamba_rank.get_layer_bytes_per_token = lambda **kwargs: 0
+    mamba_rank._minimum_live_gpu_quota = lambda: 0
+    mamba_rank.kv_cache_config = KvCacheConfig(
+        pool_ratio=[0.01, 0.99],
+        enable_partial_reuse=False,
+        max_util_for_resume=1.0,
+    )
+
+    config = mamba_rank._build_cache_config(
+        KVCacheManagerConfig(
+            tokens_per_block=32,
+            cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
+            layers=_base_attention_layer_configs(2),
+            initial_pool_ratio=[0.01, 0.99],
+        )
+    )
+
+    expected_sequences = max_batch_size * pp_size
+    assert mamba_rank._minimum_gpu_resident_sequences() == expected_sequences
+    assert any(
+        len(batch.kv_caches) == expected_sequences
+        and all(kv.capacity == 0 for kv in batch.kv_caches)
+        for batch in config.constraints
+    )
 
 
 def test_v2_hybrid_warns_when_avg_seq_len_is_missing(monkeypatch):

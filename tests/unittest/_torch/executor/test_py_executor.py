@@ -2838,13 +2838,21 @@ class TestPendingTransferResponseFlush:
         # during the idle pass itself.
         assert executor._flush_pending_transfer_responses.call_count == 2
 
-    def test_overlap_v2_hard_pause_releases_before_request_pause(self, monkeypatch):
-        """V2 hard pause preserves the overlap batch's sampled-token boundary."""
+    def test_overlap_v2_hard_pause_waits_for_previous_batch(self, monkeypatch):
+        """Consume the sampled token before discarding its request resources."""
         executor = self._make_executor_loop_stub()
         executor._is_kv_manager_v2 = True
         executor._can_pause_for_rebalance = Mock(return_value=False)
         executor._wait_for_model_engine_input_copy = Mock()
-        paused_request = Mock()
+        paused_request = Mock(py_request_id=7)
+        previous_requests = Mock()
+        previous_requests.all_requests.return_value = [paused_request]
+        previous_sample_state = Mock()
+        executor.previous_batch = types.SimpleNamespace(
+            sample_state=previous_sample_state,
+            scheduled_requests=previous_requests,
+        )
+        executor.active_requests = [paused_request]
         scheduled_batch = types.SimpleNamespace(
             encoder_requests=[], paused_requests=[paused_request], generation_requests=[]
         )
@@ -2853,17 +2861,22 @@ class TestPendingTransferResponseFlush:
         )
         executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
         lifecycle = Mock()
+        executor._update_requests = lifecycle.update_requests
+        executor._process_previous_batch = lifecycle.process_previous_batch
         executor._terminate_requests = lifecycle.terminate
         executor._pause_requests = lifecycle.pause
-        executor._can_queue = Mock(return_value=(False, True))
+        executor._can_queue = Mock(return_value=(False, False))
         executor.kv_connector_manager = None
         executor._revert_gen_alloc = Mock()
         executor._finalize_adp_dummy_allocation = Mock()
         executor.kv_cache_transceiver = None
-        executor.previous_batch = None
+        executor._send_kv_async = Mock()
         executor.enable_early_first_token_response = False
+        executor.speculation_gate = None
         executor.drafter = None
         executor._enqueue_responses = Mock()
+        executor._commit_kv_cache_stats = Mock()
+        executor.perf_manager = Mock()
         executor._handle_kv_transfer_timeouts_synced = Mock()
         executor._flush_iter_stats_synced = Mock()
         executor._kv_connector_terminate_requests = Mock()
@@ -2873,6 +2886,8 @@ class TestPendingTransferResponseFlush:
         PyExecutor._executor_loop_overlap(executor)
 
         assert lifecycle.mock_calls == [
+            call.update_requests(previous_sample_state),
+            call.process_previous_batch(),
             call.terminate([paused_request]),
             call.pause([paused_request]),
         ]

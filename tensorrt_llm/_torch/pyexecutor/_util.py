@@ -23,8 +23,9 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 is_flashinfer_gdn_supported_arch, is_sm_100f,
+                                 prefer_pinned, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -414,15 +415,14 @@ def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
     return reserve, int(reserve / w_bytes_per_token)
 
 
-def _combine_graph_resident_profile_peak(
-    graph_resident_baseline_bytes: int,
-    eager_profile_baseline_bytes: int,
-    eager_profile_peak_bytes: int,
-) -> int:
-    """Combine a resident CUDA-graph baseline with an eager peak increment."""
-    eager_increment_bytes = max(
-        eager_profile_peak_bytes - eager_profile_baseline_bytes, 0)
-    return graph_resident_baseline_bytes + eager_increment_bytes
+def _needs_gdn_sequence_count_profile(
+    model_config: ModelConfig,
+    sm_version: Optional[int] = None,
+) -> bool:
+    """Return whether capacity profiling must cover FlashInfer GDN's wide batch."""
+    return (os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1"
+            and is_qwen3_hybrid(model_config.pretrained_config)
+            and is_flashinfer_gdn_supported_arch(sm_version))
 
 
 def _await_profile_batch(py_executor: PyExecutor,
@@ -907,21 +907,23 @@ class KvCacheCreator:
         return requests
 
     def try_prepare_sequence_count_estimation(self) -> bool:
-        """Prepare a second profiling pass for sequence-dependent peaks.
+        """Prepare a second profiling pass for FlashInfer GDN's wide-batch peak.
 
         The first pass uses a minimal temporary cache and a token-maximizing
-        request shape to obtain an upper bound for the final cache quota. A
-        hybrid V2 cache can admit many more recurrent states once constructed
-        with that quota. Existing max-shape warmup covers token-max context
-        and batch-max generation separately, so it misses context kernels
-        whose transient memory grows with the total scheduled sequence count.
-        Rebuild the cache and profile both the original long prefill and the
-        widest legal context shape. This measures the missing peak without
-        encoding backend- or model-specific workspace formulas in cache
-        sizing.
+        request shape to obtain an upper bound for the final cache quota.
+        FlashInfer GDN prefill allocates transient state per context sequence,
+        so that shape does not cover the widest legal batch. Rebuild the cache
+        and measure both shapes instead of encoding the workspace size in a
+        model-specific formula.
+
+        The model/backend/architecture gate is intentionally rank-symmetric.
+        A PP rank without a local GDN layer still participates in the pass so
+        manager creation and distributed quota synchronization stay aligned.
         """
-        if not issubclass(self._kv_cache_manager_cls,
-                          MambaHybridCacheManagerV2):
+        if (not issubclass(self._kv_cache_manager_cls,
+                           MambaHybridCacheManagerV2)
+                or not _needs_gdn_sequence_count_profile(
+                    self._model_engine.model.model_config)):
             return False
 
         max_profile_requests = min(self._max_batch_size, self._max_num_tokens)
@@ -961,7 +963,6 @@ class KvCacheCreator:
             num_requests=self._sequence_profile_max_requests,
             token_budget=token_budget,
         )
-        self._dummy_reqs = wide_requests
         # Run the wide shape first so retained reusable blocks from the long
         # request cannot reduce the maximum sequence count it admits.
         self._dummy_req_batches = [wide_requests, long_requests]
@@ -1341,11 +1342,8 @@ class KvCacheCreator:
                 assert eager_profile_baseline_bytes is not None
                 eager_increment_bytes = max(
                     eager_peak_memory - eager_profile_baseline_bytes, 0)
-                peak_memory = _combine_graph_resident_profile_peak(
-                    graph_resident_baseline_bytes,
-                    eager_profile_baseline_bytes,
-                    eager_peak_memory,
-                )
+                peak_memory = (graph_resident_baseline_bytes +
+                               eager_increment_bytes)
                 logger.info(
                     "Sequence-count profiling measured "
                     f"{eager_increment_bytes / GB:.2f} GiB above the "

@@ -22,7 +22,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     CacheCost,
     KvCacheCreator,
     _await_profile_batch,
-    _combine_graph_resident_profile_peak,
+    _needs_gdn_sequence_count_profile,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
@@ -38,9 +38,19 @@ pytestmark = pytest.mark.cpu_only
 # ---------------------------------------------------------------------------
 
 
-def test_graph_resident_peak_combines_only_eager_increment() -> None:
-    assert _combine_graph_resident_profile_peak(100, 70, 95) == 125
-    assert _combine_graph_resident_profile_peak(100, 70, 60) == 100
+def test_gdn_sequence_count_profile_is_limited_to_flashinfer_qwen(monkeypatch) -> None:
+    monkeypatch.delenv("TLLM_USE_FLASHINFER_GDN_PREFILL", raising=False)
+    qwen = SimpleNamespace(pretrained_config=SimpleNamespace(architectures=["Qwen3_5ForCausalLM"]))
+    nemotron = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["NemotronHForCausalLM"])
+    )
+
+    assert _needs_gdn_sequence_count_profile(qwen, sm_version=90)
+    assert not _needs_gdn_sequence_count_profile(qwen, sm_version=80)
+    assert not _needs_gdn_sequence_count_profile(nemotron, sm_version=90)
+
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "0")
+    assert not _needs_gdn_sequence_count_profile(qwen, sm_version=90)
 
 
 def test_profile_batch_waits_for_local_final_responses() -> None:
@@ -200,11 +210,16 @@ def test_sequence_max_dummy_requests_preserve_token_budget() -> None:
     assert [len(request.input_token_ids) for request in requests] == [2, 2, 2, 2]
 
 
-def test_hybrid_v2_prepares_measured_sequence_count_estimation() -> None:
+def test_hybrid_v2_prepares_measured_sequence_count_estimation(monkeypatch) -> None:
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = SimpleNamespace(
         model=SimpleNamespace(
-            model_config=SimpleNamespace(pretrained_config=SimpleNamespace(vocab_size=128))
+            model_config=SimpleNamespace(
+                pretrained_config=SimpleNamespace(
+                    vocab_size=128,
+                    architectures=["Qwen3_5ForCausalLM"],
+                )
+            )
         ),
         max_seq_len=32,
         use_mrope=False,
@@ -223,6 +238,10 @@ def test_hybrid_v2_prepares_measured_sequence_count_estimation() -> None:
         pool_ratio=[0.5, 0.5],
         avg_seq_len=8,
     )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor._util.is_flashinfer_gdn_supported_arch",
+        lambda sm_version=None: True,
+    )
 
     assert creator.try_prepare_sequence_count_estimation()
     # Simulate the preliminary quota clamping the second-pass cache shape.
@@ -232,7 +251,6 @@ def test_hybrid_v2_prepares_measured_sequence_count_estimation() -> None:
     wide_requests, long_requests = creator._dummy_req_batches
     assert [len(request.input_token_ids) for request in long_requests] == [3, 3, 3, 1]
     assert [len(request.input_token_ids) for request in wide_requests] == [3, 3, 2, 2]
-    assert creator._dummy_reqs is wide_requests
     assert creator._sequence_profile_memory_cap == 1234
     assert creator._kv_cache_config.max_tokens == 64
     assert creator._kv_cache_config.pool_ratio == [0.25, 0.75]

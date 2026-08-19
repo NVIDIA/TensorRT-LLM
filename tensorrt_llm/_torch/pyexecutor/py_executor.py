@@ -4800,8 +4800,6 @@ class PyExecutor:
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
-                self._terminate_requests(scheduled_batch.paused_requests)
-
                 gpu_forward_events_from_perf_pool = False
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -4961,8 +4959,6 @@ class PyExecutor:
                     # Cleanup previous draft resources used in the draft model
                     self.drafter.cleanup_previous_draft_resources()
 
-                self._pause_requests(scheduled_batch.paused_requests)
-
                 if can_queue:
                     guided_decoder_failed_requests = None
                     with self.perf_manager.record_perf_events(
@@ -4999,6 +4995,7 @@ class PyExecutor:
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
 
+                previous_batch_processed = self.previous_batch is None
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
                         self.previous_batch.scheduled_requests)
@@ -5009,8 +5006,29 @@ class PyExecutor:
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
+                    previous_batch_processed = True
                 else:
                     self._enqueue_responses([])
+
+                # Hard pause discards every request-owned resource. In the
+                # overlap loop, a selected victim may still belong to
+                # ``previous_batch`` and therefore have an unconsumed sampled
+                # token. Finalize that batch first so recomputation includes
+                # the token and every resource manager has observed the
+                # completed ownership transition. If this rank had to defer
+                # previous-batch processing, leave the victim active and let
+                # the scheduler reconsider it next iteration.
+                if previous_batch_processed:
+                    active_request_ids = {
+                        req.py_request_id
+                        for req in self.active_requests
+                    }
+                    hard_paused_requests = [
+                        req for req in scheduled_batch.paused_requests
+                        if req.py_request_id in active_request_ids
+                    ]
+                    self._terminate_requests(hard_paused_requests)
+                    self._pause_requests(hard_paused_requests)
 
                 # Drain buffers from the (per-rank-divergent)
                 # _process_previous_batch above; rank-symmetric companion to

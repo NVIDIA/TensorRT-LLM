@@ -2068,6 +2068,21 @@ def _estimate_mamba_hybrid_cache_cost(
     return attention_slope + regular_slope, intercept
 
 
+def _get_v2_guaranteed_resident_sequences(
+    max_batch_size: int,
+    mapping: Mapping,
+) -> int:
+    """Return the recurrent-state floor needed for rank-consistent admission."""
+    if mapping.pp_size > 1:
+        # The first PP rank owns scheduling, but it may have no local Mamba
+        # layer and token-capacity synchronization cannot represent a fixed
+        # state cost per sequence. Until V2 synchronizes a separate resident
+        # sequence limit, every Mamba-owning rank must fit the largest PP
+        # pipeline working set that the first rank can admit.
+        return max_batch_size * mapping.pp_size
+    return 1
+
+
 class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     """Hybrid cache manager storing mamba states inside the KVCacheManager pool.
 
@@ -3161,11 +3176,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             num_reserved_dummy_slots=num_reserved_dummy_slots,
-            # Suspended V2 requests can migrate recurrent state to a colder
-            # tier. Only one runnable request and persistent padding dummies
-            # are an unavoidable GPU fixed cost; max_batch_size remains a
-            # pool-ratio hint below, not a residency requirement.
-            num_guaranteed_resident_sequences=1,
+            # PP scheduling is decided by the first rank, which may not own a
+            # recurrent layer. Preserve the full PP working-set floor until a
+            # per-sequence admission limit is synchronized across ranks. A
+            # single-stage manager only needs one request for progress.
+            num_guaranteed_resident_sequences=(
+                _get_v2_guaranteed_resident_sequences(max_batch_size, mapping)),
             include_explicit_snapshots=True,
             cap_partial_attention_snapshots=True,
             **kwargs,
@@ -3188,11 +3204,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Return the number of real requests that must fit on GPU.
 
         V2 can preserve suspended recurrent state in a colder cache tier, so
-        ``max_batch_size`` is not a hard residency requirement. One request is
-        sufficient for forward progress; the scheduler admits more whenever
-        both the recurrent and attention pools have pages for them.
+        one request is sufficient for forward progress without pipeline
+        parallelism. Under PP, the first rank may be attention-only and cannot
+        infer another rank's fixed recurrent-state cost from token capacity;
+        retain the full pipeline working-set floor until sequence admission is
+        synchronized explicitly.
         """
-        return int(self.local_num_mamba_layers > 0)
+        if self.local_num_mamba_layers == 0:
+            return 0
+        return _get_v2_guaranteed_resident_sequences(self.max_batch_size,
+                                                     self.mapping)
 
     def _minimum_resumable_state_slots(self) -> int:
         """Return physical SSM slots needed for one resumable request."""
@@ -3396,10 +3417,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                                      self._max_resident_sequences() +
                                      dummy_requests)
         # Reserve only state slots that cannot be offloaded: one runnable
-        # request plus persistent padding dummies. StorageManager adds the
-        # max_util_for_resume headroom to this logical constraint. Additional
-        # requests consume the ratio-sized pool and are suspended to a colder
-        # tier when their GPU state is not resident.
+        # request in a single-stage executor, or the full PP working set needed
+        # for rank-consistent scheduling, plus persistent padding dummies.
+        # StorageManager adds max_util_for_resume headroom to this constraint.
         ssm_floor_slots = (self._minimum_gpu_resident_sequences() +
                            self._num_reserved_dummy_slots)
         constraints = [

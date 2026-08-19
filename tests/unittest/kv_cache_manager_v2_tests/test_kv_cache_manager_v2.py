@@ -545,7 +545,8 @@ class TestNoBatching(TestKVCacheManagerV2):
         max_seq_len = 32 * 22  # 23 blocks will require more than 32MB memory
         seq_len = max_seq_len
 
-        # create a request and suspend it. It shall not consume any GPU memory after suspend.
+        # Create and suspend a request. Its pages become evictable and may
+        # remain on GPU until the next allocation reclaims or offloads them.
         req0 = self.new_request(0, None, 256, seq_len - 256)
         with TemporaryCudaStream([]) as s:
             stream = cast(CudaStream, s.handle)
