@@ -108,7 +108,13 @@ def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
     return types.SimpleNamespace(
         num_stages=num_stages,
         block_size=5,
-        _attn_params={"window_size": window_size, "head_dim": head_dim},
+        _attn_params={
+            "window_size": window_size,
+            "head_dim": head_dim,
+            "n_heads": 128,
+            "softmax_scale": 1.0,
+            "eps": 1e-6,
+        },
     )
 
 
@@ -187,7 +193,13 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     class DraftModel:
         num_stages = 1
         block_size = 5
-        _attn_params = {"window_size": 8, "head_dim": 4}
+        _attn_params = {
+            "window_size": 8,
+            "head_dim": 4,
+            "n_heads": 128,
+            "softmax_scale": 1.0,
+            "eps": 1e-6,
+        }
 
         def __init__(self):
             self.written_positions = []
@@ -371,7 +383,13 @@ def test_prepare_keeps_dummy_generation_requests_on_scratch_row():
 class _RecordingDraftModel:
     num_stages = 1
     block_size = 5
-    _attn_params = {"window_size": 8, "head_dim": 4}
+    _attn_params = {
+        "window_size": 8,
+        "head_dim": 4,
+        "n_heads": 128,
+        "softmax_scale": 1.0,
+        "eps": 1e-6,
+    }
 
     def __init__(self):
         self.forward_calls = []
