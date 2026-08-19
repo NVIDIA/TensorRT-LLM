@@ -22,11 +22,11 @@ from typing import Any, Iterable, List, Optional, Union
 
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer
 
+from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import load_wan_vae
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -367,11 +367,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
-            self.vae = AutoencoderKLWan.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.VAE,
-                torch_dtype=torch.bfloat16,  # load VAE in BF16 for memory saving
-            ).to(device)
+            # Cosmos3 ships the Wan2.2 VAE (vae/config.json declares
+            # Wan-AI/Wan2.2-TI2V-5B-Diffusers), so the native WanVAE loads the
+            # same weights from the same directory. It is faster and shards
+            # better than the diffusers class; TRTLLM_USE_DIFFUSER_VAE=1 opts
+            # back out. BF16 for memory saving.
+            self.vae = load_wan_vae(checkpoint_dir, device, torch.bfloat16)
 
             self.vae_scale_factor_temporal = getattr(
                 self.vae.config, "scale_factor_temporal", self.vae_scale_factor_temporal
