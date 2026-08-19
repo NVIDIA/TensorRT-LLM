@@ -158,6 +158,9 @@ def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch)
         def _setup_runtime_lora(self):
             events.append("runtime_lora")
 
+        def torch_compile(self):
+            pass
+
         def _setup_cache_acceleration(self):
             events.append("cache_acceleration")
 
