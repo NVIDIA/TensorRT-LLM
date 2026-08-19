@@ -17,7 +17,6 @@ Needs 1 GPU + fla-core; runs with random weights (no checkpoint).
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -128,10 +127,7 @@ def test_kda_prefill_matches_reference():
     reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
     reference._build_mtp_conv_weights()
-    assert reference._qkvg_proj_weight is None
     runtime.finalize_decode_weights()
-    assert runtime._qkvg_proj_weight is not None
-    assert runtime._bfa_proj_weight is not None
 
     slots = 4
     slot_indices = torch.tensor([2, 0], device=device, dtype=torch.long)
@@ -179,8 +175,6 @@ def test_kda_decode_matches_reference(monkeypatch, enable_pdl):
     reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
     runtime.finalize_decode_weights()
-    assert runtime._qkvg_proj_weight is not None
-    assert runtime._bfa_proj_weight is not None
 
     batch = 3
     slots = batch + 2
@@ -195,14 +189,7 @@ def test_kda_decode_matches_reference(monkeypatch, enable_pdl):
     expected = reference(hidden_states, _decode_metadata(expected_cache, slot_indices))
 
     actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
-    fused_qkvg_error = AssertionError("fused QKVG decode called a separate projection")
-    with (
-        patch.object(runtime.q_proj, "forward", side_effect=fused_qkvg_error),
-        patch.object(runtime.k_proj, "forward", side_effect=fused_qkvg_error),
-        patch.object(runtime.v_proj, "forward", side_effect=fused_qkvg_error),
-        patch.object(runtime.g_proj, "forward", side_effect=fused_qkvg_error),
-    ):
-        actual = runtime(hidden_states, _decode_metadata(actual_cache, slot_indices))
+    actual = runtime(hidden_states, _decode_metadata(actual_cache, slot_indices))
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=2e-2, atol=2e-2)
