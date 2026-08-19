@@ -279,12 +279,10 @@ class CommunicationFactory:
 
             # Try DeepEPLowLatency as fallback when DeepEP is not available
             try:
-                if top_k > DeepEPLowLatency.MAX_TOP_K:
+                max_top_k = DeepEPLowLatency.max_top_k_for(quant_config, use_low_precision_combine)
+                if top_k > max_top_k:
                     raise ValueError(
-                        f"top_k={top_k} exceeds the low-latency kernels' "
-                        f"compile-time cap MAX_TOP_K={DeepEPLowLatency.MAX_TOP_K} "
-                        "(kNumMaxTopK in internode_ll.cu); the kernel-side "
-                        "EP_HOST_ASSERT would abort on the first dispatch/combine"
+                        f"DeepEPLowLatency supports top_k <= {max_top_k}, got {top_k}."
                     )
                 strategy = DeepEPLowLatency(
                     mapping,
@@ -399,10 +397,9 @@ class CommunicationFactory:
                 use_cuda_graph,
             )
         elif method == "DEEPEPLOWLATENCY":
-            if top_k > DeepEPLowLatency.MAX_TOP_K:
-                raise ValueError(
-                    f"DeepEPLowLatency supports top_k <= {DeepEPLowLatency.MAX_TOP_K}, got {top_k}."
-                )
+            max_top_k = DeepEPLowLatency.max_top_k_for(quant_config, use_low_precision_combine)
+            if top_k > max_top_k:
+                raise ValueError(f"DeepEPLowLatency supports top_k <= {max_top_k}, got {top_k}.")
             return DeepEPLowLatency(
                 mapping,
                 num_slots,
