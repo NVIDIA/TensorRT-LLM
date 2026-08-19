@@ -712,12 +712,13 @@ class ModelConfig(Generic[TConfig]):
                 quant_config.exclude_modules = default_exclude
 
         # Honour the producer's "leave these layers unquantized" list, whatever
-        # the quant format. Compressed-tensors spells it "ignore"; modelopt,
-        # HF fp8 and mxfp8 spell it "ignored_layers". These layers carry no
-        # quant scales in the checkpoint and must be built as bf16 (per-head
-        # g_proj whose out dim is not a multiple of the block alignment, and
-        # MoE experts the producer kept in bf16 for quality). Merged on top of
-        # whatever per-format defaults were set above.
+        # the quant format. Compressed-tensors spells it "ignore"; HF fp8 and
+        # mxfp8 spell it "ignored_layers" (modelopt returns early above, so it
+        # never reaches here). These layers carry no quant scales in the
+        # checkpoint and must be built as bf16 (per-head g_proj whose out dim is
+        # not a multiple of the block alignment, and MoE experts the producer
+        # kept in bf16 for quality). Merged on top of whatever per-format
+        # defaults were set above.
         producer_ignored = list(hf_quant_config.get("ignored_layers", []) or [])
         producer_ignored += list(hf_quant_config.get("ignore", []) or [])
         if producer_ignored:

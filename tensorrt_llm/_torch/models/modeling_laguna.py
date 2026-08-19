@@ -237,11 +237,19 @@ def g_proj_quant_config(
     alignment, so a quantised g_proj trips Linear.__init__'s assert under
     tp_size > 1. __post_init__'s generic exclusion pass runs too late.
     """
-    quant_config = model_config.get_quant_config()
-    if quant_config is None or layer_idx is None:
-        return quant_config
+    if layer_idx is None:
+        return model_config.get_quant_config()
 
     name = f"model.layers.{layer_idx}.self_attn.g_proj"
+    # Resolve this layer's own config for a MIXED_PRECISION checkpoint; fall
+    # back to the global config when there is no per-layer entry for g_proj.
+    try:
+        quant_config = model_config.get_quant_config(name)
+    except ValueError:
+        quant_config = model_config.get_quant_config()
+    if quant_config is None:
+        return quant_config
+
     if not quant_config.is_module_excluded_from_quantization(name):
         return quant_config
 
