@@ -1578,6 +1578,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         max_seq_len: int,
         max_batch_size: int,
         mapping: Mapping,
+        max_num_tokens: int = 8192,
         dtype: DataType = DataType.HALF,
         spec_config: Optional["DecodingBaseConfig"] = None,
         is_estimating_kv_cache: bool = False,
@@ -1642,6 +1643,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
+            max_num_tokens=max_num_tokens,
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
@@ -2189,6 +2191,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 layer_mask=full_attention_layer_mask,
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
+                **kwargs,
             )
             # PP ranks replay the same scheduling decisions, so a rank without
             # local Mamba layers must still publish the configured boundaries.
