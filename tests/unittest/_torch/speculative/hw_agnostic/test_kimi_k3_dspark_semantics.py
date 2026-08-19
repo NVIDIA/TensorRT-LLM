@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM, dspark_layer_window_size
+from tensorrt_llm._torch.models.modeling_dspark import Qwen3DSparkForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
     dspark_markov_chain_logits,
     dspark_markov_step_bias,
@@ -263,7 +264,9 @@ def _build_drafter(dspark: bool, weights):
     from tensorrt_llm._torch.model_config import ModelConfig
 
     model_config = ModelConfig(pretrained_config=_tiny_config(dspark), attn_backend="TRTLLM")
-    drafter = DFlashForCausalLM(model_config).to("cuda")
+    # The DSpark head set lives in the DSpark drafter, not in the DFlash base.
+    drafter_cls = Qwen3DSparkForCausalLM if dspark else DFlashForCausalLM
+    drafter = drafter_cls(model_config).to("cuda")
     # Drop dspark head tensors for the plain drafter (schema without them).
     if not dspark:
         weights = {k: v for k, v in weights.items() if not k.startswith(("markov_", "confidence_"))}
@@ -355,9 +358,9 @@ needs_gpu = pytest.mark.skipif(
 def test_dspark_drafter_loads_head_weights_and_parses_config():
     weights = _tiny_weights()
     drafter = _build_drafter(True, weights)
-    assert drafter._dspark_shift_label and drafter._dspark_use_swa
-    assert drafter._dspark_swa_window == SWA_WINDOW
-    assert drafter._dspark_layer_windows == [(SWA_WINDOW - 1, SWA_WINDOW - 1)] * 2
+    assert drafter._dspark_shift_label and drafter._use_swa
+    assert drafter._swa_window == SWA_WINDOW
+    assert drafter._layer_windows == [(SWA_WINDOW - 1, SWA_WINDOW - 1)] * 2
     assert drafter.has_markov_head
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_w1.weight"])
     torch.testing.assert_close(drafter.markov_w2.cpu(), weights["markov_w2.weight"])
@@ -371,16 +374,22 @@ def test_dspark_drafter_loads_head_weights_and_parses_config():
 @needs_gpu
 def test_plain_dflash_drafter_keeps_old_gates():
     """No-regression: a config WITHOUT dspark fields resolves to the exact
-    old code path (no window, no markov, mask slots 1..K)."""
+    old code path (no window, no markov, mask slots 1..K).
+
+    The DFlash base no longer carries the DSpark head set at all, so the
+    assertions are that those attributes are absent rather than inert.
+    """
     drafter = _build_drafter(False, _tiny_weights())
-    assert not drafter._dspark_shift_label
-    assert not drafter._dspark_use_swa
-    assert drafter._dspark_layer_windows == [(-1, -1)] * 2
-    assert not drafter.has_markov_head
-    assert drafter.markov_w1 is None and drafter.confidence_proj_weight is None
-    x = torch.randn(2, 3, VOCAB)
-    t = torch.zeros(2, dtype=torch.long)
-    assert drafter.apply_markov_chain_logits(x, t) is x
+    assert not drafter._use_swa
+    assert drafter._layer_windows == [(-1, -1)] * 2
+    for absent in (
+        "_dspark_shift_label",
+        "has_markov_head",
+        "markov_w1",
+        "confidence_proj_weight",
+        "apply_markov_chain_logits",
+    ):
+        assert not hasattr(drafter, absent), f"DFlash base still carries {absent}"
 
 
 @needs_gpu
@@ -393,8 +402,8 @@ def test_legacy_causal_dflash_config_constructs():
     cfg = _tiny_config(False)
     cfg.dflash_config = dict(cfg.dflash_config, causal=True)
     drafter = DFlashForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
-    assert drafter._dspark_layer_windows == [(-1, -1)] * 2
-    assert not drafter.has_markov_head
+    assert drafter._layer_windows == [(-1, -1)] * 2
+    assert not hasattr(drafter, "has_markov_head")
 
 
 @needs_gpu
@@ -404,8 +413,8 @@ def test_dspark_causal_config_rejected():
 
     cfg = _tiny_config(True)
     cfg.dflash_config = dict(cfg.dflash_config, causal=True)
-    with pytest.raises(ValueError, match="non-causal dspark convention"):
-        DFlashForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
+    with pytest.raises(ValueError, match="non-causal DSpark convention"):
+        Qwen3DSparkForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
 
 
 @needs_gpu
@@ -416,8 +425,8 @@ def test_dspark_projector_type_alone_rejects_causal():
 
     cfg = _tiny_config(False)
     cfg.dflash_config = dict(cfg.dflash_config, projector_type="dspark", causal=True)
-    with pytest.raises(ValueError, match="non-causal dspark convention"):
-        DFlashForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
+    with pytest.raises(ValueError, match="non-causal DSpark convention"):
+        Qwen3DSparkForCausalLM(ModelConfig(pretrained_config=cfg, attn_backend="TRTLLM"))
 
 
 def _run_block_decode(drafter, weights, captured, noise_embed):

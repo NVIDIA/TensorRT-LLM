@@ -2965,6 +2965,19 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
+    attention_backend: Literal["VANILLA", "TRTLLM"] = Field(
+        default="VANILLA",
+        description=
+        "Attention backend for the pooled-context cross-attention of a "
+        "standalone DSpark drafter (one shipped as its own checkpoint rather "
+        "than inside the target's mtp.* namespace). Ignored by the embedded "
+        "DeepSeek-V4-Pro draft, which uses its own captured-context attention. "
+        "This is independent of the backend used to construct the drafter's "
+        "standard attention modules. TRTLLM requires FlashInfer and an NVIDIA "
+        "Blackwell GPU with SM100 or SM103, and uses generated FMHA kernels "
+        "with a private paged context cache; VANILLA uses FlashAttention with "
+        "a contiguous cache.")
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
@@ -5993,26 +6006,39 @@ class TorchLlmArgs(BaseLlmArgs):
                 if spec_cfg.speculative_model is None:
                     raise ValueError(
                         "DSpark requires speculative_config.speculative_model "
-                        "to point at the checkpoint directory containing the "
-                        "mtp.* draft weights (for DeepSeek-V4-Pro-DSpark this "
-                        "is the target checkpoint directory itself).")
+                        "to point at the drafter's checkpoint directory: a "
+                        "standalone DSpark drafter repository, or -- for the "
+                        "embedded DeepSeek-V4-Pro flavour, whose draft weights "
+                        "live in the mtp.* namespace -- the target checkpoint "
+                        "directory itself.")
                 # Resolve target_layer_ids / mask_token_id / block_size /
                 # markov_rank from the draft (or main) model config if not set.
-                # DSpark ships these as top-level ``dspark_*`` keys in the
-                # DeepSeek-V4-Pro config.json; also accept a nested
-                # ``dspark_config`` dict for forward compatibility.
+                # Three checkpoint spellings are in the wild for the same knobs
+                # and all are accepted here, because a key the reader misses is
+                # not an error -- it silently falls back to a default and the
+                # drafter degrades (a markov_rank read as 0 skips the Markov
+                # head entirely, costing acceptance with no warning):
+                #   - top-level ``dspark_*``  (DeepSeek-V4-Pro)
+                #   - nested ``dflash_config``  (SpecForge / RadixArk drafters)
+                #   - nested ``dspark_config``  (forward compatibility)
+                #   - plain top-level keys  (TorchSpec drafters)
                 draft_config_path = os.path.join(spec_cfg.speculative_model,
                                                  "config.json")
                 if os.path.exists(draft_config_path):
                     with open(draft_config_path) as f:
                         draft_cfg = json.load(f)
-                    dspark_cfg = draft_cfg.get("dspark_config", {})
+                    dspark_cfg = draft_cfg.get("dspark_config") or {}
+                    dflash_cfg = draft_cfg.get("dflash_config") or {}
 
                     def _dspark_get(key, top_level_key):
-                        value = dspark_cfg.get(key)
-                        if value is None:
-                            value = draft_cfg.get(top_level_key)
-                        return value
+                        for source, name in ((dspark_cfg, key), (dflash_cfg,
+                                                                 key),
+                                             (draft_cfg,
+                                              top_level_key), (draft_cfg, key)):
+                            value = source.get(name)
+                            if value is not None:
+                                return value
+                        return None
 
                     # The checkpoint's ``dspark_target_layer_ids`` is
                     # authoritative: it fixes both which target hidden states
