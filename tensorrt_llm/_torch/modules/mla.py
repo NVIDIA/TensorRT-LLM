@@ -44,6 +44,7 @@ from ..attention_backend.sparse.hooks import get_sparse_mla_hooks
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph
 from ..utils import (
     AuxStreamType,
     Fp4QuantizedTensor,
@@ -111,24 +112,27 @@ def _extract_mla_extra_attrs(layer_idx: str):
     return metadata, mla_layer
 
 
-def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> list[torch.Tensor]:
+def create_mla_outputs_impl(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
-    return mla_layer._create_outputs(hidden_states, metadata)
+    outputs = mla_layer._create_outputs(hidden_states, metadata)
+    if len(outputs) != 1:
+        raise RuntimeError("MLA custom ops require exactly one output tensor.")
+    return outputs[0]
 
 
 @torch.library.custom_op("trtllm::create_mla_outputs", mutates_args=())
-def create_mla_outputs(hidden_states: torch.Tensor, layer_idx: str) -> list[torch.Tensor]:
+def create_mla_outputs(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
 @create_mla_outputs.register_fake
-def _create_mla_outputs_fake(hidden_states, layer_idx):
+def _create_mla_outputs_fake(hidden_states: torch.Tensor, layer_idx: str) -> torch.Tensor:
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
 @torch.library.custom_op(
     "trtllm::mla_custom_op_inplace",
-    mutates_args=("output", "sparse_output", "sparse_output_sf"),
+    mutates_args=("output",),
 )
 def mla_custom_op_inplace(
     hidden_states: torch.Tensor,
@@ -136,8 +140,6 @@ def mla_custom_op_inplace(
     layer_idx: str,
     output: torch.Tensor,
     latent_cache_gen: Optional[torch.Tensor],
-    sparse_output: Optional[torch.Tensor],
-    sparse_output_sf: Optional[torch.Tensor],
     hidden_states_fp4: Optional[torch.Tensor] = None,
     hidden_states_sf: Optional[torch.Tensor] = None,
 ) -> None:
@@ -151,20 +153,16 @@ def mla_custom_op_inplace(
             scaling_factor=hidden_states_sf,
             unquantized_hidden_states=hidden_states,
         )
-    attn_output = [output]
-    if sparse_output is not None:
-        attn_output.append(sparse_output)
-    if sparse_output_sf is not None:
-        if sparse_output is None:
-            raise RuntimeError("sparse_output_sf requires sparse_output")
-        attn_output.append(sparse_output_sf)
     mla_layer.forward_impl(
         position_ids,
         hidden_states,
         metadata,
-        attn_output=attn_output,
+        attn_output=[output],
         latent_cache_gen=latent_cache_gen,
     )
+
+
+maybe_bcg_mla_custom_op_inplace = eager_on_graph(mla_custom_op_inplace)
 
 
 def fp8_block_scaling_bmm_out(
@@ -1723,36 +1721,26 @@ class MLA(nn.Module):
             return
 
         output = attn_output[0]
-        sparse_output = None
-        sparse_output_sf = None
-        if len(attn_output) > 3:
-            raise RuntimeError("MLA output hooks may return at most two sparse output buffers.")
-        if len(attn_output) > 1:
-            sparse_output = attn_output[1]
-        if len(attn_output) > 2:
-            sparse_output_sf = attn_output[2]
+        if len(attn_output) != 1:
+            raise RuntimeError("MLA custom ops require exactly one output tensor.")
 
         if isinstance(hidden_states, Fp4QuantizedTensor):
-            torch.ops.trtllm.mla_custom_op_inplace(
+            maybe_bcg_mla_custom_op_inplace(
                 hidden_states.unquantized_hidden_states,
                 position_ids,
                 self.layer_idx_str,
                 output,
                 latent_cache_gen,
-                sparse_output,
-                sparse_output_sf,
                 hidden_states.fp4_tensor,
                 hidden_states.scaling_factor,
             )
         else:
-            torch.ops.trtllm.mla_custom_op_inplace(
+            maybe_bcg_mla_custom_op_inplace(
                 hidden_states,
                 position_ids,
                 self.layer_idx_str,
                 output,
                 latent_cache_gen,
-                sparse_output,
-                sparse_output_sf,
             )
 
     def _project_output(
@@ -1816,9 +1804,9 @@ class MLA(nn.Module):
                     "unquantized_hidden_states view"
                 )
                 output_hidden_states = hidden_states.unquantized_hidden_states
-            attn_output = torch.ops.trtllm.create_mla_outputs(
-                output_hidden_states, self.layer_idx_str
-            )
+            attn_output = [
+                torch.ops.trtllm.create_mla_outputs(output_hidden_states, self.layer_idx_str)
+            ]
             self._forward_custom_op(
                 hidden_states,
                 position_ids,

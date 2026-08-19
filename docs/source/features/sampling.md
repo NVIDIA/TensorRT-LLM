@@ -201,6 +201,16 @@ modes.
     continues another one it inherits that beam's history. The prompt seeds every beam
     alike, so `prompt_ignore_length` applies to all of them equally.
 
+  * With one-model speculative decoding the penalties must be enabled at deploy time
+    with `enable_penalty: true` in the speculative decoding config, because they need
+    an occurrence workspace that is allocated up front. While the flag is off, a
+    request that sets any of the three is rejected at admission rather than decoded
+    without them. Tree speculation (`eagle_choices` or a dynamic tree) is not
+    supported and such requests are rejected even when the flag is on. Only the
+    target distribution is penalized; the draft model proposes from its unpenalized
+    distribution, which leaves the sampled result unchanged but can lower the
+    acceptance rate as the penalty grows.
+
 * If `no_repeat_ngram_size = n` is specified, any token that would recreate an `n`-gram already
   present in the sequence (prompt included) is excluded from sampling. `None` or `0` disables
   the restriction.

@@ -1779,6 +1779,42 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
 
 
 # ============================================================================
+# DeepSeek streaming text preservation
+# ============================================================================
+
+
+@pytest.mark.parametrize(
+    "parser_cls",
+    [DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser])
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        # A delta that is itself a prefix of a tool-call start token.
+        ["Use ", "<", "div> for a block element."],
+        # A delta that ends on such a prefix after other text.
+        ["The condition is a <", " b, so it holds."],
+        # Text that starts like a start token and then diverges from it, for
+        # both of the tokens the V3.2 and V4 parsers look for.
+        ["Use <｜DSML｜function", "ality and <｜DSML｜invoke", "ality"],
+    ],
+)
+def test_deepseek_streaming_preserves_withheld_text(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], deltas: list[str]) -> None:
+    """Withholding a delta may delay text but must never drop it."""
+    parser = parser_cls()
+
+    streamed = "".join(
+        parser.parse_streaming_increment(delta, sample_tools).normal_text
+        for delta in deltas)
+
+    expected = "".join(deltas)
+    assert streamed == expected, f"Expected {expected!r}, got {streamed!r}"
+    assert parser_cls().detect_and_parse(expected,
+                                         sample_tools).normal_text == expected
+
+
+# ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
 
