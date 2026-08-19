@@ -168,8 +168,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         num_layers = kwargs.get("num_layers")
 
         if sparse_index_dim is None:
-            sparse_index_dim = (
-                int(getattr(sparse_attention_config, "sparse_index_dim", 0) or 0) or 128
+            sparse_index_dim = getattr(sparse_attention_config, "sparse_index_dim", None)
+            if sparse_index_dim is None:
+                sparse_index_dim = 128
+        sparse_index_dim = int(sparse_index_dim)
+        if sparse_index_dim <= 0:
+            raise ValueError(
+                f"MiniMax M3 sparse_index_dim must be greater than 0, got {sparse_index_dim}."
             )
         if sparse_layer_ids is None:
             if num_layers is not None:
@@ -184,7 +189,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # which reads these attributes.
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
-        self.sparse_index_dim = int(sparse_index_dim)
+        self.sparse_index_dim = sparse_index_dim
         self.indexer_kv_dtype = str(getattr(sparse_attention_config, "indexer_kv_dtype", "bf16"))
         if self.indexer_kv_dtype not in ("bf16", "fp8"):
             raise ValueError(

@@ -720,6 +720,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     )
     sparse_index_dim: int = Field(
         default=128,
+        gt=0,
         description="Per-head index Q/K dimension.",
     )
     sparse_block_size: int = Field(

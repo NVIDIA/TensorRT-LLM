@@ -60,20 +60,31 @@ def test_msa_fp8_indexer_config_is_explicit_and_lowered() -> None:
     for num_index_heads in (0, -1):
         with pytest.raises(ValueError, match=r"greater than 0"):
             MiniMaxM3SparseAttentionConfig(sparse_num_index_heads=num_index_heads)
+    for sparse_index_dim in (0, -1):
+        with pytest.raises(ValueError, match=r"greater than 0"):
+            MiniMaxM3SparseAttentionConfig(sparse_index_dim=sparse_index_dim)
 
 
 @pytest.mark.parametrize(
-    ("sparse_index_dim", "indexer_kv_dtype", "base_dtype", "expected_dtype"),
+    (
+        "configured_sparse_index_dim",
+        "expected_sparse_index_dim",
+        "indexer_kv_dtype",
+        "base_dtype",
+        "expected_dtype",
+    ),
     [
-        (96, "bf16", DataType.BF16, torch.bfloat16),
-        (96, "bf16", DataType.HALF, torch.bfloat16),
-        (96, "bf16", DataType.FLOAT, torch.bfloat16),
-        (128, "fp8", DataType.HALF, torch.float8_e4m3fn),
+        (None, 128, "bf16", DataType.BF16, torch.bfloat16),
+        (96, 96, "bf16", DataType.BF16, torch.bfloat16),
+        (96, 96, "bf16", DataType.HALF, torch.bfloat16),
+        (96, 96, "bf16", DataType.FLOAT, torch.bfloat16),
+        (128, 128, "fp8", DataType.HALF, torch.float8_e4m3fn),
     ],
 )
 def test_cache_manager_honors_executor_sparse_attention_config(
     monkeypatch: pytest.MonkeyPatch,
-    sparse_index_dim: int,
+    configured_sparse_index_dim: int | None,
+    expected_sparse_index_dim: int,
     indexer_kv_dtype: str,
     base_dtype: DataType,
     expected_dtype: torch.dtype,
@@ -97,7 +108,7 @@ def test_cache_manager_honors_executor_sparse_attention_config(
     monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", fake_get_index_k_buffer)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
     sparse_config = SimpleNamespace(
-        sparse_index_dim=sparse_index_dim,
+        sparse_index_dim=configured_sparse_index_dim,
         indexer_kv_dtype=indexer_kv_dtype,
     )
 
@@ -106,12 +117,22 @@ def test_cache_manager_honors_executor_sparse_attention_config(
         sparse_attention_config=sparse_config,
     )
 
-    assert manager.sparse_index_dim == sparse_index_dim
+    assert manager.sparse_index_dim == expected_sparse_index_dim
     assert manager.indexer_kv_dtype == indexer_kv_dtype
     assert manager._torch_dtype_for_index_cache() is expected_dtype
     assert manager.get_index_k_buffer(3) is None
-    assert observed_index_buffer_args["head_dim"] == sparse_index_dim
+    assert observed_index_buffer_args["head_dim"] == expected_sparse_index_dim
     assert observed_index_buffer_args["dtype"] is expected_dtype
+
+
+@pytest.mark.parametrize("sparse_index_dim", [0, -1])
+def test_cache_manager_rejects_non_positive_sparse_index_dim(sparse_index_dim: int) -> None:
+    for kwargs in (
+        {"sparse_index_dim": sparse_index_dim},
+        {"sparse_attention_config": SimpleNamespace(sparse_index_dim=sparse_index_dim)},
+    ):
+        with pytest.raises(ValueError, match=r"sparse_index_dim must be greater than 0"):
+            MiniMaxM3KVCacheManagerV2(num_layers=4, **kwargs)
 
 
 def test_msa_metadata_rejects_undersized_max_score_buffer():
