@@ -27,7 +27,11 @@ from PIL import Image
 
 from tensorrt_llm._torch.visual_gen.utils import synchronize_media_prepare_status
 from tensorrt_llm.media.decoding import (
+    FrameSelector,
+    NvdecVideoMediaIO,
+    WindowSelector,
     _lanczos_taps,
+    _nvdec_decode,
     decode_video_reference_window,
     resize_center_crop_uint8,
     resize_fit_pad_uint8,
@@ -379,3 +383,72 @@ class TestDecodeVideoReferenceWindow:
         torch.cuda.synchronize()
         per_frame = (time.perf_counter() - start) / 10
         assert per_frame < 0.25, f"resize took {per_frame * 1e3:.1f} ms/frame"
+
+
+class TestSelectorAndMediaIO:
+    """The decode mechanism, its explicit frame selector, and the MediaIO leaf."""
+
+    _DEVICE = torch.device("cuda:0")
+
+    def test_window_selector_rejects_mixed_and_reversed_ranges(self):
+        """The range is validated when the selector is built, not at decode."""
+        with pytest.raises(ValueError, match="both count from"):
+            WindowSelector(0, -1)
+        with pytest.raises(ValueError, match="must not exceed"):
+            WindowSelector(3, 1)
+
+    def test_unimplemented_selector_is_rejected(self):
+        """Selection has no default: an unknown strategy must not silently
+        fall back to a window."""
+
+        class FpsSelector(FrameSelector):
+            pass
+
+        with pytest.raises(NotImplementedError, match="FpsSelector"):
+            _nvdec_decode(_MP4.read_bytes(), selector=FpsSelector(), device=self._DEVICE)
+
+    @pytest.mark.parametrize("fixture", [_MP4, _AVI], ids=["mp4", "avi"])
+    def test_media_io_matches_the_window_function(self, fixture):
+        """The MediaIO leaf and the legacy free function are the same decode."""
+        data = fixture.read_bytes()
+        reference = decode_video_reference_window(
+            data, first_frame=0, last_frame=4, target_h=64, target_w=64, device=self._DEVICE
+        )
+        got = NvdecVideoMediaIO(
+            selector=WindowSelector(0, 4), device=self._DEVICE, target_hw=(64, 64)
+        ).load_bytes(data)
+        assert torch.equal(got, reference)
+
+    def test_media_io_load_file_matches_load_bytes(self, tmp_path):
+        io = NvdecVideoMediaIO(
+            selector=WindowSelector(0, 4), device=self._DEVICE, target_hw=(64, 64)
+        )
+        assert torch.equal(io.load_file(str(_MP4)), io.load_bytes(_MP4.read_bytes()))
+
+    def test_no_target_keeps_the_source_resolution(self):
+        """Resize only happens when a target is given.
+
+        The fixture is natively 64x64, so the target has to be a different
+        size for the two paths to be distinguishable at all.
+        """
+        data = _MP4.read_bytes()
+        native = _nvdec_decode(data, selector=WindowSelector(0, 0), device=self._DEVICE)
+        resized = _nvdec_decode(
+            data, selector=WindowSelector(0, 0), device=self._DEVICE, target_hw=(32, 32)
+        )
+        assert native.shape == (1, 64, 64, 3)
+        assert resized.shape == (1, 32, 32, 3)
+        assert native.dtype == torch.uint8
+
+    def test_range_past_the_clip_returns_empty_not_error(self):
+        """A window beyond the clip yields what exists — here, nothing.
+
+        The target's spatial dims are kept so the caller can still pad.
+        """
+        window = _nvdec_decode(
+            _MP4.read_bytes(),
+            selector=WindowSelector(100, 104),
+            device=self._DEVICE,
+            target_hw=(64, 64),
+        )
+        assert window.shape == (0, 64, 64, 3)
