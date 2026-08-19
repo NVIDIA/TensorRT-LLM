@@ -1018,9 +1018,38 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         uses_pytorch_backend = (self._config.runtime == "serve"
                                 or self._config.backend == "pytorch")
         fixed_sequence_length = self._config.get_fixed_dataset_sequence_length()
-        if uses_pytorch_backend and fixed_sequence_length is not None:
-            kv_cache_config = config.setdefault('kv_cache_config', {})
-            kv_cache_config.setdefault('avg_seq_len', fixed_sequence_length)
+        if not uses_pytorch_backend or fixed_sequence_length is None:
+            return config
+
+        kv_cache_config = config.get('kv_cache_config')
+        if kv_cache_config is not None and 'avg_seq_len' in kv_cache_config:
+            return config
+
+        configured_max_seq_len = config.get('max_seq_len')
+        if (configured_max_seq_len is not None
+                and fixed_sequence_length > int(configured_max_seq_len)):
+            print_warning(
+                f"Not inferring avg_seq_len={fixed_sequence_length}: it "
+                f"exceeds max_seq_len={configured_max_seq_len}.")
+            return config
+
+        # Perf definitions are sometimes reused with an older wheel during
+        # release walkbacks and bisection. Do not pass a field that its strict
+        # KvCacheConfig schema does not recognize.
+        try:
+            from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+        except ImportError:
+            return config
+        kv_cache_fields = getattr(KvCacheConfig, 'model_fields', None)
+        if kv_cache_fields is None:
+            kv_cache_fields = getattr(KvCacheConfig, '__fields__', {})
+        if 'avg_seq_len' not in kv_cache_fields:
+            return config
+
+        if kv_cache_config is None:
+            kv_cache_config = {}
+            config['kv_cache_config'] = kv_cache_config
+        kv_cache_config.setdefault('avg_seq_len', fixed_sequence_length)
         return config
 
     def get_trtllm_bench_build_command(self, engine_dir) -> list:
