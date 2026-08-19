@@ -155,6 +155,10 @@ def DISABLE_CBTS = "disable_cbts"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
+// Rollout switch for pre-merge Tier 2 coverage-based narrowing. Keep collection
+// enabled above while this remains off so a later pilot allowlist has fresh data.
+@Field
+def ENABLE_CBTS_COVERAGE_TIER = false
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -846,8 +850,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Download the touch DB for audit + Tier 2 coverage-based narrowing.
-        def coverageDb = _cbtsCoverageAudit(pipeline)
+        // Download the touch DB only when Tier 2 is enabled. Tier 1 rules still
+        // run while the coverage tier is disabled during the initial rollout.
+        def coverageDb = _cbtsCoverageDb(pipeline)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -916,6 +921,17 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
         return null
     }
+}
+
+// Resolve the optional Tier 2 input behind an explicit rollout gate. Keeping
+// this separate makes the follow-up pilot allowlist a small policy change.
+def _cbtsCoverageDb(pipeline)
+{
+    if (!ENABLE_CBTS_COVERAGE_TIER) {
+        pipeline.echo("CBTS: coverage tier disabled — running Tier 1 only")
+        return null
+    }
+    return _cbtsCoverageAudit(pipeline)
 }
 
 // Fetch the touch DB and audit it; artifact.py's {path, meta} verbatim, or null on failure.
