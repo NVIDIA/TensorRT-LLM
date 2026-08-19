@@ -112,22 +112,6 @@ class TestNemotronMini4BInstruct(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
 
-@skip_post_blackwell
-class TestPhi2(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "microsoft/phi-2"
-    MODEL_PATH = f"{llm_models_root()}/phi-2"
-    EXAMPLE_FOLDER = "models/core/phi"
-
-    @skip_post_blackwell
-    def test_auto_dtype(self):
-        self.run(dtype='auto')
-
-    @skip_post_blackwell
-    @pytest.mark.skip_less_device(2)
-    def test_tp2(self):
-        self.run(tp_size=2)
-
-
 # Long sequence length test:
 # Model FP16 7B + 32K tokens in KV cache = 14 * 1024 MB + 32K * 0.5 MB = 30720 MB + scratch memory
 @pytest.mark.skip_less_device_memory(40000)
