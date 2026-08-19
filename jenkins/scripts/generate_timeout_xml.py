@@ -35,6 +35,7 @@ _XML_ILLEGAL_RE = re.compile(
 )
 
 _RANK_TIMEOUT_DATA_FILE_RE = re.compile(r"timeout_data_step(\d+)_rank(\d+)\.jsonl$")
+_FALLBACK_TEST_TIME_SECONDS = 1.0
 
 
 def sanitize_for_xml(text):
@@ -100,6 +101,8 @@ def load_timeout_map(paths, expected_nodeids=None):
                         continue
                     try:
                         rec = json.loads(raw)
+                        if isinstance(rec, dict) and rec.get("type") in {"start", "end"}:
+                            continue
                         if (
                             not isinstance(rec, dict)
                             or not isinstance(rec.get("nodeid"), str)
@@ -129,6 +132,85 @@ def load_timeout_map(paths, expected_nodeids=None):
                 file=sys.stderr,
             )
     return timeout_map
+
+
+def load_unfinished_test_data(paths, expected_nodeids=None):
+    """Load ``{nodeid: {start_time, end_time, timeout}}`` sidecar records.
+
+    The first start/end pair wins, preserving the invocation in which a test
+    actually terminated when a later invocation is run in the same stage.
+    Invalid records are skipped rather than making timeout-report generation
+    fail.
+    """
+    if not paths:
+        return {}
+    if isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+
+    test_data = {}
+    for path in sorted(map(os.fspath, paths)):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for lineno, raw in enumerate(f, 1):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        record = json.loads(raw)
+                        if isinstance(record, dict) and (
+                            record.get("type") == "timeout" or "snippet" in record
+                        ):
+                            continue
+                        nodeid = record.get("nodeid") if isinstance(record, dict) else None
+                        start_time = record.get("start_time") if isinstance(record, dict) else None
+                        end_time = record.get("end_time") if isinstance(record, dict) else None
+                        timeout = record.get("timeout") if isinstance(record, dict) else None
+                        if not isinstance(nodeid, str):
+                            raise ValueError("expected nodeid string")
+                        if start_time is not None and not isinstance(start_time, (int, float)):
+                            raise ValueError("expected start_time to be numeric or null")
+                        if end_time is not None and not isinstance(end_time, (int, float)):
+                            raise ValueError("expected end_time to be numeric or null")
+                        if timeout is not None and not isinstance(timeout, (int, float)):
+                            raise ValueError("expected timeout to be numeric or null")
+                        if start_time is None and end_time is None:
+                            raise ValueError("expected numeric start_time or end_time")
+                        if expected_nodeids is None or nodeid in expected_nodeids:
+                            data = test_data.setdefault(nodeid, {})
+                            if start_time is not None:
+                                data.setdefault("start_time", float(start_time))
+                            if end_time is not None:
+                                data.setdefault("end_time", float(end_time))
+                            if timeout is not None:
+                                data.setdefault("timeout", float(timeout))
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        print(
+                            f"WARNING: generate_timeout_xml: skipping corrupt line "
+                            f"{lineno} in {path}: {exc}",
+                            file=sys.stderr,
+                        )
+        except OSError as exc:
+            print(
+                f"WARNING: generate_timeout_xml: cannot read {path}: {exc}",
+                file=sys.stderr,
+            )
+    return test_data
+
+
+def test_duration(test, timeout_map, unfinished_test_data, now):
+    """Return the best available JUnit duration for an interrupted test."""
+    data = unfinished_test_data.get(test, {})
+    if test in timeout_map:
+        timeout = data.get("timeout")
+        if timeout is not None and timeout > 0:
+            return timeout
+        return _FALLBACK_TEST_TIME_SECONDS
+
+    start_time = data.get("start_time")
+    end_time = data.get("end_time")
+    if start_time is not None and end_time is not None:
+        return max(0.0, end_time - start_time)
+    return _FALLBACK_TEST_TIME_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +267,14 @@ def parse_xml_classname_name_file_from_testname(testname, stage_name):
     return classname, name, file
 
 
-def generate_timeout_xml(stage_name, testList, outputFilePath, timeout_map=None):
+def generate_timeout_xml(
+    stage_name,
+    testList,
+    outputFilePath,
+    timeout_map=None,
+    unfinished_test_data=None,
+    now=None,
+):
     """Generate JUnit XML report for timed-out tests.
 
     Args:
@@ -198,17 +287,27 @@ def generate_timeout_xml(stage_name, testList, outputFilePath, timeout_map=None)
             as ``pytest_timeout`` and its snippet is embedded in
             ``<system-out>``.  All other nodeids are classified as ``unknown``.
             When *None* or empty every test falls back to ``unknown``.
+        unfinished_test_data: Optional mapping containing the test start time
+            and effective pytest timeout recorded by ``PeriodicJUnitXML``.
     """
     if timeout_map is None:
         timeout_map = {}
-
+    if unfinished_test_data is None:
+        unfinished_test_data = {}
     num_tests = len(testList)
+    durations = {
+        test: test_duration(test, timeout_map, unfinished_test_data, now) for test in testList
+    }
+    timeout_count = sum(test in timeout_map for test in testList)
+    unknown_count = num_tests - timeout_count
     # Escape stage_name for XML safety
     stage_name_escaped = escape(stage_name, quote=True)
     xmlContent = (
         f'<?xml version="1.0" encoding="UTF-8"?><testsuites>\n'
         f'        <testsuite name="{stage_name_escaped}" errors="{num_tests}" '
-        f'failures="0" skipped="0" tests="{num_tests}" time="1.00">'
+        f'failures="0" skipped="0" tests="{num_tests}" '
+        f'unfinished_test="{num_tests}" timeout="{timeout_count}" unknown="{unknown_count}" '
+        f'time="{sum(durations.values()):.2f}">\n'
     )
 
     for test in testList:
@@ -232,8 +331,8 @@ def generate_timeout_xml(stage_name, testList, outputFilePath, timeout_map=None)
 
         xmlContent += (
             f'<testcase classname="{classname_escaped}" name="{name_escaped}" '
-            f'file="{file_escaped}" time="1.0">\n'
-            f"{error_block}</testcase>"
+            f'file="{file_escaped}" time="{durations[test]:.2f}">\n'
+            f"{error_block}</testcase>\n"
         )
 
     xmlContent += "</testsuite></testsuites>"
@@ -290,12 +389,19 @@ def main():
         return
 
     timeout_map = load_timeout_map(args.timeout_data_file, set(timeoutTests))
+    unfinished_test_data = load_unfinished_test_data(args.timeout_data_file, set(timeoutTests))
     classified_count = sum(test in timeout_map for test in timeoutTests)
     print(
         f"Timeout classification summary for {stageName}: {len(timeoutTests)} unfinished, "
         f"{classified_count} pytest_timeout, {len(timeoutTests) - classified_count} unknown"
     )
-    generate_timeout_xml(stageName, timeoutTests, outputFilePath, timeout_map)
+    generate_timeout_xml(
+        stageName,
+        timeoutTests,
+        outputFilePath,
+        timeout_map,
+        unfinished_test_data,
+    )
 
 
 if __name__ == "__main__":

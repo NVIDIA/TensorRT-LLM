@@ -22,7 +22,7 @@
 #       <cmd-script>       # bash script containing "cd ... && pytest ..."
 #       <out-dir>          # directory for pytest_output.log
 #       <timeout-data>     # path to timeout_data.jsonl (appended, dir auto-created)
-#       <invocation-idx>   # integer index (unused at runtime, kept for callers)
+#       <invocation-idx>   # integer index reserved for callers
 #       <unfinished>       # path to unfinished_test.txt
 #
 # Exit code: always equals pytest's own exit code regardless of whether
@@ -39,7 +39,7 @@ fi
 CMD_SCRIPT="$1"
 OUT_DIR="$2"
 TIMEOUT_DATA="$3"
-# $4 (invocation-idx) is accepted but not used inside this script
+INVOCATION_IDX="$4"
 UNFINISHED="$5"
 
 LOG="${OUT_DIR}/pytest_output.log"
@@ -71,7 +71,7 @@ trap 'cleanup_and_exit 143' TERM
 # Jenkins console.  tee's exit code is discarded; we read pytest's via
 # PIPESTATUS immediately after the pipeline completes.
 # ---------------------------------------------------------------------------
-bash "${CMD_SCRIPT}" 2>&1 | tee "${LOG}"
+TRTLLM_TIMEOUT_DATA_FILE="${TIMEOUT_DATA}" bash "${CMD_SCRIPT}" 2>&1 | tee "${LOG}"
 PYTEST_RC=${PIPESTATUS[0]}
 
 # ---------------------------------------------------------------------------
