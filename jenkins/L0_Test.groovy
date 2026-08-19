@@ -6801,6 +6801,10 @@ pipeline {
         stage("Test") {
             steps {
                 script {
+                    // Default scope map so the image-sanity path (which does not
+                    // build one) still has a value for runBranchesWithInfraDefer;
+                    // launchTestJobs overwrites this with per-stage scopes.
+                    stageInfraScope = [:]
                     try {
                         if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
                             parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
