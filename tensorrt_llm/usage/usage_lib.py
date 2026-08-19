@@ -708,7 +708,7 @@ def _background_reporter(
         )
         if not session.claim_initial():
             return
-        _send_to_gxt(payload)
+        _send_if_session_active(session, payload)
 
         # --- Heartbeat loop ---
         heartbeat_interval = _get_heartbeat_interval()
@@ -727,7 +727,7 @@ def _background_reporter(
                     session_id=session_id,
                     trtllm_version=trtllm_version,
                 )
-                _send_to_gxt(heartbeat_payload)
+                _send_if_session_active(session, heartbeat_payload)
             except (urllib.error.URLError, OSError, ValueError, TypeError):
                 pass  # fail-silent on individual heartbeat
 
@@ -746,7 +746,7 @@ _REPORTER_STARTED = False
 _REPORTER_ACTIVE = False
 _REPORTER_LOCK = threading.Lock()
 _REPORTER_STOP = threading.Event()  # signal heartbeat loop to exit
-_PENDING_TERMINAL: Optional[tuple[dict, threading.Event]] = None
+_PENDING_TERMINAL: Optional["_PendingTerminal"] = None
 _PROCESS_PID = os.getpid()
 _PROCESS_EXIT_HOOK_REGISTERED = False
 
@@ -949,10 +949,24 @@ class _TelemetrySession:
             self.initial_reported = True
             return True
 
+    def try_start_delivery(self) -> bool:
+        """Reject queued delivery when process opt-out already won the race."""
+        with self.lock:
+            return not self.disabled
+
     def disable(self) -> None:
         """Prevent a stale reference from emitting after process opt-out."""
         with self.lock:
             self.disabled = True
+
+
+@dataclass(frozen=True)
+class _PendingTerminal:
+    """Terminal payload waiting for the active reporter to finish."""
+
+    session: _TelemetrySession
+    payload: dict
+    completion: threading.Event
 
 
 _SESSION: Optional[_TelemetrySession] = None
@@ -999,14 +1013,21 @@ def _get_session() -> Optional[_TelemetrySession]:
 
 def _deactivate_usage_session() -> None:
     """Stop process telemetry after any authoritative opt-out decision."""
+    global _PENDING_TERMINAL
     global _SESSION
     global _SESSION_DISABLED
     with _SESSION_LOCK:
         session = _SESSION
         _SESSION = None
         _SESSION_DISABLED = True
-    if session is not None:
-        session.disable()
+    pending = None
+    with _REPORTER_LOCK:
+        if session is not None:
+            session.disable()
+        pending = _PENDING_TERMINAL
+        _PENDING_TERMINAL = None
+    if pending is not None:
+        pending.completion.set()
     _REPORTER_STOP.set()
 
 
@@ -1277,12 +1298,20 @@ def get_observed_signal() -> int:
     )
 
 
-def _send_terminal_event(payload: dict, completion: threading.Event) -> None:
-    """Attempt terminal delivery and always release bounded waiters."""
+def _send_if_session_active(
+    session: _TelemetrySession,
+    payload: dict,
+    completion: Optional[threading.Event] = None,
+) -> bool:
+    """Start delivery only if process opt-out has not already won."""
     try:
+        if not session.try_start_delivery():
+            return False
         _send_to_gxt(payload)
+        return True
     finally:
-        completion.set()
+        if completion is not None:
+            completion.set()
 
 
 def _finish_background_reporter() -> None:
@@ -1296,10 +1325,14 @@ def _finish_background_reporter() -> None:
             pending = _PENDING_TERMINAL
             _PENDING_TERMINAL = None
         if pending is not None:
-            _send_terminal_event(*pending)
+            _send_if_session_active(
+                pending.session,
+                pending.payload,
+                pending.completion,
+            )
     except Exception:
         if pending is not None:
-            pending[1].set()
+            pending.completion.set()
 
 
 def report_exit(
@@ -1383,8 +1416,15 @@ def report_exit(
         queued_to_reporter = False
         global _PENDING_TERMINAL
         with _REPORTER_LOCK:
+            if not session.try_start_delivery():
+                completion.set()
+                return True
             if _REPORTER_ACTIVE:
-                _PENDING_TERMINAL = (payload, completion)
+                _PENDING_TERMINAL = _PendingTerminal(
+                    session=session,
+                    payload=payload,
+                    completion=completion,
+                )
                 queued_to_reporter = True
 
         _REPORTER_STOP.set()
@@ -1393,8 +1433,8 @@ def report_exit(
             return True
 
         thread = threading.Thread(
-            target=_send_terminal_event,
-            args=(payload, completion),
+            target=_send_if_session_active,
+            args=(session, payload, completion),
             daemon=True,
             name="trtllm-usage-terminal",
         )
@@ -1460,4 +1500,4 @@ def report_usage(
             pending = _PENDING_TERMINAL
             _PENDING_TERMINAL = None
         if pending is not None:
-            pending[1].set()
+            pending.completion.set()
