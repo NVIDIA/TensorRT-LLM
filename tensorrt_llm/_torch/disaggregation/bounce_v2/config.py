@@ -16,7 +16,8 @@
 
 Mirrors the C++ ``BounceConfig``
 (cpp/tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceConfig.h)
-with the hybrid design's new defaults (design doc Section 4.1): 128 MiB max
+with the hybrid design's defaults (design doc Section 4.1; the 32 MiB chunk
+default matches the C++ bounce v2 per product decision): 32 MiB max
 chunk, 2 GiB arena, 1 MiB granularity, 8 in-flight chunks per request. The
 scatter-worker knob is dropped — the hybrid has no scatter worker threads
 (scatter completion is event-driven through the C++ completion poller).
@@ -64,10 +65,13 @@ class BounceV2Config:
     #: Buddy order-0 block size. Stays at 1 MiB so small-chunk packing
     #: granularity is unchanged from bounce v1/v2 (R8: tight packing).
     arena_allocation_granularity_bytes: int = 1 << 20
-    #: Per-chunk byte cap. 128 MiB keeps the control-plane event rate at
-    #: ~372 chunks/s for 50 GB/s and gives ~21.5 ms of pipeline slack with 8
-    #: chunks in flight. Must fit u32 (chunk sizes are 32-bit on the wire).
-    max_chunk_size_bytes: int = 128 << 20
+    #: Per-chunk byte cap. 32 MiB (matching the C++ bounce v2 default) means
+    #: ~1,490 chunks/s at 50 GB/s -- still well under the reactor's batched
+    #: event ceiling -- but only ~5.4 ms of pipeline slack with 8 chunks in
+    #: flight; raise max_inflight_chunks_per_request to widen the GIL-stall
+    #: tolerance (32 restores the ~21.5 ms slack at the same 1 GiB per-flow
+    #: staging). Must fit u32 (chunk sizes are 32-bit on the wire).
+    max_chunk_size_bytes: int = 32 << 20
     #: Per-request in-flight allocation cap (window depth of the pipeline).
     max_inflight_chunks_per_request: int = 8
     #: Streams available to the bound batched-copy op.

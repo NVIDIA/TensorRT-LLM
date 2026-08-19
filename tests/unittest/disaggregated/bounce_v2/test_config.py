@@ -34,7 +34,7 @@ def test_defaults() -> None:
     assert cfg.enabled is False
     assert cfg.arena_size_bytes == 2 << 30
     assert cfg.arena_allocation_granularity_bytes == 1 << 20
-    assert cfg.max_chunk_size_bytes == 128 << 20
+    assert cfg.max_chunk_size_bytes == 32 << 20
     assert cfg.max_inflight_chunks_per_request == 8
     assert cfg.copy_stream_count == 8
     assert cfg.min_descriptor_count == 1024
