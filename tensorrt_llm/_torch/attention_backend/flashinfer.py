@@ -166,8 +166,10 @@ class FlashInferMultiItemParams:
 
 @dataclass(kw_only=True, frozen=True)
 class PlanParams:
-    """
-    Parameters that affect the flashinfer execution plan
+    """Parameters that affect FlashInfer wrapper planning.
+
+    Include values that change wrapper-owned CUDA graph state, even when a backend derives them
+    again at runtime.
     """
 
     num_heads: int
@@ -182,6 +184,11 @@ class PlanParams:
     sm_scale: Optional[float] = None
     window_left: Optional[int] = None
     kv_pool_id: Optional[int] = None
+    # Decode wrappers own persistent graph-visible buffers and counters. The speculative query width
+    # and generation batch size must distinguish cache entries; reusing a wrapper across either
+    # dimension can expose stale launch state.
+    q_len_per_req: int = 1
+    num_generations: int = 0
 
 
 # NB: Some features (multi-item scoring) are only supported with the paged KV-cache wrapper.
@@ -1815,6 +1822,20 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if q_scaling is not None:
             sm_scale = 1 / (math.sqrt(head_dim) * q_scaling)
 
+        # FlashInfer decode accepts one q_len_per_req. Current paths keep generation widths
+        # uniform (including padded speculative drafts); guard against malformed metadata or
+        # future per-request draft widths rather than launching the wrong shape.
+        q_len_per_req = 1
+        if self.num_generations > 0:
+            generation_seq_lens = self.seq_lens[self.
+                                                num_contexts:self.num_contexts +
+                                                self.num_generations]
+            q_len_per_req = int(generation_seq_lens[0])
+            if not torch.all(generation_seq_lens == q_len_per_req):
+                raise ValueError(
+                    "FlashInfer decode requires a uniform query length per "
+                    f"request, but got {generation_seq_lens.tolist()}")
+
         plan_params = PlanParams(
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -1828,6 +1849,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             attention_mask_data=attention_mask_data,
             multi_item_params=self._multi_item_params,
             kv_pool_id=getattr(self, "_vswa_active_pool_id", None),
+            q_len_per_req=q_len_per_req,
+            num_generations=self.num_generations,
         )
         return self._plan_with_params(plan_params, flashinfer_backend)
 
@@ -2017,6 +2040,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 kv_data_type=plan_params.kv_dtype,
                 o_data_type=o_dtype,
                 block_tables=block_tables,
+                # Keep FlashInfer's recorded graph shape aligned with the wrapper cache key.
+                q_len_per_req=plan_params.q_len_per_req,
             )
             self._publish_decode_wrapper_kv_lens(decode_wrapper)
 

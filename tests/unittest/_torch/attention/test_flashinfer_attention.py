@@ -83,6 +83,76 @@ class TestFlashInferAttention(unittest.TestCase):
         )
         manager.get_batch_cache_indices.assert_called_once_with([99])
 
+    def test_decode_launch_shape_is_part_of_plan_params(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+            num_contexts=0,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            max_num_requests=3,
+            max_num_tokens=18,
+        )
+
+        def return_plan_params(plan_params, _flashinfer_backend):
+            return plan_params
+
+        with mock.patch.object(
+                metadata,
+                "_plan_with_params",
+                side_effect=return_plan_params,
+        ):
+            single_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata.seq_lens = torch.tensor([6, 6], dtype=torch.int32)
+            multi_token_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+            metadata.seq_lens = torch.tensor([6, 6, 6], dtype=torch.int32)
+            larger_batch_plan = metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+
+        self.assertEqual(single_token_plan.q_len_per_req, 1)
+        self.assertEqual(multi_token_plan.q_len_per_req, 6)
+        self.assertNotEqual(single_token_plan, multi_token_plan)
+        self.assertEqual(multi_token_plan.num_generations, 2)
+        self.assertEqual(larger_batch_plan.num_generations, 3)
+        self.assertNotEqual(multi_token_plan, larger_batch_plan)
+
+        metadata.seq_lens = torch.tensor([6, 5], dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "uniform query length"):
+            metadata.plan(
+                num_heads=32,
+                num_kv_heads=4,
+                head_dim=512,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                attention_mask_type=AttentionMaskType.causal.value,
+                flashinfer_backend="trtllm-gen",
+            )
+
     def test_generation_page_table_keeps_logical_positions(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
