@@ -1371,6 +1371,10 @@ class ModelLoader:
             self, checkpoint_dir: str,
             checkpoint_loader: BaseCheckpointLoader) -> ModelConfig:
         """Loads and validates the model configuration."""
+        # Mirror use_fine_grained_sync into env var so C++ getEnvUseFineGrainedSync()
+        # sees it at kernel-option construction time.
+        os.environ["TLLM_USE_FINE_GRAINED_SYNC"] = (
+            "1" if self.llm_args.use_fine_grained_sync else "0")
         load_config_kwargs = dict(
             checkpoint_dir=checkpoint_dir,
             trust_remote_code=self.llm_args.trust_remote_code,
@@ -1407,6 +1411,7 @@ class ModelLoader:
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
+            use_fine_grained_sync=self.llm_args.use_fine_grained_sync,
         )
 
         # Only pass model_kwargs if it's explicitly set (not None)
