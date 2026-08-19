@@ -13,6 +13,8 @@ import pytest
 from test_common import session_prefetcher
 from test_common.session_prefetcher import SessionPrefetcher, warm_page_cache
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeMarker:
     def __init__(self, *args):
