@@ -117,6 +117,11 @@ def _make_mock_kv_iter_stats(
         iter_intra_device_copy_bytes=8192,
         iter_host_dropped_blocks=0,
         iter_host_dropped_bytes=0,
+        # Non-zero on purpose: with 0 here every assertion below would pass
+        # even if the field were dropped from a view entirely, which is exactly
+        # how the pool-group allowlist omission went unnoticed.
+        iter_scratch_blocks=129,
+        iter_scratch_slots_in_use=4,
     )
     return {window_size: s}
 
@@ -431,6 +436,14 @@ class TestStatsSerializer:
         assert pool_group["secondaryPeakEvictableNumBlocks"] == 2
         assert pool_group["iterGenAllocBlocks"] == 2
         assert "iterReusedBlocks" not in pool_group
+        # SWA scratch reuse is a per-pool-group phenomenon -- a pool group is
+        # exactly the unit a scratch slot is shared within -- so the counters
+        # must survive the pool-group key filter. They were originally missing
+        # from KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS, which made the feature
+        # read as permanently inert to anything consuming this view.
+        assert pool_group["iterScratchBlocks"] == 129
+        assert pool_group["iterScratchSlotsInUse"] == 4
+        assert d["kvCacheIterationStats"]["16"]["iterScratchBlocks"] == 129
         assert "iterMissedBlocks" not in pool_group
         assert "iterCacheHitRate" not in pool_group
         assert "kvCacheIterationStatsByLifecycle" in d
@@ -502,3 +515,42 @@ class TestStatsSerializer:
         assert [stats.available for stats in secondary_peak] == [4, 5]
         assert [stats.unavailable for stats in secondary_peak] == [1, 0]
         assert [stats.evictable for stats in secondary_peak] == [1, 0]
+
+
+def test_pool_group_keys_cover_every_iteration_field():
+    """Every serialized iteration field must be classified, not forgotten.
+
+    ``KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS`` is a hand-maintained allowlist,
+    so a field added to ``serialize_kv_cache_iteration_stats`` without a
+    corresponding allowlist entry silently vanishes from
+    ``kvCacheIterationStatsByPoolGroup`` -- the view most consumers reach for,
+    since a pool group is the unit a scratch slot is shared within. That is what
+    happened to ``iterScratchBlocks``/``iterScratchSlotsInUse``: the counters were
+    emitted correctly by the manager and read as a permanent 0 by every
+    consumer of the pool-group view, which made SWA scratch reuse look inert.
+
+    This test forces a decision: a new field either belongs in the pool-group
+    view (add it to the allowlist) or it does not (name it, with a reason, in
+    KV_CACHE_ITERATION_STATS_NOT_PER_POOL_GROUP). Forgetting both fails here.
+    """
+    from tensorrt_llm._torch.pyexecutor.kv_cache_stats import (
+        KV_CACHE_ITERATION_STATS_NOT_PER_POOL_GROUP,
+        KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS,
+        serialize_kv_cache_iteration_stats,
+    )
+
+    emitted = set(serialize_kv_cache_iteration_stats(_make_mock_kv_iter_stats()[16]))
+    allowed = set(KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS)
+    excluded = set(KV_CACHE_ITERATION_STATS_NOT_PER_POOL_GROUP)
+
+    unclassified = emitted - allowed - excluded
+    assert not unclassified, (
+        f"iteration stat field(s) {sorted(unclassified)} are neither in the "
+        "pool-group allowlist nor explicitly excluded. Add them to "
+        "KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS, or to "
+        "KV_CACHE_ITERATION_STATS_NOT_PER_POOL_GROUP with a reason."
+    )
+    # The allowlist must not name fields the serializer does not emit, or the
+    # pool-group projection raises KeyError at runtime.
+    assert not (allowed - emitted), sorted(allowed - emitted)
+    assert not (allowed & excluded), sorted(allowed & excluded)

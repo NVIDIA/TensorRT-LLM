@@ -2547,7 +2547,6 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         return {
             "kv_cache_config": {
                 "tokens_per_block": 128,
-                "enable_swa_scratch_reuse": True,
             }
         }
 

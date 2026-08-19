@@ -50,6 +50,27 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_KEYS = (
     "iterIntraDeviceCopyBytes",
     "iterHostDroppedBlocks",
     "iterHostDroppedBytes",
+    "iterScratchBlocks",
+    "iterScratchSlotsInUse",
+)
+
+# Iteration fields deliberately absent from the per-pool-group view, with the
+# reason. `test_pool_group_keys_cover_every_iteration_field` asserts that every
+# field the serializer emits is either in the allowlist above or named here, so
+# adding a field without deciding which side it belongs on fails CI rather than
+# silently disappearing from the pool-group view.
+KV_CACHE_ITERATION_STATS_NOT_PER_POOL_GROUP = frozenset(
+    {
+        # Reuse accounting is tracked per window size, not per pool group: a
+        # single pool group can back several windows, so these would double
+        # count.
+        "iterReusedBlocks",
+        "iterFullReusedBlocks",
+        "iterPartialReusedBlocks",
+        "iterMissedBlocks",
+        # Derived from the four above; meaningless once they are absent.
+        "iterCacheHitRate",
+    }
 )
 
 
@@ -137,6 +158,8 @@ def serialize_kv_cache_iteration_stats(stats, keys: tuple[str, ...] | None = Non
         "iterIntraDeviceCopyBytes": stats.iter_intra_device_copy_bytes,
         "iterHostDroppedBlocks": stats.iter_host_dropped_blocks,
         "iterHostDroppedBytes": stats.iter_host_dropped_bytes,
+        "iterScratchBlocks": stats.iter_scratch_blocks,
+        "iterScratchSlotsInUse": stats.iter_scratch_slots_in_use,
     }
     if keys is None:
         return fields

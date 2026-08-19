@@ -215,7 +215,14 @@ def test_pool_ratio_overrides_constraints() -> None:
     assert config.constraints == []
 
 
-def test_default_uses_allocator_fallback() -> None:
+def test_prefill_constraint_registered_without_avg_seq_len() -> None:
+    """The chunked-prefill constraint must not be gated behind avg_seq_len.
+
+    Regression lock: when this constraint is missing, StorageManager falls back
+    to a DECODE-shaped BatchDesc whose scratch range is provably empty, so SWA
+    scratch reuse is inert for every model that does not set avg_seq_len, and
+    the SWA pool is sized from swa_floor_blocks alone.
+    """
     config = _make_cache_config_for_test(
         KvCacheConfig(host_cache_size=0),
         max_batch_size=3,
@@ -225,7 +232,31 @@ def test_default_uses_allocator_fallback() -> None:
     )
 
     assert config.initial_pool_ratio is None
+    # typical_step stays opt-in: it needs avg_seq_len, which is workload knowledge.
     assert config.typical_step is None
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])]
+
+
+def test_prefill_constraint_includes_extra_kv_tokens() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0),
+        max_batch_size=3,
+        max_seq_len=1024,
+        max_num_tokens=2048,
+        num_extra_kv_tokens=4,
+    )
+
+    assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2052, history_length=0)])]
+
+
+def test_no_prefill_constraint_without_max_num_tokens() -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0),
+        max_batch_size=3,
+        max_seq_len=1024,
+        max_num_tokens=None,
+    )
+
     assert config.constraints == []
 
 
@@ -792,3 +823,272 @@ def test_disagg_role_mapper_kinds_default_to_indexed():
         Role.ALL: MapperKind.INDEXED,
         Role.INDEX_KEY: MapperKind.REPLICATED,
     }
+
+
+# ---------------------------------------------------------------------------
+# SWA scratch reuse: PER_LAYER flat page-index rotation.
+#
+# This is the arithmetic that addresses a scratch block on the FlashInfer path.
+# It is the highest-risk code in the feature because it fails *silently*: a
+# wrong index reads another layer's KV rather than raising, so an end-to-end run
+# still exits 0 with plausible-looking output. The bug actually hit during
+# Gemma4 bring-up (a layer_idx-less lookup yielding BAD_PAGE_INDEX) was found
+# only by an illegal memory access on a B200, which is far too late and far too
+# expensive a feedback loop for integer arithmetic.
+#
+# These tests pin the invariants the flat page table depends on, on a real
+# Gemma4-12B-shaped configuration, with no GPU and no model.
+# ---------------------------------------------------------------------------
+
+# Gemma4-12B: 48 layers, 40 sliding (W=1024) / 8 full, K and V per layer.
+GEMMA4_NUM_SWA_LAYERS = 40
+GEMMA4_KV_FACTOR = 2
+# One slot holds `scale` sub-pages: kv_factor per layer across the shared group.
+GEMMA4_SCALE = GEMMA4_NUM_SWA_LAYERS * GEMMA4_KV_FACTOR
+# Each scratch block advances by one K/V pair.
+GEMMA4_SCRATCH_PAGES_PER_BLOCK = GEMMA4_KV_FACTOR
+
+
+def _reference_flat_index(position, scratch_pages, scale, layer_offset, slot_ids, div_factor):
+    """Independent restatement of the device kernel's arithmetic.
+
+    Deliberately written as a scalar loop from the formula rather than by
+    calling the implementation, so agreement is evidence rather than tautology.
+    """
+    total = position * scratch_pages
+    slot = int(slot_ids[total // scale])
+    sub = (total % scale + layer_offset) % scale
+    return (slot * scale + sub) // div_factor
+
+
+def _k_layer_offset(layer_idx):
+    return layer_idx * GEMMA4_KV_FACTOR
+
+
+class TestSwaScratchFlatIndexRotation:
+    """Correctness of compute_scratch_flat_page_indices on a Gemma4 shape."""
+
+    NUM_BLOCKS = 41  # a realistic prefill scratch range (~2340 tokens, W=1024, tpb=32)
+    SLOT_IDS = tuple(range(7, 7 + 8))  # arbitrary non-contiguous-looking slot ids
+
+    def _indices(self, layer_idx, div_factor=1, count=None):
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+            compute_scratch_flat_page_indices,
+        )
+
+        return compute_scratch_flat_page_indices(
+            0,
+            self.NUM_BLOCKS if count is None else count,
+            GEMMA4_SCRATCH_PAGES_PER_BLOCK,
+            GEMMA4_SCALE,
+            _k_layer_offset(layer_idx),
+            self.SLOT_IDS,
+            div_factor,
+        )
+
+    def test_matches_device_kernel_formula_for_every_swa_layer(self):
+        """Host rotation must equal the device kernel's, for all 40 SWA layers."""
+        for layer_idx in range(GEMMA4_NUM_SWA_LAYERS):
+            got = self._indices(layer_idx)
+            expected = [
+                _reference_flat_index(
+                    pos,
+                    GEMMA4_SCRATCH_PAGES_PER_BLOCK,
+                    GEMMA4_SCALE,
+                    _k_layer_offset(layer_idx),
+                    self.SLOT_IDS,
+                    1,
+                )
+                for pos in range(self.NUM_BLOCKS)
+            ]
+            assert got.tolist() == expected, f"layer {layer_idx} diverges from the kernel formula"
+
+    def test_v_stays_exactly_one_subpage_after_k(self):
+        """The precondition a flat page table cannot express any other way.
+
+        A flat table carries one index per block plus a kv_factor axis, so it can
+        only address V if V remains K+1 *after* the rotation. If this breaks,
+        attention reads K as V and produces silently wrong output rather than an
+        error. _validate_per_layer_kv_adjacency promises this; here it is checked
+        against the arithmetic that has to honour it.
+        """
+        for layer_idx in range(GEMMA4_NUM_SWA_LAYERS):
+            k_off = _k_layer_offset(layer_idx)
+            k = self._indices(layer_idx)
+            v = [
+                _reference_flat_index(
+                    pos, GEMMA4_SCRATCH_PAGES_PER_BLOCK, GEMMA4_SCALE, k_off + 1, self.SLOT_IDS, 1
+                )
+                for pos in range(self.NUM_BLOCKS)
+            ]
+            assert [b - a for a, b in zip(k.tolist(), v)] == [1] * self.NUM_BLOCKS, (
+                f"layer {layer_idx}: V is not adjacent to K under the scratch rotation"
+            )
+
+    def test_no_two_swa_layers_alias_the_same_subpage(self):
+        """Distinct layers must never resolve to the same page for a block.
+
+        Aliasing is the failure mode that corrupts KV without any crash: two
+        layers would read and write each other's cache. With scale == 40 layers
+        x kv_factor, all 40 layers must land on 40 distinct K sub-pages.
+        """
+        for position in range(self.NUM_BLOCKS):
+            seen = {
+                _reference_flat_index(
+                    position,
+                    GEMMA4_SCRATCH_PAGES_PER_BLOCK,
+                    GEMMA4_SCALE,
+                    _k_layer_offset(layer_idx),
+                    self.SLOT_IDS,
+                    1,
+                )
+                for layer_idx in range(GEMMA4_NUM_SWA_LAYERS)
+            }
+            assert len(seen) == GEMMA4_NUM_SWA_LAYERS, (
+                f"block position {position}: only {len(seen)} distinct pages for "
+                f"{GEMMA4_NUM_SWA_LAYERS} layers -- layers alias each other's KV"
+            )
+
+    def test_indices_stay_inside_the_addressed_slots(self):
+        """Every index must fall inside a slot the descriptor actually holds."""
+        valid = {slot * GEMMA4_SCALE + sub for slot in self.SLOT_IDS for sub in range(GEMMA4_SCALE)}
+        for layer_idx in range(GEMMA4_NUM_SWA_LAYERS):
+            assert set(self._indices(layer_idx).tolist()) <= valid, (
+                f"layer {layer_idx} produced an index outside the descriptor's slots"
+            )
+
+    def test_rotation_advances_with_block_position(self):
+        """The rotation is the reason SHARED addressing cannot work.
+
+        If a layer's sub-page were fixed across block positions it could be
+        folded into a base pointer and none of the PER_LAYER machinery would be
+        needed. Assert it genuinely moves, so this test fails if someone
+        "simplifies" the rotation away.
+        """
+        idx = self._indices(layer_idx=3)
+        sub_pages = [int(i) % GEMMA4_SCALE for i in idx.tolist()]
+        assert len(set(sub_pages)) > 1, "sub-page did not rotate with block position"
+
+    def test_kv_factor_division_preserves_pairing(self):
+        """div_factor halves the index space; K must stay kv_factor-aligned.
+
+        The flat table indexes block-granular entries, so the caller divides by
+        kv_factor. That is only sound when K is kv_factor-aligned -- one of the
+        conditions _validate_per_layer_kv_adjacency enforces.
+        """
+        for layer_idx in range(GEMMA4_NUM_SWA_LAYERS):
+            raw = self._indices(layer_idx, div_factor=1).tolist()
+            halved = self._indices(layer_idx, div_factor=GEMMA4_KV_FACTOR).tolist()
+            assert all(r % GEMMA4_KV_FACTOR == 0 for r in raw), (
+                f"layer {layer_idx}: K index is not kv_factor-aligned, so dividing by "
+                "kv_factor would collapse K and V onto the same entry"
+            )
+            assert halved == [r // GEMMA4_KV_FACTOR for r in raw]
+
+    def test_empty_range_is_empty(self):
+        assert self._indices(layer_idx=0, count=0).tolist() == []
+
+
+class TestSwaScratchSegmentClamping:
+    """Range/segment clamping in apply_scratch_to_block_segment.
+
+    The scratch range and a request's block count are computed independently, so
+    they can fail to overlap. Getting the clamp wrong does not raise -- it shifts
+    the wrong blocks by layer_offset and leaves them pointing at another layer's
+    pages, which reads as plausible output. These cases are cheap to pin and
+    impossible to notice at runtime.
+    """
+
+    SCALE = GEMMA4_SCALE
+    SPB = GEMMA4_SCRATCH_PAGES_PER_BLOCK
+    SLOT_IDS = tuple(range(7, 15))
+    LAYER_OFFSET = 6  # layer 3, K
+
+    def _apply(self, values, beg, end, div_factor=1):
+        import numpy as np
+
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+            apply_scratch_to_block_segment,
+        )
+
+        seg = np.asarray(values, dtype=np.int32).copy()
+        apply_scratch_to_block_segment(
+            seg,
+            beg,
+            end,
+            self.SPB,
+            self.SCALE,
+            self.LAYER_OFFSET,
+            self.SLOT_IDS,
+            div_factor,
+        )
+        return seg.tolist()
+
+    def test_range_entirely_before_segment_shifts_every_block(self):
+        """beg < end <= 0: nothing is scratch, so every block just gains the offset.
+
+        Regression: a naive ``seg[hi:]`` with a negative ``hi`` indexes from the
+        end of the array and shifts only a suffix, silently leaving the leading
+        blocks addressed as if the buffer were still SHARED-based.
+        """
+        values = [10, 11, 12, 13]
+        got = self._apply(values, beg=-3, end=-1)
+        assert got == [v + self.LAYER_OFFSET for v in values]
+
+    def test_empty_range_shifts_every_block(self):
+        values = [10, 11, 12, 13]
+        assert self._apply(values, beg=2, end=2) == [v + self.LAYER_OFFSET for v in values]
+
+    def test_range_entirely_after_segment_shifts_every_block(self):
+        values = [10, 11, 12, 13]
+        assert self._apply(values, beg=9, end=12) == [v + self.LAYER_OFFSET for v in values]
+
+    def test_bad_page_index_is_never_shifted(self):
+        """BAD_PAGE_INDEX must stay the sentinel; shifting it makes it a real page."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+        got = self._apply([BAD_PAGE_INDEX, 11, BAD_PAGE_INDEX], beg=5, end=5)
+        assert got[0] == BAD_PAGE_INDEX and got[2] == BAD_PAGE_INDEX
+        assert got[1] == 11 + self.LAYER_OFFSET
+
+    def test_partial_overlap_splits_scratch_and_non_scratch(self):
+        """Only blocks inside the range rotate; the rest are shifted."""
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+            compute_scratch_flat_page_indices,
+        )
+
+        values = [10, 11, 12, 13, 14]
+        got = self._apply(values, beg=1, end=3)
+        rotated = compute_scratch_flat_page_indices(
+            0, 2, self.SPB, self.SCALE, self.LAYER_OFFSET, self.SLOT_IDS, 1
+        ).tolist()
+        assert got[0] == 10 + self.LAYER_OFFSET
+        assert got[1:3] == rotated
+        assert got[3:] == [13 + self.LAYER_OFFSET, 14 + self.LAYER_OFFSET]
+
+    def test_range_clipped_to_segment_does_not_false_trip_slot_guard(self):
+        """A range extending past the request's blocks is clipped, not rejected.
+
+        Only the blocks actually addressed consume slots, so the bound must be
+        checked on the clipped range. Checking [beg, end) instead would reject
+        descriptors that are perfectly serviceable.
+        """
+        from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+            compute_scratch_flat_page_indices,
+        )
+
+        # 2 blocks addressed needs 1 slot; the unclipped range would demand 13.
+        got = self._apply([10, 11], beg=0, end=500)
+        assert (
+            got
+            == compute_scratch_flat_page_indices(
+                0, 2, self.SPB, self.SCALE, self.LAYER_OFFSET, self.SLOT_IDS, 1
+            ).tolist()
+        )
+
+    def test_insufficient_slots_raises_with_numbers(self):
+        import pytest as _pytest
+
+        with _pytest.raises(ValueError, match="scratch slot"):
+            # 400 blocks x 2 pages / scale 80 needs 10 slots; only 8 provided.
+            self._apply(list(range(400)), beg=0, end=400)

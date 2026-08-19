@@ -92,6 +92,8 @@ class KVCacheIterationStatsDelta:
     iter_intra_device_copy_bytes: int = 0
     iter_host_dropped_blocks: int = 0
     iter_host_dropped_bytes: int = 0
+    iter_scratch_blocks: int = 0
+    iter_scratch_slots_in_use: int = 0
 
 @dataclass(slots=True)
 class SsmSnapshotIterationStatsDelta:
