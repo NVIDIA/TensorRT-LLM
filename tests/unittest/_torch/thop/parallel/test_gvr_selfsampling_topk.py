@@ -128,9 +128,7 @@ _SHORT_CASES = [
 
 
 @pytest.mark.parametrize("batch_size", [1, 4], ids=lambda b: f"bs{b}")
-@pytest.mark.parametrize(
-    "top_k,n_valid", _SHORT_CASES, ids=[f"k{k}_n{n}" for k, n in _SHORT_CASES]
-)
+@pytest.mark.parametrize("top_k,n_valid", _SHORT_CASES, ids=[f"k{k}_n{n}" for k, n in _SHORT_CASES])
 def test_selfsampling_topk_short_path(batch_size, top_k, n_valid):
     gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid)
     npad = (n_valid + 63) // 64 * 64
@@ -175,9 +173,7 @@ def test_selfsampling_topk_values_short_path():
     top_k, n_valid, bs = 1024, 512, 4
     gen = torch.Generator(device=_DEV).manual_seed(42)
     logits = torch.randn((bs, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
-    pre_idx = torch.randint(
-        0, n_valid, (bs, top_k), generator=gen, dtype=torch.int32, device=_DEV
-    )
+    pre_idx = torch.randint(0, n_valid, (bs, top_k), generator=gen, dtype=torch.int32, device=_DEV)
     indices = torch.full((bs, top_k), -7, dtype=torch.int32, device=_DEV)
     values = torch.full((bs, top_k), 7.0, dtype=torch.float32, device=_DEV)
     ss_host.run(logits, pre_idx, n_valid, indices, values)
@@ -235,8 +231,14 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="aut
     )
     kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(
-        logits, pre_idx, kv_lens, indices,
-        next_n=next_n, compress_ratio=cr, values=values, engine=engine,
+        logits,
+        pre_idx,
+        kv_lens,
+        indices,
+        next_n=next_n,
+        compress_ratio=cr,
+        values=values,
+        engine=engine,
     )
     torch.cuda.synchronize()
     fmin = torch.finfo(torch.float32).min
@@ -255,7 +257,9 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="aut
             assert int(torch.unique(idx).numel()) == top_k
             ref = torch.topk(logits[r, :n], top_k).values
             got = torch.sort(torch.gather(logits[r], 0, idx) + 0.0, descending=True).values
-            assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values), f"row {r} inexact"
+            assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values), (
+                f"row {r} inexact"
+            )
             if values is not None:
                 assert torch.equal(values[r], torch.gather(logits[r], 0, idx))
 
@@ -283,7 +287,7 @@ def test_selfsampling_topk_varlen_engine_matches_reference():
     equal the reference loop's on a mixed batch (deep SPLIT rows, tsh band,
     short rows, compressed space)."""
     kv = [524288, 131075, 32800, 2000, 65540, 8192, 262144, 900]
-    top_k, next_n, cr = 1024, 1, 4
+    top_k, cr = 1024, 4
     rows = len(kv)
     n_r = [(v - 1 + 1) // cr for v in kv]
     npad = (max(n_r) + 63) // 64 * 64
@@ -474,9 +478,7 @@ def test_selfsampling_topk_varlen_cuda_graph():
                 assert int(idx.min()) >= 0 and int(idx.max()) < n
                 assert int(torch.unique(idx).numel()) == top_k
                 ref = torch.topk(logits[r, :n], top_k).values
-                got = torch.sort(
-                    torch.gather(logits[r], 0, idx) + 0.0, descending=True
-                ).values
+                got = torch.sort(torch.gather(logits[r], 0, idx) + 0.0, descending=True).values
                 assert torch.equal(got, torch.sort(ref + 0.0, descending=True).values), (
                     f"replay step {step} row {r} inexact (n={n})"
                 )
@@ -513,8 +515,19 @@ def test_selfsampling_route_factorization():
         for k in (512, 1024, 2048):
             ns = set()
             for c in (
-                2 * k, 3 * k, 4 * k + 64, 2560, 4096, 8192, 16384,
-                4 * 1024, 4 * 4096, 4 * 32768, 65536, 131072, 262144,
+                2 * k,
+                3 * k,
+                4 * k + 64,
+                2560,
+                4096,
+                8192,
+                16384,
+                4 * 1024,
+                4 * 4096,
+                4 * 32768,
+                65536,
+                131072,
+                262144,
             ):
                 ns.update(v for v in range(c - 4, c + 5) if k < v <= npad)
             ns.update(range(k + 1, npad + 1, 4999))
@@ -524,14 +537,16 @@ def test_selfsampling_route_factorization():
                 ns.add(k + 1 + s % (npad - k - 1))
             for n in sorted(ns):
                 assert ss_host.route_split(b, n, npad, k) == ss_host.route(b, n, npad, k), (
-                    b, n, k,
+                    b,
+                    n,
+                    k,
                 )
                 checked += 1
     assert checked > 10_000
 
 
 def test_selfsampling_route_bands_contiguous():
-    """route_bands must tile the envelope contiguously with n-free statics."""
+    """route_bands must tile the envelope contiguously with n-free static fields."""
     bands = ss_host.route_bands(8, 262144, 1024)
     assert bands[0][0] == 1025 and bands[-1][1] == 262144
     for (_, h1, _), (l2, _, _) in zip(bands, bands[1:]):

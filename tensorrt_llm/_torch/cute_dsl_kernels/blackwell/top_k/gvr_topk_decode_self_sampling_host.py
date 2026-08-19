@@ -664,9 +664,23 @@ def route_streaming(b, n, npad, k, force_main=False):
         return {
             "kernel": "clus",
             "tpl": (1024, u_, 1, SNB, cs),
-            "rt": {"n": n, "npad": npad, "k": k, "SCAP": scap, "CMP": cmp_,
-                   "SMP": smp, "TGT": tgt, "Q": q_, "SS2": ss2, "TGT2": tgt2},
-            "grid": (cs, b), "cluster": cs, "block": 1024, "smem": smc, "ws": False,
+            "rt": {
+                "n": n,
+                "npad": npad,
+                "k": k,
+                "SCAP": scap,
+                "CMP": cmp_,
+                "SMP": smp,
+                "TGT": tgt,
+                "Q": q_,
+                "SS2": ss2,
+                "TGT2": tgt2,
+            },
+            "grid": (cs, b),
+            "cluster": cs,
+            "block": 1024,
+            "smem": smc,
+            "ws": False,
         }
     smem_main = (scap + 4) * (8 if (R > 1 or b <= 296) else 4) + (cmp_ + 1) * 8
 
@@ -676,9 +690,24 @@ def route_streaming(b, n, npad, k, force_main=False):
         return {
             "kernel": "main",
             "tpl": (blk_, u_, minb_, SNB, kpt, split_, tshg),
-            "rt": {"n": n, "npad": npad, "k": k, "SCAP_": scap, "CMP_": cmp_, "R": R,
-                   "SMP": smp, "TGT": tgt, "Q": q_, "SS2": ss2, "TGT2": tgt2},
-            "grid": (R, b), "cluster": 1, "block": blk_, "smem": smem_main, "ws": True,
+            "rt": {
+                "n": n,
+                "npad": npad,
+                "k": k,
+                "SCAP_": scap,
+                "CMP_": cmp_,
+                "R": R,
+                "SMP": smp,
+                "TGT": tgt,
+                "Q": q_,
+                "SS2": ss2,
+                "TGT2": tgt2,
+            },
+            "grid": (R, b),
+            "cluster": 1,
+            "block": blk_,
+            "smem": smem_main,
+            "ws": True,
         }
 
     if big:
@@ -934,6 +963,7 @@ def _dummy_kv(dev_index, device):
         _DUMMY_KV[dev_index] = t
     return t
 
+
 # hot-path local bindings (each torch.<attr> lookup costs ~0.1 us; the B1
 # battery runs on EVERY call — mirror of main.cpp's "sub-100ns predicted
 # branches" intent within Python's reach; measured in notes/ct_op_NOTES.md)
@@ -963,6 +993,7 @@ def _build_launcher(b, n, npad, k):
     if fam == "main":
         dev = _device()
         raw = dev.get_compiled(tpl)
+
         # compiled ABI: (logits, pre_idx, out, ws, n, npad, k, SCAP_, CMP_,
         #                R, SMP, TGT, Q, SS2, TGT2,
         #                kv_lens, aim_base, sfac, amin, sd_en, tsh_en)
@@ -1322,8 +1353,7 @@ def run_varlen(
     # ---- reference engine (differential oracle): b=1 host loop --------------
     if _is_capturing():
         raise RuntimeError(
-            "run_varlen reference engine reads kv_lens on host, "
-            "illegal under CUDA graph capture"
+            "run_varlen reference engine reads kv_lens on host, illegal under CUDA graph capture"
         )
     # match the engine's flat-packed output convention for wider-than-k
     # buffers (pack ONCE from the tensor base, then slice per row)

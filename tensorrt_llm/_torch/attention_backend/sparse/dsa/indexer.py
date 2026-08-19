@@ -708,9 +708,7 @@ class Indexer(nn.Module):
         )
         self._selfsampling_run_varlen = None
         if self._use_self_sampling_topk:
-            from ....cute_dsl_kernels.blackwell.top_k import (
-                selfsampling_topk_run_varlen,
-            )
+            from ....cute_dsl_kernels.blackwell.top_k import selfsampling_topk_run_varlen
 
             self._selfsampling_run_varlen = selfsampling_topk_run_varlen
         self.mtp_index_share = sparse_params.mtp_index_share

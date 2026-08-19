@@ -1333,8 +1333,18 @@ class GvrMainKernel:
     """CuTeDSL port of gvr_main<BLK, U, MINB, NBS, KPT, SPLIT> (kernel.cu L377)."""
 
     def __init__(
-        self, blk: int, u: int, minb: int, nbs: int, kpt: int, split: bool, tshg: bool = False,
-        varlen: bool = False, next_n: int = 1, cr_shift: int = 0, r_const: int = 1,
+        self,
+        blk: int,
+        u: int,
+        minb: int,
+        nbs: int,
+        kpt: int,
+        split: bool,
+        tshg: bool = False,
+        varlen: bool = False,
+        next_n: int = 1,
+        cr_shift: int = 0,
+        r_const: int = 1,
     ):
         assert nbs == 256, "SNB must stay 256 (kernel.cu L170-177, measured)"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -2883,8 +2893,27 @@ class GvrMainKernel:
     ):
         b = logits.shape[0]
         self.kern(
-            logits, pre_idx, out, ws, n, npad, k, scap_dead, cmp_dead, R, SMP, TGT, Q, SS2, TGT2,
-            kv_lens, aim_base, sfac, amin, sd_en, tsh_en,
+            logits,
+            pre_idx,
+            out,
+            ws,
+            n,
+            npad,
+            k,
+            scap_dead,
+            cmp_dead,
+            R,
+            SMP,
+            TGT,
+            Q,
+            SS2,
+            TGT2,
+            kv_lens,
+            aim_base,
+            sfac,
+            amin,
+            sd_en,
+            tsh_en,
         ).launch(grid=(R, b, 1), block=(self.blk, 1, 1), stream=stream, min_blocks_per_mp=self.minb)
 
 
@@ -2910,8 +2939,17 @@ def get_compiled(tpl, options_extra: str = ""):
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
         kern = GvrMainKernel(
-            blk, u, minb, nbs, kpt, bool(split), bool(tshg),
-            varlen=True, next_n=next_n, cr_shift=cr_shift, r_const=r_const,
+            blk,
+            u,
+            minb,
+            nbs,
+            kpt,
+            bool(split),
+            bool(tshg),
+            varlen=True,
+            next_n=next_n,
+            cr_shift=cr_shift,
+            r_const=r_const,
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
