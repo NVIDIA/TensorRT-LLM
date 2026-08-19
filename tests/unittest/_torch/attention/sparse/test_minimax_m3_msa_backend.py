@@ -1186,6 +1186,7 @@ def test_nvfp4_sparse_dispatch_uses_only_the_msa_csr_path(monkeypatch):
     """Packed NVFP4 bytes must never reach the Triton sparse decode path."""
     import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as msa_gqa
 
+    monkeypatch.setattr(msa_gqa, "_MSA_NVFP4_STANDARD_STAGE_ENABLED", False)
     num_tokens, num_heads, head_dim = 2, 8, 128
     pages, kv_heads, page_size = 4, 1, 128
     packed = torch.zeros(pages, 2, kv_heads, page_size, head_dim // 2, dtype=torch.int8)
@@ -1238,6 +1239,8 @@ def test_nvfp4_sparse_dispatch_uses_only_the_msa_csr_path(monkeypatch):
     assert v_scale.item() == dequant[2].item()
     assert k_scale.data_ptr() % 16 == 0
     assert v_scale.data_ptr() % 16 == 0
+    assert called["kwargs"]["k_global_scale_value"] is None
+    assert called["kwargs"]["v_global_scale_value"] is None
 
     # The padded aligned storage is persistent on the layer object rather than
     # allocated once per sparse layer call or once per CUDA-graph replay.
@@ -1258,6 +1261,144 @@ def test_nvfp4_sparse_dispatch_uses_only_the_msa_csr_path(monkeypatch):
         called["kwargs"]["k_global_scale"].data_ptr(),
         called["kwargs"]["v_global_scale"].data_ptr(),
     ) == first_ptrs
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(64, 4), (16, 1)])
+def test_nvfp4_standard_stage_uses_preplanned_msa_and_stable_scratch(
+    monkeypatch, q_heads, kv_heads
+):
+    """The opt-in decode route stages selected pages and reuses fixed scratch."""
+    import tensorrt_llm._torch.attention_backend.fmha.msa_sparse_gqa as msa_gqa
+    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils as msa_utils
+
+    monkeypatch.setattr(msa_gqa, "_MSA_NVFP4_STANDARD_STAGE_ENABLED", True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    batch, decode_query_len = 2, 3
+    total_q, capacity, head_dim = batch * decode_query_len, 8, 128
+    pages, page_size, topk = 16, 128, 16
+    q = torch.zeros(total_q, q_heads, head_dim, dtype=torch.float8_e4m3fn)
+    packed = torch.zeros(pages, kv_heads, page_size, head_dim // 2, dtype=torch.uint8)
+    scales = torch.zeros(pages, 2, kv_heads, page_size, head_dim // 16, dtype=torch.uint8)
+    indexes = torch.zeros(total_q, kv_heads, topk, dtype=torch.int32)
+    packed_mask = torch.tensor([[[1], [3], [5]], [[1], [3], [7]]], dtype=torch.int32)
+    q_batch_row = torch.zeros(capacity, dtype=torch.int32)
+    q_batch_row[:total_q] = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32)
+    q_intra = torch.zeros(capacity, dtype=torch.int32)
+    q_intra[:total_q] = torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int32)
+    plan = object()
+    stage_calls = []
+    fmha_calls = []
+
+    def fail_csr(*args, **kwargs):
+        raise AssertionError("standard staged M3 decode must not build CSR metadata")
+
+    def stage_selected_nvfp4_to_fp8(*args, **kwargs):
+        stage_calls.append((args, kwargs))
+
+    def standard_fmha(*args, **kwargs):
+        fmha_calls.append((args, kwargs))
+        return kwargs["out"], None
+
+    fake_sparse = SimpleNamespace(
+        build_k2q_csr=fail_csr,
+        sparse_atten_nvfp4_kv_func=fail_csr,
+        stage_selected_nvfp4_to_fp8=stage_selected_nvfp4_to_fp8,
+    )
+    fake_msa = SimpleNamespace(sparse=fake_sparse, fmha_sm100=standard_fmha)
+    monkeypatch.setattr(msa_utils, "require_msa_module", lambda: fake_msa)
+    metadata = SimpleNamespace(
+        _msa_live_batch=batch,
+        msa_cu_q_lens=torch.tensor([0, 3, 6], dtype=torch.int32),
+        msa_cu_kv_lens=torch.tensor([0, 640, 1280], dtype=torch.int32),
+        _msa_max_q_len=decode_query_len,
+        msa_block_table=torch.zeros(batch, 8, dtype=torch.int32),
+        msa_seq_lens_cuda=torch.tensor([640, 640], dtype=torch.int32),
+        msa_q_batch_row=q_batch_row,
+        msa_q_intra=q_intra,
+        spec_decoding_packed_mask=packed_mask,
+        is_spec_dec_dynamic_tree=True,
+        num_contexts=0,
+        num_generations=batch,
+        kv_cache_manager=SimpleNamespace(),
+    )
+    global_scales = torch.ones(2, 4, dtype=torch.float32)
+    output = torch.empty(total_q, q_heads, head_dim, dtype=torch.bfloat16)
+
+    msa_gqa.run_msa_nvfp4_sparse_gqa(
+        q,
+        packed,
+        packed,
+        scales,
+        indexes,
+        metadata,
+        sm_scale=head_dim**-0.5,
+        k_global_scale=global_scales[0, :1],
+        v_global_scale=global_scales[1, :1],
+        k_global_scale_value=1.25,
+        v_global_scale_value=0.75,
+        plan=plan,
+        out=output,
+    )
+
+    assert len(stage_calls) == 2
+    assert stage_calls[0][1]["is_v"] is False
+    assert stage_calls[1][1]["is_v"] is True
+    assert tuple(stage_calls[0][0][5].shape) == (
+        total_q * topk,
+        kv_heads,
+        page_size,
+        head_dim,
+    )
+    assert len(fmha_calls) == 1
+    args, kwargs = fmha_calls[0]
+    assert args[3] is plan
+    assert kwargs["kv_block_indexes"] is indexes
+    assert kwargs["sparse_custom_mask"] is packed_mask
+    assert kwargs["sparse_custom_mask_q_indices"].data_ptr() == q_intra.data_ptr()
+    assert kwargs["sparse_custom_mask_batch_indices"].data_ptr() == q_batch_row.data_ptr()
+    assert kwargs["k_scale"] == 1.25
+    assert kwargs["v_scale"] == 0.75
+    assert kwargs["out"] is output
+    physical = kwargs["kv_physical_block_indexes"]
+    assert tuple(physical.shape) == (total_q, kv_heads, topk)
+    assert torch.equal(physical[:, 0], torch.arange(total_q * topk).view(total_q, topk))
+
+    first_k_scratch = stage_calls[0][0][5]
+    first_v_scratch = stage_calls[1][0][5]
+    first_physical = physical
+    metadata._msa_live_batch = 1
+    metadata.num_generations = 1
+    smaller_q = q[:decode_query_len]
+    smaller_indexes = indexes[:decode_query_len]
+    smaller_output = output[:decode_query_len]
+    msa_gqa.run_msa_nvfp4_sparse_gqa(
+        smaller_q,
+        packed,
+        packed,
+        scales,
+        smaller_indexes,
+        metadata,
+        sm_scale=head_dim**-0.5,
+        k_global_scale=global_scales[0, :1],
+        v_global_scale=global_scales[1, :1],
+        k_global_scale_value=1.25,
+        v_global_scale_value=0.75,
+        plan=plan,
+        out=smaller_output,
+    )
+    assert stage_calls[2][0][5].data_ptr() == first_k_scratch.data_ptr()
+    assert stage_calls[3][0][5].data_ptr() == first_v_scratch.data_ptr()
+    assert tuple(stage_calls[2][0][5].shape) == (
+        decode_query_len * topk,
+        kv_heads,
+        page_size,
+        head_dim,
+    )
+    smaller_physical = fmha_calls[1][1]["kv_physical_block_indexes"]
+    assert smaller_physical.data_ptr() == first_physical.data_ptr()
+    assert tuple(smaller_physical.shape) == (decode_query_len, kv_heads, topk)
+    assert len(metadata.kv_cache_manager._msa_nvfp4_selected_scratch_cache) == 1
 
 
 def test_per_token_valid_blocks_multi_token_decode():
