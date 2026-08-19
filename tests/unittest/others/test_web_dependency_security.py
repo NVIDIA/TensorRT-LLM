@@ -49,8 +49,11 @@ def test_web_framework_security_floors() -> None:
 
     assert _minimum_version(fastapi) >= Version("0.136.3")
     assert Version("0.121.3") not in fastapi.specifier
-    # Starlette 1.3.x needs fastapi < 0.137, so the upper bound is load-bearing.
-    assert Version("0.137.0") not in fastapi.specifier
+    # Deliberately no upper bound on fastapi. The cap this PR removes is what
+    # pinned Starlette below 1.x in the first place, and fastapi has carried no
+    # starlette ceiling since 0.133.0 (0.134.0-0.141.1 all declare
+    # starlette>=0.46.0 unbounded), so re-capping would recreate the same
+    # deadlock a release later.
     assert _minimum_version(starlette) >= Version("1.3.1")
     assert Version("0.50.0") not in starlette.specifier
 
