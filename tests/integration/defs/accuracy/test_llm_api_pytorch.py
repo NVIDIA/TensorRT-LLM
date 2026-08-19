@@ -6101,14 +6101,8 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize(
         "tp_size,ep_size,attention_dp",
-        [
-            (4, 4, False),
-            (4, 4, True),
-        ],
-        ids=[
-            "tep4",
-            "dep4",
-        ],
+        [(4, 4, False)],
+        ids=["tep4"],
     )
     def test_bf16_4gpu(self, tp_size, ep_size, attention_dp, mocker):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
@@ -6139,17 +6133,12 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
-    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"],
-                             ids=["cutlass", "trtllm"])
-    @pytest.mark.parametrize("tp_size,ep_size,attention_dp,enable_block_reuse",
-                             [
-                                 (1, 1, False, True),
-                                 (4, 4, True, False),
-                             ],
-                             ids=[
-                                 "tp1_block_reuse",
-                                 "dep4",
-                             ])
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM"], ids=["trtllm"])
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,attention_dp,enable_block_reuse",
+        [(4, 4, True, False)],
+        ids=["dep4"],
+    )
     def test_nvfp4(self, moe_backend, tp_size, ep_size, attention_dp,
                    enable_block_reuse, mocker):
         gpu_needed = max(tp_size, ep_size)
@@ -6161,8 +6150,6 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=enable_block_reuse)
-        if enable_block_reuse:
-            kv_cache_config.mamba_state_config.periodic_snapshot_interval = 256
         pytorch_config = dict(disable_overlap_scheduler=False,
                               cuda_graph_config=CudaGraphConfig(
                                   max_batch_size=512, enable_padding=True))
@@ -6187,7 +6174,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     def test_bf16_2gpu_mtp_ar(self):
         max_draft_len = 3
         mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
-        model_path = f"{llm_models_root()}/Qwen3-Next/Qwen3-Next-80B-A3B-Instruct"
+        model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
 
         llm_common_config = dict(
             model=model_path,

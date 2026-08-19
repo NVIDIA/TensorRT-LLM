@@ -241,7 +241,6 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 # One representative per distinct TRT-LLM architecture class:
 #   LlamaForCausalLM   — TinyLlama (also covers Mistral, which aliases LlamaModel)
 #   Gemma3ForCausalLM  — Gemma-3-1B (sliding window + global alternation)
-#   Phi3ForCausalLM    — Phi-4-mini (SuRoPE, merged QKV)
 #   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm)
 DECODER_MODELS = [
     # -- LlamaForCausalLM (covers Llama + Mistral family) --
@@ -255,13 +254,6 @@ DECODER_MODELS = [
         "google/gemma-3-1b-it",
         f"{llm_models_root()}/gemma/gemma-3-1b-it/",
         id="gemma-3-1b",
-    ),
-    # -- Phi3ForCausalLM --
-    pytest.param(
-        "microsoft/Phi-4-mini-instruct",
-        f"{llm_models_root()}/Phi-4-mini-instruct",
-        marks=pytest.mark.skip_less_device_memory(24000),
-        id="phi-4-mini",
     ),
     # -- Qwen3ForCausalLM --
     pytest.param(

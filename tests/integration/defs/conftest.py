@@ -976,10 +976,6 @@ def llm_lora_model_root(request):
         elif item == "luotuo-lora-7b-0.1":
             model_root_list.append(
                 os.path.join(models_root, "llama-models", "luotuo-lora-7b-0.1"))
-        elif item == "Phi-3-mini-4k-instruct-ru-lora":
-            model_root_list.append(
-                os.path.join(models_root, "lora", "phi",
-                             "Phi-3-mini-4k-instruct-ru-lora"))
         elif item == "peft-lora-starcoder2-15b-unity-copilot":
             model_root_list.append(
                 os.path.join(
