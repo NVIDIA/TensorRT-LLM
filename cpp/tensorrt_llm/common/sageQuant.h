@@ -32,10 +32,12 @@ struct SageQuantParams
 {
     // Required arguments for SageQuantQk (Q or K):
     int sumSeqLensQk{};
+    int batchSize{};
     int numHeads{};
     int headDim{};
     int tokenBlockSize{};
     bool kSmooth{false};
+    int const* ptrCuSeqLensQk{nullptr};
     void const* ptrQk{nullptr};
     void* ptrQkQuant{nullptr};
     kernels::Data_type inputType{kernels::DATA_TYPE_FP16};

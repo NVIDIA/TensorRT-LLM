@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import os
 import re
@@ -669,6 +672,26 @@ def test_dummy_mm_max_tokens_per_item_is_image_only():
     assert demand["image"] == (1540 // 14) ** 2 == 110**2
 
 
+def test_attention_metadata_capacity_uses_token_budget():
+    proc = _make_dummy_processor(spatial_merge_size=2)
+
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=100) == {"attention": 25}
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_tokens=12) == {"attention": 3}
+
+
+def test_mistral_item_metadata_separates_patch_and_embedding_units():
+    processor = object.__new__(MistralHFInputProcessor)
+    processor._vision_geometry = lambda: (14, 2, 3, 1024)
+
+    metadata = processor.get_mm_encoder_item_metadata(
+        [], {"image": {"image_sizes": [[28, 56], [56, 56]]}}
+    )
+
+    assert metadata.item_refs == [("image", 0), ("image", 1)]
+    assert metadata.encoder_token_lengths == [8, 16]
+    assert metadata.output_embedding_lengths == [2, 4]
+
+
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
 def test_dummy_get_size_for_max_tokens_fits_and_aligns(budget):
     proc = _make_dummy_processor()
@@ -689,24 +712,68 @@ def test_dummy_get_size_rejects_non_positive_budget():
         proc.get_size_for_max_tokens(max_tokens=0)
 
 
-@pytest.mark.parametrize("budget", [4096, 8192])
-def test_dummy_get_dummy_mm_data_for_tokens_shapes_and_saturation(budget):
-    proc = _make_dummy_processor(num_channels=3)
-    data = proc.get_dummy_mm_data_for_tokens(
-        max_tokens_per_modality={"image": budget}, dtype=torch.float16
-    )
-    image = data["image"]
-    pv = image["pixel_values"]
-    sizes = image["image_sizes"]
-    n, c, h, w = pv.shape
-    assert c == 3 and pv.dtype == torch.float16
-    assert sizes == [[h, w]] * n
-    # The batch saturates the budget: total patches <= budget, within one image.
-    per_image = (h // 14) * (w // 14)
-    assert n * per_image <= budget
-    assert n * per_image + per_image > budget
-
-
-def test_dummy_for_tokens_empty_without_image_budget():
+def test_dummy_get_dummy_mm_data_rejects_negative_item_count():
     proc = _make_dummy_processor()
-    assert proc.get_dummy_mm_data_for_tokens(max_tokens_per_modality={"audio": 1024}) == {}
+    with pytest.raises(ValueError, match=r"item counts must be nonnegative"):
+        proc.get_dummy_mm_data(max_num_encoder_tokens=1024, mm_counts={"image": -1})
+
+
+@pytest.mark.parametrize("budget", [4096, 8192])
+def test_dummy_get_dummy_mm_data_saturates_budget(budget):
+    proc = _make_dummy_processor()
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        mm_counts={"image": 1},
+        dtype=torch.float16,
+    )["image"]
+    pixel_values = image["pixel_values"]
+    num_images, channels, height, width = pixel_values.shape
+    assert num_images == 1
+    assert channels == 3
+    assert image["image_sizes"] == [[height, width]]
+    per_image = (height // 14) * (width // 14)
+    assert per_image <= budget
+    assert 2 * per_image > budget
+
+
+def test_dummy_get_dummy_mm_data_respects_requested_item_count():
+    proc = _make_dummy_processor(image_size=448)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        mm_counts={"image": 3},
+        dtype=torch.float16,
+    )["image"]
+
+    assert image["pixel_values"].shape[0] == 3
+
+
+def test_dummy_mm_data_satisfies_the_encoder_input_contract():
+    """KV-cache profiling feeds `get_dummy_mm_data()` straight to the encoder.
+
+    Nothing rebuilds these tensors through the input processor any more, so the
+    processor now restates the encoder's input layout on its own. A drift
+    between the two would surface only as a crash during startup memory
+    estimation. Drive the encoder's real batching step instead of restating its
+    expectations here, so a change on either side fails this test.
+    """
+    proc = _make_dummy_processor()
+    budget = 8192
+    tokens_per_image = proc.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)["image"]
+    num_images = min(8, budget // tokens_per_image)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        mm_counts={"image": num_images},
+        dtype=torch.float16,
+    )["image"]
+
+    # `_vision_forward` collects one entry per request and converts the sizes to
+    # tensors before batching; mirror that, then run the real batching step.
+    batched_pixel_values, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
+        pixel_values=[image["pixel_values"]],
+        image_sizes=[torch.tensor(image["image_sizes"])],
+    )
+
+    num_images = image["pixel_values"].shape[0]
+    assert batched_pixel_values.shape[0] == num_images
+    assert batched_sizes.shape == (num_images, 2)
+    assert batched_pixel_values.dtype == torch.float16

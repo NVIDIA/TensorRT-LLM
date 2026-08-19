@@ -8,7 +8,7 @@ import torch
 try:
     import ray
 except ModuleNotFoundError:
-    from tensorrt_llm import ray_stub as ray
+    from tensorrt_llm.executor.ray import stub as ray
 
 from tensorrt_llm._torch.distributed.communicator import TorchDist
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
@@ -25,7 +25,7 @@ class PgOpTest:
 
         assert len(ray.get_gpu_ids()) == 1
         self.gpu = int(ray.get_gpu_ids()[0])
-        from tensorrt_llm.executor.ray_gpu_worker import RayWorkerWrapper
+        from tensorrt_llm.executor.ray.gpu_worker import RayWorkerWrapper
         local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
         torch.cuda.set_device(local_gpu)
 
@@ -273,7 +273,7 @@ class CpBroadcastTest:
 
         assert len(ray.get_gpu_ids()) == 1
         self.gpu = int(ray.get_gpu_ids()[0])
-        from tensorrt_llm.executor.ray_gpu_worker import RayWorkerWrapper
+        from tensorrt_llm.executor.ray.gpu_worker import RayWorkerWrapper
         local_gpu = RayWorkerWrapper.physical_to_local_id(self.gpu)
         torch.cuda.set_device(local_gpu)
 

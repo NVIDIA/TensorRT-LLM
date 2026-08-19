@@ -42,7 +42,7 @@ from utils.util import (force_ampere, similar, similarity_score,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
-from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 import tempfile
 
@@ -875,7 +875,7 @@ def test_lora_many_adapters_no_memory_leak() -> None:
 def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
                                        description):
     """Test load_torch_nemo_lora function with different LoRA rank configurations."""
-    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+    from tensorrt_llm._torch.peft.lora.manager import load_torch_nemo_lora
 
     nemo_path = create_mock_nemo_lora_checkpoint(
         tmp_path,
@@ -904,7 +904,7 @@ def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
 @pytest.mark.part0
 def test_nemo_lora_unsupported_modules_validation(tmp_path):
     """Test validation of unsupported modules in NeMo LoRA."""
-    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+    from tensorrt_llm._torch.peft.lora.manager import load_torch_nemo_lora
 
     nemo_path = create_mock_nemo_lora_checkpoint(
         tmp_path,

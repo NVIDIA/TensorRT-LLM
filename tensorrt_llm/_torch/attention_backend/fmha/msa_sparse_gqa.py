@@ -186,8 +186,8 @@ class MsaSparseGqaFmha(Fmha):
 
     @classmethod
     def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
-        # fmha_sm100 runs only on the SM100 family and ships in the MSA git
-        # submodule, so it is unavailable off SM100 or without the package.
+        # fmha_sm100 runs only on the SM100 family and is packaged in the
+        # wheel, so it is unavailable off SM100 or without the wheel.
         # Imported lazily because the minimax_m3 package init imports the trtllm
         # attention classes, which a module-scope import here would cycle with.
         from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (

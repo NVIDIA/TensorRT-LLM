@@ -28,6 +28,8 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.peft.lora.manager import LoraManager
+from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
@@ -37,8 +39,6 @@ from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..lora_manager import LoraManager
-from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue

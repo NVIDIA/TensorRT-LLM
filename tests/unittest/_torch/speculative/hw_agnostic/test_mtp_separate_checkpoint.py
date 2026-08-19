@@ -4,24 +4,44 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
+from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_speculative
 from tensorrt_llm._torch.models.checkpoints.hf.nemotron_h_weight_mapper import (
     NemotronHHfWeightMapper,
 )
 from tensorrt_llm._torch.speculative.utils import (
     filter_mtp_checkpoint_weights,
-    loads_mtp_from_speculative_model,
     resolve_mtp_checkpoint_source,
     select_mtp_checkpoint_weights,
     skip_modules_for_separate_mtp_checkpoint,
     update_spec_config_from_model_config,
+    uses_mtp_head_checkpoint,
 )
 from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 
 
+class _ExternalDraftModelTarget:
+    build_mtp_draft_model_from_config = True
+
+
+class _EmbeddedOrHeadReplacementTarget:
+    pass
+
+
+def _resolve_as_head_checkpoint(spec_config):
+    pretrained_config = PretrainedConfig(architectures=["TargetModel"], num_nextn_predict_layers=1)
+    update_spec_config_from_model_config(
+        spec_config, pretrained_config, _EmbeddedOrHeadReplacementTarget
+    )
+
+
 def test_needs_separate_draft_weights_for_mtp_with_speculative_model():
     cfg = MTPDecodingConfig(max_draft_len=3, speculative_model="/path/to/mtp")
+    _resolve_as_head_checkpoint(cfg)
     assert cfg.needs_separate_draft_weights is True
 
     cfg_no_draft = MTPDecodingConfig(max_draft_len=3)
@@ -33,15 +53,61 @@ def test_needs_separate_draft_weights_still_true_for_eagle3():
     assert cfg.needs_separate_draft_weights is True
 
 
-def test_loads_mtp_from_speculative_model_helper():
-    assert (
-        loads_mtp_from_speculative_model(
-            MTPDecodingConfig(max_draft_len=3, speculative_model="/path/to/mtp")
-        )
-        is True
+def test_uses_mtp_head_checkpoint_helper():
+    spec_config = MTPDecodingConfig(max_draft_len=3, speculative_model="/path/to/mtp")
+    _resolve_as_head_checkpoint(spec_config)
+    assert uses_mtp_head_checkpoint(spec_config) is True
+    assert uses_mtp_head_checkpoint(MTPDecodingConfig(max_draft_len=3)) is False
+    assert uses_mtp_head_checkpoint(None) is False
+
+
+@pytest.mark.parametrize(
+    ("speculative_model", "target_model_cls", "expected_checkpoint_type"),
+    [
+        (None, _EmbeddedOrHeadReplacementTarget, "embedded"),
+        ("/path/to/mtp", _EmbeddedOrHeadReplacementTarget, "head_replacement"),
+        ("/path/to/assistant", _ExternalDraftModelTarget, "external_draft_model"),
+    ],
+)
+def test_mtp_checkpoint_type_selects_draft_model_constructor(
+    monkeypatch, speculative_model, target_model_cls, expected_checkpoint_type
+):
+    spec_config = MTPDecodingConfig(max_draft_len=3, speculative_model=speculative_model)
+    pretrained_config = PretrainedConfig(architectures=["TargetModel"], num_hidden_layers=52)
+    model_config = ModelConfig(
+        spec_config=spec_config,
+        pretrained_config=pretrained_config,
     )
-    assert loads_mtp_from_speculative_model(MTPDecodingConfig(max_draft_len=3)) is False
-    assert loads_mtp_from_speculative_model(None) is False
+    update_spec_config_from_model_config(spec_config, pretrained_config, target_model_cls)
+
+    external_draft_model = object()
+    replacement_mtp_heads = object()
+    monkeypatch.setattr(
+        modeling_speculative.AutoModelForCausalLM,
+        "from_config",
+        lambda draft_config: external_draft_model,
+    )
+    monkeypatch.setattr(
+        modeling_speculative,
+        "MTPForCausalLM",
+        lambda *args: replacement_mtp_heads,
+    )
+
+    draft_config = object() if expected_checkpoint_type == "external_draft_model" else None
+    draft_model = modeling_speculative.get_draft_model(
+        model_config, draft_config, object(), object()
+    )
+
+    if expected_checkpoint_type == "external_draft_model":
+        assert spec_config.uses_external_draft_model
+        assert not spec_config.uses_replacement_heads
+        assert draft_model is external_draft_model
+    else:
+        assert not spec_config.uses_external_draft_model
+        assert spec_config.uses_replacement_heads is (
+            expected_checkpoint_type == "head_replacement"
+        )
+        assert draft_model is replacement_mtp_heads
 
 
 def test_speculative_model_equal_to_target_keeps_embedded_mtp(tmp_path):
@@ -50,10 +116,9 @@ def test_speculative_model_equal_to_target_keeps_embedded_mtp(tmp_path):
     target_dir.mkdir()
 
     cfg = MTPDecodingConfig(max_draft_len=3, speculative_model=str(target_dir))
-    assert loads_mtp_from_speculative_model(cfg) is True
 
     resolve_mtp_checkpoint_source(cfg, str(target_dir))
-    assert loads_mtp_from_speculative_model(cfg) is False
+    assert uses_mtp_head_checkpoint(cfg) is False
     assert cfg.needs_separate_draft_weights is False
     # The user-provided value is left untouched.
     assert cfg.speculative_model == str(target_dir)
@@ -67,7 +132,7 @@ def test_speculative_model_equal_to_target_matches_equivalent_paths(tmp_path):
 
     cfg = MTPDecodingConfig(max_draft_len=3, speculative_model=str(link_dir))
     resolve_mtp_checkpoint_source(cfg, str(target_dir) + "/")
-    assert loads_mtp_from_speculative_model(cfg) is False
+    assert uses_mtp_head_checkpoint(cfg) is False
 
 
 def test_separate_mtp_checkpoint_survives_resolution(tmp_path):
@@ -78,7 +143,8 @@ def test_separate_mtp_checkpoint_survives_resolution(tmp_path):
 
     cfg = MTPDecodingConfig(max_draft_len=3, speculative_model=str(mtp_dir))
     resolve_mtp_checkpoint_source(cfg, str(target_dir))
-    assert loads_mtp_from_speculative_model(cfg) is True
+    _resolve_as_head_checkpoint(cfg)
+    assert uses_mtp_head_checkpoint(cfg) is True
     assert cfg.needs_separate_draft_weights is True
 
 
@@ -215,6 +281,8 @@ def _make_one_engine_stub(spec_config, num_hidden_layers: int = 52):
     target's ``model.layers[N]`` and ``draft_model.mtp_layers[0]``.
     """
     from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+
+    _resolve_as_head_checkpoint(spec_config)
 
     class _OneEngineStub(SpecDecOneEngineForCausalLM):
         # The real ``config`` is a read-only property over

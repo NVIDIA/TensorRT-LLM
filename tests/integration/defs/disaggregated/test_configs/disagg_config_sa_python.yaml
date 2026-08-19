@@ -1,0 +1,29 @@
+# Spec-split SA regression on the V2 PYTHON transceiver path:
+# identical to disagg_config_sa.yaml (ctx: no speculative_config,
+# gen: SA) but with backend NIXL + transceiver_runtime PYTHON on both
+# servers -- the runtime combination Kimi K3 disagg is required to use.
+# The existing test_disaggregated_sa covers the spec split only on the
+# C++ DEFAULT backend.
+hostname: localhost
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+free_gpu_memory_fraction: 0.1
+backend: pytorch
+disable_overlap_scheduler: true
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: NIXL
+    transceiver_runtime: PYTHON
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  cache_transceiver_config:
+    backend: NIXL
+    transceiver_runtime: PYTHON
+  speculative_config:
+    decoding_type: SA
+    max_draft_len: 4
+    max_matching_ngram_size: 4

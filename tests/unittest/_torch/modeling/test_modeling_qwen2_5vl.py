@@ -27,8 +27,8 @@ from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5_VisionModel, Qwen2_5_VLModel, Qwen2VisionModelBase,
     Qwen2VLInputProcessorBase, Qwen2VLModel, _prepare_qwen_vl_mrope_config,
     _prepare_qwen_vl_vision_attn_metadata)
-from tensorrt_llm._torch.models.modeling_qwen3vl import \
-    Qwen3VLInputProcessorBase
+from tensorrt_llm._torch.models.modeling_qwen3vl import (
+    Qwen3VLInputProcessorBase, _qwen3vl_build_batched_input)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -565,12 +565,10 @@ def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
     model = Qwen2VisionModelBase(model_config, Qwen2_5_VisionModel).visual
     model.metadata_cls = _StubVisionAttentionMetadata
 
-    max_num_requests = 8
     max_num_tokens = 16
     fixed_max_seq_len = 65_536
     expected_window_max_seq_len = 64
-    model.setup_attn_metadata(max_num_requests=max_num_requests,
-                              max_num_tokens=max_num_tokens)
+    model.setup_attn_metadata(max_num_tokens=max_num_tokens)
     model.set_attn_max_seq_len(fixed_max_seq_len)
 
     assert model._full_attn_max_seq_len == fixed_max_seq_len
@@ -582,7 +580,7 @@ def test_qwen2_5_window_attention_uses_tighter_fixed_max_seq_len() -> None:
 #
 # CPU-only unit tests that reach into the InputProcessorBase classes directly
 # (no model load) and stub just enough of the HF config so the encoder-side
-# ``_num_vision_tokens`` / ``get_size_for_max_tokens`` / ``get_dummy_mm_data_*``
+# ``_num_vision_tokens`` / ``get_size_for_max_tokens`` / ``get_dummy_mm_data``
 # math runs. Token unit is pre-merger encoder attention, matching
 # ``encoder_max_num_tokens``.
 # ---------------------------------------------------------------------------
@@ -594,6 +592,9 @@ def _make_dummy_processor(
     temporal_patch_size: int = 2,
     min_pixels: int = 3136,
     max_pixels: int = 1 << 30,
+    video_min_pixels: Optional[int] = None,
+    video_max_pixels: Optional[int] = None,
+    video_max_frames: int = 768,
 ):
     """Construct a processor stub with stubbed vision_config attrs.
 
@@ -612,15 +613,78 @@ def _make_dummy_processor(
         in_channels=3,
     )
     instance._config = SimpleNamespace(vision_config=vision_config)
-    instance._processor = SimpleNamespace(image_processor=SimpleNamespace(
-        size={
+    instance._processor = SimpleNamespace(
+        image_processor=SimpleNamespace(size={
             "shortest_edge": min_pixels,
-            "longest_edge": max_pixels
-        }))
+            "longest_edge": max_pixels,
+        }),
+        video_processor=SimpleNamespace(
+            size={
+                "shortest_edge": video_min_pixels or min_pixels,
+                "longest_edge": video_max_pixels or max_pixels,
+            },
+            max_frames=video_max_frames,
+        ),
+    )
+    instance._dtype = torch.float16
     return instance
 
 
-_DUMMY_PROCESSORS = [Qwen2VLInputProcessorBase, Qwen3VLInputProcessorBase]
+_DUMMY_PROCESSORS = [
+    Qwen2VLInputProcessorBase,
+    Qwen3VLInputProcessorBase,
+]
+
+
+def test_qwen_item_metadata_uses_prompt_order_and_pre_merger_costs():
+    processor = object.__new__(Qwen2VLInputProcessorBase)
+    processor._config = SimpleNamespace(
+        image_token_id=11,
+        video_token_id=12,
+        vision_start_token_id=10,
+        vision_end_token_id=13,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+    )
+    prompt_token_ids = [10, 12, 12, 13, 1, 10, 11, 11, 13]
+    multimodal_data = {
+        "image": {
+            "image_grid_thw": torch.tensor([[1, 4, 4]])
+        },
+        "video": {
+            "video_grid_thw": torch.tensor([[2, 4, 4]])
+        },
+    }
+
+    metadata = processor.get_mm_encoder_item_metadata(prompt_token_ids,
+                                                      multimodal_data)
+
+    assert metadata.item_refs == [("video", 0), ("image", 0)]
+    assert metadata.encoder_token_lengths == [32, 16]
+    assert metadata.output_embedding_lengths == [8, 4]
+
+
+def test_qwen_item_metadata_collapses_frame_spans_into_original_video():
+    processor = object.__new__(Qwen2VLInputProcessorBase)
+    processor._config = SimpleNamespace(
+        image_token_id=11,
+        video_token_id=12,
+        vision_start_token_id=10,
+        vision_end_token_id=13,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+    )
+    prompt_token_ids = [10, 12, 13, 100, 10, 12, 13]
+    multimodal_data = {
+        "video": {
+            "video_grid_thw": torch.tensor([[2, 4, 4]])
+        },
+    }
+
+    metadata = processor.get_mm_encoder_item_metadata(prompt_token_ids,
+                                                      multimodal_data)
+
+    assert metadata.item_refs == [("video", 0)]
+    assert metadata.encoder_token_lengths == [32]
+    assert metadata.output_embedding_lengths == [8]
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
@@ -729,64 +793,251 @@ def test_get_size_rejects_non_positive_budget(processor_cls):
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_dummy_mm_data_shapes_match_token_count(processor_cls):
-    """Direct tensor build: pixel_values rows and the grid_thw product match ``_num_vision_tokens`` per image."""
-    proc = _make_dummy_processor(processor_cls)
-    cfg = proc._config.vision_config
-    width = height = 224
-    per_image = proc._num_vision_tokens(width=width, height=height)
-    in_dim = 3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
-
-    data = proc.get_dummy_mm_data_for_size(width=width,
-                                           height=height,
-                                           num_images=3,
-                                           dtype=torch.float32)
-    image = data["image"]
-    assert image["pixel_values"].shape == (3 * per_image, in_dim)
-    assert image["pixel_values"].dtype == torch.float32
-    assert image["image_grid_thw"].shape == (3, 3)
-    # Each grid row's product equals the per-image token count.
-    grid = image["image_grid_thw"]
-    assert int(grid[0].prod().item()) == per_image
-    assert torch.equal(grid[0], grid[1]) and torch.equal(grid[1], grid[2])
-
-
-@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_get_dummy_mm_data_single_image_default(processor_cls):
-    """Defaults to a single image; grid_thw is ``[1, 3]``."""
-    proc = _make_dummy_processor(processor_cls)
-    data = proc.get_dummy_mm_data_for_size(width=224,
-                                           height=224,
-                                           dtype=torch.float16)
-    assert data["image"]["image_grid_thw"].shape == (1, 3)
-    assert data["image"]["pixel_values"].dtype == torch.float16
-
-
-@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
-def test_mm_max_tokens_per_item_is_image_only(processor_cls):
-    """Qwen-VL declares only ``image`` (image+video share one ViT), valued at the max single-image token count."""
+def test_mm_max_tokens_per_item_is_modality_aware(processor_cls):
     proc = _make_dummy_processor(processor_cls, max_pixels=512 * 512)
     demand = proc.get_mm_max_tokens_per_item()
-    assert set(demand) == {"image"}
-    # The declared per-item demand is exactly the max single-image token count.
+    assert set(demand) == {"image", "video"}
     cap_size = proc.get_size_for_max_tokens(max_tokens=10**9)
     assert demand["image"] == proc._num_vision_tokens(width=cap_size["width"],
                                                       height=cap_size["height"])
-    assert demand["image"] > 0
+    if processor_cls is Qwen3VLInputProcessorBase:
+        # Qwen3 clamps the aggregate pixels of its two-frame profile video.
+        assert demand["video"] == demand["image"] // 2
+    else:
+        # The default startup query applies one shared encoder-token budget;
+        # Qwen2/2.5 may distribute it spatially or temporally.
+        assert demand["video"] == demand["image"]
+
+
+def test_qwen2_5_attention_metadata_capacity_uses_processor_geometry():
+    proc = _make_dummy_processor(
+        Qwen2VLInputProcessorBase,
+        patch_size=16,
+        spatial_merge_size=2,
+        min_pixels=32 * 32 * 4,
+        max_pixels=32 * 32 * 64,
+    )
+    proc.config.vision_config.window_size = 128
+
+    capacities = proc.get_mm_encoder_attention_metadata_capacity(
+        max_num_tokens=160)
+
+    # One full-attention frame has at least 4 merged cells * 4 physical
+    # patches. For 4x4 windows the worst window/area ratio is a 1x4 merged
+    # grid: the encoder pads an exactly-divisible dimension by a whole window
+    # (see `_windows_along`), so it emits 2 windows for 16 physical patches.
+    # A 160-token batch therefore holds 10 such frames and 20 contexts.
+    assert capacities == {
+        "full_attention": 10,
+        "window_attention": 20,
+    }
+
+
+@pytest.mark.parametrize(
+    "merged_h,merged_w,expected_windows",
+    [
+        (1, 4, 2),  # width exactly divisible -> one all-padding window
+        (4, 4, 4),  # both exactly divisible -> ceil() would say 1
+        (3, 5, 2),  # neither divisible -> ceil() already agreed
+    ],
+)
+def test_window_count_matches_encoder_padding(merged_h, merged_w,
+                                              expected_windows):
+    """Capacity sizing must count windows the way the encoder emits them.
+
+    `get_window_index_by_thw` pads by `window - dim % window`, which is a
+    whole extra window when `dim` is an exact multiple. Those windows carry
+    only padding, so their sequence length is zero, but they still reach
+    `window_seq_lens` and still count as contexts -- so sizing the metadata
+    with `ceil()` under-allocates exactly on the divisible cases.
+    """
+    window_side = 4
+    windows = (Qwen2VLInputProcessorBase._windows_along(merged_h, window_side) *
+               Qwen2VLInputProcessorBase._windows_along(merged_w, window_side))
+    assert windows == expected_windows
+
+
+def test_qwen2_5_rejects_runtime_grid_below_startup_geometry():
+    proc = _make_dummy_processor(
+        Qwen2VLInputProcessorBase,
+        patch_size=16,
+        spatial_merge_size=2,
+        min_pixels=32 * 32 * 4,
+        max_pixels=32 * 32 * 64,
+    )
+    proc.config.vision_config.window_size = 128
+
+    proc._validate_encoder_attention_geometry(
+        {"image": torch.tensor([[1, 4, 4]])})
+    with pytest.raises(ValueError, match="startup processor geometry"):
+        proc._validate_encoder_attention_geometry(
+            {"image": torch.tensor([[1, 2, 2]])})
+
+
+def test_qwen3_attention_capacity_keeps_long_video_safe():
+    proc = _make_dummy_processor(Qwen3VLInputProcessorBase,
+                                 spatial_merge_size=2)
+
+    capacities = proc.get_mm_encoder_attention_metadata_capacity(
+        max_num_tokens=160)
+
+    # Qwen3's video resize clamp applies to aggregate temporal pixels. A long
+    # atomic video can therefore reach the hard one-merged-cell minimum for
+    # every temporal segment within the token budget.
+    assert capacities == {"attention": 40}
+
+
+def _get_profile_mm_counts(proc, budget, max_batch_size):
+    max_tokens_per_item = proc.get_mm_max_tokens_per_item(
+        max_num_encoder_tokens=budget)
+    modality, num_tokens_per_item = max(max_tokens_per_item.items(),
+                                        key=lambda item: (item[1], item[0]))
+    return {modality: min(max_batch_size, budget // num_tokens_per_item)}
 
 
 @pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
 @pytest.mark.parametrize("budget", [1024, 4096, 16384])
-def test_get_dummy_mm_data_for_tokens_saturates_budget(processor_cls, budget):
-    """Agnostic entry: total pre-merger patches are ``<= budget`` and within one image of it (saturates the budget)."""
+def test_get_dummy_mm_data_saturates_budget(processor_cls, budget):
     proc = _make_dummy_processor(processor_cls)
-    data = proc.get_dummy_mm_data_for_tokens(
-        max_tokens_per_modality={"image": budget}, dtype=torch.float32)
-    grid = data["image"]["image_grid_thw"]
+    mm_data = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=budget,
+        mm_counts=_get_profile_mm_counts(proc, budget, budget),
+        dtype=torch.float32,
+    )
+    modality = next(iter(mm_data))
+    values_key = ("pixel_values"
+                  if modality == "image" else "pixel_values_videos")
+    grid_key = ("image_grid_thw" if modality == "image" else "video_grid_thw")
+    item = mm_data[modality]
+    grid = item[grid_key]
     total_patches = int(grid.prod(dim=1).sum().item())
-    per_image = int(grid[0].prod().item())
-    # pixel_values rows == total patches across all batched images.
-    assert data["image"]["pixel_values"].shape[0] == total_patches
-    # Saturates: within the budget, and adding one more image would exceed it.
+    per_item = int(grid[0].prod().item())
+    assert item[values_key].shape[0] == total_patches
+    assert item[values_key].dtype == torch.float32
     assert total_patches <= budget
-    assert total_patches + per_image > budget
+    assert total_patches + per_item > budget
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_get_dummy_mm_data_rejects_negative_item_count(processor_cls):
+    proc = _make_dummy_processor(processor_cls)
+    with pytest.raises(ValueError, match=r"item counts must be nonnegative"):
+        proc.get_dummy_mm_data(max_num_encoder_tokens=1024,
+                               mm_counts={"image": -1})
+
+
+def test_qwen2_dummy_profiles_long_atomic_video_with_explicit_budget():
+    proc = _make_dummy_processor(Qwen2VLInputProcessorBase,
+                                 max_pixels=512 * 512)
+    video = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=14_336,
+        mm_counts={"video": 1},
+        dtype=torch.float16,
+    )["video"]
+    token_lengths = video["video_grid_thw"].prod(dim=1).tolist()
+    assert token_lengths == [14_336]
+    assert video["pixel_values_videos"].shape[0] == 14_336
+
+
+def test_qwen3_dummy_uses_image_when_it_is_the_larger_modality():
+    proc = _make_dummy_processor(Qwen3VLInputProcessorBase,
+                                 max_pixels=512 * 512)
+    image = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        mm_counts={"image": 8},
+        dtype=torch.float16,
+    )["image"]
+    token_lengths = image["image_grid_thw"].prod(dim=1).tolist()
+    assert token_lengths == [1024] * 8
+
+
+def test_qwen2_dummy_uses_legal_video_geometry():
+    proc = _make_dummy_processor(Qwen2VLInputProcessorBase,
+                                 max_pixels=512 * 512)
+    mm_data = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        mm_counts={"video": 1},
+        dtype=torch.float16,
+    )
+
+    assert set(mm_data) == {"video"}
+    video = mm_data["video"]
+    grid = video["video_grid_thw"]
+    assert grid.tolist() == [[8, 32, 32]]
+    assert int(grid.prod(dim=1).sum()) == 8192
+    assert video["pixel_values_videos"].shape[0] == 8192
+
+    # Exercise the encoder's real parser so the processed-input keys and row
+    # count stay aligned with runtime videos.
+    params = [MultimodalParams(multimodal_data=mm_data)]
+    content, extra = Qwen2VisionModelBase._parse_and_batch_multimodal_data(
+        None, params)
+    assert content["pixel_values_videos"].shape[0] == 8192
+    assert torch.equal(extra["video_grid_thw"], grid)
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_qwen_dummy_does_not_invent_temporal_grids_to_fill_budget(
+        processor_cls):
+    proc = _make_dummy_processor(processor_cls,
+                                 max_pixels=512 * 512,
+                                 video_max_frames=6)
+    mm_data = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        mm_counts=_get_profile_mm_counts(proc, 8192, 3),
+        dtype=torch.float16,
+    )
+
+    modality = next(iter(mm_data))
+    grid_key = ("image_grid_thw" if modality == "image" else "video_grid_thw")
+    grid = mm_data[modality][grid_key]
+    if processor_cls is Qwen3VLInputProcessorBase:
+        assert modality == "image"
+        assert int(grid.prod(dim=1).sum()) == 3 * 1024
+    else:
+        assert modality == "video"
+        assert grid.shape[0] == 2
+        assert int(grid.prod(dim=1).sum()) == 6144
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_dummy_mm_data_satisfies_the_encoder_input_contract(processor_cls):
+    """KV-cache profiling feeds `get_dummy_mm_data()` straight to the encoder.
+
+    Nothing rebuilds these tensors through the input processor any more, so the
+    processor now restates the encoder's input layout on its own. A drift
+    between the two would surface only as a crash during startup memory
+    estimation. Drive the encoder's real parsing step instead of restating its
+    key names here, so a rename on either side fails this test.
+    """
+    proc = _make_dummy_processor(processor_cls)
+    mm_data = proc.get_dummy_mm_data(
+        max_num_encoder_tokens=8192,
+        mm_counts=_get_profile_mm_counts(proc, 8192, 8),
+        dtype=torch.float16,
+    )
+
+    params = [MultimodalParams(multimodal_data=mm_data)]
+    modality = next(iter(mm_data))
+    if processor_cls is Qwen3VLInputProcessorBase:
+        content = _qwen3vl_build_batched_input(params)
+        pixel_values = content["pixel_values"]
+        grid = content["grid_thw"]
+    else:
+        content, extra = Qwen2VisionModelBase._parse_and_batch_multimodal_data(
+            None, params)
+        values_key = ("pixel_values"
+                      if modality == "image" else "pixel_values_videos")
+        grid_key = ("image_grid_thw"
+                    if modality == "image" else "video_grid_thw")
+        pixel_values = content[values_key]
+        grid = extra[grid_key]
+    # The encoder derives its attention sequence lengths from the grid, so the
+    # patch rows it was handed have to match.
+    assert pixel_values.shape[0] == int(grid.prod(dim=1).sum())
+    # The trailing dim is what the patch embedding projects. The dummy builder
+    # recomputes it, so pin it against the config the encoder is built from.
+    cfg = proc.config.vision_config
+    assert pixel_values.shape[1] == (cfg.in_channels * cfg.temporal_patch_size *
+                                     cfg.patch_size * cfg.patch_size)
+    assert pixel_values.dtype == torch.float16

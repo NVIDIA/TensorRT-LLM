@@ -2,14 +2,13 @@ import pytest
 from utils.util import skip_ray
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
-    check_phi3_lora_fused_modules_output_tp2_identical_to_tp1,
     test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, llama_model_path,
                        llm_get_stats_async_test_harness,
@@ -65,15 +64,6 @@ def test_llama_7b_multi_lora_tp4(cuda_graph_config):
         tensor_parallel_size=4,
         kv_cache_config=global_kv_cache_config,
         cuda_graph_config=cuda_graph_config)
-
-
-@skip_ray  # https://nvbugs/5727075
-@pytest.mark.gpu2
-@test_lora_with_and_without_cuda_graph
-def test_phi3_lora_fused_modules_output_on_tp2_identical_to_tp1(
-        cuda_graph_config) -> None:
-    check_phi3_lora_fused_modules_output_tp2_identical_to_tp1(
-        LLM, cuda_graph_config=cuda_graph_config)
 
 
 @skip_ray

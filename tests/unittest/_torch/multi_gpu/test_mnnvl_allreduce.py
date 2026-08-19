@@ -24,7 +24,6 @@ from mpi4py import MPI
 from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
-import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
 from tensorrt_llm.functional import AllReduceStrategy
@@ -49,8 +48,6 @@ SEQ_LEN_CASES = (
     (31, 11, 27, 4),  # Switching one/two shot in MNNVL
     (12, 2048),  # reallocate workspace in MNNVL
 )
-NCCL_SYMMETRIC_SEQ_LEN_CASES = tuple(seq_len for seq_len in SEQ_LEN_CASES
-                                     if 2048 not in seq_len)
 HIDDEN_SIZES = (8, 2880, 7168, 7176, 8192, 16384)
 DTYPES = (torch.bfloat16, )
 FUSION_CASES = (True, False)
@@ -85,12 +82,6 @@ def _seq_len_id(seq_len: tuple[int, ...]):
 
 def _dtype_id(dtype: torch.dtype):
     return f"dtype:{torch.finfo(dtype).dtype}"
-
-
-def _max_nccl_symmetric_buffer_size(dtype: torch.dtype):
-    max_seq_len = max(max(seq_len) for seq_len in NCCL_SYMMETRIC_SEQ_LEN_CASES)
-    return max_seq_len * max(HIDDEN_SIZES) * torch.empty(
-        (), dtype=dtype).element_size()
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor = None, eps: float = 1e-6):
@@ -150,7 +141,6 @@ def run_single_rank(
     fused_add_norm,
     reference_output_list,
     strategy,
-    max_userbuffers_size,
 ):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -167,7 +157,6 @@ def run_single_rank(
             fused_add_norm,
             reference_output_list,
             strategy,
-            max_userbuffers_size,
         )
     except Exception:
         traceback.print_exc()
@@ -350,7 +339,6 @@ def row_linear_residual_norm_fusion_forward(
     fusion: bool,
     reference_output_list: list[tuple[torch.Tensor, ...]],
     strategy: AllReduceStrategy,
-    max_userbuffers_size: int | None,
 ):
 
     # Move all tensors to GPU
@@ -364,11 +352,6 @@ def row_linear_residual_norm_fusion_forward(
 
     if strategy == AllReduceStrategy.NCCL_SYMMETRIC:
         os.environ.pop("TLLM_TEST_MNNVL", None)
-        assert max_userbuffers_size is not None
-        ub.initialize_userbuffers_manager(tensor_parallel_size, 1, 1,
-                                          tensor_parallel_rank,
-                                          torch.cuda.device_count(),
-                                          max_userbuffers_size)
     elif strategy == AllReduceStrategy.MNNVL:
         os.environ["TLLM_TEST_MNNVL"] = "1"
 
@@ -428,13 +411,8 @@ def row_linear_residual_norm_fusion_forward(
         torch.cuda.empty_cache()
 
 
-def _run_row_linear_residual_norm_fusion(seq_len,
-                                         hidden_size,
-                                         dtype,
-                                         strategy,
-                                         fusion,
-                                         mpi_pool_executor,
-                                         max_userbuffers_size=None):
+def _run_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
+                                         fusion, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = mpi_pool_executor.num_workers
 
@@ -478,7 +456,6 @@ def _run_row_linear_residual_norm_fusion(seq_len,
                 fusion,
                 reference_output_list,
                 strategy,
-                max_userbuffers_size,
             ) for i in range(tensor_parallel_size)
         ]),
     )
@@ -583,9 +560,7 @@ def test_mnnvl_nvfp4_rejects_fp32_before_launch(mpi_pool_executor):
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
-@pytest.mark.parametrize("seq_len",
-                         NCCL_SYMMETRIC_SEQ_LEN_CASES,
-                         ids=_seq_len_id)
+@pytest.mark.parametrize("seq_len", SEQ_LEN_CASES, ids=_seq_len_id)
 @pytest.mark.parametrize("hidden_size",
                          HIDDEN_SIZES,
                          ids=lambda x: f"hidden:{x}")
@@ -602,5 +577,4 @@ def test_nccl_symmetric_row_linear_residual_norm_fusion(seq_len, hidden_size,
         AllReduceStrategy.NCCL_SYMMETRIC,
         fusion,
         mpi_pool_executor,
-        max_userbuffers_size=_max_nccl_symmetric_buffer_size(dtype),
     )

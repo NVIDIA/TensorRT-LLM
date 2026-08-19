@@ -1,0 +1,19 @@
+version: 0.0.1
+l0_gb300_multi_nodes_perf_sanity_ctx5_node1_gpu4_gen1_node1_gpu4:
+- condition:
+    ranges:
+      # 5 ctx workers with each 1 node and 4 GPUs
+      # 1 gen worker with 1 node and 4 GPUs
+      system_gpu_count:
+        gte: 24
+        lte: 24
+    wildcards:
+      gpu:
+      - '*gb300*'
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  # nemotron-ultra-v3-fp4 50k2k con178
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_nemotron-ultra-v3-fp4_50k2k_con178_ctx5_dep4_gen1_dep4_eplb0_mtp6_ccb-NIXL] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb300_nemotron-ultra-v3-fp4_50k2k_con178_ctx5_dep4_gen1_dep4_eplb0_mtp6_ccb-NIXL] TIMEOUT (90)

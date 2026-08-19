@@ -18,7 +18,6 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, skip_forward
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -463,7 +462,6 @@ class Runner:
             # To run the problem size of $B$ GPUs on $A$ GPUs, we need:
             # (1) Attention: If TP, reduce the number of attention heads; If DP, nothing to change.
             # (2) MoE: If EP, reduce the number of experts; If TP, reduce head size.
-            #     Maintain the result of AllToAll method selection because it is affected by EP size.
             def load_pretrained_config(*args, **kwargs):
                 pretrained_config = load_pretrained_config_orig(*args, **kwargs)
                 if not mapping.enable_attention_dp:
@@ -484,33 +482,13 @@ class Runner:
 
             return load_pretrained_config
 
-        def make_select_alltoall_method_type(select_alltoall_method_type_orig):
-            def select_alltoall_method_type(
-                cls: type, mapping: Mapping, top_k: int, *args, **kwargs
-            ):
-                # Replace the condition `mapping.moe_ep_size <= top_k` with `scaled_from <= top_k`
-                # by replacing `top_k` with `fake_top_k`
-                if scaled_from <= top_k:
-                    fake_top_k = mapping.moe_ep_size + 1
-                else:
-                    fake_top_k = mapping.moe_ep_size - 1
-                assert (mapping.moe_ep_size <= fake_top_k) == (scaled_from <= top_k)
-                return select_alltoall_method_type_orig(mapping, fake_top_k, *args, **kwargs)
-
-            return select_alltoall_method_type
-
-        select_alltoall_method_type_wide_ep = WideEPMoE.select_alltoall_method_type
         tensorrt_llm._torch.model_config.load_pretrained_config = make_load_pretrained_config(
             mapping, load_pretrained_config
-        )
-        WideEPMoE.select_alltoall_method_type = make_select_alltoall_method_type(
-            select_alltoall_method_type_wide_ep
         )
         try:
             yield
         finally:
             tensorrt_llm._torch.model_config.load_pretrained_config = load_pretrained_config
-            WideEPMoE.select_alltoall_method_type = select_alltoall_method_type_wide_ep
 
     @staticmethod
     @contextlib.contextmanager
@@ -773,6 +751,8 @@ class Runner:
         kv_cache_dtype,
         mamba_ssm_cache_dtype,
         layer_indices,
+        kv_pool_headroom=1,
+        enable_swa_scratch_reuse=False,
     ):
         # Please refer to `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py` for `tokens_per_block`
         model_config = ModelConfig.from_pretrained(pretrained_model_name_or_path)
@@ -783,9 +763,17 @@ class Runner:
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
         config = model_config.pretrained_config
+        # max_seq_len + 1 because the is_gen path in add_dummy_requests resizes each
+        # request to capacity + 1; without the extra token the last block rounds down.
+        # kv_pool_headroom oversizes max_tokens when the manager splits it across
+        # several pools. DeepSeek-V4 needs 3; the default 1 keeps every other model
+        # on its previous allocation.
         kv_cache_config = KvCacheConfig(
-            max_tokens=max_batch_size * round_up(max_seq_len, tokens_per_block),
+            max_tokens=kv_pool_headroom
+            * max_batch_size
+            * round_up(max_seq_len + 1, tokens_per_block),
             enable_block_reuse=False,
+            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         )
         kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
@@ -888,9 +876,35 @@ class Runner:
             )
         else:
             raise NotImplementedError("Unsupported config")
-        kv_cache_manager.add_dummy_requests(
-            list(range(max_batch_size)), token_nums=[max_seq_len] * max_batch_size
-        )
+        # is_gen regardless of --run-type: these dummies only reserve blocks. The
+        # measured step takes its shape from the attn_metadata built in forward(),
+        # which sets num_contexts and prompt_lens per run type.
+        # The prefill pass below writes the history itself, so ask for materialized
+        # blocks where the manager takes the argument. Checked by signature, not by
+        # class: MambaHybridCacheManagerV2 subclasses KVCacheManagerV2 but overrides
+        # add_dummy_requests without this parameter.
+        add_dummy_kwargs = {}
+        if (
+            "materialize_history"
+            in inspect.signature(kv_cache_manager.add_dummy_requests).parameters
+        ):
+            add_dummy_kwargs["materialize_history"] = True
+        # add_dummy_requests returns None only after releasing every request it had
+        # registered, so a later lookup fails far from the cause (NVBug 6567554).
+        if (
+            kv_cache_manager.add_dummy_requests(
+                list(range(max_batch_size)),
+                token_nums=[max_seq_len] * max_batch_size,
+                is_gen=True,
+                **add_dummy_kwargs,
+            )
+            is None
+        ):
+            raise RuntimeError(
+                f"add_dummy_requests could not allocate KV cache for {max_batch_size} "
+                f"dummy requests of {max_seq_len} tokens. Raise KvCacheConfig.max_tokens "
+                f"above {kv_cache_config.max_tokens}, or lower max_batch_size / max_seq_len."
+            )
         return kv_cache_manager
 
     @staticmethod

@@ -17,7 +17,7 @@ from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, TRTLLMGenFusedMoE,
-                                 create_moe, get_moe_cls)
+                                 create_moe, resolve_moe_cls)
 from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
@@ -111,7 +111,16 @@ class Qwen3MoE(nn.Module):
             dtype=config.torch_dtype,
             apply_routing=False,
             routing_method_type=RoutingMethodType.Renormalize,
-            moe_backend_cls=get_moe_cls(model_config, layer_idx=layer_idx),
+            moe_backend_cls=resolve_moe_cls(
+                model_config,
+                routing=RoutingMethodType.Renormalize,
+                # Match the create_moe call below, which passes no bias and no
+                # swiglu alpha/beta. Left unknown, gates that create_moe
+                # rejects abstain here and the gate would name a backend the
+                # layer does not run.
+                swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
+            ),
         )
 
         self.weight_loading_mode = MoEWeightLoadingMode.FUSED_GATE_UP_PROJ if config.model_type == "qwen3_vl_moe_text" else MoEWeightLoadingMode.VANILLA

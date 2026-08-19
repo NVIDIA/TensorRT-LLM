@@ -16,7 +16,8 @@ parameterized
 pre-commit
 pybind11
 pybind11-stubgen
-pytest<9.1
+# 8.4+ needed for `pytest.RaisesExc` support in `pytest.mark.xfail`.
+pytest>=8.4,<9.1
 pytest-asyncio
 pytest-cov
 pytest-csv

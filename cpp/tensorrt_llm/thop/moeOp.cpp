@@ -1353,7 +1353,7 @@ private:
             int64_t const a_ptr = ptr_data[req_id * 3 + 0];
             int64_t const b_ptr = ptr_data[req_id * 3 + 1];
             // ptr_data[req_id * 3 + 2] is the optional DoRA magnitude vector pointer; ignored here
-            // (MoE+DoRA is rejected at load time, see tensorrt_llm/lora_manager.py).
+            // (MoE+DoRA is rejected at load time, see tensorrt_llm/_torch/peft/lora/manager.py).
 
             // Validate the raw request type before trusting it. An unexpected
             // value would otherwise fall into the CONTEXT branch and read an

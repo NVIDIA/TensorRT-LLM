@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MXFP4 (E2M1 + E8M0) group-scaled quantization utilities.
+"""Test-only MXFP4 (E2M1 + E8M0) quantization utilities.
 
 Kimi K3's routed expert Linear weights are stored in the
 ``mxfp4-pack-quantized`` format with ``group_size=32`` (see
@@ -149,15 +149,3 @@ def dequantize_last_dim_mxfp4(
     codes_grouped = codes_flat.reshape(*lead, num_groups, group_size)
     deq_grouped = _dequantize_group_e2m1(codes_grouped, scales_u8)
     return deq_grouped.reshape(*lead, n)
-
-
-def canonical_mxfp4_fp32(x: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> torch.Tensor:
-    """Round-trip ``x`` (fp32) through MXFP4 pack and unpack.
-
-    Convenience for tests: yields the fp32 value that a stored MXFP4
-    weight actually decodes to. Callers use this to initialize a
-    reference (unquantized) module with the same values a K3 MXFP4
-    weight produces, giving byte-exact parity.
-    """
-    packed, scales = quantize_last_dim_mxfp4(x, group_size=group_size)
-    return dequantize_last_dim_mxfp4(packed, scales, group_size=group_size)

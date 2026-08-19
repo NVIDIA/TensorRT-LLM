@@ -4,8 +4,8 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
-from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ..attention_backend import AttentionMetadata

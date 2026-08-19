@@ -29,6 +29,8 @@ from mpi4py import MPI
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
 from tensorrt_llm._utils import (get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm,
                                  torch_dtype_to_binding)
@@ -36,8 +38,6 @@ from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
-from tensorrt_llm.lora_helper import LoraConfig
-from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
 from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_AUTO,
                                                 KV_CACHE_HASH_ALGO_V1)
@@ -50,6 +50,7 @@ from ..._utils import (binding_to_str_dtype, binding_to_torch_dtype, mpi_rank,
                        nvtx_range)
 from ...logger import logger
 from ...mapping import CpType, Mapping
+from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
@@ -466,8 +467,7 @@ class KVCacheManager(BaseResourceManager):
         # Determine if this is VSWA (Variable Sliding Window Attention).
         # The `w > 0` check excludes LinearCacheType.RECURRENT_STATES sentinel
         # values (negative) used by hybrid linear attention models.
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
-            w > 0 for w in self.max_attention_window_vec)
+        self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size

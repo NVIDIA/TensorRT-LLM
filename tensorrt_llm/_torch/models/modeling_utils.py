@@ -17,8 +17,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
 from tqdm import tqdm
 
+from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import local_mpi_rank
-from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
@@ -28,7 +28,7 @@ from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import MoE, VanillaMoE
+from ..modules.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
@@ -1267,7 +1267,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             # and weights loading is done in the backend, so module name includes '.backend'.
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 name = '.'.join(names[:-1])
                 names = name.split('.')
 
@@ -1400,7 +1400,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
             # and weights loading is done in the backend, so module name includes '.backend'.
             # We need to use parent module name (without .backend) to match saved weight names.
             # After MoE refactoring is fully complete, all paths will follow this branch.
-            if names[-1] == "backend" and isinstance(module, MoE):
+            if names[-1] == "backend" and is_moe_weight_owner(module):
                 name = '.'.join(names[:-1])
                 names = name.split('.')
 

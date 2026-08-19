@@ -35,6 +35,9 @@ _CANON_RE = re.compile(r"(tensorrt_llm/.*)$")
 # A DB test value is `<stage>/<nodeid>`; unit tests wrap the inner entry.
 _UNITTEST_WRAP_RE = re.compile(r"::test_unittests_v2\[(?P<inner>.+)\]$")
 
+# Trailing `-<split_id>` of a pytest-split shard name.
+_SPLIT_SUFFIX_RE = re.compile(r"-\d+$")
+
 # Completeness-heuristic constants consumed by `untrusted_tests()`.
 _WORKER_SENTINEL = "tensorrt_llm/_torch/pyexecutor/py_executor.py"
 _LAUNCH_MARKERS: tuple[tuple[str, str], ...] = (
@@ -42,6 +45,8 @@ _LAUNCH_MARKERS: tuple[tuple[str, str], ...] = (
     ("tensorrt_llm/executor/executor.py", "GenerationExecutor.generate"),
 )
 _SERVING_PATH_MARKERS: tuple[str, ...] = ("disaggregated/",)
+# Stage-name markers whose GPU worker is uninstrumented, so capture is partial.
+_UNTRUSTED_STAGE_MARKERS: tuple[str, ...] = ("-Ray-",)
 _MIN_FUNCS = 30
 
 
@@ -55,6 +60,11 @@ def split_stage(test: str) -> tuple[str, str]:
     """Split a DB `test` value `<stage>/<nodeid>` into `(stage, nodeid)`; `("", test)` if no `/`."""
     stage, sep, nodeid = test.partition("/")
     return (stage, nodeid) if sep else ("", test)
+
+
+def stage_family(stage: str) -> str:
+    """Collapse a pytest-split shard name to its family (`A10-PyTorch-2` -> `A10-PyTorch`)."""
+    return _SPLIT_SUFFIX_RE.sub("", stage)
 
 
 def unwrap_unittest(nodeid: str) -> Optional[str]:
@@ -181,6 +191,15 @@ class TouchDB:
                 out.setdefault(stage, set()).add(nodeid)
         return out
 
+    def known_by_family(self) -> dict[str, set[str]]:
+        """`{stage family -> {bare nodeid, ...}}` — a stage's shards unioned."""
+        out: dict[str, set[str]] = {}
+        for test in self.known_tests():
+            stage, nodeid = split_stage(test)
+            if stage:
+                out.setdefault(stage_family(stage), set()).add(nodeid)
+        return out
+
     # -- forward lookup (debug / explain-why) --
 
     def files_touched_by(self, test: str) -> list[tuple[str, str]]:
@@ -190,6 +209,18 @@ class TouchDB:
             for row in self._conn.execute("SELECT file, qualname FROM touch WHERE test=?", (test,))
         ]
 
+    def incomplete_capture_tests(self) -> set[str]:
+        """Tests `test_meta` reports as not passed or short of the spawned process count."""
+        try:
+            rows = self._conn.execute(
+                "SELECT test FROM test_meta WHERE test != '' AND "
+                "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1)"
+            )
+        except sqlite3.OperationalError:
+            return set()
+        # Tests that recorded nothing are not selection candidates.
+        return {row[0] for row in rows} & self.known_tests()
+
     # -- coverage-completeness heuristic --
 
     def untrusted_tests(
@@ -198,14 +229,9 @@ class TouchDB:
         launch_markers: tuple[tuple[str, str], ...],
         serving_path_markers: tuple[str, ...],
         min_funcs: int,
+        untrusted_stage_markers: tuple[str, ...] = (),
     ) -> set[str]:
-        """Stage-prefixed tests whose per-test capture looks incomplete (must always run).
-
-        Flags a test that drove execution/serving but is missing `worker_file` —
-        matched by a `launch_markers` `(file, qualname_substring)` call or a
-        `serving_path_markers` nodeid substring — or that entered fewer than
-        `min_funcs` functions total.
-        """
+        """Tests missing `worker_file` after driving execution, near-empty, or on an untrusted stage."""
         drove_execution: set[str] = set()
         for file, qual_substr in launch_markers:
             drove_execution |= {
@@ -229,4 +255,11 @@ class TouchDB:
                 (min_funcs,),
             )
         }
-        return missing_worker | tiny
+        on_untrusted_stage: set[str] = set()
+        if untrusted_stage_markers:
+            on_untrusted_stage = {
+                test
+                for test in self.known_tests()
+                if any(marker in split_stage(test)[0] for marker in untrusted_stage_markers)
+            }
+        return missing_worker | tiny | on_untrusted_stage | self.incomplete_capture_tests()

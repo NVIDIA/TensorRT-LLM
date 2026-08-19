@@ -1457,6 +1457,15 @@ class TestCodexBackend:
         payload = await self._run_create_client(system_prompt="hi")
         assert payload["config"]["model_context_window"] == 1000000
 
+    async def test_create_client_requests_max_reasoning_effort(self):
+        # Codex threads run at the top reasoning tier the CLI exposes.
+        # ``max`` sits above ``xhigh`` in the CLI's effort ladder
+        # (minimal/low/medium/high/xhigh/max/ultra); the generated SDK enum
+        # still stops at ``xhigh`` but passes unknown values through, so the
+        # string must reach ``thread/start`` verbatim.
+        payload = await self._run_create_client(system_prompt="hi")
+        assert payload["config"]["model_reasoning_effort"] == "max"
+
     async def test_create_client_bypasses_all_approvals_in_thread_start(self):
         # The Codex backend runs in fully autonomous mode: no sandbox
         # restrictions and the model never asks for approval. The mock

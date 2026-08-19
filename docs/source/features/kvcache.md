@@ -88,6 +88,7 @@ Models that select the V2 manager by default:
 | Hybrid Mamba (NemotronH, Qwen3-Next) | Attention KV and Mamba state pools must be sized together |
 | DeepSeek-V4 | Sparse attention attaches auxiliary per-layer buffers |
 | GPT-OSS | Sliding window on every other layer (VSWA), so the sliding-window and full-attention pools are sized independently |
+| Gemma3 / Gemma4 (text and multimodal) | Alternating sliding-window and full-attention layers (VSWA); same independent pool sizing |
 
 Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's

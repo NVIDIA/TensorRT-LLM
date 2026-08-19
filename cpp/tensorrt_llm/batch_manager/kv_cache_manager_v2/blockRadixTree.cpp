@@ -767,7 +767,8 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
     return results;
 }
 
-std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<MatchResult> matched) const
+std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
+    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const
 {
     // All blocks except the last must be fully matched (mirrors Python: matched[:-1]).
     TLLM_CHECK_DEBUG(matched.size() <= 1
@@ -775,7 +776,6 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
             [this](auto const& m) { return m.numMatchedTokens == mTokensPerBlock; }));
 
     auto attnLcs = mLifeCycles.attentionLifeCycles();
-    auto ssmLcId = mLifeCycles.ssmLifeCycleId();
 
     // Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
     // shorten the match to the coverage of a required page. Every retry strictly
@@ -863,10 +863,21 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(std::vector<
 BlockRadixTree::ReuseMatch BlockRadixTree::match(
     ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const
 {
-    auto const matched = pruneMatch(matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch));
+    auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
+    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    // Diagnostic only: re-prune ignoring recurrent-snapshot availability to get
+    // the prefix the attention pages alone support. Only hybrid models pay for
+    // the second pass; without an SSM life cycle the two results are identical.
+    std::optional<int> attnOnlyTokens;
+    if (ssmLcId.has_value())
+    {
+        attnOnlyTokens = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+    }
+    auto const matched = pruneMatch(std::move(rawMatched), ssmLcId);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());
+    result.numTokensBeforeHybridPruning = attnOnlyTokens.value_or(result.numTokens);
     result.blocks.reserve(BlockOrdinal{static_cast<int>(matched.size())});
     for (auto const& match : matched)
     {

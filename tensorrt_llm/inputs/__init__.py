@@ -12,7 +12,8 @@ from .multimodal_data import AudioData, BaseModalityData, VideoData
 # yapf: disable
 from .registry import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ExtraProcessedInputs,
-                       InputProcessor, MultimodalPlaceholderMetadata,
+                       InputProcessor, MultimodalEncoderItemMetadata,
+                       MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, create_input_processor,
                        create_input_processor_with_hash,
                        maybe_compute_mm_embed_cumsum, register_input_processor,
@@ -51,6 +52,7 @@ __all__ = [
     "ExtraProcessedInputs",
     "BaseMultimodalDummyInputsBuilder",
     "BaseMultimodalInputProcessor",
+    "MultimodalEncoderItemMetadata",
     "MultimodalPlaceholderMetadata",
     "MultimodalPlaceholderPlacement",
     "ConversationMessage",

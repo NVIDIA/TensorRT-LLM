@@ -1,0 +1,130 @@
+metadata:
+  model_name: kimi_k3
+  precision: fp4
+  model_dir_name: Kimi-K3
+  supported_gpus:
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: 8k1k
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  # K3 weight loading takes tens of minutes per 16-GPU instance before the
+  # first token, so the job needs more headroom than the 2h other cases use.
+  job_time: 03:00:00
+  job_name: unified-benchmark
+  extra_args: --gres=gpu:4
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 5
+  benchmark_ratio: 0.0
+  streaming: true
+  concurrency_list: '512'
+  input_length: 8192
+  output_length: 1024
+  dataset_file: <dataset_file>
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  # TLLM_K3_MLA_GEN_BACKEND / TLLM_KV_CACHE_MANAGER_V2_BACKEND /
+  # TRTLLM_ENABLE_PDL / NCCL_GRAPH_MIXING_SUPPORT act on the model runtime, so
+  # they belong on the ctx and gen workers only; the disagg proxy server does
+  # not read them. TRTLLM_SERVER_DISABLE_GC / TRTLLM_WORKER_DISABLE_GC are set
+  # on both sides.
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
+    TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_MIXING_SUPPORT=0 TLLM_K3_MLA_GEN_BACKEND=trtllm-gen
+    TLLM_KV_CACHE_MANAGER_V2_BACKEND=cpp ENROOT_ALLOW_DEV=yes
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+  env_var:
+    HF_HOME: <hf_home_path>
+  tasks:
+    gsm8k_local:
+      model: local-completions
+      model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
+      extra_kwargs:
+        trust_remote_code: true
+        custom_config: tests/integration/lm_eval_configs/gsm8k_local.yaml
+worker_config:
+  # K3 constraints applied to both sides (see examples/kimi_k3/disagg/README.md):
+  # EP-only DEP16 with matched ctx/gen parallelism, no chunked prefill, no KV
+  # block reuse, tokens_per_block 64, NIXL with the Python V2 transceiver.
+  gen:
+    print_iter_log: true
+    max_batch_size: 32
+    max_num_tokens: 256
+    max_seq_len: 9236
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: true
+    enable_chunked_prefill: false
+    # Every batch size from 1 to max_batch_size gets its own captured graph, so
+    # no decode step pads up to a larger graph. Not required to run, but faster.
+    cuda_graph_config:
+      max_batch_size: 32
+      batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+      enable_padding: true
+    kv_cache_config:
+      enable_block_reuse: false
+      # 0.35, not the 0.25 default: K3 resolves use_kv_cache_manager_v2 to V2,
+      # whose accounting leaves the run short of KV blocks at the default.
+      free_gpu_memory_fraction: 0.35
+      tokens_per_block: 64
+      dtype: auto
+    moe_config:
+      backend: MEGAMOE_DEEPGEMM
+    cache_transceiver_config:
+      backend: NIXL
+      # PYTHON is mandatory: the C++ transceiver throws at construction for
+      # K3's MixedMambaHybridCacheManager.
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      # Must hold one full request payload (433 MiB KDA state + ~27 KB/token
+      # MLA latent = 649 MiB at 8k ISL); undersizing silently falls back to
+      # the host-staged tcp path.
+      kv_cache_bounce_size_mb: 1024
+    disable_overlap_scheduler: false
+    trust_remote_code: true
+  ctx:
+    print_iter_log: true
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 8212
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: true
+    enable_chunked_prefill: false
+    cuda_graph_config: null
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.35
+      tokens_per_block: 64
+      dtype: auto
+    moe_config:
+      backend: MEGAMOE_DEEPGEMM
+    cache_transceiver_config:
+      backend: NIXL
+      transceiver_runtime: PYTHON
+      max_tokens_in_buffer: 8448
+      kv_cache_bounce_size_mb: 1024
+    disable_overlap_scheduler: true
+    trust_remote_code: true

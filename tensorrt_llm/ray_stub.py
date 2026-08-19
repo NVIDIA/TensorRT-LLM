@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,35 +12,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from functools import wraps as _wraps
+"""Compatibility shim for ``tensorrt_llm.ray_stub``.
 
-from tensorrt_llm._utils import mpi_disabled as _mpi_disabled
+Will be removed once all usages are migrated to
+``tensorrt_llm.executor.ray.stub``.
 
-# Don't raise error on import - only when Ray functionality is actually used
-_RAY_NOT_INSTALLED_MSG = "Ray requested (TLLM_DISABLE_MPI=1), but not installed. Please install Ray."
+DO NOT ADD ANYTHING TO THIS FILE.
+"""
 
+import warnings
 
-def remote(*args, **kwargs):
+# Bound by attribute rather than with ``from ... import remote``: the target
+# module answers every unknown name from a module-level ``__getattr__`` that
+# raises ``RuntimeError``, and ``from X import Y`` first probes
+# ``hasattr(X, "__path__")``, which only swallows ``AttributeError`` -- so that
+# spelling raises while merely importing this file.  ``__getattr__`` is
+# forwarded as well: raising for every other name is what the target module is
+# for, and re-exporting only ``remote`` would answer ``AttributeError`` here.
+from tensorrt_llm.executor.ray import stub as _stub
 
-    def decorator(func):
-        # Returns a function that always raises.
-        # Decorated class depends on ray, but ray is not installed.
-        @_wraps(func)
-        def stub_checker(*_, **__):
-            raise RuntimeError(
-                f'Ray not installed, so the remote function / actor "{func.__name__}" is not available.'
-            )
+remote = _stub.remote
+__getattr__ = _stub.__getattr__
 
-        return stub_checker
+warnings.warn(
+    "tensorrt_llm.ray_stub has moved to tensorrt_llm.executor.ray.stub "
+    "and will be removed in a future release.",
+    FutureWarning,
+    stacklevel=2,
+)
 
-    if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
-        return decorator(args[0])
-
-    return decorator
-
-
-def __getattr__(name):
-    msg = f'Ray not installed, so "ray.{name}" is unavailable.'
-    if _mpi_disabled():
-        msg = _RAY_NOT_INSTALLED_MSG
-    raise RuntimeError(msg)
+__all__ = [
+    "remote",
+]

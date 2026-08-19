@@ -155,6 +155,10 @@ def DISABLE_CBTS = "disable_cbts"
 // Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
 @Field
 def ENABLE_CBTS_COVERAGE = true
+// Rollout switch for pre-merge Tier 2 coverage-based narrowing. Keep collection
+// enabled above while this remains off so a later pilot allowlist has fresh data.
+@Field
+def ENABLE_CBTS_COVERAGE_TIER = false
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -846,8 +850,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Shadow audit: download the latest merged touch DB and log its health + HEAD coverage gap (diagnostic only).
-        _cbtsCoverageAudit(pipeline)
+        // Download the touch DB only when Tier 2 is enabled. Tier 1 rules still
+        // run while the coverage tier is disabled during the initial rollout.
+        def coverageDb = _cbtsCoverageDb(pipeline)
 
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
@@ -872,10 +877,11 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def inputPath = "${LLM_ROOT}/cbts_input.json"
         writeFile file: inputPath, text: inputJson
 
-        def output = sh(
-            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json",
-            returnStdout: true,
-        )
+        def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
+        if (coverageDb) {
+            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
+        }
+        def output = sh(script: mainCmd, returnStdout: true)
 
         def result = _cbtsParseSelectionResult(output)
         if (result.scope == null) {
@@ -917,30 +923,45 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Download the latest merged touch DB and run coverage_audit.py on it; best-effort, never changes the CBTS decision.
+// Resolve the optional Tier 2 input behind an explicit rollout gate. Keeping
+// this separate makes the follow-up pilot allowlist a small policy change.
+def _cbtsCoverageDb(pipeline)
+{
+    if (!ENABLE_CBTS_COVERAGE_TIER) {
+        pipeline.echo("CBTS: coverage tier disabled — running Tier 1 only")
+        return null
+    }
+    return _cbtsCoverageAudit(pipeline)
+}
+
+// Fetch the touch DB and audit it; artifact.py's {path, meta} verbatim, or null on failure.
 def _cbtsCoverageAudit(pipeline)
 {
     try {
-        def covDir = "${LLM_ROOT}/cbts_cov"
-        def url = sh(
-            script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py --print-url || true",
-            returnStdout: true,
-        ).trim()
-        if (!url) {
-            pipeline.echo("CBTS audit: no coverage DB artifact found — skipping")
-            return
+        // artifact.py resolves, downloads and unpacks; paths come back
+        // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
+        // The checked-out revision is the PR head; its merge base is what drift is measured against.
+        def prHead = env.gitlabMergeRequestLastCommit ?: ""
+        def readyJson = ""
+        withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
+            readyJson = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+                returnStdout: true,
+            ).trim()
         }
-        sh "mkdir -p ${covDir}"
-        // wget the tarball (retrying) and extract the sqlite.
-        trtllm_utils.llmExecStepWithRetry(pipeline, script:
-            "wget -nv '${url}' -O ${covDir}/cbts_pystart_report.tar.gz && " +
-            "tar xzf ${covDir}/cbts_pystart_report.tar.gz -C ${covDir}")
-        sh "python3 ${LLM_ROOT}/jenkins/scripts/cbts/tools/coverage_audit.py " +
-           "--db ${covDir}/cbts_touchmap.sqlite"
+        if (!readyJson) {
+            pipeline.echo("CBTS audit: no coverage DB could be prepared — skipping Tier 2")
+            return null
+        }
+        def ready = new groovy.json.JsonSlurper().parseText(readyJson)
+        sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
+        return ready
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
+        return null
     }
 }
 
@@ -1033,6 +1054,8 @@ def _cbtsParseSelectionResult(String text)
         // Explicit null check preserves `false`; default True is safe.
         sanity_required: data.sanity_required != null ? data.sanity_required : true,
         perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,
+        // Coverage tier omits multi-GPU stages; L0_Test re-adds them under this flag.
+        enable_multi_gpu: data.enable_multi_gpu ?: false,
     ]
 }
 
@@ -1094,6 +1117,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/_torch/weight_sharing/",
         "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
         "tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py",
         "tensorrt_llm/_torch/visual_gen/modules/vae/",
@@ -1126,6 +1150,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/serve/openai_server.py",
         "tensorrt_llm/serve/router.py",
         "tests/integration/defs/cpp/test_multi_gpu.py",
+        "tests/integration/defs/model_express/",
         "tests/integration/test_lists/test-db/l0_b200_multi_gpus_perf_sanity.yml",
         "tests/integration/test_lists/test-db/l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_b200_visual_gen_perf_sanity.yml",
@@ -1155,6 +1180,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_node2_gpu8.yml",
+        "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
         "tests/integration/test_lists/test-db/l0_verl.yml",
         "tests/unittest/auto_deploy/multigpu",

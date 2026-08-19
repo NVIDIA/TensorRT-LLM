@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from agent_flow.backends.base import Backend, BackendClient, ResultEvent
 from agent_flow.types import ToolCallEvent, UsageInfo
@@ -58,6 +59,7 @@ class FakeBackend(Backend):
         hooks: dict | None = None,
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict | None = None,
+        cwd: Path | None = None,
     ):
         plan = self.plans[min(self.create_client_calls, len(self.plans) - 1)]
         self.create_client_calls += 1
@@ -73,6 +75,7 @@ class FakeBackend(Backend):
         client.hooks = hooks
         client.disallowed_tools = disallowed_tools
         client.extra_mcp_servers = extra_mcp_servers
+        client.cwd = cwd
         self.clients.append(client)
         try:
             yield client

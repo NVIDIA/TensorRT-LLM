@@ -21,24 +21,18 @@ from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
-from triton_kernels.matmul_ogs import (
-    FlexCtx,
-    FnSpecs,
-    FusedActivation,
-    GatherIndx,
-    PrecisionConfig,
-    RoutingData,
-    ScatterIndx,
-    matmul_ogs,
-)
+from triton_kernels.matmul import FlexCtx, FnSpecs, FusedActivation, PrecisionConfig, matmul
 from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.target_info import cuda_capability_geq
 from triton_kernels.tensor import FP4, Tensor, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
-from triton_kernels.tensor_details.layout import StridedLayout
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRouter
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import (
+    TritonEPRouter,
+    TritonRoutingData,
+    combine_expert_outputs,
+)
 
 PreparedWeights = tuple[Tensor, Tensor, Tensor, Tensor]
 TensorCacheKey = tuple[
@@ -66,26 +60,55 @@ def _mxfp4_value_layout(mx_axis: int):
     # kernel. GPT-OSS MoE can select the non-persistent kernel for small shapes,
     # where unswizzled values use the native MXFP4 dot_scaled path.
     if cuda_capability_geq(10):
-        return StridedLayout, {}
-    return layout.make_default_matmul_mxfp4_w_layout(mx_axis=mx_axis)
+        return None
+    # The data is already strided when the factory falls back to
+    # StridedLayout; converting it would only repack it.
+    value_layout = layout.make_default_matmul_mxfp4_w_layout(mx_axis=mx_axis)
+    if isinstance(value_layout, layout.StridedLayout):
+        return None
+    return value_layout
+
+
+def _mxfp4_scale_layout(mx_axis: int, num_warps: int = 4):
+    # Keep scale and value layouts paired. On Hopper, matmul derives SWAP_XW
+    # and its warp count from HopperMXScaleLayout; leaving scales strided while
+    # values are swizzled selects an incompatible kernel configuration.
+    if cuda_capability_geq(10):
+        return None
+    scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=mx_axis, num_warps=num_warps
+    )
+    if isinstance(scale_layout, layout.StridedLayout):
+        return None
+    return scale_layout
 
 
 def _swizzle_mxfp4(w, w_scale):
-    value_layout, value_layout_opts = _mxfp4_value_layout(mx_axis=1)
-    w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
-    w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
+    # The mx axis is the K dim in the layout factory's trailing-dims convention.
+    value_layout = _mxfp4_value_layout(mx_axis=-2)
+    scale_layout = _mxfp4_scale_layout(mx_axis=-2)
+    w = wrap_torch_tensor(w, dtype=FP4)
+    if value_layout is not None:
+        w = convert_layout(w, value_layout)
+    w_scale = wrap_torch_tensor(w_scale)
+    if scale_layout is not None:
+        w_scale = convert_layout(w_scale, scale_layout)
     return w, w_scale
 
 
-RouteFn = Callable[[torch.Tensor], tuple[RoutingData, GatherIndx, ScatterIndx]]
+RouteFn = Callable[[torch.Tensor], tuple[TritonRoutingData, torch.Tensor, torch.Tensor]]
 
 
 def _mxfp4_layout_cache_key() -> tuple[object, ...]:
-    value_layout, value_layout_opts = _mxfp4_value_layout(mx_axis=1)
+    value_layout = _mxfp4_value_layout(mx_axis=-2)
+    scale_layout = _mxfp4_scale_layout(mx_axis=-2)
+    # Layout instances are frozen dataclasses, so repr() deterministically
+    # captures both the layout type and its parameters (None → "None").
     return (
-        value_layout.__module__,
-        value_layout.__qualname__,
-        tuple(sorted(value_layout_opts.items())),
+        type(value_layout).__module__,
+        repr(value_layout),
+        type(scale_layout).__module__,
+        repr(scale_layout),
     )
 
 
@@ -252,11 +275,9 @@ def _run_mxfp4_mlp_core(
     )
 
     gate_pc = PrecisionConfig(
-        weight_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
+        b_mx_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
     )
-    down_pc = PrecisionConfig(
-        weight_scale=down_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
-    )
+    down_pc = PrecisionConfig(b_mx_scale=down_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData()))
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
@@ -264,27 +285,28 @@ def _run_mxfp4_mlp_core(
     )
 
     # gate_up (with SWiGLU fused)
-    inter = matmul_ogs(
+    inter = matmul(
         x,
         triton_gate_up_w,
         gate_up_bias.to(torch.float32),
-        routing_data,
+        a_ragged_metadata=routing_data.ragged_metadata,
         gather_indx=gather_idx,
         precision_config=gate_pc,
         gammas=None,
         fused_activation=act,
     )
 
-    # down
-    y = matmul_ogs(
+    # down (matmul scatters into token-major order; combine top-k explicitly)
+    y = matmul(
         inter,
         triton_down_w,
         down_bias.to(torch.float32),
-        routing_data,
+        a_ragged_metadata=routing_data.ragged_metadata,
         scatter_indx=scatter_idx,
         precision_config=down_pc,
         gammas=routing_data.gate_scal,
     )
+    y = combine_expert_outputs(y, routing_data)
 
     y = y.reshape(*leading_shape, hidden_size)
     return y

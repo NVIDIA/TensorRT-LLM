@@ -22,10 +22,10 @@
 #SBATCH -o log/compile.sbatch.%j.out
 #
 # compile.slurm — SLURM batch script that launches a container and runs compile.sh.
-# Usage: sbatch [sbatch_flags...] compile.slurm <container_image> <mount_dir> <scripts_dir> <repo_dir> [build_wheel_args...]
+# Usage: sbatch [sbatch_flags...] compile.slurm <container_image> <user_root_dir> <scripts_dir> <repo_dir> [build_wheel_args...]
 
 container_image=$1
-mount_dir=$2
+user_root_dir=$2
 scripts_dir=$3
 repo_dir=$4
 shift 4  # remaining args forwarded to compile.sh
@@ -35,7 +35,7 @@ mkdir -p "${logdir}"
 
 srun \
     --container-image="${container_image}" \
-    --container-mounts="${mount_dir}:${mount_dir}" \
+    --container-mounts="${user_root_dir}:${user_root_dir}" \
     --no-container-mount-home \
     --mpi=pmix \
     bash "${scripts_dir}/compile.sh" "${repo_dir}" "$@" \

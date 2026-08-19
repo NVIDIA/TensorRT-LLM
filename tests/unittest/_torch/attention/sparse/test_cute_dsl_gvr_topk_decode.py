@@ -211,27 +211,64 @@ def _make_inputs(
     return _inputs_cache[key]
 
 
+# ---------------------------------------------------------------------------
+# Compile-cost-aware covering design for the op-level sweep.
+#
+# The cuTe DSL variant (== JIT compile) key is
+#   (dtype, top_k, next_n, compress_ratio, cluster_size,
+#    pick_tuning(dtype, num_rows, N // cluster_size))
+# so ``dtype/K``, ``next_n``, ``cr``, ``cluster_size`` and ``N`` each multiply
+# the number of codegen'd kernels, while ``varlen``, ``batch_size`` and
+# ``preidx_hit_rate`` are RUNTIME-only axes that reuse an already-compiled
+# variant. The old full 8-way cross was 512 cases / 64 compiles and cuTe DSL
+# codegen (10-35 s per first-seen variant) dominated the file's CI wall clock.
+#
+# Compile cells below keep, at 16 compiles instead of 64:
+#   * (dtype, K) x (next_n, cr) FULLY crossed -- the per-row scan range
+#     ``N_eff = (seq_len - next_n + nn + 1) // cr`` is the one genuine 2-way
+#     interaction in the index math, and it is dtype/K-independent only in
+#     theory (K sets the SMEM layout the row indices are written through);
+#   * (N, cluster_size) laid out as a Latin square over those 16 cells, so
+#     (dtype, K) x (N, cs) and (next_n, cr) x (N, cs) are ALSO fully crossed
+#     (16/16 pairs each). N is what selects the T=512/1024 + 256-bit-load
+#     tuning bucket; cs selects single-CTA vs DSMEM cluster.
+# Only 3-way and higher interactions are dropped.
+_DECODE_COMPILE_CELLS = [
+    # (dtype, top_k, next_n, compress_ratio, N, cluster_size)
+    (torch.bfloat16, 512, 1, 1, 4096, 1),
+    (torch.bfloat16, 512, 1, 4, 4096, 4),
+    (torch.bfloat16, 512, 2, 1, 65536, 1),
+    (torch.bfloat16, 512, 2, 4, 65536, 4),
+    (torch.bfloat16, 1024, 1, 1, 4096, 4),
+    (torch.bfloat16, 1024, 1, 4, 65536, 1),
+    (torch.bfloat16, 1024, 2, 1, 65536, 4),
+    (torch.bfloat16, 1024, 2, 4, 4096, 1),
+    (torch.float16, 1024, 1, 1, 65536, 1),
+    (torch.float16, 1024, 1, 4, 65536, 4),
+    (torch.float16, 1024, 2, 1, 4096, 1),
+    (torch.float16, 1024, 2, 4, 4096, 4),
+    (torch.float32, 2048, 1, 1, 65536, 4),
+    (torch.float32, 2048, 1, 4, 4096, 1),
+    (torch.float32, 2048, 2, 1, 4096, 4),
+    (torch.float32, 2048, 2, 4, 65536, 1),
+]
+# Runtime-only axes, crossed against EVERY compile cell at zero codegen cost.
+# (varlen, preidx_hit_rate) is fully crossed; batch_size covers the
+# single-row grid and the batched grid. varlen needs batch_size >= 2.
+_DECODE_RUNTIME_CELLS = [
+    (False, 1, 0.0),  # single row, worst-case hint (only argmax is real)
+    (False, 32, 0.5),  # batched, production-like hint overlap
+    (True, 32, 0.0),  # ragged rows, worst-case hint
+    (True, 32, 0.5),  # ragged rows, production-like hint
+]
+
+
 @skip_not_sm100
 @pytest.mark.parametrize(
-    "dtype,top_k",
-    [
-        # Production cells: (bf16, K=512/1024) and (fp32, K=2048) match
-        # the deployed K -> dtype mapping. (fp16, K=1024) is added to keep
-        # the fp16 convert-to-fp32 tail path under test even though it is
-        # not a current production cell.
-        (torch.bfloat16, 512),
-        (torch.bfloat16, 1024),
-        (torch.float16, 1024),
-        (torch.float32, 2048),
-    ],
+    "dtype,top_k,next_n,compress_ratio,N,cluster_size",
+    _DECODE_COMPILE_CELLS,
 )
-@pytest.mark.parametrize("N", [4096, 65536])
-@pytest.mark.parametrize("varlen", [False, True])
-@pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("batch_size", [1, 32])
-@pytest.mark.parametrize("compress_ratio", [1, 4])
-@pytest.mark.parametrize("preidx_hit_rate", [0.0, 0.5])
-@pytest.mark.parametrize("cluster_size", [1, 4])
+@pytest.mark.parametrize("varlen,batch_size,preidx_hit_rate", _DECODE_RUNTIME_CELLS)
 def test_cute_dsl_gvr_topk_decode(
     dtype,
     top_k,
@@ -567,22 +604,26 @@ def test_lb_prepare_partition(B, ratio):
     )
 
 
+# N picked so all rows fall clearly below / above the 64K long_threshold.
+# fp32/K=2048 carries the (scenario x next_n) cross; bf16/K=1024 pins the
+# other SMEM layout on one case per branch. batch_size is runtime-only.
+# 10 cases / 6 compiles, down from 24 cases / 8 compiles.
+_LB_BRANCH_CELLS = [
+    # (dtype, top_k, scenario, N, seq_lens_mode, batch_size, next_n)
+    (torch.float32, 2048, "all_short", 8 * 1024, "uniform", 4, 1),
+    (torch.float32, 2048, "all_short", 8 * 1024, "uniform", 32, 2),
+    (torch.float32, 2048, "all_long", 128 * 1024, "uniform", 4, 1),
+    (torch.float32, 2048, "all_long", 128 * 1024, "uniform", 32, 2),
+    (torch.float32, 2048, "mixed_half", 128 * 1024, "half_short_half_long", 4, 1),
+    (torch.float32, 2048, "mixed_half", 128 * 1024, "half_short_half_long", 32, 2),
+    # One bf16 cell pins the other SMEM layout; mixed_half covers the long
+    # branch AND both branches in one launch.
+    (torch.bfloat16, 1024, "mixed_half", 128 * 1024, "half_short_half_long", 32, 1),
+]
+
+
 @skip_not_sm100
-@pytest.mark.parametrize(
-    "dtype,top_k",
-    [(torch.bfloat16, 1024), (torch.float32, 2048)],
-)
-@pytest.mark.parametrize(
-    "scenario,N,seq_lens_mode",
-    [
-        # N picked so all rows fall clearly below / above the 64K long_threshold.
-        ("all_short", 8 * 1024, "uniform"),
-        ("all_long", 128 * 1024, "uniform"),
-        ("mixed_half", 128 * 1024, "half_short_half_long"),
-    ],
-)
-@pytest.mark.parametrize("batch_size", [4, 32])
-@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("dtype,top_k,scenario,N,seq_lens_mode,batch_size,next_n", _LB_BRANCH_CELLS)
 def test_lb_main_branches(
     dtype, top_k, scenario, N, seq_lens_mode, batch_size, next_n, tie_aware_check
 ):
@@ -653,24 +694,44 @@ def test_lb_main_branches(
     _gvr_check(tie_aware_check, out_indices, logits, seq_lens, top_k, next_n, compress_ratio=1)
 
 
+# LB dispatch (prepare partition + long/short branch selection) is
+# dtype-insensitive by construction, so the fp32/K=2048 arm carries the
+# (next_n x cr) cross and bf16/K=512 only pins the other SMEM layout.
+# N below/above the 64K long_threshold selects the branch AND the
+# 256-bit-load/mbpm tuning bucket, so both stay represented.
+# The LB kernel is a DORMANT capability -- ``indexer.py`` passes ``order_row``
+# but never ``counters``/``max_batch_size``, so no production shape reaches
+# this path -- which is why it is covered at smoke depth (7 compiles / 14
+# cases) instead of mirroring the in-tree kernel's production dtype x K map
+# (was 16 compiles / 128 cases = 15% of this file's CI wall clock).
+_LB_COMPILE_CELLS = [
+    # (dtype, top_k, N, next_n, compress_ratio)
+    # (next_n x cr) fully crossed on the short branch, and re-crossed on the
+    # long branch at the two diagonal corners so the >64K tuning bucket sees
+    # both the trivial (1, 1) and the fully-shifted (2, 4) index math.
+    (torch.float32, 2048, 8 * 1024, 1, 1),
+    (torch.float32, 2048, 8 * 1024, 1, 4),
+    (torch.float32, 2048, 8 * 1024, 2, 1),
+    (torch.float32, 2048, 8 * 1024, 2, 4),
+    (torch.float32, 2048, 128 * 1024, 1, 1),
+    (torch.float32, 2048, 128 * 1024, 2, 4),
+    (torch.bfloat16, 512, 128 * 1024, 1, 1),
+]
+# Runtime-only for LB as well (varlen / batch_size / hint overlap never enter
+# the compile key), so the (varlen x preidx_hit_rate) cross is kept intact at
+# every LB compile cell: only compile-axis COMBINATIONS were dropped above, no
+# runtime behaviour lost.
+_LB_RUNTIME_CELLS = [
+    (False, 4, 0.0),  # uniform seq_lens, worst-case hint
+    (False, 32, 0.5),  # uniform, production-like hint overlap
+    (True, 32, 0.0),  # ragged rows, worst-case hint
+    (True, 32, 0.5),  # ragged rows, production-like hint
+]
+
+
 @skip_not_sm100
-@pytest.mark.parametrize(
-    "dtype,top_k",
-    [
-        # SMEM-layout endpoints only. LB dispatch (prepare partition +
-        # long/short branch selection) is dtype-insensitive; the full
-        # dtype x K production map stays covered by the main sweep above
-        # and by test_cute_dsl_gvr_topk_decode_r0_equivalence.
-        (torch.bfloat16, 512),
-        (torch.float32, 2048),
-    ],
-)
-@pytest.mark.parametrize("N", [8 * 1024, 128 * 1024])  # below / above 64K threshold
-@pytest.mark.parametrize("varlen", [False, True])
-@pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("batch_size", [4, 32])
-@pytest.mark.parametrize("compress_ratio", [1, 4])
-@pytest.mark.parametrize("preidx_hit_rate", [0.0, 0.5])
+@pytest.mark.parametrize("dtype,top_k,N,next_n,compress_ratio", _LB_COMPILE_CELLS)
+@pytest.mark.parametrize("varlen,batch_size,preidx_hit_rate", _LB_RUNTIME_CELLS)
 def test_lb_vs_reference(
     dtype,
     top_k,
@@ -869,20 +930,34 @@ def _make_r0_pre_idx(logits, top_k, hint, seed):
     return (pre - 1).contiguous()
 
 
+# Every case here compiles TWO kernels (R0 arm + secant arm), so this sweep
+# is the second-most codegen-dense in the file. The compile key of
+# ``_run_gvr_direct`` is (enable_r0, dtype, top_k, cluster_size, T, mbpm)
+# with T selected by N (>= 65536 -> 1024) and mbpm pinned at 1 for BS <= SMs
+# -- so ``hint`` and ``batch_size`` are runtime-only. The cells below keep
+# (dtype, K) x cluster_size fully crossed and alternate N so both T buckets
+# are exercised for every (dtype, K): 9 cells / 18 compiles, down from
+# 4 x 2 x 3 = 24 - 4 skipped = 20 cells / 40 compiles.
+_R0_EQ_CELLS = [
+    # (dtype, top_k, N, cluster_size)
+    (torch.bfloat16, 512, 8192, 1),
+    (torch.bfloat16, 512, 65536, 4),
+    (torch.bfloat16, 1024, 65536, 1),
+    (torch.bfloat16, 1024, 8192, 4),
+    (torch.float16, 1024, 8192, 1),
+    (torch.float16, 1024, 65536, 4),
+    (torch.float32, 2048, 65536, 1),
+    (torch.float32, 2048, 8192, 4),
+    # cs=8 is the runner's tiny-grid large-N pick (7-peer DSMEM aggregation);
+    # large-N only, and dtype-insensitive -> one cell.
+    (torch.float32, 2048, 65536, 8),
+]
+
+
 @skip_not_sm100
-@pytest.mark.parametrize(
-    "dtype,top_k",
-    [
-        (torch.bfloat16, 512),
-        (torch.bfloat16, 1024),
-        (torch.float16, 1024),
-        (torch.float32, 2048),
-    ],
-)
-@pytest.mark.parametrize("N", [8192, 65536])
+@pytest.mark.parametrize("dtype,top_k,N,cluster_size", _R0_EQ_CELLS)
 @pytest.mark.parametrize("batch_size", [1, 16])
 @pytest.mark.parametrize("hint", ["real", "rand"])
-@pytest.mark.parametrize("cluster_size", [1, 4, 8])
 def test_cute_dsl_gvr_topk_decode_r0_equivalence(
     dtype, top_k, N, batch_size, hint, cluster_size, tie_aware_check
 ):
@@ -1079,13 +1154,21 @@ def test_cute_dsl_gvr_topk_decode_launch_autoconfig(dtype, top_k, N, batch_size,
     _gvr_check(tie_aware_check, out, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
 
     # Override path: forcing the secant arm through launch() must also be a
-    # valid top-K and (fp32, tie-free) the identical index set.
+    # valid top-K, and on fp32 the same index set up to boundary value-ties.
+    # Restricted to fp32 because on half precision the secant arm only
+    # re-checked the tie-aware value set the R0-equivalence sweep already
+    # covers, at the cost of one more compiled kernel per cell.
+    if dtype != torch.float32:
+        return
     out_sec = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
     _GvrTopKKernel.launch(logits, pre_idx, seq_lens, out_sec, top_k, enable_r0=False)
     torch.cuda.synchronize()
     _gvr_check(tie_aware_check, out_sec, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
-    if dtype == torch.float32:
-        assert torch.equal(out.sort(dim=-1).values, out_sec.sort(dim=-1).values)
+    # fp32 randn does collide bit-exactly at these sample counts, and a
+    # collision on the top-K boundary makes the two arms' distinct picks
+    # equally valid -- so compare the index sets tie-aware, not with
+    # torch.equal (same reasoning as the R0-equivalence sweep above).
+    _assert_index_sets_equal_tie_aware(out, out_sec, logits)
 
 
 @skip_not_sm100
@@ -1166,16 +1249,28 @@ def test_cute_dsl_gvr_topk_decode_pick_policy_single_source():
                     )
 
 
+# Every (dtype, variant) pair is its own compiled kernel. The plateau
+# terminal is a value-space property (bitwise-equal plateau wider than kC),
+# so fp32 carries all five admission/emit routes and fp16 only pins the
+# half-precision bracket on the two extremes: the shipped default
+# (rank_scatter_cs1) and the secant fallback (base_r0off).
+# base_r0off exercises the classic secant admission (the exact fallback the
+# production path takes when the R0 ladder misses): its refine budget can
+# run out while the bracket is still wide, which is a different route into
+# the plateau terminal than the R0 ladder's.
+_PLATEAU_CELLS = [
+    (torch.float32, "rank_scatter_cs1"),
+    (torch.float32, "rank_scatter_cs4"),
+    (torch.float32, "snap_cs1"),
+    (torch.float32, "base_r0off"),
+    (torch.float32, "base_r0off_cs4"),
+    (torch.float16, "rank_scatter_cs1"),
+    (torch.float16, "base_r0off"),
+]
+
+
 @skip_not_sm100
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-@pytest.mark.parametrize(
-    "variant",
-    # base_r0off exercises the classic secant admission (the exact fallback the
-    # production path takes when the R0 ladder misses): its refine budget can
-    # run out while the bracket is still wide, which is a different route into
-    # the plateau terminal than the R0 ladder's.
-    ["rank_scatter_cs1", "rank_scatter_cs4", "snap_cs1", "base_r0off", "base_r0off_cs4"],
-)
+@pytest.mark.parametrize("dtype,variant", _PLATEAU_CELLS)
 def test_cute_dsl_gvr_topk_decode_plateau_terminal(dtype, variant):
     """Adversarial plateau terminal (done == 3): a bitwise-equal plateau
     WIDER than the candidate buffer (kC) straddling the K boundary. Any

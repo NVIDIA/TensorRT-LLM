@@ -25,8 +25,10 @@ import pytest
 
 from tensorrt_llm.executor import EngineDeadError
 from tensorrt_llm.executor import proxy as proxy_module
+from tensorrt_llm.executor import worker as worker_module
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.result import GenerationResult
+from tensorrt_llm.executor.worker_process_monitor import WorkerProcessIdentity
 
 
 def test_engine_dead_error_is_importable_and_carries_root_cause():
@@ -115,6 +117,205 @@ def test_register_worker_processes_with_session_reuse_factory(monkeypatch):
     proxy._register_worker_processes((proxy.READY_SIGNAL, None, identities))
 
     proxy._worker_process_monitor.register.assert_called_once_with(identities)
+
+
+class _FakeWorkerInitStatusQueue:
+    """Worker status queue that returns a fixed message sequence."""
+
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.acks = []
+
+    def poll(self, timeout):
+        return bool(self._messages)
+
+    def get(self):
+        return self._messages.pop(0)
+
+    def put(self, message):
+        self.acks.append(message)
+
+
+class _DeadAfterRegistrationMonitor:
+    """Report a worker death only after the proxy registers identities."""
+
+    def __init__(self):
+        self.identities = []
+
+    def register(self, identities):
+        self.identities = identities
+
+    def find_dead_worker(self):
+        return self.identities[0] if self.identities else None
+
+
+def test_worker_death_before_ready_is_reported_from_registered_identity():
+    """A pre-READY worker death must not depend on its MPI future finishing."""
+    identity = WorkerProcessIdentity(
+        rank=3, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
+    )
+    identity_status = (GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL, None, [identity])
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = object()
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([identity_status])
+    proxy._worker_process_monitor = _DeadAfterRegistrationMonitor()
+    proxy.mpi_futures = [_Future()]  # Deliberately remains pending.
+    proxy._fatal_error = None
+    proxy.doing_shutdown = False
+    proxy.pre_shutdown = _Mock()
+    proxy._handle_background_error = _Mock()
+
+    with pytest.raises(RuntimeError, match=r"rank 3 \(pid 12345\) exited unexpectedly"):
+        proxy._wait_for_executor_workers_ready()
+
+    assert not proxy.mpi_futures[0].done()
+    assert proxy.worker_init_status_queue.acks == ["ACK"]
+    proxy.pre_shutdown.assert_called_once_with()
+
+
+def test_remote_worker_death_before_ready_is_reported():
+    """Remote worker death must be polled before the error monitor starts."""
+    error = RuntimeError("remote worker died")
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = _Mock()
+    proxy.mpi_session.check_worker_error.return_value = error
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([])
+    proxy._worker_process_monitor = _Mock()
+    proxy._worker_process_monitor.find_dead_worker.return_value = None
+    proxy.mpi_futures = []
+    proxy._fatal_error = None
+    proxy._error_queue = _queue.Queue()
+    proxy.doing_shutdown = False
+    proxy.pre_shutdown = _Mock()
+    proxy._handle_background_error = _Mock(
+        side_effect=AssertionError("wait loop continued after remote worker death")
+    )
+
+    with pytest.raises(RuntimeError, match="remote worker died"):
+        proxy._wait_for_executor_workers_ready()
+
+    proxy.mpi_session.check_worker_error.assert_called_once_with()
+    assert proxy.worker_init_status_queue.acks == []
+    assert proxy.mpi_futures == []
+    assert proxy._fatal_error is error
+    proxy.pre_shutdown.assert_called_once_with()
+    proxy._handle_background_error.assert_not_called()
+
+
+def test_worker_identities_are_registered_once_before_ready():
+    identity = WorkerProcessIdentity(
+        rank=0, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
+    )
+    identity_status = (GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL, None, [identity])
+    ready_status = (GenerationExecutorProxy.READY_SIGNAL, None, [identity])
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = object()
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([identity_status, ready_status])
+    proxy._worker_process_monitor = _Mock()
+    proxy.mpi_futures = [_Future()]
+    proxy._handle_background_error = _Mock()
+
+    assert proxy._wait_for_executor_workers_ready() == ready_status
+    proxy._worker_process_monitor.register.assert_called_once_with([identity])
+    assert proxy.worker_init_status_queue.acks == ["ACK", "ACK"]
+
+
+def test_worker_error_status_is_not_treated_as_identities():
+    error = RuntimeError("backend construction failed")
+    error_status = (error, "traceback", [object()])
+
+    proxy = _bare_proxy()
+    proxy.mpi_session = object()
+    proxy.worker_init_status_queue = _FakeWorkerInitStatusQueue([error_status])
+    proxy._worker_process_monitor = _Mock()
+    proxy.mpi_futures = [_Future()]
+    proxy._handle_background_error = _Mock()
+
+    assert proxy._wait_for_executor_workers_ready() == error_status
+    proxy._worker_process_monitor.register.assert_not_called()
+    assert proxy.worker_init_status_queue.acks == ["ACK"]
+
+
+def test_worker_publishes_identities_before_backend_construction(monkeypatch):
+    identity = WorkerProcessIdentity(
+        rank=0, pid=12345, start_time=67890, hostname="localhost", pid_namespace=1
+    )
+    events = []
+
+    class _FakeComm:
+        def barrier(self):
+            pass
+
+        def allgather(self, captured_identity):
+            assert captured_identity == identity
+            return [identity]
+
+    class _FakeInitStatusQueue:
+        succeeds = True
+
+        def notify_with_retry(self, message):
+            events.append(("notify", message[0]))
+            return self.succeeds
+
+    class _FailingWorker:
+        def __init__(self, *args, **kwargs):
+            events.append(("construct", None))
+            raise RuntimeError("expected construction failure")
+
+    init_status_queue = _FakeInitStatusQueue()
+
+    def make_ipc_queue(*args, name, **kwargs):
+        if name == "worker_init_status_queue":
+            return init_status_queue
+        return _Mock()
+
+    fake_comm = _FakeComm()
+    monkeypatch.setattr(worker_module, "mpi_comm", lambda: fake_comm)
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 0)
+    monkeypatch.setattr(worker_module, "capture_worker_process_identity", lambda rank: identity)
+    monkeypatch.setattr(worker_module, "set_mpi_session_cpp", lambda comm: None)
+    monkeypatch.setattr(worker_module, "IpcQueue", make_ipc_queue)
+    monkeypatch.setattr(worker_module, "FusedIpcQueue", lambda *args, **kwargs: _Mock())
+
+    worker_queues = _Mock(
+        frontend_result_queue_addrs=None,
+        request_queue_addr=("request", b"key"),
+        worker_init_status_queue_addr=("status", b"key"),
+        resource_governor_queue_addr=None,
+        result_queue_addr=("result", b"key"),
+    )
+    worker_module.worker_main(
+        engine=object(),
+        worker_queues=worker_queues,
+        log_level=worker_module.logger.level,
+        worker_cls=_FailingWorker,
+        ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+        worker_process_identities_signal=(GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
+    )
+
+    assert events[:2] == [
+        ("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL),
+        ("construct", None),
+    ]
+
+    events.clear()
+    init_status_queue.succeeds = False
+    with pytest.raises(RuntimeError, match="Failed to deliver worker process identities to proxy"):
+        worker_module.worker_main(
+            engine=object(),
+            worker_queues=worker_queues,
+            log_level=worker_module.logger.level,
+            worker_cls=_FailingWorker,
+            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+            worker_process_identities_signal=(
+                GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL
+            ),
+        )
+
+    assert events == [("notify", GenerationExecutorProxy.WORKER_PROCESS_IDENTITIES_SIGNAL)]
 
 
 def test_result_step_raises_on_engine_dead():

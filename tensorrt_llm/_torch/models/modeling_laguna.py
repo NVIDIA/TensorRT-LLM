@@ -34,7 +34,12 @@ from ..distributed import AllReduce, AllReduceParams
 from ..modules.attention import _helix_cp_allgather_input, _helix_cp_output_projection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe, get_moe_cls
+from ..modules.fused_moe import (
+    MiniMaxM2MoeRoutingMethod,
+    RoutingMethodType,
+    create_moe,
+    resolve_moe_cls,
+)
 from ..modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from ..modules.fused_moe.interface import MoE as MoEInterface
 from ..modules.gated_mlp import GatedMLP
@@ -127,7 +132,15 @@ class LagunaMoE(nn.Module):
             num_experts=self.num_experts,
             top_k=self.top_k,
             dtype=config.torch_dtype,
-            moe_backend_cls=get_moe_cls(model_config),
+            moe_backend_cls=resolve_moe_cls(
+                model_config,
+                routing=RoutingMethodType.MiniMax2,
+                # Match the create_moe call below, which passes no bias and no
+                # swiglu alpha/beta. Left unknown, gates that create_moe
+                # rejects abstain here and the gate would name a backend the
+                # layer does not run.
+                swiglu_gptoss_style=False,
+            ),
         )
 
         self.experts = create_moe(

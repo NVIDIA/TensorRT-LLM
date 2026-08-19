@@ -826,7 +826,7 @@ class TestGrpcServiceEndToEnd:
 # End-to-end multimodal gRPC service tests (with VLM model)
 # ============================================================================
 
-vlm_model_name = "Qwen3/Qwen3-VL-8B-Instruct"
+vlm_model_name = "Qwen3/Qwen3-VL-2B-Instruct"
 
 
 def get_test_image_path():
@@ -837,7 +837,7 @@ def get_test_image_path():
 def grpc_vlm_service():
     """Create a real VLM LLM, request manager, and servicer for multimodal e2e testing.
 
-    Uses Qwen3-VL-8B-Instruct for vision-language model testing.
+    Uses Qwen3-VL-2B-Instruct for vision-language model testing.
     Shared across all tests in the class; class scope so this LLM does not
     coexist with the one from grpc_service (see note there).
     """
@@ -863,7 +863,7 @@ class TestGrpcMultimodalEndToEnd:
 
     Tests the full pipeline: gRPC request with image bytes -> servicer ->
     request manager -> VLM -> response.
-    Uses Qwen3-VL-8B-Instruct with test images from LLM_MODELS_ROOT.
+    Uses Qwen3-VL-2B-Instruct with test images from LLM_MODELS_ROOT.
     """
 
     def test_generate_with_image(self, grpc_vlm_service):

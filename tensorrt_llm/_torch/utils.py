@@ -201,6 +201,53 @@ class Fp4QuantizedTensor:
         return self.fp4_tensor.shape
 
 
+@dataclass
+class MxFp8QuantizedTensor:
+    """MXFP8 activation and its per-1x32 UE8M0 scaling factors.
+
+    Attributes:
+        fp8_tensor: Row-major E4M3 activation with shape
+            ``[num_tokens, hidden_size]``.
+        scaling_factor: Row-major UE8M0 scales stored as ``torch.uint8`` with
+            shape ``[num_tokens, ceil(hidden_size / 32)]``. Each value scales
+            one contiguous group of 32 activation elements.
+        is_sf_swizzled: Whether ``scaling_factor`` uses a backend-specific
+            swizzled layout. The carrier's ``split`` method requires the
+            default row-major layout and only supports the token dimension.
+    """
+
+    fp8_tensor: torch.Tensor
+    scaling_factor: torch.Tensor
+    is_sf_swizzled: bool = False
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.fp8_tensor.shape
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.fp8_tensor.dtype
+
+    def numel(self) -> int:
+        return self.fp8_tensor.numel()
+
+    def split(
+        self,
+        split_size_or_sections: int | list[int],
+        dim: int = 0,
+    ) -> tuple["MxFp8QuantizedTensor", ...]:
+        """Split activation rows and their scales along the token dimension."""
+        if dim != 0:
+            raise ValueError(
+                "MxFp8QuantizedTensor can only be split along the token dimension"
+            )
+        fp8_chunks = self.fp8_tensor.split(split_size_or_sections, dim=dim)
+        sf_chunks = self.scaling_factor.split(split_size_or_sections, dim=dim)
+        return tuple(
+            MxFp8QuantizedTensor(fp8_chunk, sf_chunk, self.is_sf_swizzled)
+            for fp8_chunk, sf_chunk in zip(fp8_chunks, sf_chunks))
+
+
 def compute_swizzled_sf_shape(row: int, col: int):
     padded_row = pad_up(row, 128)
     padded_col = pad_up(col, 4)

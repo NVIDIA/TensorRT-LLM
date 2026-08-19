@@ -71,6 +71,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     , mHistoryLength(0)
     , mExpectedPromptLength(
           expectedPromptLength.has_value() ? std::optional<int>{std::max(*expectedPromptLength, 0)} : std::nullopt)
+    , mNumTokensBeforeHybridPruning(reuseMatch.has_value() ? reuseMatch->numTokensBeforeHybridPruning : 0)
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())
 {
@@ -560,7 +561,11 @@ void KvCache::close()
     stopCommitting();
     TLLM_CHECK_DEBUG(_checkSanity());
 
-    if (mCapacity > 0)
+    // Dummy/warmup caches are reserved at the model's full declared context, not at a realistic
+    // sequence length, and mAvgSqrCapacity is an RMS -- so a handful of them dominates the
+    // statistic outright and the tuner sizes pools for sequences that never arrive. They are
+    // already tracked as stats-excluded at creation; honour that here too.
+    if (mCapacity > 0 && !mManager->isStatsExcluded(id))
     {
         mAvgCapacity.update(static_cast<double>(mCapacity));
         mManager->updateAvgSqrCapacity(mAvgCapacity.value() * mAvgCapacity.value());

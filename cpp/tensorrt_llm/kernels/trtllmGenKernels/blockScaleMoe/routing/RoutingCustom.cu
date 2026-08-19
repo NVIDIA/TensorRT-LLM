@@ -27,6 +27,7 @@
 //   7. routingIndicesOffsetsKernel    — prefix-scan + permutation (defined in RoutingKernel.cuh)
 
 #include "RoutingCustomPolicy.cuh"
+#include "RoutingCustomSelection.h"
 
 #include <cstdlib>
 
@@ -1594,6 +1595,46 @@ void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThr
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+bool prefersCoopBlockKernel(RoutingPreprocessType preprocessType, RoutingPostprocessType postprocessType,
+    int32_t numTokens, int32_t dispatchedMaxExperts, int32_t minNumExpertsForCoopOverride)
+{
+    // The cooperative block kernel is the fastest path for tiny batches. It needs an
+    // elementwise preprocess (anything but softmax-over-experts) and one CUDA block's
+    // worth of experts, since it runs one thread per expert.
+    bool const useStaticBlock = numTokens <= BlockKernelMaxNumTokens;
+    bool const preprocessIsElementwise = preprocessType == RoutingPreprocessType::None
+        || preprocessType == RoutingPreprocessType::Sigmoid || preprocessType == RoutingPreprocessType::SigmoidBias;
+
+    // The lower tier bound applies to the Renormalize policy only, which is the one that
+    // was measured. With no per-expert preprocess the classic one-warp-per-token TopK is
+    // faster through the 512-expert tier. Policies that do preprocess per expert push the
+    // classic kernel into register spilling long before that -- at E512/topK 22 SigmoidBias
+    // it needs 64 registers and a 176-byte stack against 32 registers and no stack for the
+    // cooperative kernel -- so they keep using the cooperative kernel across the whole tier
+    // range. The None + None fallback policy is left alone for the same reason: it is
+    // unmeasured, and no routing method in runner.cu selects it today.
+    //
+    // The bound is one tier lower at a single token. Measured across GB300 (SM103) and
+    // B200 (SM100) with the same launcher harness, the classic kernel wins every tier up to
+    // 512 from two tokens up, but at one token the two parts disagree at the 512 tier and
+    // both prefer the cooperative kernel at 576.
+    //
+    // The bound is the only part of this predicate that rests on measurement, and the
+    // measurement is SM100-family only, so it is the part a deployment may need to undo
+    // without a rebuild. minNumExpertsForCoopOverride carries
+    // TLLM_ROUTING_COOP_BLOCK_MIN_EXPERTS in from the caller: 0 restores the parent
+    // selection, a value above every tier forces the classic kernel.
+    bool const isRenormalize
+        = preprocessType == RoutingPreprocessType::None && postprocessType == RoutingPostprocessType::Softmax;
+    int32_t const minNumExpertsForCoop = minNumExpertsForCoopOverride >= 0
+        ? minNumExpertsForCoopOverride
+        : (numTokens == 1 ? CoopBlockKernelSingleTokenMinNumExperts : CoopBlockKernelMinNumExperts);
+    bool const meetsMinNumExperts = !isRenormalize || dispatchedMaxExperts >= minNumExpertsForCoop;
+
+    return useStaticBlock && preprocessIsElementwise && meetsMinNumExperts
+        && dispatchedMaxExperts <= CoopBlockKernelMaxNumExperts;
+}
+
 void run(Data const& data, void* stream)
 {
     TLLM_CHECK_WITH_INFO(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
@@ -1629,21 +1670,23 @@ void run(Data const& data, void* stream)
 
     bool const useStaticBlock = data.mNumTokens <= BlockKernelMaxNumTokens;
     int32_t const dispatchedMaxExperts = queryDispatchedMaxExperts(data);
-    // Cooperative block kernel: fastest path for tiny batches. Requires an elementwise
-    // preprocess (any but softmax-over-experts) and one CUDA block's worth of experts.
-    // Critical for large expert counts, where the classic one-warp-per-token TopK spills
-    // registers under the 1024-thread launch bounds (e.g. 896 experts / topK 16 at decode).
-    bool const preprocessIsElementwise = data.mPreprocessType == RoutingPreprocessType::None
-        || data.mPreprocessType == RoutingPreprocessType::Sigmoid
-        || data.mPreprocessType == RoutingPreprocessType::SigmoidBias;
     // Escape hatch for A/B validation and emergency fallback to the classic block kernel.
     static bool const disableCoopBlock = []
     {
         char const* env = std::getenv("TLLM_ROUTING_DISABLE_COOP_BLOCK");
         return env != nullptr && env[0] == '1';
     }();
-    bool const useCoopBlock = !disableCoopBlock && useStaticBlock && preprocessIsElementwise
-        && dispatchedMaxExperts <= CoopBlockKernelMaxNumExperts;
+    // The opposite direction: move the Renormalize lower tier bound instead of disabling
+    // the cooperative kernel outright. 0 restores the parent selection for every tier.
+    // Both are read once into a function-static, so they must be set before the first call.
+    static int32_t const coopBlockMinNumExpertsOverride = []
+    {
+        char const* env = std::getenv("TLLM_ROUTING_COOP_BLOCK_MIN_EXPERTS");
+        return env != nullptr ? std::atoi(env) : -1;
+    }();
+    bool const useCoopBlock = !disableCoopBlock
+        && prefersCoopBlockKernel(data.mPreprocessType, data.mPostprocessType, data.mNumTokens, dispatchedMaxExperts,
+            coopBlockMinNumExpertsOverride);
     bool const useDynBlock = !useStaticBlock && data.mNumTokens <= DynBlockKernelMaxNumTokens
         && dispatchedMaxExperts <= DynBlockKernelMaxNumExperts;
     bool const useSingleBlock = useStaticBlock || useDynBlock;

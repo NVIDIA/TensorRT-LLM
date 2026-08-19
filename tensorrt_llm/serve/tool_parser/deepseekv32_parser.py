@@ -65,6 +65,9 @@ class DeepSeekV32Parser(BaseToolParser):
 
     _eos_token = "<｜end▁of▁sentence｜>"  # nosec B105
 
+    # Invoke header up to the function name, which is arbitrary text.
+    _INVOKE_HEADER_PREFIX = '<｜DSML｜invoke name="'  # nosec B105
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"  # nosec B105
@@ -167,26 +170,37 @@ class DeepSeekV32Parser(BaseToolParser):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call or any DSML-related content
-        # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
-        # If we see these markers anywhere, we should keep buffering
-        has_tool_call = self.bot_token in current_text or "<｜DSML｜invoke" in current_text
+        start_tokens = [self.bot_token, self._INVOKE_HEADER_PREFIX]
+        start_indices = [idx for idx in map(current_text.find, start_tokens) if idx != -1]
+        has_tool_call = bool(start_indices)
 
-        # Check if buffer contains any DSML markers or ends with potential tag prefix
-        # This handles partial/streaming DSML content
-        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
-        potentially_dsml = any(marker in current_text for marker in dsml_markers)
+        # Hold the buffer back only while its tail could still complete into one of
+        # the DSML delimiters.
+        partial_tokens = [
+            self.bot_token,
+            self._INVOKE_HEADER_PREFIX,
+            self.eot_token,
+            self.invoke_end_token,
+            self._eos_token,
+        ]
+        ends_with_partial_token = any(
+            self._ends_with_partial_token(current_text, token) for token in partial_tokens
+        )
 
-        # Also check if text ends with start of a tag (to handle "<" arriving separately)
-        dsml_prefixes = ["<", "<｜", "</", "</｜"]
-        ends_with_prefix = any(current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes)
-
-        if not has_tool_call and not potentially_dsml and not ends_with_prefix:
+        if not has_tool_call and not ends_with_partial_token:
+            normal_text = current_text
             self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token, self._eos_token]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
+                normal_text = normal_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=normal_text)
+
+        # Text before the earliest start token is content, so stream it and keep the
+        # buffer from that token onwards.
+        prefix_len = min(start_indices, default=0)
+        normal_text = current_text[:prefix_len]
+        if normal_text:
+            current_text = current_text[prefix_len:]
+            self._buffer = current_text
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
@@ -288,11 +302,11 @@ class DeepSeekV32Parser(BaseToolParser):
                     break
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=normal_text, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=normal_text + current_text)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

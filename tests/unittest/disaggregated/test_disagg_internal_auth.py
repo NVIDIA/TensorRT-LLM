@@ -21,7 +21,11 @@ from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth,
     validate_internal_disagg_request,
 )
-from tensorrt_llm.serve.openai_protocol import CompletionRequest, DisaggregatedParams
+from tensorrt_llm.serve.openai_protocol import (
+    CompletionRequest,
+    ConversationParams,
+    DisaggregatedParams,
+)
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 
@@ -114,7 +118,7 @@ def test_protected_fields_accept_valid_header_after_wire_roundtrip():
         encoded_opaque_state="b3BhcXVl",
         ctx_info_endpoint="tcp://10.0.0.1:5000",
     )
-    request.disaggregated_params.conversation_id = "conversation-1"
+    request.conversation_params = ConversationParams(conversation_id="conversation-1")
     headers = build_internal_disagg_auth_headers("secret", request)
 
     wire_request = CompletionRequest.model_validate_json(
@@ -139,10 +143,10 @@ def test_ctx_info_endpoint_list_sender_matches_validated_string_receiver():
     validate_internal_disagg_request("secret", wire_request, headers)
 
 
-def test_unprotected_disagg_fields_do_not_invalidate_internal_auth_header():
+def test_conversation_params_do_not_invalidate_internal_auth_header():
     request = _make_request(ctx_info_endpoint="tcp://10.0.0.1:5000")
     headers = build_internal_disagg_auth_headers("secret", request)
-    request.disaggregated_params.conversation_id = "conversation-1"
+    request.conversation_params = ConversationParams(conversation_id="conversation-1")
 
     validate_internal_disagg_request("secret", request, headers)
 

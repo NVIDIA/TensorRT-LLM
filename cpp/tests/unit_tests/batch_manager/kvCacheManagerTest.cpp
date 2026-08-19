@@ -10379,6 +10379,79 @@ TEST_F(KVCacheManagerTest, VSWAEvictedPlaceholderAnchorAllowsTrailingReuse)
     ASSERT_NE(kvCacheManager.findBlocksInReuseTreeByBlockKeys(b6PartialKeys, window), nullptr);
 }
 
+// Regression for the O(matched_blocks^2) -> O(matched_blocks) rewrite of
+// findReusableBlockMatches: when an SWA missing anchor appears late enough that
+// no trailing window of full matches can re-validate it, the safe-prefix
+// boundary must FREEZE before the anchor and the still-matched-but-unsafe tail
+// must be dropped. The original code kept the last full-vector copy; the rewrite
+// records the boundary and truncates the tail once after the walk. Unlike the
+// fail->pass re-advance case above, this exercises truncation of a non-empty
+// tail (the missing-anchor placeholder AND a real trailing match).
+TEST_F(KVCacheManagerTest, VSWASafePrefixFreezesAtMissingAnchorWhenNoTrailingReuse)
+{
+    auto constexpr tpb = 4;
+    auto constexpr window = 3 * tpb;  // 12 tokens = 3 blocks
+    auto constexpr numBlocksSeq0 = 7; // 7 blocks = 28 tokens in seq0
+    auto constexpr blocksInPrimaryPool = 16;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
+
+    auto const blocksPerWindow = BlocksPerWindow{{window, {blocksInPrimaryPool, 0}}};
+    KVCacheManager kvCacheManager(2, 2, 64, tpb, blocksPerWindow, 8, kVSWA_BEAM_WIDTH, std::vector<SizeType32>{window},
+        tensorrt_llm::DataType::kHALF, 0, stream,
+        /*maxSequenceLength=*/128, /*chunkSize=*/128, /*enableBlockReuse=*/true);
+    kvCacheManager.allocatePools(false);
+
+    auto const makeBlockKeys = [&](SizeType32 usableTokens, bool allowPartial)
+    {
+        auto prefixTokens = std::make_shared<VecTokens>(usableTokens);
+        std::iota(prefixTokens->begin(), prefixTokens->end(), kVSWA_FIRST_TOKEN);
+        auto prefixRequest
+            = std::make_shared<LlmRequest>(99, kVSWA_MAX_NEW_TOKENS, prefixTokens, samplingConfig, kVSWA_IS_STREAMING);
+        auto const& uniqueTokens = prefixRequest->getUniqueTokens(kVSWA_BEAM_IDX);
+        auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableTokens, tpb, allowPartial);
+        return buildBlockKeys(blockedUniqueTokens, *prefixRequest);
+    };
+
+    // Seq 0: 28 tokens covering 7 blocks; b0..b5 land in the reuse trie (b6 is
+    // partial and not stored).
+    auto inputTokens0 = std::make_shared<VecTokens>(numBlocksSeq0 * tpb);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager.addSequenceBatch({{{0, numBlocksSeq0 * tpb, kVSWA_BEAM_WIDTH}}}, {std::ref(*llmRequest0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
+    kvCacheManager.storeContextBlocks(*llmRequest0);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(0, std::nullopt)));
+
+    // Evict the KV of b4 (index 4). Its trie node survives (b5 is its
+    // descendant), so on the next lookup b4 is a traversal-only missing anchor at
+    // token offset 20. Re-validation would require matching another window (12
+    // tokens) past it -- reaching token 32 == block 8 -- but only b5 (one more
+    // full block) exists before the absent b6, so the safe boundary freezes at b3
+    // and never re-advances.
+    auto const b4Keys = makeBlockKeys(5 * tpb, /*allowPartial=*/false);
+    auto b4Block = kvCacheManager.findBlocksInReuseTreeByBlockKeys(b4Keys, window);
+    ASSERT_NE(b4Block, nullptr);
+    b4Block->detachFromLookupNode();
+
+    // Seq 2: same 28-token prompt. The walk matches b0..b3 (safe), hits the b4
+    // missing anchor (guard freezes at token 20), then matches b5 (still unsafe:
+    // token 24 < 20 + 12). Safe prefix is 4 blocks; the b4 placeholder and the
+    // trailing b5 match must be truncated away.
+    auto inputTokens2 = std::make_shared<VecTokens>(numBlocksSeq0 * tpb);
+    std::iota(inputTokens2->begin(), inputTokens2->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest2
+        = std::make_shared<LlmRequest>(2, kVSWA_MAX_NEW_TOKENS, inputTokens2, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager.addSequenceBatch({{{2, numBlocksSeq0 * tpb, kVSWA_BEAM_WIDTH}}}, {std::ref(*llmRequest2)});
+
+    EXPECT_EQ(llmRequest2->getContextCurrentPosition(), 4 * tpb)
+        << "safe SWA reuse must freeze before the missing anchor and drop the unsafe tail";
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest2);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(2, llmRequest2)));
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // KvCacheConnector decode-time block allocation tests
 //

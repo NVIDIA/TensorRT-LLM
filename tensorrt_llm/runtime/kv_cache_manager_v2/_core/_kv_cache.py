@@ -238,6 +238,7 @@ class _KVCache:
         "_blocks",
         "_base_page_indices",
         "_committed_tokens",
+        "_num_tokens_before_hybrid_pruning",
         "_num_committed_blocks",
         "_finish_event",
         "_tokens_per_block",
@@ -273,6 +274,8 @@ class _KVCache:
     # be computed on the fly, but that would be slow due to python.
     _base_page_indices: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, IndexSeq]]
     _committed_tokens: list[TokenIdExt]
+    # Internal diagnostic captured from the reuse match: see ReuseMatch.
+    _num_tokens_before_hybrid_pruning: int
     # Sometimes we can't commit a block because all its tokens are already covered by another block in
     # the radix tree. But it's unsafe to just use the other block because: 1. the data may have numeric
     # difference, 2. if our block is a partial block, we can't write to memory of the other blocks.
@@ -330,6 +333,9 @@ class _KVCache:
             self.beam_width,
         )
         self._committed_tokens = []
+        self._num_tokens_before_hybrid_pruning = (
+            reuse_match.num_tokens_before_hybrid_pruning if reuse_match is not None else 0
+        )
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
         self._tokens_per_block = manager.tokens_per_block
@@ -584,7 +590,12 @@ class _KVCache:
         self.stop_committing()
         assert NDEBUG or self._check_sanity()
         manager = self.manager
-        if self.capacity > 0:
+        # Dummy/warmup caches are reserved at the model's full declared context,
+        # not at a realistic sequence length, and _avg_sqr_capacity is an RMS --
+        # so a handful of them dominates the statistic outright and the tuner
+        # sizes pools for sequences that never arrive. They are already tracked
+        # as stats-excluded at creation; honour that here too.
+        if self.capacity > 0 and not manager.is_stats_excluded(self.id):
             self._avg_capacity.update(self.capacity)
             manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
             manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
@@ -1071,6 +1082,10 @@ class _KVCache:
     @property
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
+
+    def _get_num_tokens_before_hybrid_pruning(self) -> int:
+        """Return the pre-hybrid-pruning prefix for internal diagnostics."""
+        return self._num_tokens_before_hybrid_pruning
 
     @property
     def committed_tokens(self) -> list[TokenIdExt]:

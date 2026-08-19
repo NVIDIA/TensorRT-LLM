@@ -133,6 +133,7 @@ def _retrieve_latents(
 class QwenImageLayeredPipeline(BasePipeline):
     """Qwen-Image-Layered image decomposition pipeline."""
 
+    supports_image_edit = True
     DEFAULT_GENERATION_PARAMS = _LAYERED_DEFAULT_GENERATION_PARAMS
 
     def __init__(self, pipeline_config):
@@ -236,6 +237,14 @@ class QwenImageLayeredPipeline(BasePipeline):
                 type="bool",
                 default=False,
                 description="Use English auto-caption prompt when prompt is empty.",
+            ),
+            "save_layers_to_grid": ExtraParamSchema(
+                type="bool",
+                default=False,
+                description=(
+                    "Pack generated layers into one image grid. By default the pipeline "
+                    "returns one image per layer."
+                ),
             ),
         }
 
@@ -457,6 +466,31 @@ class QwenImageLayeredPipeline(BasePipeline):
         grid = layer_stack.reshape(batch_size, grid_rows, grid_cols, height, width, channels)
         grid = grid.permute(0, 1, 3, 2, 4, 5)
         return grid.reshape(batch_size, grid_rows * height, grid_cols * width, channels)
+
+    @staticmethod
+    def _validate_save_layers_to_grid(save_layers_to_grid: bool) -> bool:
+        if not isinstance(save_layers_to_grid, bool):
+            raise ValueError(
+                "save_layers_to_grid must be a bool, "
+                f"got {type(save_layers_to_grid).__name__}: {save_layers_to_grid!r}."
+            )
+        return save_layers_to_grid
+
+    @staticmethod
+    def _format_layer_output(
+        layer_stack: torch.Tensor,
+        save_layers_to_grid: bool,
+    ) -> torch.Tensor:
+        if layer_stack.ndim != 5:
+            raise ValueError(
+                "Qwen-Image-Layered output must have shape (B, layers, H, W, C), "
+                f"got {tuple(layer_stack.shape)}."
+            )
+
+        if QwenImageLayeredPipeline._validate_save_layers_to_grid(save_layers_to_grid):
+            return QwenImageLayeredPipeline._layer_stack_to_image_grid(layer_stack)
+        batch_size, layers, height, width, channels = layer_stack.shape
+        return layer_stack.reshape(batch_size * layers, height, width, channels)
 
     @staticmethod
     def _extract_masked_hidden(
@@ -738,6 +772,7 @@ class QwenImageLayeredPipeline(BasePipeline):
             resolution=extra.get("resolution", 640),
             cfg_normalize=extra.get("cfg_normalize", False),
             use_en_prompt=extra.get("use_en_prompt", False),
+            save_layers_to_grid=extra.get("save_layers_to_grid", False),
         )
 
     @torch.inference_mode()
@@ -756,6 +791,7 @@ class QwenImageLayeredPipeline(BasePipeline):
         resolution: int = 640,
         cfg_normalize: bool = False,
         use_en_prompt: bool = False,
+        save_layers_to_grid: bool = False,
         sigmas: Optional[list] = None,
         latents: Optional[torch.Tensor] = None,
     ) -> PipelineOutput:
@@ -765,6 +801,7 @@ class QwenImageLayeredPipeline(BasePipeline):
             raise ValueError(f"resolution must be 640 or 1024, got {resolution}")
         if layers < 1:
             raise ValueError(f"layers must be >= 1, got {layers}")
+        save_layers_to_grid = self._validate_save_layers_to_grid(save_layers_to_grid)
         if (height is None) != (width is None):
             raise ValueError("height and width must be set together for QwenImageLayeredPipeline.")
 
@@ -952,5 +989,5 @@ class QwenImageLayeredPipeline(BasePipeline):
             logger.info("Layered pipeline total: %.2fs", time.time() - pipeline_start)
 
         timer.mark_end()
-        image_grid = self._layer_stack_to_image_grid(layer_stack)
-        return timer.fill(PipelineOutput(image=image_grid))
+        image = self._format_layer_output(layer_stack, save_layers_to_grid)
+        return timer.fill(PipelineOutput(image=image))
