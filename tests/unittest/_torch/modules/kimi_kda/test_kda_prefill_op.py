@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity tests for the optimized Kimi K3 KDA prefill op."""
 
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,7 @@ pytestmark = pytest.mark.skipif(
 
 def _make_attention_pair(
     expected_prefill_kernel_path: str = "optimized",
+    source_state_dict: Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[KimiKDALinearAttention, KimiKDAReference]:
     common = {
         "hidden_size": HIDDEN_SIZE,
@@ -68,6 +70,8 @@ def _make_attention_pair(
     optimized = KimiKDALinearAttention(cfg, layer_idx=0).to("cuda")
     with torch.no_grad():
         optimized.dt_bias.zero_()
+    if source_state_dict is not None:
+        optimized.load_state_dict(source_state_dict)
     reference = KimiKDAReference(**common).to("cuda")
     reference.load_state_dict(optimized.state_dict())
     optimized.finalize_decode_weights()
@@ -535,8 +539,10 @@ def test_kda_prefill_unavailable_kernel_fallback_preserves_mixed_initial_states(
     torch.manual_seed(3)
     optimized, _ = _make_attention_pair()
     monkeypatch.setattr(_kda_kernels, "is_intree_prefill_available", lambda: False)
-    fallback, _ = _make_attention_pair(expected_prefill_kernel_path="fla")
-    fallback.load_state_dict(optimized.state_dict())
+    fallback, _ = _make_attention_pair(
+        expected_prefill_kernel_path="fla",
+        source_state_dict=optimized.state_dict(),
+    )
 
     sequence_lengths = [64, 64, 64, 64]
     cumulative_lengths = torch.tensor(

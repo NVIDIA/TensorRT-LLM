@@ -17,6 +17,7 @@ Needs 1 GPU + fla-core; runs with random weights (no checkpoint).
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -105,7 +106,7 @@ def _prefill_metadata(
 
 
 @torch.no_grad()
-def test_kda_fused_prefill_matches_separate_projections():
+def test_kda_fused_qkvg_prefill_matches_separate_projections():
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
 
@@ -127,6 +128,7 @@ def test_kda_fused_prefill_matches_separate_projections():
 
     reference = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
     reference.load_state_dict(runtime.state_dict())
+    reference._build_mtp_conv_weights()
     runtime.finalize_decode_weights()
     assert runtime._qkvg_proj_weight is not None
     assert runtime._bfa_proj_weight is not None
@@ -141,10 +143,31 @@ def test_kda_fused_prefill_matches_separate_projections():
     )
 
     expected_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
-    expected = reference(hidden_states, _prefill_metadata(expected_cache, slot_indices, cu_seqlens))
+    with (
+        patch.object(reference.q_proj, "forward", wraps=reference.q_proj.forward) as q_proj,
+        patch.object(reference.k_proj, "forward", wraps=reference.k_proj.forward) as k_proj,
+        patch.object(reference.v_proj, "forward", wraps=reference.v_proj.forward) as v_proj,
+        patch.object(reference.g_proj, "forward", wraps=reference.g_proj.forward) as g_proj,
+    ):
+        expected = reference(
+            hidden_states,
+            _prefill_metadata(expected_cache, slot_indices, cu_seqlens),
+        )
+    for projection in (q_proj, k_proj, v_proj, g_proj):
+        projection.assert_called_once()
 
     actual_cache = SimpleNamespace(conv=conv_seed.clone(), temporal=state_seed.clone())
-    actual = runtime(hidden_states, _prefill_metadata(actual_cache, slot_indices, cu_seqlens))
+    fused_qkvg_error = AssertionError("fused QKVG prefill called a separate projection")
+    with (
+        patch.object(runtime.q_proj, "forward", side_effect=fused_qkvg_error),
+        patch.object(runtime.k_proj, "forward", side_effect=fused_qkvg_error),
+        patch.object(runtime.v_proj, "forward", side_effect=fused_qkvg_error),
+        patch.object(runtime.g_proj, "forward", side_effect=fused_qkvg_error),
+    ):
+        actual = runtime(
+            hidden_states,
+            _prefill_metadata(actual_cache, slot_indices, cu_seqlens),
+        )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(actual_cache.conv, expected_cache.conv, rtol=2e-2, atol=2e-2)
