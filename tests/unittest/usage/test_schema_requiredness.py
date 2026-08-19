@@ -21,7 +21,8 @@ def test_validate_detects_property_missing_from_required(
 ) -> None:
     validator = importlib.import_module("tensorrt_llm.usage.schemas.__main__")
     sms = json.loads(validator.SMS_SCHEMA_PATH.read_text(encoding="utf-8"))
-    sms["definitions"]["events"]["trtllm_heartbeat"]["required"] = []
+    heartbeat = sms["definitions"]["events"]["trtllm_heartbeat"]
+    heartbeat["required"].remove("seq")
 
     schema_path = tmp_path / "schema.json"
     schema_path.write_text(json.dumps(sms), encoding="utf-8")
