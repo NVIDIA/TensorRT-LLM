@@ -629,8 +629,12 @@ def _background_reporter(
     """
     try:
         session = _get_session()
-        session_id = session.session_id if session is not None else uuid.uuid4().hex
-        trtllm_version = session.trtllm_version if session is not None else _get_trtllm_version()
+        # A late authoritative opt-out removes and disables the session before
+        # waking the reporter. Never replace it with an uncorrelated event.
+        if session is None:
+            return
+        session_id = session.session_id
+        trtllm_version = session.trtllm_version
         # --- Collect initial data ---
         system_info = _collect_system_info()
         gpu_info = _collect_gpu_info()
@@ -702,7 +706,7 @@ def _background_reporter(
             session_id=session_id,
             trtllm_version=trtllm_version,
         )
-        if session is not None and not session.claim_initial():
+        if not session.claim_initial():
             return
         _send_to_gxt(payload)
 
