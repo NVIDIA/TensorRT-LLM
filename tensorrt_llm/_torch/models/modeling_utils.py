@@ -23,10 +23,10 @@ from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
 from ...models.modeling_utils import QuantConfig
+from ..attention.attention import Attention
 from ..attention_backend import AttentionMetadata
 from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
-from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
 from ..modules.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..modules.linear import Linear, TensorParallelMode, WeightMode

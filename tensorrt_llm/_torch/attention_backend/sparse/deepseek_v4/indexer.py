@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
-from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils

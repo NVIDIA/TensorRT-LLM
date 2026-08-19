@@ -1,9 +1,9 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from tensorrt_llm._torch.attention_backend.interface import RopeParams
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._torch.modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
 
 @torch.inference_mode()

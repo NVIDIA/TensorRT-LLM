@@ -31,7 +31,7 @@ from ..attention_backend.interface import AttentionBackend, PredefinedAttentionM
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from .linear import Linear, TensorParallelMode
+from ..modules.linear import Linear, TensorParallelMode
 
 
 class CrossAttention(nn.Module):

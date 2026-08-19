@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.attention_backend.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
@@ -25,7 +26,6 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
     do_multi_stream,
     maybe_execute_in_parallel,
 )
-from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.deep_gemm import (

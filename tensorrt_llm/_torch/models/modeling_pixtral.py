@@ -7,11 +7,11 @@ import torch
 import transformers
 
 from tensorrt_llm._torch import model_config as model_config_lib
+from tensorrt_llm._torch.attention import attention as trtllm_attention
 from tensorrt_llm._torch.attention_backend import interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
-from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import gated_mlp as trtllm_gated_mlp
 from tensorrt_llm._torch.modules import rms_norm as trtllm_rmsnorm
 from tensorrt_llm._utils import prefer_pinned
@@ -288,7 +288,7 @@ class _RopeFunction:
         self._cos, self._sin = position_embeddings
 
     # This signature matches that of
-    # `tensorrt_llm/_torch/modules/rotary_embedding.py::RotaryEmbedding.forward` so that we are
+    # `tensorrt_llm/_torch/attention/rotary_embedding.py::RotaryEmbedding.forward` so that we are
     # able to override the `PixtralAttentionLayer.rotary_embed` attribute.
     @torch.no_grad()
     def __call__(

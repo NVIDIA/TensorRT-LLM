@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     import torch
 
+    from ...attention.attention import Attention
+    from ...attention.mla import MLA
     from ...distributed import AllReduceParams
-    from ...modules.attention import Attention
-    from ...modules.mla import MLA
     from ..interface import AttentionForwardArgs, AttentionMask, AttentionMetadata
     from ..trtllm import TrtllmAttention
     from .params import SparseRuntimeParams

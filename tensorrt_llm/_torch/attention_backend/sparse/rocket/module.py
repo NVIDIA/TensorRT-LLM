@@ -11,7 +11,7 @@ from tensorrt_llm.logger import logger
 from ..hooks import AttentionSparseHooks, register_attention_sparse_hooks
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.modules.attention import Attention
+    from tensorrt_llm._torch.attention.attention import Attention
 
 
 def initialize_sparse_attn(self) -> None:

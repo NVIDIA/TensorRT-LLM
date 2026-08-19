@@ -7,10 +7,10 @@ from transformers import BertConfig
 from tensorrt_llm.llmapi.utils import logger_debug
 from tensorrt_llm.logger import logger
 
+from ..attention.attention import Attention
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear

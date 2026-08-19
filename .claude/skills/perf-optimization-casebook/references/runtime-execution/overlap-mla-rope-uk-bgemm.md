@@ -32,4 +32,4 @@ measured: []
 - **Accuracy risk:** lossless (pure scheduling; disjoint writes). The FP8 BGEMM path carries its own FP8 risk independent of this overlap.
 - **Verify:** decode step latency + nsys timeline showing BGEMM and RoPE overlapping on two streams; parity-equal attention output vs serial path; correctness with CUDA graphs on/off.
 - **Rollback:** pass `aux_stream=None` (or disable multi-stream / CUDA graphs) to run serially. Trigger: capture failures or no measured overlap.
-- **Prior art:** PR #8495. Files: `_torch/modules/attention.py`, `cpp/.../thop/dsv3RopeOp.cpp` (`mla_rope_generation`), `attention_backend/trtllm.py`. Related: the [shared/routed-expert overlap case](multi-stream-shared-routed-expert.md) (same `maybe_execute_in_parallel` pattern).
+- **Prior art:** PR #8495. Files: `_torch/attention/attention.py`, `cpp/.../thop/dsv3RopeOp.cpp` (`mla_rope_generation`), `attention_backend/trtllm.py`. Related: the [shared/routed-expert overlap case](multi-stream-shared-routed-expert.md) (same `maybe_execute_in_parallel` pattern).

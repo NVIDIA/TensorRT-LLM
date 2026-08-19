@@ -44,6 +44,9 @@ from ..attention_backend.sparse.hooks import get_sparse_mla_hooks
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
+from ..modules.linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph
 from ..utils import (
     AuxStreamType,
@@ -59,9 +62,6 @@ from .attention import (
     _helix_zero_kv_mask,
     extract_extra_attrs,
 )
-from .linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
-from .multi_stream_utils import maybe_execute_in_parallel
-from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
 

@@ -37,6 +37,7 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ...logger import logger
+from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import AllReduce
@@ -46,7 +47,6 @@ from ..modules.embedding import Embedding
 from ..modules.fused_moe import DeepSeekV3MoeRoutingMethod, create_moe
 from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 from ..modules.gated_mlp import GatedMLP
-from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model

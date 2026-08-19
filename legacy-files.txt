@@ -96,6 +96,9 @@ scripts/test_to_stage_mapping.py
 setup.py
 tensorrt_llm/__init__.py
 tensorrt_llm/_torch/__init__.py
+tensorrt_llm/_torch/attention/attention.py
+tensorrt_llm/_torch/attention/qk_norm_attention.py
+tensorrt_llm/_torch/attention/rotary_embedding.py
 tensorrt_llm/_torch/attention_backend/__init__.py
 tensorrt_llm/_torch/attention_backend/flashinfer.py
 tensorrt_llm/_torch/attention_backend/interface.py
@@ -229,7 +232,6 @@ tensorrt_llm/_torch/models/modeling_speculative.py
 tensorrt_llm/_torch/models/modeling_utils.py
 tensorrt_llm/_torch/models/modeling_vila.py
 tensorrt_llm/_torch/modules/__init__.py
-tensorrt_llm/_torch/modules/attention.py
 tensorrt_llm/_torch/modules/decoder_layer.py
 tensorrt_llm/_torch/modules/embedding.py
 tensorrt_llm/_torch/modules/fla/__init__.py
@@ -278,9 +280,7 @@ tensorrt_llm/_torch/modules/mamba/ssd_combined.py
 tensorrt_llm/_torch/modules/mamba/ssd_state_passing.py
 tensorrt_llm/_torch/modules/mlp.py
 tensorrt_llm/_torch/modules/multi_stream_utils.py
-tensorrt_llm/_torch/modules/qk_norm_attention.py
 tensorrt_llm/_torch/modules/rms_norm.py
-tensorrt_llm/_torch/modules/rotary_embedding.py
 tensorrt_llm/_torch/modules/swiglu.py
 tensorrt_llm/_torch/modules/triton_linear.py
 tensorrt_llm/_torch/peft/__init__.py

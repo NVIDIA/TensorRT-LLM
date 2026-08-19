@@ -28,6 +28,7 @@ import torch
 from utils.util import getSMVersion
 
 import tensorrt_llm
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import (
     triton_convert_req_index_to_global_index,
@@ -44,7 +45,6 @@ from tensorrt_llm._torch.attention_backend.sparse.hooks import (
 from tensorrt_llm._torch.attention_backend.sparse.params import SparseParams, SparseRuntimeParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
