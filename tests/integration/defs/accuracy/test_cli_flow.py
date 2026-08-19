@@ -230,12 +230,6 @@ class TestTinyLlama1_1BChat(CliFlowAccuracyTestHarness):
         self.run(extra_acc_spec="pp_size=4", pp_size=4)
 
 
-class TestLlama3_8BInstructGradient1048k(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "gradientai/Llama-3-8B-Instruct-Gradient-1048k"
-    MODEL_PATH = f"{llm_models_root()}/llama-models-v3/Llama-3-8B-Instruct-Gradient-1048k"
-    EXAMPLE_FOLDER = "models/core/llama"
-
-
 class TestLlama3_1_8B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
