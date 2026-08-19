@@ -318,7 +318,7 @@ class TestE2ECapture:
         assert set(features.keys()) == expected_keys
 
         # Schema version
-        assert payload["eventSchemaVer"] == "0.8"
+        assert payload["eventSchemaVer"] == "0.7"
 
         # Disagg fields present (may be empty strings)
         assert "disaggRole" in params
@@ -331,7 +331,7 @@ class TestE2ECapture:
         # heartbeat must contain the current counter snapshot for the same
         # process-scoped telemetry session.
         assert heartbeat_payload["sessionId"] == payload["sessionId"]
-        assert heartbeat_payload["eventSchemaVer"] == "0.8"
+        assert heartbeat_payload["eventSchemaVer"] == "0.7"
         heartbeat = heartbeat_payload["events"][0]
         assert heartbeat["name"] == "trtllm_heartbeat"
         assert heartbeat["parameters"]["seq"] == 0
@@ -371,7 +371,7 @@ class TestE2ECapture:
         payload = CaptureHandler.captured_payloads[0]
         event = payload["events"][0]
         params = event["parameters"]
-        assert payload["eventSchemaVer"] == "0.8"
+        assert payload["eventSchemaVer"] == "0.7"
         _assert_lifecycle_snapshot(
             params,
             active_instances=1,
@@ -431,7 +431,7 @@ with LLM(
         initial_payload = _wait_for_event("trtllm_initial_report", timeout=5)
         exit_payload = _wait_for_event("trtllm_exit_report", timeout=5)
         assert exit_payload["sessionId"] == initial_payload["sessionId"]
-        assert exit_payload["eventSchemaVer"] == "0.8"
+        assert exit_payload["eventSchemaVer"] == "0.7"
 
         terminal_events = [
             payload

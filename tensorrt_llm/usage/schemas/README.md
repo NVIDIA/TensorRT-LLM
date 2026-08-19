@@ -1,6 +1,6 @@
 # TRT-LLM Telemetry Schema Reference
 
-Schema version: **0.8** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
+Schema version: **0.7** | Client ID: `616561816355034` | Protocol: GXT Event Protocol v1.6
 
 ## Overview
 
@@ -31,7 +31,7 @@ these top-level fields in Kibana alongside the event parameters.
 | `clientType` | string | Always `"Native"`. |
 | `clientVer` | string | TRT-LLM version, e.g. `"1.3.0rc9"`. |
 | `eventProtocol` | string | Always `"1.6"`. |
-| `eventSchemaVer` | string | Schema version, currently `"0.8"`. |
+| `eventSchemaVer` | string | Schema version, currently `"0.7"`. |
 | `eventSysVer` | string | Always `"trtllm-telemetry/1.0"`. |
 | `sessionId` | string | Unique hex UUID per telemetry session. Use this to correlate initial, heartbeat, and terminal events. |
 | `sentTs` | string | ISO 8601 UTC timestamp of when the payload was sent. |
