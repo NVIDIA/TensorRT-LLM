@@ -404,6 +404,10 @@ def test_deepseek_v4_mla_builds_both_norms_at_the_v4_widths():
             index_n_heads=32, index_head_dim=128, index_topk=512
         ),
     )
+    if getSMVersion() in (120, 121):
+        # SM120/SM121 only support DeepSeek-V4 sparse MLA through the FlashInfer
+        # fp8_ds_mla path; construction raises ValueError with any other dtype.
+        model_config.extra_attrs["kv_cache_dtype"] = "fp8_ds_mla"
     mla = MLA(
         hidden_size=cfg.hidden_size,
         num_attention_heads=cfg.num_attention_heads,
