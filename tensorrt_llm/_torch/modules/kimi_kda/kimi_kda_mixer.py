@@ -22,6 +22,7 @@ import os
 from typing import List, Optional, Tuple
 
 import torch
+from fla.modules import ShortConvolution
 from torch import nn
 
 from ...attention_backend import AttentionMetadata
@@ -56,37 +57,6 @@ def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
         return tensor.to(dtype=dtype)
 
     module._apply(_cast)
-
-
-class _KDAShortConvolution(nn.Module):
-    """Own KDA convolution weights without importing the FLA fallback."""
-
-    def __init__(self, hidden_size: int, kernel_size: int, activation: str) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.kernel_size = kernel_size
-        self.activation = activation
-        self.weight = nn.Parameter(torch.empty(hidden_size, 1, kernel_size))
-        nn.init.xavier_uniform_(self.weight)
-        self._fallback_convolution: Optional[nn.Module] = None
-
-    def forward(
-        self, x: torch.Tensor, **kwargs: torch.Tensor | bool | None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Lazily construct the portable FLA operator with the owned weight."""
-        convolution = self._fallback_convolution
-        if convolution is None:
-            from fla.modules import ShortConvolution
-
-            convolution = ShortConvolution(
-                hidden_size=self.hidden_size,
-                kernel_size=self.kernel_size,
-                activation=self.activation,
-            )
-            # Keep the adapter out of state_dict; this module owns the checkpoint weight.
-            object.__setattr__(self, "_fallback_convolution", convolution)
-        convolution.weight = self.weight
-        return convolution(x, **kwargs)
 
 
 def _kda_split_conv_sections(
@@ -150,13 +120,13 @@ class KimiKDALinearAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-        self.q_conv1d = _KDAShortConvolution(
+        self.q_conv1d = ShortConvolution(
             hidden_size=projection_size, kernel_size=self.conv_size, activation="silu"
         )
-        self.k_conv1d = _KDAShortConvolution(
+        self.k_conv1d = ShortConvolution(
             hidden_size=projection_size, kernel_size=self.conv_size, activation="silu"
         )
-        self.v_conv1d = _KDAShortConvolution(
+        self.v_conv1d = ShortConvolution(
             hidden_size=projection_size, kernel_size=self.conv_size, activation="silu"
         )
 
