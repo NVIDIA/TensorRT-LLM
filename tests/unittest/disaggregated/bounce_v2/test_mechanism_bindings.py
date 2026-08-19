@@ -72,8 +72,10 @@ def _collect(poller, timeout_ms: int, got: dict[int, tuple[int, int]]) -> None:
 def _drain_ids(
     poller, expected_ids, deadline_s: float = 30.0, got=None
 ) -> dict[int, tuple[int, int]]:
-    """Drain until every id in expected_ids is seen (bounded). Returns {id: (kind, ok)}.
-    `got` carries completions already drained (e.g. during a BUSY-retry loop).
+    """Drain until every id in expected_ids is seen (bounded).
+
+    Returns {id: (kind, ok)}. `got` carries completions already drained
+    (e.g. during a BUSY-retry loop).
     """
     expected = set(expected_ids)
     got = dict(got or {})
@@ -87,8 +89,10 @@ def _drain_ids(
 
 
 def _submit_retry(pool, poller, srcs, dsts, sizes, got, deadline_s: float = 30.0) -> int:
-    """submit_copy with a bounded BUSY-retry loop; completions drained while waiting for a
-    free context are merged into `got` (they belong to earlier submissions).
+    """submit_copy with a bounded BUSY-retry loop.
+
+    Completions drained while waiting for a free context are merged into
+    `got` (they belong to earlier submissions).
     """
     deadline = time.monotonic() + deadline_s
     while True:
@@ -110,8 +114,10 @@ def _submit_and_wait(pool, poller, srcs, dsts, sizes, deadline_s: float = 30.0) 
 
 
 def _roundtrip(pool, poller, sizes: list[int], seed: int) -> None:
-    """Gather scattered source regions into a packed staging run, scatter them back out to a
-    separate destination buffer, and require byte-exact regions AND untouched inter-region gaps.
+    """Gather scattered regions into a packed run, then scatter them back out.
+
+    The scatter targets a separate destination buffer; require byte-exact
+    regions AND untouched inter-region gaps.
     """
     gap = 160  # deliberately not a multiple of 32 so region starts are unaligned
     total = int(sum(sizes))
