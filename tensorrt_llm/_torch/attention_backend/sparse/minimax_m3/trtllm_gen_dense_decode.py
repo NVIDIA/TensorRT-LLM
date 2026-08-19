@@ -156,9 +156,7 @@ def minimax_m3_trtllm_gen_dense_decode(
     staged, used when staged_subpages_per_slot matches this layer's factor and
     expanded here otherwise; see subpage_block_table.
     """
-    from tensorrt_llm._torch.attention_backend.fmha.flashinfer_trtllm_gen import (
-        _trtllm_gen_batch_decode_with_kv_cache,
-    )
+    import flashinfer
 
     kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
     num_heads = int(q.shape[1])
@@ -179,27 +177,31 @@ def minimax_m3_trtllm_gen_dense_decode(
     if staged_subpage_table is None or staged_subpages_per_slot != subpages_per_slot:
         staged_subpage_table = subpage_block_table(block_table, subpages_per_slot, reserve)
 
-    _trtllm_gen_batch_decode_with_kv_cache(
-        q,  # query
-        kv_pool,  # kv_pool
-        workspace,  # workspace_buffer
-        _counter_buffer(
+    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        query=q,
+        # The tuple form takes the K and V page views separately, which is what
+        # a flat sub-page pool is: both rows of the block table index into it.
+        kv_cache=(kv_pool, kv_pool),
+        workspace_buffer=workspace,
+        block_tables=staged_subpage_table,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        bmm1_scale=sm_scale,
+        bmm2_scale=1.0,
+        window_left=-1,  # M3 dense layers are fully causal
+        out=output,
+        sinks=None,
+        kv_layout="HND",
+        enable_pdl=enable_pdl,
+        backend="trtllm-gen",
+        q_len_per_req=decode_query_len,
+        max_q_len=None,
+        cum_seq_lens_q=None,
+        kv_cache_sf=None,  # M3 stores unscaled E4M3
+        uses_shared_paged_kv_idx=False,
+        multi_ctas_kv_counter_buffer=_counter_buffer(
             q.device, num_heads, max_num_requests, reserve
-        ),  # multi_ctas_kv_counter_buffer
-        staged_subpage_table,  # block_tables
-        seq_lens,  # seq_lens
-        max_seq_len,  # max_seq_len
-        sm_scale,  # bmm1_scale
-        1.0,  # bmm2_scale
-        -1,  # window_left: M3 dense layers are fully causal
-        output,  # out
-        None,  # sinks
-        enable_pdl,  # enable_pdl
-        decode_query_len,  # q_len_per_req
-        None,  # max_q_len
-        None,  # cum_seq_lens_q
-        None,  # kv_scale_pool: M3 stores unscaled E4M3
-        False,  # uses_shared_paged_kv_idx
+        ),
     )
 
 
