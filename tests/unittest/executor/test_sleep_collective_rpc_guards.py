@@ -1115,6 +1115,7 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         because error_msg is still None when the exception bypasses the except
         clause — leaving rank-0 with an inconsistent view of the operation.
         """
+        import threading
         from types import SimpleNamespace
         from unittest.mock import patch
 
@@ -1134,6 +1135,10 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
+        executor.control_request_barrier = threading.Event()
+        executor.control_request_barrier.set()
+        executor.control_action_done = threading.Event()
+        executor._active_control_id = None
 
         with (
             patch("torch.cuda.set_device"),
@@ -1146,23 +1151,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
             ),
             patch("torch.cuda.synchronize"),
         ):
-            # The loop receives one message then raises MemoryError which is
-            # not in the narrow except.  We patch recv to raise StopIteration
-            # on the second call so the loop terminates cleanly in the test.
-            call_count = [0]
-
-            def _recv_once(self_inner, source, tag):
-                call_count[0] += 1
-                if call_count[0] > 1:
-                    raise StopIteration
-                return {"action": "sleep", "tags": ["kv_cache"]}
-
-            executor._sleep_wakeup_comm.recv = lambda source, tag: _recv_once(None, source, tag)
-
-            try:
+            with pytest.raises(MemoryError, match="simulated OOM outside except list"):
                 executor._sleep_wakeup_listener_loop()
-            except StopIteration:
-                pass
 
         assert sent_acks, "finally block must send an ACK even for uncaught exceptions"
         assert sent_acks[0]["status"] == "error", (
@@ -1171,6 +1161,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         )
         assert sent_acks[0]["error"] is not None
         assert "MemoryError" in sent_acks[0]["error"]
+        assert not executor.control_request_barrier.is_set()
+        assert executor.control_action_done.is_set()
 
 
 class TestListenerAbortAndShutdown:
