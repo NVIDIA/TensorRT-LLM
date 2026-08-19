@@ -43,8 +43,12 @@ from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.modules.packed_qkv import (
+    build_packed_qkv,
+    select_packed_qkv_recipe,
+)
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-from tensorrt_llm._torch.visual_gen.utils import SequenceSharder, linear_supports_packed_addmm
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
@@ -543,15 +547,15 @@ class QwenJointAttention(Attention):
 
         # Fused joint-QKV packing (concat elimination). When engaged, the two
         # per-stream merged projections write straight into the packed joint
-        # QKV buffer through the registered `trtllm_vgoa::packed_qkv_proj`
-        # custom op (two addmm calls into contiguous `out=` row-slices),
-        # eliminating the torch.cat's in `_prepare_qkv_fused` with no
-        # functionalization copy-back under the per-block torch.compile.
-        # Engine-internal gating only (no public knob); the op consumes
-        # `img_qkv_proj.weight/bias` and `add_qkv_proj.weight/bias` DIRECTLY
-        # (no post-load packing or repointing), so the flag is just a
-        # post-load eligibility census set in `finalize_fused_qkv_pack()`.
-        self._use_fused_qkv_pack = False
+        # QKV buffer through the selected recipe's functional leaf op (see
+        # `visual_gen/modules/packed_qkv.py`), eliminating the torch.cat's in
+        # `_prepare_qkv_fused` with no functionalization copy-back under the
+        # per-block torch.compile. Engine-internal gating only (no public
+        # knob); the leaf ops consume the merged Linears' native parameters
+        # DIRECTLY (no post-load packing or repointing), so this is just the
+        # recipe key selected post-load in `finalize_fused_qkv_pack()`
+        # (None = merged forward + seq-dim cat fallback).
+        self._qkv_pack_recipe: Optional[str] = None
 
         # QK-norms, applied per-head on the head_dim.
         self.norm_added_q = RMSNorm(
@@ -642,39 +646,37 @@ class QwenJointAttention(Attention):
     def _qkv_pack_linears(self) -> Tuple[Linear, ...]:
         return (self.img_qkv_proj, self.add_qkv_proj)
 
-    def _qkv_pack_eligibility(self) -> bool:
-        """Post-load eligibility for the packed joint-QKV addmm path.
+    def _qkv_pack_recipe_census(self) -> Optional[str]:
+        """Post-load recipe selection for the packed joint-QKV path.
 
-        The fused path only ever runs inside `_prepare_qkv_fused`, so fused
-        QK-norm+RoPE being configured (`fuse_qk_norm_rope`, TP=1) is a
-        precondition; the runtime bf16/cuda/head-dim gate stays
-        `_use_fused_qk_norm_rope`.
+        Model-level preconditions first (the fused path only ever runs
+        inside `_prepare_qkv_fused`, so fused QK-norm+RoPE being configured
+        and TP=1; the runtime bf16/cuda/head-dim gate stays
+        `_use_fused_qk_norm_rope`); the per-Linear capability census and
+        recipe dispatch are the shared `select_packed_qkv_recipe` seam.
         """
         if not (self.fuse_qk_norm_rope and self.qk_norm):
-            return False
+            return None
         if self.tp_size != 1:
-            return False
-        # Per-Linear census (strict unquantized-bf16 check, shape match, no
-        # collective/LoRA/alternate-GEMM-backend) is shared VisualGen logic.
+            return None
         packed_dim = self.local_q_dim + 2 * self.local_kv_dim
-        return all(
-            linear_supports_packed_addmm(
-                linear, out_features=packed_dim, in_features=self.hidden_size
-            )
-            for linear in self._qkv_pack_linears()
+        return select_packed_qkv_recipe(
+            self._qkv_pack_linears(),
+            out_features=packed_dim,
+            in_features=self.hidden_size,
         )
 
     def finalize_fused_qkv_pack(self) -> None:
-        """Enable the packed joint-QKV custom-op path after weight loading.
+        """Select the packed joint-QKV recipe after weight loading.
 
         Called from `QwenImageTransformer2DModel.post_load_weights()` (after
         every Linear's own `post_load_weights`, so quant methods and weight
-        placement are final). Unlike the packed-tensor formulation this
-        replaces, there is nothing to build: the custom op reads the merged
-        Linears' own weight/bias parameters, so this is a pure eligibility
-        census. Any later weight reload stays coherent automatically.
+        placement are final). There is nothing to build: the recipe leaf ops
+        read the merged Linears' own parameters, so this is a pure
+        eligibility census. Any later weight reload stays coherent
+        automatically.
         """
-        self._use_fused_qkv_pack = self._qkv_pack_eligibility()
+        self._qkv_pack_recipe = self._qkv_pack_recipe_census()
 
     @staticmethod
     def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
@@ -699,24 +701,24 @@ class QwenJointAttention(Attention):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        """Concat-free packed joint QKV via ``trtllm_vgoa::packed_qkv_proj``.
+        """Concat-free packed joint QKV via the selected recipe's leaf op.
 
-        The registered custom op (defined in ``visual_gen/utils.py``,
-        registered when this module imports it) allocates the packed
-        buffer and projects both streams into its ``out=`` row slices. Going
-        through the op registry (instead of inlining the two addmm(out=)
-        calls here) keeps the buffer ownership opaque to inductor under the
-        production per-block torch.compile, so no functionalization
-        copy-back kernel is emitted. The weights are the merged Linears' own
-        parameters — no packed shadow copies.
+        Dispatches through `visual_gen/modules/packed_qkv.py`, which houses
+        every recipe (functional custom op + census + builder) in one place.
+        The recipe's registered leaf op allocates the packed buffer and
+        projects both streams into its ``out=`` row slices; going through
+        the op registry (instead of inlining the ``out=`` writes here) keeps
+        the buffer ownership opaque to inductor under the production
+        per-block torch.compile, so no functionalization copy-back kernel is
+        emitted. The weights are the merged Linears' own parameters — no
+        packed shadow copies.
         """
-        return torch.ops.trtllm_vgoa.packed_qkv_proj(
+        return build_packed_qkv(
+            self._qkv_pack_recipe,
             encoder_hidden_states,
             hidden_states,
-            self.add_qkv_proj.weight,
-            self.add_qkv_proj.bias,
-            self.img_qkv_proj.weight,
-            self.img_qkv_proj.bias,
+            self.add_qkv_proj,
+            self.img_qkv_proj,
         )
 
     def _prepare_qkv_fused(
@@ -726,11 +728,11 @@ class QwenJointAttention(Attention):
         image_rotary_emb: Tuple[torch.Tensor, torch.Tensor],
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Trace-time constants under the per-block torch.compile: flag is
-        # frozen post-load, shapes/dtypes recompile-guarded. B == 1 is the
+        # Trace-time constants under the per-block torch.compile: the recipe
+        # is frozen post-load, shapes/dtypes recompile-guarded. B == 1 is the
         # production CFG shape (two sequential B=1 calls); B > 1 falls back.
         use_packed = (
-            self._use_fused_qkv_pack
+            self._qkv_pack_recipe is not None
             and isinstance(hidden_states, torch.Tensor)
             and isinstance(encoder_hidden_states, torch.Tensor)
             and hidden_states.shape[0] == 1

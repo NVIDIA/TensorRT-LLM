@@ -1,10 +1,10 @@
-"""Unit tests for the packed joint-QKV projection op and its eligibility
-census (``tensorrt_llm/_torch/visual_gen/utils.py``).
+"""Unit tests for the packed joint-QKV projection recipes and their dispatch
+seam (``tensorrt_llm/_torch/visual_gen/modules/packed_qkv.py``).
 
-The op is the concat-elimination fast lane used by Qwen-Image joint
-attention: two ``addmm`` calls writing both per-stream merged-QKV
-projections straight into row slices of one packed buffer, replacing the
-per-stream projections + seq-dim ``torch.cat``.
+The packed projection is the concat-elimination fast lane used by Qwen-Image
+joint attention: the selected recipe's functional leaf op writes both
+per-stream merged-QKV projections straight into row slices of one packed
+buffer, replacing the per-stream projections + seq-dim ``torch.cat``.
 """
 
 import pytest
@@ -13,8 +13,12 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear
 
-# Importing utils registers the trtllm_vgoa::packed_qkv_proj custom op.
-from tensorrt_llm._torch.visual_gen.utils import linear_supports_packed_addmm
+# Importing the module registers the trtllm_vgoa::packed_qkv_proj_* leaf ops.
+from tensorrt_llm._torch.visual_gen.modules.packed_qkv import (
+    build_packed_qkv,
+    linear_supports_packed_addmm,
+    select_packed_qkv_recipe,
+)
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -38,13 +42,21 @@ def _make_inputs(device="cuda", dtype=torch.bfloat16):
     return txt, img, w_txt, b_txt, w_img, b_img
 
 
+def _make_merged_linear(dtype=torch.bfloat16):
+    linear = Linear(HIDDEN, PACKED, bias=True, dtype=dtype).cuda()
+    with torch.no_grad():
+        linear.weight.copy_(torch.randn_like(linear.weight))
+        linear.bias.copy_(torch.randn_like(linear.bias))
+    return linear
+
+
 @requires_cuda
-def test_packed_qkv_proj_matches_merged_linear_plus_cat():
+def test_packed_qkv_proj_bf16_matches_merged_linear_plus_cat():
     """The op output must be bit-identical to the fallback path it replaces
     (per-stream merged projection + one seq-dim cat): same GEMM problems on
     the same inputs, only the output placement differs."""
     txt, img, w_txt, b_txt, w_img, b_img = _make_inputs()
-    out = torch.ops.trtllm_vgoa.packed_qkv_proj(txt, img, w_txt, b_txt, w_img, b_img)
+    out = torch.ops.trtllm_vgoa.packed_qkv_proj_bf16(txt, img, w_txt, b_txt, w_img, b_img)
     ref = torch.cat([F.linear(txt, w_txt, b_txt), F.linear(img, w_img, b_img)], dim=1)
     assert out.shape == (1, S_TXT + S_IMG, PACKED)
     assert out.dtype == txt.dtype
@@ -52,11 +64,11 @@ def test_packed_qkv_proj_matches_merged_linear_plus_cat():
 
 
 @requires_cuda
-def test_packed_qkv_proj_opcheck():
+def test_packed_qkv_proj_bf16_opcheck():
     """torch.library.opcheck validates the schema, fake impl, and
     functional (alias-free) contract the compiled path relies on."""
     args = _make_inputs()
-    torch.library.opcheck(torch.ops.trtllm_vgoa.packed_qkv_proj, args)
+    torch.library.opcheck(torch.ops.trtllm_vgoa.packed_qkv_proj_bf16, args)
 
 
 @requires_cuda
@@ -78,3 +90,34 @@ def test_linear_supports_packed_addmm_census():
 def test_linear_supports_packed_addmm_rejects_cpu_weights():
     cpu_linear = Linear(HIDDEN, PACKED, bias=True, dtype=torch.bfloat16)
     assert not linear_supports_packed_addmm(cpu_linear, out_features=PACKED, in_features=HIDDEN)
+
+
+@requires_cuda
+def test_recipe_dispatch_select_and_build():
+    """The single dispatch seam: the census selects the bf16 recipe for an
+    eligible merged-Linear pair, the builder reproduces the fallback path
+    bit-identically from the Linears' native parameters, and any ineligible
+    Linear in the pair drops dispatch to None (caller keeps the
+    merged-forward + cat fallback)."""
+    txt_proj = _make_merged_linear()
+    img_proj = _make_merged_linear()
+    recipe = select_packed_qkv_recipe((txt_proj, img_proj), out_features=PACKED, in_features=HIDDEN)
+    assert recipe == "bf16"
+
+    torch.manual_seed(1)
+    txt = torch.randn(1, S_TXT, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    img = torch.randn(1, S_IMG, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    out = build_packed_qkv(recipe, txt, img, txt_proj, img_proj)
+    ref = torch.cat(
+        [
+            F.linear(txt, txt_proj.weight, txt_proj.bias),
+            F.linear(img, img_proj.weight, img_proj.bias),
+        ],
+        dim=1,
+    )
+    assert torch.equal(out, ref)
+
+    fp16 = Linear(HIDDEN, PACKED, bias=True, dtype=torch.float16).cuda()
+    assert (
+        select_packed_qkv_recipe((txt_proj, fp16), out_features=PACKED, in_features=HIDDEN) is None
+    )
