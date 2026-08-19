@@ -36,10 +36,12 @@ class CacheEntryState(Enum):
     READY = auto()
 
 
-class CacheAllocationKind(Enum):
+class CacheAllocationResult(Enum):
+    """How `allocate` satisfied a successful request."""
+
     READY_HIT = auto()
     NEW_RESERVATION = auto()
-    EXISTING_RESERVATION = auto()
+    RESERVATION_HIT = auto()
 
 
 @dataclass
@@ -155,12 +157,14 @@ class TensorLRUCache(Generic[K]):
         expected_bytes: int,
         *,
         retain_after_release: bool = True,
-    ) -> CacheAllocationKind | None:
+    ) -> CacheAllocationResult | None:
         """Add one reference, reserving a missing entry when needed.
 
-        Returns `None` when active requests temporarily use all cache space.
-        An entry larger than the full cache, or a conflicting size or retention
-        setting for an existing key, raises an error.
+        Returns whether the value was ready, a reservation was created, or a
+        reservation was found. Returns `None` when active requests temporarily
+        use all cache space. An entry larger than the full cache, or a
+        conflicting size or retention setting for an existing key, raises an
+        error.
         """
         if expected_bytes <= 0:
             raise ValueError("expected_bytes must be positive")
@@ -183,7 +187,7 @@ class TensorLRUCache(Generic[K]):
                 if entry.state is CacheEntryState.RESERVED:
                     entry.reference_count += 1
                     self._counters.inflight_deduplications += 1
-                    return CacheAllocationKind.EXISTING_RESERVATION
+                    return CacheAllocationResult.RESERVATION_HIT
                 if entry.state is not CacheEntryState.READY:
                     raise RuntimeError(f"unexpected cache entry state: {entry.state}")
 
@@ -195,7 +199,7 @@ class TensorLRUCache(Generic[K]):
                 entry.reference_count += 1
                 self._items.move_to_end(key)
                 self._counters.hits += 1
-                return CacheAllocationKind.READY_HIT
+                return CacheAllocationResult.READY_HIT
 
             if self._in_use_bytes + expected_bytes > self._max_bytes:
                 self._counters.blocked_allocations += 1
@@ -210,9 +214,9 @@ class TensorLRUCache(Generic[K]):
             self._reserved_bytes += expected_bytes
             self._counters.misses += 1
             self._counters.producer_misses += 1
-            return CacheAllocationKind.NEW_RESERVATION
+            return CacheAllocationResult.NEW_RESERVATION
 
-    def get(self, key: K, *, record_lookup: bool = True) -> torch.Tensor | None:
+    def get(self, key: K, *, record_stats: bool = True) -> torch.Tensor | None:
         """Return a cache-owned, immutable tensor and promote it to most-recently-used.
 
         The returned tensor aliases the cached value. Callers must not mutate it.
@@ -220,11 +224,11 @@ class TensorLRUCache(Generic[K]):
         with self._lock:
             entry = self._items.get(key)
             if entry is None or entry.state is not CacheEntryState.READY:
-                if record_lookup:
+                if record_stats:
                     self._counters.misses += 1
                 return None
 
-            if record_lookup:
+            if record_stats:
                 self._counters.hits += 1
             self._items.move_to_end(key)
             self._prepare_for_current_stream(entry)
@@ -316,10 +320,10 @@ class TensorLRUCache(Generic[K]):
                 )
             return True
 
-    def make_space_for(self, key: K, *, additional_bytes: int = 0) -> list[K]:
+    def make_space_for(self, key: K, *, pending_output_bytes: int = 0) -> list[K]:
         """Remove enough unused LRU entries to store the selected outputs."""
-        if additional_bytes < 0:
-            raise ValueError("additional_bytes must be non-negative")
+        if pending_output_bytes < 0:
+            raise ValueError("pending_output_bytes must be non-negative")
         with self._lock:
             entry = self._items.get(key)
             if entry is None or entry.state is not CacheEntryState.RESERVED:
@@ -327,7 +331,7 @@ class TensorLRUCache(Generic[K]):
 
             required_bytes = max(
                 0,
-                self._current_bytes + additional_bytes + entry.size_bytes - self._max_bytes,
+                self._current_bytes + pending_output_bytes + entry.size_bytes - self._max_bytes,
             )
             if required_bytes == 0:
                 return []

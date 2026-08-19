@@ -98,20 +98,20 @@ _UNSET = _Unset()
 
 @dataclass
 class MultimodalEncoderRequestState:
-    """Tracks the encoder-cache entry for each MM item in a request.
+    """Tracks the encoder-cache key for each MM item in a request.
 
     The state is created when an item-scheduled request enters the executor.
     Other requests leave `py_mm_encoder_state` as `None`.
 
     Encoder outputs live only in the model-owned `TensorLRUCache`. This object
-    stores one cache entry ID and one ready flag per item, in prompt order. On
-    the rank that tracks cache references, each non-empty slot holds one. Two
-    identical items may point to the same entry, but each item still holds and
-    releases its own reference. The request does not store another output
-    tensor or combined output buffer.
+    stores one cache key and one ready flag per item, in prompt order. On the
+    rank that tracks cache references, each non-empty slot holds one. Two
+    identical items may point to the same cache entry, but each item still
+    holds and releases its own reference. The request does not store another
+    output tensor or combined output buffer.
 
     Cleanup clears the slots before releasing their references, so repeated
-    request cleanup is safe. Other first-stage ranks keep the same entry IDs
+    request cleanup is safe. Other first-stage ranks keep the same cache keys
     but do not change reference counts. The schedule sent between ranks only
     contains selected items, blocked request IDs, and cache removals.
     """
@@ -126,21 +126,21 @@ class MultimodalEncoderRequestState:
     never has to re-validate user input inside the scheduler loop.
     """
 
-    recorded: List[bool]
-    """Whether each atomic item's bound cache entry is READY, in prompt order."""
+    item_ready: List[bool]
+    """Whether each item's bound cache entry is ready, in prompt order."""
 
-    entry_ids: List[Optional[Hashable]] = field(default_factory=list)
-    """Cache entry IDs held by this request, in prompt order.
+    item_cache_keys: List[Optional[Hashable]] = field(default_factory=list)
+    """Cache keys held by this request, in prompt order.
 
     A non-empty slot holds one reference on the rank that tracks them.
-    `recorded` tells whether the entry already contains its encoder output.
+    `item_ready` tells whether the entry already contains its encoder output.
     """
 
-    cache_item_keys: Union[List[Hashable], None, "_Unset"] = _UNSET
+    stable_item_cache_keys: Union[List[Hashable], None, "_Unset"] = _UNSET
     """Cached per-item reuse keys.
 
     `_UNSET` means the keys have not been computed. `None` means stable keys
-    cannot be built, so this request uses request-local entry IDs instead.
+    cannot be built, so this request uses request-local cache keys instead.
     """
 
     @classmethod
@@ -154,69 +154,71 @@ class MultimodalEncoderRequestState:
             encoder_token_lengths = embedding_lengths
         return cls(embedding_lengths=list(embedding_lengths),
                    encoder_token_lengths=list(encoder_token_lengths),
-                   recorded=[False] * len(embedding_lengths),
-                   entry_ids=[None] * len(embedding_lengths))
+                   item_ready=[False] * len(embedding_lengths),
+                   item_cache_keys=[None] * len(embedding_lengths))
 
     def __post_init__(self) -> None:
-        if not self.entry_ids:
-            self.entry_ids = [None] * len(self.recorded)
+        if not self.item_cache_keys:
+            self.item_cache_keys = [None] * len(self.item_ready)
         if not (len(self.embedding_lengths) == len(self.encoder_token_lengths)
-                == len(self.recorded) == len(self.entry_ids)):
+                == len(self.item_ready) == len(self.item_cache_keys)):
             raise ValueError("MM encoder token and embedding lengths must have "
-                             "exactly one entry per item slot")
+                             "exactly one cache key per item slot")
 
     @property
     def num_items(self) -> int:
-        return len(self.recorded)
+        return len(self.item_ready)
 
     @property
     def progress(self) -> MultimodalEncoderProgress:
-        if all(self.recorded):
+        if all(self.item_ready):
             return MultimodalEncoderProgress.READY
-        if any(self.recorded):
+        if any(self.item_ready):
             return MultimodalEncoderProgress.PARTIAL
         return MultimodalEncoderProgress.PENDING
 
     def pending_item_indices(self) -> List[int]:
         """Indices of items that still need an encoder output, prompt order."""
         return [
-            item_idx for item_idx, done in enumerate(self.recorded) if not done
+            item_idx for item_idx, ready in enumerate(self.item_ready)
+            if not ready
         ]
 
-    def set_item_entry(self, item_idx: int, entry_id: Hashable, *,
-                       ready: bool) -> None:
-        """Assign a cache entry to one item."""
-        if self.entry_ids[item_idx] is not None:
-            raise RuntimeError(f"MM item {item_idx} already has a cache entry")
-        self.entry_ids[item_idx] = entry_id
-        self.recorded[item_idx] = ready
+    def set_item_cache_key(self, item_idx: int, cache_key: Hashable, *,
+                           ready: bool) -> None:
+        """Assign a cache key to one item."""
+        if self.item_cache_keys[item_idx] is not None:
+            raise RuntimeError(f"MM item {item_idx} already has a cache key")
+        self.item_cache_keys[item_idx] = cache_key
+        self.item_ready[item_idx] = ready
 
-    def clear_item_entry(self, item_idx: int) -> Hashable:
-        """Clear one item's cache entry and return its ID."""
-        entry_id = self.entry_ids[item_idx]
-        if entry_id is None:
-            raise RuntimeError(f"MM item {item_idx} has no cache entry")
-        self.entry_ids[item_idx] = None
-        self.recorded[item_idx] = False
-        return entry_id
+    def clear_item_cache_key(self, item_idx: int) -> Hashable:
+        """Clear and return one item's cache key."""
+        cache_key = self.item_cache_keys[item_idx]
+        if cache_key is None:
+            raise RuntimeError(f"MM item {item_idx} has no cache key")
+        self.item_cache_keys[item_idx] = None
+        self.item_ready[item_idx] = False
+        return cache_key
 
-    def mark_entry_ready(self, entry_id: Hashable) -> int:
-        """Mark every item using `entry_id` as ready."""
+    def mark_cache_key_ready(self, cache_key: Hashable) -> int:
+        """Mark every item using `cache_key` as ready."""
         marked = 0
-        for item_idx, bound_entry_id in enumerate(self.entry_ids):
-            if bound_entry_id == entry_id and not self.recorded[item_idx]:
-                self.recorded[item_idx] = True
+        for item_idx, bound_cache_key in enumerate(self.item_cache_keys):
+            if bound_cache_key == cache_key and not self.item_ready[item_idx]:
+                self.item_ready[item_idx] = True
                 marked += 1
         return marked
 
-    def pop_all_entry_ids(self) -> List[Hashable]:
-        """Return and clear all entry IDs, keeping prompt order and duplicates."""
-        entry_ids = [
-            entry_id for entry_id in self.entry_ids if entry_id is not None
+    def pop_all_cache_keys(self) -> List[Hashable]:
+        """Return and clear all cache keys, keeping prompt order and duplicates."""
+        cache_keys = [
+            cache_key for cache_key in self.item_cache_keys
+            if cache_key is not None
         ]
-        self.entry_ids = [None] * len(self.entry_ids)
-        self.recorded = [False] * len(self.recorded)
-        return entry_ids
+        self.item_cache_keys = [None] * len(self.item_cache_keys)
+        self.item_ready = [False] * len(self.item_ready)
+        return cache_keys
 
 
 if TYPE_CHECKING:

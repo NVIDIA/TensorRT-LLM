@@ -6287,7 +6287,7 @@ class PyExecutor:
             self.active_requests, self.inflight_req_ids)
 
         if self._pending_mm_encoder_cache_removals:
-            if not self._owns_mm_encoder_cache_refs():
+            if not self._owns_mm_encoder_cache_references():
                 raise RuntimeError(
                     "A rank without MM cache references queued a cache removal")
             scheduler_output = scheduler_output._replace(
@@ -6361,10 +6361,10 @@ class PyExecutor:
         """Update the MM cache and encode selected items before LLM prefill."""
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items or {}
         try:
-            self.model_engine.apply_multimodal_encoder_schedule(
+            self.model_engine.run_multimodal_encoder_schedule(
                 self.active_requests,
                 scheduled_requests,
-                owns_cache_refs=self._owns_mm_encoder_cache_refs(),
+                owns_cache_references=self._owns_mm_encoder_cache_references(),
             )
         except MultimodalEncoderRequestError as e:
             error_msg = str(e)
@@ -7785,7 +7785,7 @@ class PyExecutor:
                 request.set_exclude_last_generation_logits(False)
                 request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
-    def _owns_mm_encoder_cache_refs(self) -> bool:
+    def _owns_mm_encoder_cache_references(self) -> bool:
         """Return whether this rank tracks MM cache references and eviction."""
         return (self._mm_encoder_item_scheduling_enabled
                 and self.dist.is_first_pp_rank
@@ -7796,18 +7796,19 @@ class PyExecutor:
         """Release this request's cache entries and discard unused MM data."""
         state = request.py_mm_encoder_state
         if state is not None:
-            entry_ids = state.pop_all_entry_ids()
+            cache_keys = state.pop_all_cache_keys()
             request.py_mm_encoder_state = None
-            if self._owns_mm_encoder_cache_refs():
+            if self._owns_mm_encoder_cache_references():
                 encoder_cache = self.model_engine.mm_encoder_cache
                 if encoder_cache is None:
                     raise RuntimeError(
                         "The MM cache-reference rank has no encoder cache")
-                for entry_id in entry_ids:
-                    removed_entry_id = encoder_cache.release(entry_id)
-                    if (removed_entry_id is not None and self.dist.pp_size > 1):
+                for cache_key in cache_keys:
+                    removed_cache_key = encoder_cache.release(cache_key)
+                    if (removed_cache_key is not None
+                            and self.dist.pp_size > 1):
                         self._pending_mm_encoder_cache_removals.append(
-                            removed_entry_id)
+                            removed_cache_key)
 
         mm_data = getattr(request, "py_multimodal_data", None)
         if mm_data:
@@ -8660,8 +8661,8 @@ class PyExecutor:
         live_request_ids = [
             request.py_request_id for request in self.active_requests
             if request.py_mm_encoder_state is not None and any(
-                entry_id is not None
-                for entry_id in request.py_mm_encoder_state.entry_ids)
+                cache_key is not None
+                for cache_key in request.py_mm_encoder_state.item_cache_keys)
         ]
         if live_request_ids:
             raise RuntimeError(

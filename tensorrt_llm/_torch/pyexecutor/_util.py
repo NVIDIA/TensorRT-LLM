@@ -3127,7 +3127,7 @@ def create_py_executor_instance(
             max_batch_size=model_engine.encoder_batch_size,
             max_num_tokens=model_engine.encoder_max_num_tokens,
             encoder_cache=encoder_cache,
-            get_cache_item_keys=model_engine.get_mm_encoder_item_keys,
+            get_item_cache_keys=model_engine.get_mm_encoder_item_cache_keys,
             bytes_per_encoder_embedding=(
                 model_engine.bytes_per_mm_encoder_embedding),
             retain_cache_entries=model_engine.model.encoder_cache_active,

@@ -20,7 +20,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.tensor_lru_cache import (
-    CacheAllocationKind,
+    CacheAllocationResult,
     CacheEntryState,
     TensorLRUCache,
 )
@@ -61,7 +61,7 @@ def test_put_get_pop_and_clear_update_byte_accounting() -> None:
 def test_clear_rejects_live_references_and_reservations() -> None:
     cache = TensorLRUCache[str](max_bytes=32)
 
-    assert cache.allocate("key", 8) is CacheAllocationKind.NEW_RESERVATION
+    assert cache.allocate("key", 8) is CacheAllocationResult.NEW_RESERVATION
     with pytest.raises(RuntimeError, match="live references or reservations"):
         cache.clear()
 
@@ -210,8 +210,8 @@ def test_shared_reservation_stores_one_output_and_keeps_reusable_entry() -> None
     cache = TensorLRUCache[str](max_bytes=16)
     value = torch.ones(2, dtype=torch.float32)
 
-    assert cache.allocate("key", 8) is CacheAllocationKind.NEW_RESERVATION
-    assert cache.allocate("key", 8) is CacheAllocationKind.EXISTING_RESERVATION
+    assert cache.allocate("key", 8) is CacheAllocationResult.NEW_RESERVATION
+    assert cache.allocate("key", 8) is CacheAllocationResult.RESERVATION_HIT
     assert cache.current_bytes == 0
     assert cache.stats().reserved_bytes == 8
     assert cache.stats().pinned_bytes == 0
@@ -221,7 +221,7 @@ def test_shared_reservation_stores_one_output_and_keeps_reusable_entry() -> None
     assert cache.current_bytes == 8
     assert cache.stats().reserved_bytes == 0
     assert cache.stats().pinned_bytes == 8
-    cached = cache.get("key", record_lookup=False)
+    cached = cache.get("key", record_stats=False)
     assert cached is not None
     torch.testing.assert_close(cached, value)
 
@@ -229,7 +229,7 @@ def test_shared_reservation_stores_one_output_and_keeps_reusable_entry() -> None
     assert cache.release("key") is None
     assert cache.stats().pinned_bytes == 0
     assert cache.current_bytes == 8
-    assert cache.allocate("key", 8) is CacheAllocationKind.READY_HIT
+    assert cache.allocate("key", 8) is CacheAllocationResult.READY_HIT
     assert cache.release("key") is None
 
     stats = cache.stats()
@@ -244,7 +244,7 @@ def test_non_retained_entries_are_removed_on_their_final_release() -> None:
 
     assert (
         cache.allocate("reserved", 8, retain_after_release=False)
-        is CacheAllocationKind.NEW_RESERVATION
+        is CacheAllocationResult.NEW_RESERVATION
     )
     assert cache.release("reserved") is None
     assert len(cache) == 0
@@ -252,7 +252,7 @@ def test_non_retained_entries_are_removed_on_their_final_release() -> None:
 
     assert (
         cache.allocate("ready", 8, retain_after_release=False)
-        is CacheAllocationKind.NEW_RESERVATION
+        is CacheAllocationResult.NEW_RESERVATION
     )
     assert cache.put(
         "ready",
@@ -270,13 +270,13 @@ def test_reservation_limit_and_output_space_are_checked_separately() -> None:
     assert cache.put("old-1", torch.ones(2, dtype=torch.float32))
     assert cache.put("old-2", torch.ones(2, dtype=torch.float32))
 
-    assert cache.allocate("new-1", 8) is CacheAllocationKind.NEW_RESERVATION
-    assert cache.allocate("new-2", 8) is CacheAllocationKind.NEW_RESERVATION
+    assert cache.allocate("new-1", 8) is CacheAllocationResult.NEW_RESERVATION
+    assert cache.allocate("new-2", 8) is CacheAllocationResult.NEW_RESERVATION
     assert cache.allocate("old-1", 8) is None
     assert cache.stats().blocked_allocations == 1
 
     assert cache.make_space_for("new-1") == ["old-1"]
-    assert cache.make_space_for("new-2", additional_bytes=8) == ["old-2"]
+    assert cache.make_space_for("new-2", pending_output_bytes=8) == ["old-2"]
     assert cache.current_bytes == 0
     assert cache.put(
         "new-1",
