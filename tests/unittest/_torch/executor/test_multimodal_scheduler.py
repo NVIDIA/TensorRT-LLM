@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalEagerEncoderScheduler,
     MultimodalScheduler,
     ScheduledRequests,
+    SchedulerOutput,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
@@ -63,6 +64,24 @@ class _BaseScheduler:
     def __init__(self):
         self.capacity_scheduler = _CapacityScheduler()
         self.micro_batch_scheduler = _MicroBatchScheduler()
+
+    def can_schedule(self, requests):
+        return bool(requests)
+
+
+class _CombinedScheduler:
+    def __init__(self):
+        self.eviction_protected_request_ids = None
+
+    def schedule_request(
+        self,
+        requests,
+        inflight_request_ids,
+        eviction_protected_request_ids=None,
+    ):
+        del inflight_request_ids
+        self.eviction_protected_request_ids = eviction_protected_request_ids
+        return SchedulerOutput([], list(requests), [], [], [], len(requests))
 
     def can_schedule(self, requests):
         return bool(requests)
@@ -154,6 +173,20 @@ def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
 
     assert output.scheduled_mm_encoder_items == {1: [0], 2: [0]}
     assert output.context_requests == [second]
+
+
+@pytest.mark.parametrize("scheduler_cls", [MultimodalScheduler, MultimodalEagerEncoderScheduler])
+def test_multimodal_scheduler_forwards_eviction_protection(scheduler_cls):
+    base_scheduler = _CombinedScheduler()
+    scheduler = scheduler_cls(base_scheduler, max_batch_size=2, max_num_tokens=10)
+    request = _llm_request(1)
+
+    output = scheduler.schedule_request(
+        [request], set(), eviction_protected_request_ids={request.request_id}
+    )
+
+    assert output.context_requests == [request]
+    assert base_scheduler.eviction_protected_request_ids == {request.request_id}
 
 
 def test_scheduler_defers_items_beyond_output_byte_budget():
