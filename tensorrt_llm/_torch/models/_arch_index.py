@@ -271,7 +271,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
 #     slot to an external registration is absent from the mapping but still has
 #     the attribute, so an identity scan reports it as unregistered.
 SPEC_MODE_TO_MODULE = {
-    "DFLASH": "modeling_speculative",
+    "DFLASH": "modeling_dflash",
     "DRAFT_TARGET_ONE_MODEL": "modeling_speculative",
     "DSPARK": "modeling_dspark",
     "EAGLE3_ONE_MODEL": "modeling_speculative",
