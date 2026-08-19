@@ -237,9 +237,12 @@ class CuteDslMlaFmha(PhasedFmha):
         # the default TRTLLM path on the FP8-KV path, keyed by
         # (num_heads, seq_len_q).
         _PERF_MIN_BATCH_FP8 = {
+            (6, 1): 1,
+            (12, 1): 1,
             (16, 2): 64,
             (16, 4): 32,
             (16, 8): 16,
+            (96, 1): 1,  # trtllm-gen may fail under num_head == 96
             (128, 1): 64,
             (128, 2): 32,
         }
