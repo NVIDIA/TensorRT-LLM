@@ -310,6 +310,80 @@ TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
     EXPECT_EQ(cudaFree(dst), cudaSuccess);
 }
 
+// A non-empty WANT has no retransmission path either (submit() sends it exactly once per fresh
+// rid), so a replayed one for a live flow must be dropped: re-queueing would grant fresh regions
+// over the still-held ones — the sender never writes the extras, so they leak — and the lease
+// refresh would keep the flow off staleFlows() forever, defeating the reclaim that exists for
+// exactly this state.
+TEST(BounceTransportFailure, DuplicateWantIsDroppedWithoutRegrant)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto c = cfg(/*timeoutMs=*/5000);
+    capRegions(c, c.maxInflightChunksPerRequest);
+    b::ZmqControlChannel sender("dupWantSender");
+    auto receiver = bounce_test::makeNode("dupWantReceiver", c, 1024); // receiver posts no writes
+    if (!receiver)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    ASSERT_TRUE(sender.addPeer("dupWantReceiver", receiver->ch->localEndpoint()));
+
+    constexpr std::uint64_t rid = 23;
+    sender.sendTo("dupWantReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits;
+    ASSERT_TRUE(waitGrant(sender, rid, std::chrono::seconds(5), credits));
+    ASSERT_EQ(credits.size(), 1u);
+
+    // Replay the same WANT. The arena and the per-request cap both have room for a second region,
+    // so a re-queue WOULD be granted — the negative assertion below therefore fails pre-fix.
+    sender.sendTo("dupWantReceiver", b::encodeWant(rid, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> extra;
+    EXPECT_FALSE(waitGrant(sender, rid, std::chrono::milliseconds(500), extra)) << "duplicate WANT was re-granted";
+
+    receiver->tx->shutdown();
+}
+
+// The scatter worker sizes its plan by iterating the DATA run list; a hostile/corrupt run whose
+// count is near 2^32 (bounceStride 0 keeps the span check happy) must be rejected up front, not
+// counted piece by piece — pre-fix the worker (and the flow's region) is pinned for the whole
+// count, which the rid=2 re-grant deadline below catches.
+TEST(BounceTransportFailure, OversizedScatterRunListIsRejectedNotCounted)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto c = cfg(/*timeoutMs=*/30000);
+    capRegions(c, /*regionCap=*/1);                                   // arena holds exactly ONE region
+    b::ZmqControlChannel sender("bigRunSender");
+    auto receiver = bounce_test::makeNode("bigRunReceiver", c, 1024); // receiver posts no writes
+    if (!receiver)
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    ASSERT_TRUE(sender.addPeer("bigRunReceiver", receiver->ch->localEndpoint()));
+
+    sender.sendTo("bigRunReceiver", b::encodeWant(/*rid=*/1, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits;
+    ASSERT_TRUE(waitGrant(sender, 1, std::chrono::seconds(5), credits));
+    ASSERT_EQ(credits.size(), 1u);
+
+    void* dst = nullptr;
+    ASSERT_EQ(cudaMalloc(&dst, 256), cudaSuccess);
+    // count=2^32-1 with bounceStride=0: every piece reads the same 256 in-bounds bytes, so the
+    // span check alone admits it; only the piece-count guard can reject it cheaply.
+    b::BounceScatterRun run{/*bounceOffset=*/0, reinterpret_cast<std::uintptr_t>(dst), /*dstStride=*/0,
+        /*bounceStride=*/0, /*pieceSize=*/256, /*count=*/0xFFFFFFFFu};
+    sender.sendTo("bigRunReceiver",
+        b::encodeData(/*rid=*/1, /*chunkIdx=*/0, /*numChunks=*/1, credits.front().regionHandle, {run}));
+
+    // The rejected scatter must not ACK...
+    EXPECT_EQ(countAcks(sender, std::chrono::seconds(2), /*rid=*/1), 0);
+    // ...and must release the single region promptly: rid=2 can only be granted once rid=1's
+    // region is freed, which a worker stuck counting 2^32 pieces cannot do within the deadline.
+    sender.sendTo("bigRunReceiver", b::encodeWant(/*rid=*/2, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits2;
+    EXPECT_TRUE(waitGrant(sender, 2, std::chrono::seconds(5), credits2)) << "region pinned by oversized run list";
+
+    receiver->tx->shutdown();
+    EXPECT_EQ(cudaFree(dst), cudaSuccess);
+}
+
 // A sender that takes a GRANT and then dies emits neither DATA nor a cancel, so nothing
 // event-driven can ever reclaim its region — the receiver's grant lease must. After
 // receiverFlowTimeoutMs of silence the flow is reclaimed and its region quarantined for

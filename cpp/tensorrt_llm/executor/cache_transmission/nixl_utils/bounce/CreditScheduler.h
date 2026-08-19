@@ -134,6 +134,13 @@ public:
     /// would corrupt another flow's data.
     [[nodiscard]] bool heldByFlow(std::string const& flow, std::uint64_t offset) const;
 
+    /// True if `flow` is currently tracked (has pending chunks and/or held regions). A non-empty
+    /// WANT has no retransmission path, so the transport drops a repeat one for a tracked flow —
+    /// re-queueing would re-grant over the still-held regions (the sender never writes the extras,
+    /// leaking them) and the lastProgress refresh would keep renewing the very lease that exists
+    /// to reclaim that state.
+    [[nodiscard]] bool knowsFlow(std::string const& flow) const;
+
     // ---- local (sender) role: gather staging from the SAME arena ----
     /// Allocate a region of `bytes` for local gather staging (non-blocking). Returns its offset, or
     /// nullopt if the arena can't fit it right now (caller parks and retries). With `eager` the
