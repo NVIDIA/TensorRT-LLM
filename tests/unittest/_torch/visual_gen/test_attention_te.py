@@ -8,10 +8,8 @@ GPU tests (requires transformer_engine) cover forward correctness vs VANILLA.
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
-    AttentionTensorLayout,
-    PredefinedAttentionMask,
-)
+from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
 from tensorrt_llm._torch.visual_gen.attention_backend.te import TEAttention
 
 try:
@@ -35,7 +33,7 @@ def make_te_attn():
             num_heads=num_heads,
             head_dim=head_dim,
             num_kv_heads=num_kv_heads or num_heads,
-        ).cuda()
+        )
 
     return _make
 
