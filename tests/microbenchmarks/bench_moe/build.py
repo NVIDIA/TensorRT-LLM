@@ -49,6 +49,7 @@ _BACKEND_CLASS_TO_NAME: Dict[str, str] = {
     "DeepGemmFusedMoE": "DEEPGEMM",
     "DenseGEMMFusedMoE": "DENSEGEMM",
     "MegaMoEDeepGemm": "MEGAMOE_DEEPGEMM",
+    "MegaMoECuteDsl": "MEGAMOE_CUTEDSL",
     "VanillaMoE": "VANILLA",
 }
 
