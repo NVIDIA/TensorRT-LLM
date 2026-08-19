@@ -87,6 +87,7 @@ class TestPayloadVerification:
 
         assert llm_args is not None, "report_usage was not called with llm_args"
         assert pretrained_config is not None, "report_usage was not called with pretrained_config"
+        assert usage_lib.apply_usage_session_config(telemetry_config)
 
         # Extract usage_context the same way report_usage does
         usage_context = ""
