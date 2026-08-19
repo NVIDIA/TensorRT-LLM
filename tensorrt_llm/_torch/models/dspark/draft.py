@@ -35,7 +35,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from .heads import confident_prefix_length
+from ..modeling_speculative import confident_prefix_length
 
 
 def build_draft_input_ids(
@@ -94,7 +94,7 @@ def dspark_propose(
         )
         draft_logits = corrected
     else:
-        from .heads import greedy_or_sample
+        from ..modeling_speculative import greedy_or_sample
 
         draft_tokens = greedy_or_sample(base_logits, temperature)
 

@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Dict, Generic, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
@@ -57,6 +58,406 @@ def _slice_spec_position_ids(position_ids: Optional[torch.Tensor],
     if position_ids is None:
         return None
     return position_ids[..., :num_tokens]
+
+
+# ---------------------------------------------------------------------------
+# DSpark draft-network heads, shared by both drafters that implement DSpark:
+# the DFlash path (modeling_dflash.py, standalone Kimi K3 style drafters) and
+# the DeepSeek-V4-Pro path (modeling_dspark.py, mtp.* stages inside the target
+# checkpoint). DFlash is the degenerate case -- DSpark with the Markov and
+# confidence heads switched off -- so the math below is the *only* copy; the
+# two drafters differ solely in how they store the weights and whether their
+# draft lm_head is TP vocab-sharded.
+#
+# Ported from DeepSeek's DeepSpec reference implementation
+# (https://github.com/deepseek-ai/DeepSpec, MIT License).
+# ---------------------------------------------------------------------------
+
+
+def greedy_or_sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Argmax for temperature<=0, else temperature-scaled multinomial.
+
+    Args:
+        logits: ``[..., vocab]``.
+    Returns:
+        token ids with the trailing vocab dim reduced.
+    """
+    if temperature <= 0.0:
+        return logits.argmax(dim=-1)
+    probs = torch.softmax(logits.float() / temperature, dim=-1)
+    flat = probs.reshape(-1, probs.shape[-1])
+    sampled = torch.multinomial(flat, num_samples=1).squeeze(-1)
+    return sampled.view(probs.shape[:-1])
+
+
+def dspark_markov_step_bias(prev_tokens: torch.Tensor, markov_w1: torch.Tensor,
+                            markov_w2: torch.Tensor) -> torch.Tensor:
+    """Vanilla Markov head logit bias for one intra-block draft step.
+
+    Reference: DeepSpec ``VanillaMarkov`` (deepspec/modeling/dspark/
+    markov_head.py): ``bias = markov_w2(markov_w1(prev_token))`` where
+    markov_w1 is nn.Embedding(vocab, rank) and markov_w2 is
+    nn.Linear(rank, vocab, bias=False). With both weights stored
+    [vocab, rank] this is ``markov_w1[prev] @ markov_w2.T``.
+
+    Args:
+        prev_tokens: [B] long, previous token per request (draft vocab).
+        markov_w1: [vocab, rank].
+        markov_w2: [vocab_or_shard, rank] (rows may be a TP vocab shard).
+    Returns:
+        [B, vocab_or_shard] bias in the markov weights' dtype.
+    """
+    return F.linear(F.embedding(prev_tokens, markov_w1), markov_w2)
+
+
+def dspark_markov_chain(
+    base_logits: torch.Tensor,
+    first_prev_tokens: torch.Tensor,
+    step_bias_fn,
+    *,
+    hidden_states: Optional[torch.Tensor] = None,
+    next_token_fn=None,
+    cast_bias_to_logits: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The intra-block Markov refinement loop, shared by every DSpark head.
+
+    Reference: DeepSpec ``VanillaMarkov.sample_block_tokens``. For step i,
+    ``logits_i += bias(prev_i)`` with ``prev_0`` = the anchor token (the last
+    accepted token, block slot 0) and ``prev_{i>0}`` = the token drawn from
+    step i-1's *biased* logits. llama.cpp PR #25173 implements the same chain.
+
+    The chain being sequential is load-bearing and is NOT derivable from a
+    checkpoint: published DSpark drafters ship only the training-time
+    ``apply_block_logits``, which biases the whole block in one teacher-forced
+    pass. SGLang ``srt/models/dspark.py:34-64 run_markov_block`` settles it --
+    it steps the same way, feeding back the token drawn from the biased logits.
+
+    Two callers drive this, and a change here has to satisfy both: the embedded
+    flavour chains it inside the model, which owns its sampler, while the
+    standalone flavour is driven from the worker through ``next_token_fn`` so
+    the chain can advance on a TP-gathered global argmax the model cannot
+    compute on its own.
+
+    Args:
+        base_logits: [B, K, vocab_or_shard] shared-lm_head logits.
+        first_prev_tokens: [B] long, anchor token ids (draft vocab).
+        step_bias_fn: ``(prev_tokens [B], step_hidden or None) -> bias``. A
+            closure, so a stateful head (RNN) can carry its recurrent state
+            across positions without a second loop.
+        hidden_states: [B, K, d] fed to ``step_bias_fn`` one position at a
+            time; None for the memoryless heads.
+        next_token_fn: ``([B, vocab_or_shard]) -> [B]`` token ids in the FULL
+            draft vocab; defaults to a plain argmax. Drafters whose draft
+            logits are TP vocab-sharded pass a shard-aware argmax here.
+        cast_bias_to_logits: cast the bias down to ``base_logits.dtype``
+            before adding. The DFlash drafter does; the V4-Pro drafter does
+            not (its Markov weights and its logits already agree), and adding
+            the cast there would silently narrow its accumulation dtype.
+    Returns:
+        sampled_tokens [B, K], corrected_logits [B, K, vocab_or_shard].
+        Greedy per-position argmax of the corrected logits reproduces the
+        reference sampled chain exactly.
+    """
+    batch_size, block_size = base_logits.shape[:2]
+    if block_size == 0:
+        empty = torch.empty(batch_size,
+                            0,
+                            dtype=torch.long,
+                            device=base_logits.device)
+        return empty, base_logits
+    sampled, corrected = [], []
+    prev = first_prev_tokens.long()
+    for k in range(block_size):
+        step_hidden = None if hidden_states is None else hidden_states[:, k]
+        bias = step_bias_fn(prev, step_hidden)
+        if cast_bias_to_logits:
+            bias = bias.to(base_logits.dtype)
+        step_logits = base_logits[:, k] + bias
+        corrected.append(step_logits.unsqueeze(1))
+        if next_token_fn is None:
+            prev = torch.argmax(step_logits, dim=-1)
+        else:
+            prev = next_token_fn(step_logits).long()
+        sampled.append(prev)
+    return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
+
+
+def dspark_markov_chain_logits(base_logits: torch.Tensor,
+                               first_prev_tokens: torch.Tensor,
+                               markov_w1: torch.Tensor,
+                               markov_w2: torch.Tensor,
+                               argmax_fn=None) -> torch.Tensor:
+    """Raw-tensor entry to :func:`dspark_markov_chain`, corrected logits only.
+
+    For drafters that keep the Markov head as plain checkpoint tensors rather
+    than a :class:`VanillaMarkov` module (the DFlash path). ``markov_w2`` may
+    already be sliced down to this rank's TP vocab shard, in which case
+    ``argmax_fn`` must map a shard-local row back to a full-vocab token id.
+    """
+
+    def _step_bias(prev_tokens, step_hidden):
+        del step_hidden
+        return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
+
+    _, corrected = dspark_markov_chain(base_logits,
+                                       first_prev_tokens,
+                                       _step_bias,
+                                       next_token_fn=argmax_fn,
+                                       cast_bias_to_logits=True)
+    return corrected
+
+
+class VanillaMarkov(nn.Module):
+    """Low-rank token-bigram logit bias: ``bias = W2(W1[token])``."""
+
+    markov_head_type = "vanilla"
+
+    def __init__(self, *, vocab_size: int, markov_rank: int):
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.markov_rank = int(markov_rank)
+        assert self.markov_rank > 0, (
+            f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}.")
+        self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
+        self.markov_w2 = nn.Linear(self.markov_rank,
+                                   self.vocab_size,
+                                   bias=False)
+
+    def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return F.embedding(token_ids.long(), self.markov_w1.weight)
+
+    def project_bias(self,
+                     latent_states: torch.Tensor,
+                     *,
+                     vocab_slice: Optional[slice] = None) -> torch.Tensor:
+        w2 = self.markov_w2.weight
+        if vocab_slice is not None:
+            w2 = w2[vocab_slice]
+        return F.linear(latent_states, w2)
+
+    def compute_step_bias(self,
+                          token_ids: torch.Tensor,
+                          hidden_states: Optional[torch.Tensor],
+                          *,
+                          vocab_slice: Optional[slice] = None) -> torch.Tensor:
+        del hidden_states
+        w2 = self.markov_w2.weight
+        if vocab_slice is not None:
+            w2 = w2[vocab_slice]
+        return dspark_markov_step_bias(token_ids.long(), self.markov_w1.weight,
+                                       w2)
+
+    def apply_step_logits(
+        self,
+        logits: torch.Tensor,
+        *,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        return logits + self.compute_step_bias(token_ids, hidden_states)
+
+    def sample_block_tokens(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        temperature: float = 0.0,
+        vocab_slice: Optional[slice] = None,
+        next_token_fn=None,
+        cast_bias_to_logits: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Autoregressive block sampling with the (memoryless) Markov bias.
+
+        Args:
+            base_logits: ``[batch, block_size, vocab]`` from backbone+lm_head.
+            first_prev_token_ids: ``[batch]`` token preceding the 1st position.
+            hidden_states: ``[batch, block_size, d]`` (unused by vanilla).
+            vocab_slice / next_token_fn / cast_bias_to_logits: see
+                :func:`dspark_markov_chain`; only the TP vocab-sharded DFlash
+                drafter sets them.
+        Returns:
+            sampled_tokens ``[batch, block_size]``,
+            corrected_logits ``[batch, block_size, vocab]``.
+        """
+
+        def _step_bias(prev_tokens, step_hidden):
+            return self.compute_step_bias(prev_tokens,
+                                          step_hidden,
+                                          vocab_slice=vocab_slice)
+
+        def _sample_step(step_logits):
+            return greedy_or_sample(step_logits, temperature)
+
+        return dspark_markov_chain(
+            base_logits,
+            first_prev_token_ids,
+            _step_bias,
+            hidden_states=hidden_states,
+            next_token_fn=_sample_step
+            if next_token_fn is None else next_token_fn,
+            cast_bias_to_logits=cast_bias_to_logits,
+        )
+
+
+class GatedMarkovHead(VanillaMarkov):
+    """Markov bias gated by a sigmoid of [hidden, prev_embedding]."""
+
+    markov_head_type = "gated"
+
+    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int):
+        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+        self.gate_proj = nn.Linear(hidden_size + markov_rank, markov_rank)
+
+    def compute_step_bias(self,
+                          token_ids: torch.Tensor,
+                          hidden_states: Optional[torch.Tensor],
+                          *,
+                          vocab_slice: Optional[slice] = None) -> torch.Tensor:
+        assert hidden_states is not None
+        prev_emb = self.get_prev_embeddings(token_ids)
+        gate = torch.sigmoid(
+            self.gate_proj(torch.cat([hidden_states, prev_emb],
+                                     dim=-1))).to(dtype=prev_emb.dtype)
+        return self.project_bias(gate * prev_emb, vocab_slice=vocab_slice)
+
+
+class RNNHead(VanillaMarkov):
+    """GRU-style head carrying recurrent state across block positions."""
+
+    markov_head_type = "rnn"
+
+    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int):
+        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+        self.hidden_size = int(hidden_size)
+        # [s_{k-1}; W1[x_{k-1}]; h_k] -> [gate; candidate; output]
+        self.joint_proj = nn.Linear(2 * markov_rank + hidden_size,
+                                    3 * markov_rank)
+
+    def _rnn_step(self,
+                  state,
+                  prev_embeddings,
+                  hidden_states,
+                  *,
+                  vocab_slice: Optional[slice] = None):
+        z = torch.cat([state, prev_embeddings, hidden_states], dim=-1)
+        gate_raw, cand_raw, out_raw = self.joint_proj(z).chunk(3, dim=-1)
+        gate = torch.sigmoid(gate_raw)
+        candidate = torch.tanh(cand_raw)
+        new_state = gate * state + (1.0 - gate) * candidate
+        bias = self.project_bias(torch.tanh(out_raw), vocab_slice=vocab_slice)
+        return new_state, bias
+
+    def sample_block_tokens(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        temperature: float = 0.0,
+        vocab_slice: Optional[slice] = None,
+        next_token_fn=None,
+        cast_bias_to_logits: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert hidden_states is not None
+        state = torch.zeros(base_logits.shape[0],
+                            self.markov_rank,
+                            device=base_logits.device,
+                            dtype=hidden_states.dtype)
+
+        def _step_bias(prev_tokens, step_hidden):
+            nonlocal state
+            prev_emb = self.get_prev_embeddings(prev_tokens)
+            state, bias = self._rnn_step(state,
+                                         prev_emb,
+                                         step_hidden,
+                                         vocab_slice=vocab_slice)
+            return bias
+
+        def _sample_step(step_logits):
+            return greedy_or_sample(step_logits, temperature)
+
+        return dspark_markov_chain(
+            base_logits,
+            first_prev_token_ids,
+            _step_bias,
+            hidden_states=hidden_states,
+            next_token_fn=_sample_step
+            if next_token_fn is None else next_token_fn,
+            cast_bias_to_logits=cast_bias_to_logits,
+        )
+
+
+def build_markov_head(*, markov_head_type: str, vocab_size: int,
+                      markov_rank: int,
+                      hidden_size: int) -> Optional[nn.Module]:
+    """Factory mirroring DeepSpec ``build_markov_head``; None if rank==0."""
+    if int(markov_rank) <= 0:
+        return None
+    kind = str(markov_head_type).lower()
+    if kind == "vanilla":
+        return VanillaMarkov(vocab_size=vocab_size, markov_rank=markov_rank)
+    if kind == "gated":
+        return GatedMarkovHead(vocab_size=vocab_size,
+                               markov_rank=markov_rank,
+                               hidden_size=hidden_size)
+    if kind == "rnn":
+        return RNNHead(vocab_size=vocab_size,
+                       markov_rank=markov_rank,
+                       hidden_size=hidden_size)
+    raise ValueError(f"Unsupported markov_head_type: {markov_head_type!r}")
+
+
+class DSparkConfidenceHead(nn.Module):
+    """Per-position acceptance-confidence predictor (DeepSpec
+    AcceptRatePredictor).
+
+    Input features are the backbone hidden state, optionally concatenated with
+    the Markov head's previous-token embedding. Output is a single logit per
+    position.
+    """
+
+    def __init__(self,
+                 *,
+                 hidden_size: int,
+                 markov_rank: int = 0,
+                 with_markov: bool = False):
+        super().__init__()
+        self.with_markov = bool(with_markov)
+        input_dim = int(hidden_size) + (int(markov_rank) if with_markov else 0)
+        # The checkpoint stores ``proj`` as a bias-free bf16 weight, but the
+        # confidence score is computed in fp32 (mirrors the DeepSpec reference
+        # ``Linear(input_dim, 1, dtype=torch.float32)`` with the fp32 matmul).
+        self.proj = nn.Linear(input_dim, 1, bias=False, dtype=torch.float32)
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                prev_embeddings: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.with_markov:
+            assert prev_embeddings is not None
+            features = torch.cat(
+                [hidden_states,
+                 prev_embeddings.to(hidden_states.dtype)],
+                dim=-1)
+        else:
+            features = hidden_states
+        # fp32 matmul for a stable confidence score (mirrors the reference).
+        return self.proj(features.float()).squeeze(-1)
+
+
+def confident_prefix_length(confidence_logits: torch.Tensor, *, block_size: int,
+                            threshold: float) -> int:
+    """First position k where ``sigmoid(confidence_k) < threshold``.
+
+    Returns ``block_size`` when threshold<=0 (no truncation) or all positions
+    are confident. Assumes batch size 1 (functional-first scope).
+    """
+    if threshold <= 0.0:
+        return int(block_size)
+    below = confidence_logits.sigmoid() < threshold
+    if not bool(below[0].any().item()):
+        return int(block_size)
+    return int(torch.nonzero(below[0], as_tuple=False)[0].item())
 
 
 class Eagle3Attention(Attention):

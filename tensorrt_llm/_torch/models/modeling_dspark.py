@@ -62,7 +62,6 @@ from .dspark.attention import (
     precompute_dspark_freqs_cis,
 )
 from .dspark.draft import build_draft_input_ids, dspark_propose
-from .dspark.heads import DSparkConfidenceHead, build_markov_head
 from .modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4WeightLoader,
@@ -72,6 +71,7 @@ from .modeling_deepseekv4 import (
     _rename_deepseek_v4_attn_subkey,
     _rename_deepseek_v4_ffn_subkey,
 )
+from .modeling_speculative import DSparkConfidenceHead, build_markov_head
 from .modeling_utils import register_draft_model
 
 # Matches the draft namespace ``mtp.<stage>.<rest>`` in the V4-Pro-DSpark
