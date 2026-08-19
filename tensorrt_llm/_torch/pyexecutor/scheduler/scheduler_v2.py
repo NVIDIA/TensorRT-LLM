@@ -305,7 +305,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self._prioritize_first_token_gen:
             requests_list.sort(
                 key=lambda req: (
-                    0 if (req.is_generation_only_request() and req.py_decoding_iter == 0) else 1
+                    0 if (req.is_generation_only_request and req.py_decoding_iter == 0) else 1
                 )
             )
 

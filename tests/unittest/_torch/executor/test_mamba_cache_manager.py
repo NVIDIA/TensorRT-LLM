@@ -900,7 +900,7 @@ def test_v2_disagg_slice_skips_state_index_on_mamba_free_pp_rank():
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
     transceiver._page_table = SimpleNamespace(layer_groups=[])
     request = SimpleNamespace(
-        is_generation_only_request=lambda: False,
+        is_generation_only_request=False,
         prompt_len=0,
         py_request_id=123,
     )
@@ -922,7 +922,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
     transceiver._page_table = SimpleNamespace(layer_groups=[])
     request = SimpleNamespace(
-        is_generation_only_request=lambda: False,
+        is_generation_only_request=False,
         prompt_len=0,
         py_request_id=123,
     )

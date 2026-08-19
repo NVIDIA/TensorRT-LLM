@@ -1179,7 +1179,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                          orig_prompt_len=self.prompt_len,
                                          clear_draft_tokens=True)
 
+    @property
     def is_generation_only_request(self):
+        # Must stay a property: the C++ base exposes this as a read-only
+        # property (nanobind/batch_manager/bindings.cpp), and a plain method
+        # here shadows it with something always-truthy for any caller that
+        # reads it as an attribute.
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
     def create_response(self,

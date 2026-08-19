@@ -6696,7 +6696,7 @@ class PyExecutor:
         """Flush generation transfer errors through a TP-uniform path."""
         error_requests = [
             req for req in self._get_disagg_reqs_in_error_state()
-            if req.is_generation_only_request()
+            if req.is_generation_only_request
         ]
         local_needs_flush = bool(error_requests)
 
@@ -8317,7 +8317,7 @@ class PyExecutor:
                     new_active_requests.append(request)
                 continue
 
-            if request.is_generation_only_request() and not request.is_finished:
+            if request.is_generation_only_request and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
