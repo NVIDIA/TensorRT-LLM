@@ -9,7 +9,10 @@ import torch
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention  # noqa: E402
+from tensorrt_llm._torch.modules.kimi_kda import (
+    KimiKDALinearAttention,  # noqa: E402
+    _kda_kernels,  # noqa: E402
+)
 from tests.unittest._torch.modules.kimi_kda.kimi_kda_test_utils import (  # noqa: E402
     KimiKDAReference,
     get_production_prefill_kernel_path,
@@ -357,11 +360,11 @@ def test_kda_prefill_small_varlen_dispatch_matches_fla_reference(sequence_length
 
 
 @torch.no_grad()
-def test_kda_prefill_opt_out_fallback_preserves_mixed_initial_states(monkeypatch):
-    """The explicit FLA fallback preserves prefix/continuation pool states."""
+def test_kda_prefill_unavailable_kernel_fallback_preserves_mixed_initial_states(monkeypatch):
+    """The FLA core preserves prefix and continuation pool states."""
     torch.manual_seed(3)
     optimized, _ = _make_attention_pair()
-    monkeypatch.setenv("TLLM_KDA_ENABLE_OPT_PREFILL", "0")
+    monkeypatch.setattr(_kda_kernels, "is_intree_prefill_available", lambda: False)
     fallback, _ = _make_attention_pair(expected_prefill_kernel_path="fla")
     fallback.load_state_dict(optimized.state_dict())
 

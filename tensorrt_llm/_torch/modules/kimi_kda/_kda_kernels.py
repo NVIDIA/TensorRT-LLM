@@ -222,21 +222,6 @@ class KDAKernelDispatch:
         _load_mtp_module()  # registers trtllm::kda_mtp_decode
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
 
-    def can_use_optimized_prefill(
-        self,
-        *,
-        cu_seqlens: Optional[torch.Tensor],
-        chunk_size: int = 64,
-    ) -> bool:
-        """Return whether this batch can stay on the Blackwell prefill path."""
-        if self.prefill_kernel_path != "optimized":
-            return False
-        if cu_seqlens is not None:
-            from fla.ops.utils.index import prepare_chunk_indices
-
-            return prepare_chunk_indices(cu_seqlens, chunk_size).shape[0] >= 4
-        return True
-
     def prefill_chunk_kda(
         self,
         *,

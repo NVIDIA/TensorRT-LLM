@@ -183,7 +183,6 @@ class KimiKDALinearAttention(nn.Module):
         # K == V == 128 shape. Other shapes must use the portable fallback.
         kernel_shape_ok = self.head_k_dim == 128 and self.head_dim == 128
         self._dispatch = KDAKernelDispatch(
-            use_optimized_prefill=os.getenv("TLLM_KDA_ENABLE_OPT_PREFILL", "1") == "1",
             use_optimized_decode=kernel_shape_ok,
             use_optimized_verify=kernel_shape_ok,
         )
@@ -419,17 +418,6 @@ class KimiKDALinearAttention(nn.Module):
         slot_indices,
         layer_cache=None,
     ) -> torch.Tensor:
-        if not self._dispatch.can_use_optimized_prefill(cu_seqlens=cu_seqlens):
-            return self.forward_prefill_fallback(
-                x2d,
-                cu_seqlens,
-                mamba_metadata,
-                num_prefills,
-                conv_pool,
-                ssm_pool,
-                slot_indices,
-                layer_cache,
-            )
         from einops import rearrange
 
         d = self.proj_size
@@ -525,79 +513,6 @@ class KimiKDALinearAttention(nn.Module):
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_q, conv_k, conv_v)
 
         return self._output_gate_and_proj(x, o, onorm_g)
-
-    def forward_prefill_fallback(
-        self,
-        x2d,
-        cu_seqlens,
-        mamba_metadata,
-        num_prefills,
-        conv_pool,
-        ssm_pool,
-        slot_indices,
-        layer_cache=None,
-    ) -> torch.Tensor:
-        """Portable FLA prefill with the production cache-pool contract."""
-        from einops import rearrange
-
-        d = self.proj_size
-        x = x2d.unsqueeze(0)
-        q_proj = self.q_proj(x)
-        k_proj = self.k_proj(x)
-        v_proj = self.v_proj(x)
-
-        conv_q_in = conv_k_in = conv_v_in = recurrent_in = None
-        if mamba_metadata.use_initial_states:
-            has_init = mamba_metadata.has_initial_states[:num_prefills]
-            conv_state = conv_pool.index_select(0, slot_indices)
-            conv_state[~has_init] = 0
-            conv_q_in, conv_k_in, conv_v_in = _kda_split_conv_sections(conv_state, d)
-            recurrent_in = ssm_pool.index_select(0, slot_indices)
-            recurrent_in[~has_init] = 0
-
-        q, conv_q = self.q_conv1d(
-            q_proj, cache=conv_q_in, output_final_state=True, cu_seqlens=cu_seqlens
-        )
-        k, conv_k = self.k_conv1d(
-            k_proj, cache=conv_k_in, output_final_state=True, cu_seqlens=cu_seqlens
-        )
-        v, conv_v = self.v_conv1d(
-            v_proj, cache=conv_v_in, output_final_state=True, cu_seqlens=cu_seqlens
-        )
-
-        g = rearrange(
-            self.f_b_proj(self.f_a_proj(x)),
-            "... (h d) -> ... h d",
-            d=self.head_dim,
-        )
-        beta = self.b_proj(x).float()
-        q = rearrange(q, "... (h d) -> ... h d", d=self.head_k_dim)
-        k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
-        v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
-        o, final_state = self._dispatch.prefill_chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
-            scale=self.head_k_dim**-0.5,
-            initial_state=recurrent_in,
-            safe_gate=self.gate_lower_bound is not None,
-            lower_bound=self.gate_lower_bound,
-            cu_seqlens=cu_seqlens,
-        )
-
-        conv_pool.index_copy_(
-            0,
-            slot_indices,
-            torch.cat([conv_q, conv_k, conv_v], dim=1).to(conv_pool.dtype),
-        )
-        assert final_state is not None
-        ssm_pool.index_copy_(0, slot_indices, final_state.to(ssm_pool.dtype))
-        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_q, conv_k, conv_v)
-        return self._output_gate_and_proj(x, o)
 
     def forward_decode(
         self,
