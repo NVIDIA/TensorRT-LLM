@@ -21,7 +21,6 @@ except ImportError:
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import get_dflash_flash_attention, get_dflash_trtllm_gen_ops
 from ..speculative.interface import SpeculativeDecodingMode
-from .modeling_speculative import dspark_markov_chain_logits
 from .modeling_utils import get_model_architecture, register_draft_model
 
 
@@ -30,16 +29,21 @@ def dspark_layer_window_size(
 ) -> tuple[int, int]:
     """flash-attn ``window_size`` for one draft layer of the block decode.
 
-    DSpark drafters (deepseek-ai/DeepSpec) run the draft block through HF
-    attention with ``sliding_window`` set on 'sliding_attention' layers and
-    is_causal=False. HF's flash path
-    (transformers/modeling_flash_attention_utils.py) translates that to
-    ``window_size = (sliding_window - 1, sliding_window - 1)``, i.e. each
-    query attends keys within ``swa_window - 1`` KV-index distance on both
-    sides. In the DFlash pool layout KV index == token position, so this
-    limits draft queries to the most recent ``swa_window`` context tokens
-    plus the (nearby) draft block. Full-attention layers and non-dspark
-    drafters keep flash-attn's default ``(-1, -1)`` (no window).
+    Sliding-window block decode was introduced by the DSpark drafters
+    (deepseek-ai/DeepSpec) -- hence the name -- but it is an attention
+    configuration, not part of the DSpark head set, so it stays in the DFlash
+    base: the block decode below indexes the resolved windows directly and must
+    not depend on a subclass-only attribute.
+
+    Those drafters run the draft block through HF attention with
+    ``sliding_window`` set on 'sliding_attention' layers and is_causal=False.
+    HF's flash path (transformers/modeling_flash_attention_utils.py) translates
+    that to ``window_size = (sliding_window - 1, sliding_window - 1)``, i.e.
+    each query attends keys within ``swa_window - 1`` KV-index distance on both
+    sides. In the DFlash pool layout KV index == token position, so this limits
+    draft queries to the most recent ``swa_window`` context tokens plus the
+    (nearby) draft block. Full-attention layers and drafters that do not enable
+    the window keep flash-attn's default ``(-1, -1)`` (no window).
     """
     if not use_swa:
         return (-1, -1)
@@ -129,77 +133,25 @@ class DFlashForCausalLM(nn.Module):
             f"attention_backend: {self.dflash_attention_backend}"
         )
 
-        # DSpark drafters (DFlash + low-rank Markov head + confidence head,
-        # arXiv 2607.05147; reference: deepseek-ai/DeepSpec). The weights-
-        # independent drafter-forward semantics ARE implemented here:
-        #   - vanilla Markov intra-block logit bias (applied by DFlashWorker
-        #     through apply_markov_chain_logits),
-        #   - sliding-window attention on 'sliding_attention' draft layers
-        #     during the block decode (use_swa / swa_window_size),
-        #   - the shift_label output convention (hidden state at block slot j
-        #     predicts draft token j+1; slot 0 holds the anchor token).
-        # Confidence-scheduled verification is NOT implemented yet: the
-        # confidence_proj weights are loaded (for the follow-up MR) but never
-        # used, and drafting always proposes the full K tokens.
-        self._dspark_shift_label = bool(dflash_config.get("shift_label", False))
-        self._dspark_use_swa = bool(dflash_config.get("use_swa", False))
-        self._dspark_swa_window = int(dflash_config.get("swa_window_size", 0) or 0)
-        self._dspark_markov_rank = int(dflash_config.get("markov_rank", 0) or 0)
-        self._dspark_markov_head_type = str(
-            dflash_config.get("markov_head_type", "vanilla") or "vanilla"
-        ).lower()
-        self._dspark_use_confidence_head = bool(dflash_config.get("use_confidence_head", False))
-        # Plain None placeholders rather than nn.Parameter/buffer: most
-        # DFlash checkpoints don't ship these heads, and their shapes
-        # ([vocab, rank]) are checkpoint-dependent, so nothing is
-        # pre-allocated. load_weights() fills them in only when the
-        # checkpoint ships them; consumers treat None as "head absent".
-        self.markov_w1 = None  # [vocab, rank] (nn.Embedding weight layout)
-        self.markov_w2 = None  # [vocab, rank] (nn.Linear(rank->vocab) weight)
-        self.confidence_proj_weight = None  # loaded, unused (follow-up MR)
-        self.confidence_proj_bias = None
-
-        if self._dspark_markov_rank > 0 and self._dspark_markov_head_type != "vanilla":
+        # Sliding-window block decode (use_swa / swa_window_size). Kept in the
+        # base class rather than in the DSpark subclass because the block decode
+        # below indexes ``self._layer_windows`` directly: a base-class forward
+        # must not reach for an attribute only a subclass defines. Drafters that
+        # leave use_swa unset get all-(-1,-1) windows, i.e. a no-op.
+        self._use_swa = bool(dflash_config.get("use_swa", False))
+        self._swa_window = int(dflash_config.get("swa_window_size", 0) or 0)
+        if self._use_swa and self._swa_window < 1:
             raise ValueError(
-                f"DFlash dspark drafter declares markov_head_type="
-                f"'{self._dspark_markov_head_type}'; only 'vanilla' is "
-                "supported (gated/rnn heads need per-step hidden features)."
-            )
-        if self._dspark_use_swa and self._dspark_swa_window < 1:
-            raise ValueError(
-                "DFlash dspark drafter sets use_swa but swa_window_size="
+                "DFlash drafter sets use_swa but swa_window_size="
                 f"{dflash_config.get('swa_window_size')} is invalid."
-            )
-        # causal=true is only invalid under the dspark convention. Legacy
-        # DFlash drafter configs (e.g. Laguna) also carry a causal field;
-        # their causality is handled by the legacy decode path
-        # (_sliding_layers_causal), so don't reject them here.
-        is_dspark = (
-            str(dflash_config.get("projector_type", "") or "").lower() == "dspark"
-            or self._dspark_shift_label
-            or self._dspark_use_swa
-            or self._dspark_markov_rank > 0
-            or self._dspark_use_confidence_head
-        )
-        if is_dspark and dflash_config.get("causal"):
-            raise ValueError(
-                "DFlash dspark drafter sets causal=true; the block decode "
-                "only supports the non-causal dspark convention."
             )
         # Per-layer flash-attn window for the block decode, resolved once.
         num_draft_layers = getattr(pretrained_config, "num_hidden_layers", 0)
         layer_types = getattr(pretrained_config, "layer_types", None)
-        self._dspark_layer_windows = [
-            dspark_layer_window_size(self._dspark_use_swa, self._dspark_swa_window, layer_types, i)
+        self._layer_windows = [
+            dspark_layer_window_size(self._use_swa, self._swa_window, layer_types, i)
             for i in range(num_draft_layers)
         ]
-        if self._dspark_use_confidence_head:
-            logger.warning(
-                "DFlash dspark drafter declares use_confidence_head; "
-                "confidence-scheduled verification is not implemented yet "
-                "(confidence_proj weights are loaded but unused, drafting "
-                "always proposes the full K tokens)."
-            )
 
         self.logits_processor = None  # Set by caller after construction
 
@@ -317,33 +269,6 @@ class DFlashForCausalLM(nn.Module):
         hidden_states = hidden_states.to(self.fc.weight.dtype)
         return self.hidden_norm(self.fc(hidden_states))
 
-    @property
-    def has_markov_head(self) -> bool:
-        return self._dspark_markov_rank > 0 and self.markov_w1 is not None
-
-    def apply_markov_chain_logits(
-        self,
-        base_logits: torch.Tensor,
-        first_prev_tokens: torch.Tensor,
-        argmax_fn=None,
-        vocab_slice: slice | None = None,
-    ) -> torch.Tensor:
-        """Apply the dspark vanilla-Markov intra-block bias to block logits.
-
-        No-op (returns ``base_logits`` unchanged) for non-dspark drafters.
-        See :func:`dspark_markov_chain` for the semantics; when
-        ``base_logits`` is a TP vocab shard, the caller must pass this
-        rank's ``vocab_slice`` (to shard the markov_w2 rows identically)
-        and an ``argmax_fn`` returning full-vocab token ids — DFlashWorker
-        handles both.
-        """
-        if not self.has_markov_head:
-            return base_logits
-        markov_w2 = self.markov_w2 if vocab_slice is None else self.markov_w2[vocab_slice]
-        return dspark_markov_chain_logits(
-            base_logits, first_prev_tokens, self.markov_w1, markov_w2, argmax_fn=argmax_fn
-        )
-
     def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads, head_dim):
         """Hook applied to the block-attention output before o_proj.
 
@@ -389,43 +314,6 @@ class DFlashForCausalLM(nn.Module):
                 else:
                     split[k] = v
             weights = split
-
-        # DSpark head weights: keep them out of the backbone remap (they'd
-        # get a 'model.' prefix and be dropped by allow_partial_loading).
-        # markov_w1/markov_w2 drive the intra-block logit bias; the
-        # confidence_proj weights are loaded for the confidence-scheduling
-        # follow-up MR but are not used yet.
-        dspark_keys = (
-            "markov_w1.weight",
-            "markov_w2.weight",
-            "confidence_proj.weight",
-            "confidence_proj.bias",
-        )
-        dspark_weights = {k: weights[k] for k in dspark_keys if k in weights}
-        if dspark_weights:
-            weights = {k: v for k, v in weights.items() if k not in dspark_weights}
-        if self._dspark_markov_rank > 0:
-            vocab = self.config.vocab_size
-            rank = self._dspark_markov_rank
-            for k in ("markov_w1.weight", "markov_w2.weight"):
-                if k not in dspark_weights:
-                    raise ValueError(
-                        f"DFlash dspark drafter declares markov_rank="
-                        f"{self._dspark_markov_rank} but the checkpoint is "
-                        f"missing {k}."
-                    )
-                if tuple(dspark_weights[k].shape) != (vocab, rank):
-                    raise ValueError(
-                        f"DFlash dspark {k} has shape "
-                        f"{tuple(dspark_weights[k].shape)}, expected "
-                        f"[vocab, markov_rank] = ({vocab}, {rank})."
-                    )
-            self.markov_w1 = dspark_weights["markov_w1.weight"].to("cuda")
-            self.markov_w2 = dspark_weights["markov_w2.weight"].to("cuda")
-        if "confidence_proj.weight" in dspark_weights:
-            self.confidence_proj_weight = dspark_weights["confidence_proj.weight"].to("cuda")
-        if "confidence_proj.bias" in dspark_weights:
-            self.confidence_proj_bias = dspark_weights["confidence_proj.bias"].to("cuda")
 
         # Remap: add 'model.' prefix where needed, and extract DFlash-specific weights
         remapped = {}
@@ -1055,13 +943,11 @@ class DFlashForCausalLM(nn.Module):
 
             # Per-layer view into the pooled ctx cache.
             causal, window_size = self._get_attention_mask_args(layer_idx)
-            dspark_window = (
-                self._dspark_layer_windows[layer_idx]
-                if layer_idx < len(self._dspark_layer_windows)
-                else (-1, -1)
+            swa_window = (
+                self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
             )
-            if dspark_window != (-1, -1):
-                window_size = dspark_window
+            if swa_window != (-1, -1):
+                window_size = swa_window
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
                 trtllm_gen_ops.append_paged_kv_cache(
@@ -1292,13 +1178,73 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         return (attn_output.unflatten(-1, (num_heads, head_dim)) * gate.unsqueeze(-1)).flatten(-2)
 
 
+# Published DSpark drafters spell the head switches four different ways, and a
+# reader that knows only one of them degrades silently: the heads are skipped,
+# their weights are dropped, and nothing raises. Resolution order matches
+# ``TorchLlmArgs.validate_speculative_config`` so the model and the user-visible
+# spec_config can never disagree about whether a head is on.
+_DSPARK_HEAD_KEY_ALIASES = {
+    # RadixArk/Kimi-K3-DSpark ships ``enable_confidence_head`` top-level.
+    "use_confidence_head": ("use_confidence_head", "enable_confidence_head"),
+}
+
+
+def resolve_dspark_head_config(pretrained_config, key):
+    """Resolve one DSpark head switch across every spelling in the wild.
+
+    Looks in ``dspark_config``, then ``dflash_config``, then the top level as
+    ``dspark_<key>`` and as ``<key>``, for each accepted alias of ``key``.
+    Returns ``None`` when the drafter declares the switch nowhere.
+    """
+    dspark_cfg = getattr(pretrained_config, "dspark_config", None) or {}
+    dflash_cfg = getattr(pretrained_config, "dflash_config", None) or {}
+    for name in _DSPARK_HEAD_KEY_ALIASES.get(key, (key,)):
+        for value in (
+            dspark_cfg.get(name),
+            dflash_cfg.get(name),
+            getattr(pretrained_config, f"dspark_{name}", None),
+            getattr(pretrained_config, name, None),
+        ):
+            if value is not None:
+                return value
+    return None
+
+
+def declares_dspark_heads(pretrained_config) -> bool:
+    """True when a drafter config asks for the DSpark head set.
+
+    Resolved here rather than in the DSpark module: this module must not import
+    the DSpark drafters, or the ``modeling_dspark -> modeling_dflash``
+    inheritance edge would become a cycle.
+    """
+    return bool(
+        str(resolve_dspark_head_config(pretrained_config, "projector_type") or "").lower()
+        == "dspark"
+        or resolve_dspark_head_config(pretrained_config, "shift_label")
+        or resolve_dspark_head_config(pretrained_config, "use_confidence_head")
+        or int(resolve_dspark_head_config(pretrained_config, "markov_rank") or 0) > 0
+    )
+
+
 @register_draft_model(SpeculativeDecodingMode.DFLASH)
 def _build_dflash_draft(model_config, draft_config, lm_head, model):
     """Build the DFlash drafter.
 
     Selects the Laguna variant by detecting its architecture in the draft
-    checkpoint's own config.
+    checkpoint's own config. A drafter that declares the DSpark heads is
+    rejected rather than silently served without them: DFlash no longer
+    implements the Markov / confidence / shift_label semantics, so building one
+    here would degrade the drafter with no error and show up only as a lower
+    acceptance rate.
     """
+    if declares_dspark_heads(draft_config.pretrained_config):
+        raise ValueError(
+            "This drafter checkpoint declares the DSpark head set "
+            "(dflash_config with any of projector_type='dspark', shift_label, "
+            "use_confidence_head, markov_rank > 0), which decoding_type "
+            "'DFlash' does not implement. Set speculative_config.decoding_type "
+            "to 'DSpark' to run it."
+        )
     draft_arches = getattr(draft_config.pretrained_config, "architectures", None) or []
     dflash_attention_backend = model_config.spec_config.attention_backend
     if any("Laguna" in arch for arch in draft_arches):

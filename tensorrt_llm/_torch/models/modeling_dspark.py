@@ -25,18 +25,28 @@
 #
 # The draft I/O stages are ported from the same reference
 # (`inference/model.py`: DSparkBlock.forward_embed / forward_head).
-"""DeepSeek-V4-Pro DSpark speculative-decoding draft.
+"""DSpark speculative-decoding drafters.
 
 ``DSpark`` names the speculative-decoding *algorithm*: a parallel block draft
 over captured target hidden states, refined by a low-rank Markov head and
-scheduled by a confidence head. This module holds its **in-checkpoint** flavour,
-where the draft weights ship inside the DeepSeek-V4-Pro *target* checkpoint under
-the ``mtp.*`` namespace and reuse the V4 decoder block, so the draft inherits the
-target's EPLB layer namespace and fp8/NVFP4 quantization. Standalone DSpark
-drafters — shipped as their own checkpoint, backbone resolved through the model
-registry — are built by :mod:`modeling_dflash` instead.
+scheduled by a confidence head. Every ``decoding_type: DSpark`` drafter is built
+here, in one of two flavours that differ only in how the draft is delivered:
 
-Three parts live here:
+* **embedded** — the draft weights ship inside the DeepSeek-V4-Pro *target*
+  checkpoint under the ``mtp.*`` namespace and reuse the V4 decoder block, so the
+  draft inherits the target's EPLB layer namespace and fp8/NVFP4 quantization.
+  Most of this module is this flavour.
+* **standalone** — the drafter ships as its own checkpoint and shares nothing
+  with the target but the vocabulary and the captured hidden states. Its block
+  decode is DFlash's, so :class:`DSparkDrafterForCausalLM` subclasses
+  ``DFlashForCausalLM`` and adds the Markov head, the confidence head and the
+  shift_label convention. See "Standalone DSpark drafters" near the bottom.
+
+The dependency runs one way, ``modeling_dspark -> modeling_dflash``: DFlash is
+DSpark minus those three heads, and :mod:`modeling_dflash` must not name a DSpark
+class or the edge would become a cycle.
+
+Four parts live here:
 
 1. **Draft backbone** — ``n_mtp_layers`` (3 for V4-Pro) full DeepSeek-V4 blocks
    (MLA attention + MoE + manifold Hyper-Connections), plus:
@@ -56,6 +66,10 @@ Three parts live here:
 3. **Block draft I/O** — ``build_draft_input_ids`` (the
    ``[bonus_token, noise, ...]`` block input) and ``dspark_propose`` (Markov
    refinement + static confidence truncation).
+
+4. **Standalone DSpark drafters** — :class:`DSparkDrafterForCausalLM` and its
+   per-backbone subclasses, plus the two-level ``_build_dspark_draft`` dispatch
+   that picks between the two flavours.
 
 The per-stage *backbone* forward (block attention whose K/V derive from
 ``main_x``, + MoE + mHC) is brought up and numerically validated against the real
@@ -94,7 +108,13 @@ from .modeling_deepseekv4 import (
     _rename_deepseek_v4_attn_subkey,
     _rename_deepseek_v4_ffn_subkey,
 )
-from .modeling_speculative import DSparkConfidenceHead, build_markov_head, confident_prefix_length
+from .modeling_dflash import DFlashForCausalLM, resolve_dspark_head_config
+from .modeling_speculative import (
+    DSparkConfidenceHead,
+    build_markov_head,
+    confident_prefix_length,
+    dspark_markov_chain_logits,
+)
 from .modeling_utils import register_draft_model
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -1888,12 +1908,230 @@ class DSv4DSparkForCausalLM(nn.Module):
             self.dspark_model.lm_head = target_model.lm_head
 
 
+# ----------------------------------------------------------------------------
+# Standalone DSpark drafters.
+#
+# The other DSpark flavour: the drafter ships as its own checkpoint instead of
+# living in the target's ``mtp.*`` namespace, so it shares nothing with the
+# target but the vocabulary and the captured hidden states. Its block decode is
+# DFlash's -- DSpark is DFlash plus a Markov logit bias, a confidence head and
+# the shift_label slot convention -- so these subclass ``DFlashForCausalLM`` and
+# add exactly those three.
+# ----------------------------------------------------------------------------
+
+# Both published drafters (RadixArk/Kimi-K3-DSpark, Inferact/Kimi-K3-DSpark)
+# name the head tensors after the submodules that own them: markov_head is a
+# VanillaMarkov, confidence_head an AcceptRatePredictor whose linear is ``proj``.
+# The bare spellings are kept for drafters exported without that nesting.
+_DSPARK_HEAD_WEIGHT_ALIASES = {
+    "markov_w1.weight": ("markov_head.markov_w1.weight", "markov_w1.weight"),
+    "markov_w2.weight": ("markov_head.markov_w2.weight", "markov_w2.weight"),
+    "confidence_proj.weight": ("confidence_head.proj.weight", "confidence_proj.weight"),
+    "confidence_proj.bias": ("confidence_head.proj.bias", "confidence_proj.bias"),
+}
+
+
+class DSparkDrafterForCausalLM(DFlashForCausalLM):
+    """DSpark drafter built from a standalone draft checkpoint.
+
+    Adds the DSpark head set on top of the generic DFlash block decode:
+
+      - the vanilla Markov intra-block logit bias, applied by ``DFlashWorker``
+        through :meth:`apply_markov_chain_logits`;
+      - the ``shift_label`` output convention (the hidden state at block slot j
+        predicts draft token j+1, so slot 0 holds the anchor token);
+      - the confidence head weights.
+
+    Confidence-scheduled verification is not implemented yet: ``confidence_proj``
+    is loaded but unused, and drafting always proposes the full K tokens.
+
+    The draft backbone itself is whatever the drafter config resolves to through
+    the model registry, so this class is backbone-agnostic; per-backbone
+    subclasses exist to carry backbone-specific block-decode overrides.
+
+    Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
+    """
+
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+        super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
+
+        cfg = draft_config.pretrained_config
+        # Defaults on, unlike the DFlash base: the shift_label slot layout is
+        # part of what DSpark *is*, and both published drafters set
+        # block_size == max_draft_len, where the DFlash layout (slots 1..K)
+        # runs one slot past the block and reads the next request's anchor.
+        # An explicit false still selects the legacy layout.
+        shift_label = resolve_dspark_head_config(cfg, "shift_label")
+        self._dspark_shift_label = True if shift_label is None else bool(shift_label)
+        self._dspark_markov_rank = int(resolve_dspark_head_config(cfg, "markov_rank") or 0)
+        self._dspark_markov_head_type = str(
+            resolve_dspark_head_config(cfg, "markov_head_type") or "vanilla"
+        ).lower()
+        self._dspark_use_confidence_head = bool(
+            resolve_dspark_head_config(cfg, "use_confidence_head") or False
+        )
+        # Plain None placeholders rather than nn.Parameter/buffer: the shapes
+        # ([vocab, rank]) are checkpoint-dependent, so nothing is pre-allocated
+        # and nothing is constructed in the module's default dtype. Using the
+        # checkpoint tensor as-is is also what keeps the head in the checkpoint's
+        # dtype instead of an nn.Module default. load_weights() fills them in;
+        # consumers treat None as "head absent".
+        self.markov_w1 = None  # [vocab, rank] (nn.Embedding weight layout)
+        self.markov_w2 = None  # [vocab, rank] (nn.Linear(rank->vocab) weight)
+        self.confidence_proj_weight = None  # loaded, unused (follow-up MR)
+        self.confidence_proj_bias = None
+
+        if self._dspark_markov_rank > 0 and self._dspark_markov_head_type != "vanilla":
+            raise ValueError(
+                f"DSpark drafter declares markov_head_type="
+                f"'{self._dspark_markov_head_type}'; only 'vanilla' is "
+                "supported (gated/rnn heads need per-step hidden features)."
+            )
+        # The block decode only supports the non-causal DSpark convention.
+        # Legacy DFlash drafter configs (e.g. Laguna) also carry a causal field
+        # and handle it in the legacy decode path, which is why this check lives
+        # here rather than in the DFlash base.
+        if resolve_dspark_head_config(cfg, "causal"):
+            raise ValueError(
+                "DSpark drafter sets causal=true; the block decode only "
+                "supports the non-causal DSpark convention."
+            )
+        if self._dspark_use_confidence_head:
+            logger.warning(
+                "DSpark drafter declares use_confidence_head; "
+                "confidence-scheduled verification is not implemented yet "
+                "(confidence_proj weights are loaded but unused, drafting "
+                "always proposes the full K tokens)."
+            )
+
+    @property
+    def has_markov_head(self) -> bool:
+        return self._dspark_markov_rank > 0 and self.markov_w1 is not None
+
+    def apply_markov_chain_logits(
+        self,
+        base_logits: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        argmax_fn=None,
+        vocab_slice: Optional[slice] = None,
+    ) -> torch.Tensor:
+        """Apply the vanilla-Markov intra-block bias to block logits.
+
+        No-op (returns ``base_logits`` unchanged) when the checkpoint ships no
+        Markov head. See :func:`dspark_markov_chain` for the semantics; when
+        ``base_logits`` is a TP vocab shard the caller must pass this rank's
+        ``vocab_slice`` (to shard the markov_w2 rows identically) and an
+        ``argmax_fn`` returning full-vocab token ids -- ``DFlashWorker`` handles
+        both.
+        """
+        if not self.has_markov_head:
+            return base_logits
+        markov_w2 = self.markov_w2 if vocab_slice is None else self.markov_w2[vocab_slice]
+        return dspark_markov_chain_logits(
+            base_logits, first_prev_tokens, self.markov_w1, markov_w2, argmax_fn=argmax_fn
+        )
+
+    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
+        """Take the DSpark head weights, then hand the rest to DFlash.
+
+        The head keys are pulled out before the backbone remap: left in, they
+        would pick up a ``model.`` prefix and be dropped by partial loading.
+        """
+        dspark_weights = {}
+        consumed = set()
+        for canonical, aliases in _DSPARK_HEAD_WEIGHT_ALIASES.items():
+            for name in aliases:
+                if name in weights:
+                    dspark_weights[canonical] = weights[name]
+                    consumed.add(name)
+                    break
+        if consumed:
+            weights = {k: v for k, v in weights.items() if k not in consumed}
+        # The inverse of the missing-weights check below. Without it, a config
+        # whose head switches this build cannot resolve loads the drafter with
+        # the heads silently dropped -- correct output, lower acceptance.
+        if self._dspark_markov_rank <= 0 and "markov_w1.weight" in dspark_weights:
+            raise ValueError(
+                "DSpark drafter ships markov_w1/markov_w2 but markov_rank resolved to 0. "
+                "The checkpoint's head switches were not found in dspark_config, "
+                "dflash_config, or at the top level; loading it would drop the Markov "
+                "head silently."
+            )
+        if self._dspark_markov_rank > 0:
+            vocab = self.config.vocab_size
+            rank = self._dspark_markov_rank
+            for k in ("markov_w1.weight", "markov_w2.weight"):
+                if k not in dspark_weights:
+                    raise ValueError(
+                        f"DSpark drafter declares markov_rank="
+                        f"{self._dspark_markov_rank} but the checkpoint is "
+                        f"missing {k}."
+                    )
+                if tuple(dspark_weights[k].shape) != (vocab, rank):
+                    raise ValueError(
+                        f"DSpark {k} has shape "
+                        f"{tuple(dspark_weights[k].shape)}, expected "
+                        f"[vocab, markov_rank] = ({vocab}, {rank})."
+                    )
+            self.markov_w1 = dspark_weights["markov_w1.weight"].to("cuda")
+            self.markov_w2 = dspark_weights["markov_w2.weight"].to("cuda")
+        if "confidence_proj.weight" in dspark_weights:
+            self.confidence_proj_weight = dspark_weights["confidence_proj.weight"].to("cuda")
+        if "confidence_proj.bias" in dspark_weights:
+            self.confidence_proj_bias = dspark_weights["confidence_proj.bias"].to("cuda")
+        return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+
+
+class Qwen3DSparkForCausalLM(DSparkDrafterForCausalLM):
+    """DSpark drafter on a Qwen3-style GQA draft backbone.
+
+    Overrides nothing today: the backbone is built from the drafter config
+    through the model registry, and the DSpark head set is backbone-independent,
+    so ``DSparkDrafterForCausalLM`` already covers this combination end to end.
+
+    It exists as the explicit dispatch target for ``model_type: qwen3``, which
+    keeps the supported matrix visible in class names rather than buried in a
+    builder, and as the seat for backbone-specific overrides when they arrive.
+    They will: an MLA-backboned drafter cannot reuse this block decode, which
+    assumes a fused ``qkv_proj`` and one uniform head dim across Q/K/V.
+    """
+
+
+# Standalone DSpark drafters by the draft checkpoint's ``model_type``. The key
+# is the backbone family, not the target model: the same drafter class serves
+# any target, and a target-specific one would have nothing to hold -- the
+# target-side half of DSpark is the hidden-state capture, which lives in each
+# target's own modeling file.
+_DSPARK_DRAFTERS_BY_MODEL_TYPE = {
+    "qwen3": Qwen3DSparkForCausalLM,
+}
+
+
+def draft_is_embedded_in_target(model_config, draft_config) -> bool:
+    """True when the DSpark draft weights live inside the target checkpoint.
+
+    That is the DeepSeek-V4-Pro layout: the draft is ``mtp.*`` inside the target
+    checkpoint and inherits its block definition, EPLB layer namespace and
+    quantization. The probe is the weight index rather than a config field
+    because the index is authoritative and cannot be left unset; the model_type
+    check is the fallback for a checkpoint whose index file is absent.
+    """
+    if count_dspark_stages(model_config.spec_config.speculative_model) is not None:
+        return True
+    return getattr(draft_config.pretrained_config, "model_type", None) == "deepseek_v4"
+
+
 @register_draft_model(SpeculativeDecodingMode.DSPARK)
 def _build_dspark_draft(model_config, draft_config, lm_head, model):
-    """Build the DSpark drafter, reusing the target's aux streams.
+    """Build the DSpark drafter for either flavour.
 
-    The draft stage count (``n_mtp_layers``) is not in the HF config, so it is
-    derived from the checkpoint's ``mtp.*`` namespace.
+    Two levels of dispatch:
+
+    1. Are the draft weights embedded in the target checkpoint? If so this is
+       the DeepSeek-V4-Pro draft, whose stage count (``n_mtp_layers``) is not in
+       the HF config and is derived from the ``mtp.*`` namespace.
+    2. Otherwise the drafter is standalone, and its own ``model_type`` selects
+       the backbone-specific class.
 
     Args:
         model_config: the target engine's ``ModelConfig``.
@@ -1902,22 +2140,45 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
         model: the target model, whose aux streams the draft stages reuse.
 
     Returns:
-        The ``DSv4DSparkForCausalLM`` draft module.
+        The draft ``nn.Module`` for this drafter.
     """
-    num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
-    validate_dspark_eplb_layer_base(model_config, draft_config)
-    return DSv4DSparkForCausalLM(
+    if draft_is_embedded_in_target(model_config, draft_config):
+        num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
+        validate_dspark_eplb_layer_base(model_config, draft_config)
+        return DSv4DSparkForCausalLM(
+            draft_config,
+            getattr(model, "aux_stream_dict", None),
+            num_stages=num_stages,
+            block_size=model_config.spec_config.block_size,
+        )
+
+    model_type = getattr(draft_config.pretrained_config, "model_type", None)
+    drafter_cls = _DSPARK_DRAFTERS_BY_MODEL_TYPE.get(model_type)
+    if drafter_cls is None:
+        supported = ", ".join(sorted(_DSPARK_DRAFTERS_BY_MODEL_TYPE))
+        raise NotImplementedError(
+            f"No standalone DSpark drafter for draft model_type {model_type!r}. "
+            f"Supported draft model_type values: {supported}. The dispatch keys "
+            "on the draft backbone, so a drafter is supported once its backbone "
+            "has a block-decode implementation here; MLA-backboned drafters "
+            "(e.g. Inferact/Kimi-K3-DSpark, model_type 'k3_dspark') need one and "
+            "are a follow-up."
+        )
+    return drafter_cls(
         draft_config,
-        getattr(model, "aux_stream_dict", None),
-        num_stages=num_stages,
-        block_size=model_config.spec_config.block_size,
+        dflash_attention_backend=model_config.spec_config.attention_backend,
     )
 
 
 __all__ = [
+    # Embedded (DeepSeek-V4-Pro) flavour.
     "DSv4DSparkBlock",
     "DSv4DSparkDraftModel",
     "DSv4DSparkForCausalLM",
+    # Standalone flavour.
+    "DSparkDrafterForCausalLM",
+    "Qwen3DSparkForCausalLM",
+    "draft_is_embedded_in_target",
     "validate_dspark_eplb_layer_base",
     "validate_dspark_eplb_stage_layers",
     # Captured-context attention primitives.
