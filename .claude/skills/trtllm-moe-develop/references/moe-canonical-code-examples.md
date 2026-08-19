@@ -8,7 +8,7 @@ then inspect the actual repository files.
 
 Use these examples to understand wrapper-level lifecycle and composition:
 
-- `tensorrt_llm/_torch/modules/fused_moe/configurable_moe.py`
+- `tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py`
   - `ConfigurableMoE.__init__`: backend construction, communication creation,
     chunking-related wrapper state, validation, DWDP setup, and weight-removal
     lifecycle.
@@ -38,7 +38,7 @@ Red flags:
 Use these examples when changing forward policy, chunking, communication order,
 EPLB hook order, or fused-communication behavior:
 
-- `tensorrt_llm/_torch/modules/fused_moe/moe_scheduler.py`
+- `tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py`
   - `MoEScheduler`: abstract forward strategy.
   - `ExternalCommMoEScheduler`: host-side communication path, chunking, adaptive
     quantize/dispatch ordering, communication fallback, multi-stream overlap,
@@ -48,10 +48,10 @@ EPLB hook order, or fused-communication behavior:
     no external `Communication`, `ignore_allreduce=False`, and backend
     `run_moe` invocation.
   - `create_moe_scheduler`: factory keyed by `backend.scheduler_kind`.
-- `tensorrt_llm/_torch/modules/fused_moe/interface.py`
+- `tensorrt_llm/_torch/moe/fused_moe/interface.py`
   - `MoESchedulerKind`: backend-declared selection axis for external vs fused
     cross-rank exchange.
-- `tensorrt_llm/_torch/modules/fused_moe/configurable_moe.py`
+- `tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py`
   - Scheduler is constructed after backend/comm/chunking/DWDP state is ready;
     wrapper `forward_impl` delegates and then runs shared lifecycle bookkeeping.
 
@@ -80,7 +80,7 @@ Red flags:
 
 Use these examples to decide what belongs in a backend:
 
-- `tensorrt_llm/_torch/modules/fused_moe/interface.py`
+- `tensorrt_llm/_torch/moe/fused_moe/interface.py`
   - `MoE`: current transitional base contract shared by legacy standalone MoE
     modules and newer ConfigurableMoE-compatible backends. A dedicated backend
     interface is expected in the future; do not treat legacy `forward` methods
@@ -101,22 +101,22 @@ Use these examples to decide what belongs in a backend:
   - `forward` and `forward_impl`: legacy standalone-module entrypoints only;
     avoid adding them to new ConfigurableMoE-compatible backends unless the user
     explicitly requests that behavior.
-- `tensorrt_llm/_torch/modules/fused_moe/fused_moe_cutlass.py`
+- `tensorrt_llm/_torch/moe/fused_moe/fused_moe_cutlass.py`
   - Reference backend for normal external communication and broad quant support.
   - Inspect `_get_quant_method`, `create_weights`, `load_weights`, and
     `post_load_weights` for the standard backend-to-quantization delegation
     pattern.
-- `tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py`
+- `tensorrt_llm/_torch/moe/fused_moe/fused_moe_trtllm_gen.py`
   - Reference backend for TRTLLMGen-specific input/scale contracts.
   - Inspect `_get_quant_method`, alignment validation, weight lifecycle
     delegation, and quant scale usage.
-- `tensorrt_llm/_torch/modules/fused_moe/fused_moe_deepgemm.py`
+- `tensorrt_llm/_torch/moe/fused_moe/fused_moe_deepgemm.py`
   - Reference backend for DeepGEMM workspace and Blackwell FP8 block-scale path.
-- `tensorrt_llm/_torch/modules/fused_moe/fused_moe_densegemm.py` when present
+- `tensorrt_llm/_torch/moe/fused_moe/fused_moe_densegemm.py` when present
   - Reference for a direct `MoE` backend with dense GEMM constraints.
   - Inspect backend-owned `create_weights`, `load_weights`, and
     `post_load_weights` delegation.
-- `tensorrt_llm/_torch/modules/fused_moe/mega_moe/` when present
+- `tensorrt_llm/_torch/moe/fused_moe/mega_moe/` when present
   - Reference area for a backend whose kernel owns cross-rank exchange. Inspect
     capability checks, load-balancer support, validation, weight lifecycle
     delegation, `quantize_input`, and `run_moe`.
@@ -162,7 +162,7 @@ the backend section: backend owns the module-level lifecycle entrypoints and
 method selection; quantization owns the delegated tensor layout, loading
 details, transforms, and scale registration for a quantization layout:
 
-- `tensorrt_llm/_torch/modules/fused_moe/quantization.py`
+- `tensorrt_llm/_torch/moe/fused_moe/quantization.py`
   - `FusedMoEMethodBase`: common weight create/load/post-load flow, shared weight
     loading, EPLB hooks, and quant scale setup.
   - `UnquantizedFusedMoEMethod`: simple supported-EPLB baseline.
@@ -197,16 +197,16 @@ Red flags:
 
 Use these examples when touching dynamic expert migration or slot routing:
 
-- `tensorrt_llm/_torch/modules/fused_moe/interface.py`
+- `tensorrt_llm/_torch/moe/fused_moe/interface.py`
   - `_using_load_balancer`, `_using_dynamic_load_balancer`.
   - `_load_balancer_update_statistic` and
     `_load_balancer_update_statistic_with_gathered_statistic`.
   - `_load_balancer_route` and slot/expert-ID conversion.
   - `register_all_parameter_slot_and_to_fix_weight_fns`.
-- `tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py`
+- `tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py`
   - Slot registration, expert migration, per-layer update flow, and iteration
     context.
-- `tensorrt_llm/_torch/modules/fused_moe/quantization.py`
+- `tensorrt_llm/_torch/moe/fused_moe/quantization.py`
   - `eplb_support_status`, `supports_online_eplb`,
     `need_load_shared_weights`, shared-weight registration, and transformed
     weight fix-up hooks.
@@ -246,7 +246,7 @@ Use these exact locations when adding or reviewing a per-expert Parameter that
 must survive online EPLB migration.
 
 - Bulk FC weights (base-class path, every EPLB-supporting quant method):
-  - `tensorrt_llm/_torch/modules/fused_moe/quantization.py::FusedMoEMethodBase.load_weights`
+  - `tensorrt_llm/_torch/moe/fused_moe/quantization.py::FusedMoEMethodBase.load_weights`
      --  `need_load_shared_weights(module)` branch allocates and fills
     `module.local_shared_w3_w1_tensors` / `module.local_shared_w2_tensors`
     (and bias twins when `module.bias`) sized
@@ -329,7 +329,7 @@ routed/shared index spaces overlap on the same global expert IDs.
 
 Use these examples when changing dispatch/combine behavior:
 
-- `tensorrt_llm/_torch/modules/fused_moe/communication/base.py`
+- `tensorrt_llm/_torch/moe/fused_moe/communication/base.py`
   - `Communication` ABC, `supports_post_quant_dispatch`, `prepare_dispatch`,
     `dispatch`, and `combine`.
 - `communication/communication_factory.py`
@@ -360,11 +360,11 @@ Red flags:
 
 Use these examples when wrapper forward policy grows complicated:
 
-- `tensorrt_llm/_torch/modules/fused_moe/moe_scheduler.py`
+- `tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py`
   - Scheduler forward entry, external/fused scheduler implementations, routing
     order, dispatch order, EPLB hook order, zero-token behavior, output
     truncation, and backend kwargs.
-- `tensorrt_llm/_torch/modules/fused_moe/configurable_moe.py`
+- `tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py`
   - Wrapper entry and lifecycle boundary around scheduler execution.
 - Backend forward paths
   - Useful only for legacy compatibility context or for identifying policy that
@@ -390,9 +390,9 @@ Red flags:
 
 Use these examples when changing model-to-backend selection or routing output:
 
-- `tensorrt_llm/_torch/modules/fused_moe/routing.py`
+- `tensorrt_llm/_torch/moe/fused_moe/routing.py`
   - Routing method output shape/dtype and top-k behavior.
-- `tensorrt_llm/_torch/modules/fused_moe/create_moe.py`
+- `tensorrt_llm/_torch/moe/fused_moe/create_moe.py`
   - `get_moe_cls`, `create_moe_backend`, `create_moe`, backend fallback, and
     quantization-specific selection.
 - `tests/unittest/_torch/modules/moe/moe_test_utils.py`

@@ -4,7 +4,7 @@ description: >-
   Review, design, and refactor TensorRT-LLM PyTorch MoE code for architecture fit,
   clean code, maintainability, and testability. Always use for any modification,
   review, refactor, or design planning that touches MoE modules, including
-  tensorrt_llm/_torch/modules/fused_moe, ConfigurableMoE, MoE backends,
+  tensorrt_llm/_torch/moe/fused_moe, ConfigurableMoE, MoE backends,
   MoEScheduler/moe_scheduler.py, forward execution/chunking, communication
   strategies, EPLB, quantization/weight
   handling, routing, factories, MoE docs, or MoE tests. Also use when the user
@@ -26,7 +26,7 @@ style cleanup.
 Before proposing or editing MoE code, read:
 
 1. `CODING_GUIDELINES.md`
-2. `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md`
+2. `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md`
 3. The target files being changed
 4. The relevant tests under `tests/unittest/_torch/modules/moe/`
 
@@ -36,9 +36,9 @@ Also inspect these files when the area is relevant:
   `interface.py`, backend `run_moe`/`quantize_input` paths, and communication code.
 - MegaMoE/fused communication: inspect `moe_scheduler.py`, `mega_moe/`,
   `configurable_moe.py`, `quantization.py`, and communication code.
-- Communication: `tensorrt_llm/_torch/modules/fused_moe/communication/base.py`
+- Communication: `tensorrt_llm/_torch/moe/fused_moe/communication/base.py`
   and `communication_factory.py`.
-- Quantization and weights: `tensorrt_llm/_torch/modules/fused_moe/quantization.py`.
+- Quantization and weights: `tensorrt_llm/_torch/moe/fused_moe/quantization.py`.
 - EPLB/load balancing: `interface.py`, `moe_load_balancer.py`, `quantization.py`,
   `moe_scheduler.py`, current forward-execution/chunking code, and
   `test_moe_module.py`.

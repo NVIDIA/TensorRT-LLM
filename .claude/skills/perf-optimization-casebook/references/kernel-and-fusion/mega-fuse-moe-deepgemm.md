@@ -38,4 +38,4 @@ measured: []
 - **Accuracy risk:** lossy (W4A8_MXFP4_MXFP8 MoE GEMM) but output-equivalent to the existing `TRTLLMGenFusedMoE` W4A8 backend by design (same math, different kernel) — parity is against that backend, not bf16.
 - **Verify:** numeric parity vs `TRTLLMGenFusedMoE` same model/quant; task accuracy vs that backend; MoE collapses to a single kernel in nsys.
 - **Rollback:** `moe_backend` → `TRTLLM` or `CUTLASS`. Trigger: `can_implement` rejects env (non-SM100, wrong quant, tp>1), missing DeepGEMM symbols, or parity failure.
-- **Prior art:** PR #13384. Files: `_torch/modules/fused_moe/mega_moe/backend.py` (`can_implement`), `create_moe.py`, DeepGEMM `fp8_fp4_mega_moe`/`transform_weights_for_mega_moe`. Owning specialist: **kernel-cute-specialist**.
+- **Prior art:** PR #13384. Files: `_torch/moe/fused_moe/mega_moe/backend.py` (`can_implement`), `create_moe.py`, DeepGEMM `fp8_fp4_mega_moe`/`transform_weights_for_mega_moe`. Owning specialist: **kernel-cute-specialist**.
