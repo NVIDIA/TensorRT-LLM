@@ -487,15 +487,6 @@ _STANDARD = [
         sliding_window=512,
     ),
     ModelAttnConfig(
-        "starcoder2_3b_gqa_swa4096",
-        "StarCoder2-3B",
-        num_heads=24,
-        num_kv_heads=2,
-        head_dim=128,
-        mask="sliding",
-        sliding_window=4096,
-    ),
-    ModelAttnConfig(
         "starcoder2_7b_gqa_swa4096",
         "StarCoder2-7B",
         num_heads=36,

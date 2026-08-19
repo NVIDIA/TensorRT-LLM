@@ -86,6 +86,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     concatenated sequence, and the scheduler only steps the generated prefix.
     """
 
+    supports_image_edit = True
     DEFAULT_GENERATION_PARAMS = _EDIT_DEFAULT_GENERATION_PARAMS
 
     def load_standard_components(

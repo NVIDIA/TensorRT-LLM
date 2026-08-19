@@ -79,6 +79,7 @@
 /.codex @NVIDIA/trt-llm-agent-devs
 /AGENTS.md @NVIDIA/trt-llm-agent-devs
 /CLAUDE.md @NVIDIA/trt-llm-agent-devs
+/agent-flow @NVIDIA/trt-llm-agent-devs
 /scripts/check_skill_naming_convention.py @NVIDIA/trt-llm-agent-devs
 
 # ===== DOCS / EXAMPLES =====

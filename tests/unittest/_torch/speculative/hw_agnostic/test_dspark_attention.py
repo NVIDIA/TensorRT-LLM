@@ -27,6 +27,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import tensorrt_llm._torch.models.dspark.attention as dspark_attention
 import tensorrt_llm._torch.models.modeling_dspark as modeling_dspark
 from tensorrt_llm._torch.models.dspark.attention import (
     apply_dspark_rotary,
@@ -36,6 +37,77 @@ from tensorrt_llm._torch.models.dspark.attention import (
     precompute_dspark_freqs_cis,
 )
 from tensorrt_llm._torch.models.modeling_dspark import DSparkDraftModel
+
+
+def test_rmsnorm_rope_fallback_applies_weight_without_rmsnorm(monkeypatch):
+    monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_AVAILABLE", False)
+    torch.manual_seed(11)
+    x = torch.randn(2, 3, 64, dtype=torch.bfloat16)
+    weight = torch.randn(64, dtype=torch.bfloat16)
+    freqs_cis = torch.empty(2, 3, 1, dtype=torch.complex64)
+
+    actual = dspark_attention._rmsnorm_rope_batched(
+        x,
+        weight,
+        1e-6,
+        0,
+        freqs_cis,
+        apply_weight=True,
+        apply_rmsnorm=False,
+    )
+
+    expected = (x.float() * weight.float()).to(x.dtype)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_rmsnorm_rope_skips_frequency_view_on_unsupported_arch(monkeypatch):
+    monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(dspark_attention, "is_sm_100f", lambda: False)
+    view_as_real = Mock(side_effect=AssertionError("frequency view should be skipped"))
+    monkeypatch.setattr(torch, "view_as_real", view_as_real)
+    x = torch.randn(2, 3, 64, dtype=torch.bfloat16)
+
+    actual = dspark_attention._rmsnorm_rope_batched(
+        x,
+        torch.ones(64, dtype=torch.bfloat16),
+        1e-6,
+        0,
+        torch.empty(2, 3, 1, dtype=torch.complex64),
+        apply_weight=False,
+        apply_rmsnorm=False,
+    )
+
+    assert actual is x
+    view_as_real.assert_not_called()
+
+
+def test_batched_attention_rejects_mismatched_window_size():
+    unused_tensor = torch.empty(0)
+    with pytest.raises(ValueError, match="does not match window_size"):
+        dspark_attention.dspark_attention_forward_batched(
+            torch.empty(1, 1, 1),
+            torch.empty(1, 1, 1),
+            torch.zeros(1, dtype=torch.long),
+            torch.empty(1, 2, 1),
+            torch.zeros(1, dtype=torch.long),
+            wq_a=unused_tensor,
+            q_norm_w=unused_tensor,
+            wq_b=unused_tensor,
+            wkv=unused_tensor,
+            kv_norm_w=unused_tensor,
+            wo_a=unused_tensor,
+            wo_b=unused_tensor,
+            attn_sink=unused_tensor,
+            n_heads=1,
+            head_dim=1,
+            rope_head_dim=0,
+            n_groups=1,
+            o_lora_rank=1,
+            window_size=3,
+            eps=1e-6,
+            softmax_scale=1.0,
+            freqs_cis=unused_tensor,
+        )
 
 
 def test_rope_table_is_cached_once_per_device():
