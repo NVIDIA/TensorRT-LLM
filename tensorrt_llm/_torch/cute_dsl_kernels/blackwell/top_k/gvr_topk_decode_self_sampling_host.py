@@ -1232,6 +1232,11 @@ def run_varlen(
     probe battery). Finite inputs — including +/-inf and denormals — are
     tie-aware exact.
     """
+    if logits.dtype is not torch.float32:
+        raise RuntimeError(
+            f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
+            "are a follow-up — see the PR roadmap"
+        )
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")
     if kv_lens.dtype is not _I32:

@@ -284,8 +284,11 @@ def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False, engine="aut
         ([131075, 32800, 2000], 1, 4, 512),  # v4-style compressed index space
         ([9000, 5001], 2, 1, 512),  # MTP: n varies per row within a request
         ([65540], 4, 4, 1024),  # MTP: compressed-boundary-crossing rows
+        ([40000, 7003], 3, 4, 512),  # MTP2 (next_n=3): no production config
+        # uses it today, but the window formula must generalize (gap noted
+        # in the PR's MTP-coverage section)
     ],
-    ids=["cr1_hetero_short", "cr4_hetero_short", "cr1_mtp2", "cr4_mtp4"],
+    ids=["cr1_hetero_short", "cr4_hetero_short", "cr1_mtp2", "cr4_mtp4", "cr4_mtp3"],
 )
 def test_selfsampling_topk_varlen(kv, next_n, cr, top_k, engine):
     """run_varlen production contract: per-row n from device kv_lens with the
@@ -588,3 +591,16 @@ def test_selfsampling_dispatch_is_pure_and_total():
             r = ss_host.route(4, n, npad, k)
             assert r["kernel"] in ("main", "reg", "clus", "reg_clus")
             assert r["block"] >= 128 and r["grid"][0] >= 1
+
+
+@pytest.mark.skipif(getSMVersion() < 100, reason="sm100+")
+def test_selfsampling_topk_varlen_rejects_non_fp32():
+    """Engine-level dtype contract: bf16/fp16 logits must raise a clear
+    error (the dispatch seam falls through before this; direct callers get
+    the loud contract message instead of a CuTe typing failure)."""
+    logits = torch.randn(1, 8192, device=_DEV, dtype=torch.bfloat16)
+    kv = torch.tensor([8000], dtype=torch.int32, device=_DEV)
+    pre = torch.zeros(1, 512, dtype=torch.int32, device=_DEV)
+    out = torch.empty(1, 512, dtype=torch.int32, device=_DEV)
+    with pytest.raises(RuntimeError, match="float32"):
+        ss_host.run_varlen(logits, pre, kv, out, next_n=1, compress_ratio=4, max_seq_len=32768)
