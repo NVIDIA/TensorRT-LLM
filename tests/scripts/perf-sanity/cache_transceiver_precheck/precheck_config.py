@@ -146,8 +146,8 @@ def wireup_timeout_s(max_world):
 def peer_progress_timeout_s(setup_timeout_s, rendezvous_timeout_s, wave_timeout_s, wireup_s):
     """Maximum no-progress interval while a peer is queued behind sessions.
 
-    Serialized peer waits are refreshed whenever the target gen instance
-    advances to another phase or wave. The budget therefore covers one
+    Serialized peer waits are refreshed whenever the target ctx or gen
+    instance advances to another phase or wave. The budget therefore covers one
     legitimate active phase, not the cumulative duration of every earlier
     session, which would grow to hours on 6/12-ctx topologies.
     """

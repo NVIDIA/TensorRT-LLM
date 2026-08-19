@@ -649,21 +649,21 @@ def wait_for_addr(path, timeout_s):
     raise _Timeout(f"rendezvous file {path} not published within {timeout_s}s")
 
 
-def gen_progress_path(work_dir, gen_idx):
-    """Shared progress marker for one gen instance."""
-    return os.path.join(work_dir, "progress", f"gen_{gen_idx}.json")
+def peer_progress_path(work_dir, role, server_idx):
+    """Shared progress marker for one ctx or gen instance."""
+    return os.path.join(work_dir, "progress", f"{role}_{server_idx}.json")
 
 
-def publish_gen_progress(runner, phase):
-    """Best-effort atomic phase marker used by queued ctx instances.
+def publish_peer_progress(runner, phase):
+    """Best-effort atomic phase marker used by queued peer instances.
 
-    Only the gen leader writes. A new sequence value means the target gen is
-    advancing, so ctx hello/bye waits may refresh their no-progress watchdog
-    without budgeting the cumulative duration of every earlier session.
+    Only instance leaders write. A new sequence value means the target peer is
+    advancing, so queued hello/bye waits may refresh their no-progress
+    watchdog without budgeting earlier serialized sessions cumulatively.
     """
-    if runner.role != "gen" or not runner.is_leader:
+    if not runner.is_leader:
         return
-    path = gen_progress_path(runner.work_dir, runner.server_idx)
+    path = peer_progress_path(runner.work_dir, runner.role, runner.server_idx)
     try:
         runner._precheck_progress_seq = getattr(runner, "_precheck_progress_seq", 0) + 1
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -684,10 +684,10 @@ def publish_gen_progress(runner, phase):
         pass
 
 
-def read_gen_progress(work_dir, gen_idx):
-    """Return this run's gen progress sequence, or None if absent/stale."""
+def read_peer_progress(work_dir, role, server_idx):
+    """Return this run's peer progress sequence, or None if absent/stale."""
     try:
-        with open(gen_progress_path(work_dir, gen_idx)) as f:
+        with open(peer_progress_path(work_dir, role, server_idx)) as f:
             payload = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
@@ -1299,6 +1299,107 @@ class PrecheckRunner:
             raise _TransferError(f"ZMQ control channel failed: {err}")
         return reply
 
+    def _leader_send_recv_with_progress(
+        self,
+        sock,
+        obj,
+        key,
+        *,
+        peer_role,
+        peer_idx,
+        what,
+        timeout_s,
+        arm,
+    ):
+        """REQ round-trip refreshed by progress from the queued target peer."""
+        timeout_s = int(timeout_s)
+        arm(what, seconds=timeout_s, python_alarm=False)
+        send_err = None
+        if self.is_leader:
+            try:
+                sock.send(pack_msg(obj, key))
+            except Exception as e:  # noqa: BLE001 - shared via bcast below
+                send_err = repr(e)
+        send_err = self.comm.bcast(send_err, root=0)
+        if send_err:
+            raise _TransferError(f"ZMQ control send failed: {send_err}")
+
+        return _collective_recv_with_progress(
+            runner=self,
+            sock=sock,
+            key=key,
+            peer_role=peer_role,
+            peer_idx=peer_idx,
+            what=what,
+            timeout_s=timeout_s,
+            arm=arm,
+            refresh_from_peer_progress=True,
+        )
+
+
+def _collective_recv_with_progress(
+    runner,
+    sock,
+    key,
+    peer_role,
+    peer_idx,
+    what,
+    timeout_s,
+    arm,
+    *,
+    refresh_from_peer_progress,
+):
+    """Collectively receive control; target-peer progress resets the deadline.
+
+    The caller arms the phase watchdog before entering this loop. Requiring an
+    explicit refresh policy keeps active transfer waves on a hard deadline.
+    """
+    timeout_s = int(timeout_s)
+    deadline = time.monotonic() + timeout_s
+    last_progress = (
+        read_peer_progress(runner.work_dir, peer_role, peer_idx)
+        if runner.is_leader and refresh_from_peer_progress
+        else None
+    )
+
+    while True:
+        event = None
+        if runner.is_leader:
+            zmq, _ = runner._zmq()
+            try:
+                event = ("message", unpack_msg(sock.recv(), key))
+            except zmq.Again:
+                progress = (
+                    read_peer_progress(runner.work_dir, peer_role, peer_idx)
+                    if refresh_from_peer_progress
+                    else None
+                )
+                if progress is not None and progress != last_progress:
+                    event = ("progress", progress)
+                elif time.monotonic() >= deadline:
+                    event = ("timeout", None)
+                else:
+                    event = ("poll", None)
+            except Exception as e:  # noqa: BLE001 - shared via bcast below
+                event = ("error", repr(e))
+
+        kind, payload = runner.comm.bcast(event, root=0)
+        if kind == "message":
+            return payload
+        if kind == "error":
+            raise _TransferError(f"ZMQ recv from {peer_role}_{peer_idx} failed: {payload}")
+        if kind == "timeout":
+            raise _Timeout(f"{what} made no progress for {timeout_s}s")
+        if kind == "progress":
+            last_progress = payload
+            deadline = time.monotonic() + timeout_s
+            arm(
+                what,
+                seconds=timeout_s,
+                python_alarm=False,
+                publish_progress=False,
+            )
+
 
 def _schedule(plan):
     """Deterministic (li, req_len, rep, wave) schedule both sides iterate."""
@@ -1314,9 +1415,10 @@ def _schedule(plan):
 def hello_timeout_s(plan):
     """No-progress budget for serialized hello/bye waits.
 
-    The target gen's progress marker refreshes this wait after each phase/wave,
-    so the budget covers one slow active phase rather than incorrectly using
-    either side's local peer count or multiplying every earlier session.
+    The target peer's progress marker refreshes this wait after each
+    phase/wave, so the budget covers one slow active phase rather than
+    incorrectly using either side's local peer count or multiplying every
+    earlier session.
     """
     return plan["peer_progress_timeout_s"]
 
@@ -1348,49 +1450,19 @@ def _recv_ctx_control(
     hello/bye waits, observed progress from the target gen resets the deadline.
     Active wave waits do not refresh from unrelated progress.
     """
-    comm = runner.comm
     timeout_s = int(timeout_s)
-    deadline = time.monotonic() + timeout_s
-    last_progress = (
-        read_gen_progress(runner.work_dir, peer_idx)
-        if runner.is_leader and refresh_from_gen_progress
-        else None
-    )
     arm(what, seconds=timeout_s, python_alarm=False)
-
-    while True:
-        event = None
-        if runner.is_leader:
-            zmq, _ = runner._zmq()
-            try:
-                event = ("message", unpack_msg(sock.recv(), key))
-            except zmq.Again:
-                now = time.monotonic()
-                progress = (
-                    read_gen_progress(runner.work_dir, peer_idx)
-                    if refresh_from_gen_progress
-                    else None
-                )
-                if progress is not None and progress != last_progress:
-                    event = ("progress", progress)
-                elif now >= deadline:
-                    event = ("timeout", None)
-                else:
-                    event = ("poll", None)
-            except Exception as e:  # noqa: BLE001 - shared via bcast below
-                event = ("error", repr(e))
-
-        kind, payload = comm.bcast(event, root=0)
-        if kind == "message":
-            return payload
-        if kind == "error":
-            raise _TransferError(f"ZMQ recv from gen_{peer_idx} failed: {payload}")
-        if kind == "timeout":
-            raise _Timeout(f"{what} made no progress for {timeout_s}s")
-        if kind == "progress":
-            last_progress = payload
-            deadline = time.monotonic() + timeout_s
-            arm(what, seconds=timeout_s, python_alarm=False)
+    return _collective_recv_with_progress(
+        runner=runner,
+        sock=sock,
+        key=key,
+        peer_role="gen",
+        peer_idx=peer_idx,
+        what=what,
+        timeout_s=timeout_s,
+        arm=arm,
+        refresh_from_peer_progress=refresh_from_gen_progress,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1542,7 +1614,9 @@ def _gen_open_session(runner, peer_idx, arm):
             zmq, zctx = runner._zmq()
             sock = zctx.socket(zmq.REQ)
             sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.RCVTIMEO, hello_s * 1000)
+            # Poll while queued behind another gen session so ctx progress can
+            # refresh the no-progress deadline.
+            sock.setsockopt(zmq.RCVTIMEO, CONTROL_POLL_INTERVAL_MS)
             sock.connect(f"tcp://{addr['host']}:{addr['port']}")
         except Exception as e:  # noqa: BLE001 - shared via bcast below
             err = repr(e)
@@ -1551,16 +1625,23 @@ def _gen_open_session(runner, peer_idx, arm):
         raise _TransferError(f"rendezvous with ctx_{peer_idx} failed: {err}")
 
     try:
-        arm(f"hello ctx_{peer_idx}", seconds=hello_s)
-        reply = runner._leader_send_recv(
+        reply = runner._leader_send_recv_with_progress(
             sock,
             ("hello", {"gen_idx": runner.server_idx, "fingerprint": plan["fingerprint"]}),
             key,
+            peer_role="ctx",
+            peer_idx=peer_idx,
+            what=f"hello ctx_{peer_idx}",
+            timeout_s=hello_s,
+            arm=arm,
         )
         if reply[0] == "abort":
             raise _TransferError(f"ctx_{peer_idx} aborted handshake: {reply[1]}")
         if reply[0] != "welcome":
             raise _TransferError(f"unexpected handshake reply from ctx_{peer_idx}: {reply[:1]}")
+        if runner.is_leader:
+            zmq, _ = runner._zmq()
+            sock.setsockopt(zmq.RCVTIMEO, hello_s * 1000)
         return sock, key
     except BaseException:
         if sock is not None:
@@ -1743,7 +1824,7 @@ def _install_watchdog(runner, plan, rank):
     )
     hang_detector.start()
 
-    def arm(what, seconds=None, python_alarm=True):
+    def arm(what, seconds=None, python_alarm=True, publish_progress=True):
         current_cell["what"] = what
         phase_timeout_s = int(plan["wave_timeout_s"] if seconds is None else seconds)
         signal.alarm(phase_timeout_s if python_alarm else 0)
@@ -1752,7 +1833,10 @@ def _install_watchdog(runner, plan, rank):
         # rather than one global timeout inflated by unrelated later phases.
         hang_detector.timeout = phase_timeout_s + pcfg.WATCHDOG_GRACE_S
         hang_detector.checkpoint()
-        publish_gen_progress(runner, what)
+        # Progress-derived watchdog refreshes must not echo a marker back to
+        # the peer: reciprocal echoes could keep a genuinely stuck pair alive.
+        if publish_progress:
+            publish_peer_progress(runner, what)
 
     def disarm():
         signal.alarm(0)

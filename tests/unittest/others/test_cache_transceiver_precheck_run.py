@@ -370,8 +370,8 @@ def test_schedule_covers_all_cells_in_lockstep_order():
 
 def test_timeout_budgets():
     plan = _plan()
-    # Peer count is deliberately absent: active gen progress refreshes this
-    # bounded no-progress interval for every serialized ctx waiter.
+    # Peer count is deliberately absent: active peer progress refreshes this
+    # bounded no-progress interval for every serialized waiter.
     assert rp.hello_timeout_s(plan) == 900
     # Only the schedule's FIRST rep pays the NIXL wire-up allowance.
     assert rp.wave_timeout_s(plan, 0, 0) == 180 + 300
@@ -379,23 +379,24 @@ def test_timeout_budgets():
     assert rp.wave_timeout_s(plan, 1, 0) == 180
 
 
-def test_gen_progress_marker_is_atomic_and_run_stamped(tmp_path, monkeypatch):
+@pytest.mark.parametrize("role", ["ctx", "gen"])
+def test_peer_progress_marker_is_atomic_and_run_stamped(tmp_path, monkeypatch, role):
     monkeypatch.setenv("SLURM_JOB_ID", "111")
     runner = types.SimpleNamespace(
-        role="gen",
+        role=role,
         is_leader=True,
         work_dir=str(tmp_path),
         server_idx=2,
     )
-    rp.publish_gen_progress(runner, "ctx_0 first wave")
-    first = rp.read_gen_progress(str(tmp_path), 2)
+    rp.publish_peer_progress(runner, "peer_0 first wave")
+    first = rp.read_peer_progress(str(tmp_path), role, 2)
     assert isinstance(first, int)
 
-    rp.publish_gen_progress(runner, "ctx_0 second wave")
-    assert rp.read_gen_progress(str(tmp_path), 2) != first
+    rp.publish_peer_progress(runner, "peer_0 second wave")
+    assert rp.read_peer_progress(str(tmp_path), role, 2) != first
 
     monkeypatch.setenv("SLURM_JOB_ID", "222")
-    assert rp.read_gen_progress(str(tmp_path), 2) is None
+    assert rp.read_peer_progress(str(tmp_path), role, 2) is None
 
 
 def test_ctx_control_wait_refreshes_only_on_target_gen_progress(monkeypatch):
@@ -422,16 +423,16 @@ def test_ctx_control_wait_refreshes_only_on_target_gen_progress(monkeypatch):
     monotonic = iter((0.0, 1.0, 2.0, 3.0))
     progress_reads = []
 
-    def read_progress(work_dir, gen_idx):
-        progress_reads.append(gen_idx)
+    def read_progress(work_dir, role, server_idx):
+        progress_reads.append((role, server_idx))
         return next(progress)
 
-    monkeypatch.setattr(rp, "read_gen_progress", read_progress)
+    monkeypatch.setattr(rp, "read_peer_progress", read_progress)
     monkeypatch.setattr(rp.time, "monotonic", lambda: next(monotonic))
     arms = []
 
-    def arm(what, seconds, python_alarm):
-        arms.append((what, seconds, python_alarm))
+    def arm(what, seconds, python_alarm, publish_progress=True):
+        arms.append((what, seconds, python_alarm, publish_progress))
 
     msg = rp._recv_ctx_control(
         runner,
@@ -444,8 +445,11 @@ def test_ctx_control_wait_refreshes_only_on_target_gen_progress(monkeypatch):
         refresh_from_gen_progress=True,
     )
     assert msg[0] == "done"
-    assert arms == [("bye gen_3", 5, False), ("bye gen_3", 5, False)]
-    assert progress_reads == [3, 3, 3]
+    assert arms == [
+        ("bye gen_3", 5, False, True),
+        ("bye gen_3", 5, False, False),
+    ]
+    assert progress_reads == [("gen", 3), ("gen", 3), ("gen", 3)]
 
 
 def test_ctx_control_wait_times_out_without_progress(monkeypatch):
@@ -463,7 +467,7 @@ def test_ctx_control_wait_times_out_without_progress(monkeypatch):
         _zmq=lambda: (types.SimpleNamespace(Again=Again), None),
     )
     monotonic = iter((0.0, 6.0))
-    monkeypatch.setattr(rp, "read_gen_progress", lambda work_dir, gen_idx: None)
+    monkeypatch.setattr(rp, "read_peer_progress", lambda work_dir, role, server_idx: None)
     monkeypatch.setattr(rp.time, "monotonic", lambda: next(monotonic))
     with pytest.raises(rp._Timeout, match="made no progress for 5s"):
         rp._recv_ctx_control(

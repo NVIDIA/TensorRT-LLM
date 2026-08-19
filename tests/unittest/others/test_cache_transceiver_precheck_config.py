@@ -880,7 +880,7 @@ def test_rid_tags_dense_within_session():
 
 
 class TestMultiPeerOrchestration:
-    """CPU-only end-to-end runs of the multi-ctx x 1-gen session protocol.
+    """CPU-only end-to-end runs of the multi-peer session protocol.
 
     Exercises the exact multi-instance logic of the hardware "B" topology:
     real ZMQ sockets + HMAC frames + StatusRecorder + rendezvous files via
@@ -1036,7 +1036,11 @@ class TestMultiPeerOrchestration:
         ]
         for t in threads:
             t.start()
-        gen_arm = lambda what, **kwargs: rp.publish_gen_progress(gen, what)  # noqa: E731
+
+        def gen_arm(what, publish_progress=True, **kwargs):
+            if publish_progress:
+                rp.publish_peer_progress(gen, what)
+
         try:
             rp._drive_ctx_peers(
                 gen, gen_arm, noop, rp._make_peer_failure_recorder(gen, noop, {"what": "test"})
@@ -1086,6 +1090,102 @@ class TestMultiPeerOrchestration:
         ]
         assert all(c["status"] == "PASS" for c in gen.recorder.cases)
         assert all([case["status"] for case in ctx.recorder.cases] == ["PASS"] for ctx in ctxs)
+
+    def test_one_ctx_four_gen_full_pass(self, tmp_path, monkeypatch):
+        """Queued gen instances refresh from the active ctx's progress."""
+        import threading
+
+        monkeypatch.setenv("SLURM_JOB_ID", "778")
+        monkeypatch.setenv("SLURMD_NODENAME", "127.0.0.1")
+        monkeypatch.setattr(rp, "CONTROL_POLL_INTERVAL_MS", 50)
+        cfg = _disagg_yaml(
+            hardware={
+                "gpus_per_node": 4,
+                "num_ctx_servers": 1,
+                "num_gen_servers": 4,
+            },
+            cache_transceiver_precheck={
+                "request_lengths": [32],
+                "num_requests": 1,
+                "warmup_requests": 1,
+                "rendezvous_timeout_s": 30,
+                "wave_timeout_s": 30,
+                "wireup_timeout_s": 0,
+            },
+        )
+        plan = pcfg.resolve_plan(cfg)
+        # One ctx session takes four 0.3s waves, so later gen instances wait
+        # longer than this budget and need ctx progress to avoid false timeout.
+        plan["peer_progress_timeout_s"] = 1
+        work = str(tmp_path)
+        noop = lambda *args, **kwargs: None  # noqa: E731 - signal.alarm needs main thread
+
+        ctx = self._mk_runner(
+            "ctx",
+            0,
+            plan,
+            work,
+            monkeypatch,
+            wave_delay_s=0.3,
+        )
+        gens = [self._mk_runner("gen", i, plan, work, monkeypatch) for i in range(4)]
+        peer_failures = []
+        thread_errors = []
+
+        def record_ctx_peer_failure(peer, exc):
+            peer_failures.append((peer, type(exc).__name__))
+
+        def progress_arm(runner):
+            def arm(what, publish_progress=True, **kwargs):
+                if publish_progress:
+                    rp.publish_peer_progress(runner, what)
+
+            return arm
+
+        def run_ctx():
+            try:
+                rp._serve_gen_peers(
+                    ctx,
+                    plan,
+                    progress_arm(ctx),
+                    noop,
+                    record_ctx_peer_failure,
+                )
+            except Exception as exc:  # noqa: BLE001 - surface thread failures in the test
+                thread_errors.append(("ctx", exc))
+
+        def run_gen(gen):
+            try:
+                rp._drive_ctx_peers(
+                    gen,
+                    progress_arm(gen),
+                    noop,
+                    rp._make_peer_failure_recorder(gen, noop, {"what": "test"}),
+                )
+            except Exception as exc:  # noqa: BLE001 - surface thread failures in the test
+                thread_errors.append((f"gen_{gen.server_idx}", exc))
+
+        threads = [threading.Thread(target=run_ctx, name="ctx_0", daemon=True)]
+        threads.extend(
+            threading.Thread(
+                target=run_gen,
+                args=(gen,),
+                name=f"gen_{gen.server_idx}",
+                daemon=True,
+            )
+            for gen in gens
+        )
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        leaked = [thread.name for thread in threads if thread.is_alive()]
+        assert not leaked, f"orchestration threads wedged: {leaked}"
+        assert not thread_errors
+        assert not peer_failures
+        assert [case["status"] for case in ctx.recorder.cases] == ["PASS"] * 4
+        assert all([case["status"] for case in gen.recorder.cases] == ["PASS"] for gen in gens)
 
     def test_ctx_failure_last_peer(self, tmp_path, monkeypatch):
         # The failing pair is driven LAST: the earlier healthy peer already
