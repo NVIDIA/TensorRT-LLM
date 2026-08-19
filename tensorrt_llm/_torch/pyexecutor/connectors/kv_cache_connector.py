@@ -285,6 +285,30 @@ class KvCacheConnectorScheduler(ABC):
             block_ids: The KV cacheblock IDs that were allocated.
         """
 
+    def cancel_load(self, request: LlmRequest, start: int, end: int):
+        """
+        Called when the runtime will not consume KV that was offered by
+        ``get_num_new_matched_tokens`` for prompt tokens ``[start, end)``.
+
+        Offsets are absolute prompt positions, on the same scale as
+        ``num_computed_tokens``. This is raised when the local cache overtook
+        part or all of an offer while the request was waiting to be scheduled,
+        or when the runtime could not allocate pages to cover it.
+
+        Best-effort: release any ownership taken in
+        ``get_num_new_matched_tokens`` for that range. For a synchronous load
+        nothing has been transferred yet, so this is exact. For an
+        asynchronous load the transfer necessarily began inside
+        ``get_num_new_matched_tokens`` (see ``take_scheduled_requests_pending_load``),
+        so it may already be in flight and cancelling is genuinely lossy.
+
+        Args:
+            request: The request whose offer is being handed back.
+            start: First prompt position that will not be consumed.
+            end: One past the last prompt position that will not be consumed.
+        """
+        return
+
     def wait_for_initialization(self):
         """
         Some connectors need to wait for some resources to be initialized.
@@ -526,7 +550,18 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             res = None
         return mpi_broadcast(res, root=0)
 
-    def get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> int:
+    def query_num_new_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Tuple[int, bool]:
+        """Ask the connector how much of the prompt it can serve. No side effects.
+
+        This is the half of ``get_num_new_matched_tokens`` that must run at most
+        once per request, because the connector ABC promises exactly one query
+        per request and connectors take ownership of remote blocks in it.
+        Callers that cannot commit to consuming the answer in the same iteration
+        (KVCacheManagerV2, whose scheduling pass is speculative) query here and
+        commit later via ``commit_new_matched_tokens``.
+        """
         if request.is_generation_only_request:
             raise RuntimeError("Connector API is not supported for generation-only requests!")
 
@@ -537,6 +572,18 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if num_tokens == 0 and load_kv_async:
             raise RuntimeError("load_kv_async must be False when num_tokens is 0!")
 
+        return num_tokens, load_kv_async
+
+    def commit_new_matched_tokens(
+        self, request: LlmRequest, num_tokens: int, load_kv_async: bool
+    ) -> None:
+        """Register the runtime's side of an answered query.
+
+        Must run in the iteration the request is actually scheduled:
+        ``external_loads`` is consumed and cleared by every
+        ``build_scheduler_output``, and ``new_async_requests.loading`` is read
+        by that same call to suppress the request's ``RequestData``.
+        """
         # TODO(jthomson04): This part is a bit ugly.
         # When the connector indicates that a request will be loaded
         # asynchronously, we need to suspend its execution. This is
@@ -551,7 +598,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         request.py_num_connector_matched_tokens = num_tokens
 
+    def get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> int:
+        """Query and commit in one step.
+
+        This is the V1 entry point, called from C++ while the block manager
+        holds the radix-tree mutex, so the local match and the query are atomic
+        with respect to the tree and the answer can be committed immediately.
+        """
+        num_tokens, load_kv_async = self.query_num_new_matched_tokens(request, num_computed_tokens)
+        self.commit_new_matched_tokens(request, num_tokens, load_kv_async)
         return num_tokens
+
+    def cancel_load(self, request: LlmRequest, start: int, end: int) -> None:
+        if self.scheduler is not None:
+            self.scheduler.cancel_load(request, start, end)
 
     def should_add_sequence(self, request: LlmRequest) -> bool:
         req_id = request.request_id

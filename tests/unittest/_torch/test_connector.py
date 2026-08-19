@@ -23,7 +23,7 @@ import pytest
 
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests, KvCacheConnectorManager,
+    AsyncRequests, KvCacheConnectorManager, KvCacheConnectorScheduler,
     KvCacheConnectorSchedulerOutputManager)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -175,6 +175,81 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
         assert scheduled_requests.context_requests_last_chunk == [req1]
 
     run_across_mpi(mpi_pool_executor, test, 2)
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_query_is_side_effect_free(mpi_pool_executor):
+    """The query and the commit are separable, and the query records nothing.
+
+    KVCacheManagerV2 asks during a speculative scheduling pass and resolves the
+    answer in whichever iteration the request actually runs. That only works if
+    asking is inert: `external_loads` is cleared by every
+    `build_scheduler_output`, and a request registered as loading is dropped
+    from the batch. Recording at query time would attribute the load to
+    whichever iteration happened to ask.
+    """
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+            scheduler.get_num_new_matched_tokens.return_value = (16, True)
+        else:
+            scheduler = None
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.request_id = 42
+        req.is_generation_only_request = False
+        req.py_num_connector_matched_tokens = 0
+
+        assert manager.query_num_new_matched_tokens(req, 32) == (16, True)
+
+        assert manager.new_async_requests.loading_ids == set()
+        assert manager.scheduler_output_manager.external_loads == {}
+        assert req.py_num_connector_matched_tokens == 0
+
+        manager.commit_new_matched_tokens(req, 16, True)
+
+        assert manager.new_async_requests.loading_ids == {42}
+        assert manager.scheduler_output_manager.external_loads == {42: 16}
+        assert req.py_num_connector_matched_tokens == 16
+
+        if mpi_rank() == 0:
+            assert scheduler.get_num_new_matched_tokens.call_count == 1
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_cancel_load_reaches_the_leader(mpi_pool_executor):
+
+    def test():
+        worker = MagicMock()
+        scheduler = MagicMock() if mpi_rank() == 0 else None
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.request_id = 42
+
+        manager.cancel_load(req, 0, 32)
+
+        if mpi_rank() == 0:
+            assert scheduler.cancel_load.call_args[0] == (req, 0, 32)
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+def test_cancel_load_is_additive():
+    """Existing connectors predate `cancel_load` and must keep working.
+
+    It is only ever raised by KVCacheManagerV2, so it has to stay optional with
+    a no-op default rather than becoming another abstract method.
+    """
+    assert "cancel_load" not in KvCacheConnectorScheduler.__abstractmethods__
 
 
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
