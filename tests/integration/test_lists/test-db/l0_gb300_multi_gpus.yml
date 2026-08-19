@@ -38,12 +38,12 @@ l0_gb300_multi_gpus:
   # Kimi K3 speculative decoding: exact kernel-level verify parity (random
   # weights, no checkpoint) + truncated-model e2e SA logits parity
   # (auto-skips when the Kimi K3 checkpoint is not staged).
-  - unittest/_torch/modeling -k "kimi_kda_verify"
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   # Fused KDA multi-token verify (trtllm::kda_mtp_decode): kernel-level
   # parity vs CPU golden + FLA sequential, and runtime-level fused-vs-
   # sequential two-round replay parity.
-  - unittest/_torch/modeling -k "kda_mtp_decode_cute_parity"
-  - unittest/_torch/modeling -k "kimi_kda_fused_verify"
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   # Kimi K3 op parity tests (random weights, no checkpoint; SM100/SM103).
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
