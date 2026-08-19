@@ -36,6 +36,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 using namespace tensorrt_llm::kernels;
 namespace tc = tensorrt_llm::common;
@@ -1251,6 +1252,31 @@ int AttentionOp::mlaGeneration(
             else
             {
                 tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_kv_cache_pool;
+
+                bool const usesAuxiliaryKvPool
+                    = tllmRunnerParams.kvPtr != nullptr && tllmRunnerParams.kvPtr != kv_cache_buffer.mPrimaryPoolPtr;
+                if (usesAuxiliaryKvPool)
+                {
+                    // Static sparse MLA indexes a compact KV pool containing at most
+                    // mSparseTopK rows per query. Do not let the original dense KV
+                    // length drive kernel selection or launch geometry: for long
+                    // sequences that can select a multi-CTA kernel which addresses
+                    // beyond the compact page table.
+                    TLLM_CHECK_WITH_INFO(tllmRunnerParams.mSparseTopK > 0,
+                        "Static sparse MLA requires a positive TopK, got %d", tllmRunnerParams.mSparseTopK);
+                    int32_t const originalMaxSeqLenKv = tllmRunnerParams.mMaxSeqLenKv;
+                    int32_t const effectiveMaxSeqLenKv = std::min(originalMaxSeqLenKv, tllmRunnerParams.mSparseTopK);
+                    tllmRunnerParams.mMaxSeqLenKv = effectiveMaxSeqLenKv;
+                    tllmRunnerParams.mJITWarmupMaxSeqLenKv
+                        = std::min(tllmRunnerParams.mJITWarmupMaxSeqLenKv, effectiveMaxSeqLenKv);
+                    int64_t const sumOfSeqLensKv
+                        = static_cast<int64_t>(tllmRunnerParams.mBatchSize) * effectiveMaxSeqLenKv;
+                    TLLM_CHECK_WITH_INFO(sumOfSeqLensKv <= std::numeric_limits<int32_t>::max(),
+                        "Static sparse MLA cumulative KV length exceeds int32 capacity: %ld", sumOfSeqLensKv);
+                    tllmRunnerParams.mSumOfSeqLensKv = static_cast<int32_t>(sumOfSeqLensKv);
+                    TLLM_LOG_DEBUG("Clamp static sparse MLA max KV length from %d to %d (TopK=%d)", originalMaxSeqLenKv,
+                        effectiveMaxSeqLenKv, tllmRunnerParams.mSparseTopK);
+                }
             }
         }
 
