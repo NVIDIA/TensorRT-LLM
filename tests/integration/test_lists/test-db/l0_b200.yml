@@ -276,6 +276,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_example TIMEOUT (30)
   - unittest/_torch/visual_gen/test_cosmos3_edge.py
   - unittest/_torch/visual_gen/test_cosmos3_example_prompts.py
+  - unittest/_torch/visual_gen/test_glm_image_transformer.py
+  - unittest/_torch/visual_gen/test_glm_image_pipeline.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
@@ -368,6 +370,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_wan.py::test_visual_gen_api_walkthrough
   - examples/visual_gen/test_visual_gen_flux.py::test_flux1_lpips_against_golden
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_lpips_against_golden
+  - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_lpips_against_golden
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-fp8-blockwise]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-nvfp4]
   - examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux1-cuda-graph]
@@ -379,6 +382,8 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_qwen_image.py::test_qwenimage_feature_accuracy_against_golden[cuda-graph]
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[fp8-blockwise]
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_feature_accuracy_against_golden[nvfp4]
+  - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_feature_accuracy_against_golden[fp8-blockwise]
+  - examples/visual_gen/test_visual_gen_glm.py::test_glm_image_feature_accuracy_against_golden[nvfp4]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[fp8-blockwise]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[nvfp4]
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[cuda-graph]
