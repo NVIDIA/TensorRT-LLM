@@ -28,6 +28,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 
 from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
@@ -1233,10 +1234,10 @@ class LTX2Pipeline(BasePipeline):
         Returns:
             Tensor of shape ``(1, 3, 1, H, W)`` in ``[-1, 1]``.
         """
-        if isinstance(image, str):
+        if isinstance(image, bytes):
             from PIL import Image
 
-            pil_img = Image.open(image).convert("RGB")
+            pil_img = ImageMediaIO(format="pil", drop_alpha=True).load_bytes(image)
             pil_img = pil_img.resize((width, height), Image.LANCZOS)
             import numpy as np
 

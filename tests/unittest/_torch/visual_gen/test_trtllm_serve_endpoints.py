@@ -35,11 +35,7 @@ from tensorrt_llm.serve.openai_protocol import VideoJob
 from tensorrt_llm.serve.openai_server import _normalize_image_output
 from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
-from tensorrt_llm.visual_gen.media_refs import (
-    cleanup_reference_files,
-    prepare_reference_slots,
-    resolve_media_storage_path,
-)
+from tensorrt_llm.visual_gen.media_refs import prepare_reference_slots
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 from tensorrt_llm.visual_gen.params import validate_visual_gen_params
 
@@ -215,7 +211,7 @@ class MockVisualGen:
         # used by tests to assert forwarded VisualGenParams fields.
         self.last_inputs = None
         self.last_params = None
-        # Snapshot of materialized reference-file contents at generation time,
+        # Snapshot of the resolved reference bytes at generation time,
         # captured before the route cleans them up. Keyed by stored path.
         self.last_ref_bytes = {}
         # Stand-in for the coordinator-side executor proxy. The async video
@@ -260,15 +256,12 @@ class MockVisualGen:
     # --- VisualGen interface ---
 
     def _snapshot_refs(self, params) -> None:
-        # Capture materialized reference bytes before the route cleans them up,
-        # so tests can still assert byte-identity after the request finishes.
+        # Record what each slot resolved to, so tests can assert byte-identity
+        # against the payload the client sent.
         self.last_ref_bytes = {}
         for field in ("image_reference", "video_reference", "audio_reference"):
-            for ref in getattr(params, field, None) or []:
-                path = getattr(ref, "content", None)
-                if isinstance(path, str) and os.path.exists(path):
-                    with open(path, "rb") as fh:
-                        self.last_ref_bytes[path] = fh.read()
+            refs = getattr(params, field, None) or []
+            self.last_ref_bytes[field] = [ref.content for ref in refs]
 
     def generate(self, inputs=None, params=None) -> VisualGenOutput:
         return self.generate_async(inputs=inputs, params=params).result()
@@ -288,13 +281,9 @@ class MockVisualGen:
                 extra_param_specs=self.executor.extra_param_specs,
                 ref_slot_specs=self.executor.ref_slot_specs,
             )
-        # Materialize references at the coordinator, then hand the result a
-        # terminal cleanup keyed on the same request id.
+        # Mirror the engine: resolve every reference to bytes at the coordinator.
         req_id = self._next_request_id()
-        media_storage_path = str(resolve_media_storage_path())
-        prepare_reference_slots(
-            params, request_id=str(req_id), media_storage_path=media_storage_path
-        )
+        prepare_reference_slots(params)
         self._snapshot_refs(params)
         n = getattr(params, "num_images_per_prompt", 1) if params else 1
         return MockVisualGenResult(
@@ -304,7 +293,6 @@ class MockVisualGen:
             audio=self._audio,
             should_fail=self._should_fail,
             generate_error=self._generate_error,
-            on_finish=lambda: cleanup_reference_files(media_storage_path, str(req_id)),
         )
 
     def _next_request_id(self) -> int:
@@ -359,7 +347,6 @@ class MockVisualGenResult:
         audio: Optional[torch.Tensor] = None,
         should_fail: bool = False,
         generate_error: Optional[BaseException] = None,
-        on_finish=None,
     ):
         self.request_id = request_id
         self._image = image
@@ -369,19 +356,6 @@ class MockVisualGenResult:
         # Engine-side failure surfaced through the result (capacity/client),
         # distinct from a coordinator preflight rejection.
         self._generate_error = generate_error
-        self._on_finish = on_finish
-        self._cleaned = False
-
-    def _run_finish(self):
-        # Terminal reference cleanup, run once (idempotent), mirroring the real
-        # VisualGenResult so it fires on success and failure alike.
-        if self._cleaned or self._on_finish is None:
-            return
-        self._cleaned = True
-        try:
-            self._on_finish()
-        except Exception:
-            pass
 
     def _resolve(self) -> VisualGenOutput:
         if self._generate_error is not None:
@@ -400,16 +374,10 @@ class MockVisualGenResult:
         return self.aresult().__await__()
 
     async def aresult(self, timeout=None):
-        try:
-            return self._resolve()
-        finally:
-            self._run_finish()
+        return self._resolve()
 
     def result(self, timeout=None):
-        try:
-            return self._resolve()
-        finally:
-            self._run_finish()
+        return self._resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -1643,20 +1611,15 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # image_reference is materialized to media storage and passed through as
-        # a MediaRef carrying the filesystem path.
+        # image_reference reaches the engine as a MediaRef carrying raw bytes.
         params = video_client.mock_gen.last_params
-        ref_path = params.image_reference[0].content
-        assert isinstance(ref_path, str)
-        assert ref_path.endswith("_image_ref_0")
-        # The materialized reference is input-only and is cleaned up once the
-        # request finishes, so it must not linger in media storage.
-        assert not os.path.exists(ref_path)
+        assert params.image_reference[0].content == ref_path.read_bytes()
+        assert params.image_reference[0].format == "bytes"
 
     def test_sync_video_generation_multipart_with_video_reference(self, video_client):
-        """A ``video_reference`` upload is persisted byte-identical (V2V) — the
-        serve never decodes video; the worker demuxes/NVDEC-decodes the stored
-        file. A checked-in H.264/MP4 fixture drives the boundary directly.
+        """A ``video_reference`` upload reaches the engine byte-identical (V2V) —
+        serve never decodes video; the worker demuxes/NVDEC-decodes it. A
+        checked-in H.264/MP4 fixture drives the boundary directly.
         """
         payload = _V2V_FIXTURE_MP4.read_bytes()
         with open(_V2V_FIXTURE_MP4, "rb") as f:
@@ -1673,15 +1636,12 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # Video conditioning arrives as a MediaRef holding a stored path; no
-        # image_reference is set, and the encoded bytes were persisted
-        # byte-identical (snapshotted at generation time, since the route cleans
-        # the reference up once the request finishes).
+        # Video conditioning reaches the engine as raw bytes, byte-identical to
+        # the upload, and no image_reference is set.
         params = video_client.mock_gen.last_params
         assert params.image_reference is None
-        ref_path = params.video_reference[0].content
-        assert video_client.mock_gen.last_ref_bytes[ref_path] == payload
-        assert not os.path.exists(ref_path)
+        assert params.video_reference[0].format == "bytes"
+        assert video_client.mock_gen.last_ref_bytes["video_reference"] == [payload]
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
         """Content matching no image or video container signature is rejected

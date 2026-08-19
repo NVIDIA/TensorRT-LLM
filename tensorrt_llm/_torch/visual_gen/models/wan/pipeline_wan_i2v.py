@@ -39,6 +39,7 @@ from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 
 # Supported Wan I2V 14B models:
@@ -450,7 +451,7 @@ class WanImageToVideoPipeline(BasePipeline):
     @torch.no_grad()
     def forward(
         self,
-        image: Union[PIL.Image.Image, torch.Tensor, str],
+        image: Union[PIL.Image.Image, torch.Tensor, bytes],
         prompt: Union[str, List[str]],
         seed: int,
         negative_prompt: Optional[str] = None,
@@ -462,16 +463,16 @@ class WanImageToVideoPipeline(BasePipeline):
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
         max_sequence_length: int = 512,
-        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
 
         # Validate image input — only single image is supported for batch generation
-        if not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
+        if not isinstance(image, (PIL.Image.Image, torch.Tensor, bytes)):
             raise ValueError(
-                f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
+                f"`image` must be a PIL.Image, torch.Tensor, or encoded bytes, "
                 f"got {type(image)}. Batch of different images is not supported; "
                 f"use a single image with multiple prompts instead."
             )
@@ -723,14 +724,17 @@ class WanImageToVideoPipeline(BasePipeline):
 
     def _encode_image(
         self,
-        image: Union[PIL.Image.Image, torch.Tensor, str],
-        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        image: Union[PIL.Image.Image, torch.Tensor, bytes],
+        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
     ) -> torch.Tensor:
         """Encode image(s) using CLIP image encoder (Wan 2.1 I2V only)."""
-        if isinstance(image, str):
-            image = PIL.Image.open(image).convert("RGB")
-        if isinstance(last_image, str):
-            last_image = PIL.Image.open(last_image).convert("RGB")
+        # drop_alpha keeps diffusers' semantics: convert("RGB") drops the alpha
+        # channel rather than compositing it onto white.
+        media_io = ImageMediaIO(format="pil", drop_alpha=True)
+        if isinstance(image, bytes):
+            image = media_io.load_bytes(image)
+        if isinstance(last_image, bytes):
+            last_image = media_io.load_bytes(last_image)
 
         images_to_encode = [image] if last_image is None else [image, last_image]
 
@@ -744,12 +748,12 @@ class WanImageToVideoPipeline(BasePipeline):
     def _prepare_latents(
         self,
         batch_size: int,
-        image: Union[PIL.Image.Image, torch.Tensor, str],
+        image: Union[PIL.Image.Image, torch.Tensor, bytes],
         height: int,
         width: int,
         num_frames: int,
         generator: torch.Generator,
-        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        last_image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare latents with image conditioning for I2V generation."""
         num_channels_latents = 16
@@ -761,15 +765,15 @@ class WanImageToVideoPipeline(BasePipeline):
         latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
         # Load and preprocess image(s)
-        if isinstance(image, str):
-            image = PIL.Image.open(image).convert("RGB")
+        if isinstance(image, bytes):
+            image = ImageMediaIO(format="pil", drop_alpha=True).load_bytes(image)
         image = self.video_processor.preprocess(image, height=height, width=width).to(
             self.device, dtype=torch.float32
         )
 
         if last_image is not None:
-            if isinstance(last_image, str):
-                last_image = PIL.Image.open(last_image).convert("RGB")
+            if isinstance(last_image, bytes):
+                last_image = ImageMediaIO(format="pil", drop_alpha=True).load_bytes(last_image)
             last_image = self.video_processor.preprocess(last_image, height=height, width=width).to(
                 self.device, dtype=torch.float32
             )

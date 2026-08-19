@@ -14,7 +14,6 @@
 # limitations under the License.
 """Qwen-Image-Layered image decomposition pipeline."""
 
-import io
 import math
 import time
 from typing import List, Optional, Tuple, Union
@@ -30,6 +29,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     RoleSpec,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 
 from .transformer_qwen_image_layered import QwenImageLayeredTransformer2DModel
@@ -361,14 +361,11 @@ class QwenImageLayeredPipeline(BasePipeline):
 
     @staticmethod
     def _load_image_input(image):
-        from PIL import Image
-
         if isinstance(image, list):
             return [QwenImageLayeredPipeline._load_image_input(item) for item in image]
-        if isinstance(image, str):
-            return Image.open(image).convert("RGBA")
         if isinstance(image, bytes):
-            return Image.open(io.BytesIO(image)).convert("RGBA")
+            # Layer decomposition needs the alpha channel, not a flattened RGB.
+            return ImageMediaIO(format="pil", mode="RGBA").load_bytes(image)
         if hasattr(image, "convert") and getattr(image, "mode", None) != "RGBA":
             return image.convert("RGBA")
         return image

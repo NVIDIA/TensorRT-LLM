@@ -25,6 +25,7 @@ Override checkpoint:
 """
 
 import gc
+import io
 import json
 import os
 from collections.abc import Generator
@@ -794,31 +795,23 @@ class TestReferenceImageLoad:
     """
 
     def test_truncated_image_is_a_client_error(self, tmp_path):
-        # Incompressible content, so half the file is genuinely half the image.
+        # Incompressible content, so half the payload is genuinely half the image.
         noise = PIL.Image.frombytes("RGB", (64, 64), os.urandom(64 * 64 * 3))
         whole = tmp_path / "whole.png"
         noise.save(whole, format="PNG")
         data = whole.read_bytes()
-        path = tmp_path / "truncated.png"
-        path.write_bytes(data[: len(data) // 2])
 
         with pytest.raises(ValueError, match="could not be decoded"):
-            _load_reference_image(str(path))
+            _load_reference_image(data[: len(data) // 2])
 
-    def test_unidentifiable_content_is_a_client_error(self, tmp_path):
-        path = tmp_path / "notreally.png"
-        path.write_bytes(b"not an image at all")
+    def test_unidentifiable_content_is_a_client_error(self):
         with pytest.raises(ValueError, match="could not be decoded"):
-            _load_reference_image(str(path))
+            _load_reference_image(b"not an image at all")
 
-    def test_missing_file_is_a_client_error(self, tmp_path):
-        with pytest.raises(ValueError, match="could not be decoded"):
-            _load_reference_image(str(tmp_path / "nope.png"))
-
-    def test_valid_image_loads(self, tmp_path):
-        path = tmp_path / "ok.png"
-        PIL.Image.new("RGB", (8, 8), (1, 2, 3)).save(path, format="PNG")
-        assert _load_reference_image(str(path)).size == (8, 8)
+    def test_valid_image_loads(self):
+        buffer = io.BytesIO()
+        PIL.Image.new("RGB", (8, 8), (1, 2, 3)).save(buffer, format="PNG")
+        assert _load_reference_image(buffer.getvalue()).size == (8, 8)
 
 
 _V2V_FIXTURE_MP4 = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"

@@ -18,7 +18,6 @@ Key differences from FLUX.1:
 - 4-axis RoPE: (32, 32, 32, 32) instead of 3-axis
 """
 
-import io
 import json
 import os
 import time
@@ -46,6 +45,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm.inputs.media_io import ImageMediaIO, convert_image_mode
 from tensorrt_llm.logger import logger
 
 from .transformer_flux2 import Flux2Transformer2DModel
@@ -426,9 +426,8 @@ class Flux2Pipeline(BasePipeline):
         image: Optional[
             Union[
                 PIL.Image.Image,
-                str,
                 bytes,
-                List[Union[PIL.Image.Image, str, bytes]],
+                List[Union[PIL.Image.Image, bytes]],
             ]
         ] = None,
         _condition_images: Optional[List[torch.Tensor]] = None,
@@ -754,30 +753,28 @@ class Flux2Pipeline(BasePipeline):
     def _load_reference_images(
         image: Union[
             PIL.Image.Image,
-            str,
             bytes,
-            List[Union[PIL.Image.Image, str, bytes]],
+            List[Union[PIL.Image.Image, bytes]],
         ],
     ) -> List[PIL.Image.Image]:
-        """Normalize supported reference-image inputs to materialized RGB images."""
+        """Normalize supported reference-image inputs to decoded RGB images."""
         inputs = image if isinstance(image, list) else [image]
         if not inputs:
             raise ValueError("`image` must contain at least one reference image.")
 
+        # drop_alpha keeps diffusers' semantics: convert("RGB") drops the alpha
+        # channel rather than compositing it onto white.
+        media_io = ImageMediaIO(format="pil", drop_alpha=True)
         images = []
         for index, item in enumerate(inputs):
             try:
                 if isinstance(item, PIL.Image.Image):
-                    images.append(item.convert("RGB"))
-                elif isinstance(item, str):
-                    with PIL.Image.open(item) as loaded:
-                        images.append(loaded.convert("RGB"))
+                    images.append(convert_image_mode(item, "RGB", drop_alpha=True))
                 elif isinstance(item, bytes):
-                    with PIL.Image.open(io.BytesIO(item)) as loaded:
-                        images.append(loaded.convert("RGB"))
+                    images.append(media_io.load_bytes(item))
                 else:
                     raise ValueError(
-                        "Reference images must be PIL images, file paths, or encoded bytes; "
+                        "Reference images must be PIL images or encoded bytes; "
                         f"item {index} has type {type(item).__name__}."
                     )
             except OSError as exc:

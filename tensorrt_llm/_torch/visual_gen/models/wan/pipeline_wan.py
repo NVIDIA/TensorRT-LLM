@@ -43,6 +43,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, R
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 
 from .transformer_wan import WanTransformer3DModel
@@ -476,7 +477,7 @@ class WanPipeline(BasePipeline):
         guidance_scale_2: Optional[float] = None,
         boundary_ratio: Optional[float] = None,
         max_sequence_length: int = 512,
-        image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -793,7 +794,7 @@ class WanPipeline(BasePipeline):
     def _prepare_latents_wan22_5B_i2v(
         self,
         batch_size: int,
-        image: Union[PIL.Image.Image, torch.Tensor, str],
+        image: Union[PIL.Image.Image, torch.Tensor, bytes],
         height: int,
         width: int,
         num_frames: int,
@@ -814,8 +815,8 @@ class WanPipeline(BasePipeline):
         latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
         # Load and preprocess image
-        if isinstance(image, str):
-            image = PIL.Image.open(image).convert("RGB")
+        if isinstance(image, bytes):
+            image = ImageMediaIO(format="pil", drop_alpha=True).load_bytes(image)
         image = (
             self.video_processor.preprocess(image, height=height, width=width)
             .to(self.device, dtype=self.vae.dtype)

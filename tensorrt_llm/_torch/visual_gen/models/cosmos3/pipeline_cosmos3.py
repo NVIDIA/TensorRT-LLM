@@ -45,7 +45,7 @@ from tensorrt_llm._torch.visual_gen.utils import (
     synchronize_media_prepare_status,
 )
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.utils import load_image
+from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
 
@@ -237,7 +237,7 @@ def _condition_pixel_frame_count(
     return max(condition_video_latent_indexes) * int(temporal_compression) + 1
 
 
-def _load_reference_image(path: str):
+def _load_reference_image(data: bytes):
     """Load an I2V reference, reporting unreadable content as a client error.
 
     The worker's load is the acceptance check — the serve boundary only
@@ -247,7 +247,7 @@ def _load_reference_image(path: str):
     upload would be reported as a server fault.
     """
     try:
-        return load_image(path, format="pil")
+        return ImageMediaIO(format="pil").load_bytes(data)
     except OSError as exc:
         raise ValueError(
             f"Image reference could not be decoded; it may be truncated, "
@@ -760,10 +760,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         refs_v = req.params.video_reference
         video = refs_v[0].content if refs_v else None
-        if isinstance(video, str):
-            from pathlib import Path
-
-            video = Path(video).read_bytes()  # forward() NVDEC-demuxes from memory
         if video is not None:
             _validate_video_reference(video)
         is_action = extra_params.get("action_mode") is not None
@@ -1448,7 +1444,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
-        image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
+        image: Optional[Union[PIL.Image.Image, torch.Tensor, bytes]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_frames: Optional[int] = None,
@@ -1756,9 +1752,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             raise ValueError("Batch generation is not supported for Cosmos3")
 
         # Validate image input — only single image is supported for batch generation
-        if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, str)):
+        if image is not None and not isinstance(image, (PIL.Image.Image, torch.Tensor, bytes)):
             raise ValueError(
-                f"`image` must be a PIL.Image, torch.Tensor, or file path string, "
+                f"`image` must be a PIL.Image, torch.Tensor, or encoded bytes, "
                 f"got {type(image)}. Batch of different images is not supported; "
                 f"use a single image with multiple prompts instead."
             )
@@ -2012,7 +2008,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         elif image is not None:
             prepare_error: Optional[Exception] = None
             try:
-                if isinstance(image, str):
+                if isinstance(image, bytes):
                     image = _load_reference_image(image)
 
                 if isinstance(image, PIL.Image.Image):

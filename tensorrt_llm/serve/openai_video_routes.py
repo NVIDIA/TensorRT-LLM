@@ -428,11 +428,10 @@ class _VideoRoutesMixin:
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            # Resolve/materialize references, validate params, and enqueue in the
+            # Resolve references, validate params, and enqueue in the
             # foreground (offloaded but awaited) so bad media / unknown
             # extra_params surface as 400 here, before the 202 — not as a queued
-            # job that later fails. The engine reclaims the references via its
-            # terminal hook once the background task awaits the handle.
+            # job that later fails.
             handle = await asyncio.to_thread(self.generator.generate_async, request.prompt, params)
 
             # Persist the queued job before scheduling the background task so

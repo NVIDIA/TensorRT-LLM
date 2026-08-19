@@ -10,7 +10,6 @@ with extra image-conditioning paths from Diffusers
 
 import math
 import time
-from io import BytesIO
 from typing import Any
 
 import numpy as np
@@ -20,7 +19,7 @@ import torch.distributed as dist
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm.inputs.utils import load_image
+from tensorrt_llm.inputs.media_io import ImageMediaIO
 from tensorrt_llm.logger import logger
 
 from .pipeline_qwen_image import QwenImagePipeline, _calculate_shift
@@ -164,15 +163,8 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
         if image is None:
             raise ValueError("Qwen-Image-Edit requires image_reference.")
         images = image if isinstance(image, list) else [image]
-        pil_images = []
-        for item in images:
-            if isinstance(item, bytes):
-                from PIL import Image
-
-                pil_images.append(Image.open(BytesIO(item)).convert("RGB"))
-            else:
-                pil_images.append(load_image(item, format="pil"))
-        return pil_images
+        media_io = ImageMediaIO(format="pil")
+        return [media_io.load_bytes(item) for item in images]
 
     def _preprocess_edit_images(
         self,
