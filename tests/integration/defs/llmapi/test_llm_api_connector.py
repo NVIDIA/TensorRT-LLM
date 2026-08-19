@@ -636,6 +636,153 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
         (CHUNK_SIZE * 2 + BLOCK_SIZE) / BLOCK_SIZE)
 
 
+# Sliding-window coverage. `KvCacheConfig.max_attention_window` is repeated
+# cyclically across layers (llm_args.py:3761-3765), so a one-element list gives
+# every layer the same window -- one V2 layer group with a live window -- while
+# a two-element list alternates and produces two. A window equal to
+# `max_seq_len` is normalised to "no window" (kv_cache_manager_v2.py:856-858),
+# which is how the full-attention half of the VSWA pair is spelled.
+SWA_WINDOW = 64
+SWA_MAX_SEQ_LEN = 512
+SWA_NUM_INPUT_TOKENS = 256
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                         ids=["kv_cache_manager_v2"],
+                         indirect=True)
+def test_connector_uniform_sliding_window(enforce_single_worker,
+                                          model_with_connector,
+                                          use_kv_cache_manager_v2):
+    """Connector against a KV cache in which every layer slides.
+
+    There was no sliding-window connector coverage before this test. Uniform
+    SWA is a single layer group, which is the configuration where the
+    connector's flat `new_block_ids` list is still well defined -- so this pins
+    the block-reporting contract, and the VSWA test below pins what happens once
+    that assumption breaks.
+
+    V2 only. The V1 guard rejects *variable* windows
+    (py_executor_creator.py:845-850), so uniform SWA reaches V1's connector path
+    and then dies inside it: `commit_and_get_block_hashes` (kv_cache_connector.py:386)
+    raises "commitAndGetBlockHashesForRequest does not support sliding-window
+    attention with detached front blocks" (kvCacheManager.cpp:4645) as soon as
+    the window drops a front block. That is a pre-existing V1 limitation, not
+    something this work introduces, so it is recorded rather than asserted here.
+    """
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True,
+                     max_seq_len=SWA_MAX_SEQ_LEN,
+                     kv_cache_config=KvCacheConfig(
+                         free_gpu_memory_fraction=0.1,
+                         max_attention_window=[SWA_WINDOW]))
+
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    worker.get_finished.return_value = [], []
+
+    generate_and_wait(model, scheduler, worker, [0] * SWA_NUM_INPUT_TOKENS,
+                      SamplingParams(max_tokens=4, ignore_eos=True))
+
+    sched_output = scheduler.build_connector_meta.call_args_list[0].args[0]
+    assert len(sched_output.new_requests) == 1
+    req = sched_output.new_requests[0]
+
+    assert req.computed_position == 0
+    assert req.num_scheduled_tokens == SWA_NUM_INPUT_TOKENS
+    # A single layer group keeps the flat list meaningful on both managers.
+    assert req.new_block_ids
+
+    if use_kv_cache_manager_v2:
+        # Anti-vacuity: prove the window really did collapse to one layer
+        # group, otherwise the assertion above would hold for the wrong reason.
+        layout = worker.register_kv_cache_layout.call_args.args[0]
+        assert len(layout.groups) == 1
+        assert layout.groups[0].window_size == SWA_WINDOW
+        assert list(req.new_block_ids_by_layer_group) == [0]
+        assert req.new_block_ids_by_layer_group[0] == req.new_block_ids
+    else:
+        assert req.new_block_ids_by_layer_group == {}
+
+
+# Half the prompt, and well past the window, so the pages the offer does *not*
+# need are a large enough fraction to assert on.
+SWA_OFFER_TOKENS = 128
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
+def test_connector_vswa_reports_page_indices_per_layer_group(
+        enforce_single_worker, model_with_connector, use_kv_cache_manager_v2):
+    """VSWA is where the connector's flat block list stops working.
+
+    V1 cannot describe VSWA to a connector at all: it registers a single primary
+    pool, but VSWA allocates one pool per window size. V2's layout describes one
+    region set per layer group, so the combination runs there -- but a page index
+    is scoped to a layer group, and there is no correct way to flatten indices
+    from several groups into one list. `KVCacheManagerV2` therefore reports an
+    empty `new_block_ids` and leaves `new_block_ids_by_layer_group` as the only
+    correct source (kv_cache_manager_v2.py:2519-2526, kv_cache_connector.py:365-377).
+
+    Both halves are asserted here because the rejection is deliberately
+    conditional on the manager (py_executor_creator.py). Pinning only the V2 half
+    would let the V1 guard silently disappear.
+    """
+    model_fn, scheduler, worker = model_with_connector
+
+    def build():
+        return model_fn(disable_overlap_scheduler=True,
+                        max_seq_len=SWA_MAX_SEQ_LEN,
+                        kv_cache_config=KvCacheConfig(
+                            free_gpu_memory_fraction=0.1,
+                            max_attention_window=[SWA_WINDOW, SWA_MAX_SEQ_LEN]))
+
+    if not use_kv_cache_manager_v2:
+        with pytest.raises(NotImplementedError, match="VSWA"):
+            build()
+        return
+
+    model = build()
+
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
+
+    # Alternating windows must actually produce two groups, one sliding and one
+    # full-attention, or the rest of this test is vacuous.
+    layout = worker.register_kv_cache_layout.call_args.args[0]
+    assert len(layout.groups) == 2
+    assert {group.window_size for group in layout.groups} == {SWA_WINDOW, None}
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    worker.get_finished.return_value = [], []
+
+    generate_and_wait(model, scheduler, worker, [0] * SWA_NUM_INPUT_TOKENS,
+                      SamplingParams(max_tokens=4, ignore_eos=True))
+
+    # The multi-group degradation reaches `update_state_after_alloc` too. A
+    # connector reading only `new_block_ids` sees nothing and saves nothing,
+    # which is silent unless pinned here.
+    assert scheduler.update_state_after_alloc.call_args.args[1] == []
+
+    sched_output = scheduler.build_connector_meta.call_args_list[0].args[0]
+    assert len(sched_output.new_requests) == 1
+    req = sched_output.new_requests[0]
+
+    assert req.new_block_ids == []
+    assert sorted(req.new_block_ids_by_layer_group) == [0, 1]
+    # Ordinals stay positionally aligned across groups: a block with no page in
+    # the sliding group reads back as BAD_PAGE_INDEX in place rather than
+    # shortening the list (kv_cache_manager_v2.py:2481-2490).
+    lengths = {
+        len(indices)
+        for indices in req.new_block_ids_by_layer_group.values()
+    }
+    assert len(lengths) == 1
+
+
 def _disagg_transceiver_config(use_kv_cache_manager_v2):
     """The transceiver each KV cache manager can actually be driven by.
 
