@@ -32,6 +32,7 @@ l0_cpu:
   - unittest/_torch/memory
   - unittest/_torch/modeling
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/models/test_fused_moe_ignored_layers.py
   - unittest/_torch/models/test_laguna_gproj_quant.py
   - unittest/_torch/modules
   - unittest/_torch/multimodal
