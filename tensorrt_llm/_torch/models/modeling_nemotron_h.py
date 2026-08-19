@@ -29,10 +29,10 @@ from transformers import AutoConfig, NemotronHConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.utils import ActivationType, relu2
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import QuantAlgo  # noqa: E402
 
 from ..attention_backend import AttentionMetadata
