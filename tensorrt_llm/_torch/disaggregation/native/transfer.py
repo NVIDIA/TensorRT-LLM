@@ -443,6 +443,10 @@ class Sender(SenderBase):
         # Route by (unique_rid, peer_rank) so that:
         # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
         # - Different peers can run on different threads (better load balancing)
+        if self._shutdown:
+            # The workers may already have consumed their sentinel, so nothing
+            # would ever release the claim below and this side has no deadline.
+            raise RuntimeError(f"Sender is shutting down; refusing rid={write_meta.unique_rid}")
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         # Claim the source-address lifetime before the item is visible to a
         # worker; the worker's finally releases it.  Unconditional so the two
@@ -1164,6 +1168,8 @@ class Sender(SenderBase):
         thread (cancel paths), so an unguarded send can tear a multipart frame.
         """
         with self._dealers_lock:
+            if self._shutdown:
+                return
             self._get_or_connect_dealer(endpoint).send(message)
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
@@ -1244,12 +1250,13 @@ class Sender(SenderBase):
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        for dealer in self._dealers.values():
+        with self._dealers_lock:
+            dealers, self._dealers = list(self._dealers.values()), {}
+        for dealer in dealers:
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
-        self._dealers.clear()
 
     def __del__(self):
         try:
@@ -1652,12 +1659,13 @@ class Receiver(ReceiverBase):
         if getattr(self, "_shutdown", False):
             return
         self._shutdown = True
-        for dealer in self._dealers.values():
+        with self._dealers_lock:
+            dealers, self._dealers = list(self._dealers.values()), {}
+        for dealer in dealers:
             try:
                 dealer.stop()
             except Exception as e:
                 logger.warning(f"Failed to stop dealer during Receiver shutdown: {e}")
-        self._dealers.clear()
         self._messenger.stop()
 
     def clear_session(self, unique_rid: int):
@@ -1895,6 +1903,8 @@ class Receiver(ReceiverBase):
         thread (cancel paths), so an unguarded send can tear a multipart frame.
         """
         with self._dealers_lock:
+            if self._shutdown:
+                return
             self._get_or_connect_dealer(endpoint).send(message)
 
     def _get_or_connect_dealer(self, endpoint: Optional[str]):

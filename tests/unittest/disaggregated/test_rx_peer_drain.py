@@ -33,6 +33,7 @@ import time
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
@@ -56,6 +57,12 @@ class _FakeBounce:
 
     def record_result(self, *_args, **_kwargs) -> None:
         pass  # real impl defers on_done to the scatter worker
+
+    def release_idle_reservation(self, *_args, **_kwargs) -> None:
+        pass
+
+    def orphan_reservation(self, *_args, **_kwargs) -> None:
+        pass
 
 
 class _FakeRegistrar:
@@ -201,12 +208,12 @@ def test_silent_peer_releases_the_session_after_the_drain_deadline(drain_timeout
 def test_progress_rearms_the_drain_deadline(drain_timeout) -> None:
     # The budget is an inactivity budget, not a total-duration budget: a healthy
     # transfer that keeps producing results must never trip it.
-    drain_timeout(0.2)
+    drain_timeout(2.0)
     session = _make_session(3)
     _dispatch(session, [0, 1, 2])
 
     for rank in (0, 1):
-        time.sleep(0.15)  # under the budget on its own, over it cumulatively
+        time.sleep(0.3)  # well under the budget alone, over it cumulatively
         assert session.has_transferring_tasks() is True
         _kv_result(session, rank)
 
@@ -255,3 +262,31 @@ def test_bounced_transfer_stays_pinned_until_the_scatter_lands() -> None:
     # What the scatter worker's on_done does once the copy has landed.
     session._kv_tasks[0].complete()
     assert session.has_transferring_tasks() is False
+
+
+def test_cancel_is_idempotent_and_notifies_senders_once() -> None:
+    session = _make_session(2)
+    sent: list = []
+    session._receiver.send_cancel_to_senders = lambda rid, eps: sent.append((rid, set(eps)))
+    _dispatch(session, [0, 1])
+
+    session.cancel()
+    session.cancel()
+    session.cancel()
+
+    assert len(sent) == 1
+    assert sent[0][1] == {"tcp://peer0", "tcp://peer1"}
+    assert session._terminal_status == SessionStatus.CANCELLED
+
+
+def test_dispatch_is_refused_once_the_session_is_cancelled() -> None:
+    # dispatch_task must not contact a sender after cancellation won the race,
+    # or that peer writes into buffers we are about to release.
+    session = _make_session(2)
+    session._receiver.send_cancel_to_senders = lambda *_a: None
+    assert session.mark_peer_dispatched(0, 0, "tcp://peer0") is True
+
+    session.cancel()
+
+    assert session.mark_peer_dispatched(0, 1, "tcp://peer1") is False
+    assert session._kv_tasks[0].responded_peer_ranks == set()

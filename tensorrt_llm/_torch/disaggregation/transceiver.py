@@ -701,6 +701,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = None
         completed = False
+        raised = False
         try:
             session = self._transfer_worker.create_rx_session(req)
             self._recv_sessions[rid] = session
@@ -721,6 +722,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
         except Exception:
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            raised = True
             raise
         finally:
             retain = False
@@ -730,7 +732,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 session.cancel()
                 if session.has_transferring_tasks():
                     retain = True
-                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+                    # The caller is about to see the exception; leave the error
+                    # state visible and just let the session drain.
+                    if not raised:
+                        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
             if not retain:
                 if session is not None:
                     session.close()
@@ -916,7 +921,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             completed_reqs[rid] = req
             try:
                 # transfer_end already stamped at completion detection above.
-                req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
+                # Only fall back to the dispatch-time estimate; the session's
+                # own byte count, when it has one, is the accurate value.
+                if session.kv_cache_size_bytes <= 0:
+                    req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
