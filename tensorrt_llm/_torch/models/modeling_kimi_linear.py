@@ -1958,16 +1958,20 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         #   separate dense checkpoint (K2.7-Code-DFlash schema) consumed by
         #   the generic DFlashForCausalLM wrapper, and the target only has
         #   to expose per-layer hidden states via maybe_capture_hidden_states
-        #   (see KimiLinearModel.forward). No trained K3 drafter exists yet;
-        #   this path is exercised with synthetic weights
-        #   (examples/kimi_k3/make_synthetic_dflash_drafter.py).
+        #   (see KimiLinearModel.forward).
+        # - DSpark: the same external-drafter flow with the Markov and
+        #   confidence heads enabled (RadixArk/Kimi-K3-DSpark and friends).
+        #   The target side is identical -- the capture in
+        #   KimiLinearModel.forward is unconditional -- so this gate is the
+        #   only place the mode has to be admitted.
         # Modes needing draft heads (MTP/Eagle) are blocked until a
         # draft-head checkpoint exists.
         assert (
             spec_config is None
             or spec_config.spec_dec_mode.is_sa()
             or spec_config.spec_dec_mode.is_dflash()
-        ), "Kimi K3 supports speculative decoding only with SA or DFlash"
+            or spec_config.spec_dec_mode.is_dspark()
+        ), "Kimi K3 supports speculative decoding only with SA, DFlash or DSpark"
         super().__init__(
             KimiLinearModel(model_config),
             model_config,
