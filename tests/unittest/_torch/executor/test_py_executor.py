@@ -29,7 +29,12 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
+    LlmRequestState,
+    LlmResponse,
+    SamplingConfig,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     DisaggTransferAdmissionController,
@@ -44,6 +49,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -2660,6 +2666,204 @@ class TestCheckCacheTransferErrorsAdpNoop:
         assert len(stub.handle_errors_calls) == 1
 
 
+class TestPendingTransferResponseFlush:
+    def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
+        """A lone fatal rank must fail locally rather than desynchronize TP."""
+        executor = object.__new__(PyExecutor)
+        executor._error_budget = Mock()
+        executor._error_budget.consume.return_value = True
+        executor._error_budget.budget = 0.0
+        executor._fatal_error = None
+        executor.is_shutdown = False
+        executor.enable_attention_dp = True
+        executor.dist = Mock(world_size=2)
+        executor.waiting_queue = []
+        executor.executor_request_queue = Mock()
+        executor.executor_request_queue.get_request_queue.return_value.empty.return_value = True
+        executor.gather_all_responses = False
+        executor.active_requests = []
+        executor._pending_transfer_responses = []
+        executor._enqueue_responses = Mock()
+        executor._terminate_request = Mock()
+
+        with pytest.raises(RuntimeError, match="Fatal error: local failure"):
+            PyExecutor._handle_errors(executor, "local failure")
+
+        executor._enqueue_responses.assert_not_called()
+        executor.executor_request_queue.enqueue_shutdown_request.assert_called_once_with()
+
+    def test_adp_flush_participates_with_an_empty_response_list(self):
+        """Ranks without an error still join the synchronized response gather."""
+        executor = object.__new__(PyExecutor)
+        executor._pending_transfer_responses = []
+        executor._pending_response_terminations = []
+        executor.enable_attention_dp = True
+        executor._enqueue_responses = Mock()
+
+        PyExecutor._flush_pending_transfer_responses(executor)
+
+        executor._enqueue_responses.assert_called_once_with([])
+
+    def test_flush_delivers_and_clears_buffered_responses(self):
+        executor = object.__new__(PyExecutor)
+        responses = [(7, Mock())]
+        executor._pending_transfer_responses = responses
+        executor._pending_response_terminations = []
+        executor.enable_attention_dp = False
+        executor._enqueue_responses = Mock()
+
+        PyExecutor._flush_pending_transfer_responses(executor)
+
+        executor._enqueue_responses.assert_called_once_with(responses)
+        assert executor._pending_transfer_responses == []
+
+    def test_rank_zero_keeps_result_queue_until_buffered_error_flushes(self):
+        """A queued client receives a rank-0 ADP error before cleanup."""
+        executor = object.__new__(PyExecutor)
+        request_id = 7
+        response = LlmResponse(request_id=request_id)
+        response.request_id = request_id
+        response.client_id = 42
+        response.error_msg = "transfer failed"
+        result_queue = Mock()
+        executor._pending_transfer_responses = [(request_id, response)]
+        request = types.SimpleNamespace(py_request_id=request_id)
+        executor._pending_response_terminations = [request]
+        executor.enable_attention_dp = False
+        executor.gather_all_responses = False
+        executor.dist = Mock(rank=0)
+        executor.dist.mapping.tp_group = [0]
+        executor.responses = {}
+        executor.response_cv = threading.Condition()
+        executor.result_wait_queues = {request_id: result_queue}
+        executor._terminate_request = Mock(
+            side_effect=lambda _: executor.result_wait_queues.pop(request_id)
+        )
+
+        PyExecutor._flush_pending_transfer_responses(executor)
+
+        result_queue.put_response.remote.assert_called_once_with(42, response)
+        assert request_id not in executor.result_wait_queues
+        executor._terminate_request.assert_called_once_with(request)
+
+    @staticmethod
+    def _make_executor_loop_stub():
+        executor = object.__new__(PyExecutor)
+        executor.device_id = 0
+        profiler = MagicMock()
+        profiler.__enter__.return_value = Mock()
+        executor._profiler = Mock(return_value=profiler)
+        executor.hang_detector = MagicMock()
+        executor.enable_iter_perf_stats = False
+        executor._resource_governor_enabled = False
+        executor._is_kv_manager_v2 = False
+        executor._mm_encoder_item_scheduling_enabled = False
+        executor.is_benchmark_disagg = False
+        executor._handle_disagg_cache_errors_synced = Mock()
+        executor._flush_pending_transfer_responses = Mock()
+        return executor
+
+    @staticmethod
+    def _patch_executor_loop_cuda(monkeypatch):
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device",
+            Mock(),
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice",
+            Mock(),
+        )
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT",
+            Mock(),
+        )
+
+    def test_flushes_before_clean_scheduler_shutdown(self, monkeypatch):
+        """A response buffered before scheduling must survive a clean exit."""
+        executor = self._make_executor_loop_stub()
+        executor._prepare_and_schedule_batch = Mock(return_value=(None, None))
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop(executor)
+
+        executor._flush_pending_transfer_responses.assert_called_once_with()
+
+    def test_flushes_before_benchmark_retry(self, monkeypatch):
+        """The synchronized benchmark retry path must not strand a response."""
+        executor = self._make_executor_loop_stub()
+        scheduled_batch = types.SimpleNamespace(generation_requests=[])
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(False, True))
+        executor._finalize_adp_dummy_allocation = Mock()
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop(executor)
+
+        # Once for the retry pass and once for the following clean exit.
+        assert executor._flush_pending_transfer_responses.call_count == 2
+
+    def test_idle_pass_has_one_flush(self, monkeypatch):
+        """An idle pass must not pay an additional response gather."""
+        executor = self._make_executor_loop_stub()
+        scheduled_batch = types.SimpleNamespace(
+            encoder_requests=[], paused_requests=[], generation_requests=[]
+        )
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
+        executor._terminate_requests = Mock()
+        executor._pause_requests = Mock()
+        executor._can_queue = Mock(return_value=(False, None))
+        executor.kv_connector_manager = None
+        executor._revert_gen_alloc = Mock()
+        executor._finalize_adp_dummy_allocation = Mock()
+        executor._handle_kv_transfer_timeouts_synced = Mock()
+        executor.kv_cache_transceiver = None
+        executor._kv_connector_terminate_requests = Mock()
+        executor._flush_iter_stats_synced = Mock()
+        executor.iter_counter = 0
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop(executor)
+
+        # One completed idle pass plus the clean-exit drain, not two flushes
+        # during the idle pass itself.
+        assert executor._flush_pending_transfer_responses.call_count == 2
+
+    def test_overlap_flushes_before_clean_scheduler_shutdown(self, monkeypatch):
+        """The overlap loop must not drop a buffered response on clean exit."""
+        executor = self._make_executor_loop_stub()
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        executor._wait_for_model_engine_input_copy = Mock()
+        executor._prepare_and_schedule_batch = Mock(return_value=(None, None))
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        executor._flush_pending_transfer_responses.assert_called_once_with()
+
+    def test_overlap_flushes_before_benchmark_retry(self, monkeypatch):
+        """The overlap retry path must not strand a buffered response."""
+        executor = self._make_executor_loop_stub()
+        scheduled_batch = types.SimpleNamespace(generation_requests=[])
+        executor._can_pause_for_rebalance = Mock(return_value=False)
+        executor._wait_for_model_engine_input_copy = Mock()
+        executor._prepare_and_schedule_batch = Mock(
+            side_effect=[(scheduled_batch, None), (None, None)]
+        )
+        executor._check_benchmark_disagg_gate = Mock(return_value=(False, True))
+        executor._finalize_adp_dummy_allocation = Mock()
+        self._patch_executor_loop_cuda(monkeypatch)
+
+        PyExecutor._executor_loop_overlap(executor)
+
+        # Once for the retry pass and once for the following clean exit.
+        assert executor._flush_pending_transfer_responses.call_count == 2
+
+
 class TestOneModelMTPDraftTokenScheduling:
     """Regression tests for the one-model MTP over-scheduling bug (#16101).
 
@@ -2673,12 +2877,17 @@ class TestOneModelMTPDraftTokenScheduling:
     forward then builds a uniform ``1 + runtime_draft_len`` per gen request and
     overshoots ``max_num_tokens`` (``total_num_tokens > max_num_tokens``).
 
-    The fix populates ``request.draft_tokens = [0] * max_total_draft_tokens``
-    on every in-progress generation request so scheduling reserves the correct
-    token budget. This test drives ``_prepare_and_schedule_batch`` for a
-    one-model-MTP executor and asserts generation requests get
-    ``num_draft_tokens == max_total_draft_tokens`` while context requests are
-    left untouched.
+    The fix populates both the Python and C++ draft-token representations on
+    every in-progress generation request so both schedulers reserve the
+    correct token budget. This test drives ``_prepare_and_schedule_batch`` for
+    a one-model-MTP executor and asserts generation requests get the full
+    draft-token budget while context requests are left untouched.
+
+    The Python-side fill is placeholder-only: with the overlap scheduler
+    disabled, ``_prepare_tp_inputs`` sources a generation request's draft
+    tokens from ``py_draft_tokens``, which the one-model spec sampler wrote at
+    the end of the previous iteration. Overwriting a populated list here would
+    feed zeros to the target model and collapse the acceptance rate.
 
     NOTE: Like ``test_fetch_called_once_even_in_benchmark_disagg`` in
     ``test_benchmark_disagg.py``, this uses ``object.__new__(PyExecutor)`` to
@@ -2705,7 +2914,11 @@ class TestOneModelMTPDraftTokenScheduling:
         return req
 
     @classmethod
-    def _make_one_model_mtp_executor(cls, active_requests):
+    def _make_one_model_mtp_executor(
+        cls,
+        active_requests: list[LlmRequest],
+        use_rejection_sampling: bool = False,
+    ) -> PyExecutor:
         """Construct a partially-initialised one-model-MTP PyExecutor.
 
         drafter is None (one-model MTP has no separate drafter) and
@@ -2718,11 +2931,23 @@ class TestOneModelMTPDraftTokenScheduling:
         ex = object.__new__(PyExecutor)
         ex.drafter = None
         ex.max_total_draft_tokens = cls.MAX_TOTAL_DRAFT_TOKENS
-        ex.model_engine = Mock(is_spec_decode=True)
+        spec_config = MTPDecodingConfig(
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            mtp_eagle_one_model=True,
+            use_rejection_sampling=use_rejection_sampling,
+            draft_len_schedule={1: cls.MAX_TOTAL_DRAFT_TOKENS},
+        )
+        ex.model_engine = Mock(
+            is_spec_decode=True,
+            spec_config=spec_config,
+            max_draft_len=cls.MAX_TOTAL_DRAFT_TOKENS,
+            max_total_draft_tokens=cls.MAX_TOTAL_DRAFT_TOKENS,
+        )
         ex.kv_cache_transceiver = None
         ex.is_shutdown = False
         ex.enable_iter_perf_stats = False
         ex.enable_attention_dp = False
+        ex.speculation_permanently_disabled = False
         ex.active_requests = active_requests
         ex.waiting_queue = []
 
@@ -2755,6 +2980,8 @@ class TestOneModelMTPDraftTokenScheduling:
         # Precondition: no draft tokens reserved yet on either gen request.
         assert gen.num_draft_tokens == 0
         assert disagg_gen.num_draft_tokens == 0
+        assert gen.py_draft_tokens == []
+        assert disagg_gen.py_draft_tokens == []
 
         ex = self._make_one_model_mtp_executor([gen, disagg_gen, ctx])
         scheduled_batch, _ = ex._prepare_and_schedule_batch()
@@ -2764,7 +2991,39 @@ class TestOneModelMTPDraftTokenScheduling:
         # full draft-token budget so the micro-batch scheduler reserves
         # beam + max_total_draft_tokens.
         assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
         # Disaggregated case: decode-worker request awaiting KV also normalized.
         assert disagg_gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert disagg_gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
         # Context requests are not generation requests and must be left alone.
         assert ctx.num_draft_tokens == 0
+        assert ctx.py_draft_tokens == []
+
+    def test_one_model_mtp_preserves_zero_proposal_signal_for_rejection(self) -> None:
+        gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
+        ex = self._make_one_model_mtp_executor([gen], use_rejection_sampling=True)
+
+        ex._prepare_and_schedule_batch()
+
+        assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_needs_onehot_draft_probs
+
+        batch = ScheduledRequests()
+        batch.append_generation_request(gen)
+        ex._handle_dynamic_draft_len(batch)
+
+        assert ex.model_engine.runtime_draft_len == self.MAX_TOTAL_DRAFT_TOKENS
+        assert gen.py_needs_onehot_draft_probs
+        assert gen.py_draft_tokens == [0] * self.MAX_TOTAL_DRAFT_TOKENS
+
+    def test_one_model_mtp_preserves_sampler_draft_tokens(self) -> None:
+        sampler_drafts = [7, 8]
+        gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
+        gen.py_draft_tokens = list(sampler_drafts)
+
+        ex = self._make_one_model_mtp_executor([gen])
+        ex._prepare_and_schedule_batch()
+
+        assert gen.py_draft_tokens == sampler_drafts
+        assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
