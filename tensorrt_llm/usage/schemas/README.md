@@ -81,8 +81,8 @@ fails earlier can send a terminal report without an initial report.
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
-| `architectureClassName` | LongString | HuggingFace model architecture class. | `"MixtralForCausalLM"`, `"LlamaForCausalLM"` |
-| `architectureClassHash` | LongString | Reserved for the TRTLLM-411 approved architecture hashing policy. Empty in the exit-code implementation. | `""` |
+| `architectureClassName` | LongString | Exact model architecture class when it appears in the checked-in public Hugging Face architecture allowlist; otherwise empty. | `"MixtralForCausalLM"`, `"LlamaForCausalLM"`, `""` |
+| `architectureClassHash` | LongString | Deterministic, domain-separated SHA-256 digest for a non-empty architecture outside the public allowlist; otherwise empty. | `"sha256:76873a...ccd04"`, `""` |
 | `backend` | ShortString | Execution backend. | `"pytorch"`, `"tensorrt"` |
 | `dtype` | ShortString | Model data type. | `"float16"`, `"bfloat16"`, `"auto"` |
 | `quantizationAlgo` | ShortString | Quantization algorithm. Empty string if none. | `""`, `"fp8"`, `"w4a16_awq"` |
@@ -98,6 +98,35 @@ fails earlier can send a terminal report without an initial report.
 | `llmApiConfigMetaJson` | string | JSON-serialized metadata for LLM API configuration capture. | `'{"capture_succeeded":true,...}'` |
 | `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"`, `"coordinator"`, `"server_coordinator"`, `"ctx0"`, `"gen0"` |
 | `deploymentId` | ShortString | Shared ID across disaggregated workers. Empty if not disaggregated. | `""`, `"dep-abc123"` |
+
+##### Architecture privacy policy
+
+`architectureClassName` and `architectureClassHash` are mutually exclusive.
+Telemetry reports an architecture in plaintext only when it exactly matches a
+name in `tensorrt_llm/usage/architecture_allowlist.py`. Unknown names are not
+logged or added to the payload; the hash field contains
+`"sha256:" + SHA-256("trtllm-architecture-class-v1\\0" + UTF-8(name))` so
+recurring unknown architectures can be grouped without transmitting their
+free-form names.
+
+The plural Hugging Face `architectures` field uses its first item, matching the
+model loader's selection semantics; later items are ignored. Legacy singular
+TRT-LLM architecture values and nested engine configs remain supported. Empty,
+whitespace-only, non-string, or non-UTF-8-encodable values emit empty sentinels
+for both fields. Allowlist matching is exact and does not trim or case-fold.
+
+The allowlist is generated offline from the public, checked-in PyTorch model
+index and supported-model tables. After either source adds or removes a public
+architecture, regenerate it with:
+
+```bash
+python3 scripts/update_telemetry_architecture_allowlist.py
+python3 scripts/update_telemetry_architecture_allowlist.py --check
+```
+
+The generated module records a format version and content digest. Custom or
+externally registered architecture names are deliberately absent until they
+are reviewed and represented in a public source.
 
 #### Aggregate LLM lifecycle counters
 

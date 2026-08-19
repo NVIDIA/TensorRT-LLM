@@ -357,6 +357,37 @@ class TestIngressPointReporter:
 
 
 # ---------------------------------------------------------------------------
+# Architecture privacy integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestArchitecturePrivacy:
+    """Verify the initial wire payload never contains an unknown raw name."""
+
+    def test_background_reporter_hashes_unknown_architecture(self):
+        private_architecture = "InternalCustomerModelForCausalLM"
+        pretrained_config = SimpleNamespace(architectures=[private_architecture])
+        captured = {}
+
+        def fake_send(payload):
+            captured.update(payload)
+
+        stop_event = threading.Event()
+        stop_event.set()
+
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
+            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+        ):
+            usage_lib._background_reporter(None, pretrained_config, "")
+
+        params = captured["events"][0]["parameters"]
+        assert params["architectureClassName"] == ""
+        assert params["architectureClassHash"].startswith("sha256:")
+        assert private_architecture not in json.dumps(captured)
+
+
+# ---------------------------------------------------------------------------
 # _clamp_str integration tests
 # ---------------------------------------------------------------------------
 
