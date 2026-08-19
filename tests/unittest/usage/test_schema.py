@@ -251,7 +251,7 @@ class TestSchemaConstants:
         [
             ("CLIENT_ID", "616561816355034"),
             ("EVENT_PROTOCOL", "1.6"),
-            ("EVENT_SCHEMA_VER", "0.8"),
+            ("EVENT_SCHEMA_VER", "0.7"),
             ("EVENT_SYS_VER", "trtllm-telemetry/1.0"),
         ],
     )
