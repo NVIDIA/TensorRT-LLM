@@ -558,6 +558,7 @@ class QwenImagePipeline(BasePipeline):
         do_cfg_parallel, cfg_size, cfg_rank, cfg_pg = self._cfg_parallel_state(
             use_negative_prompt_cfg
         )
+
         device = self.device
         generator = torch.Generator(device=device).manual_seed(seed)
 

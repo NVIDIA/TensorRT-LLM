@@ -224,10 +224,6 @@ l0_b200:
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_media_decode.py
-  - unittest/_torch/visual_gen/test_visual_gen_args.py
-  - unittest/_torch/visual_gen/test_visual_gen_params.py
-  - unittest/_torch/visual_gen/test_visual_gen_utils.py
-  - unittest/_torch/visual_gen/test_qwen_image_pipeline_config.py
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
