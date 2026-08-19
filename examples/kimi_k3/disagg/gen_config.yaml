@@ -38,7 +38,6 @@ cache_transceiver_config:
   # ~0.4 GB/s host-staged tcp; 512 MiB measured at ~455 GB/s/GPU.
   # Bounce engages automatically above TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES
   # (default 2 MiB) — always true for K3 payloads.
-  # at tokens_per_block=64). See ctx_config.yaml.
   # Sized to fit one full request payload (fixed 433 MiB KDA state +
   # ~27 KB/token MLA latent; 649 MiB at 8k ISL) -- see ctx_config.yaml;
   # at 512 every 8k transfer falls back to the per-fragment tcp path.
