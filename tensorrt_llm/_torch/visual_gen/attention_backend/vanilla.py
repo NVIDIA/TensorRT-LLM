@@ -28,7 +28,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from ...attention_backend.interface import PredefinedAttentionMask
+from ...attention_backend.interface import AttentionMetadata, PredefinedAttentionMask
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -70,6 +70,7 @@ class VanillaAttention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
+        attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
         **kwargs,
@@ -83,6 +84,8 @@ class VanillaAttention(AttentionBackend):
             q: Query tensor [batch_size, num_heads, seq_len, head_dim]
             k: Key tensor [batch_size, num_kv_heads, seq_len_kv, head_dim]
             v: Value tensor [batch_size, num_kv_heads, seq_len_kv, head_dim]
+            attn_metadata: Unused; SDPA derives everything from tensor shapes.
+                Preserved for future metadata-consuming variants of this path.
             attention_mask: Attention mask type (CAUSAL or FULL)
             key_padding_mask: Optional ``[B, S_kv]`` bool tensor; True = valid,
                 False = pad. Expanded internally to ``[B, 1, 1, S_kv]`` and
@@ -91,6 +94,7 @@ class VanillaAttention(AttentionBackend):
         Returns:
             Output tensor [batch_size, num_heads, seq_len, head_dim]
         """
+        _, _ = attn_metadata, kwargs
         is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
 
         assert q.dim() == 4 and q.shape[3] == self.head_dim, (
@@ -122,6 +126,11 @@ class VanillaAttention(AttentionBackend):
         return F.scaled_dot_product_attention(
             q, k, v, is_causal=is_causal, scale=self.scale, enable_gqa=enable_gqa
         )
+
+    @property
+    def requires_metadata(self) -> bool:
+        """Currently VanillaAttention only supports non-varlen batching. No metadata referred."""
+        return False
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

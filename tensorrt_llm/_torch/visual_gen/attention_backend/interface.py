@@ -20,8 +20,11 @@ Defines shared types, enums, and the abstract base class for attention backends.
 
 from abc import ABC, abstractmethod
 from enum import Enum
+from typing import Type
 
 import torch
+
+from ...attention_backend.interface import AttentionMetadata
 
 
 class AttentionTensorLayout(str, Enum):
@@ -42,7 +45,16 @@ class AttentionBackend(ABC):
     Every backend must implement ``forward`` and declare a ``preferred_layout``.
     Backends pick the kwargs they need from the caller and ignore the rest
     via ``**kwargs``.
+
+    ``attn_metadata`` is a required argument on every forward, mirroring the LLM
+    backend. Backends that do not consume metadata (VANILLA, FA4, CuTe DSL) accept
+    and ignore it; only the TRTLLM backend reads it. See
+    ``visual_gen/attention_backend/metadata.py`` for the site contract.
     """
+
+    #: Concrete metadata type this backend consumes; callers construct from
+    #: it, as the LLM engine does.
+    Metadata: Type[AttentionMetadata] = AttentionMetadata
 
     def __call__(self, *args, **kwargs) -> torch.Tensor:
         return self.forward(*args, **kwargs)
@@ -53,6 +65,8 @@ class AttentionBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor | None = None,
         v: torch.Tensor | None = None,
+        *,
+        attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor: ...
 
@@ -60,11 +74,21 @@ class AttentionBackend(ABC):
     @abstractmethod
     def preferred_layout(self) -> AttentionTensorLayout: ...
 
+    @property
+    def requires_metadata(self) -> bool:
+        """Queries if the configured attention module requires a prepared metadata to run.
+
+        For size-aligned diffusion models, many attention backends can run without a metadata.
+        """
+        return True
+
     def forward_with_lse(
         self,
         q: torch.Tensor,
         k: torch.Tensor | None = None,
         v: torch.Tensor | None = None,
+        *,
+        attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError(

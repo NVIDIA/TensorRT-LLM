@@ -48,7 +48,9 @@ try:
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _visual_gen_dist_utils import spawn_with_retry
+    from attn_metadata_utils import flux_attn_metadata
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -295,6 +297,7 @@ def _logic_flux2_transformer_parallel_vs_single_gpu(
     with torch.no_grad():
         ref_out = ref_model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(ref_model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             timestep=timestep,
             guidance=guidance,
@@ -303,6 +306,7 @@ def _logic_flux2_transformer_parallel_vs_single_gpu(
         )["sample"]
         dist_out = dist_model(
             hidden_states=hidden_states,
+            attn_metadata=flux_attn_metadata(dist_model, hidden_states, encoder_hidden_states),
             encoder_hidden_states=encoder_hidden_states,
             timestep=timestep,
             guidance=guidance,

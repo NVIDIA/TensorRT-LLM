@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+
 from ..qwen_image.transformer_qwen_image import (
     QwenEmbedRope,
     QwenImageTransformer2DModel,
@@ -197,6 +199,7 @@ class QwenImageLayeredTransformer2DModel(QwenImageTransformer2DModel):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
@@ -245,6 +248,7 @@ class QwenImageLayeredTransformer2DModel(QwenImageTransformer2DModel):
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
+                attn_metadata=attn_metadata,
                 image_rotary_emb=image_rotary_emb,
                 attention_mask=block_attention_mask,
                 timestep=timestep,

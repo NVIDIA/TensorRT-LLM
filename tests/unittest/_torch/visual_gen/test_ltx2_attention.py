@@ -15,11 +15,9 @@ import unittest
 import pytest
 import torch
 import torch.nn.functional as F
+from attn_metadata_utils import make_attn_metadata
 
-from tensorrt_llm._torch.visual_gen.config import (
-    DiffusionModelConfig,
-    create_attention_metadata_state,
-)
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
@@ -110,7 +108,7 @@ class TestLTX2SelfAttention(unittest.TestCase):
         pe = _make_pe(batch_size, seq_len, heads, head_dim, dtype, self.DEVICE)
 
         with torch.no_grad():
-            output = attn(x, context=None, pe=pe)
+            output = attn(x, make_attn_metadata(attn.attn_backend, x), context=None, pe=pe)
 
         self.assertEqual(output.shape, (batch_size, seq_len, query_dim))
 
@@ -128,7 +126,6 @@ class TestLTX2SelfAttention(unittest.TestCase):
 
         torch.manual_seed(42)
         config = _create_config("TRTLLM")
-        config.attention_metadata_state = create_attention_metadata_state()
 
         attn = (
             LTX2Attention(
@@ -147,7 +144,7 @@ class TestLTX2SelfAttention(unittest.TestCase):
         pe = _make_pe(batch_size, seq_len, heads, head_dim, dtype, self.DEVICE)
 
         with torch.no_grad():
-            output = attn(x, context=None, pe=pe)
+            output = attn(x, make_attn_metadata(attn.attn_backend, x), context=None, pe=pe)
 
         self.assertEqual(output.shape, (batch_size, seq_len, query_dim))
 
@@ -195,7 +192,12 @@ class TestLTX2CrossAttention(unittest.TestCase):
         # this via prepare_text_cache; AV cross-attn does it inline).
         with torch.no_grad():
             k, v = attn.project_kv(ctx, pe=None)
-            output = attn(x, pre_projected_kv=(k, v), pe=None)
+            output = attn(
+                x,
+                make_attn_metadata(attn.attn_backend, x, kv_seq_len=k.shape[1]),
+                pre_projected_kv=(k, v),
+                pe=None,
+            )
 
         self.assertEqual(output.shape, (batch_size, q_seq, query_dim))
 
@@ -234,7 +236,12 @@ class TestLTX2CrossAttention(unittest.TestCase):
 
         with torch.no_grad():
             k, v = attn.project_kv(ctx, pe=None)
-            output = attn(x, pre_projected_kv=(k, v), pe=None)
+            output = attn(
+                x,
+                make_attn_metadata(attn.attn_backend, x, kv_seq_len=k.shape[1]),
+                pre_projected_kv=(k, v),
+                pe=None,
+            )
 
         self.assertEqual(output.shape, (batch_size, q_seq, query_dim))
 
@@ -279,7 +286,7 @@ class TestLTX2GatedAttention(unittest.TestCase):
         pe = _make_pe(batch_size, seq_len, heads, head_dim, dtype, self.DEVICE)
 
         with torch.no_grad():
-            output = attn(x, context=None, pe=pe)
+            output = attn(x, make_attn_metadata(attn.attn_backend, x), context=None, pe=pe)
 
         self.assertEqual(output.shape, (batch_size, seq_len, query_dim))
 
@@ -321,7 +328,6 @@ class TestLTX2BackendEquivalence(unittest.TestCase):
 
         # Create TRTLLM attention and copy weights
         config_trtllm = _create_config("TRTLLM")
-        config_trtllm.attention_metadata_state = create_attention_metadata_state()
         trtllm_attn = (
             LTX2Attention(
                 query_dim=query_dim,
@@ -340,8 +346,12 @@ class TestLTX2BackendEquivalence(unittest.TestCase):
         pe = _make_pe(batch_size, seq_len, heads, head_dim, dtype, self.DEVICE)
 
         with torch.no_grad():
-            out_vanilla = vanilla_attn(x.clone(), context=None, pe=pe)
-            out_trtllm = trtllm_attn(x.clone(), context=None, pe=pe)
+            out_vanilla = vanilla_attn(
+                x.clone(), make_attn_metadata(vanilla_attn.attn_backend, x), context=None, pe=pe
+            )
+            out_trtllm = trtllm_attn(
+                x.clone(), make_attn_metadata(trtllm_attn.attn_backend, x), context=None, pe=pe
+            )
 
         # Skip comparison if either has NaN/Inf (can happen with random weights)
         has_nan = torch.isnan(out_vanilla).any() or torch.isnan(out_trtllm).any()

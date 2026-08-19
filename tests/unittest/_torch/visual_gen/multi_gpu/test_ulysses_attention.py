@@ -34,7 +34,9 @@ try:
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _visual_gen_dist_utils import spawn_with_retry
+    from attn_metadata_utils import make_backend_attn_metadata
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -578,8 +580,10 @@ def _logic_ulysses_fused_vs_unfused(rank, world_size):
         process_group=None,
     )
 
-    out_unfused = attn_unfused(q, k, v)
-    out_fused = attn_fused(q, k, v)
+    out_unfused = attn_unfused(
+        q, k, v, attn_metadata=make_backend_attn_metadata(attn_unfused, q, k)
+    )
+    out_fused = attn_fused(q, k, v, attn_metadata=make_backend_attn_metadata(attn_fused, q, k))
 
     torch.testing.assert_close(
         out_fused,
@@ -615,7 +619,12 @@ def _logic_ulysses_fused_vs_standard(rank, world_size):
         process_group=None,
     )
 
-    fused_output = attn_fused(q_shard, k_shard, v_shard)
+    fused_output = attn_fused(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn_fused, q_shard, k_shard),
+    )
 
     q_std = q_full.transpose(1, 2)
     k_std = k_full.transpose(1, 2)

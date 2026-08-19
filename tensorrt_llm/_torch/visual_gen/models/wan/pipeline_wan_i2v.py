@@ -34,7 +34,10 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_default_params,
     get_wan_extra_param_specs,
 )
-from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import (
+    retrieve_latents,
+    wan_attn_metadata_kwargs,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -577,6 +580,21 @@ class WanImageToVideoPipeline(BasePipeline):
         # Track which model was used in last step (for logging model transitions)
         last_model_used = [None]
 
+        # Build attention metadata
+        denoise_batch = self.denoise_batch_size(latents, guidance_scale=guidance_scale)
+
+        def _build_sites(model):
+            return wan_attn_metadata_kwargs(
+                model,
+                hidden_states=latents,
+                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states_image=image_embeds,
+                batch_size=denoise_batch,
+            )
+
+        attn_metadata_high = _build_sites(self.transformer)
+        attn_metadata_low = None if self.transformer_2 is None else _build_sites(self.transformer_2)
+
         def forward_fn(
             latents_input,
             extra_stream_latents,
@@ -633,8 +651,11 @@ class WanImageToVideoPipeline(BasePipeline):
                 repeat_factor = latents_input.shape[0] // image_embeds_to_use.shape[0]
                 image_embeds_to_use = image_embeds_to_use.repeat(repeat_factor, 1, 1)
 
+            sites = attn_metadata_high if current_model is self.transformer else attn_metadata_low
+
             return current_model(
                 hidden_states=latent_model_input,
+                **sites,
                 timestep=timestep_input / self.scheduler.config.num_train_timesteps,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds_to_use,

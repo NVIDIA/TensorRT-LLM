@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from attn_metadata_utils import cosmos3_attn_metadata_kwargs, make_attn_metadata
 from diffusers import UniPCMultistepScheduler
 
 from tensorrt_llm._torch.modules.mlp import MLP
@@ -406,8 +407,12 @@ class TestGeneratorOnlyKNorm:
         cos = torch.ones(1, 4, 1, 8, dtype=torch.bfloat16, device=DEVICE)
         sin = torch.zeros(1, 4, 1, 8, dtype=torch.bfloat16, device=DEVICE)
 
+        und_metadata = make_attn_metadata("VANILLA", hidden)
+
         with torch.inference_mode():
-            out_before, k_gen_before, v_before = attn.forward_with_kv(hidden, cos, sin)
+            out_before, k_gen_before, v_before = attn.forward_with_kv(
+                hidden, cos, sin, und_metadata
+            )
             # The rope above is identity (cos=1, sin=0), so the cached gen K
             # must be exactly the Nemotron-normed raw K.
             _, k_raw, _ = attn.get_qkv(hidden)
@@ -415,7 +420,7 @@ class TestGeneratorOnlyKNorm:
             assert torch.equal(k_gen_before, attn.k_norm_und_for_gen(k_raw))
 
             attn.k_norm_und_for_gen.weight.fill_(2.0)
-            out_after, k_gen_after, v_after = attn.forward_with_kv(hidden, cos, sin)
+            out_after, k_gen_after, v_after = attn.forward_with_kv(hidden, cos, sin, und_metadata)
 
         assert torch.equal(out_before, out_after)
         assert torch.equal(v_before, v_after)
@@ -1385,6 +1390,9 @@ class TestEdgeCheckpoint:
         with torch.inference_mode():
             out = transformer(
                 hidden_states=latents,
+                **cosmos3_attn_metadata_kwargs(
+                    transformer, latents, text_mask, video_shape=(1, 16, 16)
+                ),
                 timestep=timestep / 1000.0,
                 raw_timestep=timestep,
                 text_ids=text_ids,

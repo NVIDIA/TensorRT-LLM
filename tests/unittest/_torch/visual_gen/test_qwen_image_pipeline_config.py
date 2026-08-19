@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import torch
 import torch.nn.functional as F
+from attn_metadata_utils import make_attn_metadata
 
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.utils import gelu_tanh
@@ -345,8 +346,9 @@ def test_qwen_joint_attention_passes_padding_mask_to_backend(monkeypatch):
     )
     captured = {}
 
-    def fake_attn_impl(q, k, v, **kwargs):
+    def fake_attn_impl(q, k, v, attn_metadata, **kwargs):
         captured["key_padding_mask"] = kwargs.get("key_padding_mask")
+        captured["attn_metadata"] = attn_metadata
         return q.new_zeros(q.shape)
 
     monkeypatch.setattr(attention, "_attn_impl", fake_attn_impl)
@@ -357,11 +359,18 @@ def test_qwen_joint_attention_passes_padding_mask_to_backend(monkeypatch):
 
     attention(
         hidden_states=hidden_states,
+        attn_metadata=make_attn_metadata(
+            attention.attn_backend,
+            hidden_states,
+            q_seq_len=hidden_states.shape[1] + encoder_hidden_states.shape[1],
+        ),
         encoder_hidden_states=encoder_hidden_states,
         attention_mask=attention_mask,
     )
 
     assert captured["key_padding_mask"] is attention_mask
+    # The site reaches the backend alongside the mask.
+    assert captured["attn_metadata"] is not None
 
 
 def test_qwen_joint_attention_rejects_unsupported_masked_sequence_parallel(monkeypatch):
@@ -387,6 +396,9 @@ def test_qwen_joint_attention_rejects_unsupported_masked_sequence_parallel(monke
     with pytest.raises(NotImplementedError, match="Padded Qwen-Image prompts"):
         attention(
             hidden_states=torch.empty(1, 4, 16),
+            attn_metadata=make_attn_metadata(
+                attention.attn_backend, torch.empty(1, 4, 16), q_seq_len=7
+            ),
             encoder_hidden_states=torch.empty(1, 3, 16),
             attention_mask=torch.tensor([[True, False, True, True, True, True, True]]),
         )

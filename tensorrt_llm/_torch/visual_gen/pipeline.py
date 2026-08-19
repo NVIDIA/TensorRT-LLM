@@ -795,6 +795,24 @@ class BasePipeline(nn.Module):
                 current = 1.0
         return current
 
+    def denoise_batch_size(
+        self,
+        latents: torch.Tensor,
+        *,
+        guidance_scale: float,
+    ) -> int:
+        """Batch size ``forward_fn`` will be called with.
+
+        CFG parallel is supported, so each ``forward_fn`` call might not contain all CFGs for a
+        model. Use this routine to determine how many batches ``forward_fn`` will see from the
+        supplied latents tensor.
+        """
+        vgm = self.pipeline_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        do_cfg_parallel = cfg_size >= 2 and guidance_scale > 1.0
+        doubles_batch = guidance_scale > 1.0 and not do_cfg_parallel
+        return latents.shape[0] * (2 if doubles_batch else 1)
+
     def _setup_cfg_config(
         self, guidance_scale, prompt_embeds, neg_prompt_embeds, extra_cfg_tensors=None
     ):

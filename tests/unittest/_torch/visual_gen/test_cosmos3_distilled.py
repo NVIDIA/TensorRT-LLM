@@ -856,11 +856,22 @@ def _forward_ready_pipeline(**attrs) -> Cosmos3OmniMoTPipeline:
     """A pipeline stubbed just enough for forward() to run end to end."""
     defaults = dict(
         sampling=_distilled_policy(),
-        pipeline_config=SimpleNamespace(torch_dtype=torch.float32, visual_gen_mapping=None),
+        pipeline_config=SimpleNamespace(
+            torch_dtype=torch.float32,
+            visual_gen_mapping=None,
+            # forward() allocates attention metadata sites from the configured
+            # backend; see visual_gen/attention_backend/metadata.py.
+            attention=SimpleNamespace(backend="VANILLA"),
+        ),
         transformer=SimpleNamespace(
             latent_channel_size=4,
             reset_cache=lambda: None,
             device=torch.device("cpu"),
+            create_attn_metadata=lambda **kwargs: {
+                "und": None,
+                "mixed": None,
+                "mixed_ragged": None,
+            },
         ),
         vae_scale_factor_temporal=4,
         vae_scale_factor_spatial=16,

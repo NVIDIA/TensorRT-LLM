@@ -28,7 +28,7 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-from ....attention_backend.interface import PredefinedAttentionMask
+from ....attention_backend.interface import AttentionMetadata, PredefinedAttentionMask
 from ..interface import AttentionBackend, AttentionTensorLayout
 
 _cute_dsl_import_error: BaseException | None = None
@@ -740,6 +740,7 @@ class CuTeDSLAttention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
+        attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         **kwargs,
     ) -> torch.Tensor:
@@ -752,12 +753,17 @@ class CuTeDSLAttention(AttentionBackend):
             q: Query tensor [batch_size, seq_len, num_heads, head_dim]
             k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
+            attn_metadata: Unused; the CuTe DSL kernels derive everything from
+                tensor shapes. Preserved for future metadata-consuming variants
+                of this path.
             attention_mask: Attention mask type (CAUSAL or FULL)
 
         Returns:
             Output tensor [batch_size, seq_len, num_heads, head_dim]
         """
-        output, _ = self.forward_with_lse(q, k, v, attention_mask=attention_mask, **kwargs)
+        output, _ = self.forward_with_lse(
+            q, k, v, attn_metadata=attn_metadata, attention_mask=attention_mask, **kwargs
+        )
         return output
 
     def forward_with_lse(
@@ -765,6 +771,8 @@ class CuTeDSLAttention(AttentionBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        *,
+        attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -777,11 +785,19 @@ class CuTeDSLAttention(AttentionBackend):
                     always in float32. Used for numerically stable combination of
                     partial attention results in Attention2D parallelism.
         """
+        _ = attn_metadata
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
         output, lse = self._fwd(q, k, v, is_causal, **kwargs)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
         return output, lse.transpose(1, 2)
+
+    @property
+    def requires_metadata(self) -> bool:
+        """While CuTe's kernel supports varlen, its not wired to CuTeDSLAttention.
+
+        No metadata referred."""
+        return False
 
     @classmethod
     def support_lse(cls) -> bool:

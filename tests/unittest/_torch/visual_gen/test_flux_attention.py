@@ -20,11 +20,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from attn_metadata_utils import make_attn_metadata
 
-from tensorrt_llm._torch.visual_gen.config import (
-    DiffusionModelConfig,
-    create_attention_metadata_state,
-)
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
@@ -99,6 +97,13 @@ class TestFluxAttentionBackend(unittest.TestCase):
             # Skip RoPE for this sanity test (pass None)
             output, text_output = attn(
                 hidden_states=hidden_states,
+                # FLUX joint attention attends over the concatenated
+                # text + image sequence, so the site covers both.
+                attn_metadata=make_attn_metadata(
+                    attn.attn_backend,
+                    hidden_states,
+                    q_seq_len=hidden_states.shape[1] + encoder_hidden_states.shape[1],
+                ),
                 encoder_hidden_states=encoder_hidden_states,
                 image_rotary_emb=None,
             )
@@ -122,7 +127,6 @@ class TestFluxAttentionBackend(unittest.TestCase):
 
         torch.manual_seed(42)
         config = self._create_config("TRTLLM")
-        config.attention_metadata_state = create_attention_metadata_state()
 
         attn = (
             FluxJointAttention(
@@ -149,6 +153,13 @@ class TestFluxAttentionBackend(unittest.TestCase):
             # Skip RoPE for this sanity test (pass None)
             output, text_output = attn(
                 hidden_states=hidden_states,
+                # FLUX joint attention attends over the concatenated
+                # text + image sequence, so the site covers both.
+                attn_metadata=make_attn_metadata(
+                    attn.attn_backend,
+                    hidden_states,
+                    q_seq_len=hidden_states.shape[1] + encoder_hidden_states.shape[1],
+                ),
                 encoder_hidden_states=encoder_hidden_states,
                 image_rotary_emb=None,
             )
@@ -195,7 +206,6 @@ class TestFluxAttentionBackend(unittest.TestCase):
                 p.normal_(0, 0.02)
 
         config = self._create_config("TRTLLM")
-        config.attention_metadata_state = create_attention_metadata_state()
         trtllm_attn = (
             FluxJointAttention(
                 hidden_size=dim,
@@ -227,6 +237,12 @@ class TestFluxAttentionBackend(unittest.TestCase):
             for backend in ["VANILLA", "TRTLLM"]:
                 out, text_out = attns[backend](
                     hidden_states=hidden_states.clone(),
+                    # Joint attention runs over text + image concatenated.
+                    attn_metadata=make_attn_metadata(
+                        backend,
+                        hidden_states,
+                        q_seq_len=hidden_states.shape[1] + encoder_hidden_states.shape[1],
+                    ),
                     encoder_hidden_states=encoder_hidden_states.clone(),
                     image_rotary_emb=None,
                 )
@@ -321,6 +337,13 @@ class TestFlux2AttentionBackend(unittest.TestCase):
             # Skip RoPE for this sanity test (pass None)
             output, text_output = attn(
                 hidden_states=hidden_states,
+                # FLUX joint attention attends over the concatenated
+                # text + image sequence, so the site covers both.
+                attn_metadata=make_attn_metadata(
+                    attn.attn_backend,
+                    hidden_states,
+                    q_seq_len=hidden_states.shape[1] + encoder_hidden_states.shape[1],
+                ),
                 encoder_hidden_states=encoder_hidden_states,
                 image_rotary_emb=None,
             )

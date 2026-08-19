@@ -24,6 +24,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from attn_metadata_utils import flux_attn_metadata
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
@@ -95,6 +96,7 @@ def _get_flux_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat1
 
     return dict(
         hidden_states=hidden_states,
+        attn_metadata=flux_attn_metadata(transformer, hidden_states, encoder_hidden_states),
         encoder_hidden_states=encoder_hidden_states,
         pooled_projections=pooled_projections,
         timestep=timestep,
@@ -437,7 +439,12 @@ class TestFluxFP8NumericalCorrectness:
             output_bf16 = transformer_bf16(**inputs)
 
         print(f"[E2E] Running {quant_algo} transformer forward...")
-        inputs_fp8 = {k: v.clone() for k, v in inputs.items()}
+        # attn_metadata is not a tensor; clone only the tensor inputs. It is also
+        # rebuilt below so the site matches the FP8 transformer's backend.
+        inputs_fp8 = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in inputs.items()}
+        inputs_fp8["attn_metadata"] = flux_attn_metadata(
+            transformer_fp8, inputs_fp8["hidden_states"], inputs_fp8["encoder_hidden_states"]
+        )
         with torch.no_grad():
             output_fp8 = transformer_fp8(**inputs_fp8)
 
@@ -618,6 +625,13 @@ class TestFluxAttentionBackend:
             skip_warmup=True, skip_components=SKIP_COMPONENTS
         )
         transformer_trtllm = pipeline_trtllm.transformer
+
+        # Rebuild the inputs for this transformer: the attention metadata strain
+        # is typed by the backend (VANILLA gets the base AttentionMetadata,
+        # TRTLLM gets TrtllmAttentionMetadata), so it cannot be shared across
+        # backends. `_get_flux_transformer_inputs` re-seeds, so the tensors are
+        # identical and the comparison below stays apples-to-apples.
+        inputs = _get_flux_transformer_inputs(transformer_trtllm)
 
         print("[Attention Backend Test] Running TRTLLM transformer forward...")
         with torch.no_grad():

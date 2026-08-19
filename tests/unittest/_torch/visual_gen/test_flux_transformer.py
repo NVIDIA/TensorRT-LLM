@@ -17,6 +17,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.nn.functional as F
+from attn_metadata_utils import flux_attn_metadata
 
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -571,6 +572,7 @@ class TestFluxTransformer(unittest.TestCase):
         with torch.no_grad():
             output = model(
                 hidden_states=hidden_states,
+                attn_metadata=flux_attn_metadata(model, hidden_states, encoder_hidden_states),
                 encoder_hidden_states=encoder_hidden_states,
                 pooled_projections=pooled_projections,
                 timestep=timestep,
@@ -625,6 +627,7 @@ class TestFluxTransformer(unittest.TestCase):
         with torch.no_grad():
             output = model(
                 hidden_states=hidden_states,
+                attn_metadata=flux_attn_metadata(model, hidden_states, encoder_hidden_states),
                 encoder_hidden_states=encoder_hidden_states,
                 timestep=timestep,
                 guidance=guidance,
@@ -759,6 +762,9 @@ class TestFluxHuggingFaceComparison(unittest.TestCase):
 
             trtllm_output = trtllm_model(
                 hidden_states=hidden_states,
+                attn_metadata=flux_attn_metadata(
+                    trtllm_model, hidden_states, encoder_hidden_states
+                ),
                 encoder_hidden_states=encoder_hidden_states,
                 pooled_projections=pooled_projections,
                 timestep=timestep,

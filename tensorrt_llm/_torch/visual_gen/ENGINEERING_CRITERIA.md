@@ -29,6 +29,11 @@ end-to-end workflow.
    T2V / TI2V) with LPIPS — or an equivalent metric — at an explicit
    threshold, comparing against a baseline image/video produced by a
    reference framework.
+6. **Attention metadata is a forward argument.** Models take metadata as
+   required `forward()` parameters; the pipeline builds it per forward
+   from the model's `attn_metadata_spec()`. Each attention *site*
+   (e.g., LTX-2's Vid2Vid, Vid2Sound, etc.), with its own Q/KV lengths,
+   gets its own metadata object.
 
 ## 2. API
 

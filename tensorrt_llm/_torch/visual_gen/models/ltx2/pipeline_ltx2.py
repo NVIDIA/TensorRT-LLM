@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.utils import make_weak_ref
 from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
@@ -308,6 +309,15 @@ class LTX2TeaCacheExtractor:
 # ---------------------------------------------------------------------------
 
 
+def _is_attn_metadata_map(value) -> bool:
+    """Is *value* a per-site attention metadata mapping (see metadata.py)?"""
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(isinstance(v, AttentionMetadata) for v in value.values())
+    )
+
+
 class _LTX2CUDAGraphRunner(CUDAGraphRunner):
     """CUDAGraphRunner extended for LTX-2's ``Modality``-based transformer.
 
@@ -449,6 +459,8 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
             return dst
         if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor):
             dst.copy_(src)
+            return dst
+        if _is_attn_metadata_map(src) and _is_attn_metadata_map(dst):
             return dst
         if isinstance(src, Modality) and isinstance(dst, Modality):
             dst.latent.copy_(src.latent)
@@ -1760,7 +1772,37 @@ class LTX2Pipeline(BasePipeline):
         # Cache encoder output for two-stage Stage 2 reuse.
         self._cached_encoder_output = (video_embeds, audio_embeds, connector_mask)
 
+        # Multi-modal guidance runs its own cond/uncond passes, so `denoise`
+        # must not also batch for CFG.
+        effective_guidance = 1.0 if use_multi_modal_guidance else guidance_scale
+
+        # Create attention metadata
+        _denoise_batch = self.denoise_batch_size(latents, guidance_scale=effective_guidance)
+        _attn_metadata_cond = self.transformer.create_attn_metadata(
+            batch_size=_denoise_batch,
+            video_seq_len=latents.shape[1],
+            audio_seq_len=audio_latents.shape[1] if has_audio else 0,
+            text_cache=_text_cache,
+        )
+        _attn_metadata_uncond = (
+            None
+            if _text_cache_uncond is None
+            else self.transformer.create_attn_metadata(
+                batch_size=_denoise_batch,
+                video_seq_len=latents.shape[1],
+                audio_seq_len=audio_latents.shape[1] if has_audio else 0,
+                text_cache=_text_cache_uncond,
+            )
+        )
+
+        # Select the right metadata for each attention site.
+        def _attn_metadata_for(text_cache):
+            return (
+                _attn_metadata_uncond if text_cache is _text_cache_uncond else _attn_metadata_cond
+            )
+
         # ---- 9. Denoising loop ------------------------------------------
+
         def _run_transformer(
             v_latents,
             a_latents,
@@ -1822,6 +1864,7 @@ class LTX2Pipeline(BasePipeline):
                 audio=audio_mod,
                 perturbations=perturbations,
                 text_cache=text_cache,
+                attn_metadata=_attn_metadata_for(text_cache),
                 timestep=timestep_val.new_tensor(float(step_index) / num_steps),
                 step_index=step_index,
             )
@@ -1993,7 +2036,6 @@ class LTX2Pipeline(BasePipeline):
 
         # When using multi-modal guidance, we handle everything inside
         # forward_fn, so tell BasePipeline not to apply its own CFG.
-        effective_guidance = 1.0 if use_multi_modal_guidance else guidance_scale
 
         timer.mark_denoise_start()
         result = self.denoise(

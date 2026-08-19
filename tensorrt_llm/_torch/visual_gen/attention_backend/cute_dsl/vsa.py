@@ -30,6 +30,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from ....attention_backend.interface import AttentionMetadata
 from ..interface import AttentionBackend, AttentionTensorLayout
 
 _vsa_import_error = None
@@ -300,12 +301,17 @@ class VSAAttention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
+        attn_metadata: AttentionMetadata,
         gate_compress: Optional[torch.Tensor] = None,
         gate_fine: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
         VSA forward: coarse mean-pool + fine block-sparse top-K.
+
+        VSA carries its own sparse-layout metadata through
+        ``set_vsa_forward_context``; ``attn_metadata`` is unused here and
+        preserved for future metadata-consuming variants of this path.
 
         Args:
             q, k, v: [B, S, H, D] in original (un-tiled) token order.
@@ -316,6 +322,7 @@ class VSAAttention(AttentionBackend):
         Returns:
             [B, S, H, D] in the same original token order.
         """
+        _, _ = attn_metadata, kwargs
         if gate_compress is None:
             raise ValueError(
                 "VSAAttention requires gate_compress. "
@@ -398,6 +405,11 @@ class VSAAttention(AttentionBackend):
         if gate_fine is not None:
             return gate_compress * o_c_full + gate_fine * o_f
         return gate_compress * o_c_full + o_f
+
+    @property
+    def requires_metadata(self) -> bool:
+        """Currently VSAAttention only supports non-varlen batching. No metadata referred."""
+        return False
 
     @classmethod
     def support_lse(cls) -> bool:

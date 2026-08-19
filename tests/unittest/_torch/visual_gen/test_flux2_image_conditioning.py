@@ -13,6 +13,8 @@ import pytest
 import torch
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.visual_gen.attention_backend.metadata import make_diffusion_attn_metadata
 from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
 
 
@@ -136,7 +138,12 @@ def test_reference_images_run_with_cache_acceleration(
     reference_count: int,
 ) -> None:
     pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
-    pipeline.pipeline_config = SimpleNamespace(cache_backend=cache_backend)
+    pipeline.pipeline_config = SimpleNamespace(
+        cache_backend=cache_backend,
+        # The pipeline allocates attention metadata sites from the configured
+        # backend; see visual_gen/attention_backend/metadata.py.
+        attention=SimpleNamespace(backend="VANILLA"),
+    )
     pipeline._encode_prompt = lambda _prompt, _max_length: (
         torch.zeros(1, 2, 8),
         torch.zeros(2, 4),
@@ -159,6 +166,15 @@ def test_reference_images_run_with_cache_acceleration(
 
         def __init__(self) -> None:
             self.sequence_lengths: list[int] = []
+
+        def create_attn_metadata(self, *, batch_size, text_seq_len, image_seq_len):
+            return {
+                "self": make_diffusion_attn_metadata(
+                    AttentionMetadata,
+                    batch_size=batch_size,
+                    q_seq_lens=text_seq_len + image_seq_len,
+                )
+            }
 
         def parameters(self) -> Iterator[torch.Tensor]:
             return iter([torch.empty(0)])

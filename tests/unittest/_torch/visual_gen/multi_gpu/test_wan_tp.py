@@ -42,7 +42,6 @@ try:
         AttentionConfig,
         DiffusionModelConfig,
         TorchCompileConfig,
-        create_attention_metadata_state,
     )
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
@@ -51,6 +50,9 @@ try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _visual_gen_dist_utils import spawn_with_retry
 
+    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import (
+        wan_attn_metadata_kwargs,
+    )
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     from .tp_shard_utils import copy_tp_parameter
@@ -185,9 +187,6 @@ def _make_model_config(pretrained_dict, tp_size=1, ulysses_size=1, backend="VANI
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
-        attention_metadata_state=(
-            create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
-        ),
         skip_create_weights_in_init=False,
     )
     config.mapping = vgm.to_llm_mapping()
@@ -272,6 +271,11 @@ def _logic_wan_t2v_tp_forward(rank, world_size):
     with torch.no_grad():
         output = model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
         )
@@ -330,11 +334,21 @@ def _logic_wan_t2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
     with torch.no_grad():
         ref_output = ref_model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                ref_model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
         )
         tp_output = tp_model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                tp_model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
         )
@@ -390,11 +404,21 @@ def _logic_wan_t2v_tp_ulysses_vs_single_gpu(rank, world_size):
     with torch.no_grad():
         ref_output = ref_model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                ref_model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
         )
         combined_output = combined_model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                combined_model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
         )
@@ -445,6 +469,12 @@ def _logic_wan_i2v_tp_forward(rank, world_size):
     with torch.no_grad():
         output = model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_image=encoder_hidden_states_image,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
             encoder_hidden_states_image=encoder_hidden_states_image,
@@ -509,12 +539,24 @@ def _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
     with torch.no_grad():
         ref_output = ref_model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                ref_model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_image=encoder_hidden_states_image,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
             encoder_hidden_states_image=encoder_hidden_states_image,
         )
         tp_output = tp_model(
             hidden_states=hidden_states,
+            **wan_attn_metadata_kwargs(
+                tp_model,
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_image=encoder_hidden_states_image,
+            ),
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
             encoder_hidden_states_image=encoder_hidden_states_image,

@@ -50,7 +50,9 @@ try:
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _visual_gen_dist_utils import spawn_with_retry
+    from attn_metadata_utils import make_attn_metadata
 
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.visual_gen.args import AttentionConfig
@@ -368,7 +370,7 @@ def _run_tp_with_params(
             head_dim,
         )
 
-    tp_out = attn_tp(x)
+    tp_out = attn_tp(x, make_attn_metadata(attn_tp.attn_backend, x))
 
     torch.testing.assert_close(tp_out, ref_out, rtol=1e-2, atol=1e-2)
 
@@ -471,7 +473,7 @@ def _logic_tp_ulysses_combined(
     ].contiguous()
     expected_shard = ref_out[:, ulysses_rank * seq_per_rank : (ulysses_rank + 1) * seq_per_rank]
 
-    combined_out = attn_combined(x_shard)
+    combined_out = attn_combined(x_shard, make_attn_metadata(attn_combined.attn_backend, x_shard))
 
     torch.testing.assert_close(combined_out, expected_shard, rtol=1e-2, atol=1e-2)
 

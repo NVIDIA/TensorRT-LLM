@@ -48,7 +48,9 @@ try:
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from _visual_gen_dist_utils import spawn_with_retry
+    from attn_metadata_utils import make_backend_attn_metadata
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -228,11 +230,18 @@ def _logic_attn2d_forward(rank, world_size):
     v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
 
     # No mask (None) and explicit FULL mask are both valid
-    output = attn(q, k, v, batch_size=batch)
+    output = attn(q, k, v, attn_metadata=make_backend_attn_metadata(attn, q, k), batch_size=batch)
     assert output.shape == q.shape, f"Rank {rank}: expected {q.shape}, got {output.shape}"
     assert torch.isfinite(output).all(), f"Rank {rank}: output contains non-finite values"
 
-    output_full = attn(q, k, v, batch_size=batch, attention_mask=PredefinedAttentionMask.FULL)
+    output_full = attn(
+        q,
+        k,
+        v,
+        attn_metadata=make_backend_attn_metadata(attn, q, k),
+        batch_size=batch,
+        attention_mask=PredefinedAttentionMask.FULL,
+    )
     assert output_full.shape == q.shape
 
 
@@ -263,7 +272,13 @@ def _logic_attn2d_vs_standard(rank, world_size):
     except ImportError:
         pytest.skip("flash_attn_combine JIT kernels not available")
 
-    attn2d_output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    attn2d_output = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     # Reference: standard full-sequence SDPA
     scale = 1.0 / math.sqrt(head_dim)
@@ -301,7 +316,14 @@ def _logic_attn2d_invalid_mask(rank, world_size):
     v = torch.randn(2, 8, 8, 64, device=device)
 
     with pytest.raises(ValueError, match="FULL"):
-        attn(q, k, v, batch_size=2, attention_mask=PredefinedAttentionMask.CAUSAL)
+        attn(
+            q,
+            k,
+            v,
+            attn_metadata=make_backend_attn_metadata(attn, q, k),
+            batch_size=2,
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+        )
 
 
 def _logic_attn2d_asymmetric_mesh_1x4(rank, world_size):
@@ -329,7 +351,13 @@ def _logic_attn2d_asymmetric_mesh_1x4(rank, world_size):
     k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
     v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    output = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     assert output.shape == q_shard.shape, (
         f"Rank {rank}: expected {q_shard.shape}, got {output.shape}"
@@ -381,7 +409,13 @@ def _logic_attn2d_asymmetric_mesh_4x1(rank, world_size):
     k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
     v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    output = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     assert output.shape == q_shard.shape, (
         f"Rank {rank}: expected {q_shard.shape}, got {output.shape}"
@@ -433,7 +467,13 @@ def _logic_attn2d_gqa(rank, world_size):
     k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
     v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    attn2d_output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    attn2d_output = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     scale = 1.0 / math.sqrt(head_dim)
     q_std = q_full.transpose(1, 2).float()
@@ -479,7 +519,13 @@ def _logic_attn2d_cross_attention(rank, world_size):
     k_shard = k_full[:, rank * seq_per_rank_kv : (rank + 1) * seq_per_rank_kv].contiguous()
     v_shard = v_full[:, rank * seq_per_rank_kv : (rank + 1) * seq_per_rank_kv].contiguous()
 
-    attn2d_output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    attn2d_output = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
     assert attn2d_output.shape == q_shard.shape
 
     scale = 1.0 / math.sqrt(head_dim)
@@ -581,7 +627,13 @@ def _logic_attn2d_fa4_vs_standard(rank, world_size):
     k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
     v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    output = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     assert output.shape == q_shard.shape, (
         f"Rank {rank}: expected {q_shard.shape}, got {output.shape}"
@@ -642,7 +694,13 @@ def _logic_attn2d_fa4_asymmetric_1x4(rank, world_size):
     k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
     v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    output = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     assert output.shape == q_shard.shape, (
         f"Rank {rank}: expected {q_shard.shape}, got {output.shape}"
@@ -703,7 +761,13 @@ def _logic_attn2d_fa4_asymmetric_4x1(rank, world_size):
     k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
     v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    output = attn(
+        q_shard,
+        k_shard,
+        v_shard,
+        attn_metadata=make_backend_attn_metadata(attn, q_shard, k_shard),
+        batch_size=batch,
+    )
 
     assert output.shape == q_shard.shape, (
         f"Rank {rank}: expected {q_shard.shape}, got {output.shape}"

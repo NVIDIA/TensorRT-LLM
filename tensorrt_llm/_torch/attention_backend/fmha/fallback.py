@@ -109,7 +109,8 @@ class FallbackFmha(Fmha):
             max_context_length=metadata.max_context_length,
             max_seq_len=metadata.max_seq_len,
             trtllm_gen_jit_warmup=metadata.trtllm_gen_jit_warmup,
-            is_cross=metadata.is_cross,
+            # Selects the KV layout, not merely unequal Q/KV lengths.
+            is_cross=metadata.is_cross_with_kv_cache,
             # --- Per-call (AttentionForwardArgs) ---
             out_scale=forward_args.out_scale,
             kv_scale_orig_quant=forward_args.kv_scale_orig_quant,

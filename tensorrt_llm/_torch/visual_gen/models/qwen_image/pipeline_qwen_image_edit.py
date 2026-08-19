@@ -17,6 +17,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+    qwen_image_attn_metadata,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.inputs.utils import load_image
@@ -488,6 +491,7 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
         self.scheduler.set_begin_index(0)
 
         timer.mark_denoise_start()
+
         logger.info("Denoising edit (%d steps)...", len(timesteps))
         for _, t in self._profile_denoise_steps(timesteps):
             latent_model_input = torch.cat([latents, image_latents], dim=1)
@@ -497,6 +501,11 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
                 if cfg_rank == 0:
                     local_noise_pred = self.transformer(
                         hidden_states=latent_model_input,
+                        attn_metadata=qwen_image_attn_metadata(
+                            self.transformer,
+                            latent_model_input,
+                            prompt_embeds,
+                        ),
                         timestep=timestep / 1000,
                         encoder_hidden_states_mask=prompt_embeds_mask,
                         encoder_hidden_states=prompt_embeds,
@@ -506,6 +515,11 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
                 else:
                     local_noise_pred = self.transformer(
                         hidden_states=latent_model_input,
+                        attn_metadata=qwen_image_attn_metadata(
+                            self.transformer,
+                            latent_model_input,
+                            neg_prompt_embeds,
+                        ),
                         timestep=timestep / 1000,
                         encoder_hidden_states_mask=neg_prompt_embeds_mask,
                         encoder_hidden_states=neg_prompt_embeds,
@@ -524,6 +538,9 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
             else:
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
+                    attn_metadata=qwen_image_attn_metadata(
+                        self.transformer, latent_model_input, prompt_embeds
+                    ),
                     timestep=timestep / 1000,
                     encoder_hidden_states_mask=prompt_embeds_mask,
                     encoder_hidden_states=prompt_embeds,
@@ -543,6 +560,11 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
                         noise_pred = noise_pred.clone()
                     neg_noise_pred = self.transformer(
                         hidden_states=latent_model_input,
+                        attn_metadata=qwen_image_attn_metadata(
+                            self.transformer,
+                            latent_model_input,
+                            neg_prompt_embeds,
+                        ),
                         timestep=timestep / 1000,
                         encoder_hidden_states_mask=neg_prompt_embeds_mask,
                         encoder_hidden_states=neg_prompt_embeds,

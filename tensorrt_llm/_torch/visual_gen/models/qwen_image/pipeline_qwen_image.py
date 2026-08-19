@@ -24,6 +24,9 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
 )
+from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+    qwen_image_attn_metadata,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
@@ -625,6 +628,14 @@ class QwenImagePipeline(BasePipeline):
             separate_cfg = use_negative_prompt_cfg and not do_cfg_parallel
             cache_acc.refresh(len(timesteps), separate_cfg=separate_cfg)
 
+        # Create attention metadata
+        attn_metadata_pos = qwen_image_attn_metadata(self.transformer, latents, prompt_embeds)
+        attn_metadata_neg = (
+            None
+            if neg_prompt_embeds is None
+            else qwen_image_attn_metadata(self.transformer, latents, neg_prompt_embeds)
+        )
+
         for i, t in self._profile_denoise_steps(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             if do_cfg_parallel:
@@ -639,6 +650,7 @@ class QwenImagePipeline(BasePipeline):
                 )
                 noise_pred_local = self.transformer(
                     hidden_states=latents,
+                    attn_metadata=(attn_metadata_pos if cfg_rank == 0 else attn_metadata_neg),
                     timestep=timestep / 1000,
                     encoder_hidden_states_mask=local_mask,
                     encoder_hidden_states=local_embeds,
@@ -655,6 +667,7 @@ class QwenImagePipeline(BasePipeline):
                     self.transformer._cache_branch = None
                 noise_pred = self.transformer(
                     hidden_states=latents,
+                    attn_metadata=attn_metadata_pos,
                     timestep=timestep / 1000,
                     encoder_hidden_states_mask=prompt_embeds_mask,
                     encoder_hidden_states=prompt_embeds,
@@ -671,6 +684,7 @@ class QwenImagePipeline(BasePipeline):
                         self.transformer._cache_branch = "uncond"
                     neg_noise_pred = self.transformer(
                         hidden_states=latents,
+                        attn_metadata=attn_metadata_neg,
                         timestep=timestep / 1000,
                         encoder_hidden_states_mask=neg_prompt_embeds_mask,
                         encoder_hidden_states=neg_prompt_embeds,

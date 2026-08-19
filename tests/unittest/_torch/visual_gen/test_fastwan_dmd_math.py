@@ -86,7 +86,11 @@ class _RecordingTransformer:
     def parameters(self):
         yield self._dummy_param
 
-    def __call__(self, hidden_states, timestep, encoder_hidden_states):
+    def create_attn_metadata(self, **kwargs):
+        # Site names WanTransformer3DModel.forward expects; this fake needs no metadata.
+        return {"self": None, "cross_text": None}
+
+    def __call__(self, hidden_states, timestep, encoder_hidden_states, **kwargs):
         self.captured_timesteps.append(timestep.detach().clone())
         return torch.zeros_like(hidden_states)
 

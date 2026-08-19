@@ -87,6 +87,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     beam_width: int = 1
 
     @property
+    def is_cross_with_kv_cache(self) -> bool:
+        """Cross-attention whose K/V is read from a KV-cache pool.
+
+        thop uses ``is_cross`` flag to handle cross attention with kv cache
+        (``Q_CONTIGUOUS_KV`` / ``Q_PAGED_KV``, fed by ``cross_kv``), while
+        cross-attention with ``SEPARATE_QKV`` is handled without the flag.
+        """
+        return self.is_cross and self.kv_cache_manager is not None
+
+    @property
     def effective_beam_width(self) -> int:
         # Only use this for the fallback kernel's beam_width argument.
         # Cross-attention reads request-scoped encoder K/V that is written once
@@ -1906,7 +1916,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and metadata._seq_lens_cuda is not None):
             metadata.update_blackwell_first_sparse_mask_offset()
 
-        if metadata.is_cross:
+        # The ``cacheless`` (separate-QKV) cross attention does not need cross-
+        # attention specific handling
+        _cacheless_cross = (metadata.is_cross
+                            and metadata.kv_cache_manager is None
+                            and k is not None and v is not None)
+
+        if metadata.is_cross and not _cacheless_cross:
             if k is not None and v is not None:
                 k_flat = k.contiguous().view(k.shape[0], -1)
                 v_flat = v.contiguous().view(v.shape[0], -1)

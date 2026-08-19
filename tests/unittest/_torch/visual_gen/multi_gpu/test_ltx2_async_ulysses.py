@@ -39,10 +39,7 @@ try:
     import sys
     from pathlib import Path
 
-    from tensorrt_llm._torch.visual_gen.config import (
-        DiffusionModelConfig,
-        create_attention_metadata_state,
-    )
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
     # Spawn distributed workers via a helper that retries with a fresh master
@@ -166,9 +163,6 @@ def _make_model_config(
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
         cache=None,
-        attention_metadata_state=(
-            create_attention_metadata_state() if backend.upper() == "TRTLLM" else None
-        ),
         parallel=ParallelConfig(
             ulysses_size=ulysses_size,
             async_ulysses=async_ulysses,

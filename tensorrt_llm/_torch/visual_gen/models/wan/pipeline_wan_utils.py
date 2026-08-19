@@ -12,9 +12,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import torch
+
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+
+
+def wan_attn_metadata_kwargs(
+    model: Any,
+    *,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    encoder_hidden_states_image: Optional[torch.Tensor] = None,
+    batch_size: Optional[int] = None,
+) -> Dict[str, AttentionMetadata]:
+    """Name WAN's attention metadata sites for ``forward``.
+
+    Maps the site names from ``WanTransformer3DModel.create_attn_metadata()``
+    onto the ``attn_metadata_*`` keyword arguments of its ``forward``.
+    """
+    sites = model.create_attn_metadata(
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        encoder_hidden_states_image=encoder_hidden_states_image,
+        batch_size=batch_size,
+    )
+    kwargs = {
+        "attn_metadata_self": sites["self"],
+        "attn_metadata_cross_text": sites["cross_text"],
+    }
+    if "cross_image" in sites:
+        kwargs["attn_metadata_cross_image"] = sites["cross_image"]
+    return kwargs
 
 
 def retrieve_latents(

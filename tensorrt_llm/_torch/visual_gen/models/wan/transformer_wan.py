@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -7,11 +7,14 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
+from tensorrt_llm._torch.visual_gen.attention_backend.metadata import make_diffusion_attn_metadata
+from tensorrt_llm._torch.visual_gen.attention_backend.parallel import get_ulysses_seq_lens
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
@@ -349,6 +352,7 @@ class WanBlock(nn.Module):
             layer_idx=_layer_idx,
             module_name=f"blocks.{_layer_idx}.attn2",
             enable_sequence_parallel=False,
+            is_cross=True,
         )
 
         if cross_attn_norm:
@@ -516,8 +520,18 @@ class WanBlock(nn.Module):
         temb,
         freqs_cos,
         freqs_sin,
+        attn_metadata_self,
+        attn_metadata_cross_text,
+        attn_metadata_cross_image=None,
         timestep=None,
     ):
+        """WAN block forward.
+
+        WAN is a mixed-stream block: ``attn1`` self-attends over the video
+        sequence, while ``attn2`` cross-attends the same queries against the text
+        stream and (for I2V) the image stream, each with its own KV length. Each
+        site therefore gets its own metadata site rather than sharing one.
+        """
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, hidden_size
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -559,9 +573,13 @@ class WanBlock(nn.Module):
         # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
         # side stream; both paths return 3D [B, S, H*D].
         if self._use_async_ulysses:
-            attn1_out = self.attn1.forward_async(normed, freqs=freqs, timestep=timestep)
+            attn1_out = self.attn1.forward_async(
+                normed, attn_metadata_self, freqs=freqs, timestep=timestep
+            )
         else:
-            attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
+            attn1_out = self.attn1(
+                normed, attn_metadata_self, freqs=freqs, timestep=timestep, **attn1_kwargs
+            )
 
         x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
@@ -598,6 +616,7 @@ class WanBlock(nn.Module):
             q,
             k,
             v,
+            attn_metadata_cross_text,
             batch_size=batch_size,
             seq_len=seq_len,
             kv_seq_len=encoder_hidden_states_text.shape[1],
@@ -613,6 +632,7 @@ class WanBlock(nn.Module):
                 q,
                 key_img,
                 value_img,
+                attn_metadata_cross_image,
                 batch_size=batch_size,
                 seq_len=seq_len,
                 kv_seq_len=encoder_hidden_states_img.shape[1],
@@ -801,9 +821,81 @@ class WanTransformer3DModel(BaseDiffusionModel):
             .reshape(N, out_channels, T, H, W)
         )
 
+    #: Text context length WanBlock assumes when splitting a concatenated
+    #: image+text encoder state (see ``WanBlock.forward``).
+    TEXT_CONTEXT_LENGTH = 512
+
+    def video_seq_len(self, hidden_states: torch.Tensor) -> int:
+        """Number of video tokens after patch embedding."""
+        _, _, T, H, W = hidden_states.shape
+        pt, ph, pw = self.config.patch_size
+        return (T // pt) * (H // ph) * (W // pw)
+
+    def create_attn_metadata(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_image: Optional[torch.Tensor] = None,
+        batch_size: Optional[int] = None,
+    ) -> Dict[str, AttentionMetadata]:
+        """Attention metadata for this model's sites, one object per site.
+
+        WAN is a mixed-stream model with three attention sites and three different KV lengths:
+        ``self`` (video self-attention), ``cross_text`` (video queries against the text stream) and,
+        when the checkpoint supplies CLIP image embeddings (Wan 2.1 I2V), ``cross_image``.
+        """
+        metadata_cls = self.attn_backend_metadata_cls
+        vgm = self.model_config.visual_gen_mapping
+        if batch_size is None:
+            batch_size = encoder_hidden_states.shape[0]
+        # forward() shards the video sequence, so the blocks see this rank's share.
+        s_video = self.video_seq_len(hidden_states) // self.sharder.size
+        has_image = (
+            encoder_hidden_states_image is not None
+            and self.condition_embedder.image_embedder is not None
+        )
+
+        # Mirrors WanBlock.forward: with an image stream the encoder state is
+        # [image; text] and the text tail is a fixed length.
+        s_text = self.TEXT_CONTEXT_LENGTH if has_image else encoder_hidden_states.shape[1]
+
+        if not self.attn_requires_metadata:
+            return {
+                "self": None,
+                "cross_text": None,
+                **({"cross_image": None} if has_image else {}),
+            }
+
+        q_self, kv_self = get_ulysses_seq_lens(s_video, s_video, visual_gen_mapping=vgm)
+        sites = {
+            "self": make_diffusion_attn_metadata(
+                metadata_cls,
+                batch_size=batch_size,
+                q_seq_lens=q_self,
+                kv_seq_lens=None if kv_self == q_self else kv_self,
+            ),
+            "cross_text": make_diffusion_attn_metadata(
+                metadata_cls, batch_size=batch_size, q_seq_lens=s_video, kv_seq_lens=s_text
+            ),
+        }
+        if has_image:
+            # The image stream is projected by WanImageEmbedding, which preserves
+            # its sequence length, so the raw tensor's length is the KV length.
+            sites["cross_image"] = make_diffusion_attn_metadata(
+                metadata_cls,
+                batch_size=batch_size,
+                q_seq_lens=s_video,
+                kv_seq_lens=encoder_hidden_states_image.shape[1],
+            )
+        return sites
+
     def forward(
         self,
         hidden_states,
+        attn_metadata_self,
+        attn_metadata_cross_text,
+        attn_metadata_cross_image=None,
         timestep=None,
         encoder_hidden_states=None,
         encoder_hidden_states_image=None,
@@ -889,6 +981,9 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 temb_proj,
                 freqs_cos,
                 freqs_sin,
+                attn_metadata_self,
+                attn_metadata_cross_text,
+                attn_metadata_cross_image,
                 timestep=timestep,
             )
 

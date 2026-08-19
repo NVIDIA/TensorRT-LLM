@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from attn_metadata_utils import ltx2_attn_metadata
 from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
@@ -406,7 +407,12 @@ class TestLTX2AttentionBackend:
         print("[Attention Backend Test] Running VANILLA transformer forward...")
         with torch.no_grad():
             output_baseline = transformer_baseline(
-                video=video_input, audio=audio_input, text_cache=text_cache_baseline
+                video=video_input,
+                audio=audio_input,
+                text_cache=text_cache_baseline,
+                attn_metadata=ltx2_attn_metadata(
+                    transformer_baseline, video_input, audio_input, text_cache_baseline
+                ),
             )
         vout_baseline, aout_baseline = _extract_output(output_baseline)
         vout_baseline_cpu = vout_baseline.cpu() if vout_baseline is not None else None
@@ -430,7 +436,12 @@ class TestLTX2AttentionBackend:
         _, _, text_cache_trtllm = _get_ltx2_transformer_inputs(transformer_trtllm)
         with torch.no_grad():
             output_trtllm = transformer_trtllm(
-                video=video_input, audio=audio_input, text_cache=text_cache_trtllm
+                video=video_input,
+                audio=audio_input,
+                text_cache=text_cache_trtllm,
+                attn_metadata=ltx2_attn_metadata(
+                    transformer_trtllm, video_input, audio_input, text_cache_trtllm
+                ),
             )
         vout_trtllm, aout_trtllm = _extract_output(output_trtllm)
         vout_trtllm_cpu = vout_trtllm.cpu() if vout_trtllm is not None else None

@@ -16,8 +16,7 @@
 Visual Generation Attention Backend Utilities
 
 Factory functions for creating attention backends for visual generation models.
-Uses diffusion-specific wrappers (TrtllmAttention, VanillaAttention)
-that handle metadata preparation internally for simplified usage.
+Uses diffusion-specific wrappers (TrtllmAttention, VanillaAttention).
 """
 
 from typing import Optional, Type
@@ -81,17 +80,14 @@ def create_attention(
     num_kv_heads: Optional[int] = None,
     quant_config: Optional[QuantConfig] = None,
     dtype: Optional[torch.dtype] = None,
-    max_batch_size: int = 16,
-    max_seq_len: int = 4096,
     attention_config: Optional[AttentionConfig] = None,
-    attention_metadata_state: Optional[dict] = None,
     **kwargs,
 ) -> AttentionBackend:
     """
     Factory function to create attention backend instance for visual generation.
 
-    Creates diffusion-specific attention backends that handle metadata preparation
-    internally, simplifying the forward() call.
+    Creates diffusion-specific attention backends. The returned backend exposes a
+    ``Metadata`` class attribute naming the metadata type its ``forward`` expects.
 
     Args:
         backend: Backend identifier ("VANILLA", "TRTLLM", "FA4", "CUTEDSL")
@@ -101,14 +97,8 @@ def create_attention(
         num_kv_heads: Number of KV heads (for GQA/MQA, defaults to num_heads)
         quant_config: Optional quantization configuration
         dtype: Data type for the attention
-        max_batch_size: Initial batch size for metadata pre-allocation. The backend
-            will automatically reallocate if larger batches are encountered.
-        max_seq_len: Initial sequence length for metadata pre-allocation. The backend
-            will automatically reallocate if longer sequences are encountered.
         attention_config: Optional AttentionConfig used to select the attention algorithm and
             forward its quantization or sparsity configuration.
-        attention_metadata_state: Optional model-scoped metadata state from
-            visual-gen config. Required for TRTLLM backend.
         **kwargs: Additional backend-specific arguments
 
     Returns:
@@ -119,13 +109,6 @@ def create_attention(
     # Forward the validated quantization recipe to TRTLLM or the dense CuTe DSL FMHA backend.
     if attention_config is not None and attention_config.quant_attention_config is not None:
         kwargs["quant_attention_config"] = attention_config.quant_attention_config
-    if backend.upper() == "TRTLLM":
-        if attention_metadata_state is None:
-            raise ValueError(
-                "TRTLLM backend requires `attention_metadata_state` from "
-                "DiffusionModelConfig; creation path must not allocate metadata implicitly."
-            )
-        kwargs["attention_metadata_state"] = attention_metadata_state
     if backend.upper() == "CUTEDSL" and attention_config is not None:
         if (
             attention_config.sparse_attention_config is not None
@@ -143,7 +126,5 @@ def create_attention(
         num_kv_heads=num_kv_heads,
         quant_config=quant_config,
         dtype=dtype,
-        max_batch_size=max_batch_size,
-        max_seq_len=max_seq_len,
         **kwargs,
     )

@@ -42,7 +42,6 @@ try:
 
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
-    from tensorrt_llm._torch.visual_gen.config import create_attention_metadata_state
 
     # Spawn distributed workers via a helper that retries with a fresh master
     # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
@@ -53,7 +52,6 @@ try:
 
     MODULES_AVAILABLE = True
     ATTENTION_META_DICT = threading.local()
-    ATTENTION_META_DICT.metadata = create_attention_metadata_state()
 except ImportError:
     MODULES_AVAILABLE = False
 
@@ -149,7 +147,6 @@ def _logic_sage_ulysses_forward(rank, world_size, *, sage_attn_qk_int8: bool):
             k_block_size=blk_k,
             v_block_size=1,
         ),
-        attention_metadata_state=ATTENTION_META_DICT.metadata,
     )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
 
@@ -208,7 +205,6 @@ def _logic_sage_ulysses_vs_reference(
             k_block_size=sage_attn_num_elts_per_blk_k,
             v_block_size=1,
         ),
-        attention_metadata_state=ATTENTION_META_DICT.metadata,
     )
     attention = UlyssesAttention(inner_backend=inner, process_group=None)
 

@@ -26,6 +26,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 
 import pytest
 import torch
+from attn_metadata_utils import cosmos3_attn_metadata_kwargs
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
@@ -221,6 +222,7 @@ class TestCosmos3Unit:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
+                **cosmos3_attn_metadata_kwargs(model, hs, text_mask, video_shape),
                 timestep=ts / _NUM_TRAIN_TIMESTEPS,
                 raw_timestep=ts,
                 text_ids=text_ids,
@@ -239,6 +241,7 @@ class TestCosmos3Unit:
         with torch.inference_mode():
             out1 = model(
                 hidden_states=hs,
+                **cosmos3_attn_metadata_kwargs(model, hs, text_mask, video_shape),
                 timestep=ts / _NUM_TRAIN_TIMESTEPS,
                 raw_timestep=ts,
                 text_ids=text_ids,
@@ -247,6 +250,7 @@ class TestCosmos3Unit:
             )
             out2 = model(
                 hidden_states=hs,
+                **cosmos3_attn_metadata_kwargs(model, hs, text_mask, video_shape),
                 timestep=ts / _NUM_TRAIN_TIMESTEPS,
                 raw_timestep=ts,
                 text_ids=text_ids,
@@ -269,6 +273,7 @@ class TestCosmos3Unit:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
+                **cosmos3_attn_metadata_kwargs(model, hs, text_mask, video_shape),
                 timestep=ts / _NUM_TRAIN_TIMESTEPS,
                 raw_timestep=ts,
                 text_ids=text_ids,
@@ -344,6 +349,7 @@ class TestCosmos3Audio:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
+                **cosmos3_attn_metadata_kwargs(model, hs, text_mask, video_shape, audio_latents),
                 timestep=ts / _NUM_TRAIN_TIMESTEPS,
                 raw_timestep=ts,
                 text_ids=text_ids,
@@ -368,6 +374,7 @@ class TestCosmos3Audio:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
+                **cosmos3_attn_metadata_kwargs(model, hs, text_mask, video_shape),
                 timestep=ts / _NUM_TRAIN_TIMESTEPS,
                 raw_timestep=ts,
                 text_ids=text_ids,
@@ -389,6 +396,7 @@ class TestCosmos3Audio:
         with torch.inference_mode():
             out = model(
                 hidden_states=hs,
+                **cosmos3_attn_metadata_kwargs(model, hs, text_mask, video_shape, audio_latents),
                 timestep=ts / _NUM_TRAIN_TIMESTEPS,
                 raw_timestep=ts,
                 text_ids=text_ids,
@@ -431,6 +439,7 @@ class TestCosmos3TransformerCheckpoint:
         with torch.inference_mode():
             out = transformer(
                 hidden_states=hs,
+                **cosmos3_attn_metadata_kwargs(transformer, hs, text_mask, video_shape),
                 timestep=ts / _NUM_TRAIN_TIMESTEPS,
                 raw_timestep=ts,
                 text_ids=text_ids,
@@ -461,6 +470,7 @@ class TestCosmos3TransformerCheckpoint:
             with torch.inference_mode():
                 out = transformer(
                     hidden_states=hs,
+                    **cosmos3_attn_metadata_kwargs(transformer, hs, text_mask, video_shape),
                     timestep=ts / _NUM_TRAIN_TIMESTEPS,
                     raw_timestep=ts,
                     text_ids=text_ids,
