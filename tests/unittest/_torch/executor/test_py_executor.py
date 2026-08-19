@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 
 
 class MockPyExecutor:
@@ -1453,6 +1454,31 @@ def test_pad_dummy_allocation_failure_skips_padding():
 
     _run_pad(stub)
 
+    assert len(stub.active_requests) == 1
+    assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param({"return_value": None}, id="returns_none"),
+        pytest.param({"side_effect": OutOfPagesError("no pages")}, id="raises_out_of_pages"),
+    ],
+)
+def test_legacy_pad_dummy_allocation_failure_skips_padding(failure):
+    # Non-DSv4 disagg ranks take the legacy branch, where a KV-saturated
+    # rank still has to survive a refused dummy allocation. Crashing here
+    # kills the event-loop thread and hangs every peer in the can_queue
+    # allgather until the hang detector fires.
+    stub = _StubADPExecutor(enable_dsv4_adp_dummy_fixes=False)
+    stub.active_requests = [_make_adp_request(_STATE_DISAGG_GENERATION_INIT)]
+    stub.expected_num_active_requests = 1
+    stub.kv_cache_manager.add_dummy_requests.side_effect = None
+    stub.kv_cache_manager.add_dummy_requests.configure_mock(**failure)
+
+    _run_pad(stub)
+
+    assert stub.kv_cache_manager.add_dummy_requests.call_count == 1
     assert len(stub.active_requests) == 1
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 
