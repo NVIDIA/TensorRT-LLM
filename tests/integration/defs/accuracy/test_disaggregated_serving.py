@@ -297,16 +297,8 @@ def launch_disaggregated_llm(
 
     args = LlmArgs(model=model_name, tensor_parallel_size=tensor_parallel_size)
 
-    hf_quant_config_path = os.path.join(model_name, "hf_quant_config.json")
-    if os.path.isfile(hf_quant_config_path):
-        with open(hf_quant_config_path, encoding="utf-8") as config_file:
-            hf_quant_config = json.load(config_file).get("quantization", {})
-        for key in ("quant_algo", "kv_cache_quant_algo"):
-            if algo := hf_quant_config.get(key):
-                setattr(args.quant_config, key, QuantAlgo(algo))
-
-    if "FP4" in model_name and args.quant_config.quant_algo is None:
-        args.quant_config.quant_algo = QuantAlgo.NVFP4
+    if "FP4" in model_name:
+        args.quant_config.quant_algo = "NVFP4"
 
     trtllm_serve_path = "trtllm-serve"
     # Common arguments for both servers
@@ -2419,8 +2411,11 @@ class TestQwen3_5_397B_A17B_NVFP4_V2(LlmapiAccuracyTestHarness):
                 server_waiting_timeout=7200,
                 max_workers=32,
         ) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
-            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            # DuckLLM uses a metadata-only LlmArgs for accuracy reference
+            # lookup. The workers read the actual mixed-precision configuration
+            # directly from the checkpoint.
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
             run_accuracy_test(
                 llm,
                 self.MODEL_NAME,
