@@ -476,8 +476,8 @@ def _timed_checkpoint_weight_session(
     **kwargs: Any,
 ) -> Iterator[dict[str, Any]]:
     """Time synchronous session setup and teardown around materialization."""
-    session = _open_checkpoint_weight_session(checkpoint_loader,
-                                              checkpoint_dir, **kwargs)
+    session = _open_checkpoint_weight_session(checkpoint_loader, checkpoint_dir,
+                                              **kwargs)
     with timing_metric(checkpoint_preparation_metric_name, metrics):
         weights = session.__enter__()
     try:
@@ -1792,9 +1792,11 @@ class ModelLoader:
                                               model) -> None:
         """Keep loader-specific work alive through draft materialization."""
         with _timed_checkpoint_weight_session(
-                checkpoint_loader, self.spec_config.speculative_model,
-                self._metrics, ModelLoaderMetricNames.
-                DRAFT_CHECKPOINT_PREPARATION_SECONDS.value,
+                checkpoint_loader,
+                self.spec_config.speculative_model,
+                self._metrics,
+                ModelLoaderMetricNames.DRAFT_CHECKPOINT_PREPARATION_SECONDS.
+                value,
                 mapping=self.mapping) as weights:
             if model.draft_config is not None:
                 draft_model_arch = model.draft_config.pretrained_config.architectures[
@@ -1807,8 +1809,8 @@ class ModelLoader:
                 # MTP one-model + separate MTP checkpoint: no draft HF architecture.
                 draft_weight_mapper = self.weight_mapper
             with timing_metric(
-                    ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.value,
-                    self._metrics):
+                    ModelLoaderMetricNames.DRAFT_WEIGHT_POPULATION_SECONDS.
+                    value, self._metrics):
                 self._call_load_weights(model.load_draft_weights, weights,
                                         draft_weight_mapper)
                 if torch.cuda.is_available():  # CPU guard

@@ -262,6 +262,7 @@ def test_model_loader_session_spans_mapper_and_materialization() -> None:
     model = MagicMock()
     checkpoint_loader = _SessionCheckpointLoader(events)
     loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
     loader._call_load_weights = MagicMock(
         side_effect=lambda *_args, **_kwargs: events.append("materialize")
     )
@@ -280,6 +281,8 @@ def test_model_loader_session_spans_mapper_and_materialization() -> None:
         "materialize",
         "session_exit",
     ]
+    assert "checkpoint_preparation_seconds" in loader.metrics
+    assert "weight_population_seconds" in loader.metrics
 
 
 def test_draft_session_spans_mapper_and_materialization(
@@ -292,6 +295,7 @@ def test_draft_session_spans_mapper_and_materialization(
         pretrained_config=SimpleNamespace(architectures=["DraftForCausalLM"])
     )
     loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
     loader.spec_config = SimpleNamespace(speculative_model="/draft")
     loader.mapping = object()
     loader._call_load_weights = MagicMock(
@@ -311,6 +315,8 @@ def test_draft_session_spans_mapper_and_materialization(
         "materialize",
         "session_exit",
     ]
+    assert "draft_checkpoint_preparation_seconds" in loader.metrics
+    assert "draft_weight_population_seconds" in loader.metrics
 
 
 def test_mtp_draft_session_reuses_target_mapper_during_materialization() -> None:
@@ -319,6 +325,7 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization() -> None
     model = MagicMock()
     model.draft_config = None
     loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
     loader.spec_config = SimpleNamespace(speculative_model="/draft")
     loader.mapping = object()
     loader.weight_mapper = object()
@@ -330,3 +337,5 @@ def test_mtp_draft_session_reuses_target_mapper_during_materialization() -> None
 
     assert loader._call_load_weights.call_args.args[2] is loader.weight_mapper
     assert events == ["session_enter", "materialize", "session_exit"]
+    assert "draft_checkpoint_preparation_seconds" in loader.metrics
+    assert "draft_weight_population_seconds" in loader.metrics
