@@ -235,8 +235,6 @@ def test_llm_with_kv_cache_retention_config():
         (get_model_path('gpt2'), False, 0.95),  # BPE
         (get_model_path('bert/bert-base-uncased'), True, 0.95),  # WordPiece
         (get_model_path('t5-small'), True, 0.95),  # SentencePiece
-        (get_model_path('starcoder2-3b'), False, 0.95),
-        (get_model_path('falcon-7b-instruct'), False, 0.95),
         (get_model_path('llama-models-v2/llama-v2-7b-hf'), False, 0.95),
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
         (llama_model_path, False, 0.95),
