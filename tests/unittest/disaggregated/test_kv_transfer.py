@@ -1678,10 +1678,13 @@ def test_chunked_send_matches_monolithic(use_v2, request_len, chunk_blocks):
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("chunk_blocks", [1, 3])
 def test_chunked_send_with_sliding_window(chunk_blocks):
-    """Same equivalence for a windowed layer group.
+    """Same equivalence for a windowed layer group, at the transfer layer.
 
     SWA trims the source list to a resident suffix, so the chunk projection has
-    to intersect ranges rather than index from the front.
+    to intersect ranges rather than index from the front. The transceiver
+    currently refuses to pipeline a windowed model (the trimmed list need not
+    end at the chunk boundary, see KvCacheTransceiverV2), so this drives the
+    transfer layer directly and stands as the guard for enabling it later.
     """
     setup = create_transfer_worker_setup(
         ctx_tp=1,

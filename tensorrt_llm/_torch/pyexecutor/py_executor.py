@@ -5533,6 +5533,23 @@ class PyExecutor:
                 raise ValueError("Token ID out of range")
 
     def _validate_request(self, request: LlmRequest):
+        # At admission: raising from the send path would abort the worker instead.
+        # Only chunked context sends are affected, so a plain or generation-side
+        # request on a server that merely has the flag on is left alone.
+        disagg_params = request.py_disaggregated_params
+        if (self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.pipeline_transfer_enabled
+                and disagg_params is not None and request.llm_request_type
+                == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY):
+            if request.py_beam_width != 1:
+                raise ValueError(
+                    "enable_pipelined_transfer requires beam_width == 1, got "
+                    f"{request.py_beam_width}.")
+            if disagg_params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST:
+                raise ValueError(
+                    "enable_pipelined_transfer requires "
+                    "schedule_style='generation_first' on the request.")
+
         # Validate beam width
         sampling_config = request.sampling_config
         if sampling_config is not None:
@@ -6794,6 +6811,11 @@ class PyExecutor:
         for req in self.async_transfer_manager.requests_in_transfer().values():
             flag_if_kv_transfer_timed_out(req, "context")
 
+        # The transfer manager only tracks a request from its last chunk, so a
+        # stalled earlier chunk would otherwise be invisible until then.
+        for req in self.kv_cache_transceiver.pipelined_requests_in_transfer():
+            flag_if_kv_transfer_timed_out(req, "context")
+
         for req in self.active_requests:
             if req.is_disagg_generation_transmission_in_progress:
                 flag_if_kv_transfer_timed_out(req, "generation")
@@ -7473,13 +7495,18 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
 
         if self.kv_cache_transceiver:
-            # A cancel that could not finish leaves the request prefilling with
-            # an already-CANCELLED session; further chunks would only fail.
-            cancel_pending_ids = set(self.canceled_req_ids)
+            # An unfinished cancel leaves a CANCELLED session still prefilling.
+            cancel_pending_ids = set(getattr(self, "canceled_req_ids", ()))
             for req in scheduled_requests:
-                if req.is_context_only_request and (
-                        req.is_context_finished or req.is_finished_due_to_length
-                ) and not req.is_finished_due_to_cancellation:
+                if not req.is_context_only_request or req.is_finished_due_to_cancellation:
+                    continue
+                # Neither a further chunk nor the final one can land on a
+                # CANCELLED session; monolithic keeps its existing behaviour.
+                if (self.kv_cache_transceiver.pipeline_transfer_enabled
+                        and (req.py_request_id if not req.is_child else
+                             req.parent_request_id) in cancel_pending_ids):
+                    continue
+                if req.is_context_finished or req.is_finished_due_to_length:
                     # Forward is done for this request — release the
                     # IndexMapper slot so new requests can reuse it.
                     # KV blocks stay allocated for the upcoming transfer.
@@ -7491,18 +7518,20 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
-                    if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
+                    if (self.kv_cache_transceiver.kv_transfer_timeout_ms
+                            is not None
+                            and req.py_kv_transfer_start_time is None):
                         req.py_kv_transfer_start_time = time.monotonic()
-                elif (req.is_context_only_request
-                      and self.kv_cache_transceiver.pipeline_transfer_enabled
-                      and not req.is_finished_due_to_cancellation
-                      and req.state != LlmRequestState.GENERATION_COMPLETE
-                      and (req.py_request_id if not req.is_child else
-                           req.parent_request_id) not in cancel_pending_ids):
-                    # Ship the chunk that just finished so it overlaps the ones
-                    # still to be computed. GENERATION_COMPLETE means an error
-                    # path already freed the request, so its bounds are stale.
+                elif (self.kv_cache_transceiver.pipeline_transfer_enabled
+                      and req.state != LlmRequestState.GENERATION_COMPLETE):
+                    # Ship the finished chunk; GENERATION_COMPLETE means stale bounds.
                     self.kv_cache_transceiver.respond_and_send_async(req)
+                    # Start the clock here, not on the last chunk, or a chunk-0
+                    # stall stays invisible for the rest of the prefill.
+                    if (self.kv_cache_transceiver.kv_transfer_timeout_ms
+                            is not None
+                            and req.py_kv_transfer_start_time is None):
+                        req.py_kv_transfer_start_time = time.monotonic()
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:

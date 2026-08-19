@@ -58,6 +58,7 @@ def _make_response_handler_stub(active_requests, tp_allgather_result):
     executor.active_requests = list(active_requests)
     executor.perf_manager = Mock()
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
     executor._disagg_inflight_cancel_unsupported_logged = False
@@ -80,6 +81,7 @@ def _make_response_handler_stub(active_requests, tp_allgather_result):
 def test_flag_unset_short_circuits_before_capability_query(monkeypatch):
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor._disagg_inflight_cancel_unsupported_logged = False
     monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: False)
 
@@ -90,6 +92,7 @@ def test_flag_unset_short_circuits_before_capability_query(monkeypatch):
 def test_unsupported_transceiver_warns_once(monkeypatch):
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = False
     executor._disagg_inflight_cancel_unsupported_logged = False
     monkeypatch.setattr(executor_module, "is_disagg_inflight_cancel_enabled", lambda: True)
@@ -195,6 +198,7 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.async_transfer_manager = Mock()
@@ -222,6 +226,7 @@ def test_enabled_context_timeout_defers_cleanup_until_cpp_terminal_state(monkeyp
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor.kv_cache_transceiver.check_context_transfer_status.return_value = ([], [])
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
@@ -250,6 +255,7 @@ def test_context_transfer_error_keeps_request_active_until_all_owners_release():
     )
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor.active_requests = [request]
     executor.async_transfer_manager = Mock()
     executor.async_transfer_manager.end_transfer.return_value = True
@@ -298,6 +304,7 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
     executor.canceled_req_ids = [request.py_request_id]
     executor.waiting_queue = Mock()
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor.kv_cache_transceiver.cancel_request.return_value = True
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
     executor._disagg_inflight_cancel_unsupported_logged = False
@@ -324,6 +331,7 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
 def test_flag_unset_generation_driver_skips_cancel_pipeline():
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
     executor._disagg_inflight_cancel_unsupported_logged = False
     executor._check_disagg_gen_cache_transfer_status = Mock()
@@ -340,6 +348,7 @@ def test_flag_unset_generation_driver_skips_cancel_pipeline():
 def test_peer_buffer_poison_triggers_world_consistent_fatal_cleanup(monkeypatch):
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = Mock()
+    executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
     executor.kv_cache_transceiver.supports_inflight_request_cancellation.return_value = True
     executor.kv_cache_transceiver.has_poisoned_transfer_buffer.return_value = False
     executor._disagg_inflight_cancel_unsupported_logged = False

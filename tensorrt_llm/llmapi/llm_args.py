@@ -4325,12 +4325,6 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
 
-    enable_pipelined_transfer: bool = Field(
-        default=False,
-        description=
-        "Transfer each context chunk's KV cache as soon as that chunk's prefill finishes instead of waiting for the whole prompt, so transfer overlaps prefill and only the last chunk stays on the critical path. Requires the Python (v2) transceiver, enable_chunked_prefill=True, generation_first schedule style, and beam_width == 1."
-    )
-
     def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
         """Effective backend after resolving "DEFAULT" against legacy env vars.
 

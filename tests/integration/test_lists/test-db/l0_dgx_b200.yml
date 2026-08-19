@@ -17,6 +17,13 @@ l0_dgx_b200:
   tests:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
+  # --- Disaggregated pipelined KV transfer: one case per attention/cache shape.
+  # Chunk geometry and prefix reuse are covered byte-for-byte by the transfer
+  # tests in unittest/disaggregated/test_kv_transfer.py; these two only check
+  # that a real model comes out correct through the whole executor path.
+  # Timeouts are ~3x the measured 4.3 min (Llama) and 9.4 min (DeepSeek).
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[enable_block_reuse=True] TIMEOUT (15)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_pipelined_kv_transfer_nixl_python_accuracy[enable_block_reuse=True] TIMEOUT (30)
   # ------------- KV Cache V2 Scheduler IT (multi-GPU) ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens

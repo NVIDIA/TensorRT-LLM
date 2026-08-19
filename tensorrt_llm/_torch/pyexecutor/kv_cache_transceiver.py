@@ -241,6 +241,10 @@ class KvCacheTransceiver(ABC):
         """Whether each prefill chunk ships as soon as it is computed (v2 only)."""
         return False
 
+    def pipelined_requests_in_transfer(self) -> List[LlmRequest]:
+        """Context requests with a chunk in flight (pipelined transfer only)."""
+        return []
+
     def has_inflight_transfer(self, req: LlmRequest) -> bool:
         """Whether the fabric may still read this request's KV blocks.
 

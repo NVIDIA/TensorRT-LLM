@@ -44,7 +44,10 @@ class KVSlice:
     """A KV cache slice covering token_range = [start, end) of one request.
 
     Single-slice transfer uses [0, prompt_len) with is_last_slice=True;
-    multi-slice transfers split token_range and mark the last slice.
+    multi-slice transfers split token_range and mark the last slice. Both ends
+    are load-bearing for a split: start positions the slice in the request's
+    block space, so a sender that chunks must set it, and the receiver's
+    whole-prompt block list is narrowed to [start, end) before addressing.
 
     Per-layer token starts are NOT encoded in token_range — they are derived
     from block count by the sender:

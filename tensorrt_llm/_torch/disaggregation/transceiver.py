@@ -63,6 +63,10 @@ from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
+# Kill switch: the feature is on wherever it is supported, so this exists for
+# rollback and for A/B measurement.
+_DISABLE_PIPELINED_TRANSFER_ENV = "TRTLLM_DISABLE_PIPELINED_KV_TRANSFER"
+
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
     frequency_map = defaultdict(int)
@@ -101,8 +105,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if self._sender_future_timeout_ms is not None
             else None
         )
-        self._enable_pipelined_transfer = cache_transceiver_config.enable_pipelined_transfer
-        self._check_compatible(cache_transceiver_config)
+        self._check_compatible()
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
@@ -151,9 +154,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_sessions: Dict[int, TxSessionBase] = {}
         self._recv_sessions: Dict[int, RxSessionBase] = {}
         self._send_reqs = {}
+        # Chunks are in flight long before _finalize_send registers the request,
+        # so the timeout sweep would otherwise not see them at all.
+        self._pipelined_inflight: Dict[int, LlmRequest] = {}
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
+        try:
+            self._enable_pipelined_transfer = self._resolve_pipelined_transfer(
+                cache_transceiver_config
+            )
+        except ValueError:
+            # The transfer worker is already live by this point.
+            self._transfer_worker.shutdown()
+            raise
         # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
         # except under attention DP where the local count already is the total.
         self._kv_size_rank_factor = 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
@@ -343,9 +357,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         if scratch_blocks < block_ids.size
                         else np.array([], dtype=np.int64)
                     )
-                # Bound to the computed prefix, after scratch removal so a
-                # boundary-crossing allocation cannot displace initialized KV.
-                # No-op when the whole prompt is resident.
+                # Bound to the computed prefix, after scratch removal.
                 if resident_blocks < prompt_blocks and block_ids.size > resident_blocks:
                     block_ids = block_ids[:resident_blocks]
                 # Drop stale blocks the manager may still expose (V1 pre-eviction).
@@ -621,9 +633,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Scan sessions and return (completed_rids, failed_rids)."""
         completed, failed = [], []
         for rid, session in sessions.items():
-            # A pipelined session exists before its request is registered (that
-            # happens on the last slice); closing it now would drop the peer
-            # registration later chunks still need.
+            # Registration lands on the last slice; closing now strands later chunks.
             if rid not in reqs:
                 continue
             if session.is_completed():
@@ -700,6 +710,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Whether each prefill chunk is transferred as soon as it is computed."""
         return self._enable_pipelined_transfer
 
+    def pipelined_requests_in_transfer(self) -> List[LlmRequest]:
+        """Context requests with a chunk in flight, for timeout monitoring."""
+        # A cancelled or failed request leaves no last chunk, so drop whatever no
+        # longer has a session rather than growing without bound.
+        self._pipelined_inflight = {
+            rid: req for rid, req in self._pipelined_inflight.items() if rid in self._send_sessions
+        }
+        return list(self._pipelined_inflight.values())
+
     def has_inflight_transfer(self, req: LlmRequest) -> bool:
         """Whether the fabric may still read this request's KV blocks.
 
@@ -713,8 +732,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Slice for the prefill chunk that just finished, or None if it adds no block."""
         if req.py_beam_width != 1:
             raise ValueError("enable_pipelined_transfer requires beam_width == 1")
-        # Aux ships only with the last chunk, and generation_first is what makes
-        # aux required, so a session cannot report completion mid-prefill.
+        # generation_first makes aux required, which bars completion mid-prefill.
         if not self._need_aux_transfer(req):
             raise ValueError("enable_pipelined_transfer requires schedule_style=generation_first")
         tpb = self._reuse_adapter.tokens_per_block
@@ -722,20 +740,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
         is_last_chunk = req.context_remaining_length == 0
 
-        # A reuse hit starts chunk 0 at prepopulated_prompt_len, so nothing would
-        # cover [0, prepopulated); the first slice reaches back to block 0.
-        # py_last_context_chunk is pre-advance, is_first_context_chunk is not.
+        # A reuse hit leaves [0, prepopulated) uncovered, so slice 0 reaches back.
         is_first_chunk = chunk_start_pos == req.prepopulated_prompt_len
-        # Both ends round down, deferring a block that straddles the cut to the
-        # chunk that completes it; consecutive chunks then meet exactly and every
-        # block ships once. The last chunk rounds up for the final partial block.
+        # Both ends round down, deferring a straddling block to the chunk that
+        # completes it, so chunks meet exactly and every block ships once.
         chunk_start = 0 if is_first_chunk else min(chunk_start_pos // tpb, prompt_blocks)
         chunk_end = prompt_blocks if is_last_chunk else min(chunk_end_pos // tpb, prompt_blocks)
         if chunk_end <= chunk_start:
-            return None
+            if not is_last_chunk:
+                return None
+            # Degenerate (empty prompt): still emit a last slice, or the session
+            # never finalizes and aux never ships.
+            return self._create_kv_slice(req)
 
-        # Bound the source at the chunk end: V1 reserves the whole prompt up
-        # front, so uncomputed pages would otherwise look current.
+        # V1 reserves the whole prompt, so bound the source at the chunk end.
         base = self._create_kv_slice(req, resident_block_end=chunk_end)
         return KVSlice(
             is_last_slice=is_last_chunk,
@@ -744,17 +762,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 for ids in base.block_ids_per_layer_groups
             ],
             mamba_state_index=base.mamba_state_index,
-            # Token starts are derived from block count relative to
-            # token_range.end, so a chunk just narrows the range.
+            # Token starts derive from block count, so a chunk narrows the range.
             token_range=TokenRange(start=chunk_start * tpb, end=chunk_end * tpb),
         )
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
         self._ever_had_send_session = True
-        # Restamped per chunk, so this times the last chunk only; the earlier
-        # ones overlap prefill and are off the critical path.
-        req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         session = self._get_or_create_send_session(req)
         if self._enable_pipelined_transfer and req.is_context_only_request:
             kv_slice = self._build_prefill_chunk(req)
@@ -762,12 +776,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 return
         else:
             kv_slice = self._create_kv_slice(req)
+        # Restamped per chunk, so this times the last one; earlier ones overlap.
+        req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
+        rid = get_unique_rid(req)
         if kv_slice.is_last_slice:
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        else:
+            self._pipelined_inflight[rid] = req
         session.send(kv_slice)
         if kv_slice.is_last_slice:
-            # Aux goes out only here, which is what keeps is_completed() false
-            # until the last chunk is sent.
+            self._pipelined_inflight.pop(rid, None)
+            # Aux goes out only here, keeping is_completed() false until then.
             self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
@@ -880,8 +899,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
         for rid in cancelled:
+            # close() frees KV pages, so honour cancel_request()'s mid-write guard.
+            if self._send_sessions[rid].has_transferring_tasks():
+                continue
             self._send_sessions[rid].close()
-            del self._send_reqs[rid]
+            self._send_reqs.pop(rid, None)
             del self._send_sessions[rid]
 
         for rid in completed:
@@ -1129,33 +1151,44 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._wait_reqs[rid].state = LlmRequestState.CONTEXT_INIT
             del self._wait_reqs[rid]
 
-    def _check_compatible(self, cache_transceiver_config: CacheTransceiverConfig):
+    def _check_compatible(self):
         if self._mapping.cp_size != 1:
             raise ValueError(
                 f"KvCacheTransceiverV2: _check_compatible: only support context parallelism is 1: "
                 f"cp_size: {self._mapping.cp_size}"
             )
-        if not self._enable_pipelined_transfer:
-            return
-        # Layers are split across PP ranks, so a chunk would need cutting and
-        # rejoining per rank; the sender assumes it owns the whole block range.
+
+    def _resolve_pipelined_transfer(self, cfg: CacheTransceiverConfig) -> bool:
+        """Whether this rank can pipeline chunk transfers.
+
+        On wherever it is supported. Why it is off is always logged, since a
+        silently inactive feature is indistinguishable from a broken one.
+        Without chunked prefill a request yields a single slice, which addresses
+        exactly as an unpipelined transfer, so that needs no check here.
+        """
+        if os.getenv(_DISABLE_PIPELINED_TRANSFER_ENV) == "1":
+            logger.info(f"{_DISABLE_PIPELINED_TRANSFER_ENV}=1: pipelined transfer off")
+            return False
+        blockers = []
+        # Layers split across PP ranks; the sender assumes it owns every block.
         if self._mapping.pp_size != 1:
-            raise ValueError(
-                "enable_pipelined_transfer requires pipeline_parallel_size == 1 on the "
-                f"context server, got pp_size={self._mapping.pp_size}"
-            )
-        # Bounce stages a whole request per slice, which breaks once one request
-        # emits many slices against a single receiver task.
-        if cache_transceiver_config.kv_cache_bounce_size_mb != 0:
-            raise ValueError(
-                "enable_pipelined_transfer requires kv_cache_bounce_size_mb == 0, got "
-                f"{cache_transceiver_config.kv_cache_bounce_size_mb}"
-            )
+            blockers.append(f"pipeline_parallel_size={self._mapping.pp_size}")
+        # Bounce stages a whole request per slice; many slices break that.
+        if cfg.kv_cache_bounce_size_mb != 0:
+            blockers.append(f"kv_cache_bounce_size_mb={cfg.kv_cache_bounce_size_mb}")
         # Recurrent state is whole-sequence, so there is nothing partial to send.
         if isinstance(self._kv_cache_manager, (MambaHybridCacheManager, MambaHybridCacheManagerV2)):
-            raise ValueError(
-                "enable_pipelined_transfer does not support Mamba/hybrid cache managers"
-            )
+            blockers.append("a Mamba/hybrid cache manager")
+        # A windowed list is tail-trimmed, so the chunk projection cannot assume
+        # it ends at the chunk boundary; uncomputed pages get misaddressed.
+        if any(
+            getattr(lg, "sliding_window_size", None) is not None
+            for lg in self._page_table.layer_groups
+        ):
+            blockers.append("sliding-window attention")
+        if blockers:
+            logger.info("pipelined transfer off: " + "; ".join(blockers))
+        return not blockers
 
     def commit_blocks_for_reuse(self, req) -> None:
         self._reuse_adapter.commit_blocks_for_reuse(req)
