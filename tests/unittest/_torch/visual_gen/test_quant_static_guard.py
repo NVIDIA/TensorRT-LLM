@@ -17,8 +17,6 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-pytestmark = pytest.mark.cpu_only
-
 
 class _StubLinear:
     """Records load_weights calls; quant_algo resolves via the loader's global config."""
