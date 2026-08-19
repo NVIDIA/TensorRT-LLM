@@ -48,14 +48,17 @@ class DeepEPLowLatency(Communication):
     Sourced from SWITCH_HIDDEN_FOR_EXTENSION_KERNELS in extension_kernels.cu.
     """
 
-    MAX_TOP_K: int = 9
-    """int: Compile-time top-k cap of the low-latency kernels.
+    MAX_TOP_K: int = 16
+    """int: Compile-time top-k cap of the base low-latency kernels.
 
     ``kNumMaxTopK``/``kNumMaxTopk`` in internode_ll.cu (dispatch and combine)
     size per-thread register arrays with it and guard it with
     ``EP_HOST_ASSERT(num_topk <= kNumMaxTopK)`` — a larger top_k aborts on the
     first dispatch/combine, so selection must reject it up front.
     """
+
+    MAX_TOP_K_EXTENSION: int = 9
+    """int: Compile-time top-k cap of the extension kernels (kNumMaxTopK in extension_kernels.cu)."""
 
     def __init__(
         self,
@@ -167,6 +170,19 @@ class DeepEPLowLatency(Communication):
         if self.hidden_size not in self.SUPPORTED_HIDDEN_SIZES_EXTENSION:
             return False
         return self._has_nvfp4() or self._has_fp8_qdq() or self._has_w4afp8()
+
+    @classmethod
+    def max_top_k_for(cls, quant_config: QuantConfig, use_low_precision_combine: bool) -> int:
+        """Top-k cap for the kernels this configuration reaches.
+
+        Only nvfp4 post-quant dispatch and low-precision combine use the
+        extension kernels; every other path uses the base kernels.
+        """
+        if use_low_precision_combine or (
+            quant_config is not None and quant_config.layer_quant_mode.has_nvfp4()
+        ):
+            return cls.MAX_TOP_K_EXTENSION
+        return cls.MAX_TOP_K
 
     def is_workload_feasible(self, all_rank_num_tokens: List[int], num_chunks: int) -> bool:
         """
