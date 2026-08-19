@@ -25,6 +25,7 @@ python models/cosmos3_ti2v.py --prompt "A robot arm picks fruit in a grocery sto
 python models/qwen_image.py
 python models/qwen_image_layered.py --image /path/to/image.png
 python models/qwen_image_edit.py --image /path/to/source.png --prompt "Make the image look like a watercolor painting"
+python models/glm_image.py
 python models/hunyuan_t2v.py
 
 # With engine config (quant, parallelism, etc.)
