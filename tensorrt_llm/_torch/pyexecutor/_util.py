@@ -1047,10 +1047,13 @@ class KvCacheCreator:
             logger.info(
                 "KV cache size estimation is not supported for context parallelism, disable it."
             )
-            if self._is_kv_cache_manager_v2:
+            if (self._is_kv_cache_manager_v2
+                    and self._mapping.cp_config.get('cp_type') == CpType.HELIX):
                 # Promote like the encoder-decoder case so build_managers
                 # runs configure_kv_cache_capacity(), which sets the quota
                 # KVCacheManagerV2 requires at construction (V1 stays local).
+                # HELIX only: configure_kv_cache_capacity has no sizing path
+                # for other CP types and would hit its assertion.
                 self._skip_est = True
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
@@ -1101,16 +1104,24 @@ class KvCacheCreator:
         Quotas are GLOBAL tokens (rank-local budget x cp_size); the manager
         min-syncs across ranks.
         """
+        if (self._kv_cache_config.max_tokens is not None
+                and self._kv_cache_config.max_tokens <= 0):
+            raise ValueError(
+                "Helix CP: kv_cache_config.max_tokens must be positive when "
+                f"set, got {self._kv_cache_config.max_tokens}.")
         if (self._kv_cache_config.max_gpu_total_bytes or 0) > 0 or \
-                self._kv_cache_config.max_tokens:
+                (self._kv_cache_config.max_tokens or 0) > 0:
             logger.info("Helix CP: skipping KV cache capacity profiling; using "
                         "the explicitly configured quota.")
             return
         fraction = self._kv_cache_config.free_gpu_memory_fraction
         free_mem, _total = torch.cuda.mem_get_info()
         cost = self._get_kv_size_per_token()
-        local_tokens = cost.tokens_for_budget(int(free_mem * fraction))
-        max_tokens = int(local_tokens) * self._mapping.cp_size
+        # Floor to whole physical pages: a ledger block allocates one full
+        # page on every CP rank, so a partial trailing page is never usable.
+        local_tokens = (int(cost.tokens_for_budget(int(free_mem * fraction))) //
+                        self._tokens_per_block * self._tokens_per_block)
+        max_tokens = local_tokens * self._mapping.cp_size
         if max_tokens <= 0:
             raise ValueError(
                 "Helix CP: fraction-based KV sizing found no usable free "

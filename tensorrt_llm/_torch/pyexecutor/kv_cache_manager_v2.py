@@ -1486,6 +1486,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
         tokens = self._get_max_tokens_from_quota_impl(quota)
         if self._has_cp_helix and not math.isinf(tokens):
+            # Floor to whole physical pages before scaling: a ledger block
+            # allocates one full page on every CP rank, so a partial
+            # trailing page in the rank-local budget is never usable.
+            tokens = int(tokens) // self.tokens_per_block * self.tokens_per_block
             tokens *= self._helix_cp_size
         return tokens
 
@@ -1525,7 +1529,11 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         """Token capacity (GLOBAL tokens under helix) -> rank-local byte quota."""
         if self._has_cp_helix:
-            max_tokens = -(-int(max_tokens) // self._helix_cp_size)
+            # Round up to whole ledger blocks first: allocation is page-
+            # granular on every rank, so a request of N global tokens costs
+            # ceil(N / ledger_tpb) full physical pages per rank.
+            blocks = -(-int(max_tokens) // self._ledger_tokens_per_block)
+            max_tokens = blocks * self.tokens_per_block
         return self._get_quota_from_max_tokens_impl(max_tokens)
 
     def _get_quota_from_max_tokens_impl(self, max_tokens: int) -> int:
@@ -2202,6 +2210,17 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_num_available_tokens(
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0
     ) -> int:
+        """Clamp ``token_num_upper_bound`` to the allocatable token capacity.
+
+        Unit note: under helix the backend runs on the ledger
+        ``tokens_per_block``, so the returned capacity (like
+        ``token_num_upper_bound`` and ``max_seq_len``) is in GLOBAL ledger
+        tokens - the coordinate request lengths are expressed in. Callers
+        that additionally bound the result by per-forward budgets (e.g.
+        ``max_num_tokens``) stay consistent because a helix context forward
+        replicates all tokens on every rank, so both bounds constrain the
+        same request-length variable.
+        """
         extra_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
@@ -2481,11 +2500,13 @@ class KVCacheManagerV2(BaseResourceManager):
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
-        assert not (self._has_cp_helix and not req.is_dummy_request), (
-            "resize_context is not helix-aware: its rank-local chunk target "
-            "would under-size the global ledger. Helix requests are "
-            "disagg-generation-only and must never take the context path."
-        )
+        if self._has_cp_helix and not req.is_dummy_request:
+            raise ValueError(
+                "resize_context is not helix-aware: its rank-local chunk "
+                "target would under-size the global ledger. Helix requests "
+                "are disagg-generation-only and must never take the context "
+                "path."
+            )
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False

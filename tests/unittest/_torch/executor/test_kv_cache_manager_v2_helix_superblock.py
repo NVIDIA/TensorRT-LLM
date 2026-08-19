@@ -30,7 +30,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 
 
-def _mgr(cp_rank, cp_size, phys):
+def _mgr(cp_rank: int, cp_size: int, phys: int) -> SimpleNamespace:
     m = SimpleNamespace(
         tokens_per_block=phys,
         _ledger_tokens_per_block=phys * cp_size,
@@ -42,12 +42,12 @@ def _mgr(cp_rank, cp_size, phys):
     return m
 
 
-def _brute_local_len(global_len, cp_rank, cp_size, phys):
+def _brute_local_len(global_len: int, cp_rank: int, cp_size: int, phys: int) -> int:
     """Reference: token position p lives on rank (p // phys) % cp_size."""
     return sum(1 for p in range(global_len) if (p // phys) % cp_size == cp_rank)
 
 
-def test_helix_local_len_matches_brute_force():
+def test_helix_local_len_matches_brute_force() -> None:
     for cp_size in (1, 2, 4, 8):
         for phys in (2, 4, 32):
             for cp_rank in range(cp_size):
@@ -58,7 +58,7 @@ def test_helix_local_len_matches_brute_force():
                     ), (cp_size, phys, cp_rank, global_len)
 
 
-def test_set_helix_rank_fields_cross_rank_consistency():
+def test_set_helix_rank_fields_cross_rank_consistency() -> None:
     """For any (prompt_len, decoding_iter): exactly one active rank, the
     per-rank seqlens sum to the global in-flight length, and past_seen
     (= seqlen - 0/1 per the model_engine convention) sums to the global
@@ -87,7 +87,7 @@ def test_set_helix_rank_fields_cross_rank_consistency():
                 assert past_seen[r] >= 0
 
 
-def test_ledger_is_rank_invariant():
+def test_ledger_is_rank_invariant() -> None:
     """The whole point of the super-block design: nothing the scheduler or
     ledger consumes depends on cp_rank — only the derived per-rank fields
     do. Verify the derivation never touches ledger quantities by checking
@@ -104,28 +104,37 @@ def test_ledger_is_rank_invariant():
     assert max(lens) - min(lens) <= phys
 
 
-def test_quota_converters_scale_by_cp():
+def test_quota_converters_scale_by_cp() -> None:
     m = SimpleNamespace(
         _has_cp_helix=True,
         _helix_cp_size=4,
+        tokens_per_block=32,
+        _ledger_tokens_per_block=128,
         _get_max_tokens_from_quota_impl=lambda quota: 100.0,
         _get_quota_from_max_tokens_impl=lambda tokens: tokens * 7,
     )
-    # Rank-local byte quota buys 100 physical tokens -> 400 global tokens.
-    assert KVCacheManagerV2._get_max_tokens_from_quota(m, 12345) == 400.0
+    # Rank-local byte quota buys 100 physical tokens, but only 96 (= 3 whole
+    # 32-token pages) are allocatable -> 384 global ledger tokens, not 400.
+    assert KVCacheManagerV2._get_max_tokens_from_quota(m, 12345) == 384.0
     # inf (all-SWA) passes through unscaled.
     m_inf = SimpleNamespace(
         _has_cp_helix=True,
         _helix_cp_size=4,
+        tokens_per_block=32,
+        _ledger_tokens_per_block=128,
         _get_max_tokens_from_quota_impl=lambda quota: float("inf"),
     )
     assert math.isinf(KVCacheManagerV2._get_max_tokens_from_quota(m_inf, 1))
-    # Global tokens -> per-rank physical tokens (ceil) -> bytes.
-    assert KVCacheManagerV2._get_quota_from_max_tokens(m, 401) == 101 * 7
-    # cp == 1 (non-helix) is the identity.
+    # Global tokens -> whole ledger blocks (ceil) -> per-rank physical pages
+    # -> bytes: 401 global tokens need ceil(401/128) = 4 ledger blocks =
+    # 4 * 32 = 128 physical tokens per rank (not ceil(401/4) = 101).
+    assert KVCacheManagerV2._get_quota_from_max_tokens(m, 401) == 128 * 7
+    # cp == 1 (non-helix) is the identity: no page rounding is applied.
     m1 = SimpleNamespace(
         _has_cp_helix=False,
         _helix_cp_size=1,
+        tokens_per_block=32,
+        _ledger_tokens_per_block=32,
         _get_max_tokens_from_quota_impl=lambda quota: 100.0,
         _get_quota_from_max_tokens_impl=lambda tokens: tokens * 7,
     )
@@ -133,7 +142,7 @@ def test_quota_converters_scale_by_cp():
     assert KVCacheManagerV2._get_quota_from_max_tokens(m1, 400) == 2800
 
 
-def test_update_resources_leaves_history_untouched_under_helix():
+def test_update_resources_leaves_history_untouched_under_helix() -> None:
     resizes = []
 
     kv = SimpleNamespace(
@@ -167,9 +176,10 @@ def test_update_resources_leaves_history_untouched_under_helix():
     assert resizes == [(100, 54)]
 
 
-def test_helix_quota_fallback_emits_global_tokens(monkeypatch):
+def test_helix_quota_fallback_emits_global_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     """Creator fallback: the rank-local byte budget buys N physical tokens,
-    i.e. N * cp_size global (super-block ledger) tokens."""
+    floored to whole pages, i.e. (N // page) * page * cp_size global
+    (super-block ledger) tokens."""
     import torch
 
     from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
@@ -177,6 +187,7 @@ def test_helix_quota_fallback_emits_global_tokens(monkeypatch):
     def creator(max_gpu_total_bytes, max_tokens):
         return SimpleNamespace(
             _mapping=SimpleNamespace(cp_size=4),
+            _tokens_per_block=32,
             _kv_cache_config=SimpleNamespace(
                 max_gpu_total_bytes=max_gpu_total_bytes,
                 max_tokens=max_tokens,
@@ -191,26 +202,34 @@ def test_helix_quota_fallback_emits_global_tokens(monkeypatch):
     c = creator(1 << 30, None)
     assert KvCacheCreator._configure_helix_kv_cache_capacity(c) is None
     assert c._kv_cache_config.max_tokens is None
-    # No quota: (1e6 * 0.5 - 8000) // 1000 = 492 physical -> 1968 global.
+    # Explicit but non-positive max_tokens: rejected, not silently replaced
+    # by fraction sizing.
+    with pytest.raises(ValueError, match="must be positive"):
+        KvCacheCreator._configure_helix_kv_cache_capacity(creator(0, 0))
+    # No quota: (1e6 * 0.5 - 8000) // 1000 = 492 physical tokens, floored to
+    # whole 32-token pages = 480 (a ledger block needs one full page on
+    # every rank) -> 1920 global.
     c = creator(0, None)
     assert KvCacheCreator._configure_helix_kv_cache_capacity(c) is None
-    assert c._kv_cache_config.max_tokens == 492 * 4
+    assert c._kv_cache_config.max_tokens == 480 * 4
     # Degenerate free memory: actionable error instead of a deep assert.
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (0, 2_000_000))
     with pytest.raises(ValueError, match="free memory"):
         KvCacheCreator._configure_helix_kv_cache_capacity(creator(0, None))
 
 
-def test_estimation_prepare_promotes_skip_est_for_v2():
+def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     """Helix disables estimation; with a V2 manager it must also promote
-    _skip_est so build_managers() calls configure_kv_cache_capacity()."""
+    _skip_est so build_managers() calls configure_kv_cache_capacity().
+    Other CP types must NOT be promoted: configure_kv_cache_capacity has no
+    sizing path for them."""
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
     from tensorrt_llm.mapping import CpType
 
-    def creator(is_v2):
+    def creator(is_v2, cp_type=CpType.HELIX):
         return SimpleNamespace(
             _skip_est=False,
-            _mapping=SimpleNamespace(cp_config={"cp_type": CpType.HELIX}),
+            _mapping=SimpleNamespace(cp_config={"cp_type": cp_type}),
             _is_kv_cache_manager_v2=is_v2,
             _model_engine=SimpleNamespace(
                 model=SimpleNamespace(
@@ -225,17 +244,19 @@ def test_estimation_prepare_promotes_skip_est_for_v2():
     c = creator(is_v2=False)
     assert KvCacheCreator.try_prepare_estimation(c) is False
     assert c._skip_est is False
+    c = creator(is_v2=True, cp_type=CpType.ULYSSES)
+    assert KvCacheCreator.try_prepare_estimation(c) is False
+    assert c._skip_est is False
 
 
-def test_scheduler_allocation_failure_raises_under_helix():
+def test_scheduler_allocation_failure_raises_under_helix() -> None:
     """Precedent-consistent no-evict stance: allocation failure under helix
     raises instead of entering the (unvalidated-under-helix) eviction path."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
     sched = SimpleNamespace(
-        kv_cache_manager=SimpleNamespace(
-            _has_cp_helix=True, try_allocate_generation=lambda req: False
-        ),
+        has_cp_helix=True,
+        kv_cache_manager=SimpleNamespace(try_allocate_generation=lambda req: False),
     )
     req = SimpleNamespace(
         py_request_id=7,
@@ -256,7 +277,7 @@ def test_scheduler_allocation_failure_raises_under_helix():
         )
 
 
-def test_dummy_frozen_fields_sum_invariant():
+def test_dummy_frozen_fields_sum_invariant() -> None:
     """The frozen dummy fiction (last rank active, shared synthetic global
     length) keeps the same books as real requests: per-rank lengths sum to
     the synthetic global length."""
