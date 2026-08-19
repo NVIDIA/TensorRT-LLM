@@ -896,7 +896,7 @@ class TestProcessTelemetrySession:
                 termination_kind="signal",
                 component="server",
             ),
-            lifecycle_phase="shutdown",
+            lifecycle_phase="unknown",
         )
 
         session = usage_lib._get_session()
@@ -1024,7 +1024,7 @@ class TestProcessTelemetrySession:
                     component="llm",
                     exit_code_known=False,
                 ),
-                lifecycle_phase="shutdown",
+                lifecycle_phase="serving",
                 telemetry_config=telemetry_config,
             )
             second = usage_lib.report_exit(
@@ -1033,7 +1033,7 @@ class TestProcessTelemetrySession:
                     component="llm",
                     exit_code_known=False,
                 ),
-                lifecycle_phase="shutdown",
+                lifecycle_phase="serving",
                 telemetry_config=telemetry_config,
             )
 
