@@ -37,6 +37,7 @@ prove they are actually being enforced:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -253,7 +254,11 @@ class KimiKDAReference(nn.Module):
         )
         self.f_a_proj = nn.Linear(hidden_size, head_dim, bias=False)
         self.f_b_proj = nn.Linear(head_dim, projection_size, bias=False)
-        self.dt_bias = nn.Parameter(torch.empty(projection_size, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(
+            torch.empty(projection_size, dtype=torch.float32).uniform_(
+                math.log(1e-3), math.log(1e-1)
+            )
+        )
         self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
 
         if use_full_rank_gate:
