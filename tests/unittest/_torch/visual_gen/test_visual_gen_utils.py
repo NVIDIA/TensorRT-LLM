@@ -12,6 +12,8 @@ table plus the field-by-field overlay contract.
 from __future__ import annotations
 
 import base64
+import os
+import pickle
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -1005,3 +1007,80 @@ class TestResolveReference:
 
         with pytest.raises(ValueError, match="unsupported reference format"):
             _resolve_reference("a.png", "filepath")
+
+
+# =============================================================================
+# reference transport (coordinator -> rank0)
+# =============================================================================
+
+
+class TestReferenceHandleTransport:
+    """References cross the coordinator -> rank0 hop as shared-memory handles.
+
+    The payload must survive the round trip byte-identically and must not ride
+    the request pickle, which is the whole point of the handle.
+    """
+
+    @staticmethod
+    def _request(*payloads: bytes):
+        from tensorrt_llm._torch.visual_gen import DiffusionRequest
+        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
+
+        params = VisualGenParams(
+            image_reference=[MediaRef(content=p, format="bytes") for p in payloads]
+        )
+        return DiffusionRequest(request_id=1, prompt=["x"], params=params)
+
+    def test_round_trip_is_byte_identical(self):
+        payloads = (b"\x89PNG\r\n\x1a\n" + os.urandom(4096), os.urandom(1024))
+        req = self._request(*payloads)
+
+        req.refs_to_handles()
+        req.refs_to_bytes()
+
+        assert tuple(r.content for r in req.params.image_reference) == payloads
+        assert all(r.format == "bytes" for r in req.params.image_reference)
+
+    def test_payload_leaves_the_request_pickle(self):
+        """The handle is the transport, so the bytes must not also be pickled —
+        otherwise the hop still pays for a full copy of every reference."""
+        payload = os.urandom(256 * 1024)
+        req = self._request(payload)
+        before = len(pickle.dumps(req))
+
+        req.refs_to_handles()
+        after = len(pickle.dumps(req))
+
+        assert after < before - len(payload) // 2
+        assert payload not in pickle.dumps(req)
+
+    def test_survives_a_real_pickle_round_trip(self):
+        """A handle is only useful if it still resolves after being serialized
+        and rebuilt, which is what the IPC queue does to it."""
+        payload = os.urandom(8192)
+        req = self._request(payload)
+        req.refs_to_handles()
+
+        received = pickle.loads(pickle.dumps(req))
+        received.refs_to_bytes()
+
+        assert received.params.image_reference[0].content == payload
+
+    def test_no_references_costs_nothing(self):
+        """T2V/T2I requests carry no handle, so the hop is untouched for them."""
+        from tensorrt_llm._torch.visual_gen import DiffusionRequest
+        from tensorrt_llm.visual_gen import VisualGenParams
+
+        req = DiffusionRequest(request_id=1, prompt=["x"], params=VisualGenParams())
+        req.refs_to_handles()
+        assert req.ref_handles is None
+
+    def test_restore_is_idempotent(self):
+        """rank0 restores unconditionally; a second call must not re-consume a
+        handle that has already been resolved."""
+        payload = os.urandom(2048)
+        req = self._request(payload)
+        req.refs_to_handles()
+        req.refs_to_bytes()
+        req.refs_to_bytes()
+        assert req.params.image_reference[0].content == payload

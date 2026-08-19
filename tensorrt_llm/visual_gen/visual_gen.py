@@ -449,6 +449,10 @@ class VisualGen:
             prompt=prompt,
             params=resolved_params,
         )
+        # Hand the reference payloads to rank0 through shared memory instead of
+        # through the request pickle, which copies every reference byte to
+        # cross one process boundary.
+        request.refs_to_handles()
 
         self.executor.enqueue_requests([request])
         return VisualGenResult(req_id, self.executor, batch_size=batch_size)

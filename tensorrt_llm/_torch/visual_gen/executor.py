@@ -15,6 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
 
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -257,6 +258,41 @@ class DiffusionRequest:
     prompt: List[str]
     params: Optional["VisualGenParams"] = None
     prepared_inputs: Dict[str, Any] = field(default_factory=dict, repr=False)
+    # Set only between the two ends of the coordinator -> rank0 hop; see
+    # ``refs_to_handles``.
+    ref_handles: Optional[List[Dict[str, Any]]] = field(default=None, repr=False)
+
+    def refs_to_handles(self) -> None:
+        """Move reference payloads into shared memory, in place (producer side).
+
+        Only the coordinator -> rank0 hop travels as handles: rank0 restores the
+        bytes before broadcasting, because a shared-tensor handle is consumed
+        exactly once and minting one for N ranks would free the block N-1 times.
+        """
+        if self.params is None:
+            return
+        handles = []
+        for slot in ("image_reference", "video_reference", "audio_reference"):
+            for index, ref in enumerate(getattr(self.params, slot, None) or []):
+                # bytearray() because the shared storage must be writable.
+                buffer = torch.frombuffer(bytearray(ref.content), dtype=torch.uint8)
+                handles.append(
+                    {
+                        "slot": slot,
+                        "index": index,
+                        "handle": SharedTensorContainer.from_tensor(buffer).dump_to_dict(),
+                    }
+                )
+                ref.content = b""
+        self.ref_handles = handles or None
+
+    def refs_to_bytes(self) -> None:
+        """Restore reference payloads from shared memory, in place (consumer side)."""
+        for entry in self.ref_handles or []:
+            ref = getattr(self.params, entry["slot"])[entry["index"]]
+            container = SharedTensorContainer.from_dict(entry["handle"])
+            ref.content = container.get_local_view().numpy().tobytes()
+        self.ref_handles = None
 
 
 @dataclass
@@ -396,6 +432,8 @@ class DiffusionExecutor:
             req = None
             if self.rank == 0:
                 req = self.requests_ipc.get()
+                if req is not None:
+                    req.refs_to_bytes()
                 logger.info(f"Worker {self.device_id}: Request available")
 
             # Broadcast to all ranks. ``req.params.seed`` is already a
