@@ -68,15 +68,14 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.fused_moe import (
     CutlassFusedMoE,
     DeepSeekV4MoeRoutingMethod,
-    MoE,
     MoEWeightLoadingMode,
     TritonFusedMoE,
     TRTLLMGenFusedMoE,
     create_moe,
-    get_moe_cls,
+    is_moe_weight_owner,
+    resolve_moe_cls,
 )
 from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -1095,7 +1094,7 @@ class DeepseekV4WeightLoader:
                         },
                     )
                     module.load_weights(weights=[module_weights])
-                elif names[-1] == "backend" and isinstance(module, MoE):
+                elif names[-1] == "backend" and is_moe_weight_owner(module):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
                     # After MoE refactoring, ConfigurableMoE now has a backend submodule,
@@ -1504,10 +1503,22 @@ class DeepseekV4MoE(nn.Module):
         moe_swiglu_limit = None
         if swiglu_limit is not None:
             # `create_moe` only accepts swiglu_limit for these MoE classes;
-            # resolve via get_moe_cls so backend-string fallbacks (e.g.
-            # TRTLLM/CUTEDSL/DENSEGEMM dropping back to CutlassFusedMoE on
-            # unsupported quant) are handled correctly.
-            moe_cls = get_moe_cls(model_config, override_quant_config=experts_quant_config)
+            # ask the resolver rather than the backend string so that a
+            # degradation (e.g. TRTLLM/CUTEDSL/DENSEGEMM dropping back to
+            # CutlassFusedMoE on unsupported quant) is accounted for here too.
+            moe_cls = resolve_moe_cls(
+                model_config,
+                override_quant_config=experts_quant_config,
+                dtype=dtype,
+                # Same routing object as create_moe below.
+                routing=self.gate.routing_method,
+                # create_moe below passes no bias and no swiglu alpha/beta, so
+                # it resolves with the plain SwiGLU package. Say so here too:
+                # leaving this unknown lets gates abstain that create_moe
+                # rejects, and the two calls would pick different backends.
+                swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
+            )
             supports_swiglu_limit = moe_cls in (
                 CutlassFusedMoE,
                 TritonFusedMoE,
@@ -1685,7 +1696,6 @@ class DeepseekV4MoE(nn.Module):
             output_dtype=hidden_states.dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             use_dp_padding=use_dp_padding,
-            **({"alltoall_result_do_sum": False} if isinstance(self.experts, WideEPMoE) else {}),
         )
 
         return routed_output
@@ -2547,6 +2557,19 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
     ) -> Literal["V2"]:
         """Prefer KV cache manager V2 for DeepSeek-V4."""
         return "V2"
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["PYTHON"]:
+        """Prefer the Python transceiver in disaggregated serving.
+
+        DeepSeek-V4 runs DeepseekV4CacheManager, a KVCacheManagerV2
+        subclass that the C++ transceiver cannot drive; the disaggregated
+        tests pin NIXL + PYTHON for the same reason. This routes the
+        fully-'auto' path to that combination.
+        """
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         model_config = _normalize_deepseek_v4_nvfp4_mixed_precision_config(model_config)

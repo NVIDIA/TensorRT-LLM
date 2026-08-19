@@ -422,6 +422,30 @@ def _parse_injection_schedule(raw_injections: list[Any]) -> list[_InjectionSpec]
     return specs
 
 
+def _worker_id_pid(worker_id: str) -> Optional[int]:
+    """Extract the pid a cluster worker embedded in its worker id.
+
+    DisaggClusterWorker builds the id as
+    ``{role}-{host}:{port}-{time_ms}-{pid}-{rand}``. Only the last two fields
+    are fixed-width in structure, so the pid is read from the tail: a substring
+    search for ``-{pid}-`` would also match inside a host name that contains a
+    dash-delimited digit run, such as ``node-1234-a``.
+
+    Args:
+        worker_id: The ``worker_id`` reported by ``/cluster_info``.
+
+    Returns:
+        The pid, or None if the id does not have the expected shape.
+    """
+    fields = worker_id.rsplit("-", 2)
+    if len(fields) != 3:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
 def _resolve_injection_target(target: str, tracked: list[_TrackedWorker]) -> _TrackedWorker:
     """Map a YAML target string to a tracked worker.
 
@@ -1865,13 +1889,15 @@ class DisaggCancellationStressHarness:
 
         Args:
             tracked: Worker to relaunch.
-            timeout_s: Maximum seconds to wait for HTTP 200 on ``/health``.
+            timeout_s: Total budget for the respawn, covering both the
+                cluster registration that reveals the worker's port and
+                the subsequent wait for HTTP 200 on ``/health``.
 
         Returns:
             True if the respawned worker reports healthy within the
             deadline; False otherwise.
         """
-        from disagg_test_utils import _run_worker, get_free_port
+        from disagg_test_utils import _run_worker
 
         spec = tracked.spec
         old = tracked.wrapper
@@ -1884,40 +1910,132 @@ class DisaggCancellationStressHarness:
 
         role_key = "ctx" if spec.role == "ctx" else "gen"
         save_log = spec.log_path is not None
-        new_port = get_free_port()
+        deadline = time.monotonic() + timeout_s
+        # port=0 lets the respawned worker bind an OS-assigned port inside its
+        # own process and register it with the cluster. Pre-picking a port here
+        # would race whoever grabs it between the probe and the child's rebind.
         try:
             new_wrapper = _run_worker(
                 spec.model_name,
                 spec.worker_config,
                 role_key,
-                port=new_port,
+                port=0,
                 work_dir=spec.work_dir,
                 device=spec.device,
                 save_log=save_log,
                 env=spec.env,
+                # Without this the respawn writes ctx_0/gen_0 filenames, so
+                # respawning worker N truncates worker 0's log out from under
+                # the log scanner. setup_disagg_cluster already passes it.
+                worker_index=spec.index,
             )
         except Exception:
-            logger.exception(
-                "[injector] failed to respawn %s_%d on port %d",
-                spec.role,
-                spec.index,
-                new_port,
-            )
+            logger.exception("[injector] failed to respawn %s_%d", spec.role, spec.index)
             return False
         tracked.wrapper = new_wrapper
-        spec.port = new_wrapper.port
+        # _teardown_cluster terminates the wrapper lists held in self._cluster,
+        # not self._tracked_workers, so the respawn has to replace its slot
+        # there or it survives teardown and keeps holding its GPUs. Done before
+        # the port wait below, so a respawn that never registers is cleaned up
+        # too. spec.index is per-role (see _make_worker_launch_spec callers).
+        if self._cluster is not None:
+            _, ctx_workers, gen_workers, *_ = self._cluster
+            workers = ctx_workers if spec.role == "ctx" else gen_workers
+            workers[spec.index] = new_wrapper
         if new_wrapper.log_path is not None:
             spec.log_path = new_wrapper.log_path
+
+        new_port = self._await_registered_worker_port(
+            role_key,
+            new_wrapper.process.pid,
+            deadline=deadline,
+        )
+        if new_port is None:
+            logger.error(
+                "[injector] respawned %s_%d (pid %d) never registered a port with the cluster",
+                spec.role,
+                spec.index,
+                new_wrapper.process.pid,
+            )
+            return False
+        spec.port = new_port
+        new_wrapper.port = new_port
 
         logger.info(
             "[injector] respawned %s_%d on port %s; waiting up to %.0fs for /health",
             spec.role,
             spec.index,
-            new_wrapper.port,
-            timeout_s,
+            new_port,
+            max(0.0, deadline - time.monotonic()),
         )
 
-        return self._wait_for_worker_health(new_wrapper.port, timeout_s=timeout_s)
+        return self._wait_for_worker_health(
+            new_port, timeout_s=max(0.0, deadline - time.monotonic())
+        )
+
+    def _await_registered_worker_port(
+        self, role_key: str, pid: int, *, deadline: float
+    ) -> Optional[int]:
+        """Poll ``/cluster_info`` for the port a respawned worker registered.
+
+        A worker launched with ``port=0`` only knows its port after it binds,
+        so the cluster registry is the sole authoritative source. Entries are
+        matched on the worker's pid, which ``WorkerInfo.worker_id`` embeds --
+        matching on "a port we have not seen before" would be ambiguous while
+        the SIGKILLed worker's stale registration is still being reaped. See
+        ``_worker_id_pid`` for why the pid is parsed rather than substring-matched.
+
+        Args:
+            role_key: ``"ctx"`` or ``"gen"``.
+            pid: Pid of the respawned ``trtllm-serve`` process.
+            deadline: ``time.monotonic()`` value to give up at.
+
+        Returns:
+            The registered port, or None if it did not appear in time.
+        """
+        if not self._server_url:
+            logger.error("[injector] no server URL bound; cannot resolve respawned worker port")
+            return None
+
+        info_key = "context_servers" if role_key == "ctx" else "generation_servers"
+        seen_worker_ids: list[str] = []
+        while time.monotonic() < deadline:
+            if self.stop_event.is_set() or self.failed_event.is_set():
+                return None
+            try:
+                request_timeout = min(5.0, max(0.1, deadline - time.monotonic()))
+                with urllib.request.urlopen(
+                    f"{self._server_url}/cluster_info", timeout=request_timeout
+                ) as response:
+                    info = json.loads(response.read().decode("utf-8", errors="replace"))
+                seen_worker_ids = []
+                for worker_info in (info.get("current_workers") or {}).get(info_key) or []:
+                    if not isinstance(worker_info, dict):
+                        continue
+                    worker_id = str(worker_info.get("worker_id", ""))
+                    seen_worker_ids.append(worker_id)
+                    if _worker_id_pid(worker_id) != pid:
+                        continue
+                    try:
+                        return int(worker_info["port"])
+                    except (KeyError, TypeError, ValueError):
+                        logger.warning(
+                            "[injector] cluster_info %s entry for pid %d has invalid port %r",
+                            info_key,
+                            pid,
+                            worker_info.get("port"),
+                        )
+            except (json.JSONDecodeError, TimeoutError, OSError, urllib.error.URLError) as exc:
+                logger.debug("[injector] cluster_info poll failed: %s", exc)
+            self.stop_event.wait(timeout=min(1.0, max(0.0, deadline - time.monotonic())))
+
+        logger.warning(
+            "[injector] no %s worker matching pid %d in cluster_info; last saw %s",
+            info_key,
+            pid,
+            seen_worker_ids,
+        )
+        return None
 
     def _wait_for_worker_health(self, port: int, *, timeout_s: float) -> bool:
         """Poll a worker's ``/health`` endpoint until healthy or timed out."""

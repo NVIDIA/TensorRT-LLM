@@ -34,7 +34,7 @@ The PyTorch backend provides LoRA support, allowing you to:
 
 ```python
 from tensorrt_llm import LLM
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -159,7 +159,7 @@ LoRA can be applied to the routed-expert projections of a Mixture-of-Experts (Mo
 
 ```python
 from tensorrt_llm import LLM
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
 
 lora_config = LoraConfig(
     lora_target_modules=[

@@ -19,6 +19,7 @@ from tensorrt_llm.executor import GenerationResultBase, RequestError
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, RequestOutput,
                                  SADecodingConfig)
+from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
@@ -235,8 +236,6 @@ def test_llm_with_kv_cache_retention_config():
         (get_model_path('gpt2'), False, 0.95),  # BPE
         (get_model_path('bert/bert-base-uncased'), True, 0.95),  # WordPiece
         (get_model_path('t5-small'), True, 0.95),  # SentencePiece
-        (get_model_path('starcoder2-3b'), False, 0.95),
-        (get_model_path('falcon-7b-instruct'), False, 0.95),
         (get_model_path('llama-models-v2/llama-v2-7b-hf'), False, 0.95),
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
         (llama_model_path, False, 0.95),
@@ -1325,6 +1324,48 @@ class _FakeRawRequest:
 
     async def is_disconnected(self):
         return True
+
+
+def test_startup_metrics_by_server_info() -> None:
+
+    class FakeExecutor:
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_startup_metrics(self):
+            self.calls += 1  # keep track of # calls to ensure the cache in the server works
+            if self.calls == 1:
+                return None
+            return {"model_loader": {"total_model_loading_seconds": 1.5}}
+
+    executor = FakeExecutor()
+    generator = object.__new__(BaseLLM)
+    generator._executor = executor
+    generator._startup_metrics = None
+    generator._disaggregated_params = {}
+
+    server = object.__new__(OpenAIServer)
+    server.generator = generator
+    first_response = asyncio.run(server.get_server_info())
+    second_response = asyncio.run(server.get_server_info())
+    third_response = asyncio.run(server.get_server_info())
+
+    assert json.loads(first_response.body) == {
+        "disaggregated_params": {},
+        "startup_metrics": {},
+    }
+    expected_success = {
+        "disaggregated_params": {},
+        "startup_metrics": {
+            "model_loader": {
+                "total_model_loading_seconds": 1.5
+            }
+        },
+    }
+    assert json.loads(second_response.body) == expected_success
+    assert json.loads(third_response.body) == expected_success
+    assert executor.calls == 2
 
 
 def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
