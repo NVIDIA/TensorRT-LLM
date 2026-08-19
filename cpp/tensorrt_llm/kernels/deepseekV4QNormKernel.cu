@@ -88,6 +88,14 @@ struct Vec2Traits<__nv_bfloat16>
     }
 };
 
+template <typename T>
+__device__ __forceinline__ float2 normalizeAndRoundToInput(float2 value, float normScale)
+{
+    float2 const normalized{value.x * normScale, value.y * normScale};
+    auto const rounded = Vec2Traits<T>::fromFloat2(normalized);
+    return Vec2Traits<T>::toFloat2(rounded);
+}
+
 __device__ __forceinline__ float warpReduceSum(float value)
 {
     for (int mask = kWarpSize / 2; mask > 0; mask >>= 1)
@@ -274,7 +282,11 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
 
     sumSquares = warpReduceSum(sumSquares);
     float const normScale = rsqrtf(sumSquares / static_cast<float>(kHeadDim) + eps);
-    float const fp8Scale = normScale * quantScale;
+
+    // Preserve the legacy two-kernel precision contract: RMSNorm stores T
+    // (bf16 or half), then the quantization/RoPE kernel reloads T before the
+    // FP8 conversion. Skipping this round changes enough FP8 codes to regress
+    // DeepSeek-V4 model accuracy.
 
     // Position depends on the token, which every lane of the warp shares, so this is
     // warp-uniform and hoisted out of the store loop.
@@ -335,7 +347,8 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
                 for (int j = 0; j < kPairsPerVec; ++j)
                 {
                     float2 const v = Vec2Traits<T>::toFloat2(srcPairs[j]);
-                    out.pairs[j] = __nv_fp8x2_e4m3(float2{v.x * fp8Scale, v.y * fp8Scale});
+                    float2 const normalized = normalizeAndRoundToInput<T>(v, normScale);
+                    out.pairs[j] = __nv_fp8x2_e4m3(float2{normalized.x * quantScale, normalized.y * quantScale});
                 }
                 *reinterpret_cast<typename Fp8VecStore<kEltsPerVec>::Type*>(nopeOut + vecIdx * kEltsPerVec)
                     = out.packed;
@@ -349,7 +362,7 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
                 for (int j = 0; j < kPairsPerVec; ++j)
                 {
                     float2 const v = Vec2Traits<T>::toFloat2(srcPairs[j]);
-                    float2 const normalized{v.x * normScale, v.y * normScale};
+                    float2 const normalized = normalizeAndRoundToInput<T>(v, normScale);
                     float2 const coef = cos_sin_cache[static_cast<int64_t>(kRopeDim) * positionId + ropePairBase + j];
                     float2 const rotated{
                         coef.x * normalized.x - coef.y * normalized.y, coef.x * normalized.y + coef.y * normalized.x};
@@ -377,7 +390,8 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
         for (int i = 0; i < kPairsPerLane - 1; ++i)
         {
             int const pairIdx = i * kWarpSize + laneId;
-            float2 const scaled{values[i].x * fp8Scale, values[i].y * fp8Scale};
+            float2 const normalized = normalizeAndRoundToInput<T>(values[i], normScale);
+            float2 const scaled{normalized.x * quantScale, normalized.y * quantScale};
             nopeOutPair[pairIdx] = __nv_fp8x2_e4m3(scaled);
         }
 
@@ -386,7 +400,7 @@ __global__ void deepseekV4QNormFusedKernel(T const* __restrict__ input, __nv_fp8
             constexpr int i = kPairsPerLane - 1;
             int const pairIdx = i * kWarpSize + laneId;   // in [kNopePairs, kPairsPerRow)
             int const ropePairIdx = pairIdx - kNopePairs; // in [0, kRopeDim/2)
-            float2 const normalized{values[i].x * normScale, values[i].y * normScale};
+            float2 const normalized = normalizeAndRoundToInput<T>(values[i], normScale);
             if constexpr (kFuseRope)
             {
                 float2 const coef = cos_sin_cache[static_cast<int64_t>(kRopeDim) * positionId + ropePairIdx];
