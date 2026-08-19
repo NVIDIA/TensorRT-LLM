@@ -65,13 +65,12 @@ def _make_attention_pair(
     optimized = KimiKDALinearAttention(cfg, layer_idx=0).to("cuda")
     with torch.no_grad():
         optimized.dt_bias.zero_()
-    reference = KimiKDAReference(**common, use_optimized_decode=False).to("cuda")
+    reference = KimiKDAReference(**common).to("cuda")
     reference.load_state_dict(optimized.state_dict())
     if finalize_decode_weights:
         optimized.finalize_decode_weights()
 
     assert get_production_decode_kernel_path(optimized) == "optimized"
-    assert reference.decode_kernel_path == "fla"
     return optimized, reference
 
 

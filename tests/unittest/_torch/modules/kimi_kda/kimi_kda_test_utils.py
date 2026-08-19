@@ -1,14 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Test-only Kimi KDA parity façade.
+"""FLA-only Kimi KDA parity reference.
 
 This is a structural mirror of the HF reference ``KimiDeltaAttention`` in
 ``modeling_kimi.py``. Same parameter names, same layer shapes, same short
 convolution + FLA gating + FusedRMSNormGated output-gate stack. The
-delta-rule inner loop is routed through :mod:`_kda_kernels`, which selects
-the optimized sm_100 CuTe/Triton chunked prefill and fused CUDA decode
-kernels on Blackwell and falls back to the FLA references elsewhere. Production
-executor code must use ``tensorrt_llm._torch.modules.kimi_kda.KimiKDALinearAttention``.
+delta-rule inner loop calls FLA directly so optimized production kernels
+are always compared against an independent implementation. Production code
+must use ``tensorrt_llm._torch.modules.kimi_kda.KimiKDALinearAttention``.
 
 Cache ownership
 ---------------
@@ -16,23 +15,9 @@ KDA carries three short-convolution states (``conv_state_{q,k,v}``, HF
 layout ``[B, D, W]`` bf16) and one delta-rule recurrent state
 (``recurrent_state``, layout ``[B, HV, V, K]`` fp32, matching the optimized
 kernel's transposed convention). These match the hybrid-cache ownership
-pattern used by the mamba modules; the runtime cache-manager plumbing
-(``AttentionMetadata`` split, cache indices, spec/verify path) is deferred
-to the model-assembly wiring goal. This module exposes parity entry points
-that consume and return the state tensors directly so module-level tests
-can prove state roundtrip without the runtime plumbing.
-
-Kernel mutations for negative controls
---------------------------------------
-Two invariants have their own construction switches so parity tests can
-prove they are actually being enforced:
-
-* ``gate_lower_bound_override`` — replace the ``linear_attn_config``
-  gate lower bound at forward time. A value that disagrees with the HF
-  reference must fail parity.
-* ``wrong_state_layout`` — permute the recurrent state's V/K axes before
-  and after the decode kernel call so read/write hit mislabeled slots.
-  Because K == V the shape check still passes but the numerics break.
+pattern used by the mamba modules. The reference consumes and returns state
+tensors directly so module-level tests can prove state roundtrip without
+runtime cache-manager plumbing.
 """
 
 from __future__ import annotations
@@ -44,10 +29,9 @@ from typing import Optional, Tuple
 import torch
 from einops import rearrange
 from fla.modules import FusedRMSNormGated, ShortConvolution
-from fla.ops.kda import fused_recurrent_kda
+from fla.ops.kda import chunk_kda, fused_recurrent_kda
 from torch import nn
 
-from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
 
 
@@ -119,57 +103,8 @@ class KimiKDATestCachedState:
     recurrent_state: Optional[torch.Tensor]
 
 
-class KimiKDAKernelPath:
-    """Enum-like string tags for the selected KDA kernel path."""
-
-    OPTIMIZED = "optimized"
-    FLA = "fla"
-
-
-def _hf_conv_to_kernel_conv(
-    hf_cache: Optional[torch.Tensor],
-    b: int,
-    d: int,
-    w: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """HF ``[B, D, W]`` conv cache -> optimized kernel's ``[B, D, W-1]``.
-
-    HF stores W positions with the newest processed token last. The
-    optimized decode kernel's ``cs_*`` argument stores the ``W-1``
-    historical positions before the incoming token; drop the oldest column.
-    """
-    if hf_cache is None:
-        return torch.zeros(b, d, w - 1, device=device, dtype=dtype)
-    return hf_cache[:, :, 1:].contiguous()
-
-
-def _roll_hf_conv(
-    prev_hf: Optional[torch.Tensor],
-    x_new_col: torch.Tensor,
-    b: int,
-    d: int,
-    w: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Roll an HF-layout conv cache by one token.
-
-    HF ``ShortConvolution.step`` does
-    ``cache.copy_(cache.roll(shifts=-1, dims=-1)); cache[:, :, -1] = x``.
-    We implement the same semantics via ``torch.cat`` so the update is
-    independent of the kernel's internal cs handling.
-    """
-    if prev_hf is None:
-        prev = torch.zeros(b, d, w, device=device, dtype=dtype)
-    else:
-        prev = prev_hf.to(dtype=dtype)
-    return torch.cat([prev[:, :, 1:], x_new_col.to(dtype)], dim=-1).contiguous()
-
-
 class KimiKDAReference(nn.Module):
-    """Standalone Kimi K3 linear-attention parity façade.
+    """Standalone FLA Kimi K3 linear-attention parity reference.
 
     Parameters
     ----------
@@ -182,17 +117,6 @@ class KimiKDAReference(nn.Module):
     rms_norm_eps : float
     dtype : Optional[torch.dtype]
     layer_idx : int
-    use_optimized_prefill : bool
-        Enable the optimized prefill path when supported.
-    use_optimized_decode : bool
-        Enable the optimized decode path when supported.
-    gate_lower_bound_override : Optional[float]
-        Override the ``linear_attn_config`` gate lower bound. Test knob for
-        the "wrong gate lower bound" mutation control.
-    wrong_state_layout : bool
-        Swap the V and K axes of the recurrent state around the decode
-        kernel call. Test knob for the "wrong state layout" mutation
-        control on the decode path.
     """
 
     def __init__(
@@ -207,10 +131,6 @@ class KimiKDAReference(nn.Module):
         rms_norm_eps: float = 1e-5,
         dtype: Optional[torch.dtype] = None,
         layer_idx: int = 0,
-        use_optimized_prefill: bool = True,
-        use_optimized_decode: bool = True,
-        gate_lower_bound_override: Optional[float] = None,
-        wrong_state_layout: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -223,8 +143,6 @@ class KimiKDAReference(nn.Module):
         self.gate_lower_bound = gate_lower_bound
         self.rms_norm_eps = rms_norm_eps
         self.layer_idx = layer_idx
-        self.gate_lower_bound_override = gate_lower_bound_override
-        self.wrong_state_layout = wrong_state_layout
 
         projection_k_size = self.head_k_dim * self.num_k_heads
         projection_size = self.head_dim * self.num_heads
@@ -270,36 +188,8 @@ class KimiKDAReference(nn.Module):
         self.o_norm = _MetaSafeFusedRMSNormGated(head_dim, eps=rms_norm_eps, activation="sigmoid")
         self.o_proj = nn.Linear(projection_size, hidden_size, bias=False)
 
-        # Installed together by the FP8 weight loader (fused [q | k | v | g]
-        # decode GEMM). Declared here so the decode path never sees a
-        # half-installed pair.
-        self.qkvg_proj: Optional[nn.Module] = None
-        self.qkvg_split_sizes: Optional[list[int]] = None
-
         if dtype is not None:
             _meta_safe_cast_dtype(self, dtype)
-
-        # The optimized decode/verify kernels are specialized for the Kimi
-        # K3 shape (K == V == 128). Reduced-dim test configurations must
-        # fall back to FLA instead of hard-failing inside the kernels.
-        kernel_shape_ok = self.head_k_dim == 128 and self.head_dim == 128
-        self._dispatch = KDAKernelDispatch(
-            use_optimized_prefill=use_optimized_prefill,
-            use_optimized_decode=use_optimized_decode and kernel_shape_ok,
-            use_optimized_verify=kernel_shape_ok,
-        )
-
-    # ------------------------------------------------------------------
-    # Introspection helpers used by the test smoke.
-    # ------------------------------------------------------------------
-
-    @property
-    def prefill_kernel_path(self) -> str:
-        return self._dispatch.prefill_kernel_path
-
-    @property
-    def decode_kernel_path(self) -> str:
-        return self._dispatch.decode_kernel_path
 
     # ------------------------------------------------------------------
     # Prefill entry (Goal 2.1 pass path).
@@ -357,15 +247,11 @@ class KimiKDAReference(nn.Module):
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
-        lower_bound = (
-            self.gate_lower_bound_override
-            if self.gate_lower_bound_override is not None
-            else self.gate_lower_bound
-        )
+        lower_bound = self.gate_lower_bound
         safe_gate = lower_bound is not None
         scale = self.head_k_dim**-0.5
 
-        o, _final_state = self._dispatch.prefill_chunk_kda(
+        o, _final_state = chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -375,10 +261,14 @@ class KimiKDAReference(nn.Module):
             dt_bias=self.dt_bias,
             scale=scale,
             initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
+            state_v_first=True,
             cu_seqlens=cu_seqlens,
-            chunk_size=64,
         )
 
         if self.use_full_rank_gate:
@@ -392,220 +282,19 @@ class KimiKDAReference(nn.Module):
         o = self.o_proj(o)
         return o
 
-    # ------------------------------------------------------------------
-    # Decode entry (Goal 2.1 pass path).
-    # ------------------------------------------------------------------
-
     def forward_decode(
         self,
         hidden_states: torch.Tensor,
         cache: Optional[KimiKDATestCachedState] = None,
-        ssm_state_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, KimiKDATestCachedState]:
-        """T=1 cached-decode forward. Returns ``(o, new_cache)``.
+        """Run the FLA T=1 cached-decode reference.
 
         ``hidden_states`` shape ``(B, 1, hidden_size)``. Cache is
         ``KimiKDATestCachedState`` in HF layout; ``None`` fields become zero
         tensors.
         """
-        b, q_len, _ = hidden_states.shape
+        _, q_len, _ = hidden_states.shape
         assert q_len == 1, f"KimiKDAReference.forward_decode expects T=1, got T={q_len}"
-
-        if self._dispatch.decode_kernel_path == KimiKDAKernelPath.OPTIMIZED:
-            return self._decode_via_optimized(hidden_states, cache, b, ssm_state_indices)
-        if ssm_state_indices is not None:
-            raise ValueError("ssm_state_indices requires the optimized KDA decode kernel")
-        return self._decode_via_fla(hidden_states, cache, b)
-
-    # ------------------------------------------------------------------
-    # Internals — optimized decode dispatch.
-    # ------------------------------------------------------------------
-
-    def _decode_via_optimized(
-        self,
-        hidden_states: torch.Tensor,
-        cache: Optional[KimiKDATestCachedState],
-        b: int,
-        ssm_state_indices: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, KimiKDATestCachedState]:
-        dev = hidden_states.device
-        H = self.num_heads
-        HV = self.num_heads
-        K_dim = self.head_dim
-        V_dim = self.head_dim
-        W = self.conv_size
-
-        projection_size = H * K_dim
-        projection_v_size = HV * V_dim
-
-        # q/k/v and the full-rank output gate all read this same normed hidden.
-        # When their weights are read at FP8 block-scale (Blackwell decode), the
-        # loader fuses them into one ``qkvg_proj`` GEMM: one activation quant and
-        # one GEMM launch replace four, which is what the launch-bound
-        # generation step needs. The split is output-identical to the per
-        # projection GEMMs (same activation, same weight slices). The forget
-        # gate (f_a/f_b), beta and low-rank output gate stay BF16, so they keep
-        # their own calls.
-        fused_qkvg = self.qkvg_proj if self.qkvg_split_sizes is not None else None
-        if fused_qkvg is not None:
-            parts = fused_qkvg(hidden_states).split(self.qkvg_split_sizes, dim=-1)
-            q_proj_states, k_proj_states, v_proj_states = parts[0], parts[1], parts[2]
-            onorm_g_hidden = (
-                parts[3] if self.use_full_rank_gate else self.g_b_proj(self.g_a_proj(hidden_states))
-            )
-        else:
-            q_proj_states = self.q_proj(hidden_states)
-            k_proj_states = self.k_proj(hidden_states)
-            v_proj_states = self.v_proj(hidden_states)
-            onorm_g_hidden = (
-                self.g_proj(hidden_states)
-                if self.use_full_rank_gate
-                else self.g_b_proj(self.g_a_proj(hidden_states))
-            )
-
-        g_hidden = self.f_b_proj(self.f_a_proj(hidden_states))
-
-        beta_hidden = self.b_proj(hidden_states).float()
-
-        def _kernel_input(proj: torch.Tensor, h: int, d: int) -> torch.Tensor:
-            x = rearrange(proj, "b t (h d) -> t b h d", h=h, d=d)
-            return x.to(dtype=torch.bfloat16).contiguous()
-
-        x_q_full = _kernel_input(q_proj_states, H, K_dim)
-        x_k_full = _kernel_input(k_proj_states, H, K_dim)
-        x_v_full = _kernel_input(v_proj_states, HV, V_dim)
-        g_full = _kernel_input(g_hidden, H, K_dim)
-        onorm_g_full = _kernel_input(onorm_g_hidden, HV, V_dim)
-        beta_full = rearrange(beta_hidden, "b t h -> t b h").to(torch.bfloat16).contiguous()
-
-        w_q_t_full = (
-            self.q_conv1d.weight.detach().squeeze(1).transpose(0, 1).to(torch.bfloat16).contiguous()
-        )
-        w_k_t_full = (
-            self.k_conv1d.weight.detach().squeeze(1).transpose(0, 1).to(torch.bfloat16).contiguous()
-        )
-        w_v_t_full = (
-            self.v_conv1d.weight.detach().squeeze(1).transpose(0, 1).to(torch.bfloat16).contiguous()
-        )
-
-        if cache is not None and cache.conv_state_q is not None:
-            hf_cs_q_pre = cache.conv_state_q.to(torch.bfloat16)
-        else:
-            hf_cs_q_pre = torch.zeros(b, projection_size, W, device=dev, dtype=torch.bfloat16)
-        if cache is not None and cache.conv_state_k is not None:
-            hf_cs_k_pre = cache.conv_state_k.to(torch.bfloat16)
-        else:
-            hf_cs_k_pre = torch.zeros(b, projection_size, W, device=dev, dtype=torch.bfloat16)
-        if cache is not None and cache.conv_state_v is not None:
-            hf_cs_v_pre = cache.conv_state_v.to(torch.bfloat16)
-        else:
-            hf_cs_v_pre = torch.zeros(b, projection_v_size, W, device=dev, dtype=torch.bfloat16)
-
-        cs_q_full = _hf_conv_to_kernel_conv(hf_cs_q_pre, b, projection_size, W, dev, torch.bfloat16)
-        cs_k_full = _hf_conv_to_kernel_conv(hf_cs_k_pre, b, projection_size, W, dev, torch.bfloat16)
-        cs_v_full = _hf_conv_to_kernel_conv(
-            hf_cs_v_pre, b, projection_v_size, W, dev, torch.bfloat16
-        )
-
-        x_q_col = q_proj_states.transpose(1, 2).to(torch.bfloat16)
-        x_k_col = k_proj_states.transpose(1, 2).to(torch.bfloat16)
-        x_v_col = v_proj_states.transpose(1, 2).to(torch.bfloat16)
-        new_hf_cs_q = _roll_hf_conv(
-            hf_cs_q_pre, x_q_col, b, projection_size, W, dev, torch.bfloat16
-        )
-        new_hf_cs_k = _roll_hf_conv(
-            hf_cs_k_pre, x_k_col, b, projection_size, W, dev, torch.bfloat16
-        )
-        new_hf_cs_v = _roll_hf_conv(
-            hf_cs_v_pre, x_v_col, b, projection_v_size, W, dev, torch.bfloat16
-        )
-
-        if cache is not None and cache.recurrent_state is not None:
-            if ssm_state_indices is not None:
-                if self.wrong_state_layout:
-                    raise ValueError("ssm_state_indices is incompatible with wrong_state_layout")
-                state_full = cache.recurrent_state
-            else:
-                state_full = cache.recurrent_state.to(dtype=torch.float32).contiguous()
-        else:
-            if ssm_state_indices is not None:
-                raise ValueError("ssm_state_indices requires a recurrent state pool")
-            state_full = torch.zeros(b, HV, V_dim, K_dim, device=dev, dtype=torch.float32)
-
-        # The decode op requires fp32 A_log/dt_bias even in a bf16-cast module.
-        A_log_full = self.A_log.detach().float().contiguous()
-        dt_bias_full = self.dt_bias.detach().float().contiguous()
-        onorm_weight_full = self.o_norm.weight.detach().to(torch.float32).contiguous()
-        lower_bound = (
-            self.gate_lower_bound_override
-            if self.gate_lower_bound_override is not None
-            else self.gate_lower_bound
-        )
-
-        kernel_state = (
-            state_full.transpose(-1, -2).contiguous() if self.wrong_state_layout else state_full
-        )
-        o_bfhvk = self._dispatch.decode_kda(
-            x_q=x_q_full,
-            x_k=x_k_full,
-            x_v=x_v_full,
-            w_q_t=w_q_t_full,
-            w_k_t=w_k_t_full,
-            w_v_t=w_v_t_full,
-            bias_q=None,
-            bias_k=None,
-            bias_v=None,
-            cs_q=cs_q_full,
-            cs_k=cs_k_full,
-            cs_v=cs_v_full,
-            A_log=A_log_full,
-            g=g_full,
-            dt_bias=dt_bias_full,
-            beta=beta_full,
-            state=kernel_state,
-            onorm_g=onorm_g_full,
-            onorm_weight=onorm_weight_full,
-            out=None,
-            ssm_state_indices=ssm_state_indices,
-            cu_seqlens=None,
-            scale=K_dim**-0.5,
-            onorm_eps=self.o_norm.eps,
-            lower_bound=lower_bound,
-            use_beta_sigmoid_in_kernel=True,
-            verbose=False,
-            update_conv_cache=False,
-        )
-        state_full = (
-            kernel_state.transpose(-1, -2).contiguous() if self.wrong_state_layout else kernel_state
-        )
-
-        o_flat = rearrange(o_bfhvk, "b t h d -> b t (h d)")
-        o = self.o_proj(o_flat)
-
-        new_cache = KimiKDATestCachedState(
-            conv_state_q=new_hf_cs_q,
-            conv_state_k=new_hf_cs_k,
-            conv_state_v=new_hf_cs_v,
-            recurrent_state=state_full,
-        )
-        return o, new_cache
-
-    # ------------------------------------------------------------------
-    # Internals — FLA fallback decode (non-sm_100 path).
-    # ------------------------------------------------------------------
-
-    def _decode_via_fla(
-        self,
-        hidden_states: torch.Tensor,
-        cache: Optional[KimiKDATestCachedState],
-        b: int,
-    ) -> Tuple[torch.Tensor, KimiKDATestCachedState]:
-        """FLA ``fused_recurrent_kda`` decode path — used when sm_100 is unavailable.
-
-        Matches HF ``KimiDeltaAttention`` in ``fused_recurrent`` mode: uses
-        the ``ShortConvolution.step`` semantics and dispatches the delta
-        update to ``fla.ops.kda.fused_recurrent_kda``.
-        """
         q_proj_states = self.q_proj(hidden_states)
         k_proj_states = self.k_proj(hidden_states)
         v_proj_states = self.v_proj(hidden_states)
@@ -631,12 +320,6 @@ class KimiKDAReference(nn.Module):
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
-        lower_bound = (
-            self.gate_lower_bound_override
-            if self.gate_lower_bound_override is not None
-            else self.gate_lower_bound
-        )
-
         o, new_recurrent = fused_recurrent_kda(
             q=q,
             k=k,
@@ -650,7 +333,7 @@ class KimiKDAReference(nn.Module):
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             use_beta_sigmoid_in_kernel=True,
-            lower_bound=lower_bound,
+            lower_bound=self.gate_lower_bound,
             state_v_first=True,
         )
 
