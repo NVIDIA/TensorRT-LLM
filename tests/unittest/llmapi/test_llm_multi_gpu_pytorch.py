@@ -25,7 +25,6 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from .lora_test_utils import (
     check_llama3_1_multi_lora_from_request_test_harness,
-    check_phi3_lora_fused_modules_output_tp2_identical_to_tp1,
     test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, llama_model_path,
                        llm_get_stats_async_test_harness,

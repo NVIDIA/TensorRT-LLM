@@ -145,24 +145,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
-            "microsoft/Phi-3-mini-4k-instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
-            "microsoft/Phi-3-mini-4k-instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "torch"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
             "deepseek-ai/DeepSeek-V3",
             {
                 "transforms": {

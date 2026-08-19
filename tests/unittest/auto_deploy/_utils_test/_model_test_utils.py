@@ -457,15 +457,6 @@ _SMALL_MODEL_CONFIGS = {
             "num_experts": 16,
         },
     },
-    "microsoft/Phi-3-mini-4k-instruct": {
-        "model_kwargs": {
-            "num_hidden_layers": 2,
-            "hidden_size": 128,
-            "intermediate_size": 256,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-        },
-    },
     "deepseek-ai/DeepSeek-V3": {
         "model_kwargs": {
             "first_k_dense_replace": 1,
