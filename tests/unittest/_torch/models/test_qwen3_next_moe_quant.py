@@ -183,8 +183,8 @@ def _build_moe_block(moe_backend, exclude_modules, layer_idx, *, sm, quant_confi
     """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextSparseMoeBlock
-    from tensorrt_llm._torch.modules.fused_moe.impl_contract import MoEEnvironment
-    from tensorrt_llm._torch.modules.fused_moe.impl_environment import override_moe_environment
+    from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoEEnvironment
+    from tensorrt_llm._torch.moe.fused_moe.impl_environment import override_moe_environment
 
     model_config = ModelConfig(
         pretrained_config=SimpleNamespace(
@@ -213,9 +213,7 @@ def _build_moe_block(moe_backend, exclude_modules, layer_idx, *, sm, quant_confi
     # ``fused_moe/__init__`` re-exports create_moe as a function, which shadows
     # the submodule of the same name, so ``import ...create_moe as m`` binds the
     # function. Both forms below resolve the submodule through sys.modules.
-    from tensorrt_llm._torch.modules.fused_moe.create_moe import (
-        resolve_moe_cls as real_resolve_moe_cls,
-    )
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import resolve_moe_cls as real_resolve_moe_cls
 
     # Observe the resolution create_moe actually performs instead of
     # reproducing its argument list here: a copy drifts, and a copy that omits
@@ -230,7 +228,7 @@ def _build_moe_block(moe_backend, exclude_modules, layer_idx, *, sm, quant_confi
     with (
         override_moe_environment(MoEEnvironment(sm=sm)),
         patch(
-            "tensorrt_llm._torch.modules.fused_moe.create_moe.resolve_moe_cls",
+            "tensorrt_llm._torch.moe.fused_moe.create_moe.resolve_moe_cls",
             _capture,
         ),
         pytest.raises(_StopBlockInit),

@@ -28,11 +28,11 @@ from _torch.modules.moe.moe_test_utils import skip_if_insufficient_gpu_memory
 from utils.util import check_accuracy
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import BaseMoeRoutingMethod
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
+from tensorrt_llm._torch.moe.fused_moe import BaseMoeRoutingMethod
+from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation, relu2
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig

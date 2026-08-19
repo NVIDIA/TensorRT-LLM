@@ -73,7 +73,7 @@ import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import (
+from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
@@ -84,13 +84,13 @@ from tensorrt_llm._torch.modules.fused_moe import (
     SigmoidRenormMoeRoutingMethod,
     create_moe,
 )
-from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
-from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
-from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
+from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
-from tensorrt_llm._torch.modules.fused_moe.quantization import (
+from tensorrt_llm._torch.moe.fused_moe.quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod,
     DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
     FP8QDQFusedMoEMethod,
@@ -779,7 +779,7 @@ def _reset_moe_comm_state():
     import gc as _gc
 
     try:
-        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import (
+        from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
             NVLinkOneSided as _NVOS,
         )
     except ImportError:

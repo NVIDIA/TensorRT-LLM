@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType

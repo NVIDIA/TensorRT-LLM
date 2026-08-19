@@ -15,10 +15,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton_fp8_block_scale import (
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale import (
     run_triton_fp8_block_scale_moe,
 )
-from tensorrt_llm._torch.modules.fused_moe.interface import ActivationType
+from tensorrt_llm._torch.moe.fused_moe.interface import ActivationType
 from tensorrt_llm._utils import get_sm_version
 from tests.unittest._torch.helpers import calc_diff, per_block_cast_to_fp8_e8m0
 

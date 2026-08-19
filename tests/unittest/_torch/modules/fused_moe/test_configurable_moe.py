@@ -19,10 +19,7 @@ import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
-from tensorrt_llm._torch.modules.fused_moe.configurable_moe import (
-    _BACKEND_SYNC_ATTRS,
-    ConfigurableMoE,
-)
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import _BACKEND_SYNC_ATTRS, ConfigurableMoE
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
@@ -52,11 +49,11 @@ def _create_backend(
     backend = Mock()
     with (
         patch(
-            "tensorrt_llm._torch.modules.fused_moe.create_moe.resolve_moe_cls",
+            "tensorrt_llm._torch.moe.fused_moe.create_moe.resolve_moe_cls",
             return_value=Mock(),
         ),
         patch(
-            "tensorrt_llm._torch.modules.fused_moe.create_moe.create_moe_backend",
+            "tensorrt_llm._torch.moe.fused_moe.create_moe.create_moe_backend",
             return_value=backend,
         ),
     ):

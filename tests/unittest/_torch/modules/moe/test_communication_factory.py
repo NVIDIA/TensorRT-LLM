@@ -21,12 +21,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe import nccl_ep_utils
-from tensorrt_llm._torch.modules.fused_moe.communication import communication_factory
-from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
+from tensorrt_llm._torch.moe.fused_moe import nccl_ep_utils
+from tensorrt_llm._torch.moe.fused_moe.communication import communication_factory
+from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
 )
-from tensorrt_llm._torch.modules.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
 
 
 def _make_model_config(

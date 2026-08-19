@@ -42,14 +42,14 @@ from transformers.configuration_utils import PretrainedConfig
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import (
+from tensorrt_llm._torch.moe.fused_moe import (
     DeepSeekV3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
 )
-from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
     MoEEnvironment,
@@ -57,18 +57,14 @@ from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
     MoERejectReason,
     MoERunContext,
 )
-from tensorrt_llm._torch.modules.fused_moe.impl_environment import (
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import (
     collect_moe_environment,
     override_moe_environment,
 )
-from tensorrt_llm._torch.modules.fused_moe.interface import (
-    MoE,
-    MoESchedulerKind,
-    MoEWeightLoadingMode,
-)
-from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
-from tensorrt_llm._torch.modules.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
-from tensorrt_llm._torch.modules.fused_moe.quantization import (
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import impl_class_for, resolve_moe_impl
+from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
@@ -91,7 +87,7 @@ _MEGAMOE_BACKEND_TYPES = {
 
 def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
     import tensorrt_llm
-    import tensorrt_llm._torch.modules.fused_moe.quantization as quantization_module
+    import tensorrt_llm._torch.moe.fused_moe.quantization as quantization_module
 
     def fp8_fp4_mega_moe():
         pass
@@ -337,7 +333,7 @@ def test_fused_moe_load_weights_invalidates_transform_guard():
 
 
 def test_configurable_moe_post_load_weights_uses_backend_staged_hooks():
-    from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 
     class HookTestConfigurableMoE(ConfigurableMoE):
         def quantize_input(self, x, **kwargs):
@@ -365,7 +361,7 @@ def test_configurable_moe_post_load_weights_uses_backend_staged_hooks():
 
 
 def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
-    from tensorrt_llm._torch.modules.fused_moe.configurable_moe import ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 
     configurable_moe = ConfigurableMoE.__new__(ConfigurableMoE)
     torch.nn.Module.__init__(configurable_moe)
@@ -613,7 +609,7 @@ def test_megamoe_deepgemm_defaults_to_swiglu_without_situ_config():
 
 
 def test_create_moe_forwards_megamoe_activation_options(monkeypatch):
-    create_moe_module = importlib.import_module("tensorrt_llm._torch.modules.fused_moe.create_moe")
+    create_moe_module = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
     configurable_moe = MagicMock(return_value=object())
     monkeypatch.setattr(create_moe_module, "ConfigurableMoE", configurable_moe)
     monkeypatch.setattr(
@@ -670,7 +666,7 @@ def test_megamoe_init_rejects_uneven_num_slots_with_value_error():
 
 
 def test_megamoe_post_load_rejects_uneven_num_slots_with_value_error(monkeypatch):
-    import tensorrt_llm._torch.modules.fused_moe.quantization as quantization_module
+    import tensorrt_llm._torch.moe.fused_moe.quantization as quantization_module
 
     class DummyModule:
         _weights_loaded = True
@@ -728,7 +724,7 @@ def test_megamoe_cutedsl_tactic_autotune_defaults_off(
 
 
 def test_enumerate_megamoe_candidate_tactics_curated_space() -> None:
-    from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
 
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384)
@@ -1183,9 +1179,7 @@ def test_moe_backend(
 
         # Clear class-level permute indices cache between parametrized test cases
         # to work around a B200-specific kernel bug (tactic [32,5] illegal memory access)
-        from tensorrt_llm._torch.modules.fused_moe.quantization import (
-            NVFP4TRTLLMGenFusedMoEBaseMethod,
-        )
+        from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4TRTLLMGenFusedMoEBaseMethod
 
         NVFP4TRTLLMGenFusedMoEBaseMethod._cache_permute_indices.clear()
 

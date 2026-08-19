@@ -23,7 +23,7 @@ multiple of BLOCK_SIZE).
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.fused_shared_expert import fused_sigmoid_gate_mul_add
+from tensorrt_llm._torch.moe.fused_shared_expert import fused_sigmoid_gate_mul_add
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 

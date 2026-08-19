@@ -26,24 +26,24 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.modules.fused_moe import (
+from tensorrt_llm._torch.moe.fused_moe import (
     CuteDslFusedMoE,
     CutlassFusedMoE,
     MarlinFusedMoE,
     TRTLLMGenFusedMoE,
 )
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
     canonical_quant,
 )
-from tensorrt_llm._torch.modules.fused_moe.impl_environment import collect_moe_environment
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
-from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
-from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_cute_dsl import (
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
+from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_cute_dsl import (
     is_megamoe_cute_dsl_runtime_available,
 )
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
@@ -339,7 +339,7 @@ def should_skip_trtllm(
     # - Renormalize / RenormalizeNaive / Default (softmax-based)
     # See: cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu
     if routing_method_cls is not None:
-        from tensorrt_llm._torch.modules.fused_moe import (
+        from tensorrt_llm._torch.moe.fused_moe import (
             DeepSeekV3MoeRoutingMethod,
             Llama4RenormalizeMoeRoutingMethod,
         )
@@ -674,7 +674,7 @@ def should_skip_cutedsl(
     # h=2048 fails 8-17%, h=7168 fails 24-35%. Observed: e60(9.4%),
     # e64(16.5%), e256(34.6%), e384(30.9%) at threshold 3%.
     if routing_method_cls is not None:
-        from tensorrt_llm._torch.modules.fused_moe import Llama4RenormalizeMoeRoutingMethod
+        from tensorrt_llm._torch.moe.fused_moe import Llama4RenormalizeMoeRoutingMethod
 
         if (
             quant_algo == QuantAlgo.NVFP4
@@ -1104,7 +1104,7 @@ def should_skip_routing_method(
     if routing_method_cls is None or model_config is None:
         return None
 
-    from tensorrt_llm._torch.modules.fused_moe import DeepSeekV3MoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe import DeepSeekV3MoeRoutingMethod
 
     # DeepSeekV3 routing: num_experts must be divisible by n_group for the
     # view operation in noaux_tc (routing.py:298). n_group = max(1, num_experts // 2),
@@ -1480,7 +1480,7 @@ def should_skip_to_accelerate_ci(
     # --- Rule 1: Large e256-class model restrictions ---
     if is_large_model:
         if routing_method_cls is not None:
-            from tensorrt_llm._torch.modules.fused_moe import DeepSeekV3MoeRoutingMethod
+            from tensorrt_llm._torch.moe.fused_moe import DeepSeekV3MoeRoutingMethod
 
             if routing_method_cls != DeepSeekV3MoeRoutingMethod:
                 routing_name = routing_method_cls.__name__
@@ -1564,7 +1564,7 @@ def iter_base_test_configs(
                   dtype, backend_type, quant_algo, routing_method_cls, skip_reason, base_test_id)
     """
     if routing_methods is None:
-        from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
+        from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
 
         routing_methods = [RenormalizeMoeRoutingMethod]
 

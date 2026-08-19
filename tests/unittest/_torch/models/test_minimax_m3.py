@@ -50,11 +50,11 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     is_minimax_m3_vl_config,
 )
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
-from tensorrt_llm._torch.modules.fused_moe.routing import (
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
     MiniMaxM3MoeRoutingMethod,
 )
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 

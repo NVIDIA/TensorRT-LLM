@@ -206,7 +206,7 @@ def test_kimi_k3_shared_expert_parallel_construction(
     from tensorrt_llm._torch import distributed
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models import modeling_kimi_linear
-    from tensorrt_llm._torch.modules.fused_moe import ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantConfig
 

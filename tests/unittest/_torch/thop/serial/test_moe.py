@@ -32,7 +32,7 @@ from enum import Enum
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
+from tensorrt_llm._torch.moe.fused_moe import RoutingMethodType
 from tensorrt_llm._torch.utils import next_positive_power_of_2
 from tensorrt_llm.quantization.utils.fp4_utils import (
     reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)

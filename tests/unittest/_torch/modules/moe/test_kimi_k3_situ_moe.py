@@ -43,10 +43,8 @@ from tensorrt_llm._torch.models.modeling_kimi_linear import (
     KimiK3MoEGate,
     KimiK3MoERuntime,
 )
-from tensorrt_llm._torch.modules.fused_moe.communication import CommunicationFactory
-from tensorrt_llm._torch.modules.fused_moe.mega_moe.mega_moe_deepgemm import (
-    _MEGA_MOE_SYMM_BUFFER_CACHE,
-)
+from tensorrt_llm._torch.moe.fused_moe.communication import CommunicationFactory
+from tensorrt_llm._torch.moe.fused_moe.mega_moe.mega_moe_deepgemm import _MEGA_MOE_SYMM_BUFFER_CACHE
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping
@@ -627,7 +625,7 @@ def _make_routed_moe(
     """Mirror KimiK3MoERuntime's create_moe call on a single-rank mapping."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.modules.fused_moe import ConfigurableMoE, create_moe
+    from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, create_moe
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
     pretrained_config = PretrainedConfig()

@@ -60,14 +60,13 @@ from ..modules.attention import (maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
-                                 MoEWeightLoadingMode, create_moe,
-                                 is_moe_weight_owner)
-from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.mla import MLA
+from ..moe.fused_moe import (DeepSeekV3MoeRoutingMethod, MoEWeightLoadingMode,
+                             create_moe, is_moe_weight_owner)
+from ..moe.fused_moe.fused_moe_wide_ep import WideEPMoE
 
 # isort: off
-from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
+from ..moe.fused_moe.routing import Deepseekv3RoutingImpl
 # isort: on
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightsLoadingConfig,

@@ -55,12 +55,12 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
-from ..modules.fused_moe import create_moe
-from ..modules.fused_moe.interface import MoEWeightLoadingMode
-from ..modules.fused_moe.routing import MiniMaxM2MoeRoutingMethod
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import create_moe
+from ..moe.fused_moe.interface import MoEWeightLoadingMode
+from ..moe.fused_moe.routing import MiniMaxM2MoeRoutingMethod
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, create_lm_head_tp_mapping
 from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids

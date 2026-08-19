@@ -1089,7 +1089,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/distributed/",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
-        "tensorrt_llm/_torch/modules/fused_moe/",
+        "tensorrt_llm/_torch/moe/fused_moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",

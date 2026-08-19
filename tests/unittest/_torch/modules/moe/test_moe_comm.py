@@ -63,20 +63,20 @@ from mpi4py import MPI
 
 import tensorrt_llm as tllm
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import (
+from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
 )
-from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep import DeepEP
-from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
-from tensorrt_llm._torch.modules.fused_moe.communication.nccl_ep import NcclEP
-from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
-from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided_flashinfer import (
+from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
+from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided_flashinfer import (
     NVLinkTwoSidedFlashinfer,
 )
-from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import deep_ep_installed
-from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import is_nccl_ep_installed
+from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import deep_ep_installed
+from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import is_nccl_ep_installed
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 

@@ -22,17 +22,17 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEEnvironment,
     MoEProblem,
     MoERejectReason,
     canonical_quant,
 )
-from tensorrt_llm._torch.modules.fused_moe.impl_environment import MoEDep
-from tensorrt_llm._torch.modules.fused_moe.quantization import (
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
+from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4CuteDslB12xFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
 )

@@ -24,21 +24,16 @@ from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import \
-    CuteDslFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import \
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import \
     DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.interface import (
-    AlltoallMethodType, MoEWeightLoadingMode)
+from tensorrt_llm._torch.moe.fused_moe.interface import (AlltoallMethodType,
+                                                         MoEWeightLoadingMode)
 
 # isort and yapf will fight against each other here, so we disable isort
 # isort: off
-from tensorrt_llm._torch.modules.fused_moe import (
-    BaseMoeRoutingMethod, CutlassFusedMoE, TRTLLMGenFusedMoE,
-    DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod, TritonFusedMoE,
-    create_moe, WideEPMoE)
-from tensorrt_llm._torch.modules.fused_moe.quantization import \
-    NVFP4CutlassFusedMoEMethod
+from tensorrt_llm._torch.moe.fused_moe import BaseMoeRoutingMethod, CutlassFusedMoE, TRTLLMGenFusedMoE, DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod, TritonFusedMoE, create_moe, WideEPMoE
+from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4CutlassFusedMoEMethod
 # isort: on
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import get_sm_version, mpi_rank

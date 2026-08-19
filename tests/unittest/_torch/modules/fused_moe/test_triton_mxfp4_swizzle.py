@@ -6,7 +6,7 @@ import torch
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details.layout import HopperMXScaleLayout, HopperMXValueLayout
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import (
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton import (
     convert_layout_expert_chunked,
     update_weight_stride,
 )

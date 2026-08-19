@@ -354,11 +354,7 @@
 /cpp/tensorrt_llm/runtime/moeLoadBalancer @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/cute_dsl_kernels/blackwell/moe_as_dense_gemm @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/_torch/cute_dsl_kernels/mega_moe_nvfp4 @NVIDIA/trt-llm-moe-devs
-/tensorrt_llm/_torch/custom_ops/cute_dsl_megamoe_custom_op.py @NVIDIA/trt-llm-moe-devs
-/tensorrt_llm/_torch/distributed/moe_alltoall.py @NVIDIA/trt-llm-moe-devs
-/tensorrt_llm/_torch/expert_statistic.py @NVIDIA/trt-llm-moe-devs
-/tensorrt_llm/_torch/modules/fused_moe @NVIDIA/trt-llm-moe-devs
-/tensorrt_llm/_torch/modules/fused_shared_expert.py @NVIDIA/trt-llm-moe-devs
+/tensorrt_llm/_torch/moe @NVIDIA/trt-llm-moe-devs
 /tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/bench_moe @NVIDIA/trt-llm-moe-devs
 /tests/microbenchmarks/bench_moe_comm.py @NVIDIA/trt-llm-moe-devs

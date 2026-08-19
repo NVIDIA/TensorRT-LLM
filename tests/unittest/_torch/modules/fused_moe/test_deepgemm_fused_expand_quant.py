@@ -39,7 +39,7 @@ import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401  (registers torch.ops.trtllm.*)
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import (
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import (
     fused_expand_group_quant_fp8,
     masked_index_copy_group_quant_fp8,
     preprocess_after_permute,

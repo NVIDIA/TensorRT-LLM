@@ -15,7 +15,7 @@ Transforms HF on-disk MXFP4 expert tensors (``gate_up_proj_*``, ``down_proj_*`` 
 the TMA layout.
 
 Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod``
-(``tensorrt_llm/_torch/modules/fused_moe/quantization.py:4135``) — PT helpers
+(``tensorrt_llm/_torch/moe/fused_moe/quantization.py:4135``) — PT helpers
 (``maybe_pad_for_mxfp4``, ``trtllmgen_maybe_get_cached_*``, ``_get_weight_alignment``) are imported
 directly so the algorithm is byte-identical.
 """
@@ -25,7 +25,7 @@ from typing import Dict, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.quantization import (
+from tensorrt_llm._torch.moe.fused_moe.quantization import (
     _get_weight_alignment,
     maybe_pad_for_mxfp4,
     trtllmgen_maybe_get_cached_w2_permute_indices,

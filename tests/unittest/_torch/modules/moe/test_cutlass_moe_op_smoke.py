@@ -68,7 +68,7 @@ class _ModuleStub:
 
 @requires_cuda_and_op
 def test_cutlass_moe_op_run_moe_no_lora_smoke():
-    from tensorrt_llm._torch.modules.fused_moe.ops.moe_op_cutlass import CutlassMoEOp
+    from tensorrt_llm._torch.moe.fused_moe.ops.moe_op_cutlass import CutlassMoEOp
     from tensorrt_llm._torch.utils import ActivationType
 
     device = torch.device("cuda")
@@ -124,7 +124,7 @@ def test_cutlass_moe_op_run_moe_no_lora_matches_fused_moe_op():
     """The CutlassMoEOp path and the direct torch.ops.trtllm.fused_moe path
     should produce the same result for an unquantized bf16 MoE with no LoRA,
     since both ultimately call the same C++ run_moe."""
-    from tensorrt_llm._torch.modules.fused_moe.ops.moe_op_cutlass import CutlassMoEOp
+    from tensorrt_llm._torch.moe.fused_moe.ops.moe_op_cutlass import CutlassMoEOp
     from tensorrt_llm._torch.utils import ActivationType
 
     device = torch.device("cuda")

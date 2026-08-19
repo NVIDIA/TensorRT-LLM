@@ -23,7 +23,7 @@ import threading
 
 import pytest
 
-from tensorrt_llm._torch.modules.fused_moe.ep_group_health import (
+from tensorrt_llm._torch.moe.fused_moe.ep_group_health import (
     EP_MASK_NUM_WORDS,
     EPGroupHealth,
     EPGroupHealthSnapshot,

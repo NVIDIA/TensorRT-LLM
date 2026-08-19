@@ -51,7 +51,6 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMax
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (
     Linear,
@@ -63,6 +62,7 @@ from ..modules.linear import (
 )
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, create_moe
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..utils import (
     ActivationType,

@@ -31,7 +31,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm.tools.layer_wise_benchmarks.runner import make_forward_impl_check
 
 from .builders import RoutingPlan

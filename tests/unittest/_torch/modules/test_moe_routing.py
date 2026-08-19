@@ -10,15 +10,15 @@ from mpi4py import MPI
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe import (
+from tensorrt_llm._torch.moe.fused_moe import (
     BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
     DeepSeekV4MoeRoutingMethod, DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod, LoadBalancedMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod, RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod, SparseMixerMoeRoutingMethod,
     StaticMoeRoutingMethod, create_load_balanced_logits, create_moe)
-from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
-from tensorrt_llm._torch.modules.fused_moe.routing import \
+from tensorrt_llm._torch.moe.fused_moe import routing as moe_routing
+from tensorrt_llm._torch.moe.fused_moe.routing import \
     get_cached_perfect_router_logits
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -558,7 +558,7 @@ def test_perfect_router_get_cached_logits_e2e(routing_name, shape):
 
 # -----------------------------------------------------------------
 # Unified routing-method builder. Covers every RoutingMethodType in
-# tensorrt_llm._torch.modules.fused_moe.routing:
+# tensorrt_llm._torch.moe.fused_moe.routing:
 #   Default, Renormalize, RenormalizeNaive, Llama4, MiniMax2, DeepSeekV3.
 # Bias-aware routers seed a non-zero bias so tests can verify the
 # perfect-router path resets it to zeros.
@@ -748,7 +748,7 @@ def _perfect_router_worker(parallel_mode, routing_name, num_tokens, dtype,
 
     # Local import inside the worker so module-level _PERFECT_ROUTER_LOGITS_CACHE
     # is the copy living in the child process. Clear any stale state.
-    from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
+    from tensorrt_llm._torch.moe.fused_moe import routing as moe_routing
     moe_routing._PERFECT_ROUTER_LOGITS_CACHE.clear()
 
     spec = _PERFECT_ROUTER_ROUTING_SPECS[routing_name]
@@ -903,7 +903,7 @@ def _reset_perfect_router_comm_state() -> None:
     """
     import gc
 
-    from tensorrt_llm._torch.modules.fused_moe import routing as moe_routing
+    from tensorrt_llm._torch.moe.fused_moe import routing as moe_routing
 
     # Wait for any in-flight GPU work first. This teardown runs from a
     # ``finally`` block, so on the error path a worker may raise while kernels
@@ -914,7 +914,7 @@ def _reset_perfect_router_comm_state() -> None:
 
     moe_routing._PERFECT_ROUTER_LOGITS_CACHE.clear()
     try:
-        from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import \
+        from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import \
             NVLinkOneSided as _NVOS
     except ImportError:
         _NVOS = None

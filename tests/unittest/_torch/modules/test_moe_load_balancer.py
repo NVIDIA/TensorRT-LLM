@@ -7,7 +7,7 @@ from mpi4py import MPI
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, SingleLayerMoeLoadBalancer,
     get_moe_load_balancer, maybe_create_moe_load_balancer,
     moe_load_balancer_add_single_layer)

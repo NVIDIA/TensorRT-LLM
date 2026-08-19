@@ -144,7 +144,7 @@ def pack_routed_expert_weights(
     * ``gemm2_weights_scale``: ``uint8 [E, H_pad128, I_pad // 32]`` —
       shuffled + block-scale interleaved.
     """
-    from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    from tensorrt_llm._torch.moe.fused_moe.quantization import (
         maybe_pad_for_mxfp4,
         trtllmgen_maybe_get_cached_w2_permute_indices,
         trtllmgen_maybe_get_cached_w3_w1_permute_indices,

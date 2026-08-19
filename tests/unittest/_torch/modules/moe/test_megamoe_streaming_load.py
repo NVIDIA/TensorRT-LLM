@@ -26,8 +26,8 @@ torch = pytest.importorskip("torch")
 from torch import nn  # noqa: E402
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
-    from tensorrt_llm._torch.modules.fused_moe.quantization import NVFP4MegaMoECuteDslMethod
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+    from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4MegaMoECuteDslMethod
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -42,8 +42,8 @@ _STREAMED_PARAMS = ("w3_w1_weight", "w3_w1_weight_scale", "w2_weight", "w2_weigh
 
 
 def _load_classes() -> tuple[type[MoEWeightLoadingMode], type[NVFP4MegaMoECuteDslMethod]]:
-    from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
-    from tensorrt_llm._torch.modules.fused_moe.quantization import NVFP4MegaMoECuteDslMethod
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+    from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4MegaMoECuteDslMethod
 
     return MoEWeightLoadingMode, NVFP4MegaMoECuteDslMethod
 
