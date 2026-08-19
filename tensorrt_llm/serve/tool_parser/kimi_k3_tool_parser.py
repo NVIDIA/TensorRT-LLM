@@ -50,6 +50,10 @@ class KimiK3ToolParser(BaseToolParser):
     """Detector for the Kimi K3 XTML function-call format."""
 
     needs_raw_special_tokens = True
+    # Forced/named tool_choice has no grammar for XTML (no structural-tag
+    # support), so the model output still carries preamble + markup and the
+    # serving layer must extract instead of passing raw text through.
+    extracts_forced_tool_calls = True
 
     def __init__(self):
         super().__init__()
@@ -61,18 +65,24 @@ class KimiK3ToolParser(BaseToolParser):
             r"(?:<\|close\|>message<\|sep\|>|<\|end_of_msg\|>)+\s*$"
         )
 
+        # Tag headers run to the next special token. The encoder escapes only
+        # ``&`` and ``"`` in attribute values, so a literal ``<`` (or ``>``)
+        # can appear inside one; only ``<|`` is impossible without ending the
+        # header, so headers match any text that doesn't contain ``<|``.
+        attrs_pattern = r"(?:(?!<\|).)*?"
+        self._call_open_regex = re.compile(r"<\|open\|>call(?![a-zA-Z])")
         self._call_regex = re.compile(
-            r"<\|open\|>call(?P<attrs>[^<]*?)<\|sep\|>"
+            r"<\|open\|>call(?P<attrs>" + attrs_pattern + r")<\|sep\|>"
             r"(?P<body>.*?)<\|close\|>call<\|sep\|>",
             re.DOTALL,
         )
         self._argument_regex = re.compile(
-            r"<\|open\|>argument(?P<attrs>[^<]*?)<\|sep\|>"
+            r"<\|open\|>argument(?P<attrs>" + attrs_pattern + r")<\|sep\|>"
             r"(?P<value>.*?)<\|close\|>argument<\|sep\|>",
             re.DOTALL,
         )
         self._json_regex = re.compile(
-            r"<\|open\|>json(?P<attrs>[^<]*?)<\|sep\|>"
+            r"<\|open\|>json(?P<attrs>" + attrs_pattern + r")<\|sep\|>"
             r"(?P<value>.*?)<\|close\|>json<\|sep\|>",
             re.DOTALL,
         )
@@ -129,7 +139,10 @@ class KimiK3ToolParser(BaseToolParser):
     def _parse_tools_section(self, section: str, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
         calls: List[ToolCallItem] = []
+        opened_calls = len(self._call_open_regex.findall(section))
+        matched_calls = 0
         for position, match in enumerate(self._call_regex.finditer(section)):
+            matched_calls += 1
             attrs = _parse_attrs(match.group("attrs"))
             name = attrs.get("tool")
             if not name:
@@ -145,6 +158,13 @@ class KimiK3ToolParser(BaseToolParser):
                     name=name,
                     parameters=self._parse_call_arguments(match.group("body")),
                 )
+            )
+        if matched_calls < opened_calls:
+            logger.warning(
+                "kimi_k3 tool parser: %d of %d call blocks were malformed or "
+                "truncated and could not be parsed",
+                opened_calls - matched_calls,
+                opened_calls,
             )
         return calls
 
@@ -199,3 +219,25 @@ class KimiK3ToolParser(BaseToolParser):
         return StreamingParseResult(
             normal_text=normal_text + result.normal_text, calls=result.calls
         )
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Emit whatever the buffer holds when the stream ends early.
+
+        ``parse_streaming_increment`` buffers the whole tools section until
+        ``<|close|>tools<|sep|>``; if generation stops first (length limit,
+        cancellation), the buffered content would otherwise be dropped.
+        Complete call blocks are salvaged; a call truncated mid-block is
+        reported by the malformed-call warning in ``_parse_tools_section``.
+        """
+        buffer, self._buffer = self._buffer, ""
+        if not buffer:
+            return StreamingParseResult()
+        if self.bot_token not in buffer:
+            # Only a partial bot_token prefix could be held back here; the
+            # stream is over, so it is plain text after all.
+            return StreamingParseResult(normal_text=buffer)
+        logger.warning(
+            "kimi_k3 tool parser: stream ended before %s; parsing the partial tools section",
+            self.eot_token,
+        )
+        return self.detect_and_parse(buffer, tools)
