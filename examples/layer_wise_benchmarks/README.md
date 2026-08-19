@@ -372,7 +372,7 @@ Limitations:
 
 1. Error `fp8 blockscale gemm only support Hopper` on Blackwell.
 
-   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `CUTEDSL`) and `--moe-backend-for-prefill DEEPGEMM` options.
+   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `CUTEDSL`) and `--moe-backend-for-prefill DEEPGEMM` options. Passing `--moe-backend AUTO` alone also works: prefill then defaults to `AUTO` too.
 
 2. Error `huggingface_hub.errors.HfHubHTTPError: 429 Client Error: Too Many Requests for url: https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2/resolve/main/config.json`.
 
